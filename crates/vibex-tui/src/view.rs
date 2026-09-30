@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A block whose border glyphs match the terminal's capability.
 ///
@@ -43,9 +44,11 @@ use vibex_ui::shell::ShellKind;
 
 use crate::action::Intent;
 use crate::app::{
-    App, Availability, ManagementRow, Overlay, Page, RecoveryAction, SettingRow, ToastTone,
+    App, Availability, BannerTone, ComposerMode, ManagementRow, Overlay, Page, RecoveryAction,
+    SettingRow, ToastTone,
 };
 use crate::keymap::Scope;
+use crate::layout::{Bands, MIN_RAIL_TURNS};
 use crate::locale::Strings;
 use crate::text::{display_width, truncate_to_width};
 use crate::theme::{GlyphMode, TuiTheme};
@@ -320,6 +323,12 @@ pub fn block_detail_text(
 }
 
 /// Render one frame.
+/// Draw one frame.
+///
+/// The screen is a vertical stack of full-width bands (see [`crate::layout`]).
+/// Bands that are not needed this frame get a zero rect and their renderer is
+/// skipped, so an idle session shows the transcript the whole height of the
+/// screen rather than the top third of it.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     app.shell = crate::app::shell_for_columns(area.width);
@@ -328,111 +337,774 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     frame.render_widget(Block::default().style(theme.base()), area);
 
-    let plan = layout_for(app.shell, area.width, area.height);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // top bar
-            Constraint::Min(3),    // body
-            Constraint::Length(1), // key bar
-            Constraint::Length(1), // status bar
-        ])
-        .split(area);
+    let bands = crate::layout::compute(area, band_request(app));
 
-    render_top_bar(frame, rows[0], app, &theme);
-    render_body(frame, rows[1], app, &plan, &theme, strings);
-    render_key_bar(frame, rows[2], app, &theme);
-    render_status_bar(frame, rows[3], app, &theme);
+    render_status_band(frame, bands.status, app, &theme, strings);
+    if Bands::is_visible(bands.tasks) {
+        render_tasks_band(frame, bands.tasks, app, &theme, strings);
+    }
+    if Bands::is_visible(bands.todo) {
+        render_todo_band(frame, bands.todo, app, &theme, strings);
+    }
+
+    match app.page {
+        // The workbench pages share the scrollback band; they are views over the
+        // same session, so they occupy the same part of the screen.
+        Page::Agent => render_scrollback(frame, bands.scrollback, app, &theme, strings),
+        Page::Sessions => render_session_view(frame, bands.scrollback, app, &theme, strings),
+        Page::Files | Page::Changes => {
+            render_file_view(frame, bands.scrollback, app, &theme, strings)
+        }
+        Page::Management
+        | Page::Providers
+        | Page::Agents
+        | Page::Mcp
+        | Page::Skills
+        | Page::Prompts
+        | Page::Hooks
+        | Page::Devices
+        | Page::Usage
+        | Page::Recovery
+        | Page::Settings
+        | Page::Help => render_management_view(frame, bands.scrollback, app, &theme, strings),
+        Page::Terminal => {
+            let inner = page_frame(
+                frame,
+                bands.scrollback,
+                &theme,
+                strings.nav_terminal(),
+                true,
+            );
+            empty_state(frame, inner, &theme, strings.toast_action_unavailable());
+        }
+    }
+
+    // The rail maps the transcript, so it belongs to the pages that show one.
+    if Bands::is_visible(bands.gutter) && app.page.is_session_page() {
+        render_gutter(frame, bands.gutter, app, &theme);
+    }
+    if Bands::is_visible(bands.queue) {
+        render_queue_band(frame, bands.queue, app, &theme, strings);
+    }
+    if Bands::is_visible(bands.turn_status) {
+        render_turn_status(frame, bands.turn_status, app, &theme, strings);
+    }
+    if Bands::is_visible(bands.banner) {
+        render_banner(frame, bands.banner, app, &theme, strings);
+    }
+    if Bands::is_visible(bands.prompt) {
+        render_prompt(frame, bands.prompt, app, &theme, strings);
+    }
+    render_shortcuts(frame, bands.shortcuts, app, &theme);
 
     if let Some(overlay) = app.overlay.clone() {
         render_overlay(frame, area, app, &overlay, &theme);
     }
 }
 
-fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
-    let strings = app.strings;
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", strings.app_name()),
-            theme.accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("│ ", theme.border_style()),
-    ];
-    for (index, page) in [
-        (1u8, Page::Sessions),
-        (2, Page::Management),
-        (3, Page::Usage),
-        (4, Page::Settings),
-        (5, Page::Help),
-    ] {
-        let label = match page {
-            Page::Sessions => strings.nav_sessions(),
-            Page::Usage => strings.nav_usage(),
-            Page::Settings => strings.nav_settings(),
-            Page::Help => strings.nav_help(),
-            _ => strings.nav_management(),
-        };
-        let active = app.page == page || (page == Page::Sessions && app.page.is_session_page());
-        let style = if active {
-            theme.accent().add_modifier(Modifier::BOLD)
+/// What the frame wants on screen, given the current state.
+fn band_request(app: &App) -> crate::layout::BandRequest {
+    let running = app
+        .active_session()
+        .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running);
+    // The turn line is present whenever there is something to say about the
+    // turn: it is running, or it is waiting on the reader.
+    // Present whenever there is something to say about the turn: it is running,
+    // it is waiting on the reader, or it is idle with a live session to report.
+    let turn_status = u16::from(
+        running
+            || app.is_animating()
+            || app.pending_permission_count() > 0
+            || app.pending_elicitations() > 0
+            || app.active_session().is_some()
+            || app.turn_started.is_some(),
+    );
+    let queued = app.queued_messages.len() as u16;
+    crate::layout::BandRequest {
+        // The tasks row appears only when background work exists, so an idle
+        // session spends no rows on it.
+        tasks: if app.background_task_count() > 0 {
+            1
         } else {
-            theme.muted()
-        };
-        spans.push(Span::styled(format!("{index}:{label}"), style));
-        spans.push(Span::styled("  ", theme.muted()));
+            0
+        },
+        todo: 0,
+        queue: if queued > 0 { (queued + 1).min(5) } else { 0 },
+        turn_status,
+        banner: u16::from(app.banner.is_some()),
+        // The composer belongs to a session. On a page with no session context
+        // there is nothing to send, so the band is not allocated and the
+        // transcript gets its rows instead.
+        prompt: if app.page.is_session_page() {
+            // Borders (2) + one blank row above the draft + the draft itself,
+            // capped so a long paste cannot take the whole screen. The info line
+            // rides on the bottom border rather than taking a row.
+            (app.composer.line_count().min(8) as u16 + 3).max(4)
+        } else {
+            0
+        },
+        prompt_gap: u16::from(app.page.is_session_page()),
+        shortcuts: 1,
     }
-    if app.page.is_session_page() {
-        spans.push(Span::styled("│ ", theme.border_style()));
-        for (label, page) in [
-            (strings.nav_agent(), Page::Agent),
-            (strings.nav_files(), Page::Files),
-            (strings.nav_changes(), Page::Changes),
-            (strings.nav_terminal(), Page::Terminal),
-        ] {
-            let style = if app.page == page {
-                theme.strong()
-            } else {
-                theme.muted()
-            };
-            spans.push(Span::styled(format!("{label} "), style));
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_body(
+/// A one-line band summarising background work.
+fn render_tasks_band(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &mut App,
-    plan: &LayoutPlan,
+    app: &App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    let mut constraints = Vec::new();
-    if plan.show_sidebar {
-        constraints.push(Constraint::Length(plan.sidebar_width as u16));
+    let count = app.background_task_count();
+    let text = format!(
+        "{} {count} {}",
+        crate::glyphs::diamond_dotted(app.glyph_tier()),
+        strings.background_tasks()
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(theme.roles.gray),
+        ))),
+        area,
+    );
+}
+
+/// A one-line band listing the session's open steps.
+fn render_todo_band(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    _strings: Strings,
+) {
+    let done = app.todo_done_count();
+    let total = app.todo_total_count();
+    let bar_width = usize::from(area.width).saturating_sub(16).clamp(4, 40);
+    let filled = (done * bar_width).checked_div(total).unwrap_or(0);
+    let text = format!(
+        "{}{} {done}/{total}",
+        "█".repeat(filled),
+        "░".repeat(bar_width.saturating_sub(filled))
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(theme.roles.accent_user),
+        ))),
+        area,
+    );
+}
+
+/// The transcript band: full width, no frame.
+///
+/// A border around the transcript would spend two columns and two rows on a
+/// rectangle the reader already knows the shape of. The per-block rail is the
+/// structure, and it is inside the content rather than around it.
+fn render_scrollback(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if !Bands::is_visible(area) {
+        return;
     }
-    constraints.push(Constraint::Min(20));
-    if plan.show_details {
-        constraints.push(Constraint::Length(plan.details_width as u16));
+    if app.transcript.is_empty() {
+        render_welcome(frame, area, app, theme, strings);
+        return;
     }
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-    let mut index = 0;
-    if plan.show_sidebar {
-        let focused = app.focus == crate::app::Focus::Sidebar;
-        render_sidebar(frame, columns[index], app, theme, strings, focused);
-        index += 1;
+    let height = usize::from(area.height);
+    let selected = app.selection_for(Scope::Agent);
+    let mut scroll = app.scroll;
+    scroll.selected = Some(selected);
+    let lines = app.transcript.visible_lines(scroll, height, theme, strings);
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// The full-screen session list.
+///
+/// Sessions are a navigation level, not a permanent column. As a view they get
+/// the whole screen: a title, the workspace, the state and an age per row,
+/// which a 26-column sidebar could never show.
+fn render_session_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let inner = page_frame(frame, area, theme, strings.sessions_title(), true);
+    // The filter is a line of the list, not a separate overlay, so the reader
+    // can see what is being typed and what it matched at the same time.
+    let list_area = if app.filtering || !app.filter.is_empty() {
+        let filter_area = Rect { height: 1, ..inner };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("/ ", Style::default().fg(theme.roles.accent_user)),
+                Span::styled(
+                    app.filter.clone(),
+                    Style::default().fg(theme.roles.foreground),
+                ),
+                Span::styled(
+                    if app.filtering { "▏" } else { "" },
+                    Style::default().fg(theme.roles.accent_user),
+                ),
+            ])),
+            filter_area,
+        );
+        Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    let rows = app.sidebar_rows();
+    if rows.is_empty() {
+        render_welcome(frame, list_area, app, theme, strings);
+        return;
     }
-    let main = columns[index];
-    render_main(frame, main, app, theme, strings);
-    index += 1;
-    if plan.show_details {
-        let focused = app.focus == crate::app::Focus::Details;
-        render_details(frame, columns[index], app, theme, strings, focused);
+    let selected = app.selection_for(Scope::Sessions);
+    let items = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let active = row
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| app.selected_session_id() == Some(session_id));
+            let style = if index == selected {
+                Style::default()
+                    .fg(theme.roles.background)
+                    .bg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD)
+            } else if active {
+                Style::default()
+                    .fg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.roles.foreground)
+            };
+            let marker = match row.kind {
+                vibex_desktop_model::AgentSidebarRowKind::Project => {
+                    crate::glyphs::disclosure(!row.collapsed, app.glyph_tier())
+                }
+                vibex_desktop_model::AgentSidebarRowKind::Session => " ",
+            };
+            let indent = " ".repeat(usize::from(row.depth) * 2);
+            let state = row
+                .state
+                .map(|state| format!("  {}", session_state_label(state, strings)))
+                .unwrap_or_default();
+            let name_width = usize::from(list_area.width).saturating_sub(24 + state.len());
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{indent}{marker} {:<width$}",
+                        truncate_to_width(&row.label, name_width.max(8), "…"),
+                        width = name_width.max(8)
+                    ),
+                    style,
+                ),
+                Span::styled(state, Style::default().fg(theme.roles.gray_dim)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected.min(rows.len().saturating_sub(1))));
+    frame.render_stateful_widget(List::new(items), list_area, &mut state);
+}
+
+/// A human-readable session state, rather than the variant name.
+fn session_state_label(state: vibex_core::AgentSessionState, strings: Strings) -> &'static str {
+    match state {
+        vibex_core::AgentSessionState::Running => strings.running(),
+        vibex_core::AgentSessionState::NeedsInput => strings.approval_title(),
+        vibex_core::AgentSessionState::Error => strings.failed(),
+        vibex_core::AgentSessionState::Archived => strings.archived(),
+        vibex_core::AgentSessionState::Initializing => strings.connecting(),
+        _ => strings.idle(),
     }
+}
+
+/// The Files and Changes views.
+fn render_file_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let title = if app.page == Page::Changes {
+        strings.nav_changes()
+    } else {
+        strings.nav_files()
+    };
+    render_file_list(frame, area, app, theme, strings, title);
+}
+
+/// The management, device, usage, recovery and settings views.
+fn render_management_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    match app.page {
+        Page::Management => render_management(frame, area, app, theme, strings),
+        Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts | Page::Hooks => {
+            render_entry_list(frame, area, app, theme, strings)
+        }
+        Page::Devices => render_devices(frame, area, app, theme, strings),
+        Page::Usage => render_usage(frame, area, app, theme, strings),
+        Page::Recovery => render_recovery(frame, area, app, theme, strings),
+        Page::Settings => render_settings(frame, area, app, theme, strings),
+        Page::Help => render_help(frame, area, app, theme, strings),
+        _ => {}
+    }
+}
+
+/// The right gutter: a turn rail, or a scrollbar when the rail is not useful.
+///
+/// One tick per turn, positioned by conversation order rather than scroll
+/// proportion, so the rail is a map of the session rather than of the buffer.
+/// Chevrons at each end jump a turn at a time when the viewport is between
+/// turns. Both live in the same two columns the scrollbar would use, because a
+/// terminal cannot afford to show two navigators at once.
+fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
+    let turns = app.transcript.turn_count();
+    let tier = app.glyph_tier();
+    let rail_width = usize::from(area.width);
+    if rail_width == 0 || area.height == 0 {
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height));
+
+    if turns < MIN_RAIL_TURNS {
+        // A one-turn session has nothing to navigate, so the gutter falls back
+        // to a scrollbar. Only the thumb is drawn: a full track of blocks is as
+        // loud as the content and twice as wide as it needs to be.
+        let (thumb_start, thumb_len) = app.scroll_thumb(usize::from(area.height));
+        let thumb = crate::glyphs::accent_bar(tier);
+        for row in 0..usize::from(area.height) {
+            let in_thumb = row >= thumb_start && row < thumb_start + thumb_len;
+            if in_thumb {
+                lines.push(Line::from(Span::styled(
+                    thumb,
+                    Style::default().fg(theme.roles.gray_dim),
+                )));
+            } else {
+                lines.push(Line::from(""));
+            }
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+
+    let active = app.transcript.active_turn();
+    // Window the ticks when there are more turns than rows, keeping the active
+    // turn visible: an unwindowed rail would fold many turns onto one row.
+    let rows = usize::from(area.height);
+    let window_start = if turns <= rows {
+        0
+    } else {
+        active
+            .unwrap_or(0)
+            .saturating_sub(rows / 2)
+            .min(turns - rows)
+    };
+    for row in 0..rows {
+        let turn = window_start + row;
+        if turn >= turns {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let is_active = active == Some(turn);
+        lines.push(Line::from(Span::styled(
+            if is_active {
+                crate::glyphs::timeline_tick_active(tier)
+            } else {
+                crate::glyphs::timeline_tick(tier)
+            },
+            Style::default().fg(if is_active {
+                theme.roles.accent_user
+            } else {
+                theme.roles.gray_dim
+            }),
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// The turn-status row: what the Agent is doing, right now.
+///
+/// This is the band that makes the interface feel alive. It is not part of the
+/// transcript because it must never scroll away, and it says three things: what
+/// is happening, how long it has been happening, and how much it has cost in
+/// tokens. An idle-but-connected session says so, rather than showing nothing
+/// and leaving the reader unsure whether the client is still there.
+fn render_turn_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if !Bands::is_visible(area) {
+        return;
+    }
+    let tier = app.glyph_tier();
+    let phase = app.animation_phase();
+
+    let running = app
+        .active_session()
+        .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running);
+    let approvals = app.pending_permission_count();
+    let questions = app.pending_elicitations();
+
+    let (icon, label, color) = if approvals + questions > 0 {
+        (
+            crate::glyphs::diamond_filled(tier),
+            format!(
+                "{approvals} {} · {questions} {}",
+                strings.approval_label(),
+                strings.elicitation_title()
+            ),
+            theme.roles.accent_attention,
+        )
+    } else if running || app.transcript.is_animating() {
+        (
+            crate::glyphs::frame_at(
+                crate::glyphs::spinner_frames(tier),
+                phase,
+                crate::glyphs::SPINNER_TICKS_PER_FRAME,
+            ),
+            app.current_activity()
+                .unwrap_or_else(|| strings.running().to_string()),
+            theme.roles.accent_running,
+        )
+    } else {
+        (
+            crate::glyphs::frame_at(
+                crate::glyphs::idle_pulse_frames(tier),
+                phase,
+                crate::glyphs::IDLE_PULSE_TICKS_PER_FRAME,
+            ),
+            strings.idle().to_string(),
+            theme.roles.accent_system,
+        )
+    };
+
+    // Right-aligned: elapsed time and tokens, so the left side is the sentence
+    // and the right side is the measurement.
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if let Some(elapsed) = app.turn_elapsed() {
+        right.push(Span::styled(
+            format_turn_timer(elapsed),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    if let Some(tokens) = app.turn_tokens() {
+        if !right.is_empty() {
+            right.push(Span::styled(" ", Style::default().fg(theme.roles.gray_dim)));
+        }
+        right.push(Span::styled(
+            format!(
+                "{}{}",
+                crate::glyphs::token_arrow(tier),
+                compact_tokens(tokens)
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+
+    let available = usize::from(area.width).saturating_sub(
+        right
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum::<usize>()
+            + 4,
+    );
+    let left = vec![
+        Span::styled(format!("{icon} "), Style::default().fg(color)),
+        Span::styled(
+            truncate_to_width(&label, available, "…"),
+            Style::default().fg(theme.roles.gray),
+        ),
+    ];
+    render_zoned_line(frame, area, left, None, right);
+}
+
+/// Format an elapsed duration the way a person reads it.
+pub fn format_turn_timer(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+/// A transient one-line message above the composer.
+fn render_banner(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    _strings: Strings,
+) {
+    let Some(banner) = app.banner.as_ref() else {
+        return;
+    };
+    let color = match banner.tone {
+        BannerTone::Info => theme.roles.gray,
+        BannerTone::Warning => theme.roles.warning,
+        BannerTone::Danger => theme.roles.danger,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_to_width(&banner.text, usize::from(area.width), "…"),
+            Style::default().fg(color),
+        ))),
+        area,
+    );
+}
+
+/// The queued-message band.
+///
+/// Queued prompts are held back until the running turn ends, so they are shown
+/// where they will be sent from rather than buried in the transcript.
+fn render_queue_band(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "{} {} {}",
+            crate::glyphs::diamond_dotted(app.glyph_tier()),
+            app.queued_messages.len(),
+            strings.composer_queue()
+        ),
+        Style::default().fg(theme.roles.gray_dim),
+    ))];
+    for message in app
+        .queued_messages
+        .iter()
+        .take(usize::from(area.height).saturating_sub(1))
+    {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                truncate_to_width(message, usize::from(area.width).saturating_sub(4), "…")
+            ),
+            Style::default().fg(theme.roles.gray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// The prompt band.
+fn render_prompt(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if !Bands::is_visible(area) {
+        return;
+    }
+    render_composer(frame, area, app, theme, strings);
+}
+
+/// The shortcut band at the very bottom.
+fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
+    if !Bands::is_visible(area) {
+        return;
+    }
+    render_key_bar(frame, area, app, theme);
+}
+
+/// The top band: where the session is, and what state it is in.
+///
+/// The location sits on the left and the status segments are right-aligned as a
+/// group, so the left column is stable while the group grows and shrinks. A
+/// left-aligned list of everything would push the state off the edge exactly
+/// when a narrow terminal makes it most worth reading.
+fn render_status_band(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if !Bands::is_visible(area) {
+        return;
+    }
+    let sep = Span::styled(" │ ", Style::default().fg(theme.roles.gray_dim));
+
+    // ---- left: the location ---------------------------------------------
+    let mut left = Vec::new();
+    let location = app
+        .active_session()
+        .map(|session| session.workspace_root.clone())
+        .or_else(|| app.workspace_path.clone())
+        .unwrap_or_else(|| app.page_label(strings).to_string());
+    left.push(Span::styled(
+        compact_path(&location, usize::from(area.width) / 3),
+        Style::default().fg(theme.roles.path),
+    ));
+
+    // ---- right: the status segments --------------------------------------
+    let mut right: Vec<Span<'static>> = Vec::new();
+    let push_segment = |right: &mut Vec<Span<'static>>, span: Span<'static>| {
+        if !right.is_empty() {
+            right.push(sep.clone());
+        }
+        right.push(span);
+    };
+
+    let (live_text, live_color) = match app.live {
+        crate::app::LiveState::Ready => (strings.done(), theme.roles.accent_success),
+        crate::app::LiveState::Connecting => (strings.connecting(), theme.roles.gray),
+        crate::app::LiveState::Reconnecting => (strings.reconnecting(), theme.roles.warning),
+        crate::app::LiveState::Offline => (strings.disconnected(), theme.roles.danger),
+    };
+    push_segment(
+        &mut right,
+        Span::styled(live_text, Style::default().fg(live_color)),
+    );
+
+    if app.focus == crate::app::Focus::Composer {
+        push_segment(
+            &mut right,
+            Span::styled("compose", Style::default().fg(theme.roles.accent_user)),
+        );
+    }
+
+    let approvals = app.pending_permission_count();
+    let questions = app.pending_elicitations();
+    if approvals + questions > 0 {
+        push_segment(
+            &mut right,
+            Span::styled(
+                format!(
+                    "{} {}",
+                    crate::glyphs::diamond_filled(app.glyph_tier()),
+                    approvals + questions
+                ),
+                Style::default()
+                    .fg(theme.roles.accent_attention)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
+
+    if let Some(context) = context_usage_spans(app, theme) {
+        push_segment(&mut right, Span::raw(""));
+        right.pop();
+        if !right.is_empty() {
+            right.push(sep.clone());
+        }
+        right.extend(context);
+    }
+
+    if let Some(toast) = &app.toast {
+        let color = match toast.tone {
+            ToastTone::Info => theme.roles.gray,
+            ToastTone::Success => theme.roles.accent_success,
+            ToastTone::Warning => theme.roles.warning,
+            ToastTone::Danger => theme.roles.danger,
+        };
+        push_segment(
+            &mut right,
+            Span::styled(toast.text.clone(), Style::default().fg(color)),
+        );
+    }
+
+    push_segment(
+        &mut right,
+        Span::styled(
+            app.seat.label(strings).to_string(),
+            Style::default().fg(theme.roles.gray_dim),
+        ),
+    );
+
+    render_zoned_line(frame, area, left, None, right);
+}
+
+/// Shorten a path from the left so the last components stay readable.
+///
+/// The tail of a path is what identifies it; `/home/dev/…/net/upload.rs` is
+/// more useful than `/home/dev/code/peatboy/vibex-dev/vib…`.
+pub fn compact_path(path: &str, budget: usize) -> String {
+    if display_width(path) <= budget || budget < 8 {
+        return path.to_string();
+    }
+    let suffix = take_width_from_end(path, budget.saturating_sub(2));
+    format!("…/{suffix}")
+}
+
+/// The last `budget` columns of a path, starting at a component boundary.
+fn take_width_from_end(path: &str, budget: usize) -> String {
+    let mut width = 0usize;
+    let mut start = path.len();
+    for grapheme in path.graphemes(true).collect::<Vec<_>>().into_iter().rev() {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width > budget {
+            break;
+        }
+        width += grapheme_width;
+        start -= grapheme.len();
+    }
+    // Start at the next component boundary so a truncated name does not appear
+    // as a fragment of its parent.
+    match path[start..].find('/') {
+        Some(offset) if offset + 1 < path.len() - start => path[start + offset + 1..].to_string(),
+        _ => path[start..].to_string(),
+    }
+}
+
+/// The context-window readout, or nothing when there is no measurement.
+///
+/// Vibex records tokens and not prices, so this is the only quantitative status
+/// the interface can honestly show.
+fn context_usage_spans(app: &App, theme: &TuiTheme) -> Option<Vec<Span<'static>>> {
+    let usage = app.management_data.usage_session.as_ref()?;
+    let used = usage.total_tokens.unwrap_or(0);
+    let total = usage.context_window_size_tokens?;
+    if total == 0 {
+        return None;
+    }
+    let ratio = (used as f64 / total as f64).clamp(0.0, 1.0);
+    let color = if ratio >= 0.9 {
+        theme.roles.danger
+    } else if ratio >= 0.75 {
+        theme.roles.warning
+    } else if ratio >= 0.5 {
+        theme.roles.accent_user
+    } else {
+        theme.roles.gray
+    };
+    Some(vec![Span::styled(
+        format!(
+            "{} {}/{}",
+            crate::glyphs::token_arrow(app.glyph_tier()),
+            compact_tokens(used),
+            compact_tokens(total)
+        ),
+        Style::default().fg(color),
+    )])
 }
 
 /// The shared page shell: bordered title, body, and an empty-state message.
@@ -456,52 +1128,104 @@ fn page_frame(
     inner
 }
 
-/// The empty-transcript state.
+/// The first thing a new session shows.
 ///
-/// A blank pane with one grey sentence wastes the moment the reader is most
-/// likely to be lost. This says what the product is, what it can do, and the
-/// two keys that get started.
-fn render_welcome(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, strings: Strings) {
+/// An empty transcript is the moment the reader is most likely to be lost, so
+/// this is a real surface rather than a grey sentence: what the client is, what
+/// it can do, and the keys that get started. It is laid out as a hero on a wide
+/// terminal and stacked on a narrow one, because the same block cannot be both.
+fn render_welcome(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
     if area.height < 4 {
         empty_state(frame, area, theme, strings.transcript_empty());
         return;
     }
+    let wide = area.width >= 90;
+    let height = area.height.min(if wide { 14 } else { 12 });
+    let top = area.y + area.height.saturating_sub(height) / 2;
+    let region = Rect {
+        y: top,
+        height,
+        ..area
+    };
+
     let accent = Style::default()
         .fg(theme.roles.accent)
         .add_modifier(Modifier::BOLD);
+    let title = Style::default().fg(theme.roles.foreground);
     let dim = Style::default().fg(theme.roles.gray_dim);
+    let body = Style::default().fg(theme.roles.gray);
+
     let mut lines = vec![
-        Line::from(""),
         Line::from(Span::styled(format!("  {}", strings.app_name()), accent)),
         Line::from(Span::styled(
             format!("  {}", strings.product_tagline()),
-            Style::default().fg(theme.roles.gray),
+            body,
         )),
         Line::from(""),
     ];
+
+    // An empty page says what is empty; the menu below says what fills it.
+    if app.page == Page::Sessions {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.sessions_empty()),
+            title,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.transcript_empty()),
+            title,
+        )));
+    }
+    lines.push(Line::from(""));
+
+    // The menu. Each row is a key and what it does, which is more useful than a
+    // list of feature names: the reader leaves knowing a key.
     for (key, label) in [
+        ("n", strings.session_new()),
         ("/", strings.composer_command_menu()),
         ("@", strings.composer_file_menu()),
-        ("$", strings.composer_skill_menu()),
+        ("?", strings.help_title()),
     ] {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {key}  "), accent),
+            Span::styled(format!("  {key:<3}"), accent),
             Span::styled(label.to_string(), dim),
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", strings.help_hint()),
-        dim,
-    )));
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+
+    if region.height as usize > lines.len() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.help_hint()),
+            dim,
+        )));
+    }
+
+    // On a wide terminal the menu sits beside the wordmark rather than under it,
+    // so the block reads as a card instead of a wall of left-aligned lines.
+    if wide && region.height >= 8 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(28),
+                Constraint::Min(30),
+            ])
+            .split(region);
+        let mut left = lines.clone();
+        left.truncate(3);
+        frame.render_widget(Paragraph::new(Text::from(left)), columns[1]);
+        frame.render_widget(Paragraph::new(Text::from(lines.split_off(3))), columns[2]);
+        return;
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), region);
 }
 
-/// A single centred line saying why a pane is empty.
-///
-/// It deliberately does not wrap: a wrapped sentence in a narrow pane reads as
-/// a layout fault, and the key that resolves the emptiness is already on the
-/// key bar.
 fn empty_state(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, message: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -513,201 +1237,6 @@ fn empty_state(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, message: &st
             .alignment(Alignment::Center),
         area,
     );
-}
-
-fn render_sidebar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-    focused: bool,
-) {
-    let inner = page_frame(frame, area, theme, strings.sessions_title(), focused);
-    if app.filtering || !app.filter.is_empty() {
-        let filter_area = Rect { height: 1, ..inner };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("/ ", theme.accent()),
-                Span::styled(app.filter.clone(), theme.base()),
-                Span::styled("▏", theme.accent()),
-            ])),
-            filter_area,
-        );
-    }
-    let list_area = if app.filtering || !app.filter.is_empty() {
-        Rect {
-            y: inner.y + 1,
-            height: inner.height.saturating_sub(1),
-            ..inner
-        }
-    } else {
-        inner
-    };
-
-    let rows = app.sidebar_rows();
-    if rows.is_empty() {
-        // The sidebar is narrow, so it states the fact and leaves the way out
-        // to the key bar, which already offers `n`.
-        empty_state(frame, list_area, theme, strings.nothing_here());
-        return;
-    }
-    let selected = app.selection_for(Scope::Sessions);
-    let items = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let active = row
-                .session_id
-                .as_ref()
-                .is_some_and(|session_id| app.selected_session_id() == Some(session_id));
-            let marker = match row.kind {
-                vibex_desktop_model::AgentSidebarRowKind::Project => {
-                    if row.collapsed {
-                        "▸"
-                    } else {
-                        "▾"
-                    }
-                }
-                vibex_desktop_model::AgentSidebarRowKind::Session => "",
-            };
-            let indent = " ".repeat(usize::from(row.depth) * 2);
-            let state = row
-                .state
-                .map(|state| format!(" {}", session_state_marker(state)))
-                .unwrap_or_default();
-            let text = format!("{indent}{marker} {}{state}", row.label);
-            let style = if active {
-                theme.accent().add_modifier(Modifier::BOLD)
-            } else if index == selected {
-                theme.selected()
-            } else if row.kind == vibex_desktop_model::AgentSidebarRowKind::Project {
-                theme.muted().add_modifier(Modifier::BOLD)
-            } else {
-                theme.base()
-            };
-            let marker_prefix = if row.pinned { "● " } else { "" };
-            ListItem::new(Line::from(Span::styled(
-                format!("{marker_prefix}{text}"),
-                style,
-            )))
-        })
-        .collect::<Vec<_>>();
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(rows.len().saturating_sub(1))));
-    frame.render_stateful_widget(List::new(items), list_area, &mut state);
-}
-
-fn session_state_marker(state: vibex_core::AgentSessionState) -> &'static str {
-    match state {
-        vibex_core::AgentSessionState::Initializing => "…",
-        vibex_core::AgentSessionState::Idle => "",
-        vibex_core::AgentSessionState::Running => "▶",
-        vibex_core::AgentSessionState::NeedsInput => "!",
-        vibex_core::AgentSessionState::Error => "✗",
-        vibex_core::AgentSessionState::Archived => "▪",
-        _ => "",
-    }
-}
-
-fn render_main(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    match app.page {
-        Page::Sessions => render_session_summary(frame, area, app, theme, strings),
-        Page::Agent => render_agent(frame, area, app, theme, strings),
-        Page::Files | Page::Changes => render_file_list(frame, area, app, theme, strings),
-        Page::Management => render_management(frame, area, app, theme, strings),
-        Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts | Page::Hooks => {
-            render_entry_list(frame, area, app, theme, strings)
-        }
-        Page::Devices => render_devices(frame, area, app, theme, strings),
-        Page::Usage => render_usage(frame, area, app, theme, strings),
-        Page::Recovery => render_recovery(frame, area, app, theme, strings),
-        Page::Settings => render_settings(frame, area, app, theme, strings),
-        Page::Help => render_help(frame, area, app, theme, strings),
-        Page::Terminal => {
-            let inner = page_frame(frame, area, theme, strings.nav_terminal(), true);
-            empty_state(frame, inner, theme, strings.toast_action_unavailable());
-        }
-    }
-}
-
-fn render_session_summary(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    let title = app
-        .active_session()
-        .map(|session| session.title.clone())
-        .unwrap_or_else(|| strings.sessions_title().to_string());
-    let inner = page_frame(frame, area, theme, &title, true);
-    let Some(session) = app.active_session().cloned() else {
-        empty_state(frame, inner, theme, strings.sessions_empty());
-        return;
-    };
-    let rows = vec![
-        (strings.session_workspace(), session.workspace_root.clone()),
-        (strings.session_state(), format!("{:?}", session.state)),
-        (strings.runtime_agent(), session.agent_id.to_string()),
-        (
-            strings.session_title_label(),
-            session.last_message_at_ms.to_string(),
-        ),
-    ];
-    let body = rows
-        .into_iter()
-        .map(|(label, value)| {
-            Line::from(vec![
-                Span::styled(format!("{label:<16}"), theme.muted()),
-                Span::styled(value, theme.base()),
-            ])
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(body)), inner);
-}
-
-fn render_agent(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    // Borders (2), then the draft itself; the info line sits on the bottom
-    // border rather than taking a row of its own.
-    let composer_height = (app.composer.line_count().min(6) as u16 + 2).max(3);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(composer_height)])
-        .split(area);
-
-    let title = app
-        .active_session()
-        .map(|session| session.title.clone())
-        .unwrap_or_else(|| strings.nav_agent().to_string());
-    let focused = app.focus == crate::app::Focus::Main;
-    let inner = page_frame(frame, rows[0], theme, &title, focused);
-
-    if app.transcript.is_empty() {
-        render_welcome(frame, inner, theme, strings);
-    } else {
-        let height = usize::from(inner.height);
-        let selected = app.selection_for(Scope::Agent);
-        let mut scroll = app.scroll;
-        scroll.selected = Some(selected);
-        let lines = app.transcript.visible_lines(scroll, height, theme, strings);
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-    }
-
-    render_composer(frame, rows[1], app, theme, strings);
 }
 
 /// Draw the composer.
@@ -768,22 +1297,42 @@ fn render_composer(
         return;
     }
 
-    let text_area = inner;
+    // One blank row above the draft. It is what makes the box read as a place
+    // to write rather than as a one-line field with a border.
+    let text_area = Rect {
+        y: inner.y.saturating_add(1),
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
 
-    let prompt_width = 2;
+    let prompt_width = crate::glyphs::PROMPT_ARROW_WIDTH;
     let width = usize::from(text_area.width).saturating_sub(prompt_width);
-    let prefix = "❯";
-    let prefix_style = Style::default().fg(rail_color).add_modifier(Modifier::BOLD);
+    let tier = app.glyph_tier();
+    // The prefix says what the draft will do: `❯` sends to the Agent, `!` runs a
+    // shell command, `?` searches history.
+    let (prefix, prefix_color) = match app.composer_mode {
+        ComposerMode::Normal => (crate::glyphs::prompt_arrow(tier), rail_color),
+        ComposerMode::Shell => ("! ", theme.roles.command),
+        ComposerMode::HistorySearch => ("? ", theme.roles.gray),
+    };
+    let prefix_style = Style::default()
+        .fg(prefix_color)
+        .add_modifier(Modifier::BOLD);
 
     if app.composer.text().is_empty() {
-        let placeholder = if running {
-            format!("{} · Ctrl+S", strings.composer_steer())
-        } else {
-            strings.composer_placeholder().to_string()
+        // The placeholder explains the mode rather than the product: the mode is
+        // the thing the reader cannot guess from an empty box.
+        let placeholder = match app.composer_mode {
+            ComposerMode::Shell => strings.mode_shell().to_string(),
+            ComposerMode::HistorySearch => strings.composer_history().to_string(),
+            ComposerMode::Normal if running => {
+                format!("{} · Ctrl+S", strings.composer_steer())
+            }
+            ComposerMode::Normal => strings.composer_placeholder().to_string(),
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!("{prefix} "), prefix_style),
+                Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(
                     truncate_to_width(&placeholder, width, "…"),
                     Style::default().fg(theme.roles.gray_dim),
@@ -800,7 +1349,7 @@ fn render_composer(
             .enumerate()
             .map(|(index, (text, is_cursor_line))| {
                 let gutter = if index == 0 {
-                    Span::styled(format!("{prefix} "), prefix_style)
+                    Span::styled(prefix.to_string(), prefix_style)
                 } else {
                     Span::raw(" ".repeat(prompt_width))
                 };
@@ -831,7 +1380,7 @@ fn render_composer(
     }
 
     if let Some(menu) = app.completion.clone() {
-        render_completion(frame, text_area, theme, &menu);
+        render_completion(frame, area, app, theme, &menu);
     }
 }
 
@@ -852,9 +1401,11 @@ fn render_composer_info(
     if area.height == 0 {
         return;
     }
+    // A middot rather than a rule: the info line is prose about the session, not
+    // another set of columns, and a horizontal separator would read as chrome.
     let sep = |theme: &TuiTheme| {
         Span::styled(
-            format!(" {} ", crate::transcript::chrome_separator()),
+            " · ",
             Style::default().fg(if focused {
                 theme.roles.gray_dim
             } else {
@@ -952,59 +1503,164 @@ fn render_composer_info(
     frame.render_widget(Paragraph::new(right_line), right_area);
 }
 
+/// The completion popup, drawn directly above the composer.
+///
+/// Two full-width rules with no corners and no side borders, rather than a box.
+/// A box would need four more glyphs, would sit inset from the composer it
+/// belongs to, and would read as a separate window; two rules read as a drawer
+/// pulled out of the prompt. The count on the top rule says how much is behind
+/// it, which a border title cannot.
 fn render_completion(
     frame: &mut Frame<'_>,
     anchor: Rect,
+    app: &App,
     theme: &TuiTheme,
     menu: &crate::composer::CompletionMenu,
 ) {
-    let query = menu
-        .items
-        .first()
-        .map(|_| String::new())
-        .unwrap_or_default();
-    let indices = menu.filtered(&query);
+    let indices = menu.visible();
     if indices.is_empty() {
+        // No "no matches" state: the drawer simply closes, which is what the
+        // reader expects when the query stops matching anything.
         return;
     }
-    let height = (indices.len() as u16 + 2).min(8);
-    let width = anchor.width.saturating_sub(4).clamp(20, 60);
-    let x = anchor.x.min(anchor.right().saturating_sub(width));
-    let y = anchor.y.saturating_sub(height);
+    let tier = app.glyph_tier();
+    let rows = indices.len().min(crate::composer::MAX_VISIBLE_COMPLETIONS);
+    let height = rows as u16 + 2;
+    if anchor.y < height {
+        return;
+    }
     let area = Rect {
-        x,
-        y,
-        width,
+        x: anchor.x,
+        y: anchor.y - height,
+        width: anchor.width,
         height,
     };
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(theme.focus_style())
-        .style(theme.base());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let items = indices
+
+    let rule_style = Style::default().fg(theme.roles.gray_dim);
+    let title = match menu.trigger {
+        crate::composer::CompletionTrigger::Slash => strings_group(menu, 0),
+        crate::composer::CompletionTrigger::At => "".to_string(),
+        crate::composer::CompletionTrigger::Dollar => "".to_string(),
+    };
+    let _ = title;
+
+    // Top rule, with the match count right-aligned on it.
+    let mut top = vec![Span::styled(
+        "─".repeat(usize::from(area.width)),
+        rule_style,
+    )];
+    let count = format!(" {}/{} ", menu.selected + 1, indices.len());
+    let count_width = display_width(&count);
+    if usize::from(area.width) > count_width + 4 {
+        let cut = usize::from(area.width) - count_width;
+        top = vec![
+            Span::styled("─".repeat(cut), rule_style),
+            Span::styled(count, Style::default().fg(theme.roles.gray)),
+        ];
+    }
+    frame.render_widget(Paragraph::new(Line::from(top)), Rect { height: 1, ..area });
+    // Bottom rule, which is also the composer's top edge.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(area.width)),
+            rule_style,
+        ))),
+        Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
+        },
+    );
+
+    let body = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(2),
+        ..area
+    };
+    let lines = indices
         .iter()
-        .take(usize::from(inner.height))
+        .take(rows)
         .map(|index| {
-            let item = &menu.items[*index];
-            let style = if *index == menu.selected {
-                theme.selected()
-            } else {
-                theme.base()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<20}", truncate_to_width(&item.label, 20, "…")),
-                    style,
-                ),
-                Span::styled(truncate_to_width(&item.detail, 30, "…"), theme.muted()),
-            ]))
+            completion_row(
+                menu,
+                *index,
+                usize::from(body.width),
+                theme,
+                tier,
+                strings_of(app),
+            )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(List::new(items), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)), body);
+}
+
+/// One completion row.
+///
+/// The selection marker is the two-column prefix the composer uses for its own
+/// prompt arrow, so the highlighted row lines up with the text being typed and
+/// the eye does not have to jump columns.
+fn completion_row(
+    menu: &crate::composer::CompletionMenu,
+    index: usize,
+    width: usize,
+    theme: &TuiTheme,
+    tier: crate::glyphs::GlyphTier,
+    strings: Strings,
+) -> Line<'static> {
+    let Some(item) = menu.items.get(index) else {
+        return Line::from("");
+    };
+    let selected = index == menu.selected;
+    let marker = if selected {
+        crate::glyphs::prompt_arrow(tier)
+    } else {
+        "  "
+    };
+    let marker_style = Style::default().fg(if selected {
+        theme.roles.accent_user
+    } else {
+        theme.roles.gray_dim
+    });
+    let label_style = if selected {
+        Style::default()
+            .fg(theme.roles.foreground)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.roles.gray_bright)
+    };
+    let detail_style = Style::default().fg(theme.roles.gray_dim);
+    let group_style = Style::default().fg(theme.roles.accent_system);
+
+    // The group tag trails the label so a mixed list stays scannable, and the
+    // description takes whatever is left rather than a fixed column: a fixed
+    // column wastes most of the row on a narrow terminal.
+    let tag = format!(" [{}]", item.group);
+    let budget = width.saturating_sub(crate::glyphs::PROMPT_ARROW_WIDTH + display_width(&tag) + 4);
+    let label = truncate_to_width(&item.label, budget.min(40), "…");
+    let used = crate::glyphs::PROMPT_ARROW_WIDTH + display_width(&label) + display_width(&tag) + 2;
+    let detail_budget = width.saturating_sub(used);
+    let detail = truncate_to_width(&item.detail, detail_budget, "…");
+
+    let mut spans = vec![
+        Span::styled(marker.to_string(), marker_style),
+        Span::styled(label, label_style),
+        Span::styled(tag, group_style),
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::styled("  ", detail_style));
+        spans.push(Span::styled(detail, detail_style));
+    }
+    let _ = strings;
+    Line::from(spans)
+}
+
+fn strings_group(_menu: &crate::composer::CompletionMenu, _index: usize) -> String {
+    String::new()
+}
+
+fn strings_of(_app: &App) -> Strings {
+    Strings::for_locale(crate::locale::Locale::En)
 }
 
 fn render_file_list(
@@ -1013,12 +1669,8 @@ fn render_file_list(
     app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
+    title: &str,
 ) {
-    let title = if app.page == Page::Changes {
-        strings.nav_changes()
-    } else {
-        strings.nav_files()
-    };
     let inner = page_frame(frame, area, theme, title, true);
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1620,157 +2272,6 @@ fn render_help(
     frame.render_widget(List::new(items), inner);
 }
 
-/// The details pane: the facts about the open session, at a glance.
-///
-/// Details are for the things a reader checks without leaving the transcript --
-/// which runtime is answering, how full the context is, whether anything is
-/// waiting on them. Everything here is also reachable elsewhere; the pane
-/// exists so it does not have to be looked up.
-fn render_details(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-    focused: bool,
-) {
-    let inner = page_frame(frame, area, theme, strings.details(), focused);
-    let mut rows: Vec<(String, String, Style)> = Vec::new();
-    let label = Style::default().fg(theme.roles.gray_dim);
-    let value = Style::default().fg(theme.roles.foreground);
-
-    if let Some(session) = app.active_session() {
-        rows.push((
-            strings.details_state().to_string(),
-            format!("{:?}", session.state),
-            Style::default().fg(match session.state {
-                vibex_core::AgentSessionState::Running => theme.roles.accent_running,
-                vibex_core::AgentSessionState::Error => theme.roles.danger,
-                vibex_core::AgentSessionState::NeedsInput => theme.roles.accent_attention,
-                _ => theme.roles.foreground,
-            }),
-        ));
-        rows.push((
-            strings.details_agent().to_string(),
-            session.agent_id.to_string(),
-            value,
-        ));
-        if let Some(catalog) = app.runtime_options.as_ref()
-            && let Some(option) = catalog.options.first()
-        {
-            rows.push((
-                strings.details_model().to_string(),
-                option.model_label.clone(),
-                value,
-            ));
-        }
-        rows.push((
-            strings.details_workspace().to_string(),
-            session.workspace_root.clone(),
-            Style::default().fg(theme.roles.path),
-        ));
-    } else {
-        rows.push((
-            strings.details_state().to_string(),
-            strings.none().to_string(),
-            label,
-        ));
-    }
-
-    if let Some(branch) = app
-        .git_status
-        .as_ref()
-        .and_then(|status| status.branch.clone())
-    {
-        rows.push((
-            strings.details_branch().to_string(),
-            branch,
-            Style::default().fg(theme.roles.command),
-        ));
-    }
-
-    if let Some(usage) = app.management_data.usage_session.as_ref() {
-        let used = usage.total_tokens.unwrap_or(0);
-        let text = match usage.context_window_size_tokens {
-            Some(total) if total > 0 => {
-                format!("{} / {}", compact_tokens(used), compact_tokens(total))
-            }
-            _ => compact_tokens(used),
-        };
-        rows.push((strings.details_context().to_string(), text, value));
-    }
-
-    let pending = app.pending_permission_count();
-    rows.push((
-        strings.approval_label().to_string(),
-        pending.to_string(),
-        if pending > 0 {
-            Style::default()
-                .fg(theme.roles.accent_attention)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            label
-        },
-    ));
-
-    // Two columns, sized to the widest label, so nothing collides.
-    let label_width = rows
-        .iter()
-        .map(|(name, _, _)| display_width(name))
-        .max()
-        .unwrap_or(0)
-        .min(usize::from(inner.width).saturating_sub(8));
-    let mut lines = Vec::new();
-    for (name, text, style) in rows {
-        let name = truncate_to_width(&name, label_width, "…");
-        lines.push(Line::from(vec![
-            Span::styled(format!("{name:<label_width$}"), label),
-            Span::raw(" "),
-            Span::styled(
-                truncate_to_width(
-                    &text,
-                    usize::from(inner.width).saturating_sub(label_width + 2),
-                    "…",
-                ),
-                style,
-            ),
-        ]));
-    }
-
-    if let Some(worktrees) = app.worktrees.as_ref()
-        && !worktrees.managed_worktrees.is_empty()
-    {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} ({})",
-                strings.worktree_title(),
-                worktrees.managed_worktrees.len()
-            ),
-            label,
-        )));
-        for worktree in worktrees.managed_worktrees.iter().take(5) {
-            lines.push(Line::from(Span::styled(
-                truncate_to_width(
-                    &format!(
-                        "  {}",
-                        worktree.branch.clone().unwrap_or_else(|| "-".to_string())
-                    ),
-                    usize::from(inner.width),
-                    "…",
-                ),
-                Style::default().fg(theme.roles.gray),
-            )));
-        }
-    }
-
-    if lines.is_empty() {
-        empty_state(frame, inner, theme, strings.nothing_here());
-        return;
-    }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-}
-
 /// The key hint bar.
 ///
 /// Keys are drawn bold and bright, labels dim: the key is what the reader is
@@ -1787,11 +2288,12 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme
 
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1usize;
+    let mut first = true;
     let budget = usize::from(area.width);
     for (index, binding) in bindings.iter().enumerate() {
         let Some(label) = binding.label else { continue };
-        let text = format!("{} {}", binding.chord.display(), label);
-        let width = display_width(&text) + 3;
+        let text = format!("{}:{label}", binding.chord.display());
+        let width = display_width(&text) + 5;
         // The first few hints are the ones a reader needs most; they are kept
         // even when the rest would not fit.
         let pinned = index < PINNED_HINTS;
@@ -1802,115 +2304,21 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme
             continue;
         }
         used += width;
+        if !first {
+            spans.push(Span::styled(
+                "  │  ",
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+        first = false;
         spans.push(Span::styled(binding.chord.display(), key_style));
-        spans.push(Span::styled(format!(" {label}"), label_style));
-        spans.push(Span::styled(
-            "  ",
-            Style::default().fg(theme.roles.gray_dim),
-        ));
+        spans.push(Span::styled(format!(":{label}"), label_style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// How many leading hints survive a narrow terminal.
 const PINNED_HINTS: usize = 3;
-
-/// The status bar: identity on the left, context in the centre, state on the
-/// right.
-///
-/// Splitting it into zones is what stops the bar from becoming a single
-/// left-aligned sentence whose tail is the first thing a narrow terminal eats.
-/// The centre carries the thing the reader checks most often — how full the
-/// context window is — with the colour blended across usage thresholds so the
-/// answer is available without reading the number.
-fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
-    let strings = app.strings;
-    let sep = || {
-        Span::styled(
-            format!(" {} ", crate::transcript::chrome_separator()),
-            Style::default().fg(theme.roles.gray_dim),
-        )
-    };
-
-    // ---- left: where am I, and is it alive ------------------------------
-    let (live_text, live_color) = match app.live {
-        crate::app::LiveState::Ready => (strings.done(), theme.roles.accent_success),
-        crate::app::LiveState::Connecting => (strings.connecting(), theme.roles.gray),
-        crate::app::LiveState::Reconnecting => (strings.reconnecting(), theme.roles.warning),
-        crate::app::LiveState::Offline => (strings.disconnected(), theme.roles.danger),
-    };
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled(
-            app.seat.label(strings).to_string(),
-            Style::default()
-                .fg(theme.roles.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        sep(),
-        Span::styled(live_text, Style::default().fg(live_color)),
-    ];
-    if app.pending_permission_count() > 0 {
-        left.push(sep());
-        left.push(Span::styled(
-            format!("⚠ {pending}", pending = app.pending_permission_count()),
-            Style::default()
-                .fg(theme.roles.accent_attention)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    // ---- centre: context usage ------------------------------------------
-    let centre = context_usage_line(app, theme);
-
-    // ---- right: appearance, then a transient message --------------------
-    let mut right = Vec::new();
-    if let Some(toast) = &app.toast {
-        let color = match toast.tone {
-            ToastTone::Info => theme.roles.gray,
-            ToastTone::Success => theme.roles.accent_success,
-            ToastTone::Warning => theme.roles.warning,
-            ToastTone::Danger => theme.roles.danger,
-        };
-        right.push(Span::styled(toast.text.clone(), Style::default().fg(color)));
-        right.push(sep());
-    }
-    right.push(Span::styled(
-        app.theme.name.to_string(),
-        Style::default().fg(theme.roles.gray_dim),
-    ));
-    right.push(Span::raw(" "));
-
-    render_zoned_line(frame, area, left, centre, right);
-}
-
-/// The context-window readout.
-///
-/// Token counts are compacted (`8.5K / 1.0M`) and the colour is blended across
-/// usage thresholds, so the bar answers "how much room is left" from the corner
-/// of the eye. Vibex records no pricing, so no cost is shown.
-fn context_usage_line(app: &App, theme: &TuiTheme) -> Option<Vec<Span<'static>>> {
-    let usage = app.management_data.usage_session.as_ref()?;
-    let used = usage.total_tokens.unwrap_or(0);
-    let total = usage.context_window_size_tokens?;
-    if total == 0 {
-        return None;
-    }
-    let ratio = (used as f64 / total as f64).clamp(0.0, 1.0);
-    let color = if ratio >= 0.9 {
-        theme.roles.danger
-    } else if ratio >= 0.75 {
-        theme.roles.warning
-    } else if ratio >= 0.5 {
-        theme.roles.accent_user
-    } else {
-        theme.roles.gray
-    };
-    Some(vec![Span::styled(
-        format!("{} / {}", compact_tokens(used), compact_tokens(total)),
-        Style::default().fg(color),
-    )])
-}
 
 /// Compact a token count to at most four characters.
 ///
@@ -2520,7 +2928,7 @@ mod tests {
     use crate::locale::Locale;
 
     fn strings() -> Strings {
-        Strings::for_locale(Locale::En)
+        Strings::for_locale(crate::locale::Locale::En)
     }
 
     #[test]

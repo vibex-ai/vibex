@@ -16,6 +16,8 @@
 //! text      grapheme-correct measurement, wrapping with joiners, bidi order
 //! locale    en / zh-CN / zh-TW product copy
 //! keymap    one binding table per scope: dispatch + key bar + help
+//! layout    the screen as a vertical stack of full-width bands
+//! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
 //! composer  the edit buffer, completion triggers and history
 //! transcript block cache, incremental layout, viewport-only rendering
 //! view      page shells, overlays, the key bar
@@ -29,7 +31,9 @@ pub mod action;
 pub mod app;
 pub mod composer;
 pub mod console;
+pub mod glyphs;
 pub mod keymap;
+pub mod layout;
 pub mod locale;
 pub mod markdown;
 pub mod reduce;

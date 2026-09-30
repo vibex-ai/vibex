@@ -160,6 +160,8 @@ pub struct Transcript {
     animation_phase: u32,
     /// The block drawn as current last frame, so a change invalidates it.
     last_selected: Option<usize>,
+    /// Display line the viewport started at in the last frame.
+    scroll_offset: usize,
     /// Counters that make the cache behaviour observable in tests and in the
     /// benchmark harness.
     pub stats: TranscriptStats,
@@ -198,6 +200,7 @@ impl Transcript {
             theme_id: String::new(),
             animation_phase: 0,
             last_selected: None,
+            scroll_offset: 0,
             stats: TranscriptStats::default(),
         }
     }
@@ -327,6 +330,49 @@ impl Transcript {
                 member.group = GroupRole::Member;
             }
         }
+    }
+
+    /// How many turns the transcript contains.
+    ///
+    /// A turn is a run of blocks sharing a `turn_id`; blocks without one are
+    /// grouped into a single implicit turn so the rail always has an answer.
+    pub fn turn_count(&self) -> usize {
+        let mut seen: Vec<&str> = Vec::new();
+        for block in &self.blocks {
+            let key = block.turn_id.as_deref().unwrap_or("");
+            if !seen.contains(&key) {
+                seen.push(key);
+            }
+        }
+        seen.len().max(usize::from(!self.blocks.is_empty()))
+    }
+
+    /// The turn the viewport top is on, for the rail's current-tick marker.
+    pub fn active_turn(&mut self) -> Option<usize> {
+        self.ensure_layout();
+        let offset = self.scroll_offset;
+        let index = self.block_at_line(offset)?;
+        let key = self.blocks.get(index)?.turn_id.clone();
+        let mut turn = 0usize;
+        let mut seen: Vec<Option<String>> = Vec::new();
+        for block in &self.blocks {
+            if !seen.contains(&block.turn_id) {
+                if block.turn_id == key {
+                    return Some(turn);
+                }
+                seen.push(block.turn_id.clone());
+                turn += 1;
+            }
+        }
+        Some(0)
+    }
+
+    /// The line offset the viewport currently starts at.
+    ///
+    /// Kept in sync by [`Transcript::visible_lines`] so the rail and the
+    /// scrollbar can be computed without re-deriving it from the scroll state.
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
     }
 
     /// Whether any block is currently working.
@@ -577,6 +623,7 @@ impl Transcript {
             scroll.offset.min(total.saturating_sub(1))
         };
         let end = (offset + height).min(total);
+        self.scroll_offset = offset;
 
         let mut lines = Vec::with_capacity(height);
         // Find the first block whose range intersects the window.

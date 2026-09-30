@@ -31,6 +31,7 @@ fn main() {
     let mut mode = ColorMode::TrueColor;
     let mut light = false;
     let mut ansi = false;
+    let mut welcome = false;
     let mut numbers = Vec::new();
     for argument in &arguments {
         match argument.as_str() {
@@ -38,6 +39,7 @@ fn main() {
             "--no-color" => mode = ColorMode::None,
             "--ascii" => mode = ColorMode::Ansi16,
             "--ansi" => ansi = true,
+            "--welcome" => welcome = true,
             other => {
                 if let Ok(value) = other.parse::<u16>() {
                     numbers.push(value);
@@ -75,8 +77,18 @@ fn main() {
         .set_text("add a retry to the upload path and cover it with a test");
     app.navigate_to(Page::Agent);
     app.live = vibex_tui::app::LiveState::Ready;
+    if welcome {
+        // The empty-state surface, which is what a new session shows.
+        app.navigate_to(vibex_tui::app::Page::Sessions);
+    }
     let blocks = sample_session();
-    app.transcript.set_blocks(blocks);
+    if !welcome {
+        app.transcript.set_blocks(blocks);
+    }
+    // A live turn, so the rail and the turn line render rather than the idle
+    // and single-turn fallbacks.
+    app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(72));
+    app.turn_tokens = Some(12_400);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -270,13 +282,22 @@ fn sample_session() -> Vec<Block> {
     ]
 }
 
+/// Spread the sample across three turns so the rail has somewhere to navigate.
+fn turn_of(id: &str) -> &'static str {
+    match id.as_bytes().first().copied() {
+        Some(b'u') | Some(b'r') | Some(b't') | Some(b'c') | Some(b'f') => "turn-1",
+        Some(b'a') | Some(b'p') => "turn-2",
+        _ => "turn-3",
+    }
+}
+
 fn entry(id: &str, kind: TimelineRowKind, title: &str, body: &str, failed: bool) -> Block {
     Block {
         id: id.to_string(),
         kind,
         title: title.to_string(),
         body: body.to_string(),
-        turn_id: Some("turn-1".to_string()),
+        turn_id: Some(turn_of(id).to_string()),
         sequence: 1,
         expanded: false,
         collapsible: matches!(

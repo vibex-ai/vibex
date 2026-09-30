@@ -399,6 +399,72 @@ pub struct App {
     pub usage_scope_session: bool,
     /// Set by the first `Esc` in the composer; the second clears the draft.
     pub draft_clear_armed: bool,
+    /// Messages held back until the running turn ends.
+    pub queued_messages: Vec<String>,
+    /// A transient message above the composer, dismissed on the next key.
+    pub banner: Option<Banner>,
+    /// When the running turn started, for the elapsed-time readout.
+    pub turn_started: Option<std::time::Instant>,
+    /// Tokens spent by the running turn, for the readout beside the timer.
+    pub turn_tokens: Option<u64>,
+    /// What the Agent is doing right now, when the runtime says.
+    pub activity: Option<String>,
+    /// Monotonic clock driving every animation.
+    pub animation_phase: u32,
+    /// What the composer's prefix says the draft will do.
+    pub composer_mode: ComposerMode,
+}
+
+/// What the draft will do when it is sent.
+///
+/// The mode is carried by the composer's prefix rather than by a label
+/// elsewhere, so the answer is always where the reader is already looking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComposerMode {
+    /// Send the draft to the Agent.
+    #[default]
+    Normal,
+    /// Run the draft as a shell command.
+    Shell,
+    /// Treat the draft as a search over sent messages.
+    HistorySearch,
+}
+
+/// A transient message above the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Banner {
+    pub text: String,
+    pub tone: BannerTone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerTone {
+    Info,
+    Warning,
+    Danger,
+}
+
+impl Banner {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: BannerTone::Info,
+        }
+    }
+
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: BannerTone::Warning,
+        }
+    }
+
+    pub fn danger(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: BannerTone::Danger,
+        }
+    }
 }
 
 impl App {
@@ -475,6 +541,13 @@ impl App {
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
             usage_scope_session: true,
             draft_clear_armed: false,
+            queued_messages: Vec::new(),
+            banner: None,
+            turn_started: None,
+            turn_tokens: None,
+            activity: None,
+            animation_phase: 0,
+            composer_mode: ComposerMode::Normal,
         }
     }
 
@@ -659,6 +732,92 @@ impl App {
         }
     }
 
+    /// Which glyph tier the terminal can render.
+    pub fn glyph_tier(&self) -> crate::glyphs::GlyphTier {
+        crate::glyphs::GlyphTier::of(&self.theme)
+    }
+
+    /// The frame counter every animation reads from.
+    pub fn animation_phase(&self) -> u32 {
+        self.animation_phase
+    }
+
+    /// Pending questions from the Agent, which also block the turn.
+    pub fn pending_elicitations(&self) -> usize {
+        self.agent.state.elicitation_surfaces(self.shell).len()
+    }
+
+    /// How much background work the session is running.
+    pub fn background_task_count(&self) -> usize {
+        // The runtime does not yet publish a background-task list to this
+        // client, so the honest answer is zero rather than a guess.
+        0
+    }
+
+    /// Steps the session's plan has completed and total.
+    pub fn todo_done_count(&self) -> usize {
+        0
+    }
+
+    pub fn todo_total_count(&self) -> usize {
+        0
+    }
+
+    /// What the Agent is doing right now, when the runtime reported it.
+    pub fn current_activity(&self) -> Option<String> {
+        self.activity.clone()
+    }
+
+    /// How long the running turn has been going.
+    pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
+        self.turn_started.map(|started| started.elapsed())
+    }
+
+    /// Tokens spent by the running turn.
+    pub fn turn_tokens(&self) -> Option<u64> {
+        self.turn_tokens
+    }
+
+    /// A short label for the current page, used when there is no session.
+    pub fn page_label(&self, strings: Strings) -> &'static str {
+        match self.page {
+            Page::Sessions => strings.nav_sessions(),
+            Page::Agent => strings.nav_agent(),
+            Page::Files => strings.nav_files(),
+            Page::Changes => strings.nav_changes(),
+            Page::Terminal => strings.nav_terminal(),
+            Page::Management | Page::Agents => strings.nav_management(),
+            Page::Providers => strings.management_providers(),
+            Page::Mcp => strings.management_mcp(),
+            Page::Skills => strings.management_skills(),
+            Page::Prompts => strings.management_prompts(),
+            Page::Hooks => strings.management_hooks(),
+            Page::Devices => strings.devices_title(),
+            Page::Usage => strings.nav_usage(),
+            Page::Recovery => strings.recovery_title(),
+            Page::Settings => strings.nav_settings(),
+            Page::Help => strings.nav_help(),
+        }
+    }
+
+    /// The vertical scrollbar thumb, as a (start, length) pair in rows.
+    pub fn scroll_thumb(&mut self, rows: usize) -> (usize, usize) {
+        let total = self.transcript.total_height();
+        if total <= rows || rows == 0 {
+            return (0, rows);
+        }
+        let height = self.transcript.total_height();
+        let viewport = self.viewport.1 as usize;
+        let offset = if self.scroll.follow {
+            height.saturating_sub(viewport)
+        } else {
+            self.scroll.offset.min(height.saturating_sub(1))
+        };
+        let length = (rows * rows / total.max(1)).max(1);
+        let start = (offset * rows / total.max(1)).min(rows.saturating_sub(length));
+        (start, length)
+    }
+
     /// Whether the transcript has a running block worth animating.
     ///
     /// The interface repaints without input only while this is true.
@@ -666,9 +825,29 @@ impl App {
         self.transcript.is_animating()
     }
 
-    /// Step the running-rail animation. Returns whether a repaint is due.
+    /// Step every animation. Returns whether a repaint is due.
+    ///
+    /// The phase advances only while something is actually moving, which is what
+    /// preserves the zero-frames-when-idle contract.
     pub fn advance_transcript_animation(&mut self) -> bool {
-        self.transcript.advance_animation()
+        let transcript = self.transcript.advance_animation();
+        // The turn line pulses while a turn runs or while the session is idle
+        // but connected; an idle pulse is a live-session cue, not decoration.
+        let turn_line = self.turn_started.is_some() || self.pending_permission_count() > 0;
+        if !transcript && !turn_line {
+            return false;
+        }
+        if turn_line {
+            self.animation_phase = self.animation_phase.wrapping_add(1);
+        }
+        true
+    }
+
+    /// Whether a repaint is due without any input or event.
+    pub fn is_animating(&self) -> bool {
+        self.transcript.is_animating()
+            || self.turn_started.is_some()
+            || self.pending_permission_count() > 0
     }
 
     pub fn tick(&mut self) {

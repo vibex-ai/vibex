@@ -65,7 +65,28 @@ pub struct CompletionMenu {
     pub loading: bool,
 }
 
+/// How many rows the drawer shows before it scrolls.
+pub const MAX_VISIBLE_COMPLETIONS: usize = 8;
+
 impl CompletionMenu {
+    /// The rows to draw: the filtered matches, windowed around the selection.
+    ///
+    /// The menu carries no query of its own -- the composer owns the text -- so
+    /// the caller filters and this windows the result, which keeps the drawer
+    /// showing the selected row even after the list has scrolled.
+    pub fn visible(&self) -> Vec<usize> {
+        let all = (0..self.items.len()).collect::<Vec<_>>();
+        if all.len() <= MAX_VISIBLE_COMPLETIONS {
+            return all;
+        }
+        let half = MAX_VISIBLE_COMPLETIONS / 2;
+        let start = self
+            .selected
+            .saturating_sub(half)
+            .min(all.len() - MAX_VISIBLE_COMPLETIONS);
+        all[start..start + MAX_VISIBLE_COMPLETIONS].to_vec()
+    }
+
     pub fn filtered(&self, query: &str) -> Vec<usize> {
         let query = query.to_lowercase();
         self.items

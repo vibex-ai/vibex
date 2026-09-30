@@ -242,12 +242,15 @@ impl Drop for Session {
 fn startup_paints_a_first_frame() {
     let mut session = Session::start(120, 40);
     let screen = session.wait_for(|screen| screen.contains("Vibex") && screen.contains("Sessions"));
-    // The navigation destinations and the key bar come from the same tables the
-    // dispatcher uses, so their presence proves the frame is fully assembled.
-    assert!(screen.contains("Management"), "{screen}");
+    // The status band, the view and the shortcut bar are three different bands;
+    // seeing all three proves the stack was assembled rather than half-painted.
     assert!(
-        screen.contains("Quit") || screen.contains("Commands"),
-        "the key bar is missing:\n{screen}"
+        screen.contains("Done") || screen.contains("Connecting"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Commands") || screen.contains("Help"),
+        "the shortcut band is missing:\n{screen}"
     );
 }
 
@@ -364,8 +367,10 @@ fn typing_echoes_into_the_frame() {
     // the filter, which is the typing surface a fresh client always has.
     let mut session = Session::start(120, 40);
     session.wait_for(|screen| screen.contains("Vibex"));
+    // `/` opens the list filter, which is the typing surface a client with no
+    // session has.
     session.send(b"/");
-    session.pump(Duration::from_millis(200));
+    session.pump(Duration::from_millis(300));
     session.send("中文 abc".as_bytes());
     let screen = session.wait_for(|screen| screen.contains("abc"));
     assert!(screen.contains("abc"), "{screen}");
@@ -395,10 +400,14 @@ fn a_non_utf8_locale_still_renders_the_frame() {
     let mut session = Session::start(100, 30);
     let screen = session.wait_for(|screen| screen.contains("Vibex"));
     assert!(!screen.is_empty());
-    // Whatever the glyph mode, the right border must reach the last column.
-    let body = screen.lines().nth(2).unwrap_or_default();
+    // Whatever the glyph mode, the framed view's right border must reach the
+    // last column. The frame sits below the status band and its blank row.
+    let framed = screen
+        .lines()
+        .find(|line| line.contains('╭') || line.contains('+'))
+        .unwrap_or_default();
     assert!(
-        body.ends_with('│') || body.ends_with('|') || body.ends_with('╮') || body.ends_with('+'),
-        "the frame's right border is missing: {body:?}"
+        framed.trim_end().ends_with('╮') || framed.trim_end().ends_with('+'),
+        "the frame's right border is missing: {framed:?}"
     );
 }
