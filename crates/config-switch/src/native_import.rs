@@ -3096,7 +3096,14 @@ wire_api = "responses"
             .unwrap()
             .expect("grokbuild import should carry a typed ACP config");
         assert_eq!(config.command, "grok");
-        assert_eq!(config.args, vec!["agent".to_string(), "stdio".to_string()]);
+        assert_eq!(
+            config.args,
+            vec![
+                "--no-auto-update".to_string(),
+                "agent".to_string(),
+                "stdio".to_string()
+            ]
+        );
         assert_eq!(config.models, vec!["grok-4.5-20260101", "grok-4.5-fast"]);
         assert!(!format!("{preview:?}").contains("grok-secret"));
     }

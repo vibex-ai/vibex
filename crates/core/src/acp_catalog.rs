@@ -268,7 +268,13 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // published channel and release notes instead of the unreviewed build.
         "1.0.44",
         "https://docs.x.ai/build/overview",
-        &["grok", "agent", "stdio"],
+        // xAI's guidance for ACP and headless use is to skip background update
+        // checks, because a self-update can swap the binary a live session is
+        // executing. The flag is root-level and documented with exactly this
+        // launch shape. A managed launch also pins `[cli] auto_update = false`
+        // in the overlay Vibex writes; this covers the external CLI, whose
+        // config file Vibex does not own.
+        &["grok", "--no-auto-update", "agent", "stdio"],
     )
     .with_compatible_version("1.0.8"),
     AcpAgentCatalogEntry::new(
