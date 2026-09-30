@@ -4157,16 +4157,18 @@ ResolvedAgentProviderProjection {
   `content` is `{ "type": "image", "data": <base64>, "mimeType": ... }` — not a
   tool call and not a tool result — and falls back to a plain text placeholder
   `[Generated <modality>: <mediaType>]` when the media is not a base64 image.
-  The `agent_message_chunk` arm reads only text, so today that chunk produces no
-  event at all and the generation is invisible. Note what rendering would take:
+  The text reader returns nothing for such a block, so the chunk used to vanish
+  without a trace. It now emits an `ImageGeneration` event naming the media type,
+  which is the most the host can honestly say about it: displaying the pixels
+  needs somewhere to put them, and the two obvious places do not work.
   `generated_image_preview_source` resolves a reference through
   `generated_image_local_source`, which requires the path to start with the
-  session's workspace root, and `raw_extension` truncates its blocks — so
-  neither an inline `data:` URI nor a private-root path can be displayed.
-  Surfacing the pixels therefore needs a media location inside the workspace, or
-  a preview path that also accepts a Vibex-owned media directory. That is a
-  product decision, not a parsing one, which is why the wire shape is recorded
-  here while the chunk stays dark.
+  session's workspace root, so a private-root path renders nothing; and
+  `raw_extension` truncates its blocks, so an inline `data:` URI cannot ride
+  along either. Writing generated media into the user's workspace would work and
+  is deliberately not done — it is a product decision about side effects in
+  someone's repository, not a parsing one. Whoever makes that call should know
+  the wire shape is already handled and only the destination is missing.
 - DeepSeek Harness holds its model selection in `$DSH_HOME/acp-standalone-model.json`
   (`{"provider":"acp","model":"...","reasoningEffort":"..."}`), and reads
   settings.yaml only as a fallback for the model plus `permission.defaultPreset`.

@@ -2123,6 +2123,9 @@ struct AcpAttachmentShared {
     recent_usage_turn: Option<RecentUsageTurn>,
     usage_prompt_dispatched: bool,
     usage_observation_sequence: u64,
+    /// Counts generated images so two in one message keep distinct correlation
+    /// ids: they share a `messageId`, which is the other half of the id.
+    generated_image_sequence: u64,
     pending_permissions: HashMap<String, PendingPermission>,
     pending_elicitations: HashMap<String, PendingElicitation>,
     pending_terminal_creates: HashMap<String, PendingTerminalCreate>,
@@ -3980,6 +3983,47 @@ impl AcpSessionAttachment {
             .unwrap_or_default()
     }
 
+    fn generated_image_event(&self, update: &Value, mime_type: Option<String>) -> Option<AcpEvent> {
+        let process = self.process();
+        let sequence = self
+            .state
+            .lock()
+            .map(|mut state| {
+                let sequence = state.generated_image_sequence;
+                state.generated_image_sequence = sequence.saturating_add(1);
+                sequence
+            })
+            .unwrap_or(0);
+        let native_event_id = format!(
+            "{}#{sequence}",
+            update
+                .get("messageId")
+                .and_then(Value::as_str)
+                .unwrap_or("generated-image")
+        );
+        Some(AcpEvent::Canonical(crate::NormalizedAgentEvent {
+            event: crate::CanonicalAgentEvent::ImageGeneration(
+                vibex_core::ImageGenerationPayload {
+                    status: ToolCallStatus::Completed,
+                    summary: bounded_session_content("Generated image"),
+                    mime_type,
+                    // No reference: the bytes arrived inline and neither the
+                    // preview resolver nor the bounded raw extension can carry
+                    // them. The event names what arrived; the spec records what
+                    // displaying it would take.
+                    image_reference: None,
+                    raw_extension: None,
+                },
+            ),
+            provider_correlation_id: crate::stable_event_correlation_id(
+                &process.compatibility_identity,
+                &native_event_id,
+                "image_generation",
+                0,
+            ),
+        }))
+    }
+
     fn merge_context_window_usage(&self, update: &Value) -> bool {
         let decoded = decode_context_window_usage(update);
         emit_usage_decode_diagnostics(&decoded.diagnostics);
@@ -4458,6 +4502,20 @@ impl AcpSessionAttachment {
                 }
             }
             "agent_message_chunk" => {
+                // An Agent that generates media delivers it as an image content
+                // block on this same notification rather than as a tool call.
+                // The bytes have nowhere to go yet — the desktop preview
+                // resolver requires a path inside the session workspace, and a
+                // bounded raw extension would truncate them — so the pixels are
+                // dropped either way. Emitting the event still beats the silence
+                // this used to be: the row names what arrived and its media type
+                // instead of the chunk disappearing into an empty text read.
+                if let Some(mime_type) = content_block_image_mime(update.get("content")) {
+                    if let Some(event) = self.generated_image_event(update, mime_type) {
+                        self.emit_turn_event(event);
+                    }
+                    return;
+                }
                 let text = content_block_text(update.get("content"));
                 if !text.is_empty() {
                     let process = self.process();
@@ -19432,6 +19490,27 @@ fn safe_tool_raw_output(value: String) -> Option<String> {
     Some(value)
 }
 
+/// The media type of an image content block.
+///
+/// The outer `Option` answers "is this an image block" and the inner one carries
+/// the declared media type, which an Agent may omit — so a caller can tell an
+/// image without a type from content that is not an image at all.
+fn content_block_image_mime(content: Option<&Value>) -> Option<Option<String>> {
+    let content = content?;
+    let items = content
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(content));
+    items.iter().find_map(|item| {
+        (item.get("type").and_then(Value::as_str) == Some("image")).then(|| {
+            item.get("mimeType")
+                .or_else(|| item.get("mime_type"))
+                .and_then(Value::as_str)
+                .map(|mime_type| bounded_session_content(mime_type))
+        })
+    })
+}
+
 /// One chunk of terminal output an adapter streams under the reserved `_meta`.
 ///
 /// The chunk is a fragment, not the whole output so far: the adapter sends each
@@ -21677,6 +21756,40 @@ mod tests {
             Some(AgentEventRawOutputMode::Snapshot),
             "feeding fragments straight through would replace instead of append"
         );
+    }
+
+    /// An Agent that generates media sends it as an image content block on an
+    /// ordinary `agent_message_chunk`. The text reader returns nothing for such
+    /// a block, so before this the entire chunk vanished without a trace; the
+    /// media type is the one thing that can still be named about it.
+    #[test]
+    fn image_content_blocks_are_detected_on_a_message_chunk() {
+        assert_eq!(
+            content_block_image_mime(Some(&json!({
+                "type": "image",
+                "data": "aGk=",
+                "mimeType": "image/png"
+            }))),
+            Some(Some("image/png".to_string()))
+        );
+        // An image with no declared type is still an image, so the outer option
+        // has to say so while the inner one stays empty.
+        assert_eq!(
+            content_block_image_mime(Some(&json!({ "type": "image", "data": "aGk=" }))),
+            Some(None)
+        );
+        assert_eq!(
+            content_block_image_mime(Some(&json!([
+                { "type": "text", "text": "here" },
+                { "type": "image", "data": "aGk=", "mimeType": "image/webp" }
+            ]))),
+            Some(Some("image/webp".to_string()))
+        );
+        assert_eq!(
+            content_block_image_mime(Some(&json!({ "type": "text", "text": "plain" }))),
+            None
+        );
+        assert_eq!(content_block_image_mime(None), None);
     }
 
     #[test]
