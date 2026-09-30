@@ -497,12 +497,20 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, strings: 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
+/// A single centred line saying why a pane is empty.
+///
+/// It deliberately does not wrap: a wrapped sentence in a narrow pane reads as
+/// a layout fault, and the key that resolves the emptiness is already on the
+/// key bar.
 fn empty_state(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, message: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = truncate_to_width(message, usize::from(area.width), "…");
     frame.render_widget(
-        Paragraph::new(message.to_string())
-            .style(theme.muted())
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(text)
+            .style(Style::default().fg(theme.roles.gray_dim))
+            .alignment(Alignment::Center),
         area,
     );
 }
@@ -539,7 +547,9 @@ fn render_sidebar(
 
     let rows = app.sidebar_rows();
     if rows.is_empty() {
-        empty_state(frame, list_area, theme, strings.sessions_empty());
+        // The sidebar is narrow, so it states the fact and leaves the way out
+        // to the key bar, which already offers `n`.
+        empty_state(frame, list_area, theme, strings.nothing_here());
         return;
     }
     let selected = app.selection_for(Scope::Sessions);
