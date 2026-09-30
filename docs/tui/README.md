@@ -254,6 +254,16 @@ task boxes; a table is a closed box whose columns are measured in cells, so a
 double-width character cannot push the border out of line; fenced code keeps its
 own spacing and is coloured by a small per-language palette.
 
+Four roles carry the hierarchy, so a message is never one flat colour: body
+prose sits one step below `foreground` (`gray_bright`), headings and emphasis
+take the brightest `foreground`, literals — inline code, commands, paths — use
+the theme's literal colour (amber in the default theme), and link labels get
+their own role derived from the catalogue's chart series (cyan) rather than
+`accent`, which several themes resolve to plain foreground and would leave a
+link looking like underlined prose. Chrome — block headers, markers, rules,
+the URL beside a link — stays in the grey steps and never competes with the
+text it labels.
+
 Styling survives line breaks: the wrapper stays the authority on where lines
 break, and each visual line is matched back onto the styled runs, so emphasis or
 code that lands across a wrap keeps its colour. Content whose spacing *is* the

@@ -258,6 +258,17 @@ Measured contract: with no input and no events the loop produces **zero frames**
 Folding happens *before* wrapping, so a collapsed block never pays for the lines
 it will not show.
 
+**Markdown carries a colour hierarchy, not one text colour.** Body prose is
+`gray_bright`, one step below `foreground`; headings and emphasis take
+`foreground` (and bold, plus an underline on the top two heading levels);
+literals use the theme's literal role (`command`, amber in the default theme) on
+the code background; link labels use the `link` role, derived from the
+catalogue's chart series because `accent` resolves to the foreground in several
+themes. Chrome — headers, markers, rules, the target printed beside a link —
+stays in the grey steps. A single-colour theme still has to spread what it has
+across the roles that carry meaning, and a test asserts the four roles stay four
+distinct colours.
+
 **Markdown is interpreted, never echoed, and its styling survives wrapping.**
 The renderer never prints the syntax it parsed: headings carry emphasis (the top
 two levels are underlined as well, so the hierarchy survives a terminal whose
