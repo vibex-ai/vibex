@@ -624,6 +624,13 @@ strings! {
 
     // ---- help -----------------------------------------------------------
     help_title => { "Help", "帮助", "說明" },
+    help_category_global => { "Global", "全局", "全域" },
+    help_category_transcript => { "Transcript", "时间线", "時間線" },
+    help_category_composer => { "Composer", "输入框", "輸入框" },
+    help_category_modals => { "Modals", "弹窗", "彈窗" },
+    help_category_workbench => { "Workbench", "工作台", "工作台" },
+    help_category_management => { "Management", "管理", "管理" },
+    help_category_panels => { "Panels", "面板", "面板" },
     help_context => { "Context", "上下文", "上下文" },
     help_keys => { "Keys", "键位", "鍵位" },
     help_hint => {
@@ -642,6 +649,13 @@ strings! {
     // ---- command palette / overlays --------------------------------------
     palette_title => { "Command palette", "命令面板", "命令面板" },
     palette_placeholder => { "Type a command…", "输入命令…", "輸入命令…" },
+    palette_group_recent => { "Recent", "最近", "最近" },
+    palette_group_session => { "Session", "会话", "工作階段" },
+    palette_group_workbench => { "Workbench", "工作台", "工作台" },
+    palette_group_management => { "Management", "管理", "管理" },
+    palette_group_device => { "Devices", "设备", "裝置" },
+    palette_group_view => { "View", "视图", "檢視" },
+    palette_group_app => { "App", "应用", "應用" },
     overlay_confirm_title => { "Please confirm", "请确认", "請確認" },
     overlay_prompt_title => { "Input", "输入", "輸入" },
     toast_permission_denied => {

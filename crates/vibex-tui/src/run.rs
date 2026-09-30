@@ -350,6 +350,82 @@ fn handle_key(
                 _ => {}
             }
         }
+        // The shortcuts cheatsheet: `/` filters it, the arrows walk it and
+        // Left/Right fold the category the cursor is on.
+        if let Some(Overlay::Help {
+            query,
+            selected,
+            collapsed,
+        }) = app.overlay.clone()
+        {
+            match key.code {
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let mut query = query;
+                    query.push(character);
+                    app.overlay = Some(Overlay::Help {
+                        query,
+                        selected: 0,
+                        collapsed,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Backspace => {
+                    let mut query = query;
+                    query.pop();
+                    app.overlay = Some(Overlay::Help {
+                        query,
+                        selected: 0,
+                        collapsed,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Delete => {
+                    app.overlay = Some(Overlay::Help {
+                        query: String::new(),
+                        selected: 0,
+                        collapsed,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Enter => {
+                    let rows = crate::view::shortcut_rows(app, &query, &collapsed);
+                    let selected = selected.min(rows.len().saturating_sub(1));
+                    let Some(category) =
+                        rows.get(selected).and_then(|row| row.header).or_else(|| {
+                            // On a binding, fold the category above it.
+                            rows[..selected].iter().rev().find_map(|row| row.header)
+                        })
+                    else {
+                        return Ok(false);
+                    };
+                    let mut collapsed = collapsed;
+                    if !collapsed.remove(category.id()) {
+                        collapsed.insert(category.id().to_string());
+                    }
+                    app.overlay = Some(Overlay::Help {
+                        query,
+                        selected: 0,
+                        collapsed,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Esc => {
+                    // `Esc` clears the filter first and closes second, so a
+                    // mistyped search is one key from gone.
+                    if query.is_empty() {
+                        app.overlay = None;
+                    } else {
+                        app.overlay = Some(Overlay::Help {
+                            query: String::new(),
+                            selected: 0,
+                            collapsed,
+                        });
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         // The approval card accepts a digit as a direct option selection.
         if let Some(Overlay::Approval { .. }) = app.overlay
             && let KeyCode::Char(digit) = key.code

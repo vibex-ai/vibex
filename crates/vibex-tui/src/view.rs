@@ -239,6 +239,168 @@ pub const PALETTE: &[PaletteEntry] = &[
     },
 ];
 
+/// The heading a palette command is filed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PaletteGroup {
+    Recent,
+    Session,
+    Workbench,
+    Management,
+    Device,
+    View,
+    App,
+}
+
+impl PaletteGroup {
+    pub fn label(self, strings: Strings) -> &'static str {
+        match self {
+            PaletteGroup::Recent => strings.palette_group_recent(),
+            PaletteGroup::Session => strings.palette_group_session(),
+            PaletteGroup::Workbench => strings.palette_group_workbench(),
+            PaletteGroup::Management => strings.palette_group_management(),
+            PaletteGroup::Device => strings.palette_group_device(),
+            PaletteGroup::View => strings.palette_group_view(),
+            PaletteGroup::App => strings.palette_group_app(),
+        }
+    }
+}
+
+/// Which heading a command belongs under.
+pub const fn palette_group(intent: Intent) -> PaletteGroup {
+    match intent {
+        Intent::NewSession
+        | Intent::BeginRenameSession
+        | Intent::ForkSession
+        | Intent::ArchiveSession
+        | Intent::DeleteSession
+        | Intent::SwitchWorkspace
+        | Intent::OpenSelectedSession
+        | Intent::EnterSession => PaletteGroup::Session,
+        Intent::OpenFiles
+        | Intent::OpenChanges
+        | Intent::OpenBlockDetails
+        | Intent::CopyBlockBody
+        | Intent::CopyBlockMetadata
+        | Intent::ToggleBlockExpanded
+        | Intent::BeginTranscriptSearch => PaletteGroup::Workbench,
+        Intent::OpenManagementSection
+        | Intent::InstallOrUpdateAgent
+        | Intent::UninstallAgent
+        | Intent::AgentAuthMenu
+        | Intent::ToggleSelectedEntry
+        | Intent::EditSelectedEntry
+        | Intent::ReloadManagement
+        | Intent::ExportDiagnostics
+        | Intent::CreateBackup
+        | Intent::InspectBackup
+        | Intent::RestoreBackup
+        | Intent::ProviderHealth => PaletteGroup::Management,
+        Intent::CreatePairingCode | Intent::RevokeSelectedDevice | Intent::OpenDeviceAudit => {
+            PaletteGroup::Device
+        }
+        Intent::GotoSessions
+        | Intent::GotoManagement
+        | Intent::GotoUsage
+        | Intent::OpenSettings
+        | Intent::ToggleHelp
+        | Intent::ToggleSidebar
+        | Intent::FocusNext
+        | Intent::FocusPrevious => PaletteGroup::View,
+        _ => PaletteGroup::App,
+    }
+}
+
+/// Fuzzy-score `needle` against `haystack`.
+///
+/// Subsequence matching, with the bonuses that make a two-word query work:
+/// a hit at a word start beats a hit inside a word, and a contiguous run beats
+/// a scattered one. `None` means "does not match at all", which is what keeps
+/// a sheet of commands from surviving a query that has nothing to do with it.
+fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let haystack = haystack.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut score = 0i32;
+    let mut haystack_chars = haystack.char_indices().peekable();
+    let mut last_match: Option<usize> = None;
+    for wanted in needle.chars() {
+        let mut found = None;
+        for (index, candidate) in haystack_chars.by_ref() {
+            if candidate == wanted {
+                found = Some(index);
+                break;
+            }
+        }
+        let index = found?;
+        score += 1;
+        match last_match {
+            Some(previous) if previous + 1 == index => score += 4,
+            _ => {}
+        }
+        let at_word_start = index == 0
+            || haystack[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character == ' ' || character == '-' || character == '_');
+        if at_word_start {
+            score += 6;
+        }
+        last_match = Some(index);
+    }
+    Some(score)
+}
+
+/// Palette entries matching `query`, best first, with `recent` boosted.
+pub fn palette_matches_recent(
+    query: &str,
+    strings: Strings,
+    recent: &[String],
+) -> Vec<PaletteEntry> {
+    let needle = query.trim().to_lowercase();
+    let mut entries = palette_matches(&needle, strings);
+    if needle.is_empty() && !recent.is_empty() {
+        // With nothing typed the palette opens on what was just used, which is
+        // the whole point of remembering it.
+        let mut recent_entries = recent
+            .iter()
+            .filter_map(|id| {
+                let intent = Intent::from_id(id)?;
+                PALETTE.iter().find(|entry| entry.intent == intent).copied()
+            })
+            .collect::<Vec<_>>();
+        recent_entries.dedup_by_key(|entry| entry.intent);
+        let seen = recent_entries
+            .iter()
+            .map(|entry| entry.intent)
+            .collect::<Vec<_>>();
+        recent_entries.extend(
+            entries
+                .into_iter()
+                .filter(|entry| !seen.contains(&entry.intent)),
+        );
+        return recent_entries;
+    }
+    if !needle.is_empty() {
+        // Recent use is a tie-break, not a filter: a command the reader has
+        // used before rises among equally good matches.
+        entries.sort_by_key(|entry| {
+            let rank = recent
+                .iter()
+                .position(|id| id == entry.intent.id())
+                .unwrap_or(usize::MAX);
+            (
+                palette_group(entry.intent),
+                usize::from(rank == usize::MAX),
+                rank,
+                entry.label,
+            )
+        });
+    }
+    entries
+}
+
 /// Palette entries matching `query`.
 pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
     let needle = query.trim().to_lowercase();
@@ -246,23 +408,30 @@ pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
         .iter()
         .copied()
         .filter_map(|entry| {
-            let label = entry.label.to_lowercase();
-            let hint = entry.hint.to_lowercase();
-            // Prefix matches outrank substring matches, which outrank a hit
-            // in the description.
-            let score = if needle.is_empty() || label.starts_with(&needle) {
-                0usize
-            } else if label.contains(&needle) {
-                1
-            } else if hint.contains(&needle) {
-                2
+            // The label is what the reader is typing at; the hint is what they
+            // are reading, so a hit there scores lower but still counts.
+            let label = fuzzy_score(entry.label, &needle);
+            let hint = if needle.is_empty() {
+                None
             } else {
-                return None;
+                fuzzy_score(entry.hint, &needle)
+            };
+            let score = match (label, hint) {
+                (Some(score), _) => score,
+                (None, Some(score)) => score - 20,
+                (None, None) => return None,
             };
             Some((score, entry))
         })
         .collect::<Vec<_>>();
-    scored.sort_by_key(|(score, entry)| (*score, entry.label));
+    // Best first, then by group so the list reads in sections, then by label.
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| palette_group(left.1.intent).cmp(&palette_group(right.1.intent)))
+            .then_with(|| left.1.label.cmp(right.1.label))
+    });
     let mut entries = scored
         .into_iter()
         .map(|(_, entry)| entry)
@@ -3123,6 +3292,151 @@ fn composer_line_spans(text: &str, style: Style, theme: &TuiTheme) -> Vec<Span<'
     spans
 }
 
+/// One row of the shortcuts cheatsheet.
+pub struct ShortcutRow<'a> {
+    /// A category header, when the row is not a binding.
+    pub header: Option<crate::keymap::Category>,
+    pub binding: Option<&'a crate::keymap::Binding>,
+}
+
+/// The rows the cheatsheet shows: category headers, then the bindings that are
+/// not folded away and that match the query.
+pub fn shortcut_rows<'a>(
+    app: &'a App,
+    query: &str,
+    collapsed: &std::collections::BTreeSet<String>,
+) -> Vec<ShortcutRow<'a>> {
+    let needle = query.trim().to_lowercase();
+    let mut rows = Vec::new();
+    for category in crate::keymap::Category::ALL {
+        let mut bindings = app
+            .keymap
+            .bindings()
+            .iter()
+            .filter(|binding| binding.label.is_some() && binding.scope.category() == category)
+            .filter(|binding| {
+                needle.is_empty()
+                    || binding.chord.display().to_lowercase().contains(&needle)
+                    || binding
+                        .label
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&needle)
+                    || binding.intent.id().contains(&needle)
+                    || binding.intent.help().to_lowercase().contains(&needle)
+                    || binding.scope.id().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+        if bindings.is_empty() {
+            continue;
+        }
+        // A search opens the categories it matched: folding would hide the
+        // result the reader just asked for.
+        let folded = collapsed.contains(category.id()) && needle.is_empty();
+        rows.push(ShortcutRow {
+            header: Some(category),
+            binding: None,
+        });
+        if !folded {
+            bindings.sort_by_key(|binding| binding.chord.display());
+            rows.extend(bindings.into_iter().map(|binding| ShortcutRow {
+                header: None,
+                binding: Some(binding),
+            }));
+        }
+    }
+    rows
+}
+
+/// The shortcuts cheatsheet inside the help modal.
+#[allow(clippy::too_many_arguments)]
+fn render_shortcut_cheatsheet(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+    query: &str,
+    selected: usize,
+    collapsed: &std::collections::BTreeSet<String>,
+) {
+    let rows = shortcut_rows(app, query, collapsed);
+    if rows.is_empty() {
+        empty_state(frame, area, theme, strings.help_no_keys());
+        return;
+    }
+    let selected = selected.min(rows.len().saturating_sub(1));
+    let height = usize::from(area.height);
+    let offset = selected.saturating_sub(height.saturating_sub(1));
+    let mut lines = Vec::new();
+    for (index, row) in rows.iter().enumerate().skip(offset).take(height) {
+        let active = index == selected;
+        match row.header {
+            Some(category) => {
+                let folded = collapsed.contains(category.id()) && query.trim().is_empty();
+                let marker = crate::glyphs::disclosure(!folded, app.glyph_tier());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(theme.roles.accent_user),
+                    ),
+                    Span::styled(
+                        category_label(category, strings).to_string(),
+                        Style::default()
+                            .fg(theme.roles.foreground)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            None => {
+                let Some(binding) = row.binding else { continue };
+                let label = binding.label.unwrap_or_default();
+                let style = if active {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(if active { "  ▸ " } else { "    " }, style),
+                    Span::styled(format!("{:<14}", binding.chord.display()), style),
+                    Span::styled(label.to_string(), style),
+                    Span::styled(
+                        format!("   {}", binding.scope.id()),
+                        Style::default().fg(theme.roles.gray_dim),
+                    ),
+                ]));
+                // The selected binding explains itself, so the overlay is a
+                // teacher rather than a list of chords.
+                if active {
+                    lines.push(Line::from(vec![
+                        Span::styled("      ", Style::default()),
+                        Span::styled(
+                            binding.intent.help().to_string(),
+                            Style::default()
+                                .fg(theme.roles.gray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Human label for a cheatsheet category.
+fn category_label(category: crate::keymap::Category, strings: Strings) -> &'static str {
+    match category {
+        crate::keymap::Category::Global => strings.help_category_global(),
+        crate::keymap::Category::Transcript => strings.help_category_transcript(),
+        crate::keymap::Category::Composer => strings.help_category_composer(),
+        crate::keymap::Category::Modals => strings.help_category_modals(),
+        crate::keymap::Category::Workbench => strings.help_category_workbench(),
+        crate::keymap::Category::Management => strings.help_category_management(),
+        crate::keymap::Category::Panels => strings.help_category_panels(),
+    }
+}
+
 /// The key hint bar.
 ///
 /// Keys are drawn bold and bright, labels dim: the key is what the reader is
@@ -3236,7 +3550,7 @@ fn render_overlay(
     let strings = app.strings;
     match overlay {
         Overlay::Palette { query, selected } => {
-            let matches = palette_matches(query, strings);
+            let matches = app.palette_entries(query);
             let chrome = modal_chrome(
                 app,
                 strings.palette_title(),
@@ -3262,58 +3576,102 @@ fn render_overlay(
                 ])),
                 rows[0],
             );
-            let items = matches
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let style = if index == *selected {
-                        theme.selected()
+            // Grouped so the list reads in sections; the selection index is
+            // over the flat entry list, so a header is skipped by the cursor
+            // rather than counted as a row.
+            let recent_count = if query.trim().is_empty() {
+                app.palette_recent_count()
+            } else {
+                0
+            };
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let mut last_group = None;
+            for (index, entry) in matches.iter().enumerate() {
+                let group = if index < recent_count {
+                    PaletteGroup::Recent
+                } else {
+                    palette_group(entry.intent)
+                };
+                if last_group != Some(group) {
+                    last_group = Some(group);
+                    lines.push(Line::from(Span::styled(
+                        group.label(strings).to_string(),
+                        Style::default()
+                            .fg(theme.roles.gray)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
+                let style = if index == *selected {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(if index == *selected { "▸ " } else { "  " }, style),
+                    Span::styled(format!("{:<24}", entry.label), style),
+                    Span::styled(entry.hint, theme.muted()),
+                ]));
+            }
+            let height = usize::from(rows[1].height);
+            // Keep the selection on screen: the list can be longer than the
+            // drawer, and the cursor is the anchor.
+            let selected_line = {
+                let mut line = 0usize;
+                let mut group = None;
+                for (index, entry) in matches.iter().enumerate() {
+                    let entry_group = if index < recent_count {
+                        PaletteGroup::Recent
                     } else {
-                        theme.base()
+                        palette_group(entry.intent)
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:<24}", entry.label), style),
-                        Span::styled(entry.hint, theme.muted()),
-                    ]))
-                })
+                    if group != Some(entry_group) {
+                        group = Some(entry_group);
+                        line += 1;
+                    }
+                    if index == *selected {
+                        break;
+                    }
+                    line += 1;
+                }
+                line
+            };
+            let offset = selected_line.saturating_sub(height.saturating_sub(1));
+            let visible = lines
+                .into_iter()
+                .skip(offset)
+                .take(height)
                 .collect::<Vec<_>>();
-            let mut state = ratatui::widgets::ListState::default();
-            state.select(Some((*selected).min(matches.len().saturating_sub(1))));
-            frame.render_stateful_widget(List::new(items), rows[1], &mut state);
+            frame.render_widget(Paragraph::new(Text::from(visible)), rows[1]);
         }
-        Overlay::Help { scroll, .. } => {
+        Overlay::Help {
+            query,
+            selected,
+            collapsed,
+        } => {
             let chrome = modal_chrome(
                 app,
                 strings.help_title(),
                 ModalSizing::large(),
                 vec![
-                    ModalHint::new("↑↓", strings.hint_scroll()),
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("/", strings.search()),
+                    ModalHint::new("←→", strings.hint_toggle()),
                     ModalHint::new("Esc", strings.close()),
                 ],
             );
             let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
                 return;
             };
-            let mut lines = Vec::new();
-            for binding in app.keymap.bindings() {
-                let Some(label) = binding.label else { continue };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{:<22}", binding.scope.id()), theme.muted()),
-                    Span::styled(format!("{:<12}", binding.chord.display()), theme.accent()),
-                    Span::styled(label.to_string(), theme.base()),
-                ]));
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", binding.intent.help()),
-                    theme.muted(),
-                )));
-            }
-            let offset = (*scroll).min(lines.len().saturating_sub(1));
-            let visible = lines
-                .into_iter()
-                .skip(offset)
-                .take(usize::from(layout.content.height))
-                .collect::<Vec<_>>();
-            frame.render_widget(Paragraph::new(Text::from(visible)), layout.content);
+            render_shortcut_cheatsheet(
+                frame,
+                layout.content,
+                app,
+                theme,
+                strings,
+                query,
+                *selected,
+                collapsed,
+            );
         }
         Overlay::Confirm { title, body, .. } => {
             let chrome = modal_chrome(

@@ -921,6 +921,106 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
 }
 
 #[test]
+fn the_shortcuts_cheatsheet_groups_bindings_by_category() {
+    use vibex_tui::keymap::Category;
+    let app = app(120, 40);
+    let rows = vibex_tui::view::shortcut_rows(&app, "", &std::collections::BTreeSet::new());
+    let categories = rows.iter().filter_map(|row| row.header).collect::<Vec<_>>();
+    assert_eq!(
+        categories,
+        Category::ALL,
+        "a category is missing or unsorted"
+    );
+    // Every binding is filed under exactly one header.
+    assert!(rows.iter().any(|row| row.binding.is_some()));
+
+    // On screen, the first categories and the fold triangles are visible.
+    let mut app = app;
+    app.perform(vibex_tui::action::Intent::ToggleHelp);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("Global"), "{screen}");
+    assert!(screen.contains("Transcript"), "{screen}");
+}
+
+#[test]
+fn filtering_the_cheatsheet_keeps_only_matching_bindings() {
+    let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::ToggleHelp);
+    app.overlay = Some(vibex_tui::app::Overlay::Help {
+        query: "palette".to_string(),
+        selected: 0,
+        collapsed: std::collections::BTreeSet::new(),
+    });
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("Ctrl+P"), "{screen}");
+    assert!(
+        !screen.contains("Expand all"),
+        "unmatched rows survived:\n{screen}"
+    );
+}
+
+#[test]
+fn folding_a_category_hides_its_bindings_but_keeps_its_header() {
+    let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::ToggleHelp);
+    let mut collapsed = std::collections::BTreeSet::new();
+    collapsed.insert("global".to_string());
+    app.overlay = Some(vibex_tui::app::Overlay::Help {
+        query: String::new(),
+        selected: 0,
+        collapsed: collapsed.clone(),
+    });
+    let screen = text(&render(&mut app, 120, 40));
+    // The header stays and is marked folded; the bindings under it are gone.
+    assert!(screen.contains("Global"), "the header is gone:\n{screen}");
+    assert!(
+        screen.contains('▸'),
+        "the fold marker is missing:\n{screen}"
+    );
+
+    let rows = vibex_tui::view::shortcut_rows(&app, "", &collapsed);
+    assert!(
+        !rows.iter().any(|row| {
+            row.binding.is_some_and(|binding| {
+                binding.scope.category() == vibex_tui::keymap::Category::Global
+            })
+        }),
+        "a folded category still contributes rows"
+    );
+}
+
+#[test]
+fn the_palette_groups_commands_and_remembers_recent_ones() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.perform(Intent::OpenCommandPalette);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("View"), "no group headings:\n{screen}");
+    assert!(
+        screen.contains("Workbench") || screen.contains("Session"),
+        "{screen}"
+    );
+
+    // Running a command remembers it, and the next open puts it first.
+    app.remember_command(Intent::GotoUsage);
+    let entries = app.palette_entries("");
+    assert_eq!(entries[0].intent, Intent::GotoUsage);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("Recent"), "{screen}");
+}
+
+#[test]
+fn palette_fuzzy_matching_finds_a_two_word_query() {
+    let strings = Strings::for_locale(Locale::En);
+    let matches = vibex_tui::view::palette_matches("newsess", strings);
+    assert!(
+        matches.iter().any(|entry| entry.label == "New session"),
+        "a subsequence query must match: {:?}",
+        matches.iter().map(|entry| entry.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_big_paste_shows_as_one_chip_in_the_composer() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);

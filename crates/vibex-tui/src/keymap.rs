@@ -222,6 +222,48 @@ impl std::error::Error for KeyParseError {}
 
 /// Where a binding is active.
 ///
+/// The group a scope is shown under in the shortcuts cheatsheet.
+///
+/// Categories exist so the overlay can be read rather than scrolled: a reader
+/// looking for "how do I send" looks under Composer, not through forty rows of
+/// management keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Category {
+    Global,
+    Transcript,
+    Composer,
+    Modals,
+    Workbench,
+    Management,
+    Panels,
+}
+
+impl Category {
+    /// Every category, in the order the cheatsheet shows them.
+    pub const ALL: [Category; 7] = [
+        Category::Global,
+        Category::Transcript,
+        Category::Composer,
+        Category::Modals,
+        Category::Workbench,
+        Category::Management,
+        Category::Panels,
+    ];
+
+    /// Stable identifier used as the collapse key.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Category::Global => "global",
+            Category::Transcript => "transcript",
+            Category::Composer => "composer",
+            Category::Modals => "modals",
+            Category::Workbench => "workbench",
+            Category::Management => "management",
+            Category::Panels => "panels",
+        }
+    }
+}
+
 /// Scopes are checked from the most specific to [`Scope::Global`], so a page
 /// binding always wins over a global one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -299,6 +341,29 @@ impl Scope {
             Scope::Recovery => "recovery",
             Scope::Settings => "settings",
             Scope::Help => "help",
+        }
+    }
+
+    /// The category this scope's bindings are listed under.
+    pub const fn category(self) -> Category {
+        match self {
+            Scope::Global => Category::Global,
+            Scope::Agent => Category::Transcript,
+            Scope::Composer => Category::Composer,
+            Scope::Overlay => Category::Modals,
+            Scope::Sessions | Scope::Files | Scope::Changes | Scope::Terminal => {
+                Category::Workbench
+            }
+            Scope::Management
+            | Scope::Providers
+            | Scope::Agents
+            | Scope::Mcp
+            | Scope::Skills
+            | Scope::Prompts
+            | Scope::Hooks => Category::Management,
+            Scope::Devices | Scope::Usage | Scope::Recovery | Scope::Settings | Scope::Help => {
+                Category::Panels
+            }
         }
     }
 }

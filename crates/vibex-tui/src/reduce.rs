@@ -85,8 +85,9 @@ impl App {
             }
             Intent::ToggleHelp => {
                 self.overlay = Some(Overlay::Help {
-                    scroll: 0,
                     query: String::new(),
+                    selected: 0,
+                    collapsed: std::collections::BTreeSet::new(),
                 });
                 Outcome::effects(vec![])
             }
@@ -879,17 +880,35 @@ impl App {
         };
         match overlay {
             Overlay::Palette { query, selected } => self.perform_palette(intent, query, selected),
-            Overlay::Help { scroll, query: _ } => match intent {
+            Overlay::Help {
+                query,
+                selected,
+                collapsed,
+            } => match intent {
+                // The cheatsheet is navigated row by row; the renderer keeps the
+                // selection on screen, so there is no scroll offset to keep.
                 Intent::ScrollPageUp | Intent::SelectPrevious => {
-                    self.set_overlay_scroll(scroll.saturating_sub(10));
+                    self.overlay = Some(Overlay::Help {
+                        query,
+                        selected: selected.saturating_sub(1),
+                        collapsed,
+                    });
                     Outcome::effects(vec![])
                 }
                 Intent::ScrollPageDown | Intent::SelectNext => {
-                    self.set_overlay_scroll(scroll + 10);
+                    self.overlay = Some(Overlay::Help {
+                        query,
+                        selected: selected.saturating_add(1),
+                        collapsed,
+                    });
                     Outcome::effects(vec![])
                 }
                 Intent::ScrollToTop => {
-                    self.set_overlay_scroll(0);
+                    self.overlay = Some(Overlay::Help {
+                        query,
+                        selected: 0,
+                        collapsed,
+                    });
                     Outcome::effects(vec![])
                 }
                 Intent::ScrollToBottom => {
@@ -1041,15 +1060,16 @@ impl App {
     fn perform_palette(&mut self, intent: Intent, query: String, selected: usize) -> Outcome {
         match intent {
             Intent::ConfirmOverlay | Intent::PaletteRun => {
-                let matches = crate::view::palette_matches(&query, self.strings);
+                let matches = self.palette_entries(&query);
                 let Some(entry) = matches.get(selected).copied() else {
                     return Outcome::quiet();
                 };
                 self.overlay = None;
+                self.remember_command(entry.intent);
                 self.perform(entry.intent)
             }
             Intent::SelectNext => {
-                let count = crate::view::palette_matches(&query, self.strings).len();
+                let count = self.palette_entries(&query).len();
                 self.overlay = Some(Overlay::Palette {
                     query,
                     selected: if count == 0 {
@@ -1426,9 +1446,12 @@ impl App {
 
     fn set_overlay_scroll(&mut self, value: usize) {
         self.overlay = match self.overlay.clone() {
-            Some(Overlay::Help { query, .. }) => Some(Overlay::Help {
-                scroll: value,
+            Some(Overlay::Help {
+                query, collapsed, ..
+            }) => Some(Overlay::Help {
                 query,
+                selected: value,
+                collapsed,
             }),
             Some(Overlay::BlockDetails { block, .. }) => Some(Overlay::BlockDetails {
                 block,

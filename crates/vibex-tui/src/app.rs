@@ -115,8 +115,14 @@ impl Focus {
 pub enum Overlay {
     /// Fuzzy command palette over every page and action.
     Palette { query: String, selected: usize },
-    /// Contextual help, generated from the binding tables.
-    Help { scroll: usize, query: String },
+    /// The shortcuts cheatsheet: every binding, grouped by category.
+    Help {
+        query: String,
+        /// Index into the visible rows (headers included).
+        selected: usize,
+        /// Categories the reader has folded away.
+        collapsed: std::collections::BTreeSet<String>,
+    },
     /// A yes/no question that guards a destructive action.
     Confirm {
         title: String,
@@ -383,6 +389,8 @@ pub struct App {
     pub search: Option<crate::search::SearchState>,
     /// Which sent message the composer's history drawer points at.
     pub history_selection: usize,
+    /// Commands run from the palette, most recent first.
+    pub recent_commands: Vec<String>,
     /// The mouse selection over the transcript, while it is being made or after
     /// it has been copied.
     pub text_selection: Option<TextSelection>,
@@ -582,6 +590,7 @@ impl App {
             session_cards: std::collections::BTreeSet::new(),
             search: None,
             history_selection: 0,
+            recent_commands: Vec::new(),
             text_selection: None,
             last_click: None,
             queued_messages: Vec::new(),
@@ -1098,6 +1107,37 @@ impl App {
         true
     }
 
+    /// The palette's entries: recents first, then everything else.
+    pub fn palette_entries(&self, query: &str) -> Vec<crate::view::PaletteEntry> {
+        crate::view::palette_matches_recent(query, self.strings, &self.recent_commands)
+    }
+
+    /// How many of the palette's leading entries are remembered commands.
+    ///
+    /// Only meaningful for an empty query, which is when the recents are
+    /// lifted to the top; the renderer uses it to draw the `Recent` heading.
+    pub fn palette_recent_count(&self) -> usize {
+        self.recent_commands
+            .iter()
+            .filter(|id| {
+                Intent::from_id(id).is_some_and(|intent| {
+                    crate::view::PALETTE
+                        .iter()
+                        .any(|entry| entry.intent == intent)
+                })
+            })
+            .count()
+            .min(MAX_RECENT_COMMANDS)
+    }
+
+    /// Remember a command so the palette can offer it first next time.
+    pub fn remember_command(&mut self, intent: Intent) {
+        let id = intent.id().to_string();
+        self.recent_commands.retain(|candidate| candidate != &id);
+        self.recent_commands.insert(0, id);
+        self.recent_commands.truncate(MAX_RECENT_COMMANDS);
+    }
+
     // ---- composer history search ----------------------------------------
 
     /// Derive the composer's mode from what the draft starts with.
@@ -1344,6 +1384,9 @@ impl App {
 
 /// How many history entries the composer's drawer will show.
 pub const MAX_HISTORY_MATCHES: usize = 100;
+
+/// How many palette commands are remembered.
+pub const MAX_RECENT_COMMANDS: usize = 8;
 
 /// Column thresholds for the three shell layouts, re-calibrated from the
 /// desktop's pixel breakpoints for a character grid.

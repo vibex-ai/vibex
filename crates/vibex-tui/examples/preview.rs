@@ -134,8 +134,9 @@ fn main() {
     }
     let _ = ScrollState::default();
     let _ = Overlay::Help {
-        scroll: 0,
         query: String::new(),
+        selected: 0,
+        collapsed: std::collections::BTreeSet::new(),
     };
 }
 
