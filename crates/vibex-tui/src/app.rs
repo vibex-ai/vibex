@@ -1638,21 +1638,17 @@ impl App {
         self.transcript.is_animating()
     }
 
-    /// Step every animation. Returns whether a repaint is due.
+    /// Step the running indicator. Returns whether a repaint is due.
     ///
-    /// The phase advances only while something is actually moving, which is what
-    /// preserves the zero-frames-when-idle contract.
+    /// Streaming text does not need one: a delta marks the app dirty by itself,
+    /// so a transcript with no other animation stays at zero frames.
     pub fn advance_transcript_animation(&mut self) -> bool {
-        let transcript = self.transcript.advance_animation();
-        // The turn line pulses while a turn runs or while the session is idle
-        // but connected; an idle pulse is a live-session cue, not decoration.
-        let turn_line = self.turn_started.is_some() || self.pending_permission_count() > 0;
-        if !transcript && !turn_line {
+        // The spinner runs while a turn is running or while the reader is being
+        // asked for something; nothing else in the interface moves on its own.
+        if self.turn_started.is_none() && self.pending_permission_count() == 0 {
             return false;
         }
-        if turn_line {
-            self.animation_phase = self.animation_phase.wrapping_add(1);
-        }
+        self.animation_phase = self.animation_phase.wrapping_add(1);
         true
     }
 

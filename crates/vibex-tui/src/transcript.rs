@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use vibex_desktop_model::TimelineRowKind;
@@ -28,7 +28,7 @@ use vibex_desktop_model::TimelineRowKind;
 use crate::locale::Strings;
 use crate::markdown::render_plain;
 use crate::text::{display_width, truncate_to_width};
-use crate::theme::{Rail, TuiTheme};
+use crate::theme::TuiTheme;
 
 /// How many collapsed lines a long block shows before folding.
 pub const COLLAPSED_BODY_LINES: usize = 4;
@@ -201,8 +201,6 @@ pub struct Transcript {
     recency: Vec<usize>,
     width: usize,
     theme_id: String,
-    /// Frame counter driving the running-rail animation.
-    animation_phase: u32,
     /// The block drawn as current last frame, so a change invalidates it.
     last_selected: Option<usize>,
     /// Display line the viewport started at in the last frame.
@@ -244,7 +242,6 @@ impl Transcript {
             recency: Vec::new(),
             width: 0,
             theme_id: String::new(),
-            animation_phase: 0,
             last_selected: None,
             scroll_offset: 0,
             stats: TranscriptStats::default(),
@@ -470,28 +467,6 @@ impl Transcript {
     /// Whether any block is currently working.
     pub fn is_animating(&self) -> bool {
         self.blocks.iter().any(|block| block.streaming)
-    }
-
-    /// Advance the running-rail animation. Returns whether a repaint is due.
-    ///
-    /// Only a transcript with an active turn animates; an idle one keeps
-    /// returning `false`, which is what preserves the zero-frames-when-idle
-    /// contract.
-    pub fn advance_animation(&mut self) -> bool {
-        if !self.blocks.iter().any(|block| block.streaming) {
-            self.animation_phase = 0;
-            return false;
-        }
-        self.animation_phase = self.animation_phase.wrapping_add(1);
-        // The rail is the only animated chrome, and it lives inside the height
-        // cache, so the cached rows have to be dropped for the new phase.
-        for index in 0..self.blocks.len() {
-            if self.blocks[index].streaming {
-                self.rendered.remove(&index);
-                self.recency.retain(|value| *value != index);
-            }
-        }
-        true
     }
 
     /// Tell the transcript which width and theme it will render at.
@@ -732,7 +707,6 @@ impl Transcript {
             theme,
             self.width,
             strings,
-            self.animation_phase,
             self.last_selected == Some(index),
         )
     }
@@ -1402,21 +1376,23 @@ fn is_markdown(kind: TimelineRowKind) -> bool {
 /// Render one block into display lines.
 /// Chrome geometry for one transcript block.
 ///
-/// The rail is the load-bearing part: a one-column colour bar down the whole
-/// block. It gives every block a visible left edge, so a long tool output stays
-/// one object instead of dissolving into the previous one, and it lets the eye
-/// scan a session by colour before reading a word.
+/// The left edge is empty: a block is identified by what it says — the prompt
+/// mark on the reader's own words, the bullet on a work item, the colour of the
+/// text — not by a bar beside it. A column of colour per block is a column the
+/// text does not get, and once every row is one line tall the bars of adjacent
+/// blocks read as one striped edge rather than as one bar per block.
 pub mod chrome {
-    /// Width of the rail column.
-    pub const RAIL: usize = 1;
-    /// Gap between the rail and the content.
+    /// Gap between the left edge and the content.
+    ///
+    /// The selection pointer is drawn in the first of these columns, so marking
+    /// a block never moves its text.
     pub const PAD_LEFT: usize = 2;
     /// Gap between the content and the right edge.
     pub const PAD_RIGHT: usize = 1;
     /// Blank rows inserted between blocks.
     pub const GAP: usize = 1;
     /// Columns the chrome consumes in total.
-    pub const TOTAL: usize = RAIL + PAD_LEFT + PAD_RIGHT;
+    pub const TOTAL: usize = PAD_LEFT + PAD_RIGHT;
 
     /// Content width available at a given total width.
     pub const fn content_width(width: usize) -> usize {
@@ -1445,30 +1421,6 @@ fn pointer_glyph(theme: &TuiTheme) -> &'static str {
 /// The separator used between chrome items across the interface.
 pub fn chrome_separator() -> &'static str {
     "│"
-}
-
-/// Which rail a block kind wears.
-fn kind_rail(kind: TimelineRowKind) -> Rail {
-    match kind {
-        TimelineRowKind::UserMessage => Rail::User,
-        TimelineRowKind::AgentMessage => Rail::Agent,
-        TimelineRowKind::Reasoning => Rail::Thinking,
-        TimelineRowKind::ToolCall
-        | TimelineRowKind::Command
-        | TimelineRowKind::FileOperation
-        | TimelineRowKind::WebSearch
-        | TimelineRowKind::ImageGeneration => Rail::Tool,
-        TimelineRowKind::Plan | TimelineRowKind::Collaboration => Rail::Agent,
-        TimelineRowKind::TodoUpdate | TimelineRowKind::GitNotice => Rail::System,
-        TimelineRowKind::SystemNotice => Rail::System,
-        TimelineRowKind::PermissionRequest
-        | TimelineRowKind::ElicitationRequest
-        | TimelineRowKind::Retry => Rail::Attention,
-        TimelineRowKind::PermissionResolution | TimelineRowKind::ElicitationResolution => {
-            Rail::Success
-        }
-        TimelineRowKind::Error => Rail::Error,
-    }
 }
 
 /// Whether a block kind is a dense, foldable work item.
@@ -1524,33 +1476,15 @@ pub enum GroupRole {
 
 /// Render one block into display lines.
 ///
-/// Every row is prefixed with [`chrome::RAIL`] a column of the block's rail
-/// colour, then [`chrome::PAD_LEFT`] spaces. The rail is painted for the whole
-/// block, including its status and attribution rows, so the block reads as one
-/// object.
+/// Every row starts with [`chrome::PAD_LEFT`] columns of margin, the first of
+/// which carries the selection pointer.
 pub fn render_block(
     block: &Block,
     theme: &TuiTheme,
     width: usize,
     strings: Strings,
 ) -> RenderedBlock {
-    render_block_at_phase(block, theme, width, strings, 0)
-}
-
-/// As [`render_block`], with an animation phase for the running rail.
-///
-/// `phase` advances while a turn is running; the rail of the block that is
-/// currently working breathes, which is the only animation in the interface and
-/// is what makes "the Agent is thinking" legible without a spinner that steals
-/// a whole row.
-pub fn render_block_at_phase(
-    block: &Block,
-    theme: &TuiTheme,
-    width: usize,
-    strings: Strings,
-    phase: u32,
-) -> RenderedBlock {
-    render_block_styled(block, theme, width, strings, phase, false)
+    render_block_styled(block, theme, width, strings, false)
 }
 
 /// Whether a block reads as one dense row rather than a titled section.
@@ -1617,7 +1551,7 @@ pub fn gap_after(block: &Block, next: Option<&Block>) -> usize {
     if dense_run { 0 } else { chrome::GAP }
 }
 
-/// As [`render_block_at_phase`], with the current-block treatment.
+/// As [`render_block`], with the current-block treatment.
 ///
 /// The current block is marked rather than inverted: a full-width reversed row
 /// is the heaviest possible emphasis and makes the transcript look like a
@@ -1628,10 +1562,9 @@ pub fn render_block_styled(
     theme: &TuiTheme,
     width: usize,
     strings: Strings,
-    phase: u32,
     selected: bool,
 ) -> RenderedBlock {
-    render_block_in_run(block, None, theme, width, strings, phase, selected)
+    render_block_in_run(block, None, theme, width, strings, selected)
 }
 
 /// As [`render_block_styled`], told what follows the block.
@@ -1645,10 +1578,9 @@ pub fn render_block_in_run(
     theme: &TuiTheme,
     width: usize,
     strings: Strings,
-    phase: u32,
     selected: bool,
 ) -> RenderedBlock {
-    render_block_in_run_with_body(block, next, None, theme, width, strings, phase, selected)
+    render_block_in_run_with_body(block, next, None, theme, width, strings, selected)
 }
 
 /// As [`render_block_in_run`], with a body the caller has already rendered.
@@ -1664,7 +1596,6 @@ pub fn render_block_in_run_with_body(
     theme: &TuiTheme,
     width: usize,
     strings: Strings,
-    phase: u32,
     selected: bool,
 ) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1675,21 +1606,6 @@ pub fn render_block_in_run_with_body(
         // by the head's summary.
         return RenderedBlock::default();
     }
-
-    let rail = kind_rail(block.kind);
-    let mut rail_color = theme.rail(rail);
-    if block.streaming || rail == Rail::Running {
-        rail_color = pulse(theme, rail_color, phase);
-    }
-    let colored = rail_is_filled(theme);
-    let rail_style = if colored {
-        Style::default().bg(rail_color)
-    } else {
-        Style::default()
-            .fg(theme.roles.gray_dim)
-            .add_modifier(Modifier::DIM)
-    };
-    let rail_cell = if colored { " " } else { rail_glyph(theme) };
 
     let content_width = chrome::content_width(width).max(8);
     let label = kind_label(block.kind, strings);
@@ -1767,7 +1683,7 @@ pub fn render_block_in_run_with_body(
         TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
     ) && !body.is_empty();
     let prompt_mark = if headerless && matches!(block.kind, TimelineRowKind::UserMessage) {
-        Some((prompt_glyph(theme), theme.rail(Rail::User)))
+        Some((prompt_glyph(theme), theme.roles.accent_user))
     } else {
         None
     };
@@ -1783,7 +1699,7 @@ pub fn render_block_in_run_with_body(
             .map(|span| span.content.as_ref())
             .collect::<String>();
         let marker = if selected { pointer_glyph(theme) } else { " " };
-        let mut header_line = rail_line_marked(rail_style, header, marker, rail_cell);
+        let mut header_line = row_line(marker, header);
         if selected {
             header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
         }
@@ -1853,12 +1769,12 @@ pub fn render_block_in_run_with_body(
                 spans = marked;
                 text = format!("{glyph} {text}");
             }
-            let cell = if index == 0 && selected {
+            let marker = if index == 0 && selected {
                 pointer_glyph(theme)
             } else {
-                rail_cell
+                " "
             };
-            let mut row = rail_line_marked(rail_style, spans, cell, rail_cell);
+            let mut row = row_line(marker, spans);
             if index == 0 && selected {
                 row = row.style(Style::default().bg(theme.roles.surface_highlight));
             }
@@ -1898,21 +1814,13 @@ pub fn render_block_in_run_with_body(
         }
     }
     for (text, style) in status {
-        lines.push(rail_line(
-            rail_style,
-            vec![Span::styled(text.clone(), style)],
-        ));
+        lines.push(row_line(" ", vec![Span::styled(text.clone(), style)]));
         plain.push(text);
     }
 
     // Trailing gap so blocks are separated without a rule.
     for _ in 0..gap_after(block, next) {
-        lines.push(rail_line_marked(
-            rail_style,
-            Vec::new(),
-            rail_cell,
-            rail_cell,
-        ));
+        lines.push(row_line(" ", Vec::new()));
         plain.push(String::new());
     }
 
@@ -1923,66 +1831,23 @@ pub fn render_block_in_run_with_body(
     }
 }
 
-/// Build one rendered row with the rail column.
+/// Build one rendered row: the marker column, the pad, then the content.
 ///
-/// The rail is a space with a *background* colour rather than a line glyph: a
-/// filled cell stays exactly one column wide in every font, renders identically
-/// in the ASCII fallback, and does not depend on a box-drawing glyph existing.
-fn rail_line(rail: Style, spans: Vec<Span<'static>>) -> Line<'static> {
-    rail_line_marked(rail, spans, " ", " ")
-}
-
-/// As [`rail_line`], with a marker glyph in the rail column.
-///
-/// The rail is exactly one column wide: the marker *replaces* the cell rather
-/// than sitting beside it, so marking a block never changes its width.
-fn rail_line_marked(
-    rail: Style,
-    spans: Vec<Span<'static>>,
-    marker: &str,
-    cell: &str,
-) -> Line<'static> {
-    let content = if marker == " " { cell } else { marker };
+/// The marker is the block's selection pointer, or a space. It takes the first
+/// of the margin columns rather than a column of its own, so a marked block's
+/// text stays on the same column as every other block's — a row that shifted by
+/// one would break the left edge the reader scans down.
+fn row_line(marker: &str, spans: Vec<Span<'static>>) -> Line<'static> {
+    debug_assert!(marker.chars().count() <= chrome::PAD_LEFT);
+    let pad = chrome::PAD_LEFT.saturating_sub(marker.chars().count());
     let mut out = Vec::with_capacity(spans.len() + 2);
-    out.push(Span::styled(content.to_string(), rail));
-    out.push(Span::raw(" ".repeat(chrome::PAD_LEFT)));
+    out.push(Span::raw(marker.to_string()));
+    out.push(Span::raw(" ".repeat(pad)));
     out.extend(spans);
     Line::from(out)
 }
 
-/// Whether the rail can be drawn as a filled cell, or needs a glyph.
-///
-/// A filled cell is the better rail: it is exactly one column wide in every
-/// font and needs no box-drawing glyph. But it is carried entirely by colour,
-/// so a terminal without colour would lose the block structure altogether. The
-/// glyph fallback keeps the structure and lets the colour go, which is the same
-/// trade every other surface makes.
-fn rail_is_filled(theme: &TuiTheme) -> bool {
-    theme.has_color()
-}
-
-/// The rail cell used when the rail cannot be a filled block.
-fn rail_glyph(theme: &TuiTheme) -> &'static str {
-    if theme.glyphs() == crate::theme::GlyphMode::Unicode {
-        "│"
-    } else {
-        "|"
-    }
-}
-
 /// Soften a rail colour for one frame of the running animation.
-fn pulse(theme: &TuiTheme, color: Color, phase: u32) -> Color {
-    // A slow triangle wave: fully lit, then two steps down. Fast enough to read
-    // as activity, slow enough not to flicker.
-    let step = (phase % 6) as f32;
-    let weight = if step < 3.0 {
-        1.0 - step * 0.22
-    } else {
-        0.34 + (step - 3.0) * 0.22
-    };
-    theme.fade(color, weight)
-}
-
 /// The background band a block body sits on, when it benefits from one.
 fn body_band(block: &Block, theme: &TuiTheme) -> Option<Style> {
     if !block.is_open() {
@@ -2534,115 +2399,21 @@ mod tests {
     }
 
     #[test]
-    fn every_rendered_row_carries_the_rail() {
-        // The rail is what makes a long block read as one object; a row without
-        // it would visually detach from its block.
-        let mut entry = block("a", TimelineRowKind::Command, "one\ntwo\nthree");
-        // A command is a dense row; opening it is what reveals its output.
-        entry.collapsible = true;
-        entry.expanded = true;
-        let rendered = render_block(&entry, &theme(), 60, strings());
-        assert!(rendered.height > 3);
-        for line in &rendered.lines {
-            let first = line.spans.first().expect("a rail span");
-            // The rail is a filled cell, so its colour lives in the background;
-            // a foreground-coloured space would be invisible.
-            assert!(first.style.bg.is_some(), "the rail cell is not filled");
-            assert_eq!(line.spans[1].content.as_ref(), " ".repeat(chrome::PAD_LEFT));
-        }
-    }
-
-    #[test]
-    fn each_block_kind_wears_its_own_rail_colour() {
-        // Scanning a session by colour only works if the mapping is stable and
-        // the roles are actually distinct.
-        let palette = theme();
-        let rail_of = |kind| {
-            let mut entry = block("a", kind, "body");
-            entry.collapsible = false;
-            render_block(&entry, &palette, 60, strings()).lines[0].spans[0]
-                .style
-                .bg
-                .expect("rail colour")
-        };
-        // The rails a reader has to tell apart at a glance must not collide, or
-        // the colour carries no information.
-        let distinct = [
-            TimelineRowKind::UserMessage,
-            TimelineRowKind::AgentMessage,
-            TimelineRowKind::Reasoning,
-            TimelineRowKind::ToolCall,
-            TimelineRowKind::Error,
-        ]
-        .map(rail_of);
-        let unique = distinct
-            .iter()
-            .map(|color| format!("{color:?}"))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), distinct.len(), "{distinct:?}");
-    }
-
-    #[test]
-    fn a_colour_less_terminal_keeps_the_rail_as_a_glyph() {
-        // The rail is carried by colour, so without colour the block structure
-        // would vanish entirely. It falls back to a drawn line.
-        let plain = TuiTheme::resolve(
-            Some("vibex-dark"),
-            GpuiThemeMode::Dark,
-            ColorCapability {
-                mode: ColorMode::None,
-                glyphs: GlyphMode::Unicode,
-            },
-        );
-        let mut entry = block("a", TimelineRowKind::Command, "one\ntwo");
-        entry.collapsible = false;
-        let rendered = render_block(&entry, &plain, 60, strings());
-        for line in &rendered.lines {
-            assert_eq!(line.spans[0].content.as_ref(), "│");
-            assert_eq!(line.spans[0].style.bg, None);
-        }
-        // The ASCII glyph mode uses a pipe.
-        let ascii = TuiTheme::resolve(
-            Some("vibex-dark"),
-            GpuiThemeMode::Dark,
-            ColorCapability {
-                mode: ColorMode::None,
-                glyphs: GlyphMode::Ascii,
-            },
-        );
-        let rendered = render_block(&entry, &ascii, 60, strings());
-        assert_eq!(rendered.lines[0].spans[0].content.as_ref(), "|");
-    }
-
-    #[test]
-    fn the_rail_runs_down_the_whole_block_not_just_its_header() {
-        // A rail that only covers the first row would not group anything.
-        let mut entry = block("a", TimelineRowKind::Command, "one\ntwo\nthree");
-        entry.collapsible = true;
-        entry.expanded = true;
-        let rendered = render_block(&entry, &theme(), 60, strings());
-        let rail = rendered.lines[0].spans[0].style.bg.expect("rail colour");
-        assert!(rendered.height > 4);
-        for (index, line) in rendered.lines.iter().enumerate() {
-            let cell = line.spans.first().expect("a rail cell");
-            assert_eq!(
-                cell.style.bg,
-                Some(rail),
-                "row {index} fell out of the block's rail"
-            );
-        }
-    }
-
-    #[test]
     fn the_current_block_is_marked_without_inverting_its_text() {
         let mut entry = block("a", TimelineRowKind::AgentMessage, "body");
         entry.collapsible = false;
         let plain = render_block(&entry, &theme(), 60, strings());
-        let marked = render_block_styled(&entry, &theme(), 60, strings(), 0, true);
-        // The marker replaces the blank rail cell on the header only.
+        let marked = render_block_styled(&entry, &theme(), 60, strings(), true);
+        // The marker takes the first margin column, and only on the header, so
+        // the text of a marked block stays on the column of every other block.
         assert_eq!(plain.lines[0].spans[0].content.as_ref(), " ");
         assert_eq!(marked.lines[0].spans[0].content.as_ref(), "▌");
         assert_eq!(marked.lines[1].spans[0].content.as_ref(), " ");
+        assert_eq!(
+            plain.lines[0].spans[1].content.as_ref(),
+            marked.lines[0].spans[1].content.as_ref(),
+            "the marker moved the text"
+        );
         // The header is lifted rather than reversed: reverse video on a whole
         // row is the heaviest emphasis a terminal has.
         let header = marked.lines[0].style;
@@ -2757,19 +2528,19 @@ mod tests {
     }
 
     #[test]
-    fn only_a_running_transcript_animates() {
-        // The idle contract is zero frames; an animation that ticks regardless
-        // would break it.
+    fn a_streaming_block_is_still_what_makes_the_band_live() {
+        // The transcript has no animation of its own any more — a delta marks
+        // the app dirty — but "something is arriving" is still the question the
+        // turn band asks before it draws a spinner.
         let mut transcript = transcript_with(3, "settled");
-        assert!(!transcript.advance_animation());
+        assert!(!transcript.is_animating());
 
-        let mut running = transcript_with(2, "working");
         let mut streaming = block("live", TimelineRowKind::AgentMessage, "…");
         streaming.streaming = true;
-        let mut entries = running.blocks().to_vec();
+        let mut entries = transcript.blocks().to_vec();
         entries.push(streaming);
-        running.set_blocks(entries);
-        assert!(running.advance_animation());
+        transcript.set_blocks(entries);
+        assert!(transcript.is_animating());
     }
 
     #[test]

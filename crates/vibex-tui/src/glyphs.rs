@@ -46,14 +46,6 @@ pub fn prompt_arrow(tier: GlyphTier) -> &'static str {
 /// Width of [`prompt_arrow`] in columns.
 pub const PROMPT_ARROW_WIDTH: usize = 2;
 
-/// The rail of a collapsed block. Always one column.
-pub fn collapsed_accent(tier: GlyphTier) -> &'static str {
-    match tier {
-        GlyphTier::Full => "❙",
-        GlyphTier::Legacy => "|",
-    }
-}
-
 /// The heavy vertical used for an accent rail drawn as a line. One column.
 pub fn accent_bar(tier: GlyphTier) -> &'static str {
     match tier {
@@ -242,7 +234,6 @@ mod tests {
     fn single_column_glyphs_stay_single_column() {
         for tier in [full(), legacy()] {
             for glyph in [
-                collapsed_accent(tier),
                 accent_bar(tier),
                 ballot_x(tier),
                 check_mark(tier),
@@ -286,12 +277,11 @@ mod tests {
         // and the small geometric shapes are not in it.
         let forbidden = [
             "│", "┃", "▏", "▌", "▾", "▴", "•", "▪", "⠋", "⠙", "○", "◎", "◉", "◆", "◇", "◈", "✗",
-            "✓", "⇣", "❯", "❙", "╭", "╰", "─",
+            "✓", "⇣", "❯", "╭", "╰", "─",
         ];
         let tier = legacy();
         let mut drawn = vec![
             prompt_arrow(tier),
-            collapsed_accent(tier),
             accent_bar(tier),
             ballot_x(tier),
             check_mark(tier),

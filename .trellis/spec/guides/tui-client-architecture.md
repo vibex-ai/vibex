@@ -155,8 +155,9 @@ Rules that make this work:
 * **No permanently-boxed side pane.** Every border costs two columns or two rows
   the content does not get; on a fixed grid that is the whole budget. Navigation
   is a full-screen view or an overlay instead.
-* **The transcript has no frame.** Its structure is the per-block rail, which is
-  inside the content rather than around it.
+* **The transcript has no frame.** Its structure is the glyphs in its own text —
+  the prompt mark, the work bullet, the heading colour — and a blank row between
+  blocks, rather than a border around them or a rail beside them.
 * **Optional bands collapse to zero height**, never to a smaller size, and the
   frame skips their renderers entirely. `SHORT_TERMINAL_ROWS` drops the banner,
   tasks, todo and dock bands before it touches the transcript or the composer.
@@ -209,10 +210,12 @@ Rules that make this work:
 
 Structure is carried by four devices, in this order of importance:
 
-1. **The rail.** Every transcript block owns a one-column bar down its whole
-   height, coloured by block role (`ThemeRole::accent_*`, selected through
-   `TuiTheme::rail`). It is a filled cell, not a drawn glyph, and it is
-   *background*-coloured — a foreground-coloured space is invisible.
+1. **The left margin.** Two columns, the first of which carries the selection
+   pointer. It is a margin, not a bar: a per-block column of colour costs every
+   row a column of text, and once a block is one line tall the bars of adjacent
+   blocks read as one striped edge rather than as one bar per block. A block is
+   identified by what it says — the prompt mark on the reader's own words, the
+   bullet on a work item, the colour of the text — not by a stripe beside it.
 2. **The turn rail.** One tick per turn in the gutter, positioned by
    conversation order, with chevrons to jump a turn at a time. It maps the
    session, not the buffer.
@@ -224,12 +227,13 @@ Structure is carried by four devices, in this order of importance:
 
 Rules that follow:
 
-* A block is `rail | pad(2) | content | pad(1)`, and the rail covers the block's
-  status and attribution rows too, so the block reads as one object.
+* A block is `margin(2) | content | pad(1)`, and the margin is empty except for
+  the pointer: a marker that took a column of its own would shift the block's
+  text one column to the right of every other block's.
 * **The transcript is dense by default, and a row has to earn its height.**
   A work item or a notice is *one* row: its action and the single detail that
   identifies it (`is_dense_row`), with its body behind the fold and in the block
-  detail overlay. Messages keep no "You"/"Agent" header — the rail colour says
+  detail overlay. Messages keep no "You"/"Agent" header — the prompt mark says
   who is speaking and the reader's own words carry a `❯` on their first line.
   A kind label is never printed when the title already says it. Two dense rows
   are separated by nothing; everything else keeps the gap that makes it an
@@ -240,12 +244,13 @@ Rules that follow:
 * A run of three or more collapsed rows *of the same kind* folds into its first
   member (`MIN_GROUP_RUN`), which reports `+N` before its summary so truncation
   cannot hide the count. An expanded or failed row breaks the run.
-* The current block is marked with a pointer in the rail plus a lifted header.
+* The current block is marked with a pointer in the margin plus a lifted header.
   Never a full-width reversed row: it is the heaviest emphasis a terminal has.
 * Focus is expressed as a fade toward the canvas (`TuiTheme::fade`), not as a
   colour switch, so a blurred pane stays recognisable.
-* Colour is never the only carrier. When `has_color()` is false the rail becomes
-  a drawn glyph and bands disappear.
+* Colour is never the only carrier. Structure is drawn with glyphs — the prompt
+  mark, the work bullet, the disclosure, the heading text itself — so a theme
+  without colour loses emphasis, not meaning.
 * **Everything structural comes from `crate::glyphs`**, which declares each
   glyph's fallback and the width invariant it must keep. The prompt arrow is
   always two columns and every spinner frame always one, so a degradation never
@@ -344,7 +349,8 @@ transcript keeps one renderer per streaming block and drops it when the answer
 finishes, which is what makes the last frame of a stream and a reload of the
 same session the same render — a test asserts the streamed rows equal a whole
 render at every chunk boundary. There is no caret glyph in the streamed text:
-the rail pulses while the block is live, so nothing shifts and nothing flickers.
+nothing is appended to mark the live block, so nothing shifts and nothing
+flickers; the turn band's spinner is what says the Agent is still working.
 
 **A streamed block is re-rendered at push time, and laid out at frame time.**
 The delta arrives on the worker's message, the renderer advances then, and the

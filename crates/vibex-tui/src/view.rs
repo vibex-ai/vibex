@@ -721,8 +721,9 @@ fn render_todo_band(
 /// The transcript band: full width, no frame.
 ///
 /// A border around the transcript would spend two columns and two rows on a
-/// rectangle the reader already knows the shape of. The per-block rail is the
-/// structure, and it is inside the content rather than around it.
+/// rectangle the reader already knows the shape of. The blocks separate
+/// themselves with a blank row, and the reader's own words carry a prompt mark,
+/// so the band needs no frame and no rail.
 fn render_scrollback(
     frame: &mut Frame<'_>,
     area: Rect,

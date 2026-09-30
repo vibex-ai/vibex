@@ -7,7 +7,7 @@
 //!   ┌─ outer padding (1 row top and bottom, 2 columns each side) ─┐
 //!   │ <cwd>                            <seat> │ <context> │ …    │  status
 //!   │                                                            │
-//!   │  transcript — no border, the rail is its structure          │  fills
+//!   │  transcript — no border, its own left edge is the margin    │  fills
 //!   │                                                            │
 //!   │ ⠹ running · read src/net/upload.rs          12s ⇣1.2k      │  turn status
 //!   │ ╭─ title ────────────────────────────────────────╮         │
@@ -20,7 +20,8 @@
 //! Why a stack rather than panes: a terminal is a fixed grid, and every border
 //! spent on dividing it is two columns or two rows the content does not get. A
 //! transcript is the thing being read, so it takes the full width and the
-//! structure inside it -- the per-block rail -- does the work a frame would.
+//! glyphs inside it -- the prompt mark, the work bullet, the heading colour --
+//! do the work a frame would.
 //! Navigation that would otherwise be a permanent sidebar becomes a full-screen
 //! view or an overlay, which is also where it can show enough to be useful.
 //!

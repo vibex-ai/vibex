@@ -475,23 +475,6 @@ fn parse_hex_color(value: &str) -> Option<u32> {
     (value.len() == 6).then(|| u32::from_str_radix(value, 16).ok())?
 }
 
-/// The transcript rail a block wears.
-///
-/// Named by intent rather than by colour so a theme change cannot make a
-/// thinking block look like an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rail {
-    User,
-    Agent,
-    Thinking,
-    Tool,
-    System,
-    Error,
-    Success,
-    Running,
-    Attention,
-}
-
 /// Extract the packed sRGB value of a resolved colour.
 pub fn color_rgb(color: Color) -> Option<u32> {
     match color {
@@ -716,22 +699,6 @@ impl TuiTheme {
 
     pub fn success(&self) -> Style {
         Style::default().fg(self.roles.success)
-    }
-
-    /// The rail colour for a block kind. One place decides the mapping, so a
-    /// new block kind cannot silently inherit the wrong hue.
-    pub fn rail(&self, rail: Rail) -> Color {
-        match rail {
-            Rail::User => self.roles.accent_user,
-            Rail::Agent => self.roles.accent_agent,
-            Rail::Thinking => self.roles.accent_thinking,
-            Rail::Tool => self.roles.accent_tool,
-            Rail::System => self.roles.accent_system,
-            Rail::Error => self.roles.accent_error,
-            Rail::Success => self.roles.accent_success,
-            Rail::Running => self.roles.accent_running,
-            Rail::Attention => self.roles.accent_attention,
-        }
     }
 
     /// Fade a colour toward the canvas. `weight` is 1.0 for full strength and
