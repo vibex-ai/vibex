@@ -537,6 +537,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if Bands::is_visible(bands.gutter) && app.page.is_session_page() {
         render_gutter(frame, bands.gutter, app, &theme);
     }
+    // Cleared like the dock: opening the dock folds this band away, and a stale
+    // rect would let a click select a row that is no longer on screen.
+    app.regions.queue = None;
     if Bands::is_visible(bands.queue) {
         render_queue_band(frame, bands.queue, app, &theme, strings);
     }
