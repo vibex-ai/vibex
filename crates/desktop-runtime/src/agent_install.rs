@@ -179,6 +179,11 @@ const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
 const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
 const DEEPSEEK_HARNESS_ACP_PACKAGE: &str = "@openma/deepseek-harness-acp";
 const HERMES_CLI_PACKAGE: &str = "hermes-agent";
+/// The successor to the archived Python `kimi-cli`. Its own release channel is
+/// npm, and the ACP Registry entry called `kimi` still points at the PyPI line
+/// whose final release cannot start ACP at all, so this Agent must not resolve
+/// through the Registry.
+const KIMI_CODE_PACKAGE: &str = "@moonshot-ai/kimi-code";
 const MINION_ACP_RUNTIME_PACKAGE: &str = "agent-client-protocol";
 const MINION_ACP_RUNTIME_VERSION: &str = "0.8.1";
 const NODE_RELEASE_INDEX_URL: &str = "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt";
@@ -963,6 +968,18 @@ impl AgentInstallService {
                         kiro: None,
                     },
                 }
+            }
+            // The ACP Registry's `kimi` entry is the archived Python CLI, whose
+            // final release turns its entry point into a deprecation gate that
+            // prints a notice and exits 0 without ever speaking ACP. Resolve the
+            // successor's own npm channel instead of that entry.
+            ManagedCliAgent::KimiCode => {
+                self.load_latest_npm_entry(
+                    agent.registry_id(),
+                    KIMI_CODE_PACKAGE,
+                    vec!["acp".to_string()],
+                )
+                .await?
             }
             ManagedCliAgent::Kiro => {
                 let distribution = self.fetch_latest_kiro_distribution().await?;
@@ -2627,6 +2644,7 @@ enum ManagedCliAgent {
     Zcode,
     Hermes,
     Kiro,
+    KimiCode,
 }
 
 impl ManagedCliAgent {
@@ -2637,6 +2655,7 @@ impl ManagedCliAgent {
             "zcode" => Some(Self::Zcode),
             "hermes" => Some(Self::Hermes),
             "kiro" => Some(Self::Kiro),
+            "kimi" => Some(Self::KimiCode),
             _ => None,
         }
     }
@@ -2648,6 +2667,7 @@ impl ManagedCliAgent {
             Self::Zcode => "zcode-acp-server",
             Self::Hermes => "hermes",
             Self::Kiro => "kiro",
+            Self::KimiCode => "kimi",
         }
     }
 }

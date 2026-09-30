@@ -313,14 +313,22 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "kimi",
         "Kimi Code CLI",
         "Moonshot AI's open-source terminal coding agent",
-        // 1.52.0 is the archived CLI's final release, and its entry point is a
-        // deprecation gate: `kimi acp` prints a migration notice and exits 0
-        // without ever speaking ACP, so the pin cannot move to it. The agent is
-        // end-of-life upstream; staying on the last release that still serves
-        // ACP is deliberate, and migrating to the successor `kimi-code` CLI is
-        // a separate, larger change.
-        "1.49.0",
-        "https://github.com/MoonshotAI/kimi-cli",
+        // Moonshot archived the Python `kimi-cli` line: 1.51.0 marked it
+        // end-of-life and 1.52.0 turned its entry point into a deprecation gate
+        // that prints a migration notice and exits 0 without ever speaking ACP.
+        // The successor is the npm package `@moonshot-ai/kimi-code`, which keeps
+        // the `kimi acp` launch shape and the `config.toml` provider/model
+        // tables but renames the state root to `KIMI_CODE_HOME` and respells two
+        // provider types.
+        //
+        // No compatibility floor is declared, and that is deliberate. The
+        // projection now writes the successor's vocabulary, so the archived CLI
+        // could not read what Vibex writes: leaving 1.49.0 as the floor would
+        // advertise a credential and model surface that does not work. A runtime
+        // still on the old CLI collapses to the conservative surface instead,
+        // which is the honest answer, and the managed install moves it forward.
+        "2.1.1",
+        "https://github.com/MoonshotAI/kimi-code",
         &["kimi", "acp"],
     )
     .with_preset_id("kimi-cli"),

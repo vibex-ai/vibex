@@ -4065,11 +4065,22 @@ ResolvedAgentProviderProjection {
     configured id. 3.0.56 also narrowed the advertised ACP model listing to chat
     models; Vibex reads that list rather than assuming it, so it only gets
     cleaner.
-  - Kimi — 1.52.0, the archived CLI's final release, replaces its entry point
-    with a deprecation gate that prints a migration notice and exits 0 without
-    ever speaking ACP. The pin stays on 1.49.0 until the Agent moves to the
-    successor `kimi-code` CLI, which also renames the config root and several
-    provider-type spellings.
+  - Kimi, which is not a pin bump but a move to a different product. Moonshot
+    archived the Python `kimi-cli` line — 1.51.0 marked it end-of-life and
+    1.52.0 turned its entry point into a deprecation gate that prints a
+    migration notice and exits 0 without ever speaking ACP — and the successor
+    is the npm package `@moonshot-ai/kimi-code`. The launch shape survives
+    (`kimi acp`) and so does the `config.toml` provider/model table, but the
+    state root moves from `KIMI_SHARE_DIR`/`~/.kimi` to
+    `KIMI_CODE_HOME`/`~/.kimi-code`, and two provider types are respelled:
+    `openai_legacy` becomes `openai` and `google_genai` becomes `google-genai`.
+    The successor drops an entry whose type is outside its accepted set rather
+    than translating it, so the old spelling silently loses the provider. No
+    compatibility floor is declared, deliberately: the projection now writes the
+    successor's vocabulary, and the archived CLI cannot read it, so advertising
+    the floor would promise a credential and model surface that does not work.
+    The managed install resolves the successor's npm channel directly, because
+    the ACP Registry entry named `kimi` still points at the archived line.
   - DeepSeek Harness — 0.4.35 moves the bundled runtime to `0.1.7-rc.2`, turns
     `settings.yaml` into a one-shot import that is renamed on read, drops the
     Chat Completions `protocol` option in favour of the Messages base URL, and

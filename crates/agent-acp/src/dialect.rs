@@ -310,11 +310,14 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
         .profiled("registers MCP toolsets from ~/.hermes/config.yaml at launch")
         .with_enricher(AgentEventEnricherKind::Hermes)
         .with_mcp_delivery(McpWireDelivery::NativeConfig),
-    // Kimi Code 1.49 accepts ACP MCP descriptors directly. Its state root is
-    // selected with KIMI_SHARE_DIR; provider/model configuration is loaded
-    // from that root's config.toml before session/new.
+    // Kimi Code CLI accepts ACP MCP descriptors directly. Its state root is
+    // selected with KIMI_CODE_HOME (the archived Python CLI used
+    // KIMI_SHARE_DIR); provider/model configuration is loaded from that
+    // root's config.toml before session/new. Both names stay in the scrub list
+    // because either can name real credential state on a machine that has run
+    // both CLIs.
     AgentDialectProfile::generic("kimi")
-        .profiled("forwards ACP MCP descriptors and loads provider state from KIMI_SHARE_DIR")
+        .profiled("forwards ACP MCP descriptors and loads provider state from KIMI_CODE_HOME")
         .with_credential_scrub(&[
             "KIMI_SHARE_DIR",
             "KIMI_CODE_HOME",

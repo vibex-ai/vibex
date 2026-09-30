@@ -1634,7 +1634,13 @@ fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
         "grok" => Some("GROK_HOME"),
         "hermes" => Some("HERMES_HOME"),
         "kilo" => None,
-        "kimi" => Some("KIMI_SHARE_DIR"),
+        // Kimi Code CLI resolves its state root from `KIMI_CODE_HOME` and
+        // defaults to `~/.kimi-code`. The archived Python CLI used
+        // `KIMI_SHARE_DIR` and `~/.kimi`, and 2.x reads that name only inside
+        // its one-shot `kimi migrate` source resolver, so the private root has
+        // to be published under the new name or the Agent would read the user's
+        // real home while Vibex wrote a config it never loads.
+        "kimi" => Some("KIMI_CODE_HOME"),
         "mistral-vibe" => Some("VIBE_HOME"),
         "pi" => Some("PI_CODING_AGENT_DIR"),
         "qwen-code" => Some("QWEN_HOME"),
@@ -2760,11 +2766,17 @@ fn zcode_provider_kind(model: &AgentConfiguredModelBinding) -> &'static str {
 }
 
 fn kimi_provider_type(model: &AgentConfiguredModelBinding) -> &'static str {
+    // Kimi Code CLI's accepted provider types are `anthropic`, `openai`,
+    // `kimi`, `google-genai`, `openai_responses` and `vertexai`. The archived
+    // Python CLI spelled two of them differently — `openai_legacy` and
+    // `google_genai` — and 2.x keeps those spellings only in the migration
+    // map it applies to an imported legacy config, not at runtime: an entry
+    // whose type is outside the set is dropped rather than translated.
     match model.wire_protocol_id.as_str() {
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
         vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai_responses",
-        vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "google_genai",
-        _ => "openai_legacy",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "google-genai",
+        _ => "openai",
     }
 }
 
@@ -3403,7 +3415,7 @@ fn kimi_overlay(
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let provider_type = model.map(kimi_provider_type).unwrap_or("openai_legacy");
+    let provider_type = model.map(kimi_provider_type).unwrap_or("openai");
     let endpoint = endpoint
         .map(|endpoint| endpoint.url.as_str())
         .unwrap_or_default();
@@ -5573,7 +5585,7 @@ mod tests {
                 model_env_key: None,
                 overlay_path: Some("config.toml"),
                 overlay_format: Some("toml"),
-                runtime_home_env_key: Some("KIMI_SHARE_DIR"),
+                runtime_home_env_key: Some("KIMI_CODE_HOME"),
             },
             TypedProjectionExpectation {
                 agent_id: "mistral-vibe",
@@ -6009,7 +6021,7 @@ mod tests {
         assert_eq!(config["default_model"].as_str(), Some("agent-model"));
         assert_eq!(
             config["providers"]["vibex"]["type"].as_str(),
-            Some("openai_legacy")
+            Some("openai")
         );
         assert_eq!(
             config["providers"]["vibex"]["base_url"].as_str(),
@@ -6019,6 +6031,21 @@ mod tests {
             config["providers"]["vibex"]["api_key"].as_str(),
             Some(TYPED_SECRET_SENTINEL)
         );
+        // Kimi Code CLI requires `provider`, `model` and `max_context_size` on
+        // every declared Model and drops the entry when the provider type is
+        // outside its accepted set, so the projection has to name all of them.
+        assert_eq!(
+            config["models"]["agent-model"]["provider"].as_str(),
+            Some("vibex")
+        );
+        assert_eq!(
+            config["models"]["agent-model"]["model"].as_str(),
+            Some("agent-model")
+        );
+        assert!(
+            config["models"]["agent-model"]["max_context_size"].is_integer(),
+            "the successor CLI requires a declared context size"
+        );
         let auth = fs::read_to_string(&resolved.overlay_files[1]).unwrap();
         let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
         assert_eq!(auth["access_token"], TYPED_SECRET_SENTINEL);
@@ -6026,7 +6053,7 @@ mod tests {
         assert_eq!(
             resolved
                 .non_secret_env
-                .get("KIMI_SHARE_DIR")
+                .get("KIMI_CODE_HOME")
                 .map(PathBuf::from),
             Some(resolved.overlay_root.clone())
         );
@@ -7406,7 +7433,7 @@ mod tests {
         // Kimi Code CLI names each chat provider in its `type` key.
         assert_eq!(
             kimi_provider_type(&with(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)),
-            "openai_legacy"
+            "openai"
         );
         assert_eq!(
             kimi_provider_type(&with(WIRE_PROTOCOL_OPENAI_RESPONSES)),
@@ -7418,7 +7445,7 @@ mod tests {
         );
         assert_eq!(
             kimi_provider_type(&with(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI)),
-            "google_genai"
+            "google-genai"
         );
 
         // pi names the protocol implementation directly in `models.json`.
