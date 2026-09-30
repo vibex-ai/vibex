@@ -1043,6 +1043,74 @@ fn a_composer_click_places_the_cursor() {
 }
 
 #[test]
+fn a_draft_selection_is_painted_over_the_text() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.set_text("hello world");
+    app.composer.move_to_start();
+    for _ in 0..5 {
+        app.composer.extend_right();
+    }
+    let buffer = render_buffer(&mut app, 120, 40);
+    let region = app
+        .regions
+        .composer
+        .expect("the composer published its rows");
+
+    // Collect the style of two cells in the same row: one inside the
+    // selection and one outside it.
+    let mut selected = None;
+    let mut plain = None;
+    for row in region.y..region.bottom() {
+        for column in region.x..region.right() {
+            let Some(cell) = buffer.cell((column, row)) else {
+                continue;
+            };
+            match cell.symbol() {
+                "h" => selected = Some(cell.style()),
+                "w" => plain = Some(cell.style()),
+                _ => {}
+            }
+        }
+    }
+    let (selected, plain) = (
+        selected.expect("draft on screen"),
+        plain.expect("draft on screen"),
+    );
+    assert_ne!(
+        selected, plain,
+        "the selected grapheme is painted like the rest of the draft"
+    );
+    assert_eq!(app.composer.selected_text().as_deref(), Some("hello"));
+}
+
+#[test]
+fn a_drag_inside_the_composer_extends_the_draft_selection() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.set_text("first line\nsecond line");
+    let _ = render(&mut app, 120, 40);
+    let region = app
+        .regions
+        .composer
+        .expect("the composer published its rows");
+
+    // A press on the first cell starts the selection; a drag to column 5 of the
+    // same row covers the first word.
+    app.composer.move_cursor_to_cell(0, 0);
+    app.composer.begin_selection();
+    assert!(app.drag_draft_selection(region.x + 5, region.y));
+    assert_eq!(app.composer.selected_text().as_deref(), Some("first"));
+
+    // The selection survives a frame, so a highlight the reader made is not
+    // erased by the next repaint.
+    let _ = render(&mut app, 120, 40);
+    assert_eq!(app.composer.selected_text().as_deref(), Some("first"));
+}
+
+#[test]
 fn the_queue_band_shows_the_cursor_and_its_keys() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);

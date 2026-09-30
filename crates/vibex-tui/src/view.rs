@@ -2023,12 +2023,13 @@ fn render_composer(
         );
     } else {
         let (cursor_line, _) = app.composer.cursor_line_column();
-        let lines = app
-            .composer
-            .display_lines(width)
+        let chips = app.composer.chip_ranges();
+        let selection = app.composer.selection();
+        let rows = app.composer.display_rows(width);
+        let lines = rows
             .into_iter()
             .enumerate()
-            .map(|(index, (text, is_cursor_line))| {
+            .map(|(index, row)| {
                 let gutter = if index == 0 {
                     Span::styled(prefix.to_string(), prefix_style)
                 } else {
@@ -2036,13 +2037,20 @@ fn render_composer(
                 };
                 // The cursor's line is drawn at full strength; the rest of a
                 // long draft recedes so the eye stays where typing happens.
-                let style = if index == cursor_line && is_cursor_line {
+                let style = if index == cursor_line && row.cursor_line {
                     theme.base()
                 } else {
                     theme.base().add_modifier(Modifier::DIM)
                 };
                 let mut spans = vec![gutter];
-                spans.extend(composer_line_spans(&text, style, theme));
+                spans.extend(composer_line_spans(
+                    &row.text,
+                    style,
+                    theme,
+                    row.source_start,
+                    &chips,
+                    selection,
+                ));
                 Line::from(spans)
             })
             .collect::<Vec<_>>();
@@ -3361,28 +3369,52 @@ fn render_help(
 /// A chip is a single object visually as well as in the buffer: the brackets
 /// are dim and the label is coloured, so a draft with a log in it reads as
 /// "a log is attached" rather than "the draft begins with a strange sentence".
-fn composer_line_spans(text: &str, style: Style, theme: &TuiTheme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("[Pasted:") {
-        let after = &rest[start..];
-        let Some(end) = after.find(']') else {
-            break;
-        };
-        if start > 0 {
-            spans.push(Span::styled(rest[..start].to_string(), style));
+/// One display row of the draft, styled in runs.
+///
+/// The row arrives as plain text plus where it starts in the buffer, so chip
+/// labels and the selection can be recognised by byte offset rather than by
+/// scanning for marker strings. Three styles can apply to one grapheme and they
+/// have a fixed precedence: the selection wins over a chip, and a chip wins
+/// over the surrounding prose — a highlight the reader made must never be
+/// hidden by chrome.
+fn composer_line_spans(
+    text: &str,
+    style: Style,
+    theme: &TuiTheme,
+    source_start: usize,
+    chips: &[(usize, usize)],
+    selection: Option<(usize, usize)>,
+) -> Vec<Span<'static>> {
+    let chip_style = Style::default()
+        .fg(theme.roles.accent_attention)
+        .add_modifier(Modifier::BOLD);
+    let selection_style = selection_style(theme);
+    let style_for = |offset: usize| -> Style {
+        let absolute = source_start + offset;
+        if selection.is_some_and(|(start, end)| absolute >= start && absolute < end) {
+            selection_style
+        } else if chips
+            .iter()
+            .any(|(start, end)| absolute >= *start && absolute < *end)
+        {
+            chip_style
+        } else {
+            style
         }
-        let label = &after[..=end];
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(theme.roles.accent_attention)
-                .add_modifier(Modifier::BOLD),
-        ));
-        rest = &after[end + 1..];
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = style;
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        let grapheme_style = style_for(offset);
+        if grapheme_style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = grapheme_style;
+        run.push_str(grapheme);
     }
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_string(), style));
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
     }
     if spans.is_empty() {
         spans.push(Span::styled(String::new(), style));

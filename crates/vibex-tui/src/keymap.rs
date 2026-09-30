@@ -899,6 +899,21 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ComposerLineEnd,
         "Line end",
     ),
+    // `Ctrl+A` already owns line-start in this scope, so the whole-draft
+    // selection gets the Alt layer, which is where the composer keeps its
+    // larger edits (kill, redo, word motion).
+    binding(
+        Scope::Composer,
+        Chord::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        Intent::SelectAllDraft,
+        "Select all",
+    ),
+    binding(
+        Scope::Composer,
+        Chord::new(KeyCode::Char('c'), KeyModifiers::ALT),
+        Intent::CopyDraftSelection,
+        "Copy draft",
+    ),
     // ---- overlays -------------------------------------------------------
     binding(
         Scope::Overlay,

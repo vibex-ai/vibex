@@ -248,6 +248,11 @@ strings! {
         "草稿中还没有剪切过内容",
         "草稿中還沒有剪下過內容"
     },
+    composer_nothing_selected => {
+        "Select part of the draft first",
+        "请先选中草稿中的内容",
+        "請先選取草稿中的內容"
+    },
     composer_queue => { "Queue", "排队", "排隊" },
     composer_interrupt => { "Interrupt", "打断", "中斷" },
     composer_continue => { "Continue", "继续", "繼續" },

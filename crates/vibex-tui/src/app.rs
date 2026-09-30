@@ -396,6 +396,9 @@ pub struct App {
     /// The mouse selection over the transcript, while it is being made or after
     /// it has been copied.
     pub text_selection: Option<TextSelection>,
+    /// Whether the button went down inside the composer, so a drag belongs to
+    /// the draft instead of the transcript.
+    pub draft_selecting: bool,
     /// The last left click, so two clicks in the same cell can be told apart
     /// from two clicks in different ones.
     pub last_click: Option<(std::time::Instant, usize, u16)>,
@@ -684,6 +687,7 @@ impl App {
             history_selection: 0,
             recent_commands: Vec::new(),
             text_selection: None,
+            draft_selecting: false,
             last_click: None,
             queued_messages: Vec::new(),
             queue_selection: None,
@@ -1601,6 +1605,26 @@ impl App {
             head: (line, column),
             dragging: true,
         });
+    }
+
+    /// Extend the draft selection to the cell under a drag.
+    ///
+    /// The pointer is clamped into the composer: a drag that leaves the box
+    /// still selects to its nearest edge rather than jumping into the
+    /// transcript, and a draft that is shorter than the pointer's row simply
+    /// ends at its last character.
+    pub fn drag_draft_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(region) = self.regions.composer else {
+            return false;
+        };
+        if region.width == 0 || region.height == 0 {
+            return false;
+        }
+        let column = column.clamp(region.x, region.right().saturating_sub(1));
+        let row = row.clamp(region.y, region.bottom().saturating_sub(1));
+        self.composer
+            .extend_selection_to_cell(row - region.y, column - region.x);
+        true
     }
 
     /// Extend the selection in progress to one cell.

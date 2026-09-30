@@ -140,6 +140,35 @@ struct Snapshot {
     text: String,
     cursor: usize,
     chips: Vec<PasteChip>,
+    selection: Option<DraftSelection>,
+}
+
+/// A selection inside the draft, in byte offsets.
+///
+/// The `head` is always the cursor: every motion moves the head, and a
+/// selection is only non-empty while the two ends differ. Keeping the two in
+/// step means a selection never has to be translated when the text around it
+/// changes, because the cursor's own maintenance already did that work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftSelection {
+    /// The end that stays put while the head moves.
+    pub anchor: usize,
+    /// The moving end, which is also where the cursor is.
+    pub head: usize,
+}
+
+/// One visual row of the draft: what to paint and where it came from.
+///
+/// A row's `source_start` is the byte offset in [`ComposerBuffer::text`] of its
+/// first character, which is what lets a selection (held in byte offsets) be
+/// painted on wrapped display rows without a second copy of the wrap maths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayRow {
+    pub text: String,
+    /// Whether the cursor is on this row's logical line.
+    pub cursor_line: bool,
+    /// Byte offset in the buffer of the row's first character.
+    pub source_start: usize,
 }
 
 /// A pasted block collapsed into a label until the message is sent.
@@ -182,6 +211,8 @@ pub struct ComposerBuffer {
     kill_buffer: String,
     /// Collapsed pastes, in buffer order.
     chips: Vec<PasteChip>,
+    /// The draft selection, while one is being made.
+    selection: Option<DraftSelection>,
     /// The width the last `display_lines` call used, so a click can map a
     /// screen row back to a wrapped row without the renderer passing it in.
     last_display_width: usize,
@@ -197,11 +228,13 @@ impl Default for ComposerBuffer {
                 text: String::new(),
                 cursor: 0,
                 chips: Vec::new(),
+                selection: None,
             }],
             history_index: 0,
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            selection: None,
             last_display_width: 80,
         }
     }
@@ -216,6 +249,7 @@ impl ComposerBuffer {
                 text: text.clone(),
                 cursor,
                 chips: Vec::new(),
+                selection: None,
             }],
             text,
             cursor,
@@ -224,6 +258,7 @@ impl ComposerBuffer {
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            selection: None,
             last_display_width: 80,
         }
     }
@@ -249,6 +284,190 @@ impl ComposerBuffer {
         &self.kill_buffer
     }
 
+    /// The selection as a byte range in reading order, when it covers anything.
+    ///
+    /// The range is widened to whole chips: a chip is one object, so a
+    /// selection that touches one selects all of it. Otherwise half a
+    /// `[Pasted: 42 lines]` label could be copied and the other half left
+    /// behind.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let selection = self.selection?;
+        if selection.anchor == selection.head {
+            return None;
+        }
+        let (mut start, mut end) = if selection.anchor <= selection.head {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+        // Widen until stable: covering one chip's label can reach into the
+        // next, and a range that grew must be checked again.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for chip in &self.chips {
+                if chip.start < end && start < chip.end {
+                    if chip.start < start {
+                        start = chip.start;
+                        changed = true;
+                    }
+                    if chip.end > end {
+                        end = chip.end;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        (start < end).then_some((start, end))
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some()
+    }
+
+    /// The selected draft text, with chip labels exactly as they are drawn.
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|(start, end)| self.text[start..end].to_string())
+    }
+
+    /// The selected text with chip labels expanded back to what they stand for.
+    ///
+    /// Cutting or copying a collapsed paste must not put `[Pasted: 42 lines]`
+    /// on the clipboard where the reader expected the lines themselves.
+    fn selected_expanded_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let mut out = String::new();
+        let mut cursor = start;
+        for chip in &self.chips {
+            if chip.start < start || chip.end > end {
+                continue;
+            }
+            out.push_str(&self.text[cursor..chip.start]);
+            out.push_str(&chip.content);
+            cursor = chip.end;
+        }
+        out.push_str(&self.text[cursor..end]);
+        Some(out)
+    }
+
+    /// Drop the highlight. Returns whether there was one.
+    pub fn clear_selection(&mut self) -> bool {
+        let had = self.has_selection();
+        self.selection = None;
+        had
+    }
+
+    pub fn select_all(&mut self) {
+        if self.text.is_empty() {
+            self.selection = None;
+            return;
+        }
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+        self.selection = Some(DraftSelection {
+            anchor: 0,
+            head: self.text.len(),
+        });
+        self.break_batch();
+    }
+
+    /// Start a selection at the cursor. A click leaves it empty and harmless;
+    /// a drag extends it.
+    pub fn begin_selection(&mut self) {
+        self.selection = Some(DraftSelection {
+            anchor: self.cursor,
+            head: self.cursor,
+        });
+    }
+
+    /// Extend the selection, keeping the anchor where it was.
+    ///
+    /// Every `extend_*` is a plain motion plus the anchor: the motions already
+    /// know how to step over chips and graphemes, and duplicating that here
+    /// would be two implementations of the same movement.
+    fn extend_with(&mut self, motion: impl FnOnce(&mut Self)) {
+        let anchor = self
+            .selection
+            .map(|selection| selection.anchor)
+            .unwrap_or(self.cursor);
+        motion(self);
+        self.selection = Some(DraftSelection {
+            anchor,
+            head: self.cursor,
+        });
+        self.break_batch();
+    }
+
+    pub fn extend_left(&mut self) {
+        self.extend_with(|buffer| buffer.move_left());
+    }
+
+    pub fn extend_right(&mut self) {
+        self.extend_with(|buffer| buffer.move_right());
+    }
+
+    pub fn extend_word_left(&mut self) {
+        self.extend_with(|buffer| buffer.move_word_left());
+    }
+
+    pub fn extend_word_right(&mut self) {
+        self.extend_with(|buffer| buffer.move_word_right());
+    }
+
+    pub fn extend_up(&mut self) {
+        self.extend_with(|buffer| buffer.move_up());
+    }
+
+    pub fn extend_down(&mut self) {
+        self.extend_with(|buffer| buffer.move_down());
+    }
+
+    pub fn extend_line_start(&mut self) {
+        self.extend_with(|buffer| buffer.move_line_start());
+    }
+
+    pub fn extend_line_end(&mut self) {
+        self.extend_with(|buffer| buffer.move_line_end());
+    }
+
+    pub fn extend_to_start(&mut self) {
+        self.extend_with(|buffer| buffer.move_to_start());
+    }
+
+    pub fn extend_to_end(&mut self) {
+        self.extend_with(|buffer| buffer.move_to_end());
+    }
+
+    /// Extend the selection to a display cell, for a drag in the composer.
+    pub fn extend_selection_to_cell(&mut self, row: u16, column: u16) {
+        self.extend_with(|buffer| buffer.move_cursor_to_cell(row, column));
+    }
+
+    /// Delete the selected range, if there is one, leaving the cursor at its
+    /// start. The caller records the edit.
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.selection = None;
+            return false;
+        };
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.preferred_column = None;
+        self.selection = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
+        true
+    }
+
+    /// Byte ranges of every chip label, in buffer order.
+    pub fn chip_ranges(&self) -> Vec<(usize, usize)> {
+        self.chips
+            .iter()
+            .map(|chip| (chip.start, chip.end))
+            .collect()
+    }
+
     pub fn can_undo(&self) -> bool {
         self.history_index > 0
     }
@@ -266,6 +485,7 @@ impl ComposerBuffer {
             text: self.text.clone(),
             cursor: self.cursor,
             chips: self.chips.clone(),
+            selection: self.selection,
         };
         let coalesce = self.last_edit == Some(kind) && kind.coalesces();
         if coalesce && self.history_index < self.history.len() {
@@ -312,6 +532,7 @@ impl ComposerBuffer {
         let snapshot = self.history[self.history_index].clone();
         self.text = snapshot.text;
         self.chips = snapshot.chips;
+        self.selection = snapshot.selection;
         self.cursor = snapshot.cursor.min(self.text.len());
         self.preferred_column = None;
         self.break_batch();
@@ -323,6 +544,7 @@ impl ComposerBuffer {
     /// a chip for two lines is more chrome than content.
     pub fn insert_paste(&mut self, value: &str) -> bool {
         let value = normalize_line_breaks(value);
+        self.delete_selection();
         // Re-pasting the content of a chip the cursor is on expands it instead
         // of adding a second copy of the same thing.
         if let Some(index) = self.chip_covering(self.cursor).or_else(|| {
@@ -395,6 +617,7 @@ impl ComposerBuffer {
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.selection = None;
         self.chips.clear();
         self.record(EditKind::Block);
         text
@@ -449,11 +672,13 @@ impl ComposerBuffer {
 
     pub fn clear(&mut self) {
         if self.text.is_empty() {
+            self.selection = None;
             return;
         }
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.selection = None;
         self.chips.clear();
         self.record(EditKind::Block);
     }
@@ -462,6 +687,7 @@ impl ComposerBuffer {
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
+        self.selection = None;
         self.chips.clear();
         self.record(EditKind::Block);
     }
@@ -471,12 +697,16 @@ impl ComposerBuffer {
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;
         self.preferred_column = None;
+        self.selection = None;
         self.chips.clear();
         self.record(EditKind::Block);
         text
     }
 
     pub fn insert_char(&mut self, character: char) {
+        // Typing over a selection replaces it, which is the whole point of
+        // being able to select in a draft.
+        self.delete_selection();
         let at = self.cursor;
         self.text.insert(at, character);
         self.cursor += character.len_utf8();
@@ -492,6 +722,7 @@ impl ComposerBuffer {
     }
 
     pub fn insert_str(&mut self, value: &str) {
+        self.delete_selection();
         let at = self.cursor;
         self.text.insert_str(at, value);
         self.cursor += value.len();
@@ -503,6 +734,10 @@ impl ComposerBuffer {
 
     /// Delete the grapheme before the cursor.
     pub fn backspace(&mut self) -> bool {
+        if self.delete_selection() {
+            self.record(EditKind::Delete);
+            return true;
+        }
         if self.cursor == 0 {
             return false;
         }
@@ -523,6 +758,10 @@ impl ComposerBuffer {
 
     /// Delete the grapheme under the cursor.
     pub fn delete(&mut self) -> bool {
+        if self.delete_selection() {
+            self.record(EditKind::Delete);
+            return true;
+        }
         if self.cursor >= self.text.len() {
             return false;
         }
@@ -545,6 +784,13 @@ impl ComposerBuffer {
     /// `src/net.rs` in one press, and a composer that stopped at the dot would
     /// be behaving like an editor instead.
     pub fn delete_word_before(&mut self) -> bool {
+        if let Some(selected) = self.selected_expanded_text()
+            && self.delete_selection()
+        {
+            self.kill_buffer = selected;
+            self.record(EditKind::Block);
+            return true;
+        }
         let start = self.whitespace_word_start();
         if start == self.cursor {
             return false;
@@ -562,6 +808,13 @@ impl ComposerBuffer {
 
     /// Delete the word after the cursor, for `Alt+D`.
     pub fn delete_word_after(&mut self) -> bool {
+        if let Some(selected) = self.selected_expanded_text()
+            && self.delete_selection()
+        {
+            self.kill_buffer = selected;
+            self.record(EditKind::Block);
+            return true;
+        }
         let end = self.word_end(self.cursor);
         if end == self.cursor {
             return false;
@@ -579,6 +832,13 @@ impl ComposerBuffer {
     /// Delete from the cursor back to the start of the word, for
     /// `Alt+Backspace`.
     pub fn delete_word_backward(&mut self) -> bool {
+        if let Some(selected) = self.selected_expanded_text()
+            && self.delete_selection()
+        {
+            self.kill_buffer = selected;
+            self.record(EditKind::Block);
+            return true;
+        }
         let start = self.word_start(self.cursor);
         if start == self.cursor {
             return false;
@@ -596,6 +856,13 @@ impl ComposerBuffer {
 
     /// Kill from the cursor to the end of the line, for `Ctrl+K`.
     pub fn kill_to_line_end(&mut self) -> bool {
+        if let Some(selected) = self.selected_expanded_text()
+            && self.delete_selection()
+        {
+            self.kill_buffer = selected;
+            self.record(EditKind::Block);
+            return true;
+        }
         let (_, line_end) = self.cursor_line();
         // At the end of a line the newline itself is the next thing to go, so
         // repeated `Ctrl+K` joins lines the way a reader expects.
@@ -619,6 +886,13 @@ impl ComposerBuffer {
 
     /// Kill from the start of the line to the cursor, for `Ctrl+U`.
     pub fn kill_to_line_start(&mut self) -> bool {
+        if let Some(selected) = self.selected_expanded_text()
+            && self.delete_selection()
+        {
+            self.kill_buffer = selected;
+            self.record(EditKind::Block);
+            return true;
+        }
         let (line_start, _) = self.cursor_line();
         if line_start == self.cursor {
             return false;
@@ -639,6 +913,7 @@ impl ComposerBuffer {
         if self.kill_buffer.is_empty() {
             return false;
         }
+        self.delete_selection();
         let text = self.kill_buffer.clone();
         let at = self.cursor;
         self.text.insert_str(at, &text);
@@ -651,6 +926,7 @@ impl ComposerBuffer {
 
     /// Move to the start of the previous word, for `Alt+B`.
     pub fn move_word_left(&mut self) {
+        self.selection = None;
         self.cursor = self.word_start(self.cursor);
         self.preferred_column = None;
         self.break_batch();
@@ -658,6 +934,7 @@ impl ComposerBuffer {
 
     /// Move past the end of the next word, for `Alt+F`.
     pub fn move_word_right(&mut self) {
+        self.selection = None;
         self.cursor = self.word_end(self.cursor);
         self.preferred_column = None;
         self.break_batch();
@@ -771,6 +1048,7 @@ impl ComposerBuffer {
 
     pub fn move_left(&mut self) {
         self.break_batch();
+        self.selection = None;
         // A chip is one stop, not one per label character.
         self.cursor = match self.chips.iter().find(|chip| chip.end == self.cursor) {
             Some(chip) => chip.start,
@@ -781,6 +1059,7 @@ impl ComposerBuffer {
 
     pub fn move_right(&mut self) {
         self.break_batch();
+        self.selection = None;
         self.cursor = match self.chips.iter().find(|chip| chip.start == self.cursor) {
             Some(chip) => chip.end,
             None => self.next_grapheme_boundary(),
@@ -794,6 +1073,7 @@ impl ComposerBuffer {
     /// the mapping back to a logical line is done by walking the same wrapping
     /// the renderer used.
     pub fn move_cursor_to_cell(&mut self, row: u16, column: u16) {
+        self.selection = None;
         let width = self.last_display_width.max(1);
         let mut remaining = usize::from(row);
         for line in 0..self.line_count() {
@@ -852,6 +1132,7 @@ impl ComposerBuffer {
 
     pub fn move_up(&mut self) {
         self.break_batch();
+        self.selection = None;
         let (line, column) = self.cursor_line_column();
         if line == 0 {
             return;
@@ -864,6 +1145,7 @@ impl ComposerBuffer {
 
     pub fn move_down(&mut self) {
         self.break_batch();
+        self.selection = None;
         let (line, column) = self.cursor_line_column();
         if line + 1 >= self.line_count() {
             return;
@@ -876,6 +1158,7 @@ impl ComposerBuffer {
 
     pub fn move_line_start(&mut self) {
         self.break_batch();
+        self.selection = None;
         let (line, _) = self.cursor_line_column();
         self.cursor = self.line_range(line).0;
         self.preferred_column = None;
@@ -883,6 +1166,7 @@ impl ComposerBuffer {
 
     pub fn move_line_end(&mut self) {
         self.break_batch();
+        self.selection = None;
         let (line, _) = self.cursor_line_column();
         self.cursor = self.line_range(line).1;
         self.preferred_column = None;
@@ -890,12 +1174,14 @@ impl ComposerBuffer {
 
     pub fn move_to_start(&mut self) {
         self.break_batch();
+        self.selection = None;
         self.cursor = 0;
         self.preferred_column = None;
     }
 
     pub fn move_to_end(&mut self) {
         self.break_batch();
+        self.selection = None;
         self.cursor = self.text.len();
         self.preferred_column = None;
     }
@@ -1001,8 +1287,8 @@ impl ComposerBuffer {
         out
     }
 
-    /// The visual lines of the buffer, wrapped to `width`.
-    pub fn display_lines(&mut self, width: usize) -> Vec<(String, bool)> {
+    /// The visual rows of the buffer, wrapped to `width`, with their origin.
+    pub fn display_rows(&mut self, width: usize) -> Vec<DisplayRow> {
         self.last_display_width = width.max(1);
         let (cursor_line, _) = self.cursor_line_column();
         let mut out = Vec::new();
@@ -1011,13 +1297,29 @@ impl ComposerBuffer {
             let text = &self.text[start..end];
             let wrapped = crate::text::wrap_text(text, width.max(1));
             for segment in wrapped {
-                out.push((segment.text, line == cursor_line));
+                out.push(DisplayRow {
+                    text: segment.text,
+                    cursor_line: line == cursor_line,
+                    source_start: start + segment.source_start,
+                });
             }
         }
         if out.is_empty() {
-            out.push((String::new(), true));
+            out.push(DisplayRow {
+                text: String::new(),
+                cursor_line: true,
+                source_start: 0,
+            });
         }
         out
+    }
+
+    /// The visual lines of the buffer, wrapped to `width`.
+    pub fn display_lines(&mut self, width: usize) -> Vec<(String, bool)> {
+        self.display_rows(width)
+            .into_iter()
+            .map(|row| (row.text, row.cursor_line))
+            .collect()
     }
 }
 
@@ -1585,5 +1887,120 @@ mod tests {
         assert!(buffer.delete_word_backward());
         assert_eq!(buffer.text(), "read src/net.rs ");
         assert_eq!(buffer.kill_buffer(), "now");
+    }
+
+    #[test]
+    fn typing_replaces_the_selection() {
+        let mut buffer = ComposerBuffer::from_text("hello world");
+        buffer.move_to_start();
+        for _ in 0..5 {
+            buffer.extend_right();
+        }
+        assert_eq!(buffer.selection(), Some((0, 5)));
+        assert_eq!(buffer.selected_text().as_deref(), Some("hello"));
+        buffer.insert_char('X');
+        assert_eq!(buffer.text(), "X world");
+        assert_eq!(buffer.selection(), None);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hello world");
+    }
+
+    #[test]
+    fn backspace_removes_the_whole_selection() {
+        let mut buffer = ComposerBuffer::from_text("keep this tail");
+        buffer.move_to_start();
+        for _ in 0..5 {
+            buffer.extend_right();
+        }
+        assert!(buffer.backspace());
+        assert_eq!(buffer.text(), "this tail");
+        assert_eq!(buffer.cursor(), 0);
+        assert_eq!(buffer.selection(), None);
+    }
+
+    #[test]
+    fn a_selection_widens_over_a_collapsed_paste() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("before ");
+        let content = (1..=6)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(buffer.insert_paste(&content));
+        buffer.insert_str(" after");
+        let (chip_start, chip_end) = buffer.chip_ranges()[0];
+        assert_eq!(&buffer.text()[chip_start..chip_end], "[Pasted: 6 lines]");
+
+        // A pointer that lands in the middle of the label still selects all of
+        // it, so a cut can never leave half a marker behind.
+        buffer.move_cursor_to_cell(0, chip_start as u16 + 3);
+        buffer.begin_selection();
+        buffer.extend_selection_to_cell(0, 0);
+        assert_eq!(buffer.selection(), Some((0, chip_end)));
+        assert_eq!(buffer.chip_count(), 1);
+        assert!(buffer.backspace());
+        assert_eq!(buffer.chip_count(), 0);
+        // The prose before the chip and the label go together; what followed
+        // the chip stays.
+        assert_eq!(buffer.text(), " after");
+    }
+
+    #[test]
+    fn a_selection_made_by_a_click_alone_covers_nothing() {
+        let mut buffer = ComposerBuffer::from_text("a draft");
+        buffer.move_to_end();
+        buffer.begin_selection();
+        assert_eq!(buffer.selection(), None);
+        assert!(!buffer.clear_selection());
+    }
+
+    #[test]
+    fn select_all_covers_the_draft_and_a_kill_takes_it_expanded() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("run ");
+        let content = "alpha\nbeta\ngamma\ndelta";
+        assert!(buffer.insert_paste(content));
+        buffer.select_all();
+        assert_eq!(
+            buffer.selected_text().as_deref(),
+            Some("run [Pasted: 4 lines]")
+        );
+        // Cutting a chip takes what the chip stands for, not its label, so a
+        // yank puts the content back.
+        assert!(buffer.delete_word_after());
+        assert_eq!(buffer.kill_buffer(), format!("run {content}"));
+        assert_eq!(buffer.text(), "");
+        assert!(buffer.yank());
+        assert_eq!(buffer.text(), format!("run {content}"));
+    }
+
+    #[test]
+    fn a_plain_motion_drops_the_highlight_but_an_extended_one_keeps_it() {
+        let mut buffer = ComposerBuffer::from_text("one two");
+        buffer.move_to_start();
+        buffer.extend_right();
+        buffer.extend_right();
+        assert_eq!(buffer.selection(), Some((0, 2)));
+        buffer.move_right();
+        assert_eq!(buffer.selection(), None);
+
+        // Extending after a mouse selection keeps the same anchor.
+        buffer.begin_selection();
+        buffer.move_to_start();
+        buffer.extend_word_right();
+        assert_eq!(buffer.selection(), Some((0, 3)));
+        buffer.extend_word_right();
+        assert_eq!(buffer.selection(), Some((0, 7)));
+    }
+
+    #[test]
+    fn extending_into_a_line_break_selects_it() {
+        let mut buffer = ComposerBuffer::from_text("one\ntwo");
+        buffer.move_to_start();
+        buffer.extend_line_end();
+        assert_eq!(buffer.selection(), Some((0, 3)));
+        buffer.extend_right();
+        assert_eq!(buffer.selection(), Some((0, 4)));
+        assert_eq!(buffer.selected_text().as_deref(), Some("one\n"));
     }
 }

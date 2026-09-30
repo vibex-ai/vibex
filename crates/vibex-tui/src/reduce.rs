@@ -626,6 +626,20 @@ impl App {
                 self.composer.move_line_end();
                 Outcome::effects(vec![])
             }
+            Intent::SelectAllDraft => {
+                self.composer.select_all();
+                Outcome::effects(vec![])
+            }
+            Intent::CopyDraftSelection => {
+                let Some(text) = self.composer.selected_text() else {
+                    let message = self.strings.composer_nothing_selected();
+                    self.toast(Toast::info(message));
+                    return Outcome::quiet();
+                };
+                let message = self.strings.copied().to_string();
+                self.toast(Toast::success(message));
+                Outcome::effects(vec![Effect::Clipboard { text }])
+            }
 
             // ---- approval and elicitation ---------------------------------
             Intent::ApprovalApprove | Intent::ApprovalDeny | Intent::ApprovalAlways => {

@@ -666,6 +666,41 @@ fn handle_composer_key(
             app.refresh_completion();
             return Ok(Some(false));
         }
+        // Shift turns a motion into a selection. These arms come first: a
+        // `Shift+Left` also satisfies `!ctrl`, so the plain arms below would
+        // otherwise swallow it.
+        KeyCode::Left if shift && ctrl => {
+            app.composer.extend_word_left();
+            return Ok(Some(false));
+        }
+        KeyCode::Right if shift && ctrl => {
+            app.composer.extend_word_right();
+            return Ok(Some(false));
+        }
+        KeyCode::Left if shift => {
+            app.composer.extend_left();
+            return Ok(Some(false));
+        }
+        KeyCode::Right if shift => {
+            app.composer.extend_right();
+            return Ok(Some(false));
+        }
+        KeyCode::Up if shift => {
+            app.composer.extend_up();
+            return Ok(Some(false));
+        }
+        KeyCode::Down if shift => {
+            app.composer.extend_down();
+            return Ok(Some(false));
+        }
+        KeyCode::Home if shift => {
+            app.composer.extend_line_start();
+            return Ok(Some(false));
+        }
+        KeyCode::End if shift => {
+            app.composer.extend_line_end();
+            return Ok(Some(false));
+        }
         KeyCode::Left if !ctrl => {
             app.composer.move_left();
             return Ok(Some(false));
@@ -716,6 +751,12 @@ fn handle_composer_key(
         KeyCode::Esc => {
             if app.completion.is_some() {
                 app.completion = None;
+                return Ok(Some(false));
+            }
+            // A selection is dropped first, and the press is declined: the
+            // reader who highlighted a phrase and pressed Escape wanted the
+            // highlight gone, not the whole draft cleared.
+            if app.composer.clear_selection() {
                 return Ok(Some(false));
             }
             // A double Escape clears the draft; the first press only warns.
@@ -846,12 +887,16 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 }
                 return true;
             }
-            // The composer places the cursor on the cell that was clicked.
+            // The composer places the cursor on the cell that was clicked and
+            // starts a selection there: a click leaves it empty, a drag fills
+            // it, and typing over it replaces it.
             if let Some(region) = app.regions.composer
                 && rect_contains(region, mouse.column, mouse.row)
             {
                 app.composer
                     .move_cursor_to_cell(mouse.row - region.y, mouse.column - region.x);
+                app.composer.begin_selection();
+                app.draft_selecting = true;
                 return true;
             }
             if app.page != Page::Agent {
@@ -897,12 +942,27 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             false
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if app.draft_selecting {
+                return app.drag_draft_selection(mouse.column, mouse.row);
+            }
             let Some((line, column)) = mouse_cell_clamped(app, mouse.column, mouse.row) else {
                 return false;
             };
             app.extend_text_selection(line, column)
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            // A drag inside the draft copies what it selected; the highlight
+            // stays so the reader can see what went to the clipboard.
+            if app.draft_selecting {
+                app.draft_selecting = false;
+                let Some(text) = app.composer.selected_text() else {
+                    return true;
+                };
+                let message = app.strings.copied().to_string();
+                app.toast(Toast::success(message));
+                worker.dispatch(crate::app::Effect::Clipboard { text });
+                return true;
+            }
             if !app.finish_text_selection() {
                 return true;
             }

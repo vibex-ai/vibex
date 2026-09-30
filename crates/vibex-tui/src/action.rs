@@ -142,6 +142,8 @@ intents! {
     ComposerWordRight => { scope: Composer, id: "composer_word_right", label: "Word right", help: "Move the cursor past the end of the next word." },
     ComposerLineStart => { scope: Composer, id: "composer_line_start", label: "Line start", help: "Move the cursor to the start of the line." },
     ComposerLineEnd => { scope: Composer, id: "composer_line_end", label: "Line end", help: "Move the cursor to the end of the line." },
+    SelectAllDraft => { scope: Composer, id: "composer_select_all", label: "Select all", help: "Select the whole draft so typing replaces it." },
+    CopyDraftSelection => { scope: Composer, id: "composer_copy_draft", label: "Copy draft", help: "Copy the selected part of the draft to the clipboard." },
 
     // ---- overlays -------------------------------------------------------
     CloseOverlay => { scope: Overlay, id: "overlay_close", label: "Close", help: "Dismiss this overlay without applying anything." },
@@ -345,6 +347,8 @@ impl Intent {
                 | Intent::ComposerWordRight
                 | Intent::ComposerLineStart
                 | Intent::ComposerLineEnd
+                | Intent::SelectAllDraft
+                | Intent::CopyDraftSelection
                 | Intent::BeginFilter
                 | Intent::ClearFilter
                 | Intent::ActivateSetting
