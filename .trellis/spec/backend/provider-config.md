@@ -4053,9 +4053,18 @@ ResolvedAgentProviderProjection {
   - Cline — 3.0.65 resolves an initial model through
     `resolveDefaultModelId(provider, CLINE_MODEL, catalogue)`: an id outside the
     selected provider's catalogue is no longer used verbatim but silently
-    replaced by that provider's default. Projecting a Model through
-    `CLINE_MODEL` therefore has to validate the id against the advertised
-    catalogue first. The ACP `model` config-option write path is unchanged.
+    replaced by that provider's default. This does not need a code change,
+    because `CLINE_MODEL` is only the process-start hint: the Agent's
+    descriptor projects the Model through the ACP `model` config option
+    (`AgentModelControl::AcpConfigOption`), and that write path is unchanged and
+    still unvalidated in 3.0.65. Read the environment variable as a starting
+    suggestion and the config option as the authority — do not "fix" this by
+    pre-validating the id against the catalogue at projection time, because the
+    catalogue only exists inside a running Agent. The visible difference is
+    limited to the initial Model on a provider whose catalogue lacks the
+    configured id. 3.0.56 also narrowed the advertised ACP model listing to chat
+    models; Vibex reads that list rather than assuming it, so it only gets
+    cleaner.
   - Kimi — 1.52.0, the archived CLI's final release, replaces its entry point
     with a deprecation gate that prints a migration notice and exits 0 without
     ever speaking ACP. The pin stays on 1.49.0 until the Agent moves to the
@@ -4075,6 +4084,14 @@ ResolvedAgentProviderProjection {
     publishes no changelog for its ACP server either, but the ACP Registry's
     daily protocol probes cover 1.0.0, 1.1.1 and 1.2.1 and report an identical
     ACP surface at all three.
+- Do not build a client for Gemini CLI's failure taxonomy. `MAX_TOKENS_EXCEEDED`,
+  `SAFETY_BLOCKED`, `RECITATION_BLOCKED`, `OTHER_BLOCKED` and
+  `THINKING_ONLY_RESPONSE` are internal stream-error classifications inside the
+  CLI: they decide only that the turn ends gracefully instead of throwing, and
+  the host receives `stopReason: end_turn` with a `_meta.quota` block carrying
+  token counts. Nothing on the wire names the reason, so a `stopReason`-shaped
+  decoder for them would never fire. The same applies to `NO_RESPONSE_TEXT`,
+  `NO_FINISH_REASON`, `MALFORMED_FUNCTION_CALL` and `UNEXPECTED_TOOL_CALL`.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
