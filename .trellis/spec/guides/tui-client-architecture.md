@@ -150,6 +150,19 @@ Rules that make this work:
   zero height rather than printing the same rows twice on one screen.
 * **`layout::compute` is pure data.** The composition is asserted at every
   terminal size without rendering anything.
+* **The renderer owns the transcript's wrap width.** It configures the
+  `Transcript` with the band it is about to draw into; a width derived from a
+  pane layout instead (a sidebar and a details column that the band stack does
+  not have) silently wraps prose into a fraction of the screen. The public
+  `view::transcript_width` mirrors `compute`, and a test asserts the two agree
+  at several sizes.
+* **Session-view bands only exist on session pages.** `band_request` gives the
+  plan, queue, turn-status and dock bands zero height when the page has no
+  session context, so the session list cannot wear the active session's chrome.
+* **A list column is measured in cells, never in characters.** Padding a row
+  with `{:<width$}` counts characters, so a double-width title overflows its
+  column and drags everything after it out of alignment; the session list
+  measures its state column once per frame and pads by display width.
 * The gutter is taken from the transcript's right edge and only when the
   transcript is at least `MIN_TRANSCRIPT_FOR_GUTTER` wide; below that the two
   columns go back to the prose.

@@ -77,9 +77,15 @@ Navigation that would otherwise be a permanent column is a full-screen view
 (Sessions, Files, Changes) or an overlay, which is also the only way a session
 row can show a title, workspace, state and age without truncating all four.
 
+The transcript wraps to the band it is drawn in — the renderer states that
+width every frame — so a wide terminal is filled rather than showing a narrow
+column with an empty half beside it.
+
 Optional bands (background tasks, queued messages, banners, the dock) collapse
 to zero height rather than to a smaller size, and a short terminal drops them
-before it touches the transcript or the composer.
+before it touches the transcript or the composer. They belong to the session
+view, so the session list does not inherit the active session's plan or turn
+line: a global page keeps its own chrome.
 
 ## Visual language
 
@@ -214,6 +220,11 @@ Typing `? ` turns the composer into a filter over the messages you have sent;
 `↑↓` walks the matches and `Enter` recalls one into the draft. `Up` on an empty
 draft still steps through history one entry at a time.
 
+Opening a session puts the caret in the composer, and a click anywhere in the
+box takes the keyboard (a click on a text row also places the caret). The
+terminal's own cursor is drawn on the draft, so where typing will land is
+visible rather than inferred.
+
 Editing is readline-shaped, because that is the muscle memory a terminal user
 already has:
 
@@ -268,6 +279,9 @@ band from the least important end.
 
 ### Sessions
 
+Each row is three columns: the marker, the title, and the session's state,
+right-aligned in one column whose edge is the same on every row — measured in
+terminal cells, so a double-width title does not push its state out of line.
 The sidebar groups sessions by workspace and project — `g` folds the headings
 away for one flat run. `/` filters, `Enter` opens, `n` creates, `r` renames, `f`
 forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A` includes archived sessions.
