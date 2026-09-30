@@ -61,6 +61,21 @@ pub fn render_markdown(
     width: usize,
     strings: Strings,
 ) -> RenderedMarkdown {
+    render_markdown_with(source, theme, width, strings, theme.prose())
+}
+
+/// As [`render_markdown`], with the style ordinary prose is drawn in.
+///
+/// The caller knows what the block *is*: a user's own message keeps the
+/// brightest text, while an Agent's answer is set one step down so its
+/// headings and code can stand out.
+pub fn render_markdown_with(
+    source: &str,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    prose: Style,
+) -> RenderedMarkdown {
     let width = width.max(8);
     let input = MarkdownInput::new(source, "", 0);
     let document = parse_markdown(input);
@@ -69,6 +84,7 @@ pub fn render_markdown(
         strings,
         highlight: HighlightPalette::for_theme(theme),
         width,
+        prose,
         lines: Vec::new(),
     };
     builder.blocks(&document.blocks, 0);
@@ -78,7 +94,7 @@ pub fn render_markdown(
 /// Render plain text (no markdown syntax) with the same wrapping rules.
 pub fn render_plain(source: &str, theme: &TuiTheme, width: usize) -> RenderedMarkdown {
     let mut lines = Vec::new();
-    let plain_style = theme.base();
+    let plain_style = theme.prose();
     for raw in source.split('\n') {
         for wrapped in wrap_text(raw, width.max(8)) {
             let text = wrapped.text;
@@ -97,6 +113,8 @@ struct Builder<'a> {
     strings: Strings,
     highlight: HighlightPalette,
     width: usize,
+    /// The style ordinary prose is drawn in.
+    prose: Style,
     lines: Vec<(Line<'static>, String)>,
 }
 
@@ -690,7 +708,7 @@ impl<'a> Builder<'a> {
     }
 
     fn inlines(&self, inlines: &[InlineNode]) -> Vec<Span<'static>> {
-        self.inlines_styled(inlines, self.theme.base())
+        self.inlines_styled(inlines, self.prose)
     }
 
     fn inlines_styled(&self, inlines: &[InlineNode], base: Style) -> Vec<Span<'static>> {
@@ -708,17 +726,28 @@ impl<'a> Builder<'a> {
             }
             Inline::Code(text) => {
                 // No backticks: the background and colour are the marker. A
-                // reader should see code, not the syntax that marks it up.
+                // reader should see code, not the syntax that marks it up. The
+                // colour is the literal/command role rather than the theme's
+                // accent, which several themes resolve to plain foreground.
                 out.push(Span::styled(
                     text.clone(),
-                    self.theme.code().fg(self.theme.roles.accent),
+                    self.theme.code().fg(self.theme.roles.command),
                 ));
             }
             Inline::Emphasis(children) => {
                 self.inlines_into(children, style.add_modifier(Modifier::ITALIC), out);
             }
             Inline::Strong(children) => {
-                self.inlines_into(children, style.add_modifier(Modifier::BOLD), out);
+                // Bright as well as bold: a modifier alone is invisible in the
+                // terminals whose CJK face has no bold cut, and a bold run at
+                // prose brightness would not stand out from the prose anyway.
+                self.inlines_into(
+                    children,
+                    style
+                        .fg(self.theme.roles.foreground)
+                        .add_modifier(Modifier::BOLD),
+                    out,
+                );
             }
             Inline::Deletion(children) => {
                 self.inlines_into(children, style.add_modifier(Modifier::CROSSED_OUT), out);
@@ -750,7 +779,7 @@ impl<'a> Builder<'a> {
                     children,
                     style
                         .add_modifier(Modifier::UNDERLINED)
-                        .fg(self.theme.roles.accent),
+                        .fg(self.theme.roles.link),
                     out,
                 );
                 // Show the target when the label does not already name it.
@@ -1324,18 +1353,17 @@ mod tests {
         );
         assert!(text.contains("项目概览"), "{text}");
         assert!(text.contains("pnpm check:rust"), "{text}");
-        // The code span carries the code background rather than a pair of
-        // backticks, so it is still identifiable as code.
+        // The code span carries the code background and the literal colour
+        // rather than a pair of backticks, so it is still identifiable as code.
+        let palette = theme(ColorMode::TrueColor);
         let code = rendered
             .lines
             .iter()
             .flat_map(|line| line.spans.iter())
             .find(|span| span.content.contains("pnpm check:rust"))
             .expect("the code span is rendered");
-        assert_eq!(
-            code.style.bg,
-            Some(theme(ColorMode::TrueColor).roles.code_background)
-        );
+        assert_eq!(code.style.bg, Some(palette.roles.code_background));
+        assert_eq!(code.style.fg, Some(palette.roles.command));
     }
 
     #[test]
@@ -1360,9 +1388,14 @@ mod tests {
                 .collect::<String>()
         };
         let palette = theme(ColorMode::TrueColor);
-        let bold = by_style(palette.base().add_modifier(Modifier::BOLD));
+        let bold = by_style(
+            palette
+                .prose()
+                .fg(palette.roles.foreground)
+                .add_modifier(Modifier::BOLD),
+        );
         assert!(bold.contains("bold"), "bold text lost its style: {bold:?}");
-        let code = by_style(palette.code().fg(palette.roles.accent));
+        let code = by_style(palette.code().fg(palette.roles.command));
         assert!(
             code.contains("code"),
             "the code span lost its background: {code:?}"
@@ -1382,6 +1415,57 @@ mod tests {
         assert!(
             line.contains("dev   #"),
             "the alignment was collapsed: {line:?}"
+        );
+    }
+
+    #[test]
+    fn prose_headings_code_and_links_are_four_different_colours() {
+        // The complaint this guards against: everything on screen is white.
+        // A single-colour theme still has to spread what it has across the
+        // roles that carry meaning.
+        let palette = theme(ColorMode::TrueColor);
+        let rendered = render(
+            "# 标题\n\n正文 `code` 与 [链接](https://example.test) 还有 **重点**。",
+            60,
+        );
+        let colour_of = |needle: &str| {
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is not rendered"))
+                .style
+                .fg
+        };
+        let prose = colour_of("正文");
+        let heading = colour_of("标题");
+        let code = colour_of("code");
+        let link = colour_of("链接");
+        assert_eq!(
+            prose,
+            Some(palette.roles.gray_bright),
+            "prose is not dimmed"
+        );
+        assert_eq!(
+            heading,
+            Some(palette.roles.foreground),
+            "heading is not bright"
+        );
+        assert_eq!(
+            code,
+            Some(palette.roles.command),
+            "code is not its own colour"
+        );
+        assert_eq!(link, Some(palette.roles.link), "link is not its own colour");
+        let distinct = [prose, heading, code, link]
+            .into_iter()
+            .map(|colour| format!("{colour:?}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "the four roles collapsed into fewer colours"
         );
     }
 

@@ -26,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use vibex_desktop_model::TimelineRowKind;
 
 use crate::locale::Strings;
-use crate::markdown::{render_markdown, render_plain};
+use crate::markdown::render_plain;
 use crate::text::{display_width, truncate_to_width};
 use crate::theme::{Rail, TuiTheme};
 
@@ -1519,8 +1519,16 @@ pub fn render_block_styled(
     let body_background = body_band(block, theme);
     let body = block.body.trim_end_matches('\n');
     if !body.is_empty() {
+        // A reader's own words stay at full brightness; an Agent's answer is
+        // set one step down so its headings, emphasis and code have somewhere
+        // to stand.
+        let prose = if matches!(block.kind, TimelineRowKind::UserMessage) {
+            theme.base()
+        } else {
+            theme.prose()
+        };
         let mut rendered = if is_markdown(block.kind) {
-            render_markdown(body, theme, content_width, strings)
+            crate::markdown::render_markdown_with(body, theme, content_width, strings, prose)
         } else {
             render_plain(body, theme, content_width)
         };

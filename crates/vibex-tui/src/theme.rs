@@ -349,6 +349,10 @@ pub struct ThemeRole {
     pub danger: Color,
     pub command: Color,
     pub path: Color,
+    /// A hyperlink's label. Its own colour rather than `accent`, which several
+    /// themes resolve to the foreground and would leave a link looking like
+    /// ordinary prose with an underline.
+    pub link: Color,
 
     // ---- diff -----------------------------------------------------------
     pub diff_insert: Color,
@@ -485,6 +489,7 @@ impl TuiTheme {
             danger: color(token("destructive", 0xd6453f)),
             command: color(token("chart-category-4", 0xd8a94a)),
             path: color(token("chart-category-6", 0xd88a5a)),
+            link: color(token("chart-category-2", 0x5aa6d8)),
 
             diff_insert: color(token("right-rail-status-added", 0x3fae6a)),
             diff_delete: color(token("destructive", 0xd6453f)),
@@ -516,6 +521,15 @@ impl TuiTheme {
 
     pub fn muted(&self) -> Style {
         Style::default().fg(self.roles.gray)
+    }
+
+    /// Running prose: one step below `foreground`, so headings, emphasis and
+    /// code read as a different kind of thing rather than as more of the same
+    /// white. The catalogue's `secondary-foreground` is the foreground in
+    /// several themes, which is why this is the bright grey rather than that
+    /// token.
+    pub fn prose(&self) -> Style {
+        Style::default().fg(self.roles.gray_bright)
     }
 
     pub fn accent(&self) -> Style {

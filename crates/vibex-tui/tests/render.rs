@@ -1166,6 +1166,38 @@ fn markdown_styling_reaches_the_screen() {
         });
     assert!(bold, "the heading is not bold:\n{screen}");
 
+    // The colour hierarchy reaches the screen: prose is a step down from the
+    // heading, and neither is the same colour as the code.
+    let roles = vibex_tui::theme::TuiTheme::resolve(
+        Some("vibex-dark"),
+        vibex_ui::GpuiThemeMode::Dark,
+        vibex_tui::ColorCapability {
+            mode: vibex_tui::ColorMode::TrueColor,
+            glyphs: vibex_tui::GlyphMode::Unicode,
+        },
+    )
+    .roles;
+    let cell_colour = |needle: &str| {
+        let row = rows
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is on screen:\n{screen}"));
+        (0..120)
+            .filter_map(|column| buffer.cell((column, row as u16)))
+            .find(|cell| !cell.symbol().trim().is_empty())
+            .and_then(|cell| cell.style().fg)
+    };
+    assert_eq!(
+        cell_colour("正文里有"),
+        Some(roles.gray_bright),
+        "prose is not set one step down from the heading"
+    );
+    assert_eq!(
+        cell_colour("渲染标题"),
+        Some(roles.foreground),
+        "the heading is not the brightest text"
+    );
+
     // The inline code keeps the code background over its whole run, which is
     // what the backticks used to stand for.
     let code_row = rows
@@ -1189,6 +1221,14 @@ fn markdown_styling_reaches_the_screen() {
     assert!(
         coloured >= "inline_code".len(),
         "only {coloured} cells carry the code background:\n{screen}"
+    );
+    let literal = (0..120)
+        .filter_map(|column| buffer.cell((column, code_row as u16)))
+        .filter(|cell| cell.style().fg == Some(roles.command))
+        .count();
+    assert!(
+        literal >= "inline_code".len(),
+        "only {literal} cells carry the literal colour:\n{screen}"
     );
 }
 
