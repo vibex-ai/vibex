@@ -31,6 +31,10 @@ vibex-markdown = { path = "../vibex-markdown", default-features = false }
 vibex-terminal-ui = { path = "../vibex-terminal-ui" }
 vibex-ui = { path = "../vibex-ui", default-features = false }
 
+# The `stderr` diversion is a POSIX descriptor operation.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [features]
 # Builds the harness binary the PTY tests drive. Off by default so a normal
 # build does not ship a second entry point.

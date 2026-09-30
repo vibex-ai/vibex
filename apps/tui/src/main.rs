@@ -199,6 +199,9 @@ fn usage() -> String {
          \x20   VIBEX_TUI_COLOR   truecolor | ansi256 | 16 | none\n\
          \x20   VIBEX_TUI_ICONS   auto | emoji | ascii\n\
          \x20   VIBEX_TUI_KEYS    key-remap file (default <home>/tui-keys.toml)\n\
+         \x20   VIBEX_TUI_LOG     spill file for process diagnostics while the\n\
+         \x20                     interface owns the terminal (default\n\
+         \x20                     $TMPDIR/vibex-tui-<pid>.log)\n\
          \x20   NO_COLOR          disable colour entirely\n"
     )
 }

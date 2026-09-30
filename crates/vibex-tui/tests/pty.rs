@@ -6,6 +6,7 @@
 //!
 //! * the process really enters raw mode and paints a first frame;
 //! * an idle interface writes **nothing** — the measured `idle_cost` contract;
+//! * diagnostics written by the process itself never reach the frame;
 //! * quitting restores the terminal (no raw mode left behind, cursor visible,
 //!   alternate screen left);
 //! * a resize storm does not lose the frame.
@@ -38,10 +39,18 @@ struct Session {
     /// Every byte the process has written, in order.
     captured: Vec<u8>,
     emulator: TerminalEmulator,
+    /// Owns the spill file the client diverts in-process diagnostics into.
+    spill: tempfile::TempDir,
 }
 
 impl Session {
     fn start(columns: u16, rows: u16) -> Self {
+        Self::start_with(columns, rows, &[])
+    }
+
+    /// Start with extra environment variables, which is how a scenario makes
+    /// the client behave like a process that hosts a runtime.
+    fn start_with(columns: u16, rows: u16, environment: &[(&str, &str)]) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -62,6 +71,14 @@ impl Session {
         command.env_remove("VIBEX_TUI_COLOR");
         command.env_remove("VIBEX_TUI_ICONS");
         command.env_remove("NO_COLOR");
+        // The client spills in-process diagnostics into a file; keep it in a
+        // directory this scenario owns instead of the shared temporary
+        // directory.
+        let spill = tempfile::tempdir().expect("a temporary directory for the spill file");
+        command.env("VIBEX_TUI_LOG", spill.path().join("vibex-tui.log"));
+        for (key, value) in environment {
+            command.env(key, value);
+        }
         let child = pair
             .slave
             .spawn_command(command)
@@ -93,7 +110,18 @@ impl Session {
             output,
             captured: Vec::new(),
             emulator: TerminalEmulator::new(rows, columns),
+            spill,
         }
+    }
+
+    /// The file the client diverts in-process diagnostics into.
+    fn spill_path(&self) -> std::path::PathBuf {
+        self.spill.path().join("vibex-tui.log")
+    }
+
+    /// The spill file's contents, or an empty string when nothing was diverted.
+    fn spilled(&self) -> String {
+        std::fs::read_to_string(self.spill_path()).unwrap_or_default()
     }
 
     /// Drain whatever arrived, updating the emulated screen.
@@ -276,6 +304,57 @@ fn an_idle_interface_writes_nothing() {
         0,
         "an idle client wrote {idle_bytes} bytes; the idle contract is zero frames\n{}",
         String::from_utf8_lossy(&session.captured[mark..]).escape_debug()
+    );
+}
+
+/// `vibex` hosts the authority runtime in its own process, and the runtime
+/// reports startup stages on background tasks after the first frame is up.
+/// While the interface owns the terminal none of that may reach it — and none
+/// of it may be lost either.
+#[test]
+fn in_process_diagnostics_never_reach_the_terminal() {
+    let mut session = Session::start_with(120, 40, &[("VIBEX_TUI_HARNESS_STRAY_STDERR", "1")]);
+    session.wait_for(|screen| screen.contains("Vibex"));
+    // Let a burst of stray writes happen while the interface owns the screen.
+    session.pump(Duration::from_millis(700));
+
+    // Everything after the alternate-screen switch belongs to the interface.
+    // The bytes are checked rather than only the rendered frame: a write that
+    // scrolls the grid can leave the visible cells looking plausible while the
+    // user's terminal has already been displaced.
+    let raw = String::from_utf8_lossy(&session.captured).to_string();
+    let owned = raw
+        .rsplit_once("\u{1b}[?1049h")
+        .map(|(_, tail)| tail)
+        .expect("the client entered the alternate screen");
+    assert!(
+        !owned.contains("harness_stray"),
+        "a write aimed at stderr reached the terminal:\n{}",
+        session.raw_tail()
+    );
+
+    // Quit so the client restores the terminal and names the spill file.
+    session.send(b"\x11");
+    session.pump(Duration::from_millis(300));
+    session.send(b"\r");
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    while session.child.try_wait().ok().flatten().is_none() {
+        if Instant::now() >= deadline {
+            panic!("the client did not exit after the quit confirmation");
+        }
+        session.pump(Duration::from_millis(50));
+    }
+
+    let spilled = session.spilled();
+    assert!(
+        spilled.contains("vibex-startup: stage-begin stage=harness_stray_"),
+        "the diagnostics were dropped instead of diverted:\n{spilled}"
+    );
+    let raw = String::from_utf8_lossy(&session.captured).to_string();
+    assert!(
+        raw.contains("in-process diagnostics were captured"),
+        "the client never said where the diverted output went:\n{}",
+        session.raw_tail()
     );
 }
 

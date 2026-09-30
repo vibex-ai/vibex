@@ -12,6 +12,12 @@
 //!   going after the first error instead of returning early, because a partial
 //!   restore is still better than none.
 //!
+//! Taking the screen also means taking `stderr`: while the guard is active, the
+//! process's own diagnostics are diverted into a spill file by [`crate::console`]
+//! so that a stray `eprintln!` from anywhere in the process cannot land in a
+//! frame. [`report_captured_stderr`] says where they went once the screen is
+//! back.
+//!
 //! The clipboard goes through OSC 52, so the client never links an
 //! X11/Wayland clipboard crate and never touches the user's display server.
 
@@ -49,6 +55,23 @@ pub fn restore_terminal() {
         DisableBracketedPaste
     );
     let _ = stdout.flush();
+    // `stderr` comes back last: whatever is printed after the screen is
+    // restored — a panic message, a late diagnostic — is visible again.
+    crate::console::restore_stderr();
+}
+
+/// Report the diagnostics captured while the interface owned the terminal.
+///
+/// They are kept off the screen by design, so naming the spill file is what
+/// makes "diverted" mean something other than "lost". Callers run this after
+/// [`TerminalGuard::release`], when `stderr` is a terminal again.
+pub fn report_captured_stderr() {
+    if let Some((path, bytes)) = crate::console::captured() {
+        eprintln!(
+            "vibex: {bytes} bytes of in-process diagnostics were captured in {}",
+            path.display()
+        );
+    }
 }
 
 /// Owns the terminal for the lifetime of the interface.
@@ -59,20 +82,30 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     /// Enter raw mode and the alternate screen.
     pub fn enter() -> BackendResult<Self> {
-        enable_raw_mode()
-            .map_err(|error| BackendError::failed("tui_terminal_unavailable", error.to_string()))?;
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-            crossterm::cursor::Hide
-        )
-        .map_err(|error| BackendError::failed("tui_terminal_unavailable", error.to_string()))?;
-        stdout
-            .flush()
-            .map_err(|error| BackendError::failed("tui_terminal_unavailable", error.to_string()))?;
+        // The diversion goes up before the alternate screen does: output
+        // written in between would still land in the frame.
+        let _ = crate::console::divert_stderr();
+        let entered = (|| -> io::Result<()> {
+            enable_raw_mode()?;
+            let mut stdout = io::stdout();
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste,
+                crossterm::cursor::Hide
+            )?;
+            stdout.flush()
+        })();
+        if let Err(error) = entered {
+            // A half-entered terminal is worse than none, so give back whatever
+            // was taken — including `stderr` — before reporting the failure.
+            restore_terminal();
+            return Err(BackendError::failed(
+                "tui_terminal_unavailable",
+                error.to_string(),
+            ));
+        }
         install_panic_hook();
         Ok(Self { active: true })
     }

@@ -59,6 +59,9 @@ pub fn run_loop(
     // The guard restores on drop, but doing it explicitly means the cursor is
     // back before any error is printed.
     guard.release();
+    // The screen belongs to the process again, so the diagnostics that were
+    // kept out of the frames above can be named rather than silently dropped.
+    crate::terminal::report_captured_stderr();
     result
 }
 

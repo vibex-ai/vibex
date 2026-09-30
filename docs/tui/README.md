@@ -149,7 +149,23 @@ nothing.
 | `VIBEX_TUI_COLOR` | `truecolor`, `ansi256`, `16`, `none` |
 | `VIBEX_TUI_ICONS` | `auto`, `emoji`, `ascii` |
 | `VIBEX_TUI_KEYS` | key-remap file (default `<home>/tui-keys.toml`) |
+| `VIBEX_TUI_LOG` | spill file for process diagnostics (default `$TMPDIR/vibex-tui-<pid>.log`) |
 | `NO_COLOR` | disable colour entirely |
+
+## Terminal ownership
+
+The client draws on the alternate screen, so it owns the terminal for as long as
+it runs — including `stderr`. An authority seat boots the runtime *in this
+process*, and the runtime reports startup stages from background tasks that
+finish after the first frame is painted. A line like that landing in a frame
+wraps at the last column and scrolls the grid, which is the log residue that
+must never appear under the interface.
+
+So writes aimed at `stderr` are diverted into a spill file while the client owns
+the screen, and the terminal's own `stderr` is handed back on exit. Nothing is
+dropped silently: the client names the file when it exits, and the file is
+`VIBEX_TUI_LOG` when that is set. A remote seat writes nothing at all, so no
+notice is printed and no file is named.
 
 ## Degradation
 
@@ -159,6 +175,7 @@ Every one of these has a defined behaviour rather than a broken screen:
 | --- | --- |
 | stdout is not a TTY | no raw mode; a clear message and a non-zero exit |
 | terminal below 60×16 | a size notice, not a half-rendered frame |
+| in-process diagnostics | diverted to a spill file, named on exit; never drawn into a frame |
 | `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal |
 | non-UTF-8 locale | ASCII borders and markers |
 | disconnected | a banner, mutations disabled, the last known state marked stale |
@@ -178,7 +195,7 @@ Four layers:
 | Reducer | `cargo test -p vibex-tui --lib` | the intent → effect mapping is a pure function |
 | Render | `cargo test -p vibex-tui --test render` | layout degrades at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
 | Contract | `cargo test -p vibex-tui --test contracts` | dependency boundary, key tables, locale coverage, no secret-shaped copy |
-| PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, restores the terminal on exit, and survives a resize storm |
+| PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, keeps in-process diagnostics out of the terminal, restores the terminal on exit, and survives a resize storm |
 
 The PTY layer is the only one that can catch a failure outside the renderer.
 The idle test is the `idle_cost` contract from the design report: after startup

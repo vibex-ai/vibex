@@ -10,6 +10,7 @@
 //! Layering, from the bottom up:
 //!
 //! ```text
+//! console   `stderr` diversion while the interface owns the terminal
 //! terminal  raw mode, restoration, OSC 52, $EDITOR hand-off
 //! theme     design tokens → terminal colour with truecolor/256/16/none degradation
 //! text      grapheme-correct measurement, wrapping with joiners, bidi order
@@ -27,6 +28,7 @@
 pub mod action;
 pub mod app;
 pub mod composer;
+pub mod console;
 pub mod keymap;
 pub mod locale;
 pub mod markdown;

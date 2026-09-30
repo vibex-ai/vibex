@@ -60,6 +60,10 @@ tracing = "0.1"
 # the TUI binary only, so the GPUI clients never link them.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+# Terminal clients fence the process's standard error while they own the
+# screen. `rustix` is the safe descriptor layer for that, and it is the same
+# copy `crossterm` already resolves, so the graph gains no new package.
+rustix = { version = "1", features = ["stdio"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 unicode-bidi = "0.3"

@@ -23,7 +23,7 @@ vibex-server ┘          ▲                                              (desk
 
 | Allowed | Forbidden |
 | --- | --- |
-| `vibex-core`, `vibex-backend` (traits only), `vibex-desktop-model`, `vibex-ui` (`default-features = false`), `vibex-markdown` (`default-features = false`), `vibex-terminal-ui`, `ratatui`, `crossterm` | `gpui`, `gpui-component`, `vibex-desktop-runtime`, `vibex-db`, `vibex-agent-acp`, `vibex-browser`, `vibex-content` |
+| `vibex-core`, `vibex-backend` (traits only), `vibex-desktop-model`, `vibex-ui` (`default-features = false`), `vibex-markdown` (`default-features = false`), `vibex-terminal-ui`, `ratatui`, `crossterm`, `rustix` (Unix only, descriptor plumbing) | `gpui`, `gpui-component`, `vibex-desktop-runtime`, `vibex-db`, `vibex-agent-acp`, `vibex-browser`, `vibex-content` |
 
 The TUI library never starts a runtime and never decides which runtime to talk
 to. Both are the composition root's job:
@@ -91,6 +91,28 @@ Rules:
   advances a cursor across a gap and never auto-resends a prompt after a
   reconnect.
 
+### Console ownership
+
+Owning the alternate screen means owning `stderr` too. An authority seat boots
+`DesktopRuntime` **in this process**, and the runtime reports startup stages
+from background tasks that finish after the first frame is painted; a byte
+written there wraps at the last column and scrolls the grid, leaving log residue
+under the interface. So the client diverts the process's `stderr` into a spill
+file for the duration of the session (`crates/vibex-tui/src/console.rs`), and
+hands the terminal's descriptor back on exit.
+
+Rules:
+
+* the diversion is installed **before** `EnterAlternateScreen`, never after;
+* it is released by the same `TerminalGuard` that restores the screen, and by
+  the panic hook, so a panic message stays visible;
+* diverted output is named on exit, never dropped silently — an empty spill
+  prints nothing;
+* `VIBEX_TUI_LOG` chooses the spill file; the default is
+  `$TMPDIR/vibex-tui-<pid>.log`;
+* the PTY layer asserts that a byte written while the interface owns the screen
+  never reaches the terminal, which is the measured form of this rule.
+
 ## 4. Rendering
 
 The transcript is the performance-critical surface and follows four rules:
@@ -144,7 +166,7 @@ is never a column count.
 | Reducer unit tests | the intent → effect mapping is a pure function; key sequences drive state |
 | `TestBackend` render tests | layout degrades correctly at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
 | Contract tests | dependency boundary, key tables, locale coverage, no secret-shaped copy, docs exist per page |
-| PTY end-to-end | the real binary enters raw mode, paints a first frame, writes zero bytes when idle, restores the terminal on exit, survives a resize storm |
+| PTY end-to-end | the real binary enters raw mode, paints a first frame, writes zero bytes when idle, keeps in-process diagnostics out of the terminal, restores the terminal on exit, survives a resize storm |
 
 `cargo test -p vibex-tui` runs the first three. The PTY layer needs the harness
 entry point, so it runs as
