@@ -50,9 +50,9 @@ pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-SE13C3nZCYoVL569BdegoOl6vwjb7o
 pub const ZCODE_AGENT_ID: &str = "zcode";
 pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
 pub const ZCODE_ADAPTER_PACKAGE: &str = "zcode-acp-server";
-pub const ZCODE_ADAPTER_VERSION: &str = "0.37.1";
-pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-D8Ejw2RzkaxKtpO5ZJR/h41fRdpIjTKxHlPMCiO5hhCOLCe2+1k/U+fGWjBTp+IuKWDL8weEr/6VToyTWiV0DA==";
-pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.37.1";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.54.0";
+pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-6hfajroBZgbRZjbt2zNNsxpXinccCAT3dVg8TWZejktdmm6Ja5UZ3a/gVCwsbkE3dW+Gd0go+jT4ZOekz/rHSQ==";
+pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.54.0";
 pub const NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Three-state support value used before runtime negotiation is complete.
@@ -1171,7 +1171,7 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
             ("ZCODE_ACP_RUNTIME".to_string(), "node".to_string()),
         ],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: zcode-acp-server@0.37.1 forwards stdio MCP descriptors",
+            "real bridge contract schema v2: zcode-acp-server@0.54.0 forwards stdio MCP descriptors",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "Vibex launches one managed bridge per logical session",

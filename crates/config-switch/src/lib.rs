@@ -4853,7 +4853,7 @@ fn zcode_acp_preset() -> AcpProviderCatalogPreset {
     acp_catalog_preset(
         "zcode-acp-server",
         "ZCode (ACP)",
-        "ZCode through the fixed zcode-acp-server@0.37.1 Adapter managed by the Compatibility Registry.",
+        "ZCode through the fixed zcode-acp-server@0.54.0 Adapter managed by the Compatibility Registry.",
         "zcode-acp-server",
         &[],
         &["local", "acp", "zcode"],
