@@ -10877,6 +10877,7 @@ dependencies = [
  "portable-pty",
  "qrcode",
  "ratatui",
+ "regex",
  "rustix",
  "serde",
  "serde_json",

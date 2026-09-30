@@ -106,6 +106,9 @@ intents! {
     OpenFiles => { scope: Agent, id: "open_files", label: "Files", help: "Open the file tree for this session." },
     SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: "Runtime", help: "Choose the Agent runtime and model for this session." },
     ProbeAgentRuntime => { scope: Agent, id: "runtime_probe", label: "Probe", help: "Ask the runtime to re-discover available Agents." },
+    BeginTranscriptSearch => { scope: Agent, id: "transcript_search", label: "Find", help: "Search the transcript with a regular expression." },
+    SearchNext => { scope: Agent, id: "search_next", label: "Next match", help: "Jump to the next match, wrapping at the end." },
+    SearchPrevious => { scope: Agent, id: "search_previous", label: "Prev match", help: "Jump to the previous match, wrapping at the start." },
 
     // ---- composer -------------------------------------------------------
     SubmitComposer => { scope: Composer, id: "composer_submit", label: "Send", help: "Send the draft as a new turn." },
@@ -285,6 +288,9 @@ impl Intent {
                 | Intent::ToggleSessionCard
                 | Intent::CollapseSessionCards
                 | Intent::CopySessionRow
+                | Intent::BeginTranscriptSearch
+                | Intent::SearchNext
+                | Intent::SearchPrevious
                 | Intent::CopyBlockBody
                 | Intent::CopyBlockMetadata
                 | Intent::OpenBlockDetails

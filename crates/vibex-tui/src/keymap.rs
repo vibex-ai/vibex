@@ -618,6 +618,24 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Agent,
+        Chord::plain(KeyCode::Char('/')),
+        Intent::BeginTranscriptSearch,
+        "Find",
+    ),
+    binding(
+        Scope::Agent,
+        Chord::plain(KeyCode::Char('n')),
+        Intent::SearchNext,
+        "Next match",
+    ),
+    binding(
+        Scope::Agent,
+        Chord::plain(KeyCode::Char('p')),
+        Intent::SearchPrevious,
+        "Prev match",
+    ),
+    binding(
+        Scope::Agent,
         Chord::plain(KeyCode::F(3)),
         Intent::OpenChanges,
         "Changes",

@@ -562,3 +562,140 @@ fn a_session_detail_card_opens_and_closes_on_the_row() {
     let closed = text(&render(&mut app, 120, 40));
     assert!(!closed.contains("session_card0001"), "{closed}");
 }
+
+fn seeded_block(
+    id: &str,
+    kind: vibex_desktop_model::TimelineRowKind,
+    body: &str,
+) -> vibex_tui::transcript::Block {
+    vibex_tui::transcript::Block {
+        id: id.to_string(),
+        kind,
+        title: String::new(),
+        body: body.to_string(),
+        turn_id: Some("turn-1".to_string()),
+        sequence: 1,
+        expanded: false,
+        collapsible: false,
+        streaming: false,
+        failed: false,
+        pending_permission: false,
+        file_path: None,
+        runtime_attribution: None,
+        conclusion: false,
+        group: vibex_tui::transcript::GroupRole::Solo,
+    }
+}
+
+fn transcript_app(width: u16, height: u16) -> App {
+    let mut app = app(width, height);
+    app.transcript.set_blocks(vec![
+        seeded_block(
+            "block-1",
+            vibex_desktop_model::TimelineRowKind::UserMessage,
+            "fix the flaky upload test",
+        ),
+        seeded_block(
+            "block-2",
+            vibex_desktop_model::TimelineRowKind::AgentMessage,
+            "The UPLOAD path was retried twice before it succeeded.",
+        ),
+    ]);
+    app.navigate_to(Page::Agent);
+    app
+}
+
+#[test]
+fn search_opens_a_bar_with_a_counter_and_smart_case() {
+    let mut app = transcript_app(120, 40);
+    assert!(app.begin_search(), "a non-empty transcript can be searched");
+    app.search
+        .as_mut()
+        .expect("search is open")
+        .set_query("upload".to_string());
+    app.refresh_search_matches();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("search:"), "no search bar:\n{screen}");
+    // A lowercase query folds case, so both spellings match; the counter is
+    // the current match over the total.
+    assert!(screen.contains("1/2"), "wrong counter:\n{screen}");
+    assert!(app.step_search(1), "the second match is reachable");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("2/2"),
+        "stepping lost the counter:\n{screen}"
+    );
+
+    // An uppercase letter turns smart case off, and nothing spells it exactly
+    // that way.
+    app.search
+        .as_mut()
+        .expect("search is open")
+        .set_query("Upload".to_string());
+    app.refresh_search_matches();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("no matches"),
+        "uppercase must not fold:\n{screen}"
+    );
+}
+
+#[test]
+fn search_marks_matches_in_the_rendered_line() {
+    let mut app = transcript_app(120, 40);
+    assert!(app.begin_search());
+    app.search
+        .as_mut()
+        .expect("search is open")
+        .set_query("flaky".to_string());
+    app.refresh_search_matches();
+    let theme = vibex_tui::TuiTheme::resolve(
+        Some("vibex-dark"),
+        vibex_ui::GpuiThemeMode::Dark,
+        ColorCapability {
+            mode: ColorMode::TrueColor,
+            glyphs: GlyphMode::Unicode,
+        },
+    );
+    let buffer = render_buffer(&mut app, 120, 40);
+    let mut highlighted = 0usize;
+    for row in 0..40u16 {
+        for column in 0..120u16 {
+            if let Some(cell) = buffer.cell((column, row))
+                && cell.bg == theme.roles.accent_attention
+            {
+                highlighted += 1;
+            }
+        }
+    }
+    assert!(
+        highlighted >= "flaky".len(),
+        "the match is not painted: {highlighted} cells"
+    );
+}
+
+#[test]
+fn an_invalid_pattern_says_so_instead_of_matching_nothing_silently() {
+    let mut app = transcript_app(120, 40);
+    assert!(app.begin_search());
+    app.search
+        .as_mut()
+        .expect("search is open")
+        .set_query("(unclosed".to_string());
+    app.refresh_search_matches();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("bad pattern"), "{screen}");
+}
+
+#[test]
+fn a_match_is_a_regular_expression() {
+    let mut app = transcript_app(120, 40);
+    assert!(app.begin_search());
+    app.search
+        .as_mut()
+        .expect("search is open")
+        .set_query("flaky|retried".to_string());
+    app.refresh_search_matches();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("1/2"), "{screen}");
+}

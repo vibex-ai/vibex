@@ -129,8 +129,17 @@ fn event_loop(
                     dirty = true;
                 }
                 Event::Paste(text) => {
-                    app.composer.insert_str(&text);
-                    app.refresh_completion();
+                    if app.search_composing() {
+                        if let Some(search) = app.search.as_mut() {
+                            let mut query = search.query.clone();
+                            query.push_str(&text);
+                            search.set_query(query);
+                        }
+                        app.refresh_search_matches();
+                    } else {
+                        app.composer.insert_str(&text);
+                        app.refresh_completion();
+                    }
                     dirty = true;
                 }
                 _ => {}
@@ -226,6 +235,12 @@ fn handle_key(
     guard: &mut TerminalGuard,
     key: KeyEvent,
 ) -> BackendResult<bool> {
+    // The transcript search bar is a text field, so it takes printable keys
+    // before the binding table sees them — the same rule the list filter uses.
+    if app.search_composing() {
+        handle_search_key(app, key);
+        return Ok(false);
+    }
     // While a filter or a prompt is being typed, printable characters are text.
     if app.filtering {
         match key.code {
@@ -365,6 +380,51 @@ fn handle_key(
     let outcome = app.perform(intent);
     dispatch_all(worker, &outcome);
     Ok(app.should_quit)
+}
+
+/// Transcript search editing keys.
+///
+/// The bar stays in "composing" until `Enter`, so the query can be corrected
+/// while the matches are already highlighted — the case that makes a regex
+/// search usable rather than a guessing game.
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let Some(search) = app.search.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char(character) if !control => {
+            let mut query = search.query.clone();
+            query.push(character);
+            search.set_query(query);
+            app.refresh_search_matches();
+        }
+        KeyCode::Backspace => {
+            let mut query = search.query.clone();
+            query.pop();
+            search.set_query(query);
+            app.refresh_search_matches();
+        }
+        KeyCode::Delete => {
+            search.set_query(String::new());
+            search.matches.clear();
+            search.total = 0;
+        }
+        KeyCode::Enter => {
+            search.composing = false;
+            app.reveal_current_match();
+        }
+        KeyCode::Down | KeyCode::PageDown => {
+            app.step_search(1);
+        }
+        KeyCode::Up | KeyCode::PageUp => {
+            app.step_search(-1);
+        }
+        KeyCode::Esc => {
+            app.close_search();
+        }
+        _ => {}
+    }
 }
 
 /// Composer editing keys. Returns `Some(true)` to exit the program.

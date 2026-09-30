@@ -497,16 +497,149 @@ fn render_scrollback(
     if !Bands::is_visible(area) {
         return;
     }
+    // The mouse layer maps a pointer back to a display line through this rect,
+    // so it is published before any early return.
+    app.regions.scrollback = area;
     if app.transcript.is_empty() {
         render_welcome(frame, area, app, theme, strings);
         return;
     }
-    let height = usize::from(area.height);
+    // The search bar owns the last two rows of the transcript band while it is
+    // open: a rule and the bar itself, exactly as the completion drawer owns
+    // the space above the composer.
+    let (content, search_bar) = if app.search.is_some() && area.height > 3 {
+        (
+            Rect {
+                height: area.height.saturating_sub(2),
+                ..area
+            },
+            Some(Rect {
+                y: area.y + area.height.saturating_sub(2),
+                height: 2,
+                ..area
+            }),
+        )
+    } else {
+        (area, None)
+    };
+    let height = usize::from(content.height);
     let selected = app.selection_for(Scope::Agent);
     let mut scroll = app.scroll;
     scroll.selected = Some(selected);
-    let lines = app.transcript.visible_lines(scroll, height, theme, strings);
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    let pattern = app
+        .search
+        .as_ref()
+        .and_then(|search| search.pattern.clone());
+    let lines = app.transcript.visible_lines_highlighted(
+        scroll,
+        height,
+        theme,
+        strings,
+        pattern.as_ref(),
+        search_highlight_style(theme),
+    );
+    frame.render_widget(Paragraph::new(Text::from(lines)), content);
+    if let Some(rows) = search_bar {
+        render_search_bar(frame, rows, app, theme, strings);
+    }
+}
+
+/// The inverted band a search match is painted with.
+fn search_highlight_style(theme: &TuiTheme) -> Style {
+    Style::default()
+        .fg(theme.roles.background)
+        .bg(theme.roles.accent_attention)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The transcript search bar: a rule, the query with a caret, and the counter.
+fn render_search_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let Some(search) = app.search.as_ref() else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let rule = Rect { height: 1, ..area };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(rule.width)),
+            Style::default().fg(theme.roles.gray_dim),
+        ))),
+        rule,
+    );
+    let bar = Rect {
+        y: area.y + 1,
+        height: 1,
+        ..area
+    };
+    // The counter is measured first so it can never be pushed off the row by a
+    // long query; the query is truncated to what is left.
+    let counter = if search.error.is_some() {
+        strings.search_bad_pattern().to_string()
+    } else if search.is_empty() {
+        String::new()
+    } else if search.total == 0 {
+        strings.search_no_matches().to_string()
+    } else {
+        format!("{}/{}", search.position(), search.total)
+    };
+    let counter_width = display_width(&counter);
+    let label = truncate_to_width(strings.search_label(), usize::from(bar.width), "");
+    let label_width = display_width(&label);
+    let query_width = usize::from(bar.width)
+        .saturating_sub(label_width + counter_width + 2)
+        .max(4);
+    let (visible, clipped) = search_query_window(&search.query, query_width);
+    let caret = if search.composing { "▏" } else { "" };
+    let mut spans = vec![
+        Span::styled(label, Style::default().fg(theme.roles.gray)),
+        Span::styled(visible, Style::default().fg(theme.roles.foreground)),
+        Span::styled(caret.to_string(), theme.accent()),
+    ];
+    if clipped {
+        spans.push(Span::styled("…", Style::default().fg(theme.roles.gray_dim)));
+    }
+    let left = Rect {
+        width: usize::from(bar.width).saturating_sub(counter_width) as u16,
+        ..bar
+    };
+    frame.render_widget(Paragraph::new(Line::from(spans)), left);
+    if !counter.is_empty() {
+        let style = if search.error.is_some() {
+            theme.warning()
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(counter, style))).alignment(Alignment::Right),
+            bar,
+        );
+    }
+}
+
+/// The tail of `query` that fits in `width`, plus whether it was clipped.
+fn search_query_window(query: &str, width: usize) -> (String, bool) {
+    if display_width(query) <= width {
+        return (query.to_string(), false);
+    }
+    let mut tail = String::new();
+    let mut used = 0usize;
+    for grapheme in query.graphemes(true).rev() {
+        let grapheme_width = display_width(grapheme);
+        if used + grapheme_width > width.saturating_sub(1) {
+            break;
+        }
+        tail.insert_str(0, grapheme);
+        used += grapheme_width;
+    }
+    (tail, true)
 }
 
 /// The full-screen session list.

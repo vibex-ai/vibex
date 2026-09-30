@@ -667,6 +667,30 @@ impl Transcript {
         lines
     }
 
+    /// Materialise the visible lines with every search match inverted.
+    ///
+    /// Highlighting runs on the rendered line rather than on the block source,
+    /// so a phrase that survives markdown rendering (emphasis split across
+    /// spans, a wrapped paragraph) still lights up exactly where it is drawn.
+    pub fn visible_lines_highlighted(
+        &mut self,
+        scroll: ScrollState,
+        height: usize,
+        theme: &TuiTheme,
+        strings: Strings,
+        pattern: Option<&crate::search::SearchPattern>,
+        highlight: Style,
+    ) -> Vec<Line<'static>> {
+        let lines = self.visible_lines(scroll, height, theme, strings);
+        match pattern {
+            Some(pattern) => lines
+                .into_iter()
+                .map(|line| highlight_line(line, pattern, highlight))
+                .collect(),
+            None => lines,
+        }
+    }
+
     /// Measure blocks backwards from the end until `height` lines are covered.
     fn measure_tail(&mut self, height: usize, theme: &TuiTheme, strings: Strings) {
         let mut covered = 0usize;
@@ -748,14 +772,96 @@ impl Transcript {
             .collect()
     }
 
+    /// Run a compiled pattern over every block.
+    ///
+    /// Returns the indices of the blocks that contain at least one match and
+    /// the total match count. Both are needed: the counter reports the total,
+    /// while stepping moves between blocks, because scrolling to a match is a
+    /// block-level operation.
+    ///
+    /// Collapsed and folded-away content is searched like any other: the reader
+    /// searching for a phrase expects to be taken to it, not told it does not
+    /// exist because it is behind a fold.
+    pub fn search_blocks(&self, pattern: &crate::search::SearchPattern) -> (Vec<usize>, usize) {
+        let mut blocks = Vec::new();
+        let mut total = 0usize;
+        for (index, block) in self.blocks.iter().enumerate() {
+            let hits = pattern.count(&block.title) + pattern.count(&block.body);
+            if hits > 0 {
+                blocks.push(index);
+                total += hits;
+            }
+        }
+        (blocks, total)
+    }
+
     /// Scroll offset needed to bring `index` to the top of the viewport.
     pub fn offset_of_block(&mut self, index: usize) -> usize {
         self.line_of_block(index)
     }
 }
 
-/// Fit a sequence of styled parts into `width` columns, dropping whole parts
-/// from the end before truncating the last one that fits.
+/// Invert every search match in one rendered line.
+///
+/// The spans are split at the match boundaries rather than rebuilt, so the
+/// glyphs, their widths and their order are exactly what the block renderer
+/// produced; only the style of the matched cells changes.
+pub fn highlight_line(
+    line: Line<'static>,
+    pattern: &crate::search::SearchPattern,
+    highlight: Style,
+) -> Line<'static> {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let ranges = pattern.ranges(&text);
+    if ranges.is_empty() {
+        return line;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + ranges.len());
+    let mut offset = 0usize;
+    for span in line.spans {
+        let start = offset;
+        let end = offset + span.content.len();
+        offset = end;
+        let mut cursor = start;
+        for range in ranges
+            .iter()
+            .filter(|range| range.start < end && range.end > start)
+        {
+            let match_start = range.start.max(start);
+            let match_end = range.end.min(end);
+            if cursor < match_start {
+                spans.push(Span::styled(
+                    span.content[cursor - start..match_start - start].to_string(),
+                    span.style,
+                ));
+            }
+            if match_start < match_end {
+                spans.push(Span::styled(
+                    span.content[match_start - start..match_end - start].to_string(),
+                    highlight,
+                ));
+            }
+            cursor = match_end.max(cursor);
+        }
+        if cursor < end {
+            spans.push(Span::styled(
+                span.content[cursor - start..].to_string(),
+                span.style,
+            ));
+        }
+    }
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+/// Fit a sequence of styled parts into `width` columns, dropping whole parts/// from the end before truncating the last one that fits.
 fn truncate_parts(parts: Vec<(String, Style)>, width: usize) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(parts.len());
     let mut used = 0usize;

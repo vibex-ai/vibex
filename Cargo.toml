@@ -52,6 +52,9 @@ smallvec = "1"
 sha2 = "0.10"
 sys-locale = "0.3.2"
 sysinfo = "0.37"
+# Transcript search is a regex with smart case. It is the same crate the
+# filesystem layer already resolves, so the graph gains no new package.
+regex = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

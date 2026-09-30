@@ -20,6 +20,7 @@
 //! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
 //! modal     the one chrome every popup is drawn through
 //! composer  the edit buffer, completion triggers and history
+//! search    transcript search: regex with smart case
 //! transcript block cache, incremental layout, viewport-only rendering
 //! view      page shells, overlays, the key bar
 //! app       navigation and overlay state
@@ -40,6 +41,7 @@ pub mod markdown;
 pub mod modal;
 pub mod reduce;
 pub mod run;
+pub mod search;
 pub mod terminal;
 pub mod text;
 pub mod theme;

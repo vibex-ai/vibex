@@ -436,6 +436,21 @@ impl App {
                 }
                 None => Outcome::quiet(),
             },
+            Intent::BeginTranscriptSearch => {
+                self.page = Page::Agent;
+                if !self.begin_search() {
+                    self.toast(Toast::info(self.strings.transcript_empty()));
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::SearchNext => {
+                self.step_search(1);
+                Outcome::effects(vec![])
+            }
+            Intent::SearchPrevious => {
+                self.step_search(-1);
+                Outcome::effects(vec![])
+            }
 
             // ---- composer -------------------------------------------------
             Intent::SubmitComposer => self.submit_composer(),
@@ -1216,6 +1231,11 @@ impl App {
     fn go_back(&mut self) -> Outcome {
         if self.overlay.is_some() {
             self.overlay = None;
+            return Outcome::effects(vec![]);
+        }
+        // The search bar is the innermost surface on the agent page, so `Esc`
+        // closes it before it does anything else.
+        if self.close_search() {
             return Outcome::effects(vec![]);
         }
         if self.filtering {

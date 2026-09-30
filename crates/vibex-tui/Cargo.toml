@@ -16,6 +16,7 @@ description = "Character-grid client for the Vibex DesktopRuntime"
 crossterm.workspace = true
 qrcode.workspace = true
 ratatui.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sys-locale.workspace = true

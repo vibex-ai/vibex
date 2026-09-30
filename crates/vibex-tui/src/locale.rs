@@ -172,6 +172,16 @@ strings! {
         "沒有開啟工作階段詳情卡片"
     },
 
+    // ---- transcript search ----------------------------------------------
+    search_label => { " search: ", " 搜索: ", " 搜尋: " },
+    search_bad_pattern => { "bad pattern", "正则无效", "正則無效" },
+    search_no_matches => { "no matches", "无匹配", "無符合" },
+    search_regex_hint => {
+        "Regular expression · case-insensitive unless it has an uppercase letter",
+        "正则表达式 · 不含大写字母时忽略大小写",
+        "正規表達式 · 不含大寫字母時忽略大小寫"
+    },
+
     // ---- composer -------------------------------------------------------
     composer_placeholder => {
         "Send a message…  (/ commands · @ files · $ skills)",

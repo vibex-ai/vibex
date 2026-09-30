@@ -407,6 +407,8 @@ pub struct App {
     /// Keyed by id rather than row index so a refresh, a rename or a filter
     /// cannot move a card onto a different session.
     pub session_cards: std::collections::BTreeSet<String>,
+    /// The transcript search in progress, when the search bar is open.
+    pub search: Option<crate::search::SearchState>,
     /// Messages held back until the running turn ends.
     pub queued_messages: Vec<String>,
     /// A transient message above the composer, dismissed on the next key.
@@ -565,6 +567,7 @@ impl App {
             usage_scope_session: true,
             draft_clear_armed: false,
             session_cards: std::collections::BTreeSet::new(),
+            search: None,
             queued_messages: Vec::new(),
             banner: None,
             turn_started: None,
@@ -997,6 +1000,79 @@ impl App {
                 self.scroll.offset = 0;
             }
         }
+        // Streaming content can add or invalidate matches, so an open search
+        // is re-run rather than left pointing at blocks that have changed.
+        self.refresh_search_matches();
+    }
+
+    /// Open the transcript search bar.
+    ///
+    /// The view deliberately keeps following the tail: opening the bar changes
+    /// nothing until the query produces a match to jump to, so an accidental
+    /// `/` does not scroll the reader away from what they were reading.
+    pub fn begin_search(&mut self) -> bool {
+        if self.transcript.is_empty() {
+            return false;
+        }
+        self.search = Some(crate::search::SearchState::new());
+        true
+    }
+
+    /// Close the search bar and forget the query.
+    pub fn close_search(&mut self) -> bool {
+        self.search.take().is_some()
+    }
+
+    /// Re-run the open search over the current blocks.
+    ///
+    /// Called after an edit to the query and after the transcript changes; it
+    /// is deliberately not called per frame, because scanning every block is
+    /// the one part of search that is not free.
+    pub fn refresh_search_matches(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let Some(pattern) = search.pattern.clone() else {
+            return;
+        };
+        let (blocks, total) = self.transcript.search_blocks(&pattern);
+        search.set_matches(blocks, total);
+        self.reveal_current_match();
+    }
+
+    /// Whether the search bar owns the keyboard right now.
+    pub fn search_composing(&self) -> bool {
+        self.search.as_ref().is_some_and(|search| search.composing)
+    }
+
+    /// Scroll so the block the search points at is visible.
+    pub fn reveal_current_match(&mut self) {
+        let Some(block) = self
+            .search
+            .as_ref()
+            .and_then(|search| search.current_block())
+        else {
+            return;
+        };
+        let height = self.viewport.1 as usize / 2;
+        let line = self.transcript.line_of_block(block);
+        self.scroll.follow = false;
+        self.scroll.offset = line.saturating_sub(height / 3);
+        self.set_selection(Scope::Agent, block);
+    }
+
+    /// Step to the next or previous match.
+    pub fn step_search(&mut self, delta: isize) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        if search.matches.is_empty() {
+            return false;
+        }
+        search.step(delta);
+        search.composing = false;
+        self.reveal_current_match();
+        true
     }
 
     /// Recompute the shell kind for the current viewport.
