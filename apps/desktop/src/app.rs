@@ -16482,7 +16482,9 @@ impl VibexWorkbench {
         if self.selected_session_id.as_ref() == Some(&session_id) {
             self.invalidate_timeline_render_caches();
             self.rebuild_timeline_sizes();
-            self.request_timeline_scroll_to_latest();
+            // A sent message is the newest turn the reader has to see, so the
+            // timeline follows it even when they had scrolled away first.
+            self.focus_timeline_on_sent_message();
         }
     }
 
@@ -19400,6 +19402,23 @@ impl VibexWorkbench {
 
     fn request_timeline_scroll_to_latest(&mut self) {
         self.timeline_scroll_to_latest_pending = true;
+    }
+
+    /// Land the timeline on the turn the reader just sent.
+    ///
+    /// Sending is an explicit instruction to look at the message that was sent,
+    /// so it outranks the scroll position that preceded it: a reader who had
+    /// scrolled up into the history still gets the new turn, which would
+    /// otherwise be appended below the fold with nothing but the unread pill to
+    /// announce it. Resuming bottom-follow also clears the unread count and the
+    /// preserved anchor, so the returned viewport is exact rather than a later
+    /// correction. The wheel-idle task is dropped because it carries the
+    /// decision made before the send and would restore it the moment it fires.
+    fn focus_timeline_on_sent_message(&mut self) {
+        self.timeline_scroll_wheel_idle_task = None;
+        self.timeline_scroll_anchor_pending = false;
+        self.timeline_follow.set_following_bottom(true);
+        self.request_timeline_scroll_to_latest();
     }
 
     fn apply_pending_timeline_scroll(&mut self) {
@@ -76059,6 +76078,48 @@ mod tests {
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX / 2.0,
             false,
         ));
+    }
+
+    #[test]
+    fn sending_a_message_lands_the_timeline_on_the_new_turn() {
+        let source = include_str!("app.rs");
+
+        // Every send path -- local, remote, native steer and the new-session
+        // panel's first message -- installs the optimistic user message, so the
+        // resume hangs off that install rather than one composer entry point.
+        let install = source
+            .split_once("    fn install_optimistic_user_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn discard_optimistic_user_message("))
+            .map(|(body, _)| body)
+            .expect("optimistic user message install should remain inspectable");
+        let rebuild = install
+            .find("self.rebuild_timeline_sizes();")
+            .expect("the new turn should be sized before the scroll is asked for");
+        let focus = install
+            .find("self.focus_timeline_on_sent_message();")
+            .expect("a sent message should move the timeline to its own turn");
+        assert!(rebuild < focus);
+
+        let focus = source
+            .split_once("    fn focus_timeline_on_sent_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_pending_timeline_scroll("))
+            .map(|(body, _)| body)
+            .expect("the sent-message scroll should remain inspectable");
+        // The wheel-idle task carries the decision made before the send, and it
+        // would restore that decision the moment it fires.
+        let cancel_idle = focus
+            .find("self.timeline_scroll_wheel_idle_task = None;")
+            .expect("the pre-send wheel decision should be dropped");
+        let clear_anchor = focus
+            .find("self.timeline_scroll_anchor_pending = false;")
+            .expect("a preserved anchor would fight the turn that was just sent");
+        let follow = focus
+            .find("self.timeline_follow.set_following_bottom(true);")
+            .expect("sending resumes following the bottom");
+        let request = focus
+            .find("self.request_timeline_scroll_to_latest();")
+            .expect("the resumed follow should ask for the bottom scroll");
+        assert!(cancel_idle < clear_anchor && clear_anchor < follow && follow < request);
     }
 
     #[test]

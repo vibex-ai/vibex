@@ -224,6 +224,23 @@ new non-empty Agent message rows only. Streaming deltas that reconcile into the
 same row count once; reasoning, plans, tools, permissions, and other activity
 rows do not increment the badge.
 
+### Convention: Sending a message returns the timeline to the new turn
+
+Sending is an explicit instruction to look at the turn that was sent, so it
+outranks the scroll position that preceded it. The send path resumes
+bottom-follow before it asks for the bottom scroll, so a reader who had scrolled
+up into the history still lands on the new turn instead of leaving it appended
+below the fold with nothing but the unread badge to announce it. Resuming follow
+also clears the unread count and the preserved anchor, so the restored viewport
+is exact rather than a later correction.
+
+The pending wheel-resume work carries the decision made before the send and
+would put that decision back the moment it fires, so sending cancels it too.
+The resume hangs off the install of the optimistic user message rather than one
+composer entry point: local send, remote send, steered queued message and the
+new-session panel's first message all install it, and all of them are the
+reader sending a message.
+
 ### Convention: A turn is over for display once a later turn follows it
 
 The projection marks a turn `superseded` when any later turn exists in the
