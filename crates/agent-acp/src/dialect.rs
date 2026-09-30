@@ -160,6 +160,12 @@ pub struct AgentDialectProfile {
     /// Without the capability the agent collapses each model into a single
     /// pre-parameterized variant id.
     pub parameterized_model_picker: bool,
+    /// The agent implements the bare `session/steer` method, which is not ACP
+    /// core and carries no capability flag: it arrives over the extension
+    /// channel, so `initialize` never announces it and the only way to learn
+    /// that it exists is to ask. Recorded here so the host can offer steering
+    /// before the first attempt instead of after it.
+    pub standard_steering: bool,
     /// Why this agent deviates from the generic path. Recorded for
     /// diagnostics and to keep the table auditable.
     pub rationale: &'static str,
@@ -181,6 +187,7 @@ impl AgentDialectProfile {
             host_request_dialects: &[],
             restore_policy: RestorePolicy::ResumeThenLoadThenNew,
             parameterized_model_picker: false,
+            standard_steering: false,
             rationale: "generic ACP behavior only; capability comes from runtime probing",
             goal: GoalDialect::unsupported(),
         }
@@ -227,6 +234,11 @@ impl AgentDialectProfile {
 
     const fn with_parameterized_model_picker(mut self) -> Self {
         self.parameterized_model_picker = true;
+        self
+    }
+
+    const fn with_standard_steering(mut self) -> Self {
+        self.standard_steering = true;
         self
     }
 
@@ -335,7 +347,12 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
     // live tool call reports the wrapper instead of the real `mcp__…` tool.
     AgentDialectProfile::generic("codebuddy-code")
         .profiled("wraps MCP tool calls in DeferExecuteTool and re-serializes their results")
-        .with_enricher(AgentEventEnricherKind::CodeBuddy),
+        .with_enricher(AgentEventEnricherKind::CodeBuddy)
+        // `session/steer` buffers a message into the running turn and returns
+        // immediately, so a user can redirect work without cancelling it. It is
+        // an extension method with no capability flag, which is why it has to be
+        // recorded here rather than discovered from `initialize`.
+        .with_standard_steering(),
     // gemini-cli prompts for workspace trust on stdin, which no ACP client can
     // answer; without the flag the handshake stalls until the timeout.
     AgentDialectProfile::generic("gemini")
@@ -375,6 +392,14 @@ pub fn agent_dialect_profiles() -> &'static [AgentDialectProfile] {
 /// live sessions and probes must agree on it.
 pub fn agent_supports_parameterized_model_picker(agent_id: &str) -> bool {
     agent_dialect_profile(agent_id).parameterized_model_picker
+}
+
+/// Whether this agent implements the bare `session/steer` method.
+///
+/// Nothing advertises it — it is reached over the extension channel — so the
+/// host has to know from its own table whether offering steering is honest.
+pub fn agent_supports_standard_steering(agent_id: &str) -> bool {
+    agent_dialect_profile(agent_id).standard_steering
 }
 
 #[cfg(test)]
@@ -425,6 +450,28 @@ mod tests {
             assert!(
                 !agent_supports_parameterized_model_picker(agent_id),
                 "{agent_id} must not receive the Cursor picker capability"
+            );
+        }
+    }
+
+    /// Only one Agent implements `session/steer`, and nothing on the wire says
+    /// so: it arrives over the extension channel without a capability flag, so
+    /// this table is what keeps the host from either hiding steering from an
+    /// Agent that supports it or offering it for one that does not.
+    #[test]
+    fn only_the_standard_steering_agent_is_recorded_as_supporting_it() {
+        assert!(agent_supports_standard_steering("codebuddy-code"));
+        for agent_id in [
+            "claude",
+            "codex",
+            "grok",
+            "gemini",
+            "opencode",
+            "not-a-real-agent",
+        ] {
+            assert!(
+                !agent_supports_standard_steering(agent_id),
+                "{agent_id} must not be offered bare session/steer"
             );
         }
     }

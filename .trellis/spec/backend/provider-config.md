@@ -4123,6 +4123,29 @@ ResolvedAgentProviderProjection {
   accumulated chunks as a fallback. Feeding the chunks through the
   prefix-comparison delta as if each were a growing total would report every
   chunk after the first as a replacement and drop what came before it.
+- CodeBuddy's `multitask` switch needs no dedicated code, and adding some would
+  duplicate a path that already works. It is an ordinary advertised
+  config option — `{ "type": "boolean", "id": "multitask", "category":
+  "_codebuddy.ai/multitask" }` — so `config_option_kind` reads it as
+  `Boolean`, the runtime catalogue surfaces it as a Toggle, and
+  `runtime_config_wire_value` sends a JSON boolean through the raw
+  `session/set_config_option` envelope. That envelope exists precisely so a
+  boolean is not coerced into the select builder's string. The id is not in
+  `STRUCTURAL_KEYS`, so it is not filtered out of the catalogue either. The one
+  thing never to do is pass `--multitask` or `--agent multitask` on the command
+  line: the entry guard rejects the process outright when either meets `--acp`.
+- `session/steer` is the second way to steer a turn, and the dialect table is
+  what makes it safe to offer. It is neither ACP core nor namespaced with a
+  leading underscore, so it travels the extension channel while looking like a
+  core method, and no capability flag announces it. `session/steering` (the
+  `_session/steering` extension) is tried first when negotiated; otherwise the
+  bare method is sent **only** for an Agent the dialect table records as
+  implementing it, because sending it to an Agent that does not turns an
+  immediate local rejection into a round trip that waits out the prompt timeout
+  on an adapter that accepts the request and never answers. The response still
+  decides: `{"steered":true}` is `Injected`, `{"steered":false}` with any
+  `reason` (`idle`, `stale`) is `PromptRequired`, and `-32601` maps back to
+  `acp_steering_unsupported`.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,

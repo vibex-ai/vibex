@@ -223,6 +223,10 @@ const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const GROK_AGENT_ID: &str = "grok";
 const PI_AGENT_ID: &str = "pi";
+/// The bare `session/steer` method. It is not ACP core and it is not namespaced
+/// with a leading underscore either, so it reaches the Agent over the same
+/// extension channel while looking like a core method on the wire.
+const STANDARD_STEER_METHOD: &str = "session/steer";
 const OPENCODE_DEFAULT_MODEL: &str = "opencode-default";
 const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
@@ -18408,40 +18412,75 @@ impl AcpClient for AcpRuntimeClient {
         let generation = attachment.fence().activation_generation as i64;
         let payload = attachment.payload();
         let process = payload.process();
-        let evidence = process
+        let native_session_id = attachment.fence().native_session_id.clone();
+        let prompt = runtime_prompt_content(&request.text, &request.attachments);
+        let extension = process
             .operation_evidence(generation)
             .get(&AcpOperation::SessionSteering)
+            .filter(|evidence| evidence.supported_for(&process.compatibility_identity, generation))
             .cloned();
-        let Some(evidence) = evidence else {
+        if extension.is_some() {
+            let params = protocol::build_session_steering_params(&native_session_id, prompt);
+            let response = process
+                .request(
+                    AcpOperation::SessionSteering.method(),
+                    params,
+                    self.prompt_timeout,
+                )
+                .await?;
+            return match response.get("outcome").and_then(Value::as_str) {
+                Some("injected") => Ok(AcpSteerOutcome::Injected),
+                Some("promptRequired") => Ok(AcpSteerOutcome::PromptRequired),
+                _ => Err(VibexError::process(
+                    "acp_steering_response_invalid",
+                    "ACP steering response did not report a recognized outcome",
+                )),
+            };
+        }
+        // Nothing negotiated the `_session/steering` contract. The bare
+        // `session/steer` method is the other way to steer, but only the dialect
+        // table knows which Agents implement it, and that gate is load-bearing:
+        // sending it to an Agent that does not would turn an immediate local
+        // rejection into a round-trip that waits out the prompt timeout on an
+        // adapter that accepts the request and never answers.
+        if !crate::dialect::agent_supports_standard_steering(process.agent_id.as_str()) {
             return Err(VibexError::capability(
                 "acp_steering_unsupported",
                 "ACP agent did not advertise native steering support",
             ));
+        }
+        // The table is a claim about a method no capability flag announces, so
+        // the answer still decides: an Agent that turns out not to implement it
+        // answers `-32601`, which maps back to the same unsupported outcome.
+        let params = protocol::build_session_steer_params(&native_session_id, prompt);
+        let response = match process
+            .request(STANDARD_STEER_METHOD, params, self.prompt_timeout)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if is_capability_negative(&error) => {
+                return Err(VibexError::capability(
+                    "acp_steering_unsupported",
+                    "ACP agent did not advertise native steering support",
+                ));
+            }
+            Err(error) => return Err(error),
         };
-        if !evidence.supported_for(&process.compatibility_identity, generation) {
-            return Err(VibexError::capability(
-                "acp_steering_unsupported",
-                "ACP native steering is not negotiated for this activation",
-            ));
-        }
-        let prompt = runtime_prompt_content(&request.text, &request.attachments);
-        let params =
-            protocol::build_session_steering_params(&attachment.fence().native_session_id, prompt);
-        let response = process
-            .request(
-                AcpOperation::SessionSteering.method(),
-                params,
-                self.prompt_timeout,
-            )
-            .await?;
-        match response.get("outcome").and_then(Value::as_str) {
-            Some("injected") => Ok(AcpSteerOutcome::Injected),
-            Some("promptRequired") => Ok(AcpSteerOutcome::PromptRequired),
-            _ => Err(VibexError::process(
-                "acp_steering_response_invalid",
-                "ACP steering response did not report a recognized outcome",
-            )),
-        }
+        // `{"steered":true}` means the message reached the live turn.
+        // `{"steered":false}` and `{"steered":false,"reason":"idle"|"stale"}`
+        // all mean it did not, which is the same answer as `promptRequired`:
+        // the caller sends an ordinary prompt instead.
+        Ok(
+            if response
+                .get("steered")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                AcpSteerOutcome::Injected
+            } else {
+                AcpSteerOutcome::PromptRequired
+            },
+        )
     }
 
     async fn native_steering_supported(&self, binding: &ProviderBinding) -> bool {
@@ -18450,6 +18489,12 @@ impl AcpClient for AcpRuntimeClient {
         };
         let generation = attachment.fence().activation_generation as i64;
         let process = attachment.payload().process();
+        if crate::dialect::agent_supports_standard_steering(process.agent_id.as_str()) {
+            // The bare `session/steer` method has no capability flag, so this
+            // table is the only thing that lets the host offer steering before
+            // the first attempt rather than after it.
+            return true;
+        }
         process
             .operation_evidence(generation)
             .get(&AcpOperation::SessionSteering)

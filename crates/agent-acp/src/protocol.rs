@@ -897,6 +897,22 @@ pub(crate) fn build_session_prompt_params(native_session_id: &str, prompt: Vec<V
     }
 }
 
+/// Build `session/steer` params.
+///
+/// This is not an ACP core method: Agents that implement it expose it over the
+/// extension channel, so nothing in `initialize` announces it and support can
+/// only be discovered by asking. The content-block array is the same shape as
+/// `session/prompt`'s, and the Agent rejects an empty one as `invalidParams`.
+pub(crate) fn build_session_steer_params(
+    native_session_id: &str,
+    content_blocks: Vec<Value>,
+) -> Value {
+    json!({
+        "sessionId": native_session_id,
+        "contentBlocks": content_blocks,
+    })
+}
+
 /// Build `_session/steering` params.
 ///
 /// The bridge accepts the same content-block array as `session/prompt`, plus a
@@ -1143,6 +1159,27 @@ mod tests {
                 "_meta": { "steering": { "idleBehavior": "promptRequired" } },
             })
         );
+    }
+
+    /// `session/steer` names its content array differently from
+    /// `session/prompt` and carries no reserved `_meta`: it is an adapter
+    /// extension that happens not to be namespaced, so its shape is the
+    /// adapter's own rather than the prompt shape under another name.
+    #[test]
+    fn standard_steer_params_use_the_adapters_own_content_key() {
+        let params = build_session_steer_params(
+            "native-1",
+            vec![json!({ "type": "text", "text": "focus on tests" })],
+        );
+        assert_eq!(
+            params,
+            json!({
+                "sessionId": "native-1",
+                "contentBlocks": [{ "type": "text", "text": "focus on tests" }],
+            })
+        );
+        assert!(params.get("prompt").is_none());
+        assert!(params.get("_meta").is_none());
     }
 
     #[test]
