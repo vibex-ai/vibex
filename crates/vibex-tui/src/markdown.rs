@@ -30,7 +30,7 @@ use crate::theme::TuiTheme;
 
 /// A rendered markdown document: display lines plus the plain text of each,
 /// which the copy action and the search index both need.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderedMarkdown {
     pub lines: Vec<Line<'static>>,
     /// Plain text per line, same length as `lines`.
@@ -89,6 +89,175 @@ pub fn render_markdown_with(
     };
     builder.blocks(&document.blocks, 0);
     builder.finish()
+}
+
+/// A markdown document that grows a chunk at a time.
+///
+/// Re-rendering the whole document on every delta is quadratic in the length of
+/// the answer: a paragraph that took a millisecond to lay out at fifty tokens
+/// takes a hundred times that at five thousand, once per token. This keeps a
+/// *frozen prefix* instead — source bytes that can never be re-interpreted by
+/// the text that follows — and re-renders only what comes after it.
+///
+/// A freeze point is a blank line that ends a top-level block: a paragraph, a
+/// heading, a closed fence. Nothing inside a list, a quote, a table or an
+/// unclosed fence qualifies, because the text that follows can still change how
+/// those lines read.
+#[derive(Debug, Clone, Default)]
+pub struct StreamingMarkdown {
+    /// Everything received so far.
+    source: String,
+    /// Bytes of `source` the frozen rows were rendered from.
+    frozen_bytes: usize,
+    /// Rows of [`Self::rendered`] that are frozen.
+    frozen_rows: usize,
+    /// The frozen rows followed by the live tail, in one buffer.
+    ///
+    /// One buffer rather than two documents joined per delta: a join would copy
+    /// the whole answer again on every token, which is the cost this type
+    /// exists to avoid.
+    rendered: RenderedMarkdown,
+}
+
+impl StreamingMarkdown {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The text received so far.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Bytes that can no longer be re-interpreted, for tests and diagnostics.
+    pub fn frozen_bytes(&self) -> usize {
+        self.frozen_bytes
+    }
+
+    /// The document as it stands: rendered rows only.
+    pub fn rendered(&self) -> &RenderedMarkdown {
+        &self.rendered
+    }
+
+    /// Append a chunk and re-render only the unfrozen remainder.
+    ///
+    /// Returns the whole document, because that is what a caller painting a
+    /// block needs; the frozen rows are reused rather than rebuilt.
+    pub fn push(
+        &mut self,
+        delta: &str,
+        theme: &TuiTheme,
+        width: usize,
+        strings: Strings,
+        prose: Style,
+    ) -> &RenderedMarkdown {
+        if delta.is_empty() {
+            return &self.rendered;
+        }
+        self.source.push_str(delta);
+        self.rerender(theme, width, strings, prose);
+        &self.rendered
+    }
+
+    fn rerender(&mut self, theme: &TuiTheme, width: usize, strings: Strings, prose: Style) {
+        let checkpoint = freeze_point(&self.source, self.frozen_bytes);
+        if checkpoint > self.frozen_bytes {
+            // The stale tail is dropped before the newly settled source is
+            // rendered once and appended: the rows before it are never looked
+            // at again.
+            self.rendered.lines.truncate(self.frozen_rows);
+            self.rendered.plain.truncate(self.frozen_rows);
+            let settled = render_markdown_with(
+                &self.source[self.frozen_bytes..checkpoint],
+                theme,
+                width,
+                strings,
+                prose,
+            );
+            self.rendered.lines.extend(settled.lines);
+            self.rendered.plain.extend(settled.plain);
+            self.frozen_rows = self.rendered.lines.len();
+            self.frozen_bytes = checkpoint;
+        }
+        let tail = render_markdown_with(
+            &self.source[self.frozen_bytes..],
+            theme,
+            width,
+            strings,
+            prose,
+        );
+        self.rendered.lines.truncate(self.frozen_rows);
+        self.rendered.plain.truncate(self.frozen_rows);
+        self.rendered.lines.extend(tail.lines);
+        self.rendered.plain.extend(tail.plain);
+    }
+}
+
+/// Where the next freeze can be taken, at or after `from`.
+///
+/// The answer is a source offset: the end of the last blank line that follows a
+/// complete top-level block. `from` itself is returned when nothing qualifies,
+/// which is what keeps the frozen prefix monotonically growing.
+pub fn freeze_point(source: &str, from: usize) -> usize {
+    let mut checkpoint = from;
+    let mut fence_open = false;
+    let mut offset = 0usize;
+    let mut previous: Option<&str> = None;
+    for line in source.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if start < from {
+            previous = Some(line.trim_end_matches('\n'));
+            continue;
+        }
+        let text = line.trim_end_matches('\n');
+        let trimmed = text.trim_start();
+        // A fence toggles the region that must never be frozen.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fence_open = !fence_open;
+            previous = Some(text);
+            continue;
+        }
+        if text.trim().is_empty()
+            && !fence_open
+            && previous.is_some_and(|previous| is_top_level_block_end(previous))
+        {
+            // Freeze after the blank line: the paragraph break belongs to the
+            // frozen part, so the tail never starts with an empty row.
+            checkpoint = offset;
+        }
+        previous = Some(text);
+    }
+    checkpoint
+}
+
+/// Whether a line can end a complete top-level block.
+///
+/// List items, quotes, table rows and indented lines continue into whatever
+/// follows them, so a blank line after one of those is not a boundary the
+/// renderer may cut at.
+fn is_top_level_block_end(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return false;
+    }
+    if trimmed.starts_with('>')
+        || trimmed.starts_with('|')
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("+ ")
+    {
+        return false;
+    }
+    // An ordered list marker: digits followed by `.` or `)`.
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 && trimmed[digits..].starts_with(['.', ')']) {
+        return false;
+    }
+    true
 }
 
 /// Render plain text (no markdown syntax) with the same wrapping rules.
@@ -255,16 +424,13 @@ impl<'a> Builder<'a> {
             Block::Heading { level, content, .. } => {
                 // Emphasis carries the heading, not the source's `#`s: the
                 // marker is markup, and printing it is noise the reader has to
-                // skip on every heading. A rule under the top two levels keeps
-                // the hierarchy visible in terminals whose CJK font has no bold
-                // face.
-                let style = match level {
-                    1 | 2 => self
-                        .theme
-                        .strong()
-                        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
-                    _ => self.theme.strong(),
-                };
+                // skip on every heading. The *colour* carries the level, so a
+                // document's outline is legible from the hue ladder alone and
+                // survives a terminal whose CJK face has no bold cut.
+                let index = usize::from((*level).clamp(1, 6)) - 1;
+                let style = Style::default()
+                    .fg(self.theme.markdown.heading[index])
+                    .add_modifier(Modifier::BOLD);
                 let mut spans = self.inlines_styled(content, style);
                 if spans.is_empty() {
                     spans.push(Span::styled(String::new(), style));
@@ -273,13 +439,15 @@ impl<'a> Builder<'a> {
                 self.blank();
             }
             Block::Quote(children) => {
+                // A quiet bar, not a rule: the quote's own text is the content
+                // and the bar only says where it starts.
                 let marker = vec![Span::styled(
                     if self.theme.glyphs() == crate::theme::GlyphMode::Unicode {
                         "▏ ".to_string()
                     } else {
                         "| ".to_string()
                     },
-                    self.theme.muted(),
+                    Style::default().fg(self.theme.markdown.quote),
                 )];
                 self.quote_children(children, indent, marker);
                 self.blank();
@@ -373,7 +541,12 @@ impl<'a> Builder<'a> {
                             }
                         },
                     };
-                    let marker = vec![Span::styled(marker_text, self.theme.muted())];
+                    let marker_style = match item.checked {
+                        Some(true) => Style::default().fg(self.theme.markdown.task_done),
+                        Some(false) => Style::default().fg(self.theme.markdown.task_todo),
+                        None => Style::default().fg(self.theme.markdown.marker),
+                    };
+                    let marker = vec![Span::styled(marker_text, marker_style)];
                     let mut first = true;
                     for child in &item.children {
                         match &child.kind {
@@ -408,6 +581,8 @@ impl<'a> Builder<'a> {
                 self.blank();
             }
             Block::ThematicBreak => {
+                // Three cells, not a width-filling line: a rule is a pause in
+                // the prose, and a full row of dashes reads as a table border.
                 let glyph = if self.theme.glyphs() == crate::theme::GlyphMode::Unicode {
                     "─"
                 } else {
@@ -417,8 +592,8 @@ impl<'a> Builder<'a> {
                     indent,
                     Vec::new(),
                     vec![Span::styled(
-                        glyph.repeat(self.width.min(40)),
-                        self.theme.muted(),
+                        glyph.repeat(3),
+                        Style::default().fg(self.theme.markdown.rule),
                     )],
                 );
                 self.blank();
@@ -544,12 +719,17 @@ impl<'a> Builder<'a> {
     }
 
     fn code_block(&mut self, language: Option<&str>, source: &str, indent: usize) {
-        let base = self.theme.code();
+        // Literals are text on the code background; a highlighter overrides
+        // only the runs it recognises.
+        let base = self.theme.code().fg(self.theme.markdown.code);
         if let Some(language) = language.filter(|value| !value.is_empty()) {
             self.logical_with(
                 indent,
                 Vec::new(),
-                vec![Span::styled(language.to_string(), self.theme.muted())],
+                vec![Span::styled(
+                    language.to_string(),
+                    Style::default().fg(self.theme.markdown.code_language),
+                )],
             );
         }
         let lines = source.split('\n').collect::<Vec<_>>();
@@ -633,6 +813,7 @@ impl<'a> Builder<'a> {
         }
         let glyphs = self.theme.glyphs() == crate::theme::GlyphMode::Unicode;
         let (vertical, horizontal) = if glyphs { ("│", "─") } else { ("|", "-") };
+        let border = Style::default().fg(self.theme.markdown.table_border);
         // A table is a box: top, a rule under the header, and a closed bottom.
         // Without the bottom rule it reads as content that got cut off.
         let rule = |left: &str, middle: &str, right: &str, widths: &[usize]| {
@@ -654,17 +835,11 @@ impl<'a> Builder<'a> {
         };
         self.push_preformatted(
             indent,
-            vec![Span::styled(
-                rule("┌", "┬", "┐", &widths),
-                self.theme.border_style(),
-            )],
+            vec![Span::styled(rule("┌", "┬", "┐", &widths), border)],
             None,
         );
         for (row_index, row) in cells.iter().enumerate() {
-            let mut spans = vec![Span::styled(
-                format!("{vertical} "),
-                self.theme.border_style(),
-            )];
+            let mut spans = vec![Span::styled(format!("{vertical} "), border)];
             for (index, width) in widths.iter().enumerate() {
                 let cell = row.get(index).map(String::as_str).unwrap_or_default();
                 // Padding is measured in cells: `{:<width$}` counts
@@ -683,26 +858,20 @@ impl<'a> Builder<'a> {
                 } else {
                     format!(" {vertical} ")
                 };
-                spans.push(Span::styled(edge, self.theme.border_style()));
+                spans.push(Span::styled(edge, border));
             }
             self.push_preformatted(indent, spans, None);
             if row_index == 0 && header.is_some() {
                 self.push_preformatted(
                     indent,
-                    vec![Span::styled(
-                        rule("├", "┼", "┤", &widths),
-                        self.theme.border_style(),
-                    )],
+                    vec![Span::styled(rule("├", "┼", "┤", &widths), border)],
                     None,
                 );
             }
         }
         self.push_preformatted(
             indent,
-            vec![Span::styled(
-                rule("└", "┴", "┘", &widths),
-                self.theme.border_style(),
-            )],
+            vec![Span::styled(rule("└", "┴", "┘", &widths), border)],
             None,
         );
     }
@@ -725,13 +894,12 @@ impl<'a> Builder<'a> {
                 out.push(Span::styled(text.clone(), style));
             }
             Inline::Code(text) => {
-                // No backticks: the background and colour are the marker. A
-                // reader should see code, not the syntax that marks it up. The
-                // colour is the literal/command role rather than the theme's
-                // accent, which several themes resolve to plain foreground.
+                // No backticks: the colour is the marker. A literal takes the
+                // syntax palette's own colour rather than a background, so a
+                // sentence with three code spans in it stays a sentence.
                 out.push(Span::styled(
                     text.clone(),
-                    self.theme.code().fg(self.theme.roles.command),
+                    Style::default().fg(self.theme.markdown.code),
                 ));
             }
             Inline::Emphasis(children) => {
@@ -786,7 +954,10 @@ impl<'a> Builder<'a> {
                 let label = plain_inlines(children);
                 let target = resource_target(destination);
                 if !label.contains(&target) {
-                    out.push(Span::styled(format!(" <{target}>"), self.theme.muted()));
+                    out.push(Span::styled(
+                        format!(" <{target}>"),
+                        Style::default().fg(self.theme.markdown.link_target),
+                    ));
                 }
             }
             Inline::Image(image) => {
@@ -808,7 +979,10 @@ impl<'a> Builder<'a> {
             }
             Inline::Break => out.push(Span::raw(" ")),
             Inline::FootnoteReference(label) => {
-                out.push(Span::styled(format!("[^{label}]"), self.theme.muted()));
+                out.push(Span::styled(
+                    format!("[^{label}]"),
+                    Style::default().fg(self.theme.markdown.marker),
+                ));
             }
         }
     }
@@ -1002,28 +1176,20 @@ pub struct HighlightPalette {
 }
 
 impl HighlightPalette {
+    /// The palette the theme already parsed.
+    ///
+    /// The catalogue ships the syntax colours as JSON; parsing it here would
+    /// put a JSON parse inside every render, including every delta of a
+    /// streaming answer.
     pub fn for_theme(theme: &TuiTheme) -> Self {
-        use crate::theme::ColorMode;
-        if theme.capability.mode == ColorMode::None {
-            return Self::default();
-        }
-        let Some(definition) = vibex_ui::theme_catalog::theme(theme.id) else {
-            return Self::default();
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(definition.highlight_json) else {
-            return Self::default();
-        };
-        let lookup = |key: &str| -> Option<ratatui::style::Color> {
-            let value = json.get("syntax")?.get(key)?.get("color")?.as_str()?;
-            parse_hex_color(value).and_then(|rgb| theme.capability.color(rgb))
-        };
+        let syntax = theme.syntax;
         Self {
-            keyword: lookup("keyword"),
-            string: lookup("string"),
-            comment: lookup("comment"),
-            number: lookup("number"),
-            function: lookup("function"),
-            type_name: lookup("type"),
+            keyword: syntax.keyword,
+            string: syntax.string,
+            comment: syntax.comment,
+            number: syntax.number,
+            function: syntax.function,
+            type_name: syntax.type_name,
         }
     }
 
@@ -1136,14 +1302,6 @@ impl HighlightPalette {
         flush(&mut token, token_style, &mut spans);
         spans
     }
-}
-
-fn parse_hex_color(value: &str) -> Option<u32> {
-    let hex = value.trim().trim_start_matches('#');
-    if hex.len() < 6 {
-        return None;
-    }
-    u32::from_str_radix(&hex[..6], 16).ok()
 }
 
 /// Keyword sets per language family. Unknown languages get no colouring rather
@@ -1353,8 +1511,10 @@ mod tests {
         );
         assert!(text.contains("项目概览"), "{text}");
         assert!(text.contains("pnpm check:rust"), "{text}");
-        // The code span carries the code background and the literal colour
-        // rather than a pair of backticks, so it is still identifiable as code.
+        // The code span carries the literal colour rather than a pair of
+        // backticks, so it is still identifiable as code — and it keeps the
+        // prose background, because a sentence with a code span in it is still
+        // a sentence.
         let palette = theme(ColorMode::TrueColor);
         let code = rendered
             .lines
@@ -1362,8 +1522,8 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .find(|span| span.content.contains("pnpm check:rust"))
             .expect("the code span is rendered");
-        assert_eq!(code.style.bg, Some(palette.roles.code_background));
-        assert_eq!(code.style.fg, Some(palette.roles.command));
+        assert_eq!(code.style.bg, None);
+        assert_eq!(code.style.fg, Some(palette.markdown.code));
     }
 
     #[test]
@@ -1395,10 +1555,10 @@ mod tests {
                 .add_modifier(Modifier::BOLD),
         );
         assert!(bold.contains("bold"), "bold text lost its style: {bold:?}");
-        let code = by_style(palette.code().fg(palette.roles.command));
+        let code = by_style(Style::default().fg(palette.markdown.code));
         assert!(
             code.contains("code"),
-            "the code span lost its background: {code:?}"
+            "the code span lost its colour: {code:?}"
         );
     }
 
@@ -1449,15 +1609,19 @@ mod tests {
         );
         assert_eq!(
             heading,
-            Some(palette.roles.foreground),
-            "heading is not bright"
+            Some(palette.markdown.heading[0]),
+            "heading does not wear its level's colour"
         );
         assert_eq!(
             code,
-            Some(palette.roles.command),
+            Some(palette.markdown.code),
             "code is not its own colour"
         );
-        assert_eq!(link, Some(palette.roles.link), "link is not its own colour");
+        assert_eq!(
+            link,
+            Some(palette.markdown.link),
+            "link is not its own colour"
+        );
         let distinct = [prose, heading, code, link]
             .into_iter()
             .map(|colour| format!("{colour:?}"))
@@ -1543,6 +1707,88 @@ mod tests {
         assert!(text.contains("* item") || text.contains("- item"), "{text}");
         assert!(!text.contains('─'), "{text}");
         assert!(!text.contains('│'), "{text}");
+    }
+
+    /// The document streamed in chunks must render exactly like the whole
+    /// document, or the last frame of a stream would differ from a reload.
+    #[test]
+    fn a_streamed_document_renders_like_a_finished_one() {
+        let source = "\
+# Title
+
+First paragraph with `code` in it.
+
+- one
+- two
+
+```rust
+fn main() {}
+```
+
+Second paragraph that arrives later.
+
+---
+
+> quoted line
+";
+        let theme = theme(ColorMode::TrueColor);
+        let strings = Strings::for_locale(Locale::En);
+        let mut stream = StreamingMarkdown::new();
+        let mut grown = String::new();
+        for chunk in source.as_bytes().chunks(7) {
+            let chunk = std::str::from_utf8(chunk).unwrap();
+            grown.push_str(chunk);
+            let streamed = stream.push(chunk, &theme, 40, strings, theme.prose());
+            let whole = render(grown.as_str(), 40);
+            assert_eq!(
+                streamed.plain.join("\n").trim_end(),
+                whole.plain.join("\n").trim_end(),
+                "streaming diverged after {grown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_frozen_prefix_only_grows_at_settled_boundaries() {
+        let theme = theme(ColorMode::TrueColor);
+        let strings = Strings::for_locale(Locale::En);
+        let mut stream = StreamingMarkdown::new();
+        stream.push("first paragraph", &theme, 40, strings, theme.prose());
+        assert_eq!(
+            stream.frozen_bytes(),
+            0,
+            "an unterminated paragraph is not settled"
+        );
+        stream.push(" continued\n\n", &theme, 40, strings, theme.prose());
+        let settled = stream.frozen_bytes();
+        assert!(settled > 0, "a blank line ends a top-level block");
+        stream.push("second paragraph", &theme, 40, strings, theme.prose());
+        assert_eq!(
+            stream.frozen_bytes(),
+            settled,
+            "text inside the live paragraph moved the freeze point"
+        );
+    }
+
+    #[test]
+    fn nothing_inside_a_structure_is_frozen() {
+        // A list continues across blank lines, an open fence swallows
+        // everything after it, and a table's rows belong together: freezing
+        // any of them would re-render the tail out of context.
+        let cases = [
+            "- one\n\n- two\n\n",
+            "1. one\n\n2. two\n\n",
+            "> quoted\n\n> more\n\n",
+            "| a | b |\n\n| - | - |\n\n",
+            "```rust\ncode\n\nstill code\n",
+            "  indented\n\n  still indented\n\n",
+        ];
+        for case in cases {
+            assert_eq!(freeze_point(case, 0), 0, "froze inside {case:?}");
+        }
+        // A closed fence *is* settled.
+        let closed = "```rust\ncode\n```\n\nnext\n";
+        assert!(freeze_point(closed, 0) > 0, "a closed fence can freeze");
     }
 
     #[test]

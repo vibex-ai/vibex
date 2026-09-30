@@ -366,6 +366,102 @@ impl ThemeRole {
     }
 }
 
+/// The colours a markdown document is drawn in.
+///
+/// A document is not a rail: it needs a hue *ladder* for structure (a heading
+/// level is a depth, and depth has to be visible at a glance), one colour for
+/// literals, and one muted step for the marks that are punctuation rather than
+/// content — bullets, rules, quote bars, table borders. Emphasis deliberately
+/// has no colour of its own: weight and slant carry it, so colour can keep
+/// meaning "this is a different kind of thing".
+///
+/// The hues come from the catalogue's chart series, which exist precisely to be
+/// a fixed set of distinguishable colours inside one theme, so every shipped
+/// theme gets the same relationships with its own hues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownPalette {
+    /// Heading levels 1..=6, brightest first. The last three recede into grey:
+    /// a document rarely goes that deep, and when it does the deepest levels
+    /// are structure, not emphasis.
+    pub heading: [Color; 6],
+    /// Inline code and the body of a fenced block.
+    pub code: Color,
+    /// The language label on a fence, which names the literal rather than being
+    /// one.
+    pub code_language: Color,
+    /// A link's label.
+    pub link: Color,
+    /// The target printed beside a link whose label does not name it.
+    pub link_target: Color,
+    /// Bullets, ordered markers, footnote references.
+    pub marker: Color,
+    /// A checked task box.
+    pub task_done: Color,
+    /// An unchecked task box.
+    pub task_todo: Color,
+    /// The bar beside a quotation.
+    pub quote: Color,
+    /// A thematic break.
+    pub rule: Color,
+    /// A table's borders.
+    pub table_border: Color,
+}
+
+/// The syntax colours a fenced code block is highlighted with.
+///
+/// Read once per theme rather than per block: the catalogue ships the palette
+/// as JSON, and parsing it inside every render would put a JSON parse on the
+/// streaming path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyntaxPalette {
+    pub keyword: Option<Color>,
+    pub string: Option<Color>,
+    pub comment: Option<Color>,
+    pub number: Option<Color>,
+    pub function: Option<Color>,
+    pub type_name: Option<Color>,
+    /// `text.code.span`: the colour of a literal that is not being highlighted.
+    pub code: Option<Color>,
+    /// `title`: a symbol definition or a heading inside code.
+    pub title: Option<Color>,
+}
+
+impl SyntaxPalette {
+    /// Read the catalogue's syntax palette out of the theme definition.
+    ///
+    /// `resolve` maps a packed sRGB value to a colour the terminal can show, so
+    /// a palette that cannot be represented degrades with everything else
+    /// instead of leaking `Rgb` into a 16-colour terminal.
+    pub fn from_json(json: &str, resolve: &impl Fn(u32) -> Color) -> Self {
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(json) else {
+            return Self::default();
+        };
+        let Some(syntax) = document.get("syntax") else {
+            return Self::default();
+        };
+        let lookup = |key: &str| -> Option<Color> {
+            let value = syntax.get(key)?.get("color")?.as_str()?;
+            parse_hex_color(value).map(resolve)
+        };
+        Self {
+            keyword: lookup("keyword"),
+            string: lookup("string"),
+            comment: lookup("comment"),
+            number: lookup("number"),
+            function: lookup("function"),
+            type_name: lookup("type"),
+            code: lookup("text.code.span"),
+            title: lookup("title"),
+        }
+    }
+}
+
+/// Parse a `#rrggbb` colour from the token catalogue.
+fn parse_hex_color(value: &str) -> Option<u32> {
+    let value = value.trim().trim_start_matches('#');
+    (value.len() == 6).then(|| u32::from_str_radix(value, 16).ok())?
+}
+
 /// The transcript rail a block wears.
 ///
 /// Named by intent rather than by colour so a theme change cannot make a
@@ -399,6 +495,10 @@ pub struct TuiTheme {
     pub mode: GpuiThemeMode,
     pub capability: ColorCapability,
     pub roles: ThemeRole,
+    /// The colours markdown is drawn in.
+    pub markdown: MarkdownPalette,
+    /// The syntax colours a fenced code block is highlighted with.
+    pub syntax: SyntaxPalette,
 }
 
 impl TuiTheme {
@@ -494,12 +594,48 @@ impl TuiTheme {
             diff_insert: color(token("right-rail-status-added", 0x3fae6a)),
             diff_delete: color(token("destructive", 0xd6453f)),
         };
+        // A colour-less terminal gets no syntax palette at all: the highlighter
+        // checks for an empty one and skips the work, and `Reset` would
+        // otherwise make every token look "coloured".
+        let syntax = if matches!(capability.mode, ColorMode::None) {
+            SyntaxPalette::default()
+        } else {
+            SyntaxPalette::from_json(definition.highlight_json, &color)
+        };
+        // Body copy, so a markdown-only colour never has to reach for `roles`.
+        let body_rgb = token("muted-foreground", foreground_rgb);
+        let markdown = MarkdownPalette {
+            heading: [
+                // Three hues, then the greys: a document that nests deeper than
+                // three levels is outlining, not emphasising.
+                color(token("chart-category-1", 0x5b8dee)),
+                color(token("chart-category-3", 0x4bbf9a)),
+                color(token("chart-category-9", 0x8f7fd4)),
+                color(mix_rgb(body_rgb, foreground_rgb, 0.45)),
+                color(body_rgb),
+                color(mix_rgb(body_rgb, background_rgb, 0.45)),
+            ],
+            code: syntax
+                .code
+                .unwrap_or_else(|| color(token("chart-category-3", 0x4bbf9a))),
+            code_language: color(mix_rgb(body_rgb, background_rgb, 0.3)),
+            link: color(token("chart-category-2", 0x5aa6d8)),
+            link_target: color(mix_rgb(body_rgb, background_rgb, 0.3)),
+            marker: color(body_rgb),
+            task_done: color(token("chart-2", 0x2e9e5b)),
+            task_todo: color(body_rgb),
+            quote: color(body_rgb),
+            rule: color(mix_rgb(body_rgb, background_rgb, 0.3)),
+            table_border: color(mix_rgb(body_rgb, background_rgb, 0.2)),
+        };
         Self {
             id: definition.id,
             name: definition.name,
             mode: definition.mode,
             capability,
             roles,
+            markdown,
+            syntax,
         }
     }
 
@@ -757,6 +893,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_shipped_theme_keeps_a_markdown_hue_ladder() {
+        // Markdown carries structure with colour: a heading level, a literal,
+        // and a link have to stay three different things in every theme, and
+        // the top three heading levels have to stay three different *depths*.
+        let capability = ColorCapability {
+            mode: ColorMode::TrueColor,
+            glyphs: GlyphMode::Unicode,
+        };
+        for mode in GpuiThemeMode::ALL {
+            for definition in theme_catalog::themes_for(mode) {
+                let theme = TuiTheme::from_definition(definition, capability);
+                let markdown = theme.markdown;
+                let ladder = markdown.heading[..3]
+                    .iter()
+                    .map(|colour| format!("{colour:?}"))
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    ladder.len(),
+                    3,
+                    "{} collapses its heading levels onto fewer colours",
+                    definition.id
+                );
+                for (left, right) in [
+                    (markdown.heading[0], markdown.code),
+                    (markdown.heading[0], markdown.link),
+                    (markdown.code, markdown.link),
+                    (markdown.table_border, markdown.rule),
+                ] {
+                    assert_ne!(
+                        left, right,
+                        "{} draws two markdown roles in one colour",
+                        definition.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_colour_less_theme_has_no_syntax_palette() {
+        // `Reset` is a colour as far as an `Option<Color>` is concerned; the
+        // highlighter checks for the empty palette to skip its work entirely.
+        let capability = ColorCapability {
+            mode: ColorMode::None,
+            glyphs: GlyphMode::Ascii,
+        };
+        let definition = theme_catalog::themes_for(GpuiThemeMode::Dark)
+            .next()
+            .expect("a shipped dark theme");
+        let theme = TuiTheme::from_definition(definition, capability);
+        assert_eq!(theme.syntax, SyntaxPalette::default());
     }
 
     #[test]

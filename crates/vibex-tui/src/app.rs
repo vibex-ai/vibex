@@ -1757,7 +1757,12 @@ impl App {
             .state
             .view(&self.projection.sidebar, "", self.shell);
         self.projection.rows = view.timeline_rows.clone();
-        let blocks: Vec<Block> = view.timeline_rows.iter().map(block_from_row).collect();
+        let blocks: Vec<Block> = view
+            .timeline_rows
+            .iter()
+            .filter(|row| row_is_rendered(row))
+            .map(block_from_row)
+            .collect();
         // A prepend is the only change that moves the content under the
         // viewport, and it is recognisable from the head alone: the block that
         // used to start the transcript now sits further down. An append, a
@@ -2618,6 +2623,21 @@ impl AppOptions {
     }
 }
 
+/// Whether a projected row earns a row in the transcript.
+///
+/// A timeline carries bookkeeping as well as conversation, and a character grid
+/// pays for every line it shows: a plan update is already rendered by the dock,
+/// and the *resolution* of an approval is visible in the request that stays on
+/// screen. Drawing them again costs the reader the thing they are reading for.
+pub fn row_is_rendered(row: &TimelineRow) -> bool {
+    !matches!(
+        row.kind,
+        vibex_desktop_model::TimelineRowKind::TodoUpdate
+            | vibex_desktop_model::TimelineRowKind::PermissionResolution
+            | vibex_desktop_model::TimelineRowKind::ElicitationResolution
+    )
+}
+
 /// Project one authoritative `TimelineRow` into a transcript block.
 pub fn block_from_row(row: &TimelineRow) -> Block {
     Block {
@@ -2628,7 +2648,9 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
         turn_id: row.turn_id.clone(),
         sequence: row.last_sequence,
         expanded: false,
-        collapsible: row.collapsible,
+        // A dense row shows one line by shape, so it has to be openable to be
+        // readable in full: the transcript is where its body lives.
+        collapsible: row.collapsible || crate::transcript::is_dense_row(row.kind),
         streaming: row.streaming,
         failed: row.failed,
         pending_permission: row.pending_permission || row.turn_pending_permission,

@@ -1398,14 +1398,16 @@ fn render_turn_status(
             theme.roles.accent_running,
         )
     } else {
+        // Idle is a fact, not an animation: a plain mark in the dim grey, so a
+        // glance at the band cannot mistake "nothing is happening" for progress.
         (
-            crate::glyphs::frame_at(
-                crate::glyphs::idle_pulse_frames(tier),
-                phase,
-                crate::glyphs::IDLE_PULSE_TICKS_PER_FRAME,
-            ),
+            if tier == crate::glyphs::GlyphTier::Full {
+                "·"
+            } else {
+                "."
+            },
             strings.idle().to_string(),
-            theme.roles.accent_system,
+            theme.roles.gray_dim,
         )
     };
 

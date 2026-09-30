@@ -1035,9 +1035,10 @@ fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
     assert_eq!(copied, prefix.trim_end());
 
     // A selection over several lines joins them with newlines and drops the
-    // padding a terminal would otherwise put on the clipboard.
+    // padding a terminal would otherwise put on the clipboard. Block rows are
+    // dense, so the second *text* row is the next block's first line.
     app.begin_text_selection(0, 0);
-    app.extend_text_selection(1, 6);
+    app.extend_text_selection(2, 6);
     let copied = app.selected_text().expect("a multi-line selection");
     assert!(copied.contains('\n'), "lines are not joined: {copied:?}");
     for line in copied.lines() {
@@ -1290,23 +1291,25 @@ fn markdown_styling_reaches_the_screen() {
 
     // The colour hierarchy reaches the screen: prose is a step down from the
     // heading, and neither is the same colour as the code.
-    let roles = vibex_tui::theme::TuiTheme::resolve(
+    let theme = vibex_tui::theme::TuiTheme::resolve(
         Some("vibex-dark"),
         vibex_ui::GpuiThemeMode::Dark,
         vibex_tui::ColorCapability {
             mode: vibex_tui::ColorMode::TrueColor,
             glyphs: vibex_tui::GlyphMode::Unicode,
         },
-    )
-    .roles;
+    );
+    let roles = theme.roles;
     let cell_colour = |needle: &str| {
         let row = rows
             .iter()
             .position(|row| row.contains(needle))
             .unwrap_or_else(|| panic!("{needle} is on screen:\n{screen}"));
+        // The first *content* cell: the rail is a filled space and the current
+        // block's pointer glyph sits in it.
         (0..120)
             .filter_map(|column| buffer.cell((column, row as u16)))
-            .find(|cell| !cell.symbol().trim().is_empty())
+            .find(|cell| cell.symbol().chars().any(char::is_alphanumeric))
             .and_then(|cell| cell.style().fg)
     };
     assert_eq!(
@@ -1316,41 +1319,34 @@ fn markdown_styling_reaches_the_screen() {
     );
     assert_eq!(
         cell_colour("渲染标题"),
-        Some(roles.foreground),
-        "the heading is not the brightest text"
+        Some(theme.markdown.heading[2]),
+        "the heading does not wear its level's colour"
     );
 
-    // The inline code keeps the code background over its whole run, which is
-    // what the backticks used to stand for.
+    // The inline code keeps the literal colour over its whole run, which is
+    // what the backticks used to stand for, and it does not need a background
+    // of its own to read as code.
     let code_row = rows
         .iter()
         .position(|row| row.contains("inline_code"))
         .expect("the code span is on screen");
-    let code_background = vibex_tui::theme::TuiTheme::resolve(
-        Some("vibex-dark"),
-        vibex_ui::GpuiThemeMode::Dark,
-        vibex_tui::ColorCapability {
-            mode: vibex_tui::ColorMode::TrueColor,
-            glyphs: vibex_tui::GlyphMode::Unicode,
-        },
-    )
-    .roles
-    .code_background;
-    let coloured = (0..120)
+    let code_cells = (0..120)
         .filter_map(|column| buffer.cell((column, code_row as u16)))
-        .filter(|cell| cell.style().bg == Some(code_background))
-        .count();
-    assert!(
-        coloured >= "inline_code".len(),
-        "only {coloured} cells carry the code background:\n{screen}"
-    );
-    let literal = (0..120)
-        .filter_map(|column| buffer.cell((column, code_row as u16)))
-        .filter(|cell| cell.style().fg == Some(roles.command))
+        .filter(|cell| !cell.symbol().trim().is_empty())
+        .collect::<Vec<_>>();
+    let literal = code_cells
+        .iter()
+        .filter(|cell| cell.style().fg == Some(theme.markdown.code))
         .count();
     assert!(
         literal >= "inline_code".len(),
         "only {literal} cells carry the literal colour:\n{screen}"
+    );
+    assert!(
+        code_cells
+            .iter()
+            .all(|cell| cell.style().bg != Some(roles.code_background)),
+        "an inline literal still wears a code background:\n{screen}"
     );
 }
 
@@ -2279,11 +2275,244 @@ fn a_prepended_history_page_keeps_the_readers_viewport_anchored() {
         screen.contains(&anchor_text),
         "the block the reader was looking at must stay on screen:\n{screen}"
     );
-    assert!(
-        !screen.contains("history message 1"),
-        "the fetched page lands above the viewport, not in it:\n{screen}"
-    );
+    // The pinned prompt is the row *above* the viewport, so the last fetched
+    // message may legitimately appear there; the page itself must not. The
+    // match is on a line ending, because "message 1" is inside "message 10".
+    for fetched in [
+        "history message 1",
+        "history message 2",
+        "history message 3",
+        "history message 4",
+    ] {
+        assert!(
+            !after.iter().any(|line| line.trim_end().ends_with(fetched)),
+            "{fetched} landed in the viewport instead of above it:\n{screen}"
+        );
+    }
     // The older page really is loaded: it is what the reader now scrolls into.
     assert_eq!(app.agent.state.timeline_oldest_sequence(), Some(1));
     assert!(!app.agent.state.timeline_has_older);
+}
+
+/// A timeline item with every field the wire requires.
+fn seeded_item(
+    session_id: &vibex_core::VibexSessionId,
+    sequence: i64,
+    kind: vibex_core::TimelineItemKind,
+    payload: vibex_core::TimelinePayload,
+) -> vibex_core::TimelineItem {
+    vibex_core::TimelineItem {
+        id: vibex_core::TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence,
+        timestamp_ms: 1_000 + sequence,
+        source: vibex_core::TimelineSource::Agent,
+        kind,
+        correlation_id: Some(vibex_core::CorrelationId::new()),
+        provider_correlation_id: None,
+        redaction_state: vibex_core::TimelineRedactionState::None,
+        execution_attribution: None,
+        payload,
+    }
+}
+
+#[test]
+fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
+    // The density contract: a dozen timeline events are a dozen *lines* of
+    // transcript, not a dozen sections. Each tool call is one row, a run of
+    // them folds into its first, and the bookkeeping rows (a plan update, an
+    // approval's resolution) are not drawn at all.
+    let session_id = vibex_core::VibexSessionId::new();
+    let mut app = app(110, 40);
+    app.navigate_to(Page::Agent);
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    let mut items = vec![
+        seeded_item(
+            &session_id,
+            1,
+            vibex_core::TimelineItemKind::UserMessage,
+            vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: "Fix the flaky test in the runner".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            2,
+            vibex_core::TimelineItemKind::SystemNotice,
+            vibex_core::TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                message: "session resumed from disk".into(),
+                level: vibex_core::SystemNoticeLevel::Info,
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            3,
+            vibex_core::TimelineItemKind::AgentMessage,
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "I will look at the runner tests first.".into(),
+                is_final: true,
+            }),
+        ),
+    ];
+    for (offset, (tool, argument)) in [
+        ("read_file", "crates/runner/src/lib.rs"),
+        ("read_file", "crates/runner/src/tests.rs"),
+        ("grep", "flaky"),
+        ("read_file", "crates/runner/src/scheduler.rs"),
+        ("write_file", "crates/runner/src/scheduler.rs"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        items.push(seeded_item(
+            &session_id,
+            4 + offset as i64,
+            vibex_core::TimelineItemKind::ToolCall,
+            vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: format!("call-{offset}"),
+                tool_name: tool.into(),
+                status: vibex_core::ToolCallStatus::Completed,
+                summary: String::new(),
+                input_summary: Some(argument.into()),
+                output_summary: Some("412 lines".into()),
+                raw_extension: None,
+            }),
+        ));
+    }
+    items.push(seeded_item(
+        &session_id,
+        9,
+        vibex_core::TimelineItemKind::TodoUpdate,
+        vibex_core::TimelinePayload::TodoUpdate(vibex_core::TodoUpdatePayload {
+            title: "fix flaky test".into(),
+            items: Vec::new(),
+            raw_extension: None,
+        }),
+    ));
+    items.push(seeded_item(
+        &session_id,
+        10,
+        vibex_core::TimelineItemKind::PermissionResolution,
+        vibex_core::TimelinePayload::PermissionResolution(vibex_core::PermissionResolution {
+            request_id: vibex_core::RequestId::new(),
+            session_id: session_id.clone(),
+            response: vibex_core::PermissionResponseKind::Approve,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: None,
+            resolved_at_ms: 1_000,
+        }),
+    ));
+    items.push(seeded_item(
+        &session_id,
+        11,
+        vibex_core::TimelineItemKind::AgentMessage,
+        vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+            text: "Done: the test now uses the fake clock.".into(),
+            is_final: true,
+        }),
+    ));
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id, items);
+    app.sync_transcript();
+
+    // Nine of the eleven items are conversation or the one notice worth
+    // keeping; the plan update and the approval's resolution are the dock's
+    // and the request row's business.
+    assert_eq!(app.transcript.blocks().len(), 9);
+    let screen = text(&render(&mut app, 110, 40));
+    assert!(
+        screen.contains("❯ Fix the flaky test in the runner"),
+        "{screen}"
+    );
+    assert!(screen.contains("session resumed from disk"), "{screen}");
+    assert!(
+        screen.contains("Done: the test now uses the fake clock."),
+        "{screen}"
+    );
+    // Five tool calls read as one row that says how many it stands for.
+    assert!(screen.contains("read_file  +4"), "{screen}");
+    assert!(
+        !screen.contains("Tool read_file"),
+        "the kind label doubles the title:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Plan ") && !screen.contains("Permission"),
+        "bookkeeping rows reached the transcript:\n{screen}"
+    );
+    // The whole turn fits in a screen and a half, where one row per event plus
+    // a body for each section would not.
+    assert!(
+        app.transcript.total_height() <= 14,
+        "the turn costs {} rows",
+        app.transcript.total_height()
+    );
+}
+
+#[test]
+fn a_streamed_answer_grows_frame_by_frame() {
+    // The streaming contract: every delta that arrives is on screen in the
+    // frame that follows it, and the block only ever grows.
+    let session_id = vibex_core::VibexSessionId::new();
+    let mut app = app(100, 30);
+    app.navigate_to(Page::Agent);
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id.clone(), Vec::new());
+
+    let mut heights = Vec::new();
+    for (sequence, (delta, visible)) in [
+        ("# Report\n\n", "Report"),
+        ("The runner test", "The runner test"),
+        (" is flaky because", "is flaky because"),
+        (" it reads the wall clock.\n\n", "wall clock"),
+        ("The fix uses the fake clock.\n", "fake clock"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sequence = sequence as i64 + 1;
+        let applied = app.agent.apply_event(vibex_backend::BackendEvent::Timeline(
+            vibex_core::TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence,
+                item: seeded_item(
+                    &session_id,
+                    sequence,
+                    vibex_core::TimelineItemKind::AgentMessage,
+                    vibex_core::TimelinePayload::AgentMessageDelta(
+                        vibex_core::AgentMessageDeltaPayload {
+                            text_delta: delta.to_string(),
+                            chunk_index: sequence as u32 - 1,
+                            phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+                        },
+                    ),
+                ),
+            },
+        ));
+        assert_eq!(applied, vibex_ui::AgentEventDecision::Applied);
+        app.sync_transcript();
+        let screen = text(&render(&mut app, 100, 30));
+        // Wide glyph spacing and the rail make an exact match fragile, so the
+        // check is on the words the reader would see.
+        assert!(
+            screen.contains(visible),
+            "{visible:?} is missing from the frame after {delta:?}:\n{screen}"
+        );
+        heights.push(app.transcript.total_height());
+    }
+    // The block grows by what arrived, never shrinks: a frame that re-laid the
+    // whole body out would still pass this, which is why the incremental
+    // renderer has its own test.
+    assert!(
+        heights.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the block shrank while streaming: {heights:?}"
+    );
+    assert!(heights.last() > heights.first(), "{heights:?}");
 }

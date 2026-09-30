@@ -187,6 +187,12 @@ pub struct Transcript {
     heights: Vec<u32>,
     /// Per-block content key at the time the height was measured.
     keys: Vec<u64>,
+    /// The incremental markdown renderer of each block that is still arriving.
+    ///
+    /// A streaming block is re-rendered on every delta; keeping the frozen
+    /// prefix here is what makes that cost the size of the unfrozen tail rather
+    /// than the size of the answer.
+    live: std::collections::HashMap<String, crate::markdown::StreamingMarkdown>,
     /// Prefix sums over `heights`, using the estimate for unmeasured slots.
     offsets: Vec<usize>,
     layout_valid: bool,
@@ -231,6 +237,7 @@ impl Transcript {
             blocks: Vec::new(),
             heights: Vec::new(),
             keys: Vec::new(),
+            live: std::collections::HashMap::new(),
             offsets: Vec::new(),
             layout_valid: false,
             rendered: HashMap::new(),
@@ -372,7 +379,11 @@ impl Transcript {
                 continue;
             }
             let start = index;
-            while index < self.blocks.len() && eligible_for_group(&self.blocks[index]) {
+            let kind = self.blocks[start].kind;
+            while index < self.blocks.len()
+                && eligible_for_group(&self.blocks[index])
+                && self.blocks[index].kind == kind
+            {
                 index += 1;
             }
             let run = index - start;
@@ -495,6 +506,7 @@ impl Transcript {
             .for_each(|height| *height = UNMEASURED);
         self.rendered.clear();
         self.recency.clear();
+        self.live.clear();
         self.layout_valid = false;
     }
 
@@ -579,6 +591,11 @@ impl Transcript {
     }
 
     /// Estimate the height of an unmeasured block from its title and body shape.
+    ///
+    /// The estimate only has to be close: a block is measured exactly the first
+    /// time it is rendered. What it must not do is disagree with the renderer
+    /// about *shape*, or scrolling a session of dense rows would jump as they
+    /// came into view.
     fn estimate_height(&self, index: usize) -> usize {
         let Some(block) = self.blocks.get(index) else {
             return 1;
@@ -587,12 +604,26 @@ impl Transcript {
         if matches!(block.group, GroupRole::Member) {
             return 0;
         }
+        let next = self.blocks.get(index + 1);
+        let gap = gap_after(block, next);
         let available = self.width.max(8);
-        let header = 1 + display_width(&block.title) / available;
-        let summary = usize::from(matches!(block.group, GroupRole::Head { hidden } if hidden > 0));
-        let body_lines = if block.body.is_empty() {
+        let dense = is_dense_row(block.kind);
+        let open = if dense {
+            block.expanded
+        } else {
+            block.is_open()
+        };
+        // The header is truncated to one row, and a message has none at all —
+        // its first line *is* the message.
+        let headerless = matches!(
+            block.kind,
+            TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+        ) && !block.body.is_empty();
+        let header = usize::from(!headerless);
+        let body_lines = if block.body.is_empty() || (dense && !open && !block.streaming) {
+            // A dense row's body is behind the fold.
             0
-        } else if block.is_open() {
+        } else if open {
             // Count newlines plus a wrap allowance per line.
             let explicit = block.body.matches('\n').count() + 1;
             let wrap_allowance = block.body.len() / available.max(1);
@@ -600,7 +631,10 @@ impl Transcript {
         } else {
             COLLAPSED_BODY_LINES.min(block.body.matches('\n').count() + 1)
         };
-        (header + body_lines + summary + chrome::GAP).max(1)
+        let status = usize::from(block.failed && block.kind != TimelineRowKind::Error)
+            + usize::from(block.pending_permission)
+            + usize::from(block.runtime_attribution.is_some() && !dense);
+        (header + body_lines + status + gap).max(1)
     }
 
     /// Measure one block precisely and cache the height.
@@ -632,13 +666,59 @@ impl Transcript {
         }
     }
 
+    /// Advance the incremental renderer of a block that is still arriving.
+    ///
+    /// A block that is not streaming has no live renderer: its body takes the
+    /// ordinary path, which is also what the final, non-streaming render of a
+    /// finished answer uses — so the last frame of a stream and a reload of the
+    /// same session agree exactly.
+    fn refresh_stream(
+        &mut self,
+        block: &Block,
+        theme: &TuiTheme,
+        strings: Strings,
+        width: usize,
+        prose: Style,
+    ) {
+        if !block.streaming || !is_markdown(block.kind) {
+            self.live.remove(&block.id);
+            return;
+        }
+        let renderer = self.live.entry(block.id.clone()).or_default();
+        let source = renderer.source();
+        if !block.body.starts_with(source) {
+            // The block was rewritten rather than appended to (an edit, or a
+            // reconnect that replayed it): start the render over.
+            *renderer = crate::markdown::StreamingMarkdown::new();
+        }
+        if block.body.len() > renderer.source().len() {
+            let delta = block.body[renderer.source().len()..].to_string();
+            renderer.push(&delta, theme, width, strings, prose);
+        }
+    }
+
     fn render_block(&mut self, index: usize, theme: &TuiTheme, strings: Strings) -> RenderedBlock {
         let Some(block) = self.blocks.get(index).cloned() else {
             return RenderedBlock::default();
         };
+        // The successor decides the separator, so a run of tool calls renders
+        // as a list rather than as a stack of sections.
+        let next = self.blocks.get(index + 1).cloned();
+        let prose = if matches!(block.kind, TimelineRowKind::UserMessage) {
+            theme.base()
+        } else {
+            theme.prose()
+        };
+        let body_width = chrome::content_width(self.width.max(8)).max(8);
+        self.refresh_stream(&block, theme, strings, body_width, prose);
+        // Borrowed after the renderer has been advanced, so a delta never has
+        // to copy the rows that are already settled.
+        let streamed = self.live.get(&block.id).map(|live| live.rendered());
         self.stats.blocks_rendered += 1;
-        render_block_styled(
+        render_block_in_run_with_body(
             &block,
+            next.as_ref(),
+            streamed,
             theme,
             self.width,
             strings,
@@ -802,7 +882,10 @@ impl Transcript {
             return None;
         }
         if scroll.follow {
-            self.measure_tail(viewport, theme, strings);
+            // One screen plus a pinned header's worth: the prompt that is about
+            // to be pinned sits just above the viewport, and a header can only
+            // be clipped from a block that has been measured.
+            self.measure_tail(viewport + MAX_STICKY_ROWS + STICKY_GAP_ROWS, theme, strings);
         }
         self.ensure_layout();
         let total = self.offsets.last().copied().unwrap_or(0);
@@ -866,7 +949,19 @@ impl Transcript {
             break;
         }
         let rendered = self.rendered.get(&index)?.clone();
-        let end = (clip_top + height).min(rendered.lines.len());
+        // The block's own trailing blank rows are the separator before the next
+        // block, not content: a header clipped down to them would reserve a row
+        // to show nothing, so the clip stops at the last row with text on it.
+        let content_rows = rendered
+            .plain
+            .iter()
+            .rposition(|line| !line.trim().is_empty())
+            .map_or(0, |last| last + 1);
+        if content_rows == 0 {
+            return None;
+        }
+        let clip_top = clip_top.min(content_rows - 1);
+        let end = (clip_top + height).min(content_rows);
         let lines = rendered
             .lines
             .get(clip_top.min(end)..end)
@@ -1319,6 +1414,15 @@ pub mod chrome {
     }
 }
 
+/// The glyph marking the reader's own message.
+fn prompt_glyph(theme: &TuiTheme) -> &'static str {
+    if theme.glyphs() == crate::theme::GlyphMode::Unicode {
+        "❯"
+    } else {
+        ">"
+    }
+}
+
 /// The glyph marking the block the cursor is on.
 fn pointer_glyph(theme: &TuiTheme) -> &'static str {
     if theme.glyphs() == crate::theme::GlyphMode::Unicode {
@@ -1439,6 +1543,70 @@ pub fn render_block_at_phase(
     render_block_styled(block, theme, width, strings, phase, false)
 }
 
+/// Whether a block reads as one dense row rather than a titled section.
+///
+/// Work items and notices are the bulk of a session and the least of it: a run
+/// of ten reads is evidence for a sentence, not ten sections. Each one is a
+/// single row — its action and the one detail that identifies it — and the full
+/// text is one keypress away in the block's detail overlay.
+pub fn is_dense_row(kind: TimelineRowKind) -> bool {
+    is_work_item(kind)
+        || matches!(
+            kind,
+            TimelineRowKind::SystemNotice
+                | TimelineRowKind::GitNotice
+                | TimelineRowKind::Retry
+                | TimelineRowKind::PermissionResolution
+                | TimelineRowKind::ElicitationResolution
+        )
+}
+
+/// Whether a block's first row carries the kind's name as well as its title.
+///
+/// Two labels are worse than one: "Agent Agent" and "Reasoning Reasoning" cost
+/// a reader attention on every row to say nothing. A work item's title is the
+/// action it took, and the rail already says it is work.
+fn shows_kind_label(kind: TimelineRowKind, title: &str, label: &str) -> bool {
+    if is_work_item(kind) {
+        return false;
+    }
+    !title.eq_ignore_ascii_case(label) && !title.to_lowercase().starts_with(&label.to_lowercase())
+}
+
+/// The one line a dense row shows beside its title.
+///
+/// This is the detail that identifies the row — a path, a match count, the
+/// first line of output — not the beginning of a report: the body stays behind
+/// the fold.
+fn dense_summary(block: &Block) -> Option<String> {
+    let body = block.body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let first = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    if first.is_empty() {
+        return None;
+    }
+    // A summary that only repeats the title says nothing.
+    (!first.eq_ignore_ascii_case(block.title.trim())).then(|| first.to_string())
+}
+
+/// The blank rows that follow a block.
+///
+/// Two dense rows are a list, not two sections, and a blank row between every
+/// pair of them is most of a session's height. Everything else keeps the gap
+/// that separates blocks into objects.
+pub fn gap_after(block: &Block, next: Option<&Block>) -> usize {
+    let dense_run = is_dense_row(block.kind)
+        && !block.expanded
+        && next.is_some_and(|next| is_dense_row(next.kind) && !next.expanded);
+    if dense_run { 0 } else { chrome::GAP }
+}
+
 /// As [`render_block_at_phase`], with the current-block treatment.
 ///
 /// The current block is marked rather than inverted: a full-width reversed row
@@ -1453,12 +1621,48 @@ pub fn render_block_styled(
     phase: u32,
     selected: bool,
 ) -> RenderedBlock {
+    render_block_in_run(block, None, theme, width, strings, phase, selected)
+}
+
+/// As [`render_block_styled`], told what follows the block.
+///
+/// The run's shape decides the separator: two dense rows sit together as a run,
+/// everything else is separated into an object. Passing the neighbour is what
+/// lets a session of forty tool calls read as a list instead of forty sections.
+pub fn render_block_in_run(
+    block: &Block,
+    next: Option<&Block>,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    phase: u32,
+    selected: bool,
+) -> RenderedBlock {
+    render_block_in_run_with_body(block, next, None, theme, width, strings, phase, selected)
+}
+
+/// As [`render_block_in_run`], with a body the caller has already rendered.
+///
+/// The transcript passes the live renderer's output for a block that is still
+/// arriving, so a streamed answer is laid out from its frozen prefix instead of
+/// being re-parsed from the first token on every delta.
+#[allow(clippy::too_many_arguments)]
+pub fn render_block_in_run_with_body(
+    block: &Block,
+    next: Option<&Block>,
+    streamed: Option<&crate::markdown::RenderedMarkdown>,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    phase: u32,
+    selected: bool,
+) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
 
     if matches!(block.group, GroupRole::Member) {
         // Folded into the run above; contributes nothing but is still counted
-        // by the head's summary line.
+        // by the head's summary.
         return RenderedBlock::default();
     }
 
@@ -1479,6 +1683,15 @@ pub fn render_block_styled(
 
     let content_width = chrome::content_width(width).max(8);
     let label = kind_label(block.kind, strings);
+    let dense = is_dense_row(block.kind);
+    // `Block::is_open` means "not collapsible" as well as "the reader opened
+    // it"; a dense row is showing one line because that is its shape, so only
+    // an explicit expansion reveals its body.
+    let open = if dense {
+        block.expanded
+    } else {
+        block.is_open()
+    };
     let title_style = match block.kind {
         TimelineRowKind::UserMessage => theme.base().add_modifier(Modifier::BOLD),
         _ => theme.base(),
@@ -1487,38 +1700,92 @@ pub fn render_block_styled(
     if let Some((glyph, style)) = bullet(block.kind, theme, !block.is_open()) {
         parts.push((format!("{glyph} "), style));
     }
-    parts.push((
-        format!("{label} "),
-        theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
-    ));
-    parts.push((block.title.clone(), title_style));
-    if block.streaming {
-        parts.push((" ▍".to_string(), theme.accent()));
+    if shows_kind_label(block.kind, &block.title, label) {
+        parts.push((
+            format!("{label} "),
+            theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
+        ));
     }
-    if block.collapsible && !block.expanded {
+    // A notice's title is its severity and its body is the sentence, so the
+    // sentence is what the row shows — with the severity carried by colour
+    // rather than by a word the reader has to skip.
+    let (heading, title_style) = if matches!(block.kind, TimelineRowKind::SystemNotice) {
+        let style = match block.title.trim() {
+            "Warning" => theme.warning(),
+            "Error" => theme.danger(),
+            _ => theme.dimmed(theme.roles.gray),
+        };
+        (
+            dense_summary(block).unwrap_or_else(|| block.title.clone()),
+            style,
+        )
+    } else {
+        (block.title.clone(), title_style)
+    };
+    parts.push((heading, title_style));
+    // The one detail that identifies a dense row, dimmed beside its title.
+    // A streaming block never carries one: its body *is* the answer, and the
+    // summary would be the first line of a sentence still being written.
+    if let GroupRole::Head { hidden } = block.group
+        && hidden > 0
+    {
+        // Before the summary: a truncated row must still say how many rows it
+        // stands for.
+        parts.push((format!("  +{hidden}"), theme.dimmed(theme.roles.gray_dim)));
+    }
+    if dense && !open && !block.streaming && !matches!(block.kind, TimelineRowKind::SystemNotice) {
+        if let Some(summary) = dense_summary(block) {
+            parts.push((format!("  {summary}"), theme.dimmed(theme.roles.gray_dim)));
+        }
+    }
+    if block.collapsible && !block.expanded && !dense {
         parts.push((
             format!("  ({})", strings.transcript_collapsed_hint()),
             theme.dimmed(theme.roles.gray_dim),
         ));
     }
-    let header = truncate_parts(parts, content_width);
-    let header_plain = header
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let marker = if selected { pointer_glyph(theme) } else { " " };
-    let mut header_line = rail_line_marked(rail_style, header, marker, rail_cell);
-    if selected {
-        header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
-    }
-    lines.push(header_line);
-    plain.push(header_plain);
-
-    // A lifted band behind a work body separates blocks that sit next to each
-    // other without spending a row on a separator.
-    let body_background = body_band(block, theme);
     let body = block.body.trim_end_matches('\n');
-    if !body.is_empty() {
+    // A message *is* its text: a "You" or "Agent" row above every one of them
+    // spends a row of the transcript saying what the rail colour already says.
+    // The reader's own message keeps a prompt mark on its first line so the two
+    // speakers stay distinguishable in a long scroll.
+    let headerless = matches!(
+        block.kind,
+        TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+    ) && !body.is_empty();
+    let prompt_mark = if headerless && matches!(block.kind, TimelineRowKind::UserMessage) {
+        Some((prompt_glyph(theme), theme.rail(Rail::User)))
+    } else {
+        None
+    };
+    // The mark costs two columns, so the text is wrapped that much narrower.
+    let body_width = content_width
+        .saturating_sub(prompt_mark.map_or(0, |_| 2))
+        .max(8);
+
+    if !headerless {
+        let header = truncate_parts(parts, content_width);
+        let header_plain = header
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let marker = if selected { pointer_glyph(theme) } else { " " };
+        let mut header_line = rail_line_marked(rail_style, header, marker, rail_cell);
+        if selected {
+            header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
+        }
+        lines.push(header_line);
+        plain.push(header_plain);
+    }
+
+    // A dense row is one row: its body is what the fold is for, and the detail
+    // overlay can show all of it. A streaming row is the exception — it is the
+    // answer arriving, so it renders as it is written.
+    let shows_body = !body.is_empty() && (!dense || open || block.streaming);
+    if shows_body {
+        // A lifted band behind a work body separates blocks that sit next to
+        // each other without spending a row on a separator.
+        let body_background = body_band(block, theme);
         // A reader's own words stay at full brightness; an Agent's answer is
         // set one step down so its headings, emphasis and code have somewhere
         // to stand.
@@ -1527,19 +1794,32 @@ pub fn render_block_styled(
         } else {
             theme.prose()
         };
-        let mut rendered = if is_markdown(block.kind) {
-            crate::markdown::render_markdown_with(body, theme, content_width, strings, prose)
-        } else {
-            render_plain(body, theme, content_width)
+        let mut rendered = match streamed {
+            Some(rendered) => rendered.clone(),
+            None if is_markdown(block.kind) => {
+                crate::markdown::render_markdown_with(body, theme, body_width, strings, prose)
+            }
+            None => render_plain(body, theme, body_width),
         };
         let style = body_style(block, theme);
+        // Markdown separates paragraphs with a blank row, including the last
+        // one; the block gap is the separator between blocks, and two of them
+        // is one row of a session spent on nothing.
+        while rendered
+            .plain
+            .last()
+            .is_some_and(|line| line.trim().is_empty())
+        {
+            rendered.lines.pop();
+            rendered.plain.pop();
+        }
         // Fold before wrapping: a collapsed block must not pay for the lines it
         // is not going to show.
-        if !block.is_open() && rendered.height() > COLLAPSED_BODY_LINES {
+        if !open && rendered.height() > COLLAPSED_BODY_LINES {
             rendered.lines.truncate(COLLAPSED_BODY_LINES);
             rendered.plain.truncate(COLLAPSED_BODY_LINES);
         }
-        for (line, text) in rendered.lines.into_iter().zip(rendered.plain) {
+        for (index, (line, text)) in rendered.lines.into_iter().zip(rendered.plain).enumerate() {
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
                 styled = styled.style(style);
@@ -1547,12 +1827,29 @@ pub fn render_block_styled(
             if let Some(background) = body_background {
                 styled = styled.style(background);
             }
-            lines.push(rail_line_marked(
-                rail_style,
-                styled.spans,
-                rail_cell,
-                rail_cell,
-            ));
+            let mut spans = styled.spans;
+            let mut text = text;
+            if index == 0
+                && let Some((glyph, colour)) = prompt_mark
+            {
+                let mut marked = vec![Span::styled(
+                    format!("{glyph} "),
+                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
+                )];
+                marked.append(&mut spans);
+                spans = marked;
+                text = format!("{glyph} {text}");
+            }
+            let cell = if index == 0 && selected {
+                pointer_glyph(theme)
+            } else {
+                rail_cell
+            };
+            let mut row = rail_line_marked(rail_style, spans, cell, rail_cell);
+            if index == 0 && selected {
+                row = row.style(Style::default().bg(theme.roles.surface_highlight));
+            }
+            lines.push(row);
             plain.push(text);
         }
     }
@@ -1570,7 +1867,22 @@ pub fn render_block_styled(
         ));
     }
     if let Some(runtime) = &block.runtime_attribution {
-        status.push((format!("[{runtime}]"), theme.dimmed(theme.roles.gray_dim)));
+        // Attribution rides the header of a dense row rather than spending a
+        // row of its own: it is a label, not a sentence.
+        if dense {
+            let text = format!(" [{runtime}]");
+            if let Some(last) = lines.last_mut() {
+                last.spans.push(Span::styled(
+                    text.clone(),
+                    theme.dimmed(theme.roles.gray_dim),
+                ));
+                if let Some(plain) = plain.last_mut() {
+                    plain.push_str(&text);
+                }
+            }
+        } else {
+            status.push((format!("[{runtime}]"), theme.dimmed(theme.roles.gray_dim)));
+        }
     }
     for (text, style) in status {
         lines.push(rail_line(
@@ -1580,29 +1892,8 @@ pub fn render_block_styled(
         plain.push(text);
     }
 
-    // The summary line of a collapsed run. It replaces the folded members, so
-    // it carries their rail rather than a generic grey.
-    if let GroupRole::Head { hidden } = block.group
-        && hidden > 0
-    {
-        let glyph = if theme.glyphs() == crate::theme::GlyphMode::Unicode {
-            "╶╶"
-        } else {
-            "--"
-        };
-        let text = format!("{glyph} {hidden} more");
-        lines.push(rail_line(
-            rail_style,
-            vec![Span::styled(
-                text.clone(),
-                theme.dimmed(theme.roles.gray_dim),
-            )],
-        ));
-        plain.push(text);
-    }
-
     // Trailing gap so blocks are separated without a rule.
-    for _ in 0..chrome::GAP {
+    for _ in 0..gap_after(block, next) {
         lines.push(rail_line_marked(
             rail_style,
             Vec::new(),
@@ -2119,13 +2410,18 @@ mod tests {
             transcript.visible_lines(ScrollState::default(), 500, &palette, strings);
             transcript.total_height()
         };
-        assert!(collapsed > COLLAPSED_BODY_LINES);
+        // A dense row is one row: thirty lines of command output cost the
+        // transcript a header, not a screenful.
+        assert_eq!(collapsed, 1 + chrome::GAP, "{collapsed}");
         assert!(transcript.toggle_block(0));
         let expanded = {
             transcript.visible_lines(ScrollState::default(), 500, &palette, strings);
             transcript.total_height()
         };
-        assert!(expanded > collapsed, "{expanded} !> {collapsed}");
+        assert!(
+            expanded > collapsed + COLLAPSED_BODY_LINES,
+            "expanding did not reveal the body: {expanded} !> {collapsed}"
+        );
     }
 
     #[test]
@@ -2229,7 +2525,9 @@ mod tests {
         // The rail is what makes a long block read as one object; a row without
         // it would visually detach from its block.
         let mut entry = block("a", TimelineRowKind::Command, "one\ntwo\nthree");
-        entry.collapsible = false;
+        // A command is a dense row; opening it is what reveals its output.
+        entry.collapsible = true;
+        entry.expanded = true;
         let rendered = render_block(&entry, &theme(), 60, strings());
         assert!(rendered.height > 3);
         for line in &rendered.lines {
@@ -2307,7 +2605,8 @@ mod tests {
     fn the_rail_runs_down_the_whole_block_not_just_its_header() {
         // A rail that only covers the first row would not group anything.
         let mut entry = block("a", TimelineRowKind::Command, "one\ntwo\nthree");
-        entry.collapsible = false;
+        entry.collapsible = true;
+        entry.expanded = true;
         let rendered = render_block(&entry, &theme(), 60, strings());
         let rail = rendered.lines[0].spans[0].style.bg.expect("rail colour");
         assert!(rendered.height > 4);
@@ -2377,7 +2676,9 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("5 more"), "{text}");
+        // The folded count rides the head's own row rather than spending a row
+        // of its own.
+        assert!(text.contains("+5"), "{text}");
     }
 
     #[test]
