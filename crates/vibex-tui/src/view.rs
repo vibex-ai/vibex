@@ -1554,8 +1554,15 @@ fn render_dock_band(
     // is clamped here rather than trusted.
     let selected = app.dock_selection.unwrap_or(0).min(rows.len() - 1);
     let offset = selected.saturating_sub(visible.saturating_sub(1));
-    let shown = rows.iter().enumerate().skip(offset).take(visible);
-    let mut hidden = rows.len().saturating_sub(offset + visible);
+    // One row is given up to the "more" line when the rest does not fit, so the
+    // number it reports counts what is really left out.
+    let capacity = if rows.len().saturating_sub(offset) > visible {
+        visible.saturating_sub(1)
+    } else {
+        visible
+    };
+    let hidden = rows.len().saturating_sub(offset + capacity);
+    let shown = rows.iter().enumerate().skip(offset).take(capacity);
     for (index, row) in shown {
         let active = focused && index == selected;
         let base = if active {
@@ -1669,14 +1676,8 @@ fn render_dock_band(
                 ]));
             }
         }
-        if hidden > 0 && index == rows.len().saturating_sub(1) {
-            hidden = 0;
-        }
     }
-    if hidden > 0 && lines.len() > visible {
-        // The last visible row is given up to say how much is below, which is
-        // more useful than the row that would have been clipped there.
-        lines.truncate(visible);
+    if hidden > 0 {
         lines.push(Line::from(Span::styled(
             format!(
                 "  {} {} {}",

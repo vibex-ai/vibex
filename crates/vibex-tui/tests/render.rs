@@ -1034,6 +1034,23 @@ fn the_dock_cursor_skips_headings_and_takes_a_held_message_back() {
 }
 
 #[test]
+fn a_long_dock_says_how_much_it_is_not_showing() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    // Ten held messages, against a dock that can show seven rows besides its
+    // title: the rest must be counted rather than silently dropped.
+    for index in 0..10 {
+        app.enqueue_message(format!("held message {index}"));
+    }
+    app.perform(Intent::ToggleDock);
+    assert_eq!(app.dock_height() as usize, vibex_tui::app::MAX_DOCK_ROWS);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("more"), "{screen}");
+    assert!(screen.contains("held message 0"), "{screen}");
+}
+
+#[test]
 fn hiding_finished_dock_work_leaves_the_running_step() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
