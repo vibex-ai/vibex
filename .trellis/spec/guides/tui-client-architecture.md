@@ -258,6 +258,21 @@ Measured contract: with no input and no events the loop produces **zero frames**
 Folding happens *before* wrapping, so a collapsed block never pays for the lines
 it will not show.
 
+**Markdown is interpreted, never echoed, and its styling survives wrapping.**
+The renderer never prints the syntax it parsed: headings carry emphasis (the top
+two levels are underlined as well, so the hierarchy survives a terminal whose
+CJK font has no bold face) instead of `#` markers, inline code is a background
+run instead of backticks, and links print their destination only when the label
+does not already say it. Wrapping is style-preserving: `wrap_text` decides where
+lines break, and each visual line is matched back onto the styled runs
+character-by-character (a break consumes the space it broke on, so offsets are
+not reliable) — re-applying only the first span's style to a wrapped line erases
+every emphasis, code and link on it. Content whose spacing *is* the layout —
+fenced code, diffs, table rows and rules — takes a preformatted path that
+hard-wraps by cell and never collapses runs of spaces, and a table is a closed
+box (`┌┬┐ ├┼┤ └┴┘`) whose columns are padded by display width, so a double-width
+cell cannot push the next `│` out of line.
+
 Colour degrades `truecolor → ansi256 → 16 → none`, resolved from
 `NO_COLOR` > `VIBEX_TUI_COLOR` > detection > truecolor. Colour is never the sole
 carrier of meaning. Icon and border glyphs degrade to ASCII when the locale is

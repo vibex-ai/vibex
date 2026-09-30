@@ -243,6 +243,22 @@ for a case that a terminal rarely reaches. Undo coalesces consecutive typing
 into one step and breaks the batch on a cursor move, so undo removes what was
 just typed rather than moving text out from under a cursor placed on purpose.
 
+### Markdown
+
+Agent messages are markdown, and the interface interprets it rather than echoing
+it. Headings are bold (the top two levels also underlined, so the hierarchy
+survives a terminal whose CJK font has no bold face) with no `#` markers; inline
+code is a background run rather than a pair of backticks; links show their
+destination only when the label does not already say it; lists get markers and
+task boxes; a table is a closed box whose columns are measured in cells, so a
+double-width character cannot push the border out of line; fenced code keeps its
+own spacing and is coloured by a small per-language palette.
+
+Styling survives line breaks: the wrapper stays the authority on where lines
+break, and each visual line is matched back onto the styled runs, so emphasis or
+code that lands across a wrap keeps its colour. Content whose spacing *is* the
+layout — code, diffs, tables — is never re-flowed.
+
 ### Status bar
 
 Identity on the left, context in the centre, appearance on the right. Splitting
