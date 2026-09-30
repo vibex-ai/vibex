@@ -19,6 +19,7 @@
 //! layout    the screen as a vertical stack of full-width bands
 //! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
 //! modal     the one chrome every popup is drawn through
+//! onboarding what to do first, in order, until it is done
 //! composer  the edit buffer, completion triggers and history
 //! search    transcript search: regex with smart case
 //! transcript block cache, incremental layout, viewport-only rendering
@@ -39,6 +40,7 @@ pub mod layout;
 pub mod locale;
 pub mod markdown;
 pub mod modal;
+pub mod onboarding;
 pub mod reduce;
 pub mod run;
 pub mod search;

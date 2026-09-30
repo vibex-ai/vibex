@@ -182,6 +182,50 @@ strings! {
         "正規表達式 · 不含大寫字母時忽略大小寫"
     },
 
+    // ---- first-run guidance ---------------------------------------------
+    onboarding_title => { "Getting started", "开始使用", "開始使用" },
+    onboarding_connect => {
+        "Connect to the runtime",
+        "连接运行时",
+        "連線執行階段"
+    },
+    onboarding_connect_detail => {
+        "The client attaches to the runtime that owns this home",
+        "客户端会连接到拥有此 home 的运行时",
+        "客戶端會連線到擁有此 home 的執行階段"
+    },
+    onboarding_workspace => {
+        "Choose where the Agent works",
+        "选择 Agent 的工作目录",
+        "選擇 Agent 的工作目錄"
+    },
+    onboarding_workspace_detail => {
+        "Browse directories on the machine that runs the Agent",
+        "浏览运行 Agent 的机器上的目录",
+        "瀏覽執行 Agent 的機器上的目錄"
+    },
+    onboarding_session => {
+        "Start a session",
+        "新建会话",
+        "新增工作階段"
+    },
+    onboarding_session_detail => {
+        "One session per task; it keeps the conversation and its workspace",
+        "每个任务一个会话，保存对话与工作区",
+        "每個任務一個工作階段，保存對話與工作區"
+    },
+    onboarding_first_message => {
+        "Write the first message",
+        "写下第一条消息",
+        "寫下第一則訊息"
+    },
+    onboarding_first_message_detail => {
+        "Say what you want done; / lists commands, @ lists files",
+        "说明你想做什么；/ 列出命令，@ 列出文件",
+        "說明你想做什麼；/ 列出命令，@ 列出檔案"
+    },
+    onboarding_done => { "Ready", "已就绪", "已就緒" },
+
     // ---- composer -------------------------------------------------------
     composer_placeholder => {
         "Send a message…  (/ commands · @ files · $ skills)",

@@ -900,3 +900,51 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
     assert_eq!(app.settings.theme_id, "vibex-dark");
     assert!(app.overlay.is_none());
 }
+
+#[test]
+fn the_welcome_screen_orders_the_first_run_steps() {
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    let screen = text(&render(&mut app, 120, 40));
+    let positions = [
+        "Connect to the runtime",
+        "Choose where the Agent works",
+        "Start a session",
+        "Write the first message",
+    ]
+    .map(|needle| {
+        screen
+            .find(needle)
+            .unwrap_or_else(|| panic!("the guide lost {needle}:\n{screen}"))
+    });
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "the steps are out of order:\n{screen}"
+    );
+    // The first incomplete step is the one that explains itself.
+    assert!(screen.contains("Browse directories"), "{screen}");
+}
+
+#[test]
+fn the_first_run_guide_retires_once_every_step_is_done() {
+    let mut app = app(120, 40);
+    let session = seeded_session("session_onboard01", "a session");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.active_session.resolve(session);
+    app.transcript.set_blocks(vec![seeded_block(
+        "block-1",
+        vibex_desktop_model::TimelineRowKind::UserMessage,
+        "the first message",
+    )]);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    assert!(app.onboarding_complete(), "every step is satisfied");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        !screen.contains("Getting started"),
+        "the guide must retire when it has nothing left to say:\n{screen}"
+    );
+}

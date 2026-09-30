@@ -1459,6 +1459,14 @@ fn render_welcome(
         empty_state(frame, area, theme, strings.transcript_empty());
         return;
     }
+    // While the first-run steps are unfinished the guide is the content, in
+    // order, with the next step to take called out. It belongs to the landing
+    // surface: once a session is open the transcript is what matters, and the
+    // remaining step is named by that surface's own empty state.
+    if app.page == Page::Sessions && !app.onboarding_complete() && area.height >= 14 {
+        render_onboarding(frame, area, app, theme, strings);
+        return;
+    }
     let wide = area.width >= 90;
     let height = area.height.min(if wide { 14 } else { 12 });
     let top = area.y + area.height.saturating_sub(height) / 2;
@@ -1537,6 +1545,112 @@ fn render_welcome(
         frame.render_widget(Paragraph::new(Text::from(lines.split_off(3))), columns[2]);
         return;
     }
+    frame.render_widget(Paragraph::new(Text::from(lines)), region);
+}
+
+/// The first-run guide: the steps, in order, with the next one called out.
+fn render_onboarding(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let steps = app.onboarding();
+    let accent = Style::default()
+        .fg(theme.roles.accent)
+        .add_modifier(Modifier::BOLD);
+    let done_style = Style::default().fg(theme.roles.accent_success);
+    let current_style = Style::default()
+        .fg(theme.roles.foreground)
+        .add_modifier(Modifier::BOLD);
+    let future_style = Style::default().fg(theme.roles.gray_dim);
+    let detail_style = Style::default().fg(theme.roles.gray);
+
+    let check = crate::glyphs::check_mark(app.glyph_tier());
+    let arrow = crate::glyphs::prompt_arrow(app.glyph_tier());
+    let bullet = crate::glyphs::diamond_hollow(app.glyph_tier());
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  {} · {}", strings.app_name(), strings.onboarding_title()),
+            accent,
+        )),
+        Line::from(Span::styled(
+            format!("  {}", strings.sessions_empty()),
+            Style::default().fg(theme.roles.foreground),
+        )),
+        Line::from(""),
+    ];
+    for progress in &steps {
+        let (marker, style) = if progress.done {
+            (check, done_style)
+        } else if progress.current {
+            (arrow, current_style)
+        } else {
+            (bullet, future_style)
+        };
+        let key = progress.step.key();
+        let label = progress.step.label(strings);
+        let mut spans = vec![
+            Span::styled(format!("  {marker} "), style),
+            Span::styled(label.to_string(), style),
+        ];
+        if progress.done {
+            spans.push(Span::styled(
+                format!("  {}", strings.onboarding_done()),
+                done_style,
+            ));
+        } else if !key.is_empty() {
+            spans.push(Span::styled(
+                format!("   {key}"),
+                Style::default()
+                    .fg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+        // Only the step being taken explains itself; four explanations at once
+        // would be a manual rather than a guide.
+        if progress.current {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", progress.step.detail(strings)),
+                detail_style,
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    // The keys a first-time reader needs, in the same shape the plain welcome
+    // uses. Optional: on a short terminal the steps matter more, so the menu
+    // and then the hint are the first things dropped.
+    let budget = usize::from(area.height);
+    if lines.len() + 6 <= budget {
+        for (key, label) in [
+            ("n", strings.session_new()),
+            ("/", strings.composer_command_menu()),
+            ("@", strings.composer_file_menu()),
+            ("?", strings.help_title()),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<3}"), accent),
+                Span::styled(label.to_string(), detail_style),
+            ]));
+        }
+    }
+    if lines.len() + 2 <= budget {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.help_hint()),
+            future_style,
+        )));
+    }
+    // Centre what was actually built, so a clipped row is never the last step.
+    let height = (lines.len() as u16).min(area.height);
+    let region = Rect {
+        y: area.y + area.height.saturating_sub(height) / 2,
+        height,
+        ..area
+    };
     frame.render_widget(Paragraph::new(Text::from(lines)), region);
 }
 
