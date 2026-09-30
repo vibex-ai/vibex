@@ -61,6 +61,8 @@ pub struct BandRequest {
     pub prompt_gap: u16,
     /// The key hint bar. Always present unless the caller sets it to zero.
     pub shortcuts: u16,
+    /// A denser status row under the composer.
+    pub status_line: u16,
 }
 
 /// The rectangles the frame is made of.
@@ -78,6 +80,7 @@ pub struct Bands {
     pub turn_status: Rect,
     pub banner: Rect,
     pub prompt: Rect,
+    pub status_line: Rect,
     pub shortcuts: Rect,
 }
 
@@ -157,6 +160,10 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
         constraints.push(Constraint::Length(request.prompt_gap));
     }
     constraints.push(Constraint::Length(request.prompt));
+    let status_line = if short { 0 } else { request.status_line };
+    if status_line > 0 {
+        constraints.push(Constraint::Length(status_line));
+    }
     constraints.push(Constraint::Length(shortcuts));
 
     let chunks = Layout::vertical(constraints).split(content);
@@ -201,6 +208,11 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
         take();
     }
     let prompt = take();
+    let status_line_rect = if status_line > 0 {
+        take()
+    } else {
+        Rect::default()
+    };
     let shortcuts_rect = take();
 
     // The gutter is taken from the transcript's right edge, and only when there
@@ -233,6 +245,7 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
         turn_status: turn_status_rect,
         banner: banner_rect,
         prompt,
+        status_line: status_line_rect,
         shortcuts: shortcuts_rect,
     }
 }
@@ -330,6 +343,7 @@ mod tests {
                     prompt: 4,
                     prompt_gap: 1,
                     shortcuts: 1,
+                    status_line: 1,
                 },
             );
             assert!(
@@ -386,6 +400,7 @@ mod tests {
                 queue: 2,
                 turn_status: 1,
                 banner: 1,
+                status_line: 1,
                 prompt: 4,
                 prompt_gap: 1,
                 shortcuts: 1,
@@ -401,6 +416,7 @@ mod tests {
             bands.turn_status,
             bands.banner,
             bands.prompt,
+            bands.status_line,
             bands.shortcuts,
         ] {
             if !Bands::is_visible(rect) {

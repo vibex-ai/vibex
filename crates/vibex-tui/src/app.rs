@@ -447,6 +447,36 @@ pub struct TodoProgress {
 pub struct Banner {
     pub text: String,
     pub tone: BannerTone,
+    /// What the message is, which decides what may replace it.
+    pub priority: BannerPriority,
+}
+
+/// Who owns the banner row.
+///
+/// There is one row, so something has to decide who gets it. Ordering the
+/// claimants is that decision: a warning about the connection outranks a tip,
+/// and a tip never displaces a mode reminder the reader still needs. Without
+/// this the last writer wins and the row flickers between unrelated messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BannerPriority {
+    /// A toast-like note about something that just happened.
+    Transient,
+    /// A rotating tip.
+    Tip,
+    /// A reminder about the mode the composer is in.
+    Mode,
+    /// Something the reader must know: offline, held messages.
+    Warning,
+}
+
+/// What a banner is, for the copy and the priority bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerKind {
+    Offline,
+    Held,
+    ShellMode,
+    HistoryMode,
+    Tip,
 }
 
 /// Regions the last frame painted, kept so a mouse event can be mapped back to
@@ -466,6 +496,8 @@ pub struct FrameRegions {
     pub composer: Option<ratatui::layout::Rect>,
     /// The queue band's rows, for click-to-select.
     pub queue: Option<ratatui::layout::Rect>,
+    /// The banner row, which a click dismisses.
+    pub banner: Option<ratatui::layout::Rect>,
     /// A row-per-index list the frame drew: its rect and the scope it selects
     /// in. Clicking row `n` selects entry `n`.
     pub list: Option<ListRegion>,
@@ -542,6 +574,7 @@ impl Banner {
         Self {
             text: text.into(),
             tone: BannerTone::Info,
+            priority: BannerPriority::Transient,
         }
     }
 
@@ -549,6 +582,7 @@ impl Banner {
         Self {
             text: text.into(),
             tone: BannerTone::Warning,
+            priority: BannerPriority::Warning,
         }
     }
 
@@ -556,7 +590,13 @@ impl Banner {
         Self {
             text: text.into(),
             tone: BannerTone::Danger,
+            priority: BannerPriority::Warning,
         }
+    }
+
+    pub fn with_priority(mut self, priority: BannerPriority) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -610,6 +650,7 @@ impl App {
                 selected: 0,
                 view: SettingsMode::Browse,
                 filter: String::new(),
+                status_line: true,
             },
             management_data: ManagementData::default(),
             selection: BTreeMap::new(),
@@ -1242,6 +1283,64 @@ impl App {
         });
         self.last_click = (!repeat).then_some((now, usize::from(row), column));
         repeat
+    }
+
+    /// Claim the banner row, if this message outranks what is there.
+    ///
+    /// Returns whether the banner changed, so the caller can decide to redraw.
+    pub fn set_banner(&mut self, banner: Banner) -> bool {
+        match &self.banner {
+            Some(current) if current.priority > banner.priority => false,
+            Some(current) if current.text == banner.text => false,
+            _ => {
+                self.banner = Some(banner);
+                true
+            }
+        }
+    }
+
+    /// Release the banner row when the condition behind it has gone.
+    pub fn clear_banner(&mut self, priority: BannerPriority) {
+        if self
+            .banner
+            .as_ref()
+            .is_some_and(|banner| banner.priority == priority)
+        {
+            self.banner = None;
+        }
+    }
+
+    /// Keep the banner row in step with the connection and the draft's mode.
+    ///
+    /// Called once per frame's worth of state change: the producers are
+    /// conditions rather than events, so a banner that is no longer true is
+    /// withdrawn by the same code that raised it.
+    pub fn refresh_banner(&mut self) -> bool {
+        if !self.live.is_live() {
+            return self.set_banner(
+                Banner::warning(self.strings.toast_offline())
+                    .with_priority(BannerPriority::Warning),
+            );
+        }
+        self.clear_banner(BannerPriority::Warning);
+        if !self.queued_messages.is_empty() && self.page == Page::Agent {
+            let text = format!(
+                "{} · {}",
+                self.strings.queue_held(),
+                self.strings.queue_hint()
+            );
+            return self.set_banner(Banner::info(text).with_priority(BannerPriority::Mode));
+        }
+        if self.composer_mode != ComposerMode::Normal && self.page == Page::Agent {
+            let text = match self.composer_mode {
+                ComposerMode::HistorySearch => self.strings.composer_history_hint(),
+                ComposerMode::Shell => self.strings.mode_shell(),
+                ComposerMode::Normal => "",
+            };
+            return self.set_banner(Banner::info(text).with_priority(BannerPriority::Mode));
+        }
+        self.clear_banner(BannerPriority::Mode);
+        false
     }
 
     // ---- the send queue --------------------------------------------------

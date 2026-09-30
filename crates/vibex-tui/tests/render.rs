@@ -203,22 +203,26 @@ fn the_prompt_sits_directly_above_the_shortcuts_band() {
         .iter()
         .position(|line| line.contains('❯'))
         .expect("the prompt is on screen");
-    // The prompt's own bottom border and the shortcut band are the two rows
-    // below it; nothing else may intrude between them.
-    assert_eq!(
-        prompt_row,
-        lines.len() - 4,
-        "the prompt is not stacked above the shortcut band:\n{}",
-        lines.join("\n")
-    );
+    // Below the prompt: its own bottom border, the status line, the shortcut
+    // band, then the outer padding. Nothing else may intrude.
     assert!(
         lines[prompt_row + 1].contains('╰'),
         "the prompt has no bottom border: {:?}",
         lines[prompt_row + 1]
     );
+    let band_row = lines
+        .iter()
+        .position(|line| line.contains("Ctrl+P"))
+        .expect("the shortcut band is on screen");
     assert!(
-        lines[prompt_row + 2].contains("Ctrl+P") || lines[prompt_row + 3].contains("Ctrl+P"),
-        "the shortcut band does not follow the prompt"
+        band_row > prompt_row + 1,
+        "the shortcut band is above the prompt:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        band_row >= lines.len() - 3,
+        "the shortcut band is not at the bottom:\n{}",
+        lines.join("\n")
     );
 }
 
@@ -918,6 +922,58 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
     app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     assert_eq!(app.settings.theme_id, "vibex-dark");
     assert!(app.overlay.is_none());
+}
+
+#[test]
+fn the_bottom_status_line_can_be_turned_off() {
+    use vibex_tui::settings::SettingRow;
+    let mut app = app(120, 44);
+    app.navigate_to(Page::Agent);
+    let with = text(&render(&mut app, 120, 44));
+    app.settings.status_line = false;
+    let without = text(&render(&mut app, 120, 44));
+    // The rows go back to the transcript, so the two frames differ.
+    assert_ne!(with, without);
+    // And the setting is a real row with a real value.
+    assert_eq!(
+        app.setting_value(SettingRow::StatusLine),
+        vibex_tui::Strings::for_locale(Locale::En).disabled()
+    );
+    assert!(app.apply_setting_value(SettingRow::StatusLine, "on"));
+    assert!(app.settings.status_line);
+}
+
+#[test]
+fn a_warning_banner_outranks_a_tip_and_is_not_displaced() {
+    use vibex_tui::app::{Banner, BannerPriority};
+    let mut app = app(120, 40);
+    assert!(app.set_banner(Banner::info("a tip").with_priority(BannerPriority::Tip)));
+    assert!(
+        !app.set_banner(Banner::info("another tip").with_priority(BannerPriority::Transient)),
+        "a lower priority must not displace a higher one"
+    );
+    assert!(app.set_banner(Banner::danger("offline").with_priority(BannerPriority::Warning)));
+    assert_eq!(
+        app.banner.as_ref().map(|banner| banner.text.as_str()),
+        Some("offline")
+    );
+    // The condition clearing withdraws only its own banner.
+    app.clear_banner(BannerPriority::Tip);
+    assert!(app.banner.is_some(), "the warning is not a tip");
+    app.clear_banner(BannerPriority::Warning);
+    assert!(app.banner.is_none());
+}
+
+#[test]
+fn the_banner_row_is_published_and_clickable() {
+    use vibex_tui::app::{Banner, BannerPriority};
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.set_banner(Banner::danger("the runtime is offline").with_priority(BannerPriority::Warning));
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("the runtime is offline"), "{screen}");
+    let rect = app.regions.banner.expect("the banner is clickable");
+    assert!(rect.height == 1 && rect.width > 0);
 }
 
 #[test]

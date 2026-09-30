@@ -25,6 +25,7 @@ pub enum SettingRow {
     Icons,
     Language,
     Keys,
+    StatusLine,
     Workspace,
     Backend,
     Seat,
@@ -99,6 +100,11 @@ pub const SETTINGS: &[SettingDef] = &[
         row: SettingRow::Language,
         section: SettingsSection::Language,
         kind: SettingKind::Choice,
+    },
+    SettingDef {
+        row: SettingRow::StatusLine,
+        section: SettingsSection::Interface,
+        kind: SettingKind::Toggle,
     },
     SettingDef {
         row: SettingRow::Workspace,
@@ -179,6 +185,8 @@ pub struct SettingsState {
     pub selected: usize,
     pub view: SettingsMode,
     pub filter: String,
+    /// Whether the bottom status line is shown.
+    pub status_line: bool,
 }
 
 /// One value a chooser offers.
@@ -241,6 +249,7 @@ impl App {
             SettingRow::Icons => strings.settings_icons(),
             SettingRow::Language => strings.settings_language(),
             SettingRow::Keys => strings.settings_keys(),
+            SettingRow::StatusLine => strings.settings_status_line(),
             SettingRow::Workspace => strings.session_workspace(),
             SettingRow::Backend => strings.settings_backend(),
             SettingRow::Seat => strings.settings_connection(),
@@ -256,6 +265,7 @@ impl App {
             SettingRow::Icons => strings.settings_icons_hint(),
             SettingRow::Language => strings.settings_language_hint(),
             SettingRow::Keys => strings.settings_keys_hint(),
+            SettingRow::StatusLine => strings.settings_status_line_hint(),
             SettingRow::Workspace => strings.settings_workspace_hint(),
             SettingRow::Backend => strings.settings_backend_hint(),
             SettingRow::Seat => strings.settings_seat_hint(),
@@ -281,6 +291,12 @@ impl App {
                 self.strings.settings_keys_reload(),
                 self.keymap.bindings().len()
             ),
+            SettingRow::StatusLine => if self.settings.status_line {
+                self.strings.enabled()
+            } else {
+                self.strings.disabled()
+            }
+            .to_string(),
             SettingRow::Workspace => self
                 .workspace_path
                 .clone()
@@ -325,6 +341,18 @@ impl App {
                     })
                     .collect()
             }
+            SettingRow::StatusLine => ["on", "off"]
+                .into_iter()
+                .map(|value| SettingChoice {
+                    value: value.to_string(),
+                    label: if value == "on" {
+                        self.strings.enabled().to_string()
+                    } else {
+                        self.strings.disabled().to_string()
+                    },
+                    current: (value == "on") == self.settings.status_line,
+                })
+                .collect(),
             SettingRow::Icons => ["unicode", "ascii"]
                 .into_iter()
                 .map(|value| SettingChoice {
@@ -359,6 +387,7 @@ impl App {
             SettingRow::Mode => "dark".to_string(),
             SettingRow::Theme => "vibex-dark".to_string(),
             SettingRow::Icons => "unicode".to_string(),
+            SettingRow::StatusLine => "on".to_string(),
             SettingRow::Language => Locale::En.tag().to_string(),
             SettingRow::Workspace => String::new(),
             _ => self.setting_value(row),
@@ -418,6 +447,14 @@ impl App {
                 }
                 self.settings.locale = locale;
                 self.strings = Strings::with_locale(locale);
+                true
+            }
+            SettingRow::StatusLine => {
+                let enabled = value == "on";
+                if enabled == self.settings.status_line {
+                    return false;
+                }
+                self.settings.status_line = enabled;
                 true
             }
             SettingRow::Workspace => {

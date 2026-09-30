@@ -544,10 +544,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_turn_status(frame, bands.turn_status, app, &theme, strings);
     }
     if Bands::is_visible(bands.banner) {
+        app.regions.banner = Some(bands.banner);
         render_banner(frame, bands.banner, app, &theme, strings);
     }
     if Bands::is_visible(bands.prompt) {
         render_prompt(frame, bands.prompt, app, &theme, strings);
+    }
+    if Bands::is_visible(bands.status_line) {
+        render_status_line(frame, bands.status_line, app, &theme, strings);
     }
     render_shortcuts(frame, bands.shortcuts, app, &theme);
 
@@ -599,6 +603,9 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         },
         prompt_gap: u16::from(app.page.is_session_page()),
         shortcuts: 1,
+        status_line: u16::from(
+            app.settings.status_line && app.page.is_session_page() && app.viewport.1 > 24,
+        ),
     }
 }
 
@@ -3526,6 +3533,87 @@ fn category_label(category: crate::keymap::Category, strings: Strings) -> &'stat
         crate::keymap::Category::Management => strings.help_category_management(),
         crate::keymap::Category::Panels => strings.help_category_panels(),
     }
+}
+
+/// The bottom status line: a denser second row of context.
+///
+/// The top band answers "where am I and is it alive"; this one answers "what am
+/// I working on": the branch, the model, the context budget and how much is
+/// waiting. It is optional because a terminal that has just lost two rows to it
+/// is a terminal that lost two rows of transcript.
+fn render_status_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let sep = Span::styled(" │ ", Style::default().fg(theme.roles.gray_dim));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push = |spans: &mut Vec<Span<'static>>, span: Span<'static>| {
+        if !spans.is_empty() {
+            spans.push(sep.clone());
+        }
+        spans.push(span);
+    };
+    if let Some(status) = app.git_status.as_ref() {
+        let branch = status
+            .branch
+            .clone()
+            .unwrap_or_else(|| "detached".to_string());
+        push(
+            &mut spans,
+            Span::styled(
+                format!(
+                    "{} {branch}",
+                    crate::glyphs::diamond_hollow(app.glyph_tier())
+                ),
+                Style::default().fg(theme.roles.path),
+            ),
+        );
+        if !status.changes.is_empty() {
+            push(
+                &mut spans,
+                Span::styled(
+                    format!("{} {}", status.changes.len(), strings.nav_changes()),
+                    Style::default().fg(theme.roles.accent_attention),
+                ),
+            );
+        }
+    }
+    if let Some(progress) = app.todo_progress() {
+        push(
+            &mut spans,
+            Span::styled(
+                format!("{}/{}", progress.done, progress.total),
+                Style::default().fg(theme.roles.accent_user),
+            ),
+        );
+    }
+    if let Some(context) = context_usage_spans(app, theme) {
+        push(&mut spans, Span::raw(""));
+        spans.pop();
+        if !spans.is_empty() {
+            spans.push(sep.clone());
+        }
+        spans.extend(context);
+    }
+    if !app.queued_messages.is_empty() {
+        push(
+            &mut spans,
+            Span::styled(
+                format!("{} {}", app.queued_messages.len(), strings.composer_queue()),
+                Style::default().fg(theme.roles.gray),
+            ),
+        );
+    }
+    if spans.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.roles.surface)),
+        area,
+    );
 }
 
 /// The key hint bar.

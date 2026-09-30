@@ -171,6 +171,13 @@ fn event_loop(
             }
         }
 
+        // ---- the banner row ----------------------------------------------
+        // The banner is a condition rather than an event: refreshing it here
+        // means a message that is no longer true withdraws itself.
+        if app.refresh_banner() {
+            dirty = true;
+        }
+
         // ---- the send queue ----------------------------------------------
         // A turn that has ended releases the next held message. Checked here,
         // after worker results have been applied, because that is the only
@@ -756,6 +763,14 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            // A banner is dismissed by clicking it: it has no key of its own
+            // and would otherwise stay until its condition changed.
+            if let Some(rect) = app.regions.banner
+                && rect_contains(rect, mouse.column, mouse.row)
+            {
+                app.banner = None;
+                return true;
+            }
             // The modal's close affordance is the one chrome control the mouse
             // owns, and it only exists while a modal is open.
             if let Some(close) = app.regions.modal_close

@@ -546,6 +546,12 @@ strings! {
     settings_icons => { "Icons", "图标", "圖示" },
     settings_color => { "Colour", "颜色", "顏色" },
     settings_keys => { "Key bindings", "键位", "鍵位" },
+    settings_status_line => { "Status line", "状态行", "狀態列" },
+    settings_status_line_hint => {
+        "A second, denser status row under the composer: branch, model and context",
+        "输入框下方的第二行状态：分支、模型与上下文用量",
+        "輸入框下方的第二行狀態：分支、模型與上下文用量"
+    },
     settings_keys_hint => {
         "Rebind in ~/.vibex/tui-keys.toml",
         "在 ~/.vibex/tui-keys.toml 中重映射",
