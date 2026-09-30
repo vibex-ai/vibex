@@ -9,9 +9,35 @@ media stack itself.
 vibex                      # attach to (or start) the runtime for this home
 vibex connect vibex://…    # pair with a runtime and attach to it
 vibex status               # report which seat this home would use
+vibex status --home <dir>  # ... for another home, without attaching
+vibex --home <dir>         # run against another home
 vibex-server tui           # run the client from the server binary
 vibex-desktop tui          # run the client from the desktop binary (Linux)
 ```
+
+`vibex status` never attaches, so it is the first thing to run when something
+is wrong — it prints the home, the flavour, the seat, the endpoint and the
+reason, and exits zero even when the real run would fail.
+
+### Homes and flavours
+
+The leaf of the home path decides which runtime flavour the client starts:
+
+| Home ends with | Flavour | Local listener |
+| --- | --- | --- |
+| `desktop-preview`, `desktop-rc`, `desktop-stable` | that desktop channel | the desktop Direct port, 1428 |
+| anything else | server | 8765, or `VIBEX_BIND_ADDR` |
+
+The flavour has to come from the path because the runtime refuses to start a
+channel in a home that does not match it. `--home /tmp/scratch` is therefore a
+throwaway server-style runtime, which is the quickest way to try the client
+without touching a real home.
+
+Local attachment never trusts the loopback interface on its own: the client
+reads the runtime's identity public key from the home's own
+`relay/desktop-identity.json` and compares it with what the runtime presents.
+Plain HTTP is used only for a loopback route whose runtime does not terminate
+TLS, and only with the explicit development opt-in.
 
 ## Packaging
 
