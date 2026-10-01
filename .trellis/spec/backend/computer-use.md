@@ -243,28 +243,31 @@ maps each failure onto a named `ComputerUnavailableReason` instead of a boolean.
 ## Settings and installation
 
 The settings page is the product's front door for this feature. Nothing about
-setup requires a terminal, and nothing about setup happens on its own:
+setup requires a terminal, and nothing happens on its own. It is built from the
+same rows and groups as every other settings page — no wizard, no modal — and it
+says four things:
 
-- **One switch turns the feature on and off**, and it takes effect immediately:
+- **The switch.** One row turns the feature on and off, and the change is live:
   turning it on starts the helper and the endpoint, turning it off releases the
   desktop and stops them. The runtime is told what the user chose rather than
-  the other way round, and `VIBEX_COMPUTER_USE=1` only *seeds* that switch once
+  the other way round, and `VIBEX_COMPUTER_USE=1` only *seeds* the switch once
   so an administrator does not have to find it.
-- **A three-step rail tells the truth about where the machine is**: install the
-  driver, grant the system permission, turn it on. The step is derived from the
-  machine — driver present, permission usable, switch on — never remembered, so
-  a reinstall or a revoked permission moves it back.
-- **Installing the driver is an explicit user action.** The command is a fixed,
-  documented installer per platform, shown before it runs; a model can never
-  influence it. Vibex never installs anything silently, and the check button
-  re-probes without changing anything.
-- **The management dialog** holds the approval policy (allow / ask / deny), the
-  self-target switch, the call timeout and a capability list built from the
-  platform's own statement, so a platform that cannot do something says so where
-  the user is deciding.
+- **The driver.** Its row carries the state of this machine and the two actions
+  that change it: Install and Check again. Installing runs a fixed, documented
+  installer for the platform, only after the button is pressed, and never from
+  anything a model wrote. The sentence under the buttons names the one thing
+  still missing — a driver, a permission, the switch — or the driver in use, and
+  it is derived from the machine rather than remembered, so a reinstall or a
+  revoked permission moves it back.
+- **The system permissions.** A read-only line with the three states the
+  operating system reports, because Vibex cannot consent on the user's behalf
+  and a permission that needs a restart must not look like a denial.
+- **Approval, calls and this platform.** The approval policy (allow / ask /
+  deny), the switch that permits operating Vibex's own windows, the call
+  timeout, and one row per capability family so a platform that cannot do
+  something says so next to the switch that would have used it.
 
-Three limits on the approval policy are deliberate and are stated in the dialog
-itself:
+Three limits on the approval policy are deliberate and are stated on the page:
 
 1. `Allow` removes the per-action card for approvable classes; it never reaches
    the classes that are refused outright. A password manager and a secure field
@@ -272,9 +275,9 @@ itself:
 2. Destructive clicks and foreground takeovers keep their per-action card even
    under `Allow`. They are irreversible and user-visible; a global preference is
    not consent for a specific irreversible act.
-3. Operating Vibex's own window has its own switch rather than riding on the
-   policy, because the failure it prevents — an Agent driving its own window —
-   is a feedback loop, not an over-permissioned action.
+3. Operating Vibex's own windows has its own switch rather than riding on the
+   policy, because the failure it prevents — an Agent driving the window it is
+   running in — is a feedback loop, not an over-permissioned action.
 
 The call timeout is bounded to the offered choices and snaps up, so a
 hand-edited settings file cannot shorten every action to nothing or set it to

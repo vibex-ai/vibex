@@ -32479,77 +32479,6 @@ impl VibexWorkbench {
         self.apply_computer_settings(cx);
     }
 
-    /// Opens the management dialog: policy, runtime parameters and capabilities.
-    ///
-    /// The dialog reads its values from the workbench on every rebuild rather
-    /// than from a snapshot taken when it opened: a segmented control that does
-    /// not move after it is clicked would be lying about the setting.
-    fn open_computer_management(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entity = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let (settings, status) = entity.read_with(cx, |this, _| {
-                (this.computer_settings(), this.computer_status())
-            });
-            let step = computer_setup_step(
-                &status.driver,
-                status.availability.as_ref(),
-                settings.enabled,
-            );
-            let capabilities =
-                std::sync::Arc::new(computer_capability_overview(status.availability.as_ref()));
-            let capabilities = capabilities.clone();
-            let is_dark = cx.theme().is_dark();
-            let popover = theme::semantic_color("popover", is_dark);
-            let foreground = theme::semantic_color("popover-foreground", is_dark);
-            let apply = entity.clone();
-            let self_target = entity.clone();
-            let timeout_entity = entity.clone();
-            dialog
-                .title(locale::text("Management settings", "管理设置", "管理設定"))
-                .w(px(520.0))
-                .max_w(px(520.0))
-                .rounded(px(14.0))
-                .bg(popover)
-                .text_color(foreground)
-                .overlay(true)
-                .overlay_closable(true)
-                .content(move |content, _, cx| {
-                    let policy = settings.approval_policy;
-                    let allow_self = settings.allow_self_target;
-                    let timeout = settings.call_timeout_ms;
-                    let apply = apply.clone();
-                    let self_target = self_target.clone();
-                    let timeout_entity = timeout_entity.clone();
-                    content.child(render_computer_management(
-                        policy,
-                        allow_self,
-                        timeout,
-                        capabilities.as_ref(),
-                        step,
-                        cx,
-                        move |policy, cx| {
-                            apply.update(cx, |this, cx| {
-                                this.set_computer_approval_policy(policy, cx)
-                            });
-                        },
-                        move |allowed, cx| {
-                            self_target.update(cx, |this, cx| {
-                                this.set_computer_allow_self_target(allowed, cx)
-                            });
-                        },
-                        move |timeout, cx| {
-                            timeout_entity
-                                .update(cx, |this, cx| this.set_computer_call_timeout(timeout, cx));
-                        },
-                    ))
-                })
-                .footer(
-                    DialogFooter::new()
-                        .child(DialogClose::new().child(locale::text("Close", "关闭", "關閉"))),
-                )
-        });
-    }
-
     /// Stores browser preferences and applies them to the panel that is open.
     ///
     /// Resolved here rather than in the panel: the workbench owns the settings,
@@ -66110,8 +66039,10 @@ impl FoundationSettings {
     /// The settings page for computer use.
     ///
     /// The workbench owns the decisions and the runtime; this page renders them
-    /// and asks the workbench to change them, so the settings and the panel
-    /// can never disagree about what is on.
+    /// and asks the workbench to change them, so the settings and the panel can
+    /// never disagree about what is on. Everything lives on the page — a
+    /// settings surface that hides half its switches behind a modal is a
+    /// settings surface people stop reading.
     fn render_computer_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let (settings, status) = match self.workbench.read_with(cx, |workbench, _| {
             (workbench.computer_settings(), workbench.computer_status())
@@ -66128,11 +66059,11 @@ impl FoundationSettings {
         let master = setting_row(
             locale::text("Computer use", "电脑操作", "電腦操作"),
             locale::text(
-                "Let an Agent read this machine's screen and drive its applications, the way it \
-                 drives the terminal and the browser panel. Off by default: the Agent acts on \
+                "Let an Agent read this machine's screen and act on its applications, beside the \
+                 terminal and the browser panel. Off by default, because the Agent then acts on \
                  your real desktop with your real accounts.",
-                "允许 Agent 读取本机屏幕并操作桌面应用，和终端、浏览器面板同属一类工具。默认关闭：Agent 会用它操作你真实的桌面和真实账号。",
-                "允許 Agent 讀取本機螢幕並操作桌面應用，和終端機、瀏覽器面板同屬一類工具。預設關閉：Agent 會用它操作你真實的桌面和真實帳號。",
+                "允许 Agent 读取本机屏幕并操作桌面应用，和终端、浏览器面板同属一类工具。默认关闭：打开后 Agent 会操作你真实的桌面和真实账号。",
+                "允許 Agent 讀取本機螢幕並操作桌面應用，和終端機、瀏覽器面板同屬一類工具。預設關閉：開啟後 Agent 會操作你真實的桌面和真實帳號。",
             ),
             Switch::new("computer-enabled")
                 .small()
@@ -66147,93 +66078,224 @@ impl FoundationSettings {
             cx,
         );
 
-        let driver_control = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                Button::new("computer-install-driver")
-                    .small()
-                    .primary()
-                    .label(locale::text("Install", "安装", "安裝"))
-                    .disabled(status.busy)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let _ = this
-                            .workbench
-                            .update(cx, |workbench, cx| workbench.install_computer_driver(cx));
-                    })),
-            )
-            .child(
-                Button::new("computer-detect-driver")
-                    .small()
-                    .outline()
-                    .label(locale::text("Check", "检测", "偵測"))
-                    .disabled(status.busy)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let _ = this
-                            .workbench
-                            .update(cx, |workbench, cx| workbench.detect_computer_driver(cx));
-                    })),
-            );
-        let driver_status = computer_driver_line(&status);
         let driver_row = setting_row(
             locale::text("Desktop driver", "桌面驱动", "桌面驅動"),
             locale::text(
-                "Install the driver first, grant the system permission it asks for, then turn \
-                 computer use on. The driver runs in its own helper process, and Vibex never \
-                 installs it without this button.",
-                "先安装驱动，再完成它要求的系统授权，最后打开电脑操作。驱动运行在独立的 helper 进程里，Vibex 不会在你点这个按钮前安装它。",
-                "先安裝驅動，再完成它要求的系統授權，最後開啟電腦操作。驅動執行在獨立的 helper 程序裡，Vibex 不會在你按這個按鈕前安裝它。",
+                "The driver does the clicking; it runs in its own helper process, which owns the \
+                 system grants. Vibex installs it only when you press Install.",
+                "真正执行点击的是驱动，它运行在独立的 helper 进程里并持有系统授权。只有你按下“安装”时 Vibex 才会安装它。",
+                "真正執行點擊的是驅動，它執行在獨立的 helper 程序裡並持有系統授權。只有你按下「安裝」時 Vibex 才會安裝它。",
             ),
-            v_flex().items_end().gap_2().child(driver_control).child(
-                div()
-                    .max_w(px(320.0))
-                    .text_xs()
-                    .whitespace_normal()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(driver_status),
+            v_flex()
+                .items_end()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("computer-install-driver")
+                                .small()
+                                .label(locale::text("Install", "安装", "安裝"))
+                                .disabled(status.busy || status.driver.is_installed())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this.workbench.update(cx, |workbench, cx| {
+                                        workbench.install_computer_driver(cx)
+                                    });
+                                })),
+                        )
+                        .child(
+                            Button::new("computer-detect-driver")
+                                .small()
+                                .outline()
+                                .label(locale::text("Check again", "重新检测", "重新偵測"))
+                                .disabled(status.busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this.workbench.update(cx, |workbench, cx| {
+                                        workbench.detect_computer_driver(cx)
+                                    });
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .max_w(px(340.0))
+                        .text_xs()
+                        .whitespace_normal()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(computer_readiness_note(step, &status)),
+                ),
+            stacked,
+            cx,
+        );
+
+        let permissions_row = setting_row(
+            locale::text("System permissions", "系统权限", "系統權限"),
+            locale::text(
+                "Granted by the operating system, not by Vibex. Screen recording may need a \
+                 restart before it takes effect.",
+                "由操作系统授予，Vibex 无法代替你同意。屏幕录制在部分系统上需要重启后才生效。",
+                "由作業系統授予，Vibex 無法代替你同意。螢幕錄製在部分系統上需要重新啟動後才生效。",
+            ),
+            div()
+                .max_w(px(340.0))
+                .text_xs()
+                .whitespace_normal()
+                .text_color(cx.theme().muted_foreground)
+                .child(computer_permission_summary(status.availability.as_ref())),
+            stacked,
+            cx,
+        );
+
+        let approval_row = setting_row(
+            locale::text("What needs approval", "需要批准的操作", "需要批准的操作"),
+            locale::text(
+                "Ask raises a card for every action the risk model flags. Allow skips those cards, \
+                 but never for a password manager, a secure field, a destructive control or a \
+                 foreground takeover — those keep asking whatever this is set to. Deny refuses \
+                 them and tells the Agent so.",
+                "“询问”会为风险模型标记的每个操作弹出确认卡；“允许”跳过这些卡，但密码管理器、安全输入框、破坏性控件和前台接管始终逐次询问，不受这里影响；“拒绝”会直接拒绝并告知 Agent。",
+                "「詢問」會為風險模型標記的每個操作彈出確認卡；「允許」跳過這些卡，但密碼管理器、安全輸入框、破壞性控件和前景接管始終逐次詢問，不受這裡影響；「拒絕」會直接拒絕並告知 Agent。",
+            ),
+            settings_segmented_control(
+                "computer-approval-policy",
+                vec![
+                    settings_segmented_option(
+                        locale::text("Allow", "允许", "允許"),
+                        settings.approval_policy == vibex_core::ComputerApprovalPolicy::Allow,
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.workbench.update(cx, |workbench, cx| {
+                                workbench.set_computer_approval_policy(
+                                    vibex_core::ComputerApprovalPolicy::Allow,
+                                    cx,
+                                )
+                            });
+                        }),
+                    ),
+                    settings_segmented_option(
+                        locale::text("Ask", "询问", "詢問"),
+                        settings.approval_policy == vibex_core::ComputerApprovalPolicy::Ask,
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.workbench.update(cx, |workbench, cx| {
+                                workbench.set_computer_approval_policy(
+                                    vibex_core::ComputerApprovalPolicy::Ask,
+                                    cx,
+                                )
+                            });
+                        }),
+                    ),
+                    settings_segmented_option(
+                        locale::text("Deny", "拒绝", "拒絕"),
+                        settings.approval_policy == vibex_core::ComputerApprovalPolicy::Deny,
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.workbench.update(cx, |workbench, cx| {
+                                workbench.set_computer_approval_policy(
+                                    vibex_core::ComputerApprovalPolicy::Deny,
+                                    cx,
+                                )
+                            });
+                        }),
+                    ),
+                ],
             ),
             stacked,
             cx,
         );
 
-        let manage_row = setting_row(
-            locale::text("Management settings", "管理设置", "管理設定"),
+        let self_row = setting_row(
             locale::text(
-                "Driver information, the approval policy, the call timeout and what this \
-                 platform can do.",
-                "查看驱动信息、调整审批策略、单次调用超时与本平台的能力范围。",
-                "檢視驅動資訊、調整審批策略、單次呼叫逾時與本平台的能力範圍。",
+                "Vibex's own windows",
+                "Vibex 自身的窗口",
+                "Vibex 自身的視窗",
             ),
-            Button::new("computer-manage")
+            locale::text(
+                "Off by default: an Agent driving the window it is running in is a feedback loop, \
+                 and it could close the settings you are reading. Turn it on only while testing \
+                 automation against Vibex itself.",
+                "默认关闭：Agent 操作自己所在的窗口会形成回环，甚至可能关掉你正在看的设置。只有在用自动化测试 Vibex 自身时才需要打开。",
+                "預設關閉：Agent 操作自己所在的視窗會形成回環，甚至可能關掉你正在看的設定。只有在用自動化測試 Vibex 自身時才需要開啟。",
+            ),
+            Switch::new("computer-allow-self-target")
                 .small()
-                .outline()
-                .label(locale::text("Manage", "管理", "管理"))
-                .on_click(cx.listener(|this, _, window, cx| {
+                .checked(settings.allow_self_target)
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    let allowed = *enabled;
                     let _ = this.workbench.update(cx, |workbench, cx| {
-                        workbench.open_computer_management(window, cx)
+                        workbench.set_computer_allow_self_target(allowed, cx)
                     });
                 })),
             stacked,
             cx,
         );
 
+        let timeout_options: Vec<Tab> = vibex_core::COMPUTER_CALL_TIMEOUT_CHOICES_MS
+            .iter()
+            .map(|choice| {
+                let choice = *choice;
+                settings_segmented_option(
+                    SharedString::from(format!("{}s", choice / 1000)),
+                    settings.call_timeout_ms == choice,
+                    cx.listener(move |this, _, _, cx| {
+                        let _ = this.workbench.update(cx, |workbench, cx| {
+                            workbench.set_computer_call_timeout(choice, cx)
+                        });
+                    }),
+                )
+            })
+            .collect();
+        let timeout_row = setting_row(
+            locale::text("Timeout", "超时时间", "逾時時間"),
+            locale::text(
+                "How long one desktop action may take before it is reported as a timeout. A call \
+                 that never settles holds the Agent's whole turn.",
+                "单次桌面操作的最长等待时间，超过就按超时上报。一次永不返回的调用会拖住 Agent 的整个回合。",
+                "單次桌面操作的最長等待時間，超過就按逾時上報。一次永不返回的呼叫會拖住 Agent 的整個回合。",
+            ),
+            settings_segmented_control("computer-call-timeout", timeout_options),
+            stacked,
+            cx,
+        );
+
+        let mut platform_rows = vec![computer_platform_note(status.availability.as_ref())];
+        platform_rows.extend(
+            computer_capability_rows(status.availability.as_ref())
+                .into_iter()
+                .map(|row| {
+                    setting_row(
+                        row.label,
+                        row.detail,
+                        settings_value_chip(if row.supported {
+                            locale::text("Supported", "支持", "支援")
+                        } else {
+                            locale::text("Not on this platform", "本平台不支持", "本平台不支援")
+                        }),
+                        stacked,
+                        cx,
+                    )
+                }),
+        );
+
         settings_page(
             locale::text("Computer use", "电脑操作", "電腦操作"),
             locale::text(
-                "Computer use is a tool panel: it lets an Agent act on this machine's desktop. \
-                 You watch it, approve what needs approving, and can stop it at any time from the \
-                 computer panel.",
-                "电脑操作是一个工具面板：让 Agent 操作本机桌面。你可以看着它、批准需要批准的动作，并随时在电脑操作面板里停止它。",
-                "電腦操作是一個工具面板：讓 Agent 操作本機桌面。你可以看著它、批准需要批准的動作，並隨時在電腦操作面板裡停止它。",
+                "An Agent can act on this machine's desktop the way it already acts in the \
+                 terminal and the browser panel. You watch it in the computer panel, answer the \
+                 cards that need answering, and can stop it from there at any time.",
+                "Agent 可以像使用终端和浏览器面板一样操作本机桌面。你可以在电脑操作面板里看它做了什么、回答需要确认的卡片，并随时从那里停止它。",
+                "Agent 可以像使用終端機和瀏覽器面板一樣操作本機桌面。你可以在電腦操作面板裡看它做了什麼、回答需要確認的卡片，並隨時從那裡停止它。",
             ),
             vec![
-                SettingsGroup::unlabeled(vec![master]),
-                SettingsGroup {
-                    label: Some(locale::text("Get started", "开始使用", "開始使用")),
-                    leading: Some(computer_setup_stepper(step, cx)),
-                    rows: vec![driver_row, manage_row],
-                },
+                SettingsGroup::unlabeled(vec![master, driver_row, permissions_row]),
+                SettingsGroup::new(
+                    locale::text("Approval", "审批", "審批"),
+                    vec![approval_row, self_row],
+                ),
+                SettingsGroup::new(locale::text("Calls", "调用", "呼叫"), vec![timeout_row]),
+                SettingsGroup::with_leading(
+                    locale::text("This platform", "本平台", "本平台"),
+                    platform_rows.remove(0),
+                    platform_rows,
+                ),
             ],
             cx,
         )
@@ -68336,17 +68398,6 @@ enum ComputerSetupStep {
     Done,
 }
 
-impl ComputerSetupStep {
-    fn index(self) -> usize {
-        match self {
-            Self::InstallDriver => 0,
-            Self::GrantPermission => 1,
-            Self::TurnOn => 2,
-            Self::Done => 3,
-        }
-    }
-}
-
 fn computer_setup_step(
     driver: &DriverState,
     availability: Option<&ComputerAvailability>,
@@ -68375,459 +68426,199 @@ fn computer_setup_step(
     ComputerSetupStep::Done
 }
 
-/// The three-step "get started" rail above the driver card.
+/// The one-line readiness sentence under the driver buttons.
 ///
-/// A stepper rather than a paragraph because the order is not a suggestion: a
-/// permission granted before the driver exists is granted to nothing, and the
-/// feature cannot start until all three are true.
-fn computer_setup_stepper(step: ComputerSetupStep, cx: &App) -> AnyElement {
-    let is_dark = cx.theme().is_dark();
-    let primary = theme::semantic_color("primary", is_dark);
-    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-    let border = theme::semantic_color("border", is_dark);
-    let current = step.index();
-    let labels = [
-        (
-            locale::text("Install driver", "安装驱动", "安裝驅動"),
-            locale::text("Next step", "下一步", "下一步"),
-        ),
-        (
-            locale::text("System permission", "系统授权", "系統授權"),
-            locale::text("Pending", "待完成", "待完成"),
-        ),
-        (
-            locale::text("Turn on", "启用", "啟用"),
-            locale::text("Pending", "待完成", "待完成"),
-        ),
-    ];
-    let mut rail = Vec::new();
-    for (index, (label, pending)) in labels.iter().enumerate() {
-        if index > 0 {
-            rail.push(
-                div()
-                    .flex_none()
-                    .w(px(28.0))
-                    .h(px(1.0))
-                    .bg(border)
-                    .into_any_element(),
-            );
-        }
-        let done = index < current;
-        let active = index == current;
-        rail.push(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(22.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if done || active { primary } else { border })
-                        .when(done || active, |this| this.bg(primary.opacity(0.15)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(if done || active {
-                            primary
-                        } else {
-                            muted_foreground
-                        })
-                        .child(SharedString::from(format!("{}", index + 1))),
+/// It replaces a numbered checklist with a sentence about this machine: what is
+/// missing, in the order the steps have to happen, and nothing at all once the
+/// feature is running.
+fn computer_readiness_note(step: ComputerSetupStep, status: &ComputerSettingsStatus) -> String {
+    match step {
+        ComputerSetupStep::InstallDriver => match &status.driver {
+            DriverState::InstallFailed { detail } => format!(
+                "{} {detail}",
+                locale::text(
+                    "The last install failed:",
+                    "上次安装失败：",
+                    "上次安裝失敗："
                 )
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if active || done {
-                                    primary
-                                } else {
-                                    muted_foreground
-                                })
-                                .child(*label),
-                        )
-                        .child(div().text_xs().text_color(muted_foreground).child(if done {
-                            locale::text("Done", "已完成", "已完成")
-                        } else {
-                            *pending
-                        })),
-                )
-                .into_any_element(),
-        );
+            ),
+            DriverState::Installing => locale::text(
+                "Installing. This can take a few minutes.",
+                "正在安装，可能需要几分钟。",
+                "正在安裝，可能需要幾分鐘。",
+            )
+            .to_string(),
+            _ => locale::text(
+                "No driver on this machine yet.",
+                "本机还没有驱动。",
+                "本機還沒有驅動。",
+            )
+            .to_string(),
+        },
+        ComputerSetupStep::GrantPermission => locale::text(
+            "The driver is in place; the operating system still has to allow it.",
+            "驱动已就位，还需要操作系统的授权。",
+            "驅動已就位，還需要作業系統的授權。",
+        )
+        .to_string(),
+        ComputerSetupStep::TurnOn => locale::text(
+            "Everything is in place. Turn computer use on above.",
+            "准备工作已完成，打开上面的开关即可使用。",
+            "準備工作已完成，開啟上面的開關即可使用。",
+        )
+        .to_string(),
+        ComputerSetupStep::Done => match &status.driver {
+            DriverState::Installed { path, version } => match version {
+                Some(version) => format!(
+                    "{} {version} — {}",
+                    locale::text("Running with", "正在使用", "正在使用"),
+                    path.display()
+                ),
+                None => format!(
+                    "{} — {}",
+                    locale::text("Running with", "正在使用", "正在使用"),
+                    path.display()
+                ),
+            },
+            _ => locale::text("Running.", "正在运行。", "正在執行。").to_string(),
+        },
     }
-    h_flex()
+}
+
+/// The three permission states, on one line, without inventing a fourth.
+fn computer_permission_summary(availability: Option<&ComputerAvailability>) -> String {
+    let Some(availability) = availability else {
+        return locale::text("Not checked yet.", "尚未检测。", "尚未偵測。").to_string();
+    };
+    let permissions = availability.permissions;
+    let name = |state: vibex_core::ComputerPermissionState| -> &'static str {
+        match state {
+            vibex_core::ComputerPermissionState::Granted => {
+                locale::text("granted", "已授权", "已授權")
+            }
+            vibex_core::ComputerPermissionState::Denied => {
+                locale::text("denied", "已拒绝", "已拒絕")
+            }
+            vibex_core::ComputerPermissionState::NotDetermined => {
+                locale::text("not asked yet", "尚未申请", "尚未申請")
+            }
+            vibex_core::ComputerPermissionState::RestartRequired => locale::text(
+                "granted, restart needed",
+                "已授权，需重启",
+                "已授權，需重新啟動",
+            ),
+            vibex_core::ComputerPermissionState::NotRequired => {
+                locale::text("not required", "无需授权", "無需授權")
+            }
+            vibex_core::ComputerPermissionState::Unknown => locale::text("unknown", "未知", "未知"),
+        }
+    };
+    format!(
+        "{} {} · {} {} · {} {}",
+        locale::text("Accessibility", "无障碍", "無障礙"),
+        name(permissions.accessibility),
+        locale::text("Screen recording", "屏幕录制", "螢幕錄製"),
+        name(permissions.screen_recording),
+        locale::text("Input", "输入", "輸入"),
+        name(permissions.input_injection),
+    )
+}
+
+/// The platform's own statement, as the capability group's leading line.
+fn computer_platform_note(availability: Option<&ComputerAvailability>) -> AnyElement {
+    let note = availability
+        .map(|availability| availability.support.note.clone())
+        .unwrap_or_else(|| {
+            locale::text(
+                "The platform's capabilities appear here once the driver has been checked.",
+                "检测驱动后，这里会显示本平台的能力范围。",
+                "偵測驅動後，這裡會顯示本平台的能力範圍。",
+            )
+            .to_string()
+        });
+    div()
         .w_full()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .children(rail)
+        .text_xs()
+        .whitespace_normal()
+        .child(SharedString::from(note))
         .into_any_element()
 }
 
-/// The one-line driver status under the buttons.
-fn computer_driver_line(status: &ComputerSettingsStatus) -> String {
-    match &status.driver {
-        DriverState::Unknown => locale::text(
-            "Not checked yet on this machine.",
-            "尚未检测本机驱动。",
-            "尚未偵測本機驅動。",
-        )
-        .to_string(),
-        DriverState::Missing => locale::text(
-            "No driver found. Press Install to fetch it, then check again.",
-            "没有找到驱动。点击“安装”获取，然后重新检测。",
-            "沒有找到驅動。按下「安裝」取得，然後重新偵測。",
-        )
-        .to_string(),
-        DriverState::Installing => locale::text(
-            "Installing. This can take a few minutes.",
-            "正在安装，可能需要几分钟。",
-            "正在安裝，可能需要幾分鐘。",
-        )
-        .to_string(),
-        DriverState::Installed { path, version } => match version {
-            Some(version) => format!(
-                "{} {} — {}",
-                locale::text("Installed", "已安装", "已安裝"),
-                version,
-                path.display()
-            ),
-            None => format!(
-                "{} — {}",
-                locale::text("Installed", "已安装", "已安裝"),
-                path.display()
-            ),
-        },
-        DriverState::InstallFailed { detail } => format!(
-            "{} {detail}",
-            locale::text("Install failed:", "安装失败：", "安裝失敗：")
-        ),
-    }
-}
-
-/// What this platform can do, for the management dialog.
-///
-/// Rows come from the platform's own capability statement, so the list is the
-/// product's claim rather than a marketing bullet: a platform that cannot do
-/// something says so where the user chooses to use it.
-struct ComputerCapability {
-    label: String,
+/// One capability line: what it is, and whether this platform does it.
+struct ComputerCapabilityRow {
+    label: &'static str,
+    detail: &'static str,
     supported: bool,
 }
 
-fn computer_capability_overview(
+/// The capability rows, grouped the way a reader would ask about them.
+///
+/// A platform that cannot do something says so here, next to the switch that
+/// would have used it, instead of leaving a user to discover it from a failing
+/// action.
+fn computer_capability_rows(
     availability: Option<&ComputerAvailability>,
-) -> Vec<ComputerCapability> {
+) -> Vec<ComputerCapabilityRow> {
     let support = availability.map(|availability| availability.support.clone());
-    let mut rows = vec![ComputerCapability {
-        label: locale::text(
-            "Read the accessibility tree and drive controls by name",
-            "读取无障碍树，按控件名称操作",
-            "讀取無障礙樹，按控件名稱操作",
-        )
-        .to_string(),
-        supported: true,
-    }];
-    rows.push(ComputerCapability {
-        label: locale::text(
-            "Enumerate and switch between application windows",
-            "枚举并切换应用窗口",
-            "列舉並切換應用視窗",
-        )
-        .to_string(),
-        supported: support
-            .as_ref()
-            .map(|support| support.window_capture)
-            .unwrap_or(true),
-    });
-    rows.push(ComputerCapability {
-        label: locale::text(
-            "Move the pointer, click and drag",
-            "移动指针、点击与拖拽",
-            "移動指標、點擊與拖曳",
-        )
-        .to_string(),
-        supported: true,
-    });
-    rows.push(ComputerCapability {
-        label: locale::text(
-            "Type text and press keys",
-            "输入文本与按键",
-            "輸入文字與按鍵",
-        )
-        .to_string(),
-        supported: true,
-    });
-    rows.push(ComputerCapability {
-        label: locale::text(
-            "Capture the screen for the panel and for image-capable Agents",
-            "为面板和具备图片能力的 Agent 截屏",
-            "為面板和具備圖片能力的 Agent 截圖",
-        )
-        .to_string(),
-        supported: support
-            .as_ref()
-            .map(|support| support.window_capture)
-            .unwrap_or(true),
-    });
-    rows.push(ComputerCapability {
-        label: locale::text(
-            "Act on a window without taking focus",
-            "在不抢焦点的情况下操作窗口",
-            "在不搶焦點的情況下操作視窗",
-        )
-        .to_string(),
-        supported: support
-            .as_ref()
-            .map(|support| support.background_input)
-            .unwrap_or(true),
-    });
-    rows.push(ComputerCapability {
-        label: locale::text(
-            "Take over the foreground when the platform requires it (always asks first)",
-            "平台不支持时临时接管前台（每次都会先询问）",
-            "平台不支援時臨時接管前景（每次都會先詢問）",
-        )
-        .to_string(),
-        supported: support
-            .as_ref()
-            .map(|support| support.foreground_escalation_available)
-            .unwrap_or(true),
-    });
-    rows
-}
-
-/// The management dialog body: policy, runtime parameters, capabilities.
-#[allow(clippy::too_many_arguments)]
-fn render_computer_management(
-    policy: vibex_core::ComputerApprovalPolicy,
-    allow_self_target: bool,
-    timeout_ms: u64,
-    capabilities: &[ComputerCapability],
-    step: ComputerSetupStep,
-    cx: &App,
-    on_policy: impl Fn(vibex_core::ComputerApprovalPolicy, &mut gpui::App) + Clone + 'static,
-    on_self_target: impl Fn(bool, &mut gpui::App) + Clone + 'static,
-    on_timeout: impl Fn(u64, &mut gpui::App) + Clone + 'static,
-) -> AnyElement {
-    let policy_control = settings_segmented_control(
-        "computer-approval-policy",
-        vec![
-            settings_segmented_option(
-                locale::text("Allow", "允许", "允許"),
-                policy == vibex_core::ComputerApprovalPolicy::Allow,
-                {
-                    let on_policy = on_policy.clone();
-                    move |_, _, cx| on_policy(vibex_core::ComputerApprovalPolicy::Allow, cx)
-                },
+    let background = support
+        .as_ref()
+        .map(|support| support.background_input)
+        .unwrap_or(true);
+    let foreground = support
+        .as_ref()
+        .map(|support| support.foreground_escalation_available)
+        .unwrap_or(true);
+    let capture = support
+        .as_ref()
+        .map(|support| support.window_capture)
+        .unwrap_or(true);
+    vec![
+        ComputerCapabilityRow {
+            label: locale::text(
+                "Read and drive controls",
+                "读取并操作控件",
+                "讀取並操作控件",
             ),
-            settings_segmented_option(
-                locale::text("Ask", "询问", "詢問"),
-                policy == vibex_core::ComputerApprovalPolicy::Ask,
-                {
-                    let on_policy = on_policy.clone();
-                    move |_, _, cx| on_policy(vibex_core::ComputerApprovalPolicy::Ask, cx)
-                },
+            detail: locale::text(
+                "The accessibility tree gives the Agent names to act on instead of pixels to guess at.",
+                "通过无障碍树按名称操作，而不是靠猜坐标。",
+                "透過無障礙樹按名稱操作，而不是靠猜座標。",
             ),
-            settings_segmented_option(
-                locale::text("Deny", "拒绝", "拒絕"),
-                policy == vibex_core::ComputerApprovalPolicy::Deny,
-                move |_, _, cx| on_policy(vibex_core::ComputerApprovalPolicy::Deny, cx),
+            supported: true,
+        },
+        ComputerCapabilityRow {
+            label: locale::text("Pointer and keyboard", "指针与键盘", "指標與鍵盤"),
+            detail: locale::text(
+                "Moving, clicking, dragging, typing and key chords.",
+                "移动、点击、拖拽、输入文本与组合键。",
+                "移動、點擊、拖曳、輸入文字與組合鍵。",
             ),
-        ],
-    );
-    let policy_row = setting_row(
-        locale::text("Tool approval", "工具审批", "工具審批"),
-        locale::text(
-            "Whether an Agent needs your approval before it acts. Password managers and secure \
-             fields are refused in every mode, and a destructive click or a foreground takeover \
-             keeps asking even under Allow — those are irreversible.",
-            "决定 Agent 操作桌面时是否需要你批准。密码管理器与安全输入框在任何模式下都会被拒绝；发送、支付、删除这类不可撤销的点击和前台接管，即使在“允许”下也仍然逐次询问。",
-            "決定 Agent 操作桌面時是否需要你批准。密碼管理器與安全輸入框在任何模式下都會被拒絕；傳送、支付、刪除這類不可撤銷的點擊和前景接管，即使在「允許」下也仍然逐次詢問。",
-        ),
-        policy_control,
-        false,
-        cx,
-    );
-    let self_row = setting_row(
-        locale::text(
-            "Allow operating Vibex itself",
-            "允许操作 Vibex 自身",
-            "允許操作 Vibex 自身",
-        ),
-        locale::text(
-            "Off by default: an Agent driving its own window is a feedback loop, and it could \
-             close the settings you are reading. Turn it on only while testing the automation \
-             against Vibex itself.",
-            "默认关闭：Agent 操作自己的窗口会形成回环，甚至可能关掉你正在看的设置。只有在用自动化测试 Vibex 自身时才建议打开。",
-            "預設關閉：Agent 操作自己的視窗會形成回環，甚至可能關掉你正在看的設定。只有在用自動化測試 Vibex 自身時才建議開啟。",
-        ),
-        Switch::new("computer-allow-self-target")
-            .small()
-            .checked(allow_self_target)
-            .on_click({
-                let on_self_target = on_self_target.clone();
-                move |enabled, _, cx| on_self_target(*enabled, cx)
-            }),
-        false,
-        cx,
-    );
-    let timeout_options: Vec<Tab> = vibex_core::COMPUTER_CALL_TIMEOUT_CHOICES_MS
-        .iter()
-        .map(|choice| {
-            settings_segmented_option(
-                SharedString::from(format!("{}s", choice / 1000)),
-                timeout_ms == *choice,
-                {
-                    let on_timeout = on_timeout.clone();
-                    let choice = *choice;
-                    move |_, _, cx| on_timeout(choice, cx)
-                },
-            )
-        })
-        .collect();
-    let timeout_row = setting_row(
-        locale::text("Call timeout", "单次调用超时", "單次呼叫逾時"),
-        locale::text(
-            "How long one desktop action may take before it is reported as a timeout. A call that \
-             never settles holds the Agent's whole turn.",
-            "单次桌面操作的最长等待时间，超过就按超时上报。一次永不返回的调用会拖住 Agent 的整个回合。",
-            "單次桌面操作的最長等待時間，超過就按逾時上報。一次永不返回的呼叫會拖住 Agent 的整個回合。",
-        ),
-        settings_segmented_control("computer-call-timeout", timeout_options),
-        false,
-        cx,
-    );
-
-    let mut capability_rows = Vec::new();
-    for capability in capabilities {
-        capability_rows.push(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(6.0))
-                        .rounded_full()
-                        .bg(if capability.supported {
-                            theme::semantic_color("primary", cx.theme().is_dark())
-                        } else {
-                            cx.theme().muted_foreground.opacity(0.4)
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if capability.supported {
-                            cx.theme().foreground
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(SharedString::from(capability.label.clone())),
-                )
-                .into_any_element(),
-        );
-    }
-
-    v_flex()
-        .w_full()
-        .gap_5()
-        .px_5()
-        .py_4()
-        .child(
-            v_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(locale::text("Safety and approval", "安全与审批", "安全與審批")),
-                )
-                .child(
-                    v_flex()
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.55))
-                        .bg(cx.theme().muted.opacity(0.35))
-                        .px_4()
-                        .py_1()
-                        .child(policy_row)
-                        .child(
-                            div()
-                                .h(px(1.0))
-                                .bg(cx.theme().border.opacity(0.5)),
-                        )
-                        .child(self_row),
-                ),
-        )
-        .child(
-            v_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(locale::text("Runtime", "运行时配置", "執行時設定")),
-                )
-                .child(
-                    v_flex()
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.55))
-                        .bg(cx.theme().muted.opacity(0.35))
-                        .px_4()
-                        .py_1()
-                        .child(timeout_row),
-                ),
-        )
-        .child(
-            v_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(locale::text("Capabilities", "能力概览", "能力概覽")),
-                )
-                .child(
-                    v_flex()
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.55))
-                        .bg(cx.theme().muted.opacity(0.35))
-                        .px_4()
-                        .py_3()
-                        .gap_2()
-                        .children(capability_rows),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .whitespace_normal()
-                .text_color(cx.theme().muted_foreground)
-                .child(match step {
-                    ComputerSetupStep::Done => locale::text(
-                        "Actions run directly on this machine and cannot be undone. Keep the \
-                         policy on Ask for everyday work.",
-                        "操作直接作用在本机且不可撤销；日常使用建议保持“询问”。",
-                        "操作直接作用在本機且不可撤銷；日常使用建議保持「詢問」。",
-                    ),
-                    _ => locale::text(
-                        "Setup is not finished yet: install the driver, grant the system \
-                         permission and turn computer use on before an Agent can act.",
-                        "设置尚未完成：请先安装驱动、完成系统授权并打开电脑操作，Agent 才能开始操作。",
-                        "設定尚未完成：請先安裝驅動、完成系統授權並開啟電腦操作，Agent 才能開始操作。",
-                    ),
-                }),
-        )
-        .into_any_element()
+            supported: true,
+        },
+        ComputerCapabilityRow {
+            label: locale::text("Screen capture", "屏幕截取", "螢幕擷取"),
+            detail: locale::text(
+                "Frames for the panel, and screenshots for Agents whose adapter forwards images.",
+                "为面板提供画面，为具备图片能力的 Agent 提供截图。",
+                "為面板提供畫面，為具備圖片能力的 Agent 提供截圖。",
+            ),
+            supported: capture,
+        },
+        ComputerCapabilityRow {
+            label: locale::text(
+                "Acting without taking focus",
+                "不抢焦点地操作",
+                "不搶焦點地操作",
+            ),
+            detail: locale::text(
+                "Whether the Agent can work in a window you are not looking at, or has to bring \
+                 it forward and ask first.",
+                "决定 Agent 能否在你没看的窗口里操作，还是必须把它切到前台并先征求同意。",
+                "決定 Agent 能否在你沒看的視窗裡操作，還是必須把它切到前景並先徵求同意。",
+            ),
+            supported: background || foreground,
+        },
+    ]
 }
 
 /// One labeled section of a settings page.
@@ -69813,13 +69604,13 @@ mod tests {
     use gpui_component::notification::Notification;
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
-        AgentMessageDeltaPayload, AgentMessagePayload, ComputerPlatform, ComputerPlatformSupport,
-        FileOperationPayload, GitChange, GitChangeKind, GitWorktreeConflictFile,
-        GitWorktreeMergeStrategy, GitWorktreeOperationDetail, GitWorktreeOperationKind,
-        MessageSubmissionId, PlanPayload, PlanStepPayload, ProviderProfileId,
-        ProviderProfileStatus, ReasoningPayload, RuntimeOptionAvailability, SessionConfigValue,
-        SessionRuntimeOption, TimelineItemId, TimelineRedactionState, TimelineSource,
-        TodoUpdatePayload, UserMessagePayload, WorkspaceId,
+        AgentMessageDeltaPayload, AgentMessagePayload, ComputerPermissionReport,
+        ComputerPermissionState, ComputerPlatform, ComputerPlatformSupport, FileOperationPayload,
+        GitChange, GitChangeKind, GitWorktreeConflictFile, GitWorktreeMergeStrategy,
+        GitWorktreeOperationDetail, GitWorktreeOperationKind, MessageSubmissionId, PlanPayload,
+        PlanStepPayload, ProviderProfileId, ProviderProfileStatus, ReasoningPayload,
+        RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeOption, TimelineItemId,
+        TimelineRedactionState, TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
     #[test]
@@ -69871,47 +69662,102 @@ mod tests {
     }
 
     #[test]
-    fn the_management_page_reports_what_the_platform_cannot_do() {
-        // Wayland without the opt-in: background input is unavailable, and the
-        // capability list has to say so rather than showing a neutral bullet.
+    fn the_capability_rows_report_what_this_platform_cannot_do() {
+        // Wayland without the opt-in cannot drive an occluded surface. The row
+        // stays supported because a foreground takeover is still possible — the
+        // honest answer is "it asks first", not "impossible" — while a platform
+        // with neither says so.
         let wayland = ComputerAvailability {
             platform: ComputerPlatform::LinuxWayland,
             support: ComputerPlatformSupport::for_platform(ComputerPlatform::LinuxWayland, false),
             ..ComputerAvailability::unavailable(ComputerUnavailableReason::FeatureDisabled, None)
         };
-        let rows = computer_capability_overview(Some(&wayland));
-        let background = rows
+        let rows = computer_capability_rows(Some(&wayland));
+        let focus = rows
             .iter()
-            .find(|row| row.label.contains("Act on a window without taking focus"))
-            .expect("the background-input row exists");
-        assert!(!background.supported, "Wayland without opt-in must say so");
-        // X11 claims it.
+            .find(|row| row.label == "Acting without taking focus")
+            .expect("the focus row exists");
+        assert!(focus.supported);
+        let no_input = ComputerAvailability {
+            platform: ComputerPlatform::Unknown,
+            support: ComputerPlatformSupport::for_platform(ComputerPlatform::Unknown, false),
+            ..ComputerAvailability::unavailable(
+                ComputerUnavailableReason::PlatformUnsupported,
+                None,
+            )
+        };
+        let rows = computer_capability_rows(Some(&no_input));
+        assert!(
+            rows.iter().any(|row| !row.supported),
+            "a platform that cannot capture or inject must say so"
+        );
+        // X11 claims every row it is offered.
         let x11 = ComputerAvailability {
             platform: ComputerPlatform::LinuxX11,
             support: ComputerPlatformSupport::for_platform(ComputerPlatform::LinuxX11, false),
             ..ComputerAvailability::unavailable(ComputerUnavailableReason::FeatureDisabled, None)
         };
-        let rows = computer_capability_overview(Some(&x11));
-        assert!(rows.iter().all(
-            |row| !row.label.contains("Act on a window without taking focus") || row.supported
-        ));
+        assert!(
+            computer_capability_rows(Some(&x11))
+                .iter()
+                .all(|row| row.supported)
+        );
+        // Without a probe nothing is claimed as unsupported.
+        assert!(
+            computer_capability_rows(None)
+                .iter()
+                .all(|row| row.supported)
+        );
     }
 
     #[test]
-    fn the_driver_line_never_claims_more_than_was_checked() {
+    fn the_permission_summary_names_all_three_states() {
+        let report = ComputerPermissionReport {
+            accessibility: ComputerPermissionState::Granted,
+            screen_recording: ComputerPermissionState::RestartRequired,
+            input_injection: ComputerPermissionState::NotRequired,
+            restart_required_after_grant: true,
+        };
+        let availability = ComputerAvailability {
+            permissions: report,
+            ..ComputerAvailability::unavailable(ComputerUnavailableReason::PermissionPending, None)
+        };
+        let summary = computer_permission_summary(Some(&availability));
+        assert!(summary.contains("granted"));
+        assert!(summary.contains("restart needed"));
+        assert!(summary.contains("not required"));
+        assert!(computer_permission_summary(None).contains("Not checked"));
+    }
+
+    #[test]
+    fn the_readiness_note_says_what_is_missing_and_nothing_more() {
         let mut status = ComputerSettingsStatus::default();
-        assert!(computer_driver_line(&status).contains("Not checked"));
+        assert!(
+            computer_readiness_note(ComputerSetupStep::InstallDriver, &status)
+                .contains("No driver")
+        );
+        status.driver = DriverState::InstallFailed {
+            detail: "curl: (7) connection refused".to_string(),
+        };
+        assert!(
+            computer_readiness_note(ComputerSetupStep::InstallDriver, &status)
+                .contains("connection refused")
+        );
         status.driver = DriverState::Installed {
             path: std::path::PathBuf::from("/usr/bin/cua-driver"),
             version: Some("0.28.0".to_string()),
         };
-        let line = computer_driver_line(&status);
-        assert!(line.contains("/usr/bin/cua-driver"));
-        assert!(line.contains("0.28.0"));
-        status.driver = DriverState::InstallFailed {
-            detail: "curl: (7) connection refused".to_string(),
-        };
-        assert!(computer_driver_line(&status).contains("connection refused"));
+        assert!(
+            computer_readiness_note(ComputerSetupStep::GrantPermission, &status)
+                .contains("operating system")
+        );
+        assert!(
+            computer_readiness_note(ComputerSetupStep::TurnOn, &status)
+                .contains("Turn computer use on")
+        );
+        let ready = computer_readiness_note(ComputerSetupStep::Done, &status);
+        assert!(ready.contains("/usr/bin/cua-driver"));
+        assert!(ready.contains("0.28.0"));
     }
 
     #[test]
