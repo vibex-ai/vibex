@@ -110,6 +110,8 @@ strings! {
     hint_revert => { "revert", "还原", "還原" },
     hint_reset => { "reset", "重置", "重設" },
     hint_confirm_delete => { "confirm delete", "确认删除", "確認刪除" },
+    // A modal that nests: `Esc` steps out one level rather than closing it.
+    hint_back => { "back", "返回", "返回" },
 
     // ---- destinations ---------------------------------------------------
     nav_sessions => { "Sessions", "会话", "工作階段" },
@@ -503,8 +505,14 @@ strings! {
     runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },
     runtime_current => { "Current", "当前", "目前" },
     runtime_unavailable => { "Unavailable", "不可用", "無法使用" },
-    // The run options the chosen Agent publishes, under the catalogue rows.
+    // The run options the chosen Agent publishes, one Tab away from the
+    // catalogue rows.
     runtime_run_options => { "Run options", "运行选项", "執行選項" },
+    runtime_no_run_options => {
+        "This Agent publishes no run options",
+        "此 Agent 没有可调整的运行选项",
+        "此 Agent 沒有可調整的執行選項"
+    },
     runtime_default => { "Default", "默认", "預設" },
     runtime_thinking_depth => { "Thinking depth", "思考深度", "思考深度" },
     runtime_conversation_mode => { "Conversation mode", "对话模式", "對話模式" },

@@ -4931,84 +4931,129 @@ fn render_overlay(
         } => {
             render_pairing(frame, area, app, code, link, *permission, theme);
         }
-        Overlay::RuntimePicker { selected } => {
+        Overlay::RuntimePicker { view, selected } => {
             let options = app
                 .runtime_options
                 .as_ref()
                 .map(|catalog| catalog.options.clone())
                 .unwrap_or_default();
             let run_options = app.run_options();
-            let choices = options.len();
-            let chrome = modal_chrome(
-                app,
-                strings.runtime_title(),
-                ModalSizing::picker(),
-                vec![
-                    ModalHint::new("↑↓", strings.hint_nav()),
-                    ModalHint::new("Enter", strings.hint_select()),
-                    ModalHint::new("Esc", strings.close()),
-                ],
-            );
+            let show_choices = *view == crate::app::RuntimePickerView::Choices;
+            let title = if show_choices {
+                strings.runtime_title().to_string()
+            } else {
+                format!(
+                    "{} · {}",
+                    strings.runtime_title(),
+                    strings.runtime_run_options()
+                )
+            };
+            // The second view is one `Tab` away, and the footer is where that
+            // is legible: a catalogue as long as the machine has models would
+            // otherwise hide the run options at its end.
+            let mut hints = vec![ModalHint::new("↑↓", strings.hint_nav())];
+            if !run_options.is_empty() {
+                hints.push(ModalHint::new(
+                    "Tab",
+                    if show_choices {
+                        strings.runtime_run_options()
+                    } else {
+                        strings.runtime_title()
+                    },
+                ));
+            }
+            hints.push(ModalHint::new("Enter", strings.hint_select()));
+            hints.push(ModalHint::new(
+                "Esc",
+                if show_choices {
+                    strings.close()
+                } else {
+                    strings.hint_back()
+                },
+            ));
+            let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
             let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
                 return;
             };
-            // One row per Agent, authentication source and model the runtime
-            // publishes. The row the session is on is marked rather than
-            // merely listed first: "which Agent am I talking to" is the
-            // question this overlay exists to answer.
-            let mut items = Vec::with_capacity(choices + run_options.len() + 1);
-            for (index, option) in options.iter().enumerate() {
-                let style = if index == *selected {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
-                let current = app.runtime_option_is_current(option);
-                let mut spans = vec![Span::styled(
-                    if current { "● " } else { "  " }.to_string(),
-                    Style::default().fg(theme.roles.accent_user),
-                )];
-                spans.push(Span::styled(
-                    format!("{:<18}", truncate_to_width(&option.agent_label, 18, "…")),
-                    if current {
-                        style.add_modifier(Modifier::BOLD)
+            let mut items = Vec::new();
+            if show_choices {
+                // One row per Agent, authentication source and model the runtime
+                // publishes. The row the session is on is marked rather than
+                // merely listed first: "which Agent am I talking to" is the
+                // question this view exists to answer.
+                for (index, option) in options.iter().enumerate() {
+                    let style = if index == *selected {
+                        theme.selected()
                     } else {
-                        style
-                    },
-                ));
-                spans.push(Span::styled(
-                    truncate_to_width(
-                        &format!("{}/{}", option.auth_source_label, option.model_label),
-                        34,
-                        "…",
-                    ),
-                    theme.muted(),
-                ));
-                if current {
-                    spans.push(Span::styled(
-                        format!("  {}", strings.runtime_current()),
+                        theme.base()
+                    };
+                    let current = app.runtime_option_is_current(option);
+                    let mut spans = vec![Span::styled(
+                        if current { "● " } else { "  " }.to_string(),
                         Style::default().fg(theme.roles.accent_user),
-                    ));
-                } else if option.availability != vibex_core::RuntimeOptionAvailability::Available {
+                    )];
                     spans.push(Span::styled(
-                        format!("  {}", strings.runtime_unavailable()),
-                        Style::default().fg(theme.roles.gray_dim),
+                        format!("{:<18}", truncate_to_width(&option.agent_label, 18, "…")),
+                        if current {
+                            style.add_modifier(Modifier::BOLD)
+                        } else {
+                            style
+                        },
                     ));
+                    spans.push(Span::styled(
+                        truncate_to_width(
+                            &format!("{}/{}", option.auth_source_label, option.model_label),
+                            34,
+                            "…",
+                        ),
+                        theme.muted(),
+                    ));
+                    if current {
+                        spans.push(Span::styled(
+                            format!("  {}", strings.runtime_current()),
+                            Style::default().fg(theme.roles.accent_user),
+                        ));
+                    } else if option.availability
+                        != vibex_core::RuntimeOptionAvailability::Available
+                    {
+                        spans.push(Span::styled(
+                            format!("  {}", strings.runtime_unavailable()),
+                            Style::default().fg(theme.roles.gray_dim),
+                        ));
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
                 }
-                items.push(ListItem::new(Line::from(spans)));
-            }
-            // The run options the chosen entry publishes, under the choices
-            // they belong to. Without them the switcher answers "which Agent"
-            // but not "how it runs", which is half of what the composer's own
-            // line promises.
-            if !run_options.is_empty() {
-                items.push(ListItem::new(Line::from(Span::styled(
-                    format!("── {} ", strings.runtime_run_options()),
-                    theme.dimmed(theme.roles.gray_dim),
-                ))));
+            } else {
+                // How the chosen entry runs, and nothing else: this view is
+                // short on purpose, so every row is reachable without scrolling.
+                // The caption names whose options these are — the point of the
+                // view is that the catalogue behind it is out of sight.
+                let (agent, model) = app.composer_runtime_labels();
+                let caption = if model.is_empty() {
+                    agent
+                } else {
+                    format!("{agent} · {model}")
+                };
+                let mut content = layout.content;
+                if content.height > 1 {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate_to_width(&caption, usize::from(content.width), "…"),
+                            theme.dimmed(theme.roles.gray),
+                        ))),
+                        Rect {
+                            height: 1,
+                            ..content
+                        },
+                    );
+                    content = Rect {
+                        y: content.y + 1,
+                        height: content.height - 1,
+                        ..content
+                    };
+                }
                 for (index, option) in run_options.iter().enumerate() {
-                    let row = choices + index;
-                    let style = if row == *selected {
+                    let style = if index == *selected {
                         theme.selected()
                     } else {
                         theme.base()
@@ -5032,16 +5077,13 @@ fn render_overlay(
                     ));
                     items.push(ListItem::new(Line::from(spans)));
                 }
+                let mut state = ratatui::widgets::ListState::default();
+                state.select(Some((*selected).min(items.len().saturating_sub(1))));
+                frame.render_stateful_widget(List::new(items), content, &mut state);
+                return;
             }
-            // The section header is a row the reader sees but cannot select, so
-            // the list cursor is the switcher row plus one past the choices.
-            let item_index = if *selected < choices || run_options.is_empty() {
-                *selected
-            } else {
-                *selected + 1
-            };
             let mut state = ratatui::widgets::ListState::default();
-            state.select(Some(item_index.min(items.len().saturating_sub(1))));
+            state.select(Some((*selected).min(items.len().saturating_sub(1))));
             frame.render_stateful_widget(List::new(items), layout.content, &mut state);
         }
         Overlay::RunOptionValues {
@@ -5054,7 +5096,7 @@ fn render_overlay(
                 vec![
                     ModalHint::new("↑↓", strings.hint_nav()),
                     ModalHint::new("Enter", strings.hint_select()),
-                    ModalHint::new("Esc", strings.close()),
+                    ModalHint::new("Esc", strings.hint_back()),
                 ],
             );
             let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {

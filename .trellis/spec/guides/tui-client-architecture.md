@@ -441,22 +441,27 @@ is never a column count.
   submits a compare-and-set switch. A backend that cannot switch runtimes gets a
   toast instead of an overlay whose Enter does nothing.
 * **An Agent is more than its model, so the switcher carries its run options.**
-  Under the catalogue rows, the picker lists what the chosen Agent publishes —
-  thinking depth, conversation mode, then its session features — read through
-  the shared `RuntimeCascadeProjection` rather than re-derived here, so all
-  three clients agree on what an Agent offers. `selected` indexes
-  `App::runtime_picker_rows()` (choices first, run options after) and the
-  section header is a row the reader sees but cannot land on. A row opens a
-  value list whose first entry is the Agent's own default (`On`/`Off` for a
-  switch, free text for a string feature, which the prompt overlay collects);
-  the value list's `Esc` steps back into the switcher on the row it came from,
-  and it carries the option with it rather than an index, so a catalogue read
-  that lands while it is open cannot move a value onto another option. Every
-  apply re-checks the value against the catalogue and re-uses
-  `Effect::SwitchRuntime` — the composing page keeps it in
-  `new_session_runtime` for the session it creates — and the composer's info
-  line names the depth and mode in effect beside the runtime, because the
-  question "what will this message be sent through" is answered there.
+  What the chosen Agent publishes — thinking depth, conversation mode, then its
+  session features — is read through the shared `RuntimeCascadeProjection`
+  rather than re-derived here, so all three clients agree on what an Agent
+  offers. It is the switcher's *second view*, not rows appended under the
+  catalogue: the catalogue is as long as the machine has models, and the run
+  options belong past the bottom of a fifty-row list only in the sense that
+  they are hidden there. `Tab`/`Shift+Tab` swap `RuntimePickerView::Choices` and
+  `RuntimePickerView::Options`, `selected` indexes the rows of whichever view is
+  up (`App::runtime_picker_row_count()`), the options view opens on a caption
+  naming whose options they are, and a view with nothing in it says so rather
+  than swallowing the key. A row opens a value list whose first entry is the
+  Agent's own default (`On`/`Off` for a switch, free text for a string feature,
+  which the prompt overlay collects); `Esc` steps out one view at a time — value
+  list, run options, catalogue, closed — and the value list carries the option
+  with it rather than an index, so a catalogue read that lands while it is open
+  cannot move a value onto another option. Every apply re-checks the value
+  against the catalogue and re-uses `Effect::SwitchRuntime` — the composing page
+  keeps it in `new_session_runtime` for the session it creates — and the
+  composer's info line names the depth and mode in effect beside the runtime,
+  because the question "what will this message be sent through" is answered
+  there.
 * Every action has a keyboard path. The mouse is an enhancement only.
 * Every page renders through the shared page frame; no page hand-rolls chrome.
 * **Every popup renders through `crate::modal`.** One chrome — border, title on

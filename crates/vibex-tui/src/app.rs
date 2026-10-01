@@ -161,17 +161,20 @@ pub enum Overlay {
     },
     /// The runtime and model picker.
     ///
-    /// `selected` indexes [`App::runtime_picker_rows`]: the catalogue's Agent,
-    /// authentication source and model rows first, then the run options the
-    /// chosen entry publishes.
-    RuntimePicker { selected: usize },
-    /// One run option's values, opened from the switcher's run-option rows.
+    /// `view` is which half of it is on screen and `selected` indexes the rows
+    /// of *that* view, so a catalogue of fifty models cannot bury the handful
+    /// of run options under it: `Tab` moves between the two.
+    RuntimePicker {
+        view: RuntimePickerView,
+        selected: usize,
+    },
+    /// One run option's values, opened from the switcher's run-option view.
     ///
     /// The option travels with the overlay rather than being looked up again by
     /// row index: a catalogue read that lands while the list is open must not
     /// put a value onto a different option.
     RunOptionValues {
-        /// The switcher row that opened it, so `Esc` steps back there.
+        /// The run-option row that opened it, so `Esc` steps back there.
         row: usize,
         selected: usize,
         option: RunOption,
@@ -313,14 +316,17 @@ impl RunOption {
     }
 }
 
-/// One row of the runtime switcher, in the order it is drawn.
+/// Which half of the runtime switcher is on screen.
+///
+/// Two views rather than one list because the catalogue is as long as the
+/// machine has models: appending the handful of run options under fifty rows
+/// of Agent/model is the same as hiding them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimePickerRow {
-    /// An entry of the runtime catalogue, by index into its `options`.
-    Choice(usize),
-    /// One of the chosen entry's run options, by index into
-    /// [`App::run_options`].
-    RunOption(usize),
+pub enum RuntimePickerView {
+    /// The catalogue: which Agent, authentication source and model.
+    Choices,
+    /// The chosen entry's run options: how that Agent runs.
+    Options,
 }
 
 /// A transient status message.
@@ -1430,18 +1436,19 @@ impl App {
         options
     }
 
-    /// The rows the runtime switcher draws, in order.
-    pub fn runtime_picker_rows(&self) -> Vec<RuntimePickerRow> {
-        let choices = self
-            .runtime_options
-            .as_ref()
-            .map(|catalog| catalog.options.len())
-            .unwrap_or(0);
-        let run_options = self.run_options().len();
-        let mut rows = Vec::with_capacity(choices + run_options);
-        rows.extend((0..choices).map(RuntimePickerRow::Choice));
-        rows.extend((0..run_options).map(RuntimePickerRow::RunOption));
-        rows
+    /// How many rows one view of the runtime switcher lists.
+    ///
+    /// The two views index their own rows: the catalogue by entry, the run
+    /// options by what the chosen entry publishes.
+    pub fn runtime_picker_row_count(&self, view: RuntimePickerView) -> usize {
+        match view {
+            RuntimePickerView::Choices => self
+                .runtime_options
+                .as_ref()
+                .map(|catalog| catalog.options.len())
+                .unwrap_or(0),
+            RuntimePickerView::Options => self.run_options().len(),
+        }
     }
 
     /// The value rows a run option's list offers: the Agent's own default

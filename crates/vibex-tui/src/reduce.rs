@@ -17,7 +17,7 @@ use vibex_core::{
 use crate::action::Intent;
 use crate::app::{
     App, Availability, Effect, Focus, ManagementRow, Overlay, Page, PromptField, RecoveryAction,
-    RunOption, RunOptionKey, RunOptionKind, RuntimePickerRow, Toast,
+    RunOption, RunOptionKey, RunOptionKind, RuntimePickerView, Toast,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
@@ -1092,13 +1092,22 @@ impl App {
         // Global escape hatches still work with an overlay open.
         match intent {
             Intent::CloseOverlay | Intent::Back => {
-                // A value list was opened *from* the switcher, so leaving it
-                // steps back into the switcher rather than dropping the whole
-                // picker and making the reader press `Ctrl+G` again.
+                // The switcher's two views nest: the run options were opened
+                // from the catalogue, and the value list from the run options,
+                // so `Esc` steps back one level at a time rather than dropping
+                // the reader out of the surface they are working in.
                 self.overlay = match self.overlay.take() {
-                    Some(Overlay::RunOptionValues { row, .. }) => {
-                        Some(Overlay::RuntimePicker { selected: row })
-                    }
+                    Some(Overlay::RunOptionValues { row, .. }) => Some(Overlay::RuntimePicker {
+                        view: RuntimePickerView::Options,
+                        selected: row,
+                    }),
+                    Some(Overlay::RuntimePicker {
+                        view: RuntimePickerView::Options,
+                        ..
+                    }) => Some(Overlay::RuntimePicker {
+                        view: RuntimePickerView::Choices,
+                        selected: self.current_runtime_option_index().unwrap_or(0),
+                    }),
                     // A cancelled text option takes its key with it, so the
                     // next prompt cannot submit a value for this one.
                     Some(Overlay::Prompt {
@@ -1236,22 +1245,34 @@ impl App {
                 _ => Outcome::quiet(),
             },
             Overlay::PairingCode { .. } => Outcome::quiet(),
-            Overlay::RuntimePicker { selected } => match intent {
+            Overlay::RuntimePicker { view, selected } => match intent {
                 Intent::ConfirmOverlay | Intent::ApprovalApprove => {
-                    self.activate_runtime_picker_row(selected)
+                    self.activate_runtime_picker_row(view, selected)
                 }
                 Intent::SelectNext => {
-                    let count = self.runtime_picker_rows().len();
+                    let count = self.runtime_picker_row_count(view);
                     self.overlay = Some(Overlay::RuntimePicker {
+                        view,
                         selected: (selected + 1) % count.max(1),
                     });
                     Outcome::effects(vec![])
                 }
                 Intent::SelectPrevious => {
                     self.overlay = Some(Overlay::RuntimePicker {
+                        view,
                         selected: selected.saturating_sub(1),
                     });
                     Outcome::effects(vec![])
+                }
+                // `Tab` is the two halves of the switcher: the catalogue, and
+                // the run options of the entry in effect. They are views rather
+                // than one list because the catalogue is as long as the machine
+                // has models.
+                Intent::OverlayNextField => {
+                    self.show_runtime_picker_view(RuntimePickerView::Options)
+                }
+                Intent::OverlayPreviousField => {
+                    self.show_runtime_picker_view(RuntimePickerView::Choices)
                 }
                 _ => Outcome::quiet(),
             },
@@ -2170,24 +2191,43 @@ impl App {
     /// session with no matching entry (a catalogue that moved under it) opens
     /// on the first row rather than on nothing.
     pub fn show_runtime_picker(&mut self) {
-        let selected = self.current_runtime_option_index().unwrap_or(0);
-        self.overlay = Some(Overlay::RuntimePicker { selected });
+        self.show_runtime_picker_view(RuntimePickerView::Choices);
+    }
+
+    /// Put one view of the switcher on screen.
+    ///
+    /// The catalogue opens on the choice the session is on; the run options
+    /// open on their first row, because which one the reader wants is not a
+    /// question the catalogue can answer. A view with nothing in it says so
+    /// rather than showing an empty box or swallowing the key.
+    pub fn show_runtime_picker_view(&mut self, view: RuntimePickerView) -> Outcome {
+        let selected = match view {
+            RuntimePickerView::Choices => self.current_runtime_option_index().unwrap_or(0),
+            RuntimePickerView::Options => 0,
+        };
+        if view == RuntimePickerView::Options && self.run_options().is_empty() {
+            self.toast(Toast::warning(
+                self.strings.runtime_no_run_options().to_string(),
+            ));
+            return Outcome::quiet();
+        }
+        self.overlay = Some(Overlay::RuntimePicker { view, selected });
+        Outcome::effects(vec![])
     }
 
     /// Act on the switcher row the reader confirmed.
     ///
-    /// A catalogue row is a runtime change and closes the picker, exactly as it
-    /// did before the run options were listed under it. A run option is about
-    /// the choice already in effect, so it opens what that option accepts
-    /// rather than closing the surface the reader is working in.
-    fn activate_runtime_picker_row(&mut self, row: usize) -> Outcome {
-        match self.runtime_picker_rows().get(row).copied() {
-            Some(RuntimePickerRow::Choice(index)) => {
+    /// A catalogue row is a runtime change and closes the picker. A run option
+    /// is about the choice already in effect, so it opens what that option
+    /// accepts rather than closing the surface the reader is working in.
+    fn activate_runtime_picker_row(&mut self, view: RuntimePickerView, row: usize) -> Outcome {
+        match view {
+            RuntimePickerView::Choices => {
                 self.overlay = None;
-                self.apply_runtime_selection(index)
+                self.apply_runtime_selection(row)
             }
-            Some(RuntimePickerRow::RunOption(index)) => {
-                let Some(option) = self.run_options().into_iter().nth(index) else {
+            RuntimePickerView::Options => {
+                let Some(option) = self.run_options().into_iter().nth(row) else {
                     return Outcome::quiet();
                 };
                 match option.kind {
@@ -2209,7 +2249,6 @@ impl App {
                     }
                 }
             }
-            None => Outcome::quiet(),
         }
     }
 
@@ -3049,7 +3088,13 @@ mod tests {
                 actionable_error: None,
             });
         app.show_runtime_picker();
-        assert_eq!(app.overlay, Some(Overlay::RuntimePicker { selected: 1 }));
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: 1
+            })
+        );
     }
 
     #[test]
@@ -3143,7 +3188,13 @@ mod tests {
             outcome.effects.is_empty(),
             "the catalogue was already loaded"
         );
-        assert_eq!(app.overlay, Some(Overlay::RuntimePicker { selected: 1 }));
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: 1
+            })
+        );
         assert!(app.runtime_option_is_current(&app.runtime_options.as_ref().unwrap().options[1]));
 
         // Choosing the unavailable entry refuses instead of issuing a switch
@@ -3152,7 +3203,10 @@ mod tests {
         assert!(refused.effects.is_empty());
 
         // Choosing the available one asks for exactly that selection.
-        app.overlay = Some(Overlay::RuntimePicker { selected: 0 });
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: 0,
+        });
         let switched = app.perform(Intent::ConfirmOverlay);
         let [
             Effect::SwitchRuntime {
@@ -3272,22 +3326,37 @@ mod tests {
     }
 
     #[test]
-    fn the_switcher_lists_the_run_options_the_chosen_agent_publishes() {
-        // The composer promises the Agent's run options; the switcher is where
-        // they are read. They follow the catalogue rows so the Agent is still
-        // the first question the surface asks.
-        let app = app_with_run_options(Page::Agent);
+    fn the_switcher_publishes_run_options_as_a_view_of_their_own() {
+        // A catalogue is as long as the machine has models, so the run options
+        // cannot be appended under it: they are the switcher's second view, and
+        // `Tab` is what moves between them.
+        let mut app = app_with_run_options(Page::Agent);
+        assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Choices), 2);
+        assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Options), 4);
+
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: 1,
+        });
+        let outcome = app.perform(Intent::OverlayNextField);
+        assert!(outcome.effects.is_empty(), "{outcome:?}");
         assert_eq!(
-            app.runtime_picker_rows(),
-            vec![
-                RuntimePickerRow::Choice(0),
-                RuntimePickerRow::Choice(1),
-                RuntimePickerRow::RunOption(0),
-                RuntimePickerRow::RunOption(1),
-                RuntimePickerRow::RunOption(2),
-                RuntimePickerRow::RunOption(3),
-            ]
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Options,
+                selected: 0,
+            })
         );
+        // And back, on the entry the page is on rather than on row 0.
+        app.perform(Intent::OverlayPreviousField);
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: 1,
+            })
+        );
+
         let options = app.run_options();
         assert_eq!(
             options.iter().map(|o| o.key.clone()).collect::<Vec<_>>(),
@@ -3315,6 +3384,39 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_with_nothing_to_tune_says_so_rather_than_showing_an_empty_view() {
+        let mut app = capable_app();
+        app.navigate_to(Page::Agent);
+        app.live = crate::app::LiveState::Ready;
+        // The first entry publishes no run options at all.
+        let catalog = run_option_catalog();
+        let desired = catalog.options[0].selection.clone();
+        app.runtime_options = Some(catalog);
+        session_on(&mut app, desired);
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: 0,
+        });
+
+        let outcome = app.perform(Intent::OverlayNextField);
+        assert!(outcome.effects.is_empty());
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: 0,
+            }),
+            "an empty run-option view was shown"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text == app.strings.runtime_no_run_options()),
+            "the key was swallowed without saying why"
+        );
+    }
+
+    #[test]
     fn a_session_gets_the_run_option_it_chooses_as_a_runtime_switch() {
         let mut app = app_with_run_options(Page::Agent);
         let agent_id = app.runtime_options.as_ref().expect("catalogue").options[1]
@@ -3322,16 +3424,18 @@ mod tests {
             .agent_id
             .clone();
 
-        // The catalogue row is row 1, so thinking depth is the row after the
-        // two choices.
-        app.overlay = Some(Overlay::RuntimePicker { selected: 2 });
+        // Thinking depth is the first row of the run-option view.
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 0,
+        });
         let opened = app.perform(Intent::ConfirmOverlay);
         assert!(
             opened.effects.is_empty(),
             "opening a value list issued work: {opened:?}"
         );
         let Some(Overlay::RunOptionValues {
-            row: 2,
+            row: 0,
             selected: 0,
             option,
         }) = app.overlay.clone()
@@ -3372,7 +3476,10 @@ mod tests {
         app.runtime_options = Some(catalog);
         session_on(&mut app, desired);
 
-        app.overlay = Some(Overlay::RuntimePicker { selected: 2 });
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 0,
+        });
         app.perform(Intent::ConfirmOverlay);
         // The list opens on the value in effect, so `Default` is two steps up.
         let Some(Overlay::RunOptionValues { selected: 2, .. }) = app.overlay.clone() else {
@@ -3390,8 +3497,11 @@ mod tests {
     fn a_toggle_run_option_is_offered_as_on_and_off() {
         let mut app = app_with_run_options(Page::Agent);
 
-        // Web search is the third run option, so it sits on row 4.
-        app.overlay = Some(Overlay::RuntimePicker { selected: 4 });
+        // Web search is the third run option.
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 2,
+        });
         app.perform(Intent::ConfirmOverlay);
         let Some(Overlay::RunOptionValues { option, .. }) = app.overlay.clone() else {
             panic!("the toggle did not open a value list: {:?}", app.overlay);
@@ -3423,9 +3533,12 @@ mod tests {
     fn a_free_text_run_option_is_applied_through_the_prompt() {
         let mut app = app_with_run_options(Page::Agent);
 
-        // Notes is the fourth run option, so it sits on row 5, and it has no
-        // value list: it asks for one.
-        app.overlay = Some(Overlay::RuntimePicker { selected: 5 });
+        // Notes is the fourth run option, and it has no value list: it asks for
+        // one.
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 3,
+        });
         let opened = app.perform(Intent::ConfirmOverlay);
         assert!(opened.effects.is_empty());
         assert_eq!(
@@ -3463,15 +3576,34 @@ mod tests {
     fn escape_from_a_value_list_returns_to_the_switcher_row() {
         let mut app = app_with_run_options(Page::Agent);
 
-        app.overlay = Some(Overlay::RuntimePicker { selected: 3 });
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 1,
+        });
         app.perform(Intent::ConfirmOverlay);
         assert!(matches!(
             app.overlay,
-            Some(Overlay::RunOptionValues { row: 3, .. })
+            Some(Overlay::RunOptionValues { row: 1, .. })
         ));
         app.perform(Intent::Back);
-        assert_eq!(app.overlay, Some(Overlay::RuntimePicker { selected: 3 }));
-        // And the switcher itself still closes.
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Options,
+                selected: 1,
+            })
+        );
+        // The run-option view steps back into the catalogue, on the entry the
+        // session is on rather than on nothing.
+        app.perform(Intent::Back);
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: 1,
+            })
+        );
+        // And the catalogue still closes.
         app.perform(Intent::Back);
         assert_eq!(app.overlay, None);
     }
@@ -3484,10 +3616,13 @@ mod tests {
             .agent_id
             .clone();
 
-        // The catalogue row is row 1, so conversation mode is row 3. The modes
-        // are listed in the catalogue's own order — `Pair` before `Plan` —
-        // after the default row.
-        app.overlay = Some(Overlay::RuntimePicker { selected: 3 });
+        // Conversation mode is the second run option. The modes are listed in
+        // the catalogue's own order — `Pair` before `Plan` — after the default
+        // row.
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 1,
+        });
         app.perform(Intent::ConfirmOverlay);
         let Some(Overlay::RunOptionValues { option, .. }) = app.overlay.clone() else {
             panic!("the mode list did not open: {:?}", app.overlay);

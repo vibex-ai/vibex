@@ -476,10 +476,11 @@ fn open_session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) 
 }
 
 #[test]
-fn the_runtime_switcher_lists_the_run_options_the_agent_publishes() {
+fn the_switcher_keeps_the_run_options_one_key_away_from_the_catalogue() {
     // Picking an Agent is only half of "what will this message be sent
-    // through": the run options the Agent publishes belong in the same surface,
-    // under the choices they belong to.
+    // through". The run options are the switcher's second view rather than rows
+    // appended under the catalogue: this catalogue is short, but a machine with
+    // fifty models would push them past the bottom of the list.
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -489,6 +490,21 @@ fn the_runtime_switcher_lists_the_run_options_the_agent_publishes() {
     open_session_on(&mut app, desired);
     app.show_runtime_picker();
 
+    // The catalogue view answers "which Agent", and says how to reach the rest.
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("codex"), "{screen}");
+    assert!(
+        screen.contains("Tab") && screen.contains("Run options"),
+        "the switcher does not advertise its second view:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thinking depth"),
+        "the catalogue view mixes in the run options:\n{screen}"
+    );
+
+    // One `Tab` and the run options are the whole list, reachable without
+    // scrolling past the catalogue.
+    app.perform(vibex_tui::action::Intent::OverlayNextField);
     let screen = text(&render(&mut app, 120, 40));
     for expected in [
         "Run options",
@@ -500,9 +516,45 @@ fn the_runtime_switcher_lists_the_run_options_the_agent_publishes() {
     ] {
         assert!(
             screen.contains(expected),
-            "the switcher does not offer {expected:?}:\n{screen}"
+            "the run-option view does not offer {expected:?}:\n{screen}"
         );
     }
+    assert!(
+        !screen.contains("claude-sonnet"),
+        "the run-option view still lists the catalogue:\n{screen}"
+    );
+}
+
+#[test]
+fn a_long_catalogue_does_not_bury_the_run_options() {
+    // The case that made the appended-list design useless: forty models on
+    // screen, and the handful of run options past the bottom of them.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let mut catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    let model = vibex_core::RuntimeModelSelection::explicit("gpt-5");
+    for index in 0..40 {
+        let mut extra = catalog.options[1].clone();
+        extra.model_label = format!("gpt-5-{index}");
+        extra.selection.model = model.clone();
+        catalog.options.push(extra);
+    }
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+    app.show_runtime_picker();
+    app.perform(vibex_tui::action::Intent::OverlayNextField);
+
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Thinking depth") && screen.contains("Conversation mode"),
+        "the run options are still under the catalogue:\n{screen}"
+    );
+    assert!(
+        !screen.contains("gpt-5-39"),
+        "the run-option view drew catalogue rows:\n{screen}"
+    );
 }
 
 #[test]
@@ -517,12 +569,15 @@ fn a_run_option_offers_the_agents_own_default_and_what_it_accepts() {
     app.show_runtime_picker();
 
     // Confirm the thinking-depth row, which lists what the Agent accepts.
-    app.overlay = Some(vibex_tui::app::Overlay::RuntimePicker { selected: 2 });
+    app.overlay = Some(vibex_tui::app::Overlay::RuntimePicker {
+        view: vibex_tui::app::RuntimePickerView::Options,
+        selected: 0,
+    });
     let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     assert!(outcome.effects.is_empty(), "{outcome:?}");
     assert!(matches!(
         app.overlay,
-        Some(vibex_tui::app::Overlay::RunOptionValues { row: 2, .. })
+        Some(vibex_tui::app::Overlay::RunOptionValues { row: 0, .. })
     ));
 
     let screen = text(&render(&mut app, 120, 40));
