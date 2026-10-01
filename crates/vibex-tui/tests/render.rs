@@ -395,6 +395,178 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
     );
 }
 
+/// A catalogue whose second entry publishes run options: a thinking ladder, a
+/// conversation mode, and a switch.
+fn run_option_catalog() -> vibex_core::SessionRuntimeOptionCatalog {
+    let value = |value: &str, label: &str| vibex_core::SessionConfigValue {
+        value: value.to_string(),
+        label: (!label.is_empty()).then(|| label.to_string()),
+    };
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bal".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let mut codex = option("codex", "gpt-5");
+    codex.reasoning_efforts = vec![value("low", "Low"), value("high", "High")];
+    codex.modes = vec![value("plan", "Plan")];
+    codex.features = vec![vibex_core::SessionRuntimeFeature {
+        id: "web_search".to_string(),
+        label: "Web search".to_string(),
+        description: None,
+        kind: vibex_core::SessionRuntimeFeatureKind::Toggle,
+        current_value: Some(value("false", "")),
+        default_value: Some(value("false", "")),
+        values: Vec::new(),
+    }];
+    vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![option("claude", "claude-sonnet"), codex],
+    }
+}
+
+/// Put the open session on `desired`, as the runtime reports it.
+fn open_session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) {
+    let session_id = vibex_core::VibexSessionId::new();
+    app.agent
+        .state
+        .active_session
+        .resolve(vibex_core::AgentSession {
+            id: session_id.clone(),
+            title: "a session".to_string(),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-render-workspace".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: desired.agent_id.clone(),
+            state: vibex_core::AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_message_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        });
+    app.agent.state.selected_session_id = Some(session_id);
+    app.agent
+        .state
+        .runtime_selection
+        .resolve(vibex_core::AgentSessionRuntimeSelectionState {
+            desired: desired.clone(),
+            effective: desired,
+            status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+            session_revision: 1,
+            selection_revision: 1,
+            current_binding_id: None,
+            activation_generation: 1,
+            pending_switch_id: None,
+            actionable_error: None,
+        });
+}
+
+#[test]
+fn the_runtime_switcher_lists_the_run_options_the_agent_publishes() {
+    // Picking an Agent is only half of "what will this message be sent
+    // through": the run options the Agent publishes belong in the same surface,
+    // under the choices they belong to.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+    app.show_runtime_picker();
+
+    let screen = text(&render(&mut app, 120, 40));
+    for expected in [
+        "Run options",
+        "Thinking depth",
+        "Conversation mode",
+        "Web search",
+        // The values in effect, named rather than left to the wire's words.
+        "Off",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "the switcher does not offer {expected:?}:\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn a_run_option_offers_the_agents_own_default_and_what_it_accepts() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+    app.show_runtime_picker();
+
+    // Confirm the thinking-depth row, which lists what the Agent accepts.
+    app.overlay = Some(vibex_tui::app::Overlay::RuntimePicker { selected: 2 });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    assert!(outcome.effects.is_empty(), "{outcome:?}");
+    assert!(matches!(
+        app.overlay,
+        Some(vibex_tui::app::Overlay::RunOptionValues { row: 2, .. })
+    ));
+
+    let screen = text(&render(&mut app, 120, 40));
+    for expected in ["Thinking depth", "Default", "Low", "High", "Current"] {
+        assert!(
+            screen.contains(expected),
+            "the value list does not offer {expected:?}:\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn the_prompt_names_the_run_options_the_session_is_on() {
+    // The values the reader set ride beside the runtime they belong to, so
+    // "how will this message be sent" is answered from the composer itself.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let catalog = run_option_catalog();
+    let mut desired = catalog.options[1].selection.clone();
+    desired.reasoning_effort = Some("high".to_string());
+    desired.mode_id = Some("plan".to_string());
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    let info_row = lines
+        .iter()
+        .find(|line| line.contains("Ctrl+G"))
+        .expect("the info line is on screen");
+    assert!(
+        info_row.contains("codex · bal/gpt-5 · High · Plan · Ctrl+G"),
+        "the info line does not name the run options in effect: {info_row:?}"
+    );
+    // A feature stays in the switcher: the line carries the shape of the
+    // message, not every setting behind it.
+    assert!(
+        !info_row.contains("Web search"),
+        "the info line grew a feature list: {info_row:?}"
+    );
+    assert!(!screen.is_empty());
+}
+
 #[test]
 fn the_settings_page_lists_theme_language_and_keys() {
     let mut app = app(120, 40);

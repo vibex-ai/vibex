@@ -108,7 +108,7 @@ intents! {
     NextPanel => { scope: Agent, id: "panel_next", label: "Next panel", help: "Move to the next workbench panel." },
     OpenChanges => { scope: Agent, id: "open_changes", label: "Changes", help: "Open the Git workbench for this session." },
     OpenFiles => { scope: Agent, id: "open_files", label: "Files", help: "Open the file tree for this session." },
-    SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: "Runtime", help: "Choose the Agent runtime and model for this session." },
+    SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: "Runtime", help: "Choose the Agent, its model and the run options it publishes." },
     ProbeAgentRuntime => { scope: Agent, id: "runtime_probe", label: "Probe", help: "Ask the runtime to re-discover available Agents." },
     BeginTranscriptSearch => { scope: Agent, id: "transcript_search", label: "Find", help: "Search the transcript with a regular expression." },
     ToggleDock => { scope: Agent, id: "dock_toggle", label: "Dock", help: "Show or hide the panel of running agents, the plan and held messages." },

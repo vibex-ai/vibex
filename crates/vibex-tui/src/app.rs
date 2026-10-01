@@ -160,7 +160,22 @@ pub enum Overlay {
         permission: RemoteDevicePermissionLevel,
     },
     /// The runtime and model picker.
+    ///
+    /// `selected` indexes [`App::runtime_picker_rows`]: the catalogue's Agent,
+    /// authentication source and model rows first, then the run options the
+    /// chosen entry publishes.
     RuntimePicker { selected: usize },
+    /// One run option's values, opened from the switcher's run-option rows.
+    ///
+    /// The option travels with the overlay rather than being looked up again by
+    /// row index: a catalogue read that lands while the list is open must not
+    /// put a value onto a different option.
+    RunOptionValues {
+        /// The switcher row that opened it, so `Esc` steps back there.
+        row: usize,
+        selected: usize,
+        option: RunOption,
+    },
     /// The directory the next session will work in.
     ///
     /// A picker rather than a text field: the reader is choosing a directory
@@ -206,6 +221,106 @@ pub enum PromptField {
     RestoreBackupId,
     WorktreeBranch,
     ImagePath,
+    /// A run option the Agent publishes as free text rather than as a list.
+    RunOptionValue,
+}
+
+/// Which run option a row of the switcher, or a value list, is about.
+///
+/// The Agent's own vocabulary is kept in [`RunOptionKey::Feature`]: the id is
+/// what travels back to the runtime, never a label.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RunOptionKey {
+    /// How deep the Agent thinks before it answers.
+    ReasoningEffort,
+    /// The Agent's conversation mode.
+    Mode,
+    /// A provider-neutral session feature the Agent advertises.
+    Feature(String),
+}
+
+/// How the reader picks a run option's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOptionKind {
+    /// One of the listed values, chosen from a value list.
+    Choice,
+    /// On or off.
+    Toggle,
+    /// Free text, typed into the prompt overlay.
+    Text,
+}
+
+/// A catalogue value as words: its label when it has one, its wire value
+/// otherwise.
+fn session_config_value_label(value: &vibex_core::SessionConfigValue) -> String {
+    value
+        .label
+        .clone()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| value.value.clone())
+}
+
+/// One run option the selected Agent publishes.
+///
+/// This is the client's view of the Agent's session configuration: what the
+/// option is called, what it accepts, and what the page's selection currently
+/// asks for. The two value fields are deliberately distinct — `explicit` is
+/// what would be sent, `resolved` is what is in effect — because an Agent that
+/// publishes a current value is describing itself, not an override the reader
+/// made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOption {
+    pub key: RunOptionKey,
+    pub label: String,
+    pub description: Option<String>,
+    pub kind: RunOptionKind,
+    /// The values the option accepts, in the catalogue's order. Empty for a
+    /// [`RunOptionKind::Text`] option.
+    pub values: Vec<vibex_core::SessionConfigValue>,
+    /// What the selection explicitly asks for; `None` is the Agent's own
+    /// default, which is the value list's first row.
+    pub explicit: Option<String>,
+    /// The value in effect: for a feature with no override, what the Agent
+    /// published.
+    pub resolved: Option<vibex_core::SessionConfigValue>,
+}
+
+impl RunOption {
+    /// The value in effect, as words, with the default for nothing set.
+    pub fn resolved_label(&self, default_label: &str) -> String {
+        self.resolved
+            .as_ref()
+            .map(|value| {
+                value
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| value.value.clone())
+                    .trim()
+                    .to_string()
+            })
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| default_label.to_string())
+    }
+
+    /// Whether the selection overrides the Agent's own value.
+    pub const fn is_explicit(&self) -> bool {
+        self.explicit.is_some()
+    }
+
+    /// Whether one value list row is the one the selection is on.
+    pub fn is_selected_value(&self, value: Option<&str>) -> bool {
+        self.explicit.as_deref() == value
+    }
+}
+
+/// One row of the runtime switcher, in the order it is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePickerRow {
+    /// An entry of the runtime catalogue, by index into its `options`.
+    Choice(usize),
+    /// One of the chosen entry's run options, by index into
+    /// [`App::run_options`].
+    RunOption(usize),
 }
 
 /// A transient status message.
@@ -563,6 +678,11 @@ pub struct App {
     /// The Agent and model chosen on the composing page, before there is a
     /// session to move. It is the runtime the session is *created* with.
     pub new_session_runtime: Option<vibex_core::SessionRuntimeSelection>,
+    /// The free-text run option the open prompt is editing.
+    ///
+    /// A text option's value belongs to a key the prompt overlay cannot carry,
+    /// so the key waits here for the one submission the prompt can make.
+    pub run_option_prompt: Option<RunOptionKey>,
     /// In-progress elicitation answers.
     pub elicitation_draft: crate::reduce::ElicitationDraft,
     /// Whether the usage page shows this session or the aggregate.
@@ -977,6 +1097,7 @@ impl App {
             workspace_path: None,
             pending_new_session: None,
             new_session_runtime: None,
+            run_option_prompt: None,
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
             usage_scope_session: true,
             session_cards: std::collections::BTreeSet::new(),
@@ -1143,6 +1264,239 @@ impl App {
             .options
             .iter()
             .position(|option| self.runtime_option_is_current(option))
+    }
+
+    /// The catalogue entry a selection belongs to, when the catalogue holds it.
+    pub fn runtime_option_for(
+        &self,
+        selection: &vibex_core::SessionRuntimeSelection,
+    ) -> Option<&vibex_core::SessionRuntimeOption> {
+        self.runtime_options
+            .as_ref()?
+            .options
+            .iter()
+            .find(|option| {
+                option.selection.agent_id == selection.agent_id
+                    && option.selection.auth_source == selection.auth_source
+                    && option.selection.model == selection.model
+            })
+    }
+
+    /// The first catalogue entry a session may be created or switched on.
+    fn default_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
+        self.runtime_options
+            .as_ref()?
+            .options
+            .iter()
+            .find(|option| option.availability == vibex_core::RuntimeOptionAvailability::Available)
+            .map(|option| option.selection.clone())
+    }
+
+    /// Whether the page answers for a session that does not exist yet.
+    ///
+    /// The composing page keeps the client's session *selected* — leaving the
+    /// page has to return there — so anything that asks "which session?" while
+    /// it is up answers with the session behind the page rather than with what
+    /// the reader is writing. Reading a runtime choice, and applying one, both
+    /// have to ask the *page* first.
+    pub fn page_is_composing(&self) -> bool {
+        self.page == Page::NewSession || self.active_session().is_none()
+    }
+
+    /// The runtime selection this page's next message would go through.
+    ///
+    /// The composing page answers with the choice it is holding — falling back
+    /// to the catalogue's first available entry, which is what
+    /// [`Effect::CreateSession`] uses when the page chose nothing — while an
+    /// open session answers with its own durable desired selection. A session
+    /// whose runtime has never been activated has no selection to read, so it
+    /// gets none rather than the catalogue's first entry, which would offer
+    /// another Agent's options over it.
+    pub fn page_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
+        if self.page_is_composing() {
+            return self
+                .new_session_runtime
+                .clone()
+                .or_else(|| self.default_runtime_selection());
+        }
+        self.session_runtime_selection().cloned()
+    }
+
+    /// The run options the page's selected Agent publishes.
+    ///
+    /// The catalogue is the authority: a selection the catalogue does not hold
+    /// (an Agent that has since gone away) yields no options rather than a
+    /// guess. Order is the Agent's own — thinking depth, conversation mode,
+    /// then the session features — and it is what both the switcher and the
+    /// value lists index.
+    pub fn run_options(&self) -> Vec<RunOption> {
+        let Some(selection) = self.page_runtime_selection() else {
+            return Vec::new();
+        };
+        let Some(catalog) = self.runtime_options.as_ref() else {
+            return Vec::new();
+        };
+        let projection =
+            vibex_desktop_model::RuntimeCascadeProjection::from_catalog(catalog, &selection);
+        let mut options = Vec::new();
+        if !projection.reasoning_efforts.is_empty() {
+            options.push(RunOption {
+                key: RunOptionKey::ReasoningEffort,
+                label: self.strings.runtime_thinking_depth().to_string(),
+                description: None,
+                kind: RunOptionKind::Choice,
+                values: projection
+                    .reasoning_efforts
+                    .iter()
+                    .map(|choice| vibex_core::SessionConfigValue {
+                        value: choice.value.clone(),
+                        label: Some(choice.label.clone()),
+                    })
+                    .collect(),
+                explicit: selection.reasoning_effort.clone(),
+                resolved: selection.reasoning_effort.as_ref().map(|effort| {
+                    vibex_core::SessionConfigValue {
+                        value: effort.clone(),
+                        label: projection
+                            .reasoning_efforts
+                            .iter()
+                            .find(|choice| &choice.value == effort)
+                            .map(|choice| choice.label.clone()),
+                    }
+                }),
+            });
+        }
+        if !projection.modes.is_empty() {
+            options.push(RunOption {
+                key: RunOptionKey::Mode,
+                label: self.strings.runtime_conversation_mode().to_string(),
+                description: None,
+                kind: RunOptionKind::Choice,
+                values: projection
+                    .modes
+                    .iter()
+                    .map(|choice| vibex_core::SessionConfigValue {
+                        value: choice.value.clone(),
+                        label: Some(choice.label.clone()),
+                    })
+                    .collect(),
+                explicit: selection.mode_id.clone(),
+                resolved: selection
+                    .mode_id
+                    .as_ref()
+                    .map(|mode| vibex_core::SessionConfigValue {
+                        value: mode.clone(),
+                        label: projection
+                            .modes
+                            .iter()
+                            .find(|choice| &choice.value == mode)
+                            .map(|choice| choice.label.clone()),
+                    }),
+            });
+        }
+        for feature in projection.features {
+            let kind = match feature.kind {
+                vibex_core::SessionRuntimeFeatureKind::String => RunOptionKind::Text,
+                vibex_core::SessionRuntimeFeatureKind::Toggle => RunOptionKind::Toggle,
+                vibex_core::SessionRuntimeFeatureKind::Select => RunOptionKind::Choice,
+            };
+            let resolved = feature.value_for(&selection.config_values);
+            // A switch reads as a state, not as the wire's `true`: the row is
+            // the reader's only view of a value the Agent published as a word.
+            let resolved = match (kind, resolved) {
+                (RunOptionKind::Toggle, Some(value)) => {
+                    let label = match value.value.as_str() {
+                        "true" => Some(self.strings.runtime_on().to_string()),
+                        "false" => Some(self.strings.runtime_off().to_string()),
+                        _ => value.label.clone(),
+                    };
+                    Some(vibex_core::SessionConfigValue {
+                        value: value.value,
+                        label,
+                    })
+                }
+                (_, resolved) => resolved,
+            };
+            options.push(RunOption {
+                key: RunOptionKey::Feature(feature.id.clone()),
+                label: feature.label.clone(),
+                description: feature.description.clone(),
+                kind,
+                values: feature.values.clone(),
+                explicit: selection.config_values.get(&feature.id).cloned(),
+                resolved,
+            });
+        }
+        options
+    }
+
+    /// The rows the runtime switcher draws, in order.
+    pub fn runtime_picker_rows(&self) -> Vec<RuntimePickerRow> {
+        let choices = self
+            .runtime_options
+            .as_ref()
+            .map(|catalog| catalog.options.len())
+            .unwrap_or(0);
+        let run_options = self.run_options().len();
+        let mut rows = Vec::with_capacity(choices + run_options);
+        rows.extend((0..choices).map(RuntimePickerRow::Choice));
+        rows.extend((0..run_options).map(RuntimePickerRow::RunOption));
+        rows
+    }
+
+    /// The value rows a run option's list offers: the Agent's own default
+    /// first, then what the option accepts.
+    ///
+    /// A toggle is spelled as its two states rather than as a bare `true` and
+    /// `false`, and a value in effect that the catalogue stopped publishing
+    /// keeps its row, so "which value am I on" stays answerable.
+    pub fn run_option_choices(&self, option: &RunOption) -> Vec<(Option<String>, String)> {
+        let mut rows = vec![(None, self.strings.runtime_default().to_string())];
+        match option.kind {
+            RunOptionKind::Toggle => {
+                rows.push((
+                    Some("true".to_string()),
+                    self.strings.runtime_on().to_string(),
+                ));
+                rows.push((
+                    Some("false".to_string()),
+                    self.strings.runtime_off().to_string(),
+                ));
+            }
+            RunOptionKind::Choice | RunOptionKind::Text => {
+                for value in &option.values {
+                    rows.push((Some(value.value.clone()), session_config_value_label(value)));
+                }
+            }
+        }
+        if let Some(explicit) = option.explicit.as_deref()
+            && !rows
+                .iter()
+                .any(|(value, _)| value.as_deref() == Some(explicit))
+        {
+            rows.push((Some(explicit.to_string()), explicit.to_string()));
+        }
+        rows
+    }
+
+    /// The run options the composer's info line names: how deep the Agent
+    /// thinks and which conversation mode it is in, when the selection asks for
+    /// either.
+    ///
+    /// The Agent's own features stay in the switcher: the info line has room
+    /// for the shape of the message about to be written, not for a list of
+    /// every setting behind it.
+    pub fn composer_run_option_labels(&self) -> Vec<String> {
+        self.run_options()
+            .into_iter()
+            .filter(|option| {
+                matches!(
+                    option.key,
+                    RunOptionKey::ReasoningEffort | RunOptionKey::Mode
+                ) && option.is_explicit()
+            })
+            .map(|option| option.resolved_label(self.strings.runtime_default()))
+            .collect()
     }
 
     /// The Agent and model a message from this page will be sent through.

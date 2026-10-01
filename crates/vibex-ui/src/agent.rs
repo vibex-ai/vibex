@@ -361,7 +361,10 @@ impl AgentWorkflowState {
             return true;
         }
         !matches!(
-            self.active_session.value.as_ref().map(|session| session.state),
+            self.active_session
+                .value
+                .as_ref()
+                .map(|session| session.state),
             Some(
                 AgentSessionState::Idle
                     | AgentSessionState::Error

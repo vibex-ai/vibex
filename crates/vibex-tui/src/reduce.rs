@@ -17,7 +17,7 @@ use vibex_core::{
 use crate::action::Intent;
 use crate::app::{
     App, Availability, Effect, Focus, ManagementRow, Overlay, Page, PromptField, RecoveryAction,
-    Toast,
+    RunOption, RunOptionKey, RunOptionKind, RuntimePickerRow, Toast,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
@@ -1092,7 +1092,24 @@ impl App {
         // Global escape hatches still work with an overlay open.
         match intent {
             Intent::CloseOverlay | Intent::Back => {
-                self.overlay = None;
+                // A value list was opened *from* the switcher, so leaving it
+                // steps back into the switcher rather than dropping the whole
+                // picker and making the reader press `Ctrl+G` again.
+                self.overlay = match self.overlay.take() {
+                    Some(Overlay::RunOptionValues { row, .. }) => {
+                        Some(Overlay::RuntimePicker { selected: row })
+                    }
+                    // A cancelled text option takes its key with it, so the
+                    // next prompt cannot submit a value for this one.
+                    Some(Overlay::Prompt {
+                        field: PromptField::RunOptionValue,
+                        ..
+                    }) => {
+                        self.run_option_prompt = None;
+                        None
+                    }
+                    _ => None,
+                };
                 return Outcome::effects(vec![]);
             }
             Intent::RequestQuit => return self.confirm_quit(),
@@ -1221,11 +1238,10 @@ impl App {
             Overlay::PairingCode { .. } => Outcome::quiet(),
             Overlay::RuntimePicker { selected } => match intent {
                 Intent::ConfirmOverlay | Intent::ApprovalApprove => {
-                    self.overlay = None;
-                    self.apply_runtime_selection(selected)
+                    self.activate_runtime_picker_row(selected)
                 }
                 Intent::SelectNext => {
-                    let count = self.runtime_option_count();
+                    let count = self.runtime_picker_rows().len();
                     self.overlay = Some(Overlay::RuntimePicker {
                         selected: (selected + 1) % count.max(1),
                     });
@@ -1234,6 +1250,39 @@ impl App {
                 Intent::SelectPrevious => {
                     self.overlay = Some(Overlay::RuntimePicker {
                         selected: selected.saturating_sub(1),
+                    });
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::RunOptionValues {
+                row,
+                selected,
+                option,
+            } => match intent {
+                Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                    let choices = self.run_option_choices(&option);
+                    let Some((value, _)) = choices.get(selected) else {
+                        return Outcome::quiet();
+                    };
+                    let value = value.clone();
+                    self.overlay = None;
+                    self.apply_run_option(&option.key, value)
+                }
+                Intent::SelectNext => {
+                    let count = self.run_option_choices(&option).len();
+                    self.overlay = Some(Overlay::RunOptionValues {
+                        row,
+                        selected: (selected + 1) % count.max(1),
+                        option,
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::SelectPrevious => {
+                    self.overlay = Some(Overlay::RunOptionValues {
+                        row,
+                        selected: selected.saturating_sub(1),
+                        option,
                     });
                     Outcome::effects(vec![])
                 }
@@ -1567,6 +1616,20 @@ impl App {
                     BackendOperation::RecoveryBackupRestore,
                     Effect::RestoreBackup { backup_id: trimmed },
                 )
+            }
+            PromptField::RunOptionValue => {
+                // The key rode along with the prompt; taking it here is what
+                // makes a stale submission impossible.
+                let Some(key) = self.run_option_prompt.take() else {
+                    return Outcome::quiet();
+                };
+                if trimmed.is_empty() {
+                    self.toast(Toast::warning(
+                        self.strings.runtime_option_required().to_string(),
+                    ));
+                    return Outcome::quiet();
+                }
+                self.apply_run_option(&key, Some(trimmed))
             }
         }
     }
@@ -2111,11 +2174,139 @@ impl App {
         self.overlay = Some(Overlay::RuntimePicker { selected });
     }
 
-    fn runtime_option_count(&self) -> usize {
-        self.runtime_options
-            .as_ref()
-            .map(|catalog| catalog.options.len())
-            .unwrap_or(0)
+    /// Act on the switcher row the reader confirmed.
+    ///
+    /// A catalogue row is a runtime change and closes the picker, exactly as it
+    /// did before the run options were listed under it. A run option is about
+    /// the choice already in effect, so it opens what that option accepts
+    /// rather than closing the surface the reader is working in.
+    fn activate_runtime_picker_row(&mut self, row: usize) -> Outcome {
+        match self.runtime_picker_rows().get(row).copied() {
+            Some(RuntimePickerRow::Choice(index)) => {
+                self.overlay = None;
+                self.apply_runtime_selection(index)
+            }
+            Some(RuntimePickerRow::RunOption(index)) => {
+                let Some(option) = self.run_options().into_iter().nth(index) else {
+                    return Outcome::quiet();
+                };
+                match option.kind {
+                    RunOptionKind::Text => self.open_run_option_prompt(option),
+                    RunOptionKind::Choice | RunOptionKind::Toggle => {
+                        // The cursor starts on the value in effect, which on a
+                        // fresh selection is the Agent's own default.
+                        let choices = self.run_option_choices(&option);
+                        let selected = choices
+                            .iter()
+                            .position(|(value, _)| option.is_selected_value(value.as_deref()))
+                            .unwrap_or(0);
+                        self.overlay = Some(Overlay::RunOptionValues {
+                            row,
+                            selected,
+                            option,
+                        });
+                        Outcome::effects(vec![])
+                    }
+                }
+            }
+            None => Outcome::quiet(),
+        }
+    }
+
+    /// Ask for a free-text run option's value.
+    ///
+    /// The open prompt carries its field but not the option it belongs to, so
+    /// the key waits on the app for the one submission the prompt can make.
+    fn open_run_option_prompt(&mut self, option: RunOption) -> Outcome {
+        self.run_option_prompt = Some(option.key.clone());
+        let title = option.label.clone();
+        let value = option
+            .explicit
+            .clone()
+            .or_else(|| option.resolved.as_ref().map(|value| value.value.clone()))
+            .unwrap_or_default();
+        self.overlay = Some(Overlay::Prompt {
+            title,
+            field: PromptField::RunOptionValue,
+            value,
+        });
+        Outcome::effects(vec![])
+    }
+
+    /// Apply one run option to the page's runtime selection.
+    ///
+    /// What the Agent publishes is the only thing that may be sent: a value the
+    /// catalogue no longer advertises is refused rather than moved onto the
+    /// session as a switch the runtime would reject. `None` clears the override,
+    /// which is what the value list's `Default` row means.
+    fn apply_run_option(&mut self, key: &RunOptionKey, value: Option<String>) -> Outcome {
+        let Some(selection) = self.page_runtime_selection() else {
+            return Outcome::quiet();
+        };
+        let Some(option) = self
+            .run_options()
+            .into_iter()
+            .find(|option| &option.key == key)
+        else {
+            return Outcome::quiet();
+        };
+        let accepted = match (key, value.as_deref()) {
+            (_, None) => true,
+            (RunOptionKey::Feature(id), Some(value)) => self
+                .runtime_option_for(&selection)
+                .and_then(|entry| entry.features.iter().find(|feature| &feature.id == id))
+                .is_some_and(|feature| feature.accepts_value(value)),
+            (_, Some(value)) => option
+                .values
+                .iter()
+                .any(|candidate| candidate.value == value),
+        };
+        if !accepted {
+            return Outcome::quiet();
+        }
+        let mut next = selection;
+        match key {
+            RunOptionKey::ReasoningEffort => next.reasoning_effort = value.clone(),
+            RunOptionKey::Mode => next.mode_id = value.clone(),
+            RunOptionKey::Feature(id) => match value.clone() {
+                Some(value) => {
+                    next.config_values.insert(id.clone(), value);
+                }
+                None => {
+                    next.config_values.remove(id);
+                }
+            },
+        }
+        // The composing page keeps the choice for the session it is about to
+        // create; an open session is moved with a compare-and-set switch, which
+        // is the same path a runtime change takes. The page is asked first:
+        // while it is up, the session behind it is not what the reader is
+        // tuning.
+        if self.page_is_composing() {
+            self.new_session_runtime = Some(next);
+            let value = self.run_option_value_label(&option, value.as_deref());
+            self.toast(Toast::success(format!("{}: {value}", option.label)));
+            return Outcome::quiet();
+        }
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return Outcome::quiet();
+        };
+        self.guard(
+            BackendOperation::AgentSwitchRuntime,
+            Effect::SwitchRuntime {
+                session_id,
+                selection: next,
+            },
+        )
+    }
+
+    /// The words for one value of a run option, for the acknowledgement.
+    fn run_option_value_label(&self, option: &RunOption, explicit: Option<&str>) -> String {
+        self.run_option_choices(option)
+            .into_iter()
+            .find(|(value, _)| value.as_deref() == explicit)
+            .map(|(_, label)| label)
+            .unwrap_or_else(|| self.strings.runtime_default().to_string())
     }
 
     fn apply_runtime_selection(&mut self, index: usize) -> Outcome {
@@ -2976,6 +3167,375 @@ mod tests {
         assert_eq!(
             selection,
             &app.runtime_options.as_ref().unwrap().options[0].selection
+        );
+    }
+
+    /// A catalogue whose second entry publishes run options: a thinking ladder,
+    /// two conversation modes, a switch and a free-text field.
+    fn run_option_catalog() -> vibex_core::SessionRuntimeOptionCatalog {
+        let value = |value: &str, label: &str| vibex_core::SessionConfigValue {
+            value: value.to_string(),
+            label: (!label.is_empty()).then(|| label.to_string()),
+        };
+        let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+            selection: vibex_core::SessionRuntimeSelection::provider(
+                vibex_core::AgentId::parse(agent).expect("agent id"),
+                vibex_core::ProviderProfileId::new(),
+                model,
+            ),
+            agent_label: agent.to_string(),
+            auth_source_label: "bal".to_string(),
+            model_label: model.to_string(),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+        };
+        let mut agent = option("codex", "gpt-5");
+        agent.reasoning_efforts = vec![value("low", "Low"), value("high", "High")];
+        agent.modes = vec![value("plan", "Plan"), value("pair", "Pair")];
+        agent.features = vec![
+            vibex_core::SessionRuntimeFeature {
+                id: "web_search".to_string(),
+                label: "Web search".to_string(),
+                description: None,
+                kind: vibex_core::SessionRuntimeFeatureKind::Toggle,
+                current_value: Some(value("true", "")),
+                default_value: Some(value("true", "")),
+                values: Vec::new(),
+            },
+            vibex_core::SessionRuntimeFeature {
+                id: "notes".to_string(),
+                label: "Notes".to_string(),
+                description: Some("Free text the Agent reads".to_string()),
+                kind: vibex_core::SessionRuntimeFeatureKind::String,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            },
+        ];
+        vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option("claude", "claude-sonnet"), agent],
+        }
+    }
+
+    /// Put the open session on a selection, as the runtime reports it.
+    fn session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) {
+        app.live = crate::app::LiveState::Ready;
+        let mut session = openable_session("session_enter0001");
+        session.agent_id = desired.agent_id.clone();
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.agent
+            .state
+            .runtime_selection
+            .resolve(vibex_core::AgentSessionRuntimeSelectionState {
+                desired: desired.clone(),
+                effective: desired,
+                status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+                session_revision: 1,
+                selection_revision: 1,
+                current_binding_id: None,
+                activation_generation: 1,
+                pending_switch_id: None,
+                actionable_error: None,
+            });
+    }
+
+    /// An app whose loaded catalogue publishes run options, with the page
+    /// either on the second entry (a session) or holding it (the composing
+    /// page).
+    fn app_with_run_options(page: Page) -> App {
+        let mut app = capable_app();
+        app.navigate_to(page);
+        let catalog = run_option_catalog();
+        let desired = catalog.options[1].selection.clone();
+        app.runtime_options = Some(catalog);
+        if page == Page::NewSession {
+            app.live = crate::app::LiveState::Ready;
+            app.new_session_runtime = Some(desired);
+        } else {
+            session_on(&mut app, desired);
+        }
+        app
+    }
+
+    /// The one runtime switch an outcome asked for, if it asked for one.
+    fn switched(outcome: &Outcome) -> Option<&vibex_core::SessionRuntimeSelection> {
+        outcome.effects.iter().find_map(|effect| match effect {
+            Effect::SwitchRuntime { selection, .. } => Some(selection),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_switcher_lists_the_run_options_the_chosen_agent_publishes() {
+        // The composer promises the Agent's run options; the switcher is where
+        // they are read. They follow the catalogue rows so the Agent is still
+        // the first question the surface asks.
+        let app = app_with_run_options(Page::Agent);
+        assert_eq!(
+            app.runtime_picker_rows(),
+            vec![
+                RuntimePickerRow::Choice(0),
+                RuntimePickerRow::Choice(1),
+                RuntimePickerRow::RunOption(0),
+                RuntimePickerRow::RunOption(1),
+                RuntimePickerRow::RunOption(2),
+                RuntimePickerRow::RunOption(3),
+            ]
+        );
+        let options = app.run_options();
+        assert_eq!(
+            options.iter().map(|o| o.key.clone()).collect::<Vec<_>>(),
+            vec![
+                RunOptionKey::ReasoningEffort,
+                RunOptionKey::Mode,
+                RunOptionKey::Feature("web_search".to_string()),
+                RunOptionKey::Feature("notes".to_string()),
+            ]
+        );
+        assert_eq!(options[0].label, "Thinking depth");
+        assert_eq!(options[0].explicit, None);
+        assert_eq!(options[0].resolved_label("Default"), "Default");
+        assert_eq!(options[1].label, "Conversation mode");
+        // A switch reads as a state, not as the wire's `true`, and it is the
+        // Agent's published value rather than an override the reader made.
+        assert_eq!(options[2].kind, RunOptionKind::Toggle);
+        assert_eq!(options[2].resolved_label("Default"), "On");
+        assert_eq!(options[2].explicit, None);
+        assert_eq!(options[3].kind, RunOptionKind::Text);
+        assert_eq!(
+            options[3].description.as_deref(),
+            Some("Free text the Agent reads")
+        );
+    }
+
+    #[test]
+    fn a_session_gets_the_run_option_it_chooses_as_a_runtime_switch() {
+        let mut app = app_with_run_options(Page::Agent);
+        let agent_id = app.runtime_options.as_ref().expect("catalogue").options[1]
+            .selection
+            .agent_id
+            .clone();
+
+        // The catalogue row is row 1, so thinking depth is the row after the
+        // two choices.
+        app.overlay = Some(Overlay::RuntimePicker { selected: 2 });
+        let opened = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            opened.effects.is_empty(),
+            "opening a value list issued work: {opened:?}"
+        );
+        let Some(Overlay::RunOptionValues {
+            row: 2,
+            selected: 0,
+            option,
+        }) = app.overlay.clone()
+        else {
+            panic!("the value list did not open: {:?}", app.overlay);
+        };
+        assert_eq!(option.key, RunOptionKey::ReasoningEffort);
+        // Nothing is overridden, so the list starts on the Agent's own default.
+        assert_eq!(
+            app.run_option_choices(&option)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>(),
+            vec!["Default", "Low", "High"]
+        );
+
+        // Down to `High`, which is one past `Low`.
+        app.perform(Intent::SelectNext);
+        app.perform(Intent::SelectNext);
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        let selection = switched(&outcome).expect("the choice did not switch the session");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        // The rest of the selection travels untouched: a run option is a
+        // setting on the Agent, not a different Agent.
+        assert_eq!(selection.agent_id, agent_id);
+        assert_eq!(selection.mode_id, None);
+        assert!(selection.config_values.is_empty());
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn the_default_row_clears_a_run_option_the_session_is_on() {
+        let mut app = capable_app();
+        app.navigate_to(Page::Agent);
+        let catalog = run_option_catalog();
+        let mut desired = catalog.options[1].selection.clone();
+        desired.reasoning_effort = Some("high".to_string());
+        app.runtime_options = Some(catalog);
+        session_on(&mut app, desired);
+
+        app.overlay = Some(Overlay::RuntimePicker { selected: 2 });
+        app.perform(Intent::ConfirmOverlay);
+        // The list opens on the value in effect, so `Default` is two steps up.
+        let Some(Overlay::RunOptionValues { selected: 2, .. }) = app.overlay.clone() else {
+            panic!("the value list did not open on `High`: {:?}", app.overlay);
+        };
+        app.perform(Intent::SelectPrevious);
+        app.perform(Intent::SelectPrevious);
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        let selection =
+            switched(&outcome).expect("clearing the override did not switch the session");
+        assert_eq!(selection.reasoning_effort, None);
+    }
+
+    #[test]
+    fn a_toggle_run_option_is_offered_as_on_and_off() {
+        let mut app = app_with_run_options(Page::Agent);
+
+        // Web search is the third run option, so it sits on row 4.
+        app.overlay = Some(Overlay::RuntimePicker { selected: 4 });
+        app.perform(Intent::ConfirmOverlay);
+        let Some(Overlay::RunOptionValues { option, .. }) = app.overlay.clone() else {
+            panic!("the toggle did not open a value list: {:?}", app.overlay);
+        };
+        assert_eq!(
+            app.run_option_choices(&option),
+            vec![
+                (None, "Default".to_string()),
+                (Some("true".to_string()), "On".to_string()),
+                (Some("false".to_string()), "Off".to_string()),
+            ]
+        );
+        // `On` is already in effect through the Agent's own value, so the
+        // reader's next step is the explicit `Off`.
+        app.perform(Intent::SelectNext);
+        app.perform(Intent::SelectNext);
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        let selection = switched(&outcome).expect("the toggle did not switch the session");
+        assert_eq!(
+            selection
+                .config_values
+                .get("web_search")
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn a_free_text_run_option_is_applied_through_the_prompt() {
+        let mut app = app_with_run_options(Page::Agent);
+
+        // Notes is the fourth run option, so it sits on row 5, and it has no
+        // value list: it asks for one.
+        app.overlay = Some(Overlay::RuntimePicker { selected: 5 });
+        let opened = app.perform(Intent::ConfirmOverlay);
+        assert!(opened.effects.is_empty());
+        assert_eq!(
+            app.run_option_prompt,
+            Some(RunOptionKey::Feature("notes".to_string()))
+        );
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Prompt {
+                field: PromptField::RunOptionValue,
+                ..
+            })
+        ));
+        // An empty answer is refused rather than sent as a blank setting.
+        let empty = app.perform(Intent::ConfirmOverlay);
+        assert!(empty.effects.is_empty(), "{empty:?}");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text == app.strings.runtime_option_required()),
+            "an empty text value was refused without saying why"
+        );
+        // And cancelling takes the key with it, so a later prompt cannot submit
+        // a value for this option.
+        app.overlay = Some(Overlay::Prompt {
+            title: "Notes".to_string(),
+            field: PromptField::RunOptionValue,
+            value: String::new(),
+        });
+        app.perform(Intent::Back);
+        assert_eq!(app.run_option_prompt, None);
+    }
+
+    #[test]
+    fn escape_from_a_value_list_returns_to_the_switcher_row() {
+        let mut app = app_with_run_options(Page::Agent);
+
+        app.overlay = Some(Overlay::RuntimePicker { selected: 3 });
+        app.perform(Intent::ConfirmOverlay);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::RunOptionValues { row: 3, .. })
+        ));
+        app.perform(Intent::Back);
+        assert_eq!(app.overlay, Some(Overlay::RuntimePicker { selected: 3 }));
+        // And the switcher itself still closes.
+        app.perform(Intent::Back);
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn the_composing_page_keeps_a_run_option_for_the_session_it_creates() {
+        let mut app = app_with_run_options(Page::NewSession);
+        let agent_id = app.runtime_options.as_ref().expect("catalogue").options[1]
+            .selection
+            .agent_id
+            .clone();
+
+        // The catalogue row is row 1, so conversation mode is row 3. The modes
+        // are listed in the catalogue's own order — `Pair` before `Plan` —
+        // after the default row.
+        app.overlay = Some(Overlay::RuntimePicker { selected: 3 });
+        app.perform(Intent::ConfirmOverlay);
+        let Some(Overlay::RunOptionValues { option, .. }) = app.overlay.clone() else {
+            panic!("the mode list did not open: {:?}", app.overlay);
+        };
+        assert_eq!(
+            app.run_option_choices(&option)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>(),
+            vec!["Default", "Pair", "Plan"]
+        );
+        app.perform(Intent::SelectNext);
+        app.perform(Intent::SelectNext);
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            outcome.effects.is_empty(),
+            "a page with no session issued work: {outcome:?}"
+        );
+        let chosen = app
+            .new_session_runtime
+            .as_ref()
+            .expect("the page kept no runtime");
+        assert_eq!(chosen.mode_id.as_deref(), Some("plan"));
+        assert_eq!(chosen.agent_id, agent_id);
+    }
+
+    #[test]
+    fn a_run_option_the_catalogue_stopped_publishing_is_not_sent() {
+        let mut app = app_with_run_options(Page::Agent);
+
+        // A stale value list (the catalogue moved under it) must not move the
+        // session onto a setting no Agent advertises.
+        let refused = app.apply_run_option(
+            &RunOptionKey::ReasoningEffort,
+            Some("nonexistent".to_string()),
+        );
+        assert!(refused.effects.is_empty(), "{refused:?}");
+        assert_eq!(
+            app.session_runtime_selection()
+                .and_then(|selection| selection.reasoning_effort.clone()),
+            None
+        );
+        // A value the Agent does publish is sent.
+        let accepted =
+            app.apply_run_option(&RunOptionKey::ReasoningEffort, Some("high".to_string()));
+        assert_eq!(
+            switched(&accepted).and_then(|selection| selection.reasoning_effort.clone()),
+            Some("high".to_string())
         );
     }
 

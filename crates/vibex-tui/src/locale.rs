@@ -503,6 +503,14 @@ strings! {
     runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },
     runtime_current => { "Current", "当前", "目前" },
     runtime_unavailable => { "Unavailable", "不可用", "無法使用" },
+    // The run options the chosen Agent publishes, under the catalogue rows.
+    runtime_run_options => { "Run options", "运行选项", "執行選項" },
+    runtime_default => { "Default", "默认", "預設" },
+    runtime_thinking_depth => { "Thinking depth", "思考深度", "思考深度" },
+    runtime_conversation_mode => { "Conversation mode", "对话模式", "對話模式" },
+    runtime_on => { "On", "开", "開" },
+    runtime_off => { "Off", "关", "關" },
+    runtime_option_required => { "A value is required", "需要填写一个值", "需要填寫一個值" },
 
     // ---- workspace ------------------------------------------------------
     workspace_pick => { "Choose a workspace", "选择工作区", "選擇工作區" },

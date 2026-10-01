@@ -2883,6 +2883,16 @@ fn render_composer_info(
     };
 
     let mut line = Vec::new();
+    // How the Agent runs, not only which one it is: the values the reader set
+    // on the switcher's run options ride beside the runtime they belong to, so
+    // "what will this message be sent through" is answered without opening it.
+    let run_options = app.composer_run_option_labels();
+    let push_run_options = |line: &mut Vec<Span<'static>>| {
+        for label in &run_options {
+            line.push(sep(theme));
+            line.push(Span::styled(label.clone(), flag(theme)));
+        }
+    };
     // Model identity: the session's own, or — on the page where a session is
     // being written — the one the new message would be sent through, because
     // choosing it is what that page is for.
@@ -2896,6 +2906,7 @@ fn render_composer_info(
             line.push(sep(theme));
             line.push(Span::styled(model, flag(theme)));
         }
+        push_run_options(&mut line);
         line.push(sep(theme));
         line.push(Span::styled(
             strings.runtime_switch_hint().to_string(),
@@ -2946,6 +2957,7 @@ fn render_composer_info(
         // line already names the runtime, so it also names the key that moves it.
         // A backend that cannot honour the key explains itself with a toast
         // rather than silently dropping the entry point.
+        push_run_options(&mut line);
         line.push(sep(theme));
         line.push(Span::styled(
             strings.runtime_switch_hint().to_string(),
@@ -4925,6 +4937,8 @@ fn render_overlay(
                 .as_ref()
                 .map(|catalog| catalog.options.clone())
                 .unwrap_or_default();
+            let run_options = app.run_options();
+            let choices = options.len();
             let chrome = modal_chrome(
                 app,
                 strings.runtime_title(),
@@ -4942,55 +4956,172 @@ fn render_overlay(
             // publishes. The row the session is on is marked rather than
             // merely listed first: "which Agent am I talking to" is the
             // question this overlay exists to answer.
-            let items = options
+            let mut items = Vec::with_capacity(choices + run_options.len() + 1);
+            for (index, option) in options.iter().enumerate() {
+                let style = if index == *selected {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                let current = app.runtime_option_is_current(option);
+                let mut spans = vec![Span::styled(
+                    if current { "● " } else { "  " }.to_string(),
+                    Style::default().fg(theme.roles.accent_user),
+                )];
+                spans.push(Span::styled(
+                    format!("{:<18}", truncate_to_width(&option.agent_label, 18, "…")),
+                    if current {
+                        style.add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    },
+                ));
+                spans.push(Span::styled(
+                    truncate_to_width(
+                        &format!("{}/{}", option.auth_source_label, option.model_label),
+                        34,
+                        "…",
+                    ),
+                    theme.muted(),
+                ));
+                if current {
+                    spans.push(Span::styled(
+                        format!("  {}", strings.runtime_current()),
+                        Style::default().fg(theme.roles.accent_user),
+                    ));
+                } else if option.availability != vibex_core::RuntimeOptionAvailability::Available {
+                    spans.push(Span::styled(
+                        format!("  {}", strings.runtime_unavailable()),
+                        Style::default().fg(theme.roles.gray_dim),
+                    ));
+                }
+                items.push(ListItem::new(Line::from(spans)));
+            }
+            // The run options the chosen entry publishes, under the choices
+            // they belong to. Without them the switcher answers "which Agent"
+            // but not "how it runs", which is half of what the composer's own
+            // line promises.
+            if !run_options.is_empty() {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("── {} ", strings.runtime_run_options()),
+                    theme.dimmed(theme.roles.gray_dim),
+                ))));
+                for (index, option) in run_options.iter().enumerate() {
+                    let row = choices + index;
+                    let style = if row == *selected {
+                        theme.selected()
+                    } else {
+                        theme.base()
+                    };
+                    let set = option.is_explicit();
+                    let mut spans = vec![Span::styled(
+                        if set { "● " } else { "  " }.to_string(),
+                        Style::default().fg(theme.roles.accent_user),
+                    )];
+                    spans.push(Span::styled(
+                        format!("{:<18}", truncate_to_width(&option.label, 18, "…")),
+                        style,
+                    ));
+                    spans.push(Span::styled(
+                        truncate_to_width(
+                            &option.resolved_label(strings.runtime_default()),
+                            34,
+                            "…",
+                        ),
+                        if set { style } else { theme.muted() },
+                    ));
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+            }
+            // The section header is a row the reader sees but cannot select, so
+            // the list cursor is the switcher row plus one past the choices.
+            let item_index = if *selected < choices || run_options.is_empty() {
+                *selected
+            } else {
+                *selected + 1
+            };
+            let mut state = ratatui::widgets::ListState::default();
+            state.select(Some(item_index.min(items.len().saturating_sub(1))));
+            frame.render_stateful_widget(List::new(items), layout.content, &mut state);
+        }
+        Overlay::RunOptionValues {
+            selected, option, ..
+        } => {
+            let chrome = modal_chrome(
+                app,
+                &option.label,
+                ModalSizing::picker(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("Enter", strings.hint_select()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
+            );
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
+            // A long-winded option explains itself in a caption above the
+            // values, so the rows stay one line each.
+            let mut content = layout.content;
+            if let Some(description) = option.description.as_deref()
+                && content.height > 1
+            {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        truncate_to_width(description, usize::from(content.width), "…"),
+                        theme.dimmed(theme.roles.gray),
+                    ))),
+                    Rect {
+                        height: 1,
+                        ..content
+                    },
+                );
+                content = Rect {
+                    y: content.y + 1,
+                    height: content.height - 1,
+                    ..content
+                };
+            }
+            let choices = app.run_option_choices(option);
+            // The marker and the "Current" badge own the rest of the row; a
+            // label takes what is left rather than a width guessed in advance.
+            let label_width = usize::from(content.width)
+                .saturating_sub(2 + strings.runtime_current().len() + 2)
+                .max(8);
+            let items = choices
                 .iter()
                 .enumerate()
-                .map(|(index, option)| {
+                .map(|(index, (value, label))| {
                     let style = if index == *selected {
                         theme.selected()
                     } else {
                         theme.base()
                     };
-                    let current = app.runtime_option_is_current(option);
+                    let current = option.is_selected_value(value.as_deref());
                     let mut spans = vec![Span::styled(
                         if current { "● " } else { "  " }.to_string(),
                         Style::default().fg(theme.roles.accent_user),
                     )];
                     spans.push(Span::styled(
-                        format!("{:<18}", truncate_to_width(&option.agent_label, 18, "…")),
+                        truncate_to_width(label, label_width, "…"),
                         if current {
                             style.add_modifier(Modifier::BOLD)
                         } else {
                             style
                         },
                     ));
-                    spans.push(Span::styled(
-                        truncate_to_width(
-                            &format!("{}/{}", option.auth_source_label, option.model_label),
-                            34,
-                            "…",
-                        ),
-                        theme.muted(),
-                    ));
                     if current {
                         spans.push(Span::styled(
                             format!("  {}", strings.runtime_current()),
                             Style::default().fg(theme.roles.accent_user),
-                        ));
-                    } else if option.availability
-                        != vibex_core::RuntimeOptionAvailability::Available
-                    {
-                        spans.push(Span::styled(
-                            format!("  {}", strings.runtime_unavailable()),
-                            Style::default().fg(theme.roles.gray_dim),
                         ));
                     }
                     ListItem::new(Line::from(spans))
                 })
                 .collect::<Vec<_>>();
             let mut state = ratatui::widgets::ListState::default();
-            state.select(Some((*selected).min(options.len().saturating_sub(1))));
-            frame.render_stateful_widget(List::new(items), layout.content, &mut state);
+            state.select(Some((*selected).min(items.len().saturating_sub(1))));
+            frame.render_stateful_widget(List::new(items), content, &mut state);
         }
         Overlay::WorkspacePicker { selected } => {
             let listing = app.workspace_browse.clone();

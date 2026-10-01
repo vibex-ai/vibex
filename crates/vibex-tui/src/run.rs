@@ -369,7 +369,11 @@ fn handle_key(
                     return Ok(false);
                 }
                 KeyCode::Esc => {
-                    app.overlay = None;
+                    // Through the reducer, not around it: a cancelled prompt
+                    // may be holding state of its own (a run option's key) that
+                    // only the reducer knows to drop.
+                    let outcome = app.perform(crate::action::Intent::Back);
+                    dispatch_all(worker, &outcome);
                     return Ok(false);
                 }
                 _ => {}
@@ -989,7 +993,11 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if let Some(close) = app.regions.modal_close
                 && rect_contains(close, mouse.column, mouse.row)
             {
-                app.overlay = None;
+                // The same way out as `Esc`, so a modal holding state of its
+                // own — a run option's key — is left the way the reducer
+                // expects rather than around it.
+                let outcome = app.perform(crate::action::Intent::Back);
+                dispatch_all(worker, &outcome);
                 app.regions.modal_close = None;
                 return true;
             }
