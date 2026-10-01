@@ -403,7 +403,9 @@ impl App {
                 Outcome::effects(vec![Effect::ListWorkspaces])
             }
             Intent::OpenWorkspaceBrowser => {
-                self.toast(Toast::info(self.strings.workspace_browse().to_string()));
+                self.overlay = Some(Overlay::WorkspacePicker { selected: 0 });
+                // The listing is what the picker draws, and the browse root is
+                // where a reader who has never been anywhere should start.
                 Outcome::effects(vec![Effect::BrowseDirectories { path: None }])
             }
             Intent::WorkspaceBrowseUp => {
@@ -426,12 +428,10 @@ impl App {
                     return Outcome::quiet();
                 };
                 let path = entry.path.clone();
-                self.overlay = Some(Overlay::Prompt {
-                    title: self.strings.session_new().to_string(),
-                    field: PromptField::NewSessionTitle,
-                    value: String::new(),
-                });
                 self.workspace_path = Some(path);
+                self.overlay = None;
+                self.page = Page::NewSession;
+                self.focus = Focus::Composer;
                 Outcome::effects(vec![])
             }
 
@@ -1224,6 +1224,40 @@ impl App {
                 }
                 _ => Outcome::quiet(),
             },
+            Overlay::WorkspacePicker { selected } => match intent {
+                // Enter takes the highlighted directory, exactly as choosing it
+                // from the listing does: one gesture, one meaning.
+                Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                    self.set_selection(crate::keymap::Scope::Sessions, selected);
+                    self.overlay = None;
+                    self.perform(Intent::WorkspaceBrowseSelect)
+                }
+                Intent::SelectNext => {
+                    let count = self
+                        .workspace_browse
+                        .as_ref()
+                        .map(|listing| listing.entries.len())
+                        .unwrap_or(0);
+                    self.overlay = Some(Overlay::WorkspacePicker {
+                        selected: if count == 0 {
+                            0
+                        } else {
+                            (selected + 1) % count
+                        },
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::SelectPrevious => {
+                    self.overlay = Some(Overlay::WorkspacePicker {
+                        selected: selected.saturating_sub(1),
+                    });
+                    Outcome::effects(vec![])
+                }
+                // Climbing out of a directory is part of browsing it, so it
+                // stays inside the picker rather than closing it.
+                Intent::WorkspaceBrowseUp => self.perform(Intent::WorkspaceBrowseUp),
+                _ => Outcome::quiet(),
+            },
             Overlay::BlockDetails { scroll, .. } => match intent {
                 Intent::ScrollPageDown | Intent::SelectNext => {
                     self.set_overlay_scroll(scroll + 10);
@@ -1398,20 +1432,6 @@ impl App {
                     title: trimmed,
                 }])
             }
-            PromptField::NewSessionTitle => {
-                let workspace_root = self
-                    .workspace_path
-                    .clone()
-                    .or_else(|| {
-                        self.active_session()
-                            .map(|session| session.workspace_root.clone())
-                    })
-                    .unwrap_or_default();
-                Outcome::effects(vec![Effect::CreateSession {
-                    workspace_root,
-                    title: (!trimmed.is_empty()).then_some(trimmed),
-                }])
-            }
             PromptField::WorkspacePath => {
                 Outcome::effects(vec![Effect::OpenWorkspace { root_path: trimmed }])
             }
@@ -1582,6 +1602,14 @@ impl App {
             self.filter.clear();
             return Outcome::effects(vec![]);
         }
+        // Leaving the composing page abandons the session that was never
+        // created, not the draft: the words stay in the composer, so `n` again
+        // finds them.
+        if self.page == Page::NewSession {
+            self.page = Page::Sessions;
+            self.focus = Focus::Main;
+            return Outcome::effects(vec![]);
+        }
         // The composer is where the keyboard lands when a session is opened, so
         // it must not be a room with no door: `Esc` from a session returns to
         // the session list rather than only moving focus off the draft. `Tab`
@@ -1730,14 +1758,53 @@ impl App {
             .map(|worktree| worktree.worktree_path.clone())
     }
 
+    /// Land on the page a new session starts on.
+    ///
+    /// A page rather than a dialog: the reader asked to start writing, and the
+    /// first thing worth showing them is the prompt they will write in with the
+    /// runtime it will be sent through named beside it. No session exists yet —
+    /// the send creates it — so this only moves the reader to the page, and the
+    /// workspace list comes along because the page names the directory.
     fn begin_new_session(&mut self) -> Outcome {
-        self.overlay = Some(Overlay::Prompt {
-            title: self.strings.session_new().to_string(),
-            field: PromptField::NewSessionTitle,
-            value: String::new(),
-        });
+        self.page = Page::NewSession;
+        self.focus = Focus::Composer;
         self.workspace_path = None;
         Outcome::effects(vec![Effect::ListWorkspaces])
+    }
+
+    /// Ask for a session and keep the draft that will open it.
+    ///
+    /// The title is not asked for: it comes from the message, which is where a
+    /// title comes from anyway, and a reader who has just written a paragraph
+    /// should not then be asked to name it. The message waits in
+    /// [`App::pending_new_session`] because a send needs a session id, and the
+    /// id only exists once the runtime answers.
+    fn create_session_from_draft(&mut self) -> Outcome {
+        if self.composer.is_empty() {
+            self.toast(Toast::warning(self.strings.composer_empty().to_string()));
+            return Outcome::quiet();
+        }
+        let outgoing = self.composer.take_outgoing();
+        self.completion = None;
+        let workspace_root = self
+            .workspace_path
+            .clone()
+            .or_else(|| {
+                self.active_session()
+                    .map(|session| session.workspace_root.clone())
+            })
+            .or_else(|| {
+                self.workspace_rows
+                    .first()
+                    .map(|workspace| workspace.workspace.root_path.clone())
+            })
+            .unwrap_or_default();
+        self.pending_new_session = Some(outgoing);
+        Outcome::effects(vec![Effect::CreateSession {
+            workspace_root,
+            title: None,
+            runtime: self.new_session_runtime.clone(),
+        }])
     }
 
     fn begin_rename_session(&mut self) -> Outcome {
@@ -1856,6 +1923,11 @@ impl App {
         if self.composer.is_empty() {
             self.toast(Toast::warning(self.strings.composer_empty().to_string()));
             return Outcome::quiet();
+        }
+        // The composing page has no session yet — asking it for one is what the
+        // send *does* — so it is answered before the session checks, not after.
+        if self.page == Page::NewSession {
+            return self.create_session_from_draft();
         }
         let Some(session_id) = self.selected_session_id().cloned() else {
             self.toast(Toast::warning(self.strings.sessions_empty().to_string()));
@@ -2027,6 +2099,18 @@ impl App {
             return Outcome::quiet();
         }
         let Some(session_id) = self.selected_session_id().cloned() else {
+            // No session yet: the choice belongs to the one about to be created.
+            if self.page == Page::NewSession {
+                self.new_session_runtime = Some(option.selection.clone());
+                let message = format!(
+                    "{}: {} · {}",
+                    self.strings.session_runtime_label(),
+                    option.agent_label,
+                    option.model_label
+                );
+                self.toast(Toast::success(message));
+                return Outcome::quiet();
+            }
             return Outcome::quiet();
         };
         self.guard(
@@ -2040,6 +2124,9 @@ impl App {
 
     fn refresh_current_page(&mut self) -> Outcome {
         match self.page {
+            Page::NewSession => Outcome::effects(vec![Effect::ListSessions {
+                include_archived: self.show_archived,
+            }]),
             Page::Sessions => Outcome::effects(vec![Effect::ListSessions {
                 include_archived: self.show_archived,
             }]),

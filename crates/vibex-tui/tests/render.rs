@@ -3165,3 +3165,284 @@ fn a_sent_image_keeps_its_place_in_the_message() {
         attachments[0].uri
     );
 }
+
+#[test]
+fn starting_a_session_lands_on_a_page_with_the_prompt_in_it() {
+    // `n` used to open a dialog asking what to call the session. A reader who
+    // asked for a session asked to *write*, so the gesture now lands on a page
+    // that hands them the composer.
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+
+    assert_eq!(app.page, vibex_tui::app::Page::NewSession);
+    assert!(
+        app.overlay.is_none(),
+        "a dialog was opened: {:?}",
+        app.overlay
+    );
+    assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
+
+    let screen = text(&render(&mut app, 100, 30));
+    assert!(screen.contains("██"), "the mark is missing:\n{screen}");
+    assert!(
+        screen.contains("New session"),
+        "the page does not name itself:\n{screen}"
+    );
+    assert!(
+        screen.contains("Send a message"),
+        "the prompt is not on the page:\n{screen}"
+    );
+    // The runtime the message will go through is named on the page *and* on the
+    // composer's own line, because choosing it is what the page is for.
+    assert!(
+        screen.contains("Ctrl+G"),
+        "the runtime switch is not offered:\n{screen}"
+    );
+    assert!(
+        screen.contains("Commands") && screen.contains("Files"),
+        "the draft's vocabulary is not spelled out:\n{screen}"
+    );
+}
+
+#[test]
+fn the_first_message_creates_the_session_it_is_written_in() {
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    // The page starts with no directory of its own: one chosen for a previous
+    // session is not silently reused. The reader picks one, or the open
+    // session's directory answers.
+    assert_ne!(app.new_session_workspace(), "/tmp/vibex-new-session");
+    app.workspace_path = Some("/tmp/vibex-new-session".to_string());
+    assert_eq!(app.new_session_workspace(), "/tmp/vibex-new-session");
+    app.composer.insert_str("fix the flaky test");
+
+    let outcome = app.perform(Intent::SubmitComposer);
+    let created = outcome
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            vibex_tui::Effect::CreateSession {
+                workspace_root,
+                title,
+                runtime,
+            } => Some((workspace_root.clone(), title.clone(), runtime.clone())),
+            _ => None,
+        })
+        .expect("no session was asked for");
+    assert_eq!(created.0, "/tmp/vibex-new-session");
+    assert_eq!(
+        created.1, None,
+        "the reader is asked to name a session they have already described"
+    );
+    assert_eq!(
+        created.2, None,
+        "a runtime was invented for a page that chose none"
+    );
+    // Empty draft: the same key says so instead of creating an empty session.
+    assert!(
+        app.composer.text().is_empty(),
+        "the draft stayed in the box after being handed over"
+    );
+
+    // The session answers; the held message opens it.
+    let session_id = vibex_core::VibexSessionId::new();
+    let effect = app
+        .pending_send_effect(session_id.clone())
+        .expect("the message that asked for the session is sent");
+    match effect {
+        vibex_tui::Effect::SendMessage {
+            session_id: sent_to,
+            text,
+            ..
+        } => {
+            assert_eq!(sent_to, session_id);
+            assert_eq!(text, "fix the flaky test");
+        }
+        other => panic!("unexpected effect: {other:?}"),
+    }
+    // Only once: the held message is not a queue.
+    assert!(app.pending_send_effect(session_id).is_none());
+}
+
+#[test]
+fn leaving_the_composing_page_keeps_what_was_written() {
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("half a thought");
+    app.perform(Intent::Back);
+    assert_eq!(app.page, vibex_tui::app::Page::Sessions);
+    assert_eq!(
+        app.composer.text(),
+        "half a thought",
+        "cancelling threw the draft away"
+    );
+}
+
+#[test]
+fn the_mark_moves_only_where_it_is_drawn() {
+    use vibex_tui::action::Intent;
+    let theme = vibex_tui::theme::TuiTheme::resolve(
+        Some("vibex-dark"),
+        vibex_ui::GpuiThemeMode::Dark,
+        vibex_tui::ColorCapability {
+            mode: vibex_tui::ColorMode::TrueColor,
+            glyphs: vibex_tui::GlyphMode::Unicode,
+        },
+    );
+    // The sweep is a lit band, so two phases cannot draw the same mark.
+    let first = vibex_tui::logo::rows(&theme, 0, true);
+    let later = vibex_tui::logo::rows(&theme, 20, true);
+    assert_ne!(text_of(&first), text_of(&later), "the mark does not move");
+    // The letters never change, only the light on them.
+    assert_eq!(
+        text_of(&vibex_tui::logo::rows(&theme, 0, false)),
+        text_of(&vibex_tui::logo::rows(&theme, 40, false))
+    );
+
+    // A page that waits animates; every other page still holds still.
+    let mut app = app(100, 30);
+    assert!(!app.chrome_animating());
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    assert!(
+        app.chrome_animating(),
+        "the page that waits does not breathe"
+    );
+    assert!(app.advance_transcript_animation());
+    app.perform(Intent::Back);
+    assert!(!app.chrome_animating());
+    assert!(!app.advance_transcript_animation());
+}
+
+/// The mark with its styling: the sweep changes the light, not the letters.
+fn text_of(lines: &[ratatui::text::Line<'static>]) -> String {
+    lines
+        .iter()
+        .map(|line| format!("{line:?}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_composing_page_chooses_the_runtime_the_session_is_born_with() {
+    use vibex_tui::action::Intent;
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bal".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![option("claude", "claude-sonnet"), option("codex", "gpt-5")],
+    });
+    app.perform(Intent::NewSession);
+
+    // The picker opens on the page, and the choice is kept for the session
+    // rather than needing one to exist first. (The session list's own key is
+    // gated on the backend supporting a switch, which a client with no backend
+    // cannot; the overlay and its confirm are what this test is about.)
+    app.show_runtime_picker();
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::ConfirmOverlay);
+    assert!(app.overlay.is_none(), "the picker stayed open");
+    assert_eq!(
+        app.new_session_runtime.as_ref().map(|selection| selection
+            .model
+            .model_id()
+            .unwrap_or_default()
+            .to_string()),
+        Some("gpt-5".to_string())
+    );
+
+    // Writing and sending creates the session with that runtime.
+    app.composer.insert_str("write something");
+    let outcome = app.perform(Intent::SubmitComposer);
+    let runtime = outcome
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            vibex_tui::Effect::CreateSession { runtime, .. } => Some(runtime.clone()),
+            _ => None,
+        })
+        .expect("no session was asked for")
+        .expect("the page's choice was dropped");
+    assert_eq!(
+        runtime.model.model_id(),
+        Some("gpt-5"),
+        "the session is created on the page's runtime"
+    );
+}
+
+#[test]
+fn the_composing_page_can_choose_the_directory_it_works_in() {
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("keep me");
+
+    // The browser is a picker over the listing the runtime sent, not a text
+    // field: the directory has to exist on the runtime's host, which this
+    // client cannot check for itself.
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy".to_string(),
+        parent: Some("/home".to_string()),
+        entries: vec![
+            vibex_core::RemoteWorkspaceDirectoryEntry {
+                name: "code".to_string(),
+                path: "/home/peatboy/code".to_string(),
+            },
+            vibex_core::RemoteWorkspaceDirectoryEntry {
+                name: "notes".to_string(),
+                path: "/home/peatboy/notes".to_string(),
+            },
+        ],
+    });
+    app.perform(Intent::OpenWorkspaceBrowser);
+    assert!(matches!(
+        app.overlay,
+        Some(vibex_tui::app::Overlay::WorkspacePicker { .. })
+    ));
+    let screen = text(&render(&mut app, 100, 30));
+    assert!(
+        screen.contains("code"),
+        "the listing is not drawn:\n{screen}"
+    );
+    assert!(screen.contains("notes"), "{screen}");
+
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::ConfirmOverlay);
+    assert!(app.overlay.is_none(), "the picker stayed open");
+    assert_eq!(
+        app.workspace_path.as_deref(),
+        Some("/home/peatboy/notes"),
+        "the highlighted directory was not chosen"
+    );
+    assert_eq!(app.page, vibex_tui::app::Page::NewSession);
+    assert_eq!(app.composer.text(), "keep me", "the draft was lost");
+    let screen = text(&render(&mut app, 100, 30));
+    assert!(
+        screen.contains("notes"),
+        "the chosen directory is not named on the page:\n{screen}"
+    );
+}

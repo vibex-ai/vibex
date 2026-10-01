@@ -157,7 +157,7 @@ fn event_loop(
             match messages.try_recv() {
                 Ok(message) => {
                     handled += 1;
-                    apply_message(app, message)?;
+                    apply_message(app, worker, message)?;
                     dirty = true;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -193,7 +193,7 @@ fn event_loop(
         }
 
         // ---- tick ---------------------------------------------------------
-        let period = if app.transcript_animating() {
+        let period = if app.chrome_animating() {
             ANIMATION_TICK
         } else {
             TICK
@@ -1160,7 +1160,7 @@ fn mouse_cell_clamped(app: &mut App, column: u16, row: u16) -> Option<(usize, u1
     Some((line, column - rect.x))
 }
 
-fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
+fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> BackendResult<()> {
     match message {
         AppMessage::Pasted(content) => {
             use crate::worker::ClipboardContent;
@@ -1262,15 +1262,25 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
         }
         AppMessage::SessionCreated(result) => match result {
             Ok(session) => {
-                app.toast(Toast::success(format!(
-                    "{}: {}",
-                    app.strings.session_new(),
-                    session.title
-                )));
                 app.open_session(session.id.clone());
                 app.live = LiveState::Ready;
+                // The message that asked for the session opens it: the reader
+                // wrote a prompt, not a request for an empty session.
+                match app.pending_send_effect(session.id) {
+                    Some(effect) => worker.dispatch(effect),
+                    None => app.toast(Toast::success(format!(
+                        "{}: {}",
+                        app.strings.session_new(),
+                        session.title
+                    ))),
+                }
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            Err(error) => {
+                // The draft is kept rather than sent nowhere: the reader can ask
+                // for the session again with the words still in the box.
+                app.restore_pending_new_session();
+                app.toast(Toast::danger(error.message));
+            }
         },
         AppMessage::Mutation { key, result } => {
             app.pending.remove(&key);

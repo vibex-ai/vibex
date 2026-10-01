@@ -131,6 +131,9 @@ strings! {
         "還沒有工作階段 — 按 n 新增"
     },
     session_new => { "New session", "新建会话", "新增工作階段" },
+    session_runtime_label => { "Runtime", "运行时", "執行環境" },
+    session_workspace_label => { "Workspace", "工作区", "工作區" },
+    workspace_switch_hint => { "Ctrl+W change", "Ctrl+W 切换", "Ctrl+W 切換" },
     session_open => { "Open", "打开", "開啟" },
     session_rename => { "Rename", "重命名", "重新命名" },
     session_archive => { "Archive", "归档", "封存" },

@@ -464,6 +464,21 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **A new session is a page, not a dialog.** The reader who asks for one asked
+  to write, so the gesture lands on a page that hands them the composer and
+  names what the message will be sent through — Agent, model, workspace — with
+  the keys that change them. The session is created by *sending*: the title comes
+  from the message, and a runtime chosen on the page travels into
+  `Effect::CreateSession` rather than needing a session to exist first. The page
+  is a session page for the bands (`is_session_page`), so the composer owns the
+  keyboard and the status band is drawn; `Esc` returns to the session list with
+  the draft intact.
+* **The waiting mark is the only chrome that animates by itself.**
+  `chrome_animating` gates both the tick period and
+  `advance_transcript_animation`, so a session that is merely open still costs
+  zero frames — and a terminal that
+  cannot blend colours gets the mark at full strength rather than a sweep it
+  cannot show.
 * **A paste over the threshold collapses into a chip.** `PASTE_CHIP_LINES` /
   `PASTE_CHIP_BYTES` decide; the buffer's text holds the label and the original
   bytes ride in a `Chip`. A chip is atomic — the cursor steps over it, one

@@ -985,6 +985,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         "Copy draft",
     ),
     // ---- overlays -------------------------------------------------------
+    // Climbing out of a directory is part of browsing it, so the picker keeps
+    // the key the workspace list uses rather than inventing a second one.
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('u')),
+        Intent::WorkspaceBrowseUp,
+    ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Esc),

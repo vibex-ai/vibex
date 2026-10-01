@@ -38,6 +38,7 @@ pub mod glyphs;
 pub mod keymap;
 pub mod layout;
 pub mod locale;
+pub mod logo;
 pub mod markdown;
 pub mod modal;
 pub mod onboarding;

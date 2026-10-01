@@ -530,6 +530,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         // The workbench pages share the scrollback band; they are views over the
         // same session, so they occupy the same part of the screen.
         Page::Agent => render_scrollback(frame, bands.scrollback, app, &theme, strings),
+        Page::NewSession => render_new_session(frame, bands.scrollback, app, &theme, strings),
         Page::Sessions => render_session_view(frame, bands.scrollback, app, &theme, strings),
         Page::Files | Page::Changes => {
             render_file_view(frame, bands.scrollback, app, &theme, strings)
@@ -2015,6 +2016,163 @@ fn page_frame(
 /// this is a real surface rather than a grey sentence: what the client is, what
 /// it can do, and the keys that get started. It is laid out as a hero on a wide
 /// terminal and stacked on a narrow one, because the same block cannot be both.
+/// The page a new session starts on: the mark, and the prompt under it.
+///
+/// A reader who asks for a new session wants to *write*, so the page hands them
+/// the composer and shows what the message will be sent through — the Agent, the
+/// model, the workspace — rather than asking them a question about it first. The
+/// session itself is created by sending: its title comes from the message, which
+/// is where a title comes from anyway.
+fn render_new_session(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if area.height < 4 || area.width < 24 {
+        empty_state(frame, area, theme, strings.session_new());
+        return;
+    }
+    let lit = app.composing_page_shines();
+    let mark = crate::logo::rows(theme, app.animation_phase(), lit);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Room for the mark, a blank row, the lines under it and the hint, or the
+    // mark is dropped and the words speak for themselves.
+    let mark_fits = area.height as usize >= mark.len() + 9;
+    if mark_fits {
+        lines.push(Line::from(""));
+        let indent = usize::from(area.width).saturating_sub(crate::logo::width(theme.glyphs())) / 2;
+        lines.extend(mark.into_iter().map(|line| {
+            let mut spans = vec![Span::raw(" ".repeat(indent))];
+            spans.extend(line.spans);
+            Line::from(spans)
+        }));
+    }
+    lines.push(Line::from(""));
+    let heading = vec![Span::styled(
+        strings.session_new().to_string(),
+        Style::default()
+            .fg(theme.roles.foreground)
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.push(centred(area.width, heading));
+    lines.push(centred(
+        area.width,
+        vec![Span::styled(
+            format!("vibex {}", env!("CARGO_PKG_VERSION")),
+            theme.dimmed(theme.roles.gray_dim),
+        )],
+    ));
+    lines.push(Line::from(""));
+
+    // What the message will be sent through, and where. Both are answers the
+    // reader needs before writing, and both are one key away from changing.
+    let (agent, model) = app.composer_runtime_labels();
+    let runtime = if model.is_empty() {
+        agent
+    } else {
+        format!("{agent} · {model}")
+    };
+    lines.push(setting_row(
+        area.width,
+        strings.session_runtime_label(),
+        &runtime,
+        theme,
+        Some(strings.runtime_switch_hint()),
+    ));
+    // A path is longer than any terminal: the tail is the part that says where
+    // the session will work, so that is the part kept.
+    lines.push(setting_row(
+        area.width,
+        strings.session_workspace_label(),
+        &app.new_session_workspace(),
+        theme,
+        Some(strings.workspace_switch_hint()),
+    ));
+    lines.push(Line::from(""));
+
+    // The draft's own vocabulary, spelled out: the page is the one place a
+    // first-time reader has nothing else to read.
+    let hints = [
+        ("/", strings.composer_command_menu()),
+        ("@", strings.composer_file_menu()),
+        ("$", strings.composer_skill_menu()),
+    ];
+    let mut spans = vec![Span::raw("  ")];
+    for (index, (key, label)) in hints.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", theme.dimmed(theme.roles.gray_dim)));
+        }
+        spans.push(Span::styled(
+            format!("{key} "),
+            Style::default().fg(theme.roles.accent_user),
+        ));
+        spans.push(Span::styled(
+            label.to_string(),
+            theme.dimmed(theme.roles.gray),
+        ));
+    }
+    lines.push(Line::from(spans));
+
+    // Centred as a block, the way the desktop's page is: the mark sits over the
+    // prompt it belongs to rather than hanging at the top of a tall band.
+    let body = lines.len().min(usize::from(area.height));
+    let top = usize::from(area.height).saturating_sub(body) / 3;
+    let region = Rect {
+        y: area.y + top as u16,
+        height: body as u16,
+        ..area
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)), region);
+}
+
+/// The width of the label column on the new-session page.
+const SETTING_LABEL_COLUMN: usize = 9;
+
+/// One `label  value  hint` row of the new-session page.
+fn setting_row(
+    width: u16,
+    label: &str,
+    value: &str,
+    theme: &TuiTheme,
+    hint: Option<&str>,
+) -> Line<'static> {
+    let hint = hint.map(|hint| format!("  {hint}")).unwrap_or_default();
+    // A fixed label column, so the values of two rows line up whatever the
+    // language says the labels are.
+    let label_column = SETTING_LABEL_COLUMN;
+    let padded = format!("{label:<label_column$} ");
+    // The row is centred, so it must not be wider than the terminal: the value
+    // takes what is left after the label and the hint.
+    let budget = usize::from(width)
+        .saturating_sub(padded.chars().count() + hint.chars().count() + 2)
+        .max(8);
+    // A path keeps its tail — the directory the session works in is the end of
+    // it — and anything else keeps its head.
+    let value = compact_path(value, budget);
+    let used = padded.chars().count() + value.chars().count() + hint.chars().count() + 2;
+    let indent = usize::from(width).saturating_sub(used) / 2;
+    Line::from(vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(padded, theme.dimmed(theme.roles.gray_dim)),
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(theme.roles.foreground),
+        ),
+        Span::styled(hint, theme.dimmed(theme.roles.gray)),
+    ])
+}
+
+/// One centred line of already-styled spans.
+fn centred(width: u16, spans: Vec<Span<'static>>) -> Line<'static> {
+    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let indent = usize::from(width).saturating_sub(used) / 2;
+    let mut out = vec![Span::raw(" ".repeat(indent))];
+    out.extend(spans);
+    Line::from(out)
+}
+
 fn render_welcome(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2275,10 +2433,15 @@ fn render_composer(
         theme.roles.gray_dim
     };
 
-    let title = app
-        .active_session()
-        .map(|session| session.title.clone())
-        .unwrap_or_else(|| strings.product_tagline().to_string());
+    let title = match app.page {
+        // The box is where a session is born, so it is titled with the page
+        // rather than with the session the reader is about to leave behind.
+        crate::app::Page::NewSession => strings.session_new().to_string(),
+        _ => app
+            .active_session()
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| strings.product_tagline().to_string()),
+    };
 
     let block = bordered(theme)
         .border_style(Style::default().fg(border_color))
@@ -2570,8 +2733,25 @@ fn render_composer_info(
     };
 
     let mut line = Vec::new();
-    // Model identity, when the session has one.
-    if let Some(session) = app.active_session() {
+    // Model identity: the session's own, or — on the page where a session is
+    // being written — the one the new message would be sent through, because
+    // choosing it is what that page is for.
+    if app.page == Page::NewSession && app.active_session().is_none() {
+        let (agent, model) = app.composer_runtime_labels();
+        line.push(Span::styled(
+            agent,
+            flag(theme).add_modifier(Modifier::BOLD),
+        ));
+        if !model.is_empty() {
+            line.push(sep(theme));
+            line.push(Span::styled(model, flag(theme)));
+        }
+        line.push(sep(theme));
+        line.push(Span::styled(
+            strings.runtime_switch_hint().to_string(),
+            flag(theme),
+        ));
+    } else if let Some(session) = app.active_session() {
         // The Agent and model the draft will actually be sent through. The
         // catalogue's first entry is *not* that: a session keeps its own
         // runtime until the reader switches it, so naming the default here
@@ -4660,6 +4840,68 @@ fn render_overlay(
                 .collect::<Vec<_>>();
             let mut state = ratatui::widgets::ListState::default();
             state.select(Some((*selected).min(options.len().saturating_sub(1))));
+            frame.render_stateful_widget(List::new(items), layout.content, &mut state);
+        }
+        Overlay::WorkspacePicker { selected } => {
+            let listing = app.workspace_browse.clone();
+            let path = listing
+                .as_ref()
+                .map(|listing| listing.path.clone())
+                .unwrap_or_default();
+            let title = format!(
+                "{}  {}",
+                strings.session_workspace_label(),
+                compact_path(&path, 40)
+            );
+            let chrome = modal_chrome(
+                app,
+                &title,
+                ModalSizing::picker(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("Enter", strings.hint_select()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
+            );
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
+            let entries = listing
+                .as_ref()
+                .map(|listing| listing.entries.clone())
+                .unwrap_or_default();
+            let items = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let style = if index == *selected {
+                        theme.selected()
+                    } else {
+                        theme.base()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            if index == *selected { "❯ " } else { "  " }.to_string(),
+                            Style::default().fg(theme.roles.accent_user),
+                        ),
+                        Span::styled(truncate_to_width(&entry.name, 44, "…"), style),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                // An empty directory is a fact, not an error: say so where the
+                // rows would have been.
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  {}", strings.workspace_empty()),
+                        theme.dimmed(theme.roles.gray_dim),
+                    ))),
+                    layout.content,
+                );
+                return;
+            }
+            let mut state = ratatui::widgets::ListState::default();
+            state.select(Some((*selected).min(items.len() - 1)));
             frame.render_stateful_widget(List::new(items), layout.content, &mut state);
         }
         Overlay::BlockDetails { block, scroll } => {

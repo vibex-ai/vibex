@@ -36,6 +36,12 @@ use crate::view::SeatKind;
 pub enum Page {
     Sessions,
     Agent,
+    /// Writing the first message of a session that does not exist yet.
+    ///
+    /// A session is created by sending, not by answering a prompt about it: the
+    /// reader who presses `n` wants to write, so the page they land on is a
+    /// prompt, with the runtime it will be sent through named beside it.
+    NewSession,
     Files,
     Changes,
     Terminal,
@@ -57,7 +63,7 @@ impl Page {
     pub const fn scope(self) -> Scope {
         match self {
             Page::Sessions => Scope::Sessions,
-            Page::Agent => Scope::Agent,
+            Page::Agent | Page::NewSession => Scope::Agent,
             Page::Files => Scope::Files,
             Page::Changes => Scope::Changes,
             Page::Terminal => Scope::Terminal,
@@ -78,8 +84,14 @@ impl Page {
     pub const fn is_session_page(self) -> bool {
         matches!(
             self,
-            Page::Agent | Page::Files | Page::Changes | Page::Terminal
+            Page::Agent | Page::NewSession | Page::Files | Page::Changes | Page::Terminal
         )
+    }
+
+    /// Whether the page exists to write a message: the composer owns the
+    /// keyboard, and the bands a session's view needs are the ones it shows.
+    pub const fn is_composing_page(self) -> bool {
+        matches!(self, Page::Agent | Page::NewSession)
     }
 }
 
@@ -149,6 +161,13 @@ pub enum Overlay {
     },
     /// The runtime and model picker.
     RuntimePicker { selected: usize },
+    /// The directory the next session will work in.
+    ///
+    /// A picker rather than a text field: the reader is choosing a directory
+    /// that exists on the *runtime's* host, which this client cannot list for
+    /// itself, and typing a path from memory is how a session ends up in a
+    /// directory nobody meant.
+    WorkspacePicker { selected: usize },
     /// A read-only detail view for one transcript block.
     BlockDetails { block: usize, scroll: usize },
     /// The key-binding editor: every binding, rebindable in place.
@@ -175,7 +194,6 @@ pub enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptField {
     RenameSession,
-    NewSessionTitle,
     WorkspacePath,
     CommitMessage,
     ProviderSecret,
@@ -447,6 +465,13 @@ pub struct App {
     /// The workspace chosen in the workspace browser, consumed by the
     /// new-session prompt.
     pub workspace_path: Option<String>,
+    /// The message the composing page was holding when the session was asked
+    /// for. The send needs a session id, and the id only exists once the runtime
+    /// answers — so the message waits here for exactly one round trip.
+    pub pending_new_session: Option<crate::composer::Outgoing>,
+    /// The Agent and model chosen on the composing page, before there is a
+    /// session to move. It is the runtime the session is *created* with.
+    pub new_session_runtime: Option<vibex_core::SessionRuntimeSelection>,
     /// In-progress elicitation answers.
     pub elicitation_draft: crate::reduce::ElicitationDraft,
     /// Whether the usage page shows this session or the aggregate.
@@ -845,6 +870,8 @@ impl App {
             runtime_options: None,
             runtime_picker_pending: false,
             workspace_path: None,
+            pending_new_session: None,
+            new_session_runtime: None,
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
             usage_scope_session: true,
             session_cards: std::collections::BTreeSet::new(),
@@ -972,10 +999,89 @@ impl App {
     /// The index of the open session's runtime choice in the loaded catalogue.
     pub fn current_runtime_option_index(&self) -> Option<usize> {
         let catalog = self.runtime_options.as_ref()?;
+        if self.active_session().is_none()
+            && let Some(chosen) = self.new_session_runtime.as_ref()
+        {
+            return catalog
+                .options
+                .iter()
+                .position(|option| &option.selection == chosen);
+        }
         catalog
             .options
             .iter()
             .position(|option| self.runtime_option_is_current(option))
+    }
+
+    /// The Agent and model a message from this page will be sent through.
+    ///
+    /// Read from the session's own runtime selection rather than from the
+    /// catalogue's first entry: a session keeps the runtime it was created with
+    /// until the reader switches it, and the page has to name that one.
+    pub fn composer_runtime_labels(&self) -> (String, String) {
+        if let Some(option) = self
+            .current_runtime_option_index()
+            .and_then(|index| self.runtime_options.as_ref()?.options.get(index))
+        {
+            return (option.agent_label.clone(), option.model_label.clone());
+        }
+        let agent = self
+            .session_runtime_selection()
+            .map(|selection| selection.agent_id.to_string())
+            .or_else(|| {
+                self.active_session()
+                    .map(|session| session.agent_id.to_string())
+            })
+            .or_else(|| {
+                self.runtime_options
+                    .as_ref()
+                    .and_then(|catalog| catalog.options.first())
+                    .map(|option| option.agent_label.clone())
+            })
+            .unwrap_or_else(|| self.strings.runtime_unavailable().to_string());
+        let model = self
+            .session_runtime_selection()
+            .and_then(|selection| selection.model.model_id())
+            .map(str::to_string)
+            .or_else(|| {
+                self.runtime_options
+                    .as_ref()
+                    .and_then(|catalog| catalog.options.first())
+                    .map(|option| option.model_label.clone())
+            })
+            .unwrap_or_default();
+        (agent, model)
+    }
+
+    /// Whether the page's mark is lit: it shines only on a page that waits.
+    pub fn composing_page_shines(&self) -> bool {
+        self.page == Page::NewSession && self.focus == Focus::Composer
+    }
+
+    /// The workspace a session created from the composing page will open in.
+    ///
+    /// The same answer [`Self::create_session_from_draft`] sends: the directory
+    /// the reader chose, else the one the open session already runs in.
+    pub fn new_session_workspace(&self) -> String {
+        self.workspace_path
+            .clone()
+            .or_else(|| {
+                self.active_session()
+                    .map(|session| session.workspace_root.clone())
+            })
+            .or_else(|| {
+                self.workspace_rows
+                    .first()
+                    .map(|workspace| workspace.workspace.root_path.clone())
+            })
+            // Nothing has told us where the runtime works yet; this client's own
+            // directory is the honest guess while the list is on its way.
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_default()
     }
 
     /// Workspace the session pages read from.
@@ -1158,6 +1264,7 @@ impl App {
     /// Row count for the page that currently owns the selection.
     pub fn page_row_count(&self) -> usize {
         match self.page {
+            Page::NewSession => 0,
             Page::Sessions => self.sidebar_rows().len(),
             Page::Management => ManagementRow::ALL.len(),
             Page::Devices => self.management_data.devices.len(),
@@ -1622,6 +1729,7 @@ impl App {
         match self.page {
             Page::Sessions => strings.nav_sessions(),
             Page::Agent => strings.nav_agent(),
+            Page::NewSession => strings.session_new(),
             Page::Files => strings.nav_files(),
             Page::Changes => strings.nav_changes(),
             Page::Terminal => strings.nav_terminal(),
@@ -1678,14 +1786,26 @@ impl App {
         self.transcript.is_animating()
     }
 
+    /// Whether anything on screen is moving without the reader's input.
+    ///
+    /// The composing page's mark shines; a turn's spinner turns. Everything
+    /// else holds still, which is what keeps an idle session at zero frames.
+    pub fn chrome_animating(&self) -> bool {
+        self.transcript_animating() || self.composing_page_shines()
+    }
+
     /// Step the running indicator. Returns whether a repaint is due.
     ///
     /// Streaming text does not need one: a delta marks the app dirty by itself,
     /// so a transcript with no other animation stays at zero frames.
     pub fn advance_transcript_animation(&mut self) -> bool {
         // The spinner runs while a turn is running or while the reader is being
-        // asked for something; nothing else in the interface moves on its own.
-        if self.turn_started.is_none() && self.pending_permission_count() == 0 {
+        // asked for something; the composing page's mark shines while it waits.
+        // Nothing else in the interface moves on its own.
+        if self.turn_started.is_none()
+            && self.pending_permission_count() == 0
+            && !self.composing_page_shines()
+        {
             return false;
         }
         self.animation_phase = self.animation_phase.wrapping_add(1);
@@ -1754,6 +1874,31 @@ impl App {
         // in the composer without a trip through `Tab`.
         self.focus = Focus::Composer;
         self.scroll = ScrollState::default();
+    }
+
+    /// Put a held draft back in the composer after a failed creation.
+    pub fn restore_pending_new_session(&mut self) {
+        if let Some(outgoing) = self.pending_new_session.take() {
+            self.composer.set_draft(outgoing.text, outgoing.images);
+        }
+    }
+
+    /// The effect that opens a freshly created session with the message that
+    /// asked for it.
+    ///
+    /// A draft that was only a request for a session — an empty one — is not
+    /// sent: the reader asked for a session, and an empty turn is not a message.
+    pub fn pending_send_effect(&mut self, session_id: VibexSessionId) -> Option<Effect> {
+        let outgoing = self.pending_new_session.take()?;
+        if outgoing.text.trim().is_empty() && outgoing.images.is_empty() {
+            return None;
+        }
+        let attachments = self.wire_attachments(&outgoing.images);
+        Some(Effect::SendMessage {
+            session_id,
+            text: outgoing.text,
+            attachments,
+        })
     }
 
     /// Take the keyboard into the composer, placing the caret when the click
@@ -2863,6 +3008,9 @@ pub enum Effect {
     CreateSession {
         workspace_root: String,
         title: Option<String>,
+        /// The runtime chosen on the composing page, when the reader made a
+        /// choice there: a session is created *with* an Agent, not moved to one.
+        runtime: Option<vibex_core::SessionRuntimeSelection>,
     },
     RenameSession {
         session_id: VibexSessionId,

@@ -350,8 +350,9 @@ Each row is three columns: the marker, the title, and the session's state,
 right-aligned in one column whose edge is the same on every row — measured in
 terminal cells, so a double-width title does not push its state out of line.
 The sidebar groups sessions by workspace and project — `g` folds the headings
-away for one flat run. `/` filters, `Enter` opens, `n` creates, `r` renames, `f`
-forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A` includes archived sessions.
+away for one flat run. `/` filters, `Enter` opens, `n` starts a new one, `r`
+renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A` includes
+archived sessions.
 `p` pins the selected session above the rest, and `Alt+↑`/`Alt+↓` move it
 through a manual order. Pinned rows always sort first, so a move across that
 line is refused with a message rather than silently doing nothing.
@@ -360,8 +361,30 @@ The arrangement — pins, order, folded groups and headings — is the reader's
 preference rather than the runtime's state, so it is written to
 `~/.vibex/tui-sidebar.json` beside the key file. A client with nowhere to write
 keeps it in memory for the run. Session creation picks a workspace through
-the authority's own directory browser, so a remote client chooses a path that
-exists where the Agent runs.
+the authority's own directory browser — `Ctrl+W` opens the picker over the
+runtime's listing, `u` climbs out of a directory, `Enter` chooses — so a remote
+client chooses a path that exists where the Agent runs, rather than typing one
+from memory.
+
+### New session
+
+`n` does not ask a question: it opens a page. The reader who asked for a session
+asked to *write*, so the page hands them the composer with the mark above it and
+the runtime the message will go through named under that — the Agent and model,
+the workspace, and the keys that change both (`Ctrl+G` for the runtime, `Ctrl+W`
+for the directory). The draft's own vocabulary is spelled out there too, because
+this is the one screen where a reader has nothing else to read.
+
+The session is created by *sending*, not by answering a dialog: the title comes
+from the message, which is where a title comes from anyway. A runtime chosen on
+the page is the one the session is born with — created with it, rather than
+moved to it afterwards — and `Esc` leaves the page with the words still in the
+box, so the gesture is repeatable.
+
+The mark is drawn from characters — block glyphs where the terminal has them,
+two rows of ASCII where it does not — and a light sweeps across it while the
+page waits. It is the client's only animation that is not a turn's spinner, and
+it stops the moment the reader leaves.
 
 `e` opens a detail card under the selected row — id, workspace, state, agent,
 model when it is known, the timestamps, and the message and turn counts for the

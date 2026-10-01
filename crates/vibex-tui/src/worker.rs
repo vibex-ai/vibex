@@ -257,13 +257,19 @@ impl Dispatch {
             Effect::CreateSession {
                 workspace_root,
                 title,
+                runtime,
             } => {
-                let runtime = match self.current_runtime_selection().await {
-                    Ok(selection) => selection,
-                    Err(error) => {
-                        self.failure("create_session", error);
-                        return;
-                    }
+                // The page may have chosen one; otherwise the first available
+                // catalogue entry is what a new session gets.
+                let runtime = match runtime {
+                    Some(selection) => selection,
+                    None => match self.current_runtime_selection().await {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            self.failure("create_session", error);
+                            return;
+                        }
+                    },
                 };
                 let request = payloads::create_session(workspace_root, title, runtime);
                 match self.facade.agent().create_session(request).await {
