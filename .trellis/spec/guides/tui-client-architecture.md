@@ -667,6 +667,17 @@ is never a column count.
   exist first. The page is a session page for the *composer*
   (`is_composing_page`), so the composer owns the keyboard; `Esc` returns to the
   session list with the draft intact.
+* **The page's choices belong to the page until a creation consumes them.**
+  Entering the composing page keeps the Agent and the directory already chosen
+  for it: `Ctrl+G` and `Ctrl+W` are global, so a reader who picked either from
+  the list picked it for the session they are about to write, and resetting the
+  choice on the way in (`begin_new_session`) is how their choice went nowhere.
+  A creation is what consumes both — `enter_creating_session` clears the
+  directory, and the Agent the creation carried is what the view that waits for
+  it names — so the page a reader comes back to afterwards names the directory of
+  the session they are in rather than one chosen for a session that already
+  exists. The page *shows* what it holds (the hero's runtime and workspace rows),
+  so a kept choice is never a silent one.
 * **The waiting mark is the only chrome that animates by itself.**
   `chrome_animating` gates both the tick period and
   `advance_transcript_animation`, so a session that is merely open still costs

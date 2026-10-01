@@ -1967,10 +1967,17 @@ impl App {
     /// runtime it will be sent through named beside it. No session exists yet —
     /// the send creates it — so this only moves the reader to the page, and the
     /// workspace list comes along because the page names the directory.
+    ///
+    /// The page keeps the choices already made for it — the Agent and the
+    /// directory — because those belong to the page, not to the session behind
+    /// it: a reader who picked a directory from the list picked it for the
+    /// session they are about to write, and dropping it here is how a choice
+    /// went nowhere. A creation consumes both (`enter_creating_session`), so the
+    /// page a reader returns to afterwards names the directory of the session
+    /// they are in rather than one chosen for a session that already exists.
     fn begin_new_session(&mut self) -> Outcome {
         self.page = Page::NewSession;
         self.focus = Focus::Composer;
-        self.workspace_path = None;
         let mut effects = vec![Effect::ListWorkspaces];
         // The page names the Agent the session will be created with and offers
         // its run options, so the catalogue is read on the way in rather than
@@ -4043,6 +4050,93 @@ mod tests {
                 .as_ref()
                 .and_then(|selection| selection.reasoning_effort.as_deref()),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn writing_a_new_session_leaves_the_open_one_where_it_was() {
+        // The reported flow, end to end: a codex session is open and the reader
+        // goes back to the list, picks deepseek-harness for the session they are
+        // about to write, presses `n` and sends. The new session is
+        // deepseek-harness and the codex session is still codex — the two
+        // choices never reach each other.
+        let mut app = capable_app();
+        let mut catalog = run_option_catalog();
+        let mut deepseek = catalog.options[0].clone();
+        deepseek.selection.agent_id = vibex_core::AgentId::parse("deepseek-harness").expect("id");
+        deepseek.agent_label = "DeepSeek Harness".to_string();
+        deepseek.model_label = "deepseek-v4.1-flash".to_string();
+        catalog.options.push(deepseek);
+        let codex = catalog.options[1].selection.clone();
+        let picked = catalog.options[2].selection.clone();
+        app.runtime_options = Some(catalog);
+        app.new_session_runtime = None;
+        session_on(&mut app, codex.clone());
+        app.navigate_to(Page::Sessions);
+
+        // The reader chooses the next session's Agent while looking at the list.
+        app.show_runtime_picker();
+        assert_eq!(app.current_runtime_option_index(), Some(0));
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: 2,
+        });
+        let chosen = app.perform(Intent::ConfirmOverlay);
+        assert!(switched(&chosen).is_none(), "{chosen:?}");
+        assert_eq!(app.composer_runtime_labels().0, "DeepSeek Harness");
+
+        // `n`, write, send: the creation carries what the page named.
+        app.perform(Intent::NewSession);
+        assert_eq!(app.composer_runtime_labels().0, "DeepSeek Harness");
+        app.composer.insert_str("a deepseek thing");
+        let created = created_runtime(&app.perform(Intent::SubmitComposer))
+            .expect("the page named a runtime and created with none");
+        assert_eq!(created.agent_id, picked.agent_id);
+
+        // And the session the reader came from is still the Agent it was.
+        assert_eq!(
+            app.session_runtime_selection()
+                .map(|selection| selection.agent_id.clone()),
+            Some(codex.agent_id),
+            "writing a new session moved the open one"
+        );
+    }
+
+    #[test]
+    fn a_directory_chosen_off_the_page_belongs_to_the_next_session() {
+        // The workspace key is global like the runtime one, and the same rule
+        // applies: a directory chosen while the page shows no session is the
+        // next session's, so `n` keeps the reader's choice instead of dropping
+        // it on the way in. A creation consumes it, so the page a reader comes
+        // back to names the session's own directory rather than one chosen for a
+        // session that already exists.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.navigate_to(Page::Sessions);
+        // What the picker stores when a directory is chosen from the list.
+        app.workspace_path = Some("/home/peatboy/notes".to_string());
+
+        app.perform(Intent::NewSession);
+        assert_eq!(
+            app.new_session_workspace(),
+            "/home/peatboy/notes",
+            "the page dropped the directory the reader chose for it"
+        );
+
+        app.composer.insert_str("write here");
+        let created = app.perform(Intent::SubmitComposer);
+        let Some(Effect::CreateSession { workspace_root, .. }) = created
+            .effects
+            .iter()
+            .find(|effect| matches!(effect, Effect::CreateSession { .. }))
+        else {
+            panic!("no session was asked for: {created:?}");
+        };
+        assert_eq!(workspace_root, "/home/peatboy/notes");
+        assert!(
+            app.workspace_path.is_none(),
+            "the page kept a directory the session took"
         );
     }
 
