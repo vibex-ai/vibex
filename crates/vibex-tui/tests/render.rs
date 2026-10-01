@@ -3728,6 +3728,158 @@ fn the_new_session_page_names_the_agent_it_will_be_created_with() {
 }
 
 #[test]
+fn the_new_session_page_does_not_wear_the_session_behind_it() {
+    // A reader who leaves a running session to write a new one is on a page
+    // with no session of its own. The turn line, the clock and the composer's
+    // status answer for the page: a running turn behind it, a turn streaming
+    // into it, and its plan are all that session's own page, not this one.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let mut behind = seeded_session("session_behind0001", "a long turn behind the page");
+    behind.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![behind.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(behind.id.clone());
+    app.agent.state.active_session.resolve(behind.clone());
+    app.navigate_to(Page::Agent);
+    // The clock is the session's: it has been running for a while.
+    app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(189));
+    app.turn_tokens = Some(4_096);
+    app.sync_transcript();
+    assert!(app.is_animating(), "the running session is not animating");
+    assert!(app.turn_elapsed().is_some());
+    let session_screen = text(&render(&mut app, 120, 40));
+    assert!(
+        session_screen.contains("Running") || session_screen.contains("运行中"),
+        "the session's own page does not read as running:\n{session_screen}"
+    );
+
+    app.perform(Intent::NewSession);
+    app.sync_turn_clock();
+
+    // The page's own answers: no turn, no clock, no tokens, no activity.
+    assert!(
+        !app.turn_reads_running(),
+        "the page read the session as running"
+    );
+    assert!(!app.session_running());
+    assert!(
+        app.turn_elapsed().is_none(),
+        "the page kept the session's clock"
+    );
+    assert!(app.turn_tokens().is_none());
+    assert!(app.current_activity().is_none());
+    assert!(
+        !app.transcript_animating(),
+        "the page animates for a transcript it does not draw"
+    );
+    // The mark still shines while the page waits, so the page is alive — but
+    // for itself, not for the turn behind it.
+    assert!(app.composing_page_shines());
+    // The clock itself keeps counting: it is the session's, and the reader who
+    // goes back to it must find the turn's real elapsed time.
+    assert!(
+        app.turn_started.is_some(),
+        "the session's clock was thrown away"
+    );
+
+    let page_screen = text(&render(&mut app, 120, 40));
+    assert!(
+        page_screen.contains("New session"),
+        "the composing page is not on screen:\n{page_screen}"
+    );
+    assert!(
+        !page_screen
+            .chars()
+            .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(character)),
+        "the session's turn spinner is on the composing page:\n{page_screen}"
+    );
+    assert!(
+        !page_screen.contains("3m09s") && !page_screen.contains("189"),
+        "the session's clock is on the composing page:\n{page_screen}"
+    );
+    assert!(
+        !page_screen.contains("4.1k") && !page_screen.contains("4096"),
+        "the session's tokens are on the composing page:\n{page_screen}"
+    );
+    assert!(
+        !page_screen.contains("Steer · Ctrl+S"),
+        "the page offers to steer a turn it does not have:\n{page_screen}"
+    );
+    assert!(
+        page_screen.contains("Send a message"),
+        "the empty page does not offer its own prompt:\n{page_screen}"
+    );
+}
+
+#[test]
+fn steering_on_the_new_session_page_keeps_the_draft_out_of_the_session_behind() {
+    // `Ctrl+S` steers the turn of the session the reader is *in*. On the page
+    // where a session is being written there is no such turn, and steering the
+    // one behind the page would deliver the draft to the Agent the reader is
+    // leaving — the exact Agent they did not choose.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let mut behind = seeded_session("session_behind0002", "codex turn");
+    behind.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![behind.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(behind.id.clone());
+    app.agent.state.active_session.resolve(behind);
+
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("this belongs to the new session");
+    let outcome = app.perform(Intent::SteerRunningTurn);
+    assert!(
+        outcome.effects.is_empty(),
+        "the draft was steered into the session behind the page: {outcome:?}"
+    );
+    assert_eq!(
+        app.composer.text(),
+        "this belongs to the new session",
+        "the draft left the composer for another session"
+    );
+    assert!(
+        app.toast.is_some(),
+        "the refusal says nothing to the reader"
+    );
+}
+
+#[test]
+fn the_composing_page_never_names_the_agent_behind_it() {
+    // The catalogue has not arrived — the page cannot name the entry it will
+    // create with — and the session behind it is a codex one. The page must
+    // still not name that Agent: it names the entry a creation with no choice
+    // would use once the catalogue lands, and says the runtime is unavailable
+    // when it never does.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let mut open = seeded_session("session_behind0003", "codex session");
+    open.agent_id = vibex_core::AgentId::parse("codex").expect("agent id");
+    app.agent
+        .apply_sessions(Ok(vec![open.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(open.id.clone());
+    app.agent.state.active_session.resolve(open);
+    app.perform(Intent::NewSession);
+
+    assert_eq!(
+        app.composer_runtime_labels().0,
+        app.strings.runtime_unavailable()
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        !screen.contains("codex"),
+        "the page named the Agent behind it:\n{screen}"
+    );
+}
+
+#[test]
 fn the_composing_page_can_choose_the_directory_it_works_in() {
     use vibex_tui::action::Intent;
     let mut app = app(100, 30);
@@ -4455,40 +4607,59 @@ fn the_creating_session_view_waits_for_its_session() {
     // screen — and an `Esc` there does not walk the reader into another
     // session's view, which does not exist yet.
     use vibex_tui::action::Intent;
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bai".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
     let mut app = app(110, 30);
     app.live = vibex_tui::app::LiveState::Ready;
+    // The entry the reader picks is *not* the catalogue's first, so a view that
+    // named the default here would name an Agent the session is not being made
+    // with.
     app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
         revision: 1,
         agents: Vec::new(),
         auth_sources: Vec::new(),
-        options: vec![vibex_core::SessionRuntimeOption {
-            selection: vibex_core::SessionRuntimeSelection::provider(
-                vibex_core::AgentId::parse("deepseek").expect("agent id"),
-                vibex_core::ProviderProfileId::new(),
-                "deepseek-v4.1-flash",
-            ),
-            agent_label: "DeepSeek Harness".to_string(),
-            auth_source_label: "bai".to_string(),
-            model_label: "deepseek-v4.1-flash".to_string(),
-            reasoning_efforts: Vec::new(),
-            modes: Vec::new(),
-            features: Vec::new(),
-            availability: vibex_core::RuntimeOptionAvailability::Available,
-        }],
+        options: vec![
+            option("claude", "claude-sonnet"),
+            option("deepseek", "deepseek-v4.1-flash"),
+        ],
     });
     app.perform(Intent::NewSession);
+    app.show_runtime_picker();
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::ConfirmOverlay);
+    assert_eq!(
+        app.composer_runtime_labels().0,
+        "deepseek",
+        "the page did not take the reader's pick"
+    );
     app.composer.insert_str("first message");
     app.perform(Intent::SubmitComposer);
 
     let screen = text(&render(&mut app, 110, 30));
     assert!(screen.contains("first message"), "{screen}");
     assert!(
-        screen.contains("DeepSeek Harness"),
-        "the runtime being used is not named:\\n{screen}"
+        screen.contains("deepseek · deepseek-v4.1-flash"),
+        "the runtime being used is not named:\n{screen}"
+    );
+    assert!(
+        !screen.contains("claude"),
+        "the creating view named the catalogue's default:\n{screen}"
     );
     assert!(
         screen.contains(app.strings.running()) || screen.contains("ctrl"),
-        "the view does not read as working:\\n{screen}"
+        "the view does not read as working:\n{screen}"
     );
     // Nothing about a session that does not exist yet is selectable state: the
     // view is the new session's, and only its own message is in it.

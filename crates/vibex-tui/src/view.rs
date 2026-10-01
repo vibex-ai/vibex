@@ -597,30 +597,32 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
 /// What the frame wants on screen, given the current state.
 fn band_request(app: &App) -> crate::layout::BandRequest {
+    // Everything from the turn line down belongs to the session view. On the
+    // session list the active session's plan and turn state are not what the
+    // reader is looking at, and printing them above the list is how a global
+    // page ends up wearing another page's chrome. The page where a session is
+    // being written is the same case from the other side: it is a page with a
+    // composer, not a session, so the session behind it — which the reader is
+    // leaving — must not put its turn, plan or held queue on it.
+    let session_view = app.page.is_session_page() && app.page_owns_session();
     // A send the runtime has not answered yet counts as running: the reader
     // pressed Enter, and the round trip must not read as "idle, message lost".
     let running = app.turn_reads_running();
-    // The turn line is present whenever there is something to say about the
-    // turn: it is running, or it is waiting on the reader.
     // Present whenever there is something to say about the turn: it is running,
     // it is waiting on the reader, or it is idle with a live session to report.
     let turn_status = u16::from(
-        running
-            || app.is_animating()
-            || app.pending_permission_count() > 0
-            || app.pending_elicitations() > 0
-            || app.active_session().is_some()
-            || app.turn_started.is_some(),
+        session_view
+            && (running
+                || app.is_animating()
+                || app.page_approval_count() > 0
+                || app.page_elicitation_count() > 0
+                || app.active_session().is_some()
+                || app.turn_started.is_some()),
     );
     // Only the open session's queue is drawn: the band is above *this*
     // composer, and a message held for another session is not this reader's to
     // see or act on here.
     let queued = app.queued_for_active().len() as u16;
-    // Everything from the turn line down belongs to the session view. On the
-    // session list the active session's plan and turn state are not what the
-    // reader is looking at, and printing them above the list is how a global
-    // page ends up wearing another page's chrome.
-    let session_view = app.page.is_session_page();
     crate::layout::BandRequest {
         // The tasks row appears only when background work exists, so an idle
         // session spends no rows on it.
@@ -641,7 +643,7 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         } else {
             (queued + 1).min(5)
         },
-        turn_status: if session_view { turn_status } else { 0 },
+        turn_status,
         banner: u16::from(app.banner.is_some()),
         dock: if session_view && app.dock_open {
             app.dock_height()
@@ -1602,8 +1604,8 @@ fn render_turn_status(
     let phase = app.animation_phase();
 
     let running = app.turn_reads_running();
-    let approvals = app.pending_permission_count();
-    let questions = app.pending_elicitations();
+    let approvals = app.page_approval_count();
+    let questions = app.page_elicitation_count();
 
     let (icon, label, color) = if approvals + questions > 0 {
         (
@@ -1615,7 +1617,7 @@ fn render_turn_status(
             ),
             theme.roles.accent_attention,
         )
-    } else if running || app.transcript.is_animating() {
+    } else if running || app.transcript_animating() {
         (
             crate::glyphs::frame_at(
                 crate::glyphs::spinner_frames(tier),
@@ -2040,11 +2042,17 @@ fn render_status_band(
 
     // ---- left: the location ---------------------------------------------
     let mut left = Vec::new();
-    let location = app
-        .active_session()
-        .map(|session| session.workspace_root.clone())
-        .or_else(|| app.workspace_path.clone())
-        .unwrap_or_else(|| app.page_label(strings).to_string());
+    // The composing page names the directory the session it is writing will
+    // open in — the one the reader picked, else the open session's — rather
+    // than the session behind the page, which the reader is leaving.
+    let location = if app.page_owns_session() {
+        app.active_session()
+            .map(|session| session.workspace_root.clone())
+            .or_else(|| app.workspace_path.clone())
+    } else {
+        Some(app.new_session_workspace())
+    }
+    .unwrap_or_else(|| app.page_label(strings).to_string());
     left.push(Span::styled(
         compact_path(&location, usize::from(area.width) / 3),
         Style::default().fg(theme.roles.path),
@@ -2165,6 +2173,11 @@ fn take_width_from_end(path: &str, budget: usize) -> String {
 /// Vibex records tokens and not prices, so this is the only quantitative status
 /// the interface can honestly show.
 fn context_usage_spans(app: &App, theme: &TuiTheme) -> Option<Vec<Span<'static>>> {
+    // The numbers are a session's own: the composing page has none, and what was
+    // read for the session behind it is not this page's context.
+    if !app.page_owns_session() {
+        return None;
+    }
     let usage = app.management_data.usage_session.as_ref()?;
     let used = usage.total_tokens.unwrap_or(0);
     let total = usage.context_window_size_tokens?;
@@ -3042,9 +3055,10 @@ fn render_composer_info(
     // A continuation counting down is drawn where the reader is looking when
     // they are inside the session — the Desktop puts the same seconds on its
     // composer — so a message that is about to be sent on its own never
-    // arrives unannounced.
+    // arrives unannounced. A page writing a new session has no session whose
+    // continuation it could be.
     if let Some(seconds) = app
-        .selected_session_id()
+        .page_session_id()
         .and_then(|session_id| app.auto_continue.countdown_seconds(session_id))
     {
         line.push(sep(theme));
@@ -3070,7 +3084,7 @@ fn render_composer_info(
             flag(theme),
         ));
     }
-    let pending = app.pending_permission_count();
+    let pending = app.page_approval_count();
     if pending > 0 {
         line.push(sep(theme));
         line.push(Span::styled(

@@ -1236,6 +1236,34 @@ impl App {
         self.agent.state.active_session.value.as_ref()
     }
 
+    /// Whether the page in front of the reader is a session's own page.
+    ///
+    /// The composing page deliberately keeps the session it came from
+    /// *selected* — leaving the page has to return there — but the reader is
+    /// writing a *new* session there, which does not exist yet. Everything that
+    /// describes "the session in front of the reader" — its turn and clock,
+    /// its queue, its plan, its approval count, the Agent its messages go
+    /// through — has to answer for the page, so while this is false those
+    /// answers are empty rather than the session behind the page, which the
+    /// reader is leaving.
+    ///
+    /// The distinction is the *page*, not whether a session happens to be
+    /// selected: a send that is still creating its session has no session of
+    /// its own either, and the view that waits for it must still read as
+    /// working.
+    pub fn page_owns_session(&self) -> bool {
+        self.page != Page::NewSession
+    }
+
+    /// The session this page answers for, when it has one of its own.
+    pub fn page_session_id(&self) -> Option<&VibexSessionId> {
+        if self.page_owns_session() {
+            self.selected_session_id()
+        } else {
+            None
+        }
+    }
+
     /// Open the session view for a session that does not exist yet.
     ///
     /// The reader sent the first message and the runtime is still making the
@@ -1311,13 +1339,20 @@ impl App {
             .find(|option| option_is_selection(option, selection))
     }
 
-    /// The first catalogue entry a session may be created or switched on.
+    /// The catalogue entry a creation with no choice of its own would use.
+    ///
+    /// This is the worker's own rule — the first entry the catalogue says is
+    /// available, else the first one it publishes — deliberately mirrored here
+    /// rather than guessed at: the entry this names is exactly the one
+    /// [`Effect::CreateSession`] falls back to when the choice arrives empty, so
+    /// the page and the session it creates can never name two different Agents.
     fn default_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
-        self.runtime_options
-            .as_ref()?
+        let catalog = self.runtime_options.as_ref()?;
+        catalog
             .options
             .iter()
             .find(|option| option.availability == vibex_core::RuntimeOptionAvailability::Available)
+            .or_else(|| catalog.options.first())
             .map(|option| option.selection.clone())
     }
 
@@ -1343,6 +1378,12 @@ impl App {
     /// whose runtime has never been activated has no selection to read, so it
     /// gets none rather than the catalogue's first entry, which would offer
     /// another Agent's options over it.
+    ///
+    /// The view that waits for a session being created has neither: the session
+    /// it comes from is gone and the new one has no snapshot yet. The choice
+    /// the page held is what that creation was made with, so it answers in the
+    /// gap — naming the catalogue's default there would name an Agent this
+    /// client is not using.
     pub fn page_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
         if self.page == Page::NewSession {
             return self
@@ -1353,12 +1394,17 @@ impl App {
         if let Some(selection) = self.session_runtime_selection() {
             return Some(selection.clone());
         }
-        // Nothing is selected to answer with: a client with no session in front
-        // of it names the entry a creation with no choice would use.
+        // Nothing is selected to answer with. A session the client has selected
+        // but not loaded yet answers none, so the switcher cannot offer another
+        // Agent's options over it; a client with no session in front of it
+        // answers with the choice its page held, or with the entry a creation
+        // with no choice would use.
         if self.selected_session_id().is_some() {
             return None;
         }
-        self.default_runtime_selection()
+        self.new_session_runtime
+            .clone()
+            .or_else(|| self.default_runtime_selection())
     }
 
     /// The run options the page's selected Agent publishes.
@@ -1547,6 +1593,13 @@ impl App {
     /// from the session behind the page — naming that one is what promised an
     /// Agent the message would not go through. A choice the reader has tuned
     /// with a run option is still named by the entry it belongs to.
+    ///
+    /// The composing page has no session to fall back to either: when it holds
+    /// no choice — a catalogue that has not arrived, or one that publishes
+    /// nothing — it names the entry a creation with no choice would use, or
+    /// says the runtime is unavailable when the catalogue has none. Naming the
+    /// session behind the page here is what made the page claim codex while the
+    /// creation used the catalogue's default.
     pub fn composer_runtime_labels(&self) -> (String, String) {
         if let Some(selection) = self.page_runtime_selection() {
             if let Some(option) = self.runtime_option_for(&selection) {
@@ -1563,14 +1616,15 @@ impl App {
                     .unwrap_or_default(),
             );
         }
-        // Nothing is selected to read: an open session — or the row the list
+        // Nothing is selected to read. An open session — or the row the list
         // holds for it, while its runtime state is still arriving — still names
-        // its Agent, and a client with no session at all falls back to the
-        // catalogue's first entry, which is what a creation would use.
-        if let Some(session) = self.active_session().or_else(|| {
-            self.selected_session_id()
-                .and_then(|session_id| self.session_by_id(session_id))
-        }) {
+        // its Agent, but only on that session's own page.
+        if self.page_owns_session()
+            && let Some(session) = self.active_session().or_else(|| {
+                self.selected_session_id()
+                    .and_then(|session_id| self.session_by_id(session_id))
+            })
+        {
             return (session.agent_id.to_string(), String::new());
         }
         match self
@@ -2402,8 +2456,12 @@ impl App {
     }
 
     /// Whether the dock owns the list keys right now.
+    ///
+    /// The dock is a session's own panel — delegated agents, its plan, its held
+    /// queue — so the composing page has none: the flag survives the visit and
+    /// the panel returns with the session it belongs to.
     pub fn dock_is_focused(&self) -> bool {
-        self.dock_open && self.dock_selection.is_some()
+        self.page_owns_session() && self.dock_open && self.dock_selection.is_some()
     }
 
     /// How much background work the session is running.
@@ -2418,8 +2476,12 @@ impl App {
     /// The runtime publishes a plan as a `TodoUpdate` (or `Plan`) timeline row
     /// whose body is one `Status: title` line per step, so the progress bar is
     /// derived from the transcript the reader can see rather than from a second
-    /// source of truth that could disagree with it.
+    /// source of truth that could disagree with it. The composing page has no
+    /// session whose plan it could be, so it answers none.
     pub fn todo_progress(&self) -> Option<TodoProgress> {
+        if !self.page_owns_session() {
+            return None;
+        }
         // The projection, not the transcript: a plan update is bookkeeping the
         // transcript deliberately does not draw, and a progress band that
         // disappeared with the row it summarises would be worse than no band.
@@ -2464,18 +2526,28 @@ impl App {
     }
 
     /// What the Agent is doing right now, when the runtime reported it.
+    ///
+    /// The composing page has no Agent answering yet, so it reports nothing
+    /// rather than what the session behind the page happened to be doing.
     pub fn current_activity(&self) -> Option<String> {
-        self.activity.clone()
+        self.page_owns_session()
+            .then(|| self.activity.clone())
+            .flatten()
     }
 
     /// How long the running turn has been going.
     pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
+        if !self.page_owns_session() {
+            return None;
+        }
         self.turn_started.map(|started| started.elapsed())
     }
 
     /// Tokens spent by the running turn.
     pub fn turn_tokens(&self) -> Option<u64> {
-        self.turn_tokens
+        self.page_owns_session()
+            .then_some(self.turn_tokens)
+            .flatten()
     }
 
     /// A short label for the current page, used when there is no session.
@@ -2535,9 +2607,11 @@ impl App {
 
     /// Whether the transcript has a running block worth animating.
     ///
-    /// The interface repaints without input only while this is true.
+    /// The interface repaints without input only while this is true. The
+    /// composing page draws no transcript, so a turn streaming in the session
+    /// behind it is not something to repaint for.
     pub fn transcript_animating(&self) -> bool {
-        self.transcript.is_animating()
+        self.page_owns_session() && self.transcript.is_animating()
     }
 
     /// Whether anything on screen is moving without the reader's input.
@@ -2567,8 +2641,15 @@ impl App {
     /// no path can leave the clock running after the turn stopped — which would
     /// keep the client repainting for the rest of the session — or leave it at
     /// zero while the runtime works.
+    ///
+    /// The inquiry is page-independent even though the readout is not: the
+    /// composing page does not draw the clock, and a reader who steps out to
+    /// write a new session and comes back must find the turn's own elapsed time
+    /// rather than one that restarted when they returned.
     pub fn sync_turn_clock(&mut self) -> bool {
-        let running = self.turn_reads_running() || self.transcript.is_animating();
+        let running = self.open_session_is_running()
+            || self.pending_send_for_selected().is_some()
+            || self.transcript.is_animating();
         match (running, self.turn_started.is_some()) {
             (true, false) => {
                 self.turn_started = Some(std::time::Instant::now());
@@ -2592,11 +2673,33 @@ impl App {
     /// on the reader pulses. Everything else holds still, which is what keeps an
     /// idle session at zero frames.
     pub fn is_animating(&self) -> bool {
-        self.transcript.is_animating()
+        self.transcript_animating()
             || self.turn_reads_running()
-            || self.pending_permission_count() > 0
-            || self.pending_elicitations() > 0
+            || self.page_approval_count() > 0
+            || self.page_elicitation_count() > 0
             || self.composing_page_shines()
+    }
+
+    /// The approvals the page in front of the reader is waiting on.
+    ///
+    /// A session's approvals belong to its own page: the composing page is
+    /// writing a session that does not exist yet, so the count it shows is zero
+    /// rather than what the session behind it is waiting for.
+    pub fn page_approval_count(&self) -> usize {
+        if self.page_owns_session() {
+            self.pending_permission_count()
+        } else {
+            0
+        }
+    }
+
+    /// The questions the page in front of the reader is waiting on.
+    pub fn page_elicitation_count(&self) -> usize {
+        if self.page_owns_session() {
+            self.pending_elicitations()
+        } else {
+            0
+        }
     }
 
     pub fn tick(&mut self) -> crate::reduce::Outcome {
@@ -2991,31 +3094,58 @@ impl App {
 
     // ---- the send queue --------------------------------------------------
 
-    /// Whether the open session has a turn running.
-    pub fn session_running(&self) -> bool {
+    /// Whether the session behind the page has a turn running.
+    ///
+    /// Page-independent on purpose: the turn clock is the session's, not the
+    /// page drawing it, so a reader who steps out to write a new session and
+    /// comes back finds the turn's real elapsed time instead of one that
+    /// restarted on their return. Nothing draws this while the composing page
+    /// is up — see [`Self::session_running`].
+    fn open_session_is_running(&self) -> bool {
         self.active_session()
             .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running)
     }
 
-    /// Whether the open session *reads* as running.
+    /// Whether the page in front of the reader has a turn running.
+    ///
+    /// The composing page has no session of its own, so it never does: what the
+    /// session behind it is doing belongs to that session's own page.
+    pub fn session_running(&self) -> bool {
+        self.page_owns_session() && self.open_session_is_running()
+    }
+
+    /// Whether the page in front of the reader *reads* as running.
     ///
     /// A send that the runtime has not answered yet counts: the reader pressed
     /// Enter, and a client that shows "idle" for the round trip reads as one
-    /// that dropped the message.
+    /// that dropped the message. The composing page counts only the send it is
+    /// holding — none, because sending leaves it for the session view.
     pub fn turn_reads_running(&self) -> bool {
         self.session_running() || self.pending_send_for_active().is_some()
     }
 
-    /// The unconfirmed send for the open session, if there is one.
-    ///
-    /// A send whose session is still being created belongs to the reader as
-    /// well: they are looking at the page the session will open on, and the
-    /// message they just wrote is the only thing on it.
-    pub fn pending_send_for_active(&self) -> Option<&PendingSend> {
+    /// The unconfirmed send for the selected session, whichever page is up.
+    fn pending_send_for_selected(&self) -> Option<&PendingSend> {
         let pending = self.pending_send.as_ref()?;
         match pending.session_id.as_ref() {
             None => Some(pending),
             Some(session_id) => (self.selected_session_id() == Some(session_id)).then_some(pending),
+        }
+    }
+
+    /// The unconfirmed send for the page in front of the reader, if there is
+    /// one.
+    ///
+    /// A send whose session is still being created belongs to the reader as
+    /// well: they are looking at the page the session will open on, and the
+    /// message they just wrote is the only thing on it. A send that belongs to
+    /// the session behind the composing page does not: that page is writing a
+    /// new session, and the round trip of another one is not its state.
+    pub fn pending_send_for_active(&self) -> Option<&PendingSend> {
+        if self.page_owns_session() {
+            self.pending_send_for_selected()
+        } else {
+            None
         }
     }
 
@@ -3120,7 +3250,10 @@ impl App {
     /// away wherever they are — but what they see and act on is the queue of
     /// the session in front of them.
     pub fn queued_for_active(&self) -> Vec<usize> {
-        let Some(session_id) = self.selected_session_id() else {
+        // The composing page holds no session's queue: the messages it is
+        // written for belong to the session behind it, which the reader is
+        // leaving, and Enter there creates a session rather than holding one.
+        let Some(session_id) = self.page_session_id() else {
             return Vec::new();
         };
         self.queued_messages

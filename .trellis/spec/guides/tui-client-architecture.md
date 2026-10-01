@@ -175,6 +175,11 @@ Rules that make this work:
 * **Session-view bands only exist on session pages.** `band_request` gives the
   plan, queue, turn-status and dock bands zero height when the page has no
   session context, so the session list cannot wear the active session's chrome.
+  The composing page is that case from the other side: it is a session page for
+  the *composer* (`is_composing_page`), yet it has no session of its own, so
+  `band_request` gates those bands on `page_owns_session` as well — a running
+  turn, its elapsed clock, its plan and its held queue belong to the session the
+  reader is leaving, not to the page writing a new one.
 * **The composer is sized in wrapped rows, not newlines.** A draft that is one
   logical line can be several rows on screen, so `band_request` cannot know the
   prompt's height on its own: `render` computes the frame once to learn the
@@ -610,18 +615,35 @@ is never a column count.
   the Agent and model the page and the composer's info line name, the entry the
   picker opens on and marks as current, and the run options a view lists all
   come from `App::page_runtime_selection()` — the page's own choice, or the
-  catalogue's first available entry, which is what a creation with no choice
-  uses — and `Effect::CreateSession` carries that same selection instead of
-  leaving the runtime to reach for a default of its own.
+  entry a creation with no choice falls back to (`default_runtime_selection`
+  mirrors the worker's own rule: first available, else first published) — and
+  `Effect::CreateSession` carries that same selection instead of leaving the
+  runtime to reach for a default of its own. The rule is one predicate,
+  `App::page_owns_session()`: every session-scoped read that describes the page
+  — the turn and its clock, the queue, the plan, the dock, the approval count,
+  the steer key, the transcript's animation — answers empty while it is false.
+  Two exceptions are deliberate. The clock *keeps counting* behind the page
+  (`sync_turn_clock` asks the session, not the page) so a reader who steps out
+  and back finds the turn's real elapsed time; and the view that waits for a
+  session being created is not the composing page, so a send in flight still
+  reads as running there.
+* **The runtime a page names is the runtime it creates with.** A creation is
+  not allowed to land on an Agent the page never named: the page answers with
+  the catalogue's fallback entry when it has no choice of its own, and a send
+  from the composing page on a backend that *can* publish a catalogue reads it
+  instead of handing the choice to the runtime's default — the draft waits, and
+  the reader presses `Enter` again once the Agent has a name. Only a backend
+  that publishes no catalogue at all keeps the runtime's fallback, because there
+  is nothing there for the page to name.
 * **A new session is a page, not a dialog.** The reader who asks for one asked
   to write, so the gesture lands on a page that hands them the composer and
   names what the message will be sent through — Agent, model, workspace — with
-  the keys that change them. The session is created by *sending*: the title comes
-  from the message, and a runtime chosen on the page travels into
-  `Effect::CreateSession` rather than needing a session to exist first. The page
-  is a session page for the bands (`is_session_page`), so the composer owns the
-  keyboard and the status band is drawn; `Esc` returns to the session list with
-  the draft intact.
+  the keys that change them, and never the session behind it. The session is
+  created by *sending*: the title comes from the message, and a runtime chosen on
+  the page travels into `Effect::CreateSession` rather than needing a session to
+  exist first. The page is a session page for the *composer*
+  (`is_composing_page`), so the composer owns the keyboard; `Esc` returns to the
+  session list with the draft intact.
 * **The waiting mark is the only chrome that animates by itself.**
   `chrome_animating` gates both the tick period and
   `advance_transcript_animation`, so a session that is merely open still costs

@@ -327,6 +327,11 @@ strings! {
     composer_interrupt => { "Interrupt", "打断", "中斷" },
     composer_continue => { "Continue", "继续", "繼續" },
     composer_steer => { "Steer", "插话", "插話" },
+    composer_steer_no_session => {
+        "Nothing is running here yet — Enter sends this and creates the session",
+        "新会话还没有运行中的回合 — 按 Enter 发送并新建会话",
+        "新工作階段還沒有執行中的回合 — 按 Enter 傳送並新增工作階段"
+    },
     composer_steer_unavailable => {
         "Steering needs a local runtime — the turn will be interrupted and resent",
         "运行中插话需要本机运行时 — 将改为打断后重发",
@@ -509,6 +514,18 @@ strings! {
     runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },
     runtime_current => { "Current", "当前", "目前" },
     runtime_unavailable => { "Unavailable", "不可用", "無法使用" },
+    // A creation is named by the Agent it will run on; until the catalogue has
+    // arrived there is nothing to name, so the message waits.
+    runtime_catalogue_reading => {
+        "Reading the runtime catalogue — the message will wait",
+        "正在读取运行时列表 — 消息会先保留",
+        "正在讀取執行階段清單 — 訊息會先保留"
+    },
+    runtime_no_agents => {
+        "The runtime publishes no Agent to create a session with",
+        "运行时没有可用来新建会话的 Agent",
+        "執行階段沒有可用來新增工作階段的 Agent"
+    },
     // The run options the chosen Agent publishes, one Tab away from the
     // catalogue rows.
     runtime_run_options => { "Run options", "运行选项", "執行選項" },

@@ -1987,10 +1987,36 @@ impl App {
     /// should not then be asked to name it. The message waits in
     /// [`App::pending_new_session`] because a send needs a session id, and the
     /// id only exists once the runtime answers.
+    ///
+    /// The Agent is not asked for either, at this point: a session is created
+    /// *with* one, so a page that cannot name one reads the catalogue rather
+    /// than handing the choice to the runtime, which would land the session on
+    /// an Agent the reader never saw. A backend that publishes no catalogue at
+    /// all keeps the runtime's own fallback — there is nothing here to name.
     fn create_session_from_draft(&mut self) -> Outcome {
         if self.composer.is_empty() {
             self.toast(Toast::warning(self.strings.composer_empty().to_string()));
             return Outcome::quiet();
+        }
+        // Read before the page is left: the selection the page names is what the
+        // session is created with, and `enter_creating_session` is what clears
+        // the view of the session it came from.
+        let runtime = self.page_runtime_selection();
+        if runtime.is_none() && self.runtime_catalog_available() {
+            let message = if self.runtime_options.is_none() {
+                // The catalogue is on its way: the draft waits for the Agent
+                // that will answer it.
+                self.strings.runtime_catalogue_reading()
+            } else {
+                // A catalogue that publishes nothing is not going to answer.
+                self.strings.runtime_no_agents()
+            };
+            self.toast(Toast::warning(message.to_string()));
+            return if self.runtime_options.is_none() {
+                Outcome::effects(vec![Effect::ListRuntimeOptions])
+            } else {
+                Outcome::quiet()
+            };
         }
         let outgoing = self.composer.take_outgoing();
         self.completion = None;
@@ -2007,10 +2033,6 @@ impl App {
                     .map(|workspace| workspace.workspace.root_path.clone())
             })
             .unwrap_or_default();
-        // Read before the page is left: the selection the page names is what the
-        // session is created with, and `enter_creating_session` is what clears
-        // the view of the session it came from.
-        let runtime = self.page_runtime_selection();
         self.pending_new_session = Some(outgoing.clone());
         // The reader leaves the page with the message: the session view is
         // where it will be answered, so waiting on the page for the runtime to
@@ -2196,6 +2218,17 @@ impl App {
     fn steer_composer(&mut self) -> Outcome {
         if self.composer.is_empty() {
             self.toast(Toast::warning(self.strings.composer_empty().to_string()));
+            return Outcome::quiet();
+        }
+        // The composing page has no turn to interject into — the message it
+        // holds is what creates one — and the session behind it is not the
+        // reader's target: steering that one would deliver the draft to
+        // whatever they were looking at before, which is exactly the Agent they
+        // did not choose. The draft stays in the box for `Enter` to send.
+        if !self.page_owns_session() {
+            self.toast(Toast::warning(
+                self.strings.composer_steer_no_session().to_string(),
+            ));
             return Outcome::quiet();
         }
         let Some(session_id) = self.selected_session_id().cloned() else {
@@ -3932,6 +3965,110 @@ mod tests {
             .expect("the page named a runtime and created with none");
         assert_eq!(created.agent_id, agent_id);
         assert_eq!(created.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_send_waits_for_the_agent_it_will_be_created_with() {
+        // A session is created *with* an Agent, so a page that cannot name one
+        // reads the catalogue instead of handing the choice to the runtime —
+        // which would land the session on an Agent the reader never saw. The
+        // draft stays in the box for the `Enter` that follows.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("who answers this?");
+        let waiting = app.perform(Intent::SubmitComposer);
+        assert!(
+            waiting
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListRuntimeOptions)),
+            "the page did not read the catalogue: {waiting:?}"
+        );
+        assert!(
+            created_runtime(&waiting).is_none(),
+            "a session was created before an Agent could be named"
+        );
+        assert_eq!(app.composer.text(), "who answers this?");
+        assert!(app.pending_new_session.is_none());
+
+        // A catalogue that publishes nothing is not going to answer: the page
+        // says so rather than creating with a runtime the reader never chose.
+        app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: Vec::new(),
+        });
+        let refused = app.perform(Intent::SubmitComposer);
+        assert!(refused.effects.is_empty(), "{refused:?}");
+        assert_eq!(app.composer.text(), "who answers this?");
+    }
+
+    #[test]
+    fn the_composing_page_and_its_creation_name_the_same_entry() {
+        // A catalogue with nothing available is the one case where the page has
+        // no usable entry to name. It still answers for itself rather than for
+        // the session behind it: it names the entry a creation with no choice
+        // falls back to — the worker's own rule — so the page and the session
+        // it makes can never name two different Agents.
+        let mut app = capable_app();
+        let catalog = run_option_catalog();
+        let unavailable = catalog.options[0].clone();
+        let mut option = unavailable.clone();
+        option.availability = vibex_core::RuntimeOptionAvailability::RequiresConfiguration;
+        app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        });
+        session_on(&mut app, catalog.options[1].selection.clone());
+        app.perform(Intent::NewSession);
+
+        assert_eq!(
+            app.composer_runtime_labels().0,
+            option.agent_label,
+            "the page did not name the entry a creation would use"
+        );
+        app.composer.insert_str("a new thing");
+        let created = created_runtime(&app.perform(Intent::SubmitComposer))
+            .expect("the page named a runtime and created with none");
+        assert_eq!(created.agent_id, option.selection.agent_id);
+        assert_eq!(created.model, option.selection.model);
+    }
+
+    #[test]
+    fn a_new_session_after_a_codex_row_is_the_agent_the_page_picked() {
+        // The reader is in a codex session and the list holds its row, so the
+        // reader presses `n`, picks another Agent on the page and sends. What
+        // is created must be the Agent on the page, never the one behind it.
+        let mut app = capable_app();
+        let catalog = run_option_catalog();
+        let codex = catalog.options[1].selection.clone();
+        let claude = catalog.options[0].selection.clone();
+        app.runtime_options = Some(catalog);
+        app.new_session_runtime = None;
+        session_on(&mut app, codex);
+
+        app.perform(Intent::NewSession);
+        // The reader opens the switcher and takes the first row, which is the
+        // Agent that is not the one behind the page.
+        app.show_runtime_picker();
+        app.perform(Intent::ConfirmOverlay);
+        assert_eq!(
+            app.new_session_runtime.as_ref().map(|s| s.agent_id.clone()),
+            Some(claude.agent_id.clone())
+        );
+        assert_eq!(app.composer_runtime_labels().0, "claude");
+
+        app.composer.insert_str("a new thing");
+        let created = created_runtime(&app.perform(Intent::SubmitComposer))
+            .expect("the page named a runtime and created with none");
+        assert_eq!(
+            created.agent_id, claude.agent_id,
+            "the creation used the Agent behind the page"
+        );
     }
 
     #[test]
