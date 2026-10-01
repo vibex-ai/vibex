@@ -13,6 +13,8 @@ pub type ComputerResult<T> = Result<T, ComputerError>;
 pub mod codes {
     /// The user denied the approval card.
     pub const DENIED: &str = "computer_permission_denied";
+    /// The approval policy refuses every approval-requiring action.
+    pub const APPROVAL_POLICY_DENIED: &str = "computer_approval_policy_denied";
     /// The action class is refused outright and no approval can override it.
     pub const HARD_DENIED: &str = "computer_action_blocked";
     /// The emergency stop is in force.

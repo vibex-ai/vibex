@@ -53,6 +53,33 @@ use crate::screenshot::decode_base64;
 use crate::selfguard::SelfTargetGuard;
 use crate::tools;
 
+/// The decisions a user can change while the runtime is running.
+///
+/// Kept apart from [`ComputerServiceConfig`] because these are read on every
+/// action: the settings panel must be able to change the approval policy, the
+/// self-target allowance and the call timeout without restarting the runtime or
+/// the helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputerRuntimeSettings {
+    /// Whether the feature may run at all. Live, because the settings switch
+    /// turns it on and off without restarting the application.
+    pub enabled: bool,
+    pub approval_policy: vibex_core::ComputerApprovalPolicy,
+    pub allow_self_target: bool,
+    pub call_timeout_ms: u64,
+}
+
+impl Default for ComputerRuntimeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            approval_policy: vibex_core::ComputerApprovalPolicy::Ask,
+            allow_self_target: false,
+            call_timeout_ms: vibex_core::COMPUTER_CALL_TIMEOUT_DEFAULT_MS,
+        }
+    }
+}
+
 /// How the service is configured for one runtime.
 #[derive(Debug, Clone)]
 pub struct ComputerServiceConfig {
@@ -68,6 +95,8 @@ pub struct ComputerServiceConfig {
     pub frame_interval_ms: u64,
     /// Whether the feature is switched on at all.
     pub enabled: bool,
+    /// The user's live decisions.
+    pub settings: ComputerRuntimeSettings,
 }
 
 impl ComputerServiceConfig {
@@ -79,6 +108,7 @@ impl ComputerServiceConfig {
             disconnect_hard_ms: COMPUTER_DISCONNECT_HARD_MS,
             frame_interval_ms: 700,
             enabled: true,
+            settings: ComputerRuntimeSettings::default(),
         }
     }
 
@@ -333,6 +363,9 @@ struct ComputerServiceInner {
     last_heartbeat_ms: AtomicU64,
     self_guard: Mutex<SelfTargetGuard>,
     frame_tasks: Mutex<HashMap<ComputerSessionId, tokio::task::JoinHandle<()>>>,
+    /// The user's live decisions, read on every action so the settings panel
+    /// does not need a restart to change them.
+    settings: std::sync::RwLock<ComputerRuntimeSettings>,
     /// The process-backed helper, when the engine is one. Kept beside the
     /// engine because the lifecycle commands (resume, shutdown) have to reach
     /// the helper even when every session is stopped.
@@ -352,6 +385,10 @@ impl std::fmt::Debug for ComputerService {
 impl ComputerService {
     pub fn new(config: ComputerServiceConfig) -> Self {
         let (events, _) = broadcast::channel(256);
+        let mut initial_settings = config.settings;
+        // The constructor's `enabled` stays the startup answer; the live copy
+        // is what the settings switch changes.
+        initial_settings.enabled = config.enabled;
         Self {
             inner: Arc::new(ComputerServiceInner {
                 config,
@@ -366,6 +403,7 @@ impl ComputerService {
                 last_heartbeat_ms: AtomicU64::new(unix_timestamp_ms().max(0) as u64),
                 self_guard: Mutex::new(SelfTargetGuard::new()),
                 frame_tasks: Mutex::new(HashMap::new()),
+                settings: std::sync::RwLock::new(initial_settings),
                 helper: std::sync::RwLock::new(None),
             }),
         }
@@ -417,6 +455,22 @@ impl ComputerService {
 
     pub fn config(&self) -> &ComputerServiceConfig {
         &self.inner.config
+    }
+
+    /// The user's live decisions.
+    pub fn runtime_settings(&self) -> ComputerRuntimeSettings {
+        self.inner
+            .settings
+            .read()
+            .map(|settings| *settings)
+            .unwrap_or_default()
+    }
+
+    /// Adopts the user's decisions without restarting anything.
+    pub fn apply_runtime_settings(&self, settings: ComputerRuntimeSettings) {
+        if let Ok(mut slot) = self.inner.settings.write() {
+            *slot = settings;
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ComputerServiceEvent> {
@@ -481,7 +535,7 @@ impl ComputerService {
     /// A missing engine is not an error here: it is the reason the feature is
     /// unavailable, and the UI needs the reason more than it needs a failure.
     pub async fn availability(&self) -> ComputerAvailability {
-        if !self.inner.config.enabled {
+        if !self.runtime_settings().enabled {
             return self.unavailable(ComputerUnavailableReason::FeatureDisabled, None);
         }
         if self.inner.remote_unsupported.load(Ordering::SeqCst) {

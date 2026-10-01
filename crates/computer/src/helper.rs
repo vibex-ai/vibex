@@ -936,6 +936,9 @@ pub struct HelperEngine {
     driver: Option<PathBuf>,
     owner_file: Option<PathBuf>,
     env: Vec<(String, String)>,
+    /// How long one request may take. Settings own this, because a desktop
+    /// action that never settles holds the Agent's whole turn.
+    timeout: Duration,
     connection: Mutex<Option<HelperConnection>>,
     next_id: std::sync::atomic::AtomicU64,
     state: Mutex<HelperState>,
@@ -970,6 +973,7 @@ impl HelperEngine {
             driver: None,
             owner_file: None,
             env: Vec::new(),
+            timeout: HELPER_REQUEST_TIMEOUT,
             connection: Mutex::new(None),
             next_id: std::sync::atomic::AtomicU64::new(1),
             state: Mutex::new(HelperState::Unauthenticated),
@@ -990,6 +994,17 @@ impl HelperEngine {
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
+    }
+
+    /// Sets how long one request may take.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// How long one request may take.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The helper's last known state.
@@ -1075,7 +1090,7 @@ impl HelperEngine {
         loop {
             let mut guard = self.ensure_connection().await?;
             let connection = guard.as_mut().expect("the connection was just ensured");
-            match exchange(connection, &request, HELPER_REQUEST_TIMEOUT).await {
+            match exchange(connection, &request, self.timeout).await {
                 Ok(reply) => match reply.into_result() {
                     Ok(result) => return Ok(result),
                     Err(error) => {

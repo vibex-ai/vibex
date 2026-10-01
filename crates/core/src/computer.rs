@@ -1022,6 +1022,73 @@ impl ComputerRiskClass {
     }
 }
 
+/// What the user chose to do about approval-requiring actions.
+///
+/// The choice is global because it is a statement about how much the user
+/// trusts the Agent with this machine, not a per-action decision. It never
+/// reaches the classes that are refused outright: a credential store and a
+/// secure text field stay refused in every mode, and operating Vibex's own
+/// window has its own switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerApprovalPolicy {
+    /// Ask for every action the risk model marks as approval-requiring.
+    #[default]
+    Ask,
+    /// Run approval-requiring actions without a card. Destructive actions are
+    /// irreversible, so the UI says so next to the choice.
+    Allow,
+    /// Refuse every approval-requiring action. The Agent is told the policy
+    /// refused it, so it can ask the user rather than retry.
+    Deny,
+}
+
+impl ComputerApprovalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// The call timeouts the settings offer.
+///
+/// A desktop action can be slow (an application starting, a dialog animating),
+/// but a tool call that never settles holds the Agent's whole turn, so the
+/// choice is bounded rather than free-form.
+pub const COMPUTER_CALL_TIMEOUT_CHOICES_MS: &[u64] = &[30_000, 60_000, 120_000, 300_000];
+
+/// The call timeout used when nothing was chosen.
+pub const COMPUTER_CALL_TIMEOUT_DEFAULT_MS: u64 = 60_000;
+
+/// Clamps a configured call timeout onto the offered choices.
+pub fn normalize_call_timeout_ms(value: u64) -> u64 {
+    COMPUTER_CALL_TIMEOUT_CHOICES_MS
+        .iter()
+        .copied()
+        .find(|choice| *choice == value)
+        .unwrap_or_else(|| {
+            // An unlisted value snaps to the nearest larger choice, so a
+            // hand-edited file cannot shorten every action to nothing.
+            COMPUTER_CALL_TIMEOUT_CHOICES_MS
+                .iter()
+                .copied()
+                .find(|choice| *choice >= value)
+                .unwrap_or(COMPUTER_CALL_TIMEOUT_DEFAULT_MS)
+        })
+}
+
 /// What the runtime does with an action class by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1474,6 +1541,36 @@ mod tests {
         assert!(is_secure_field_role("PasswordBox"));
         assert!(!is_secure_field_role("AXTextField"));
         assert!(!is_secure_field_role(""));
+    }
+
+    #[test]
+    fn the_approval_policy_round_trips_and_defaults_to_asking() {
+        assert_eq!(
+            ComputerApprovalPolicy::default(),
+            ComputerApprovalPolicy::Ask
+        );
+        for policy in [
+            ComputerApprovalPolicy::Ask,
+            ComputerApprovalPolicy::Allow,
+            ComputerApprovalPolicy::Deny,
+        ] {
+            assert_eq!(ComputerApprovalPolicy::parse(policy.as_str()), Some(policy));
+        }
+        assert_eq!(
+            ComputerApprovalPolicy::parse("ALLOW"),
+            Some(ComputerApprovalPolicy::Allow)
+        );
+        assert_eq!(ComputerApprovalPolicy::parse("maybe"), None);
+    }
+
+    #[test]
+    fn call_timeouts_snap_to_an_offered_choice() {
+        assert_eq!(normalize_call_timeout_ms(30_000), 30_000);
+        assert_eq!(normalize_call_timeout_ms(300_000), 300_000);
+        // An unlisted value snaps up, never down to nothing.
+        assert_eq!(normalize_call_timeout_ms(1), 30_000);
+        assert_eq!(normalize_call_timeout_ms(45_000), 60_000);
+        assert_eq!(normalize_call_timeout_ms(u64::MAX), 60_000);
     }
 
     #[test]

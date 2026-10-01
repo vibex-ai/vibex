@@ -125,6 +125,7 @@ pub use browser::{
 pub use canonical_json::canonical_json_vec;
 pub use computer::{
     AGENTS_WITH_NATIVE_COMPUTER_USE, AGENTS_WITHOUT_MCP_DELIVERY, COMPUTER_APPROVAL_TTL_MS,
+    COMPUTER_CALL_TIMEOUT_CHOICES_MS, COMPUTER_CALL_TIMEOUT_DEFAULT_MS,
     COMPUTER_CONCURRENT_ACTIVITY_MS, COMPUTER_CREDENTIAL_APP_DENYLIST,
     COMPUTER_DESTRUCTIVE_ACTION_WORDS, COMPUTER_DISCONNECT_HARD_MS, COMPUTER_DISCONNECT_SOFT_MS,
     COMPUTER_HELPER_TOKEN_PREFIX, COMPUTER_LOOP_HISTORY_ITEMS, COMPUTER_MAX_QUEUED_INPUTS,
@@ -135,15 +136,16 @@ pub use computer::{
     COMPUTER_SCREENSHOT_START_EDGE, COMPUTER_SECURE_TEXT_FIELD_ROLE,
     COMPUTER_UNTRUSTED_CONTENT_BEGIN, COMPUTER_UNTRUSTED_CONTENT_END,
     COMPUTER_UNTRUSTED_CONTENT_NOTICE, ComputerActionKind, ComputerActionRecord,
-    ComputerApplication, ComputerApprovalGranularity, ComputerAvailability, ComputerDeliveryMode,
-    ComputerElement, ComputerExecutionSource, ComputerFrame, ComputerObservation,
-    ComputerOperationStatus, ComputerPermissionReport, ComputerPermissionState, ComputerPlatform,
-    ComputerPlatformSupport, ComputerRect, ComputerRiskClass, ComputerRiskPolicy,
-    ComputerScreenshot, ComputerSession, ComputerSessionSnapshot, ComputerSessionState,
-    ComputerToolDelivery, ComputerToolTier, ComputerUnavailableReason, ComputerUnverifiedReason,
-    ComputerUseDelivery, ComputerVerification, ComputerWindow, computer_helper_token,
-    computer_helper_token_matches, computer_mcp_session_token, fence_untrusted_screen_content,
-    is_credential_application, is_destructive_action_label, is_secure_field_role,
+    ComputerApplication, ComputerApprovalGranularity, ComputerApprovalPolicy, ComputerAvailability,
+    ComputerDeliveryMode, ComputerElement, ComputerExecutionSource, ComputerFrame,
+    ComputerObservation, ComputerOperationStatus, ComputerPermissionReport,
+    ComputerPermissionState, ComputerPlatform, ComputerPlatformSupport, ComputerRect,
+    ComputerRiskClass, ComputerRiskPolicy, ComputerScreenshot, ComputerSession,
+    ComputerSessionSnapshot, ComputerSessionState, ComputerToolDelivery, ComputerToolTier,
+    ComputerUnavailableReason, ComputerUnverifiedReason, ComputerUseDelivery, ComputerVerification,
+    ComputerWindow, computer_helper_token, computer_helper_token_matches,
+    computer_mcp_session_token, fence_untrusted_screen_content, is_credential_application,
+    is_destructive_action_label, is_secure_field_role, normalize_call_timeout_ms,
     verify_computer_helper_token, verify_computer_mcp_session_token,
 };
 pub use delegation::{

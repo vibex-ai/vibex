@@ -77,7 +77,9 @@ use acp_terminal::DesktopAcpTerminalHost;
 
 pub use agent_auth_context::AgentAuthContextService;
 pub use browser::BrowserRuntime;
-pub use computer::{ComputerRuntime, HelperSpawnPolicy};
+pub use computer::{
+    ComputerRuntime, DriverInstallCommand, DriverState, HelperSpawnPolicy, driver_install_command,
+};
 
 pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRuntimeOptions};
 pub use auth_catalog::AgentAuthCatalogService;

@@ -125,6 +125,45 @@ pub struct ComputerRuntime {
     disconnect_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The reason this runtime cannot use computer use, when it cannot.
     unavailable: Mutex<Option<(ComputerUnavailableReason, String)>>,
+    /// What the runtime needs to start the helper later.
+    ///
+    /// The settings switch turns the feature on without restarting the app, so
+    /// the launch inputs have to outlive the first start attempt.
+    launch: std::sync::RwLock<Option<ComputerLaunchInputs>>,
+    /// The platform's own directory the engine installs into, shown in the
+    /// settings so the user can see where "install" writes.
+    driver: Mutex<DriverState>,
+}
+
+/// The inputs a start needs, kept for a late start.
+#[derive(Debug, Clone)]
+pub struct ComputerLaunchInputs {
+    pub sidecar_command: Option<PathBuf>,
+    pub headless: bool,
+}
+
+/// What the runtime knows about the desktop driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverState {
+    /// Never probed.
+    Unknown,
+    /// Present at this path, with the version the driver reported.
+    Installed {
+        path: PathBuf,
+        version: Option<String>,
+    },
+    /// Not found on this machine.
+    Missing,
+    /// An install is running right now.
+    Installing,
+    /// The last install attempt failed, with a bounded reason.
+    InstallFailed { detail: String },
+}
+
+impl DriverState {
+    pub fn is_installed(&self) -> bool {
+        matches!(self, Self::Installed { .. })
+    }
 }
 
 /// Who a computer session belongs to, for the audit row.
@@ -168,6 +207,8 @@ impl ComputerRuntime {
             audit_task: Mutex::new(None),
             disconnect_task: Mutex::new(None),
             unavailable: Mutex::new(None),
+            launch: std::sync::RwLock::new(None),
+            driver: Mutex::new(DriverState::Unknown),
         })
     }
 
@@ -204,7 +245,13 @@ impl ComputerRuntime {
         sidecar_command: Option<PathBuf>,
         headless: bool,
     ) -> VibexResult<()> {
-        if !self.service.config().enabled {
+        if let Ok(mut slot) = self.launch.write() {
+            *slot = Some(ComputerLaunchInputs {
+                sidecar_command: sidecar_command.clone(),
+                headless,
+            });
+        }
+        if !self.service.runtime_settings().enabled {
             self.mark_unavailable(
                 ComputerUnavailableReason::FeatureDisabled,
                 "computer use is switched off for this runtime",
@@ -657,6 +704,197 @@ impl ComputerRuntime {
             })
             .collect()
     }
+}
+
+impl ComputerRuntime {
+    /// Applies the user's settings, starting or stopping the feature as needed.
+    ///
+    /// A switch in the settings is a live action: turning it on starts the
+    /// helper and the endpoint, turning it off releases the desktop and stops
+    /// them. Neither requires restarting the application, which is the whole
+    /// point of the settings page.
+    pub async fn apply_settings(
+        self: &Arc<Self>,
+        mut settings: vibex_computer::service::ComputerRuntimeSettings,
+        enabled: bool,
+    ) -> VibexResult<()> {
+        settings.enabled = enabled;
+        self.service.apply_runtime_settings(settings);
+        // The timeout lives on the helper client, which is created with the
+        // engine; the next start picks it up, and a running one is restarted
+        // when the value actually changed.
+        let timeout_changed = self
+            .helper
+            .lock()
+            .await
+            .as_ref()
+            .map(|helper| {
+                helper.timeout() != std::time::Duration::from_millis(settings.call_timeout_ms)
+            })
+            .unwrap_or(false);
+        if !enabled {
+            self.shutdown().await;
+            self.mark_unavailable(
+                ComputerUnavailableReason::FeatureDisabled,
+                "computer use is switched off in the settings",
+            )
+            .await;
+            return Ok(());
+        }
+        if self.endpoint_url.lock().await.is_some() && !timeout_changed {
+            *self.unavailable.lock().await = None;
+            return Ok(());
+        }
+        if timeout_changed {
+            // Rebuilding the helper is the honest way to change a deadline that
+            // is baked into its client; the desktop is released first.
+            self.shutdown().await;
+        }
+        *self.unavailable.lock().await = None;
+        let inputs = self.launch.read().ok().and_then(|slot| slot.clone());
+        let Some(inputs) = inputs else {
+            return Ok(());
+        };
+        self.start(inputs.sidecar_command, inputs.headless).await
+    }
+
+    /// Probes the desktop driver and remembers what it found.
+    ///
+    /// Read-only: it looks for the executable and asks the engine for its
+    /// version. Nothing is installed and the desktop is not touched.
+    pub async fn detect_driver(&self) -> DriverState {
+        let state = match vibex_computer::CuaDriverCli::discover() {
+            Some(driver) => {
+                let version = driver.tool_surface().await.ok().map(|surface| {
+                    format!(
+                        "{} tools",
+                        surface.split(',').filter(|n| !n.is_empty()).count()
+                    )
+                });
+                DriverState::Installed {
+                    path: driver.executable().to_path_buf(),
+                    version,
+                }
+            }
+            None => DriverState::Missing,
+        };
+        *self.driver.lock().await = state.clone();
+        state
+    }
+
+    /// The driver state as last probed.
+    pub async fn driver_state(&self) -> DriverState {
+        self.driver.lock().await.clone()
+    }
+
+    /// Installs the desktop driver, on an explicit user action.
+    ///
+    /// This is the one place the product runs a vendor installer, and it is
+    /// deliberately narrow: the user pressed Install, the command is a fixed
+    /// documented script for this platform (never a model-supplied string), and
+    /// the outcome — including the installer's own output — is reported back
+    /// to the settings. Nothing installs on its own.
+    pub async fn install_driver(self: &Arc<Self>) -> DriverState {
+        if matches!(*self.driver.lock().await, DriverState::Installing) {
+            return DriverState::Installing;
+        }
+        *self.driver.lock().await = DriverState::Installing;
+        let platform = vibex_computer::driver::detect_platform();
+        let command = match driver_install_command(platform) {
+            Some(command) => command,
+            None => {
+                let state = DriverState::InstallFailed {
+                    detail: format!(
+                        "there is no documented driver installer for {}",
+                        platform.as_str()
+                    ),
+                };
+                *self.driver.lock().await = state.clone();
+                return state;
+            }
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(DRIVER_INSTALL_TIMEOUT_SECS),
+            tokio::process::Command::new(command.program)
+                .args(&command.args)
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await;
+        let state = match outcome {
+            Ok(Ok(output)) if output.status.success() => {
+                let detected = self.detect_driver().await;
+                match detected {
+                    DriverState::Installed { .. } => detected,
+                    _ => DriverState::InstallFailed {
+                        detail: "the installer finished but no driver was found on this machine"
+                            .to_string(),
+                    },
+                }
+            }
+            Ok(Ok(output)) => DriverState::InstallFailed {
+                detail: bounded_output(&output.stderr, &output.stdout),
+            },
+            Ok(Err(error)) => DriverState::InstallFailed {
+                detail: error.to_string(),
+            },
+            Err(_) => DriverState::InstallFailed {
+                detail: format!(
+                    "the installer did not finish within {DRIVER_INSTALL_TIMEOUT_SECS}s"
+                ),
+            },
+        };
+        *self.driver.lock().await = state.clone();
+        state
+    }
+}
+
+/// How long the vendor installer may take.
+const DRIVER_INSTALL_TIMEOUT_SECS: u64 = 600;
+
+/// The fixed installer for one platform.
+///
+/// A value rather than a string built at the call site: the settings show this
+/// command before it runs, and a model must never be able to influence it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverInstallCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// The documented installer for this platform, when there is one.
+pub fn driver_install_command(platform: ComputerPlatform) -> Option<DriverInstallCommand> {
+    match platform {
+        ComputerPlatform::Macos | ComputerPlatform::LinuxX11 | ComputerPlatform::LinuxWayland => {
+            Some(DriverInstallCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "curl -fsSL https://cua.ai/driver/install.sh | /bin/sh".to_string(),
+                ],
+            })
+        }
+        ComputerPlatform::Windows => Some(DriverInstallCommand {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "irm https://cua.ai/driver/install.ps1 | iex".to_string(),
+            ],
+        }),
+        ComputerPlatform::Unknown => None,
+    }
+}
+
+fn bounded_output(stderr: &[u8], stdout: &[u8]) -> String {
+    let text = if stderr.is_empty() { stdout } else { stderr };
+    let text = String::from_utf8_lossy(text);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "the installer reported no output".to_string();
+    }
+    let bounded: String = trimmed.chars().take(400).collect();
+    bounded
 }
 
 /// Wraps the helper so the service can hold it as an engine while the runtime
@@ -1167,6 +1405,42 @@ mod tests {
             assert_eq!(*delivery, ComputerRuntime::use_delivery_for(agent));
             assert_eq!(*tier, ComputerRuntime::tool_tier_for_agent(agent));
         }
+    }
+
+    #[test]
+    fn the_installer_is_a_fixed_command_per_platform() {
+        let macos =
+            driver_install_command(ComputerPlatform::Macos).expect("macOS has an installer");
+        assert_eq!(macos.program, "/bin/sh");
+        assert!(macos.args.join(" ").contains("cua.ai/driver/install.sh"));
+        let linux =
+            driver_install_command(ComputerPlatform::LinuxX11).expect("Linux has an installer");
+        assert_eq!(linux, macos);
+        let windows =
+            driver_install_command(ComputerPlatform::Windows).expect("Windows has an installer");
+        assert_eq!(windows.program, "powershell");
+        assert!(windows.args.join(" ").contains("cua.ai/driver/install.ps1"));
+        assert!(driver_install_command(ComputerPlatform::Unknown).is_none());
+    }
+
+    #[test]
+    fn a_driver_state_answers_whether_the_step_is_done() {
+        assert!(
+            DriverState::Installed {
+                path: PathBuf::from("/usr/bin/cua-driver"),
+                version: None,
+            }
+            .is_installed()
+        );
+        assert!(!DriverState::Missing.is_installed());
+        assert!(!DriverState::Unknown.is_installed());
+        assert!(!DriverState::Installing.is_installed());
+        assert!(
+            !DriverState::InstallFailed {
+                detail: "no".to_string()
+            }
+            .is_installed()
+        );
     }
 
     #[test]

@@ -1174,6 +1174,10 @@ pub struct DesktopUiStateV1 {
     /// engine the address bar searches with.
     #[serde(default)]
     pub browser: crate::BrowserUiState,
+    /// Computer-use preferences: whether the Agent may drive this machine's
+    /// desktop, how much approval it needs, and how long one call may take.
+    #[serde(default)]
+    pub computer: crate::ComputerUiState,
     pub right_rail: RightRailUiState,
     #[serde(default)]
     pub session: SessionUiState,
@@ -1210,6 +1214,7 @@ impl Default for DesktopUiStateV1 {
             terminal: TerminalUiState::default(),
             terminal_preferences: TerminalPreferencesUiState::default(),
             browser: crate::BrowserUiState::default(),
+            computer: crate::ComputerUiState::default(),
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
             desktop_behavior: DesktopBehaviorUiState::default(),
@@ -1236,6 +1241,7 @@ impl DesktopUiStateV1 {
         }
         self.source_app_version = bounded_required(&self.source_app_version, 80)
             .ok_or(UiStateError::Validation("source app version is empty"))?;
+        self.computer.normalize();
         self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
