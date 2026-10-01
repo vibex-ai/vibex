@@ -303,12 +303,21 @@ impl ComputerRuntime {
             // The engine first: without it the endpoint would answer every call
             // with `engine_missing`, which is the same answer the UI already
             // has, and starting it keeps the two consistent.
-            let engine = self.start_engine(sidecar_command).await;
+            let engine = self.start_engine(sidecar_command.clone()).await;
             if let Some(engine) = engine {
                 self.service.install_engine(engine);
             }
         }
-        self.start_endpoint().await
+        self.start_endpoint().await?;
+        // The tool is installed here rather than only at runtime startup: the
+        // switch can be turned on long after the process started, and a start
+        // that brings the endpoint up without telling the Agent manager about
+        // it would leave every session with no desktop tools and no reason
+        // why. `install_tool_config` is idempotent.
+        if let Some(command) = sidecar_command {
+            self.install_tool_config(command).await?;
+        }
+        Ok(())
     }
 
     async fn mark_unavailable(&self, reason: ComputerUnavailableReason, detail: &str) {
@@ -600,11 +609,9 @@ impl ComputerRuntime {
             endpoint,
             capability_token: self.capability_token.clone(),
         };
-        match self.agent.manager().install_computer_mcp_tool(config) {
-            Ok(()) => Ok(()),
-            Err(error) if error.code == "computer_mcp_tool_already_installed" => Ok(()),
-            Err(error) => Err(error),
-        }
+        // Idempotent by replacement: a later start rebinds the endpoint, and
+        // the newest address is the one sessions must be told about.
+        self.agent.manager().install_computer_mcp_tool(config)
     }
 
     /// Stops the endpoint, releases the desktop and terminates the helper.

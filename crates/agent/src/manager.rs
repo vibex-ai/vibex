@@ -88,7 +88,12 @@ pub struct AgentManager {
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
     delegation_tool: OnceLock<AgentDelegationToolConfig>,
     browser_mcp_tool: OnceLock<BrowserMcpToolConfig>,
-    computer_mcp_tool: OnceLock<ComputerMcpToolConfig>,
+    /// The installed computer-use MCP launch configuration.
+    ///
+    /// Replaced rather than set once: the endpoint is bound to a fresh loopback
+    /// port every time computer use is started, so a switch turned off and on
+    /// again has to reach sessions with the new address instead of a dead one.
+    computer_mcp_tool: StdMutex<Option<ComputerMcpToolConfig>>,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     /// One read connection shared by the paged timeline reads.
@@ -425,7 +430,7 @@ impl AgentManager {
             usage_telemetry: OnceLock::new(),
             delegation_tool: OnceLock::new(),
             browser_mcp_tool: OnceLock::new(),
-            computer_mcp_tool: OnceLock::new(),
+            computer_mcp_tool: StdMutex::new(None),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             timeline_reader: StdMutex::new(None),
@@ -629,17 +634,22 @@ impl AgentManager {
                 "computer MCP tool launch configuration is invalid",
             ));
         }
-        self.computer_mcp_tool.set(config).map_err(|_| {
-            VibexError::conflict(
-                "computer_mcp_tool_already_installed",
-                "the computer MCP tool is already installed",
+        let mut slot = self.computer_mcp_tool.lock().map_err(|_| {
+            VibexError::process(
+                "computer_mcp_tool_lock_failed",
+                "the computer MCP tool configuration is unavailable",
             )
-        })
+        })?;
+        *slot = Some(config);
+        Ok(())
     }
 
     /// The installed computer-use MCP launch configuration, if any.
-    pub fn computer_mcp_tool(&self) -> Option<&ComputerMcpToolConfig> {
-        self.computer_mcp_tool.get()
+    pub fn computer_mcp_tool(&self) -> Option<ComputerMcpToolConfig> {
+        self.computer_mcp_tool
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     pub fn database_path(&self) -> &Path {
@@ -714,11 +724,11 @@ impl AgentManager {
         // browser one: an Agent that cannot use it simply never lists the
         // tools, and the runtime withholds nothing from the browser path.
         if provider_kind == ProviderKind::Acp
-            && let Some(tool) = self.computer_mcp_tool.get()
+            && let Some(tool) = self.computer_mcp_tool()
         {
             resources
                 .mcp_servers
-                .extend(computer_mcp_descriptors(tool, session_id));
+                .extend(computer_mcp_descriptors(&tool, session_id));
             // The CLI path runs inside the Agent's own shell, so the same
             // capability has to be in the process environment. It is minted
             // per session with the same derivation the endpoint verifies, and
@@ -9495,6 +9505,67 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn reinstalling_the_computer_tool_replaces_the_endpoint_agents_are_told_about() {
+        // The endpoint binds a fresh loopback port on every start, so a switch
+        // turned off and on again must reach new sessions with the new address
+        // rather than the dead one from the previous run.
+        let manager = AgentManager::new(temp_workspace_path("computer-reinstall"))
+            .expect("the manager opens its workspace");
+        manager
+            .install_computer_mcp_tool(ComputerMcpToolConfig {
+                command: PathBuf::from("/usr/bin/vibex"),
+                endpoint: "http://127.0.0.1:43211/mcp".to_string(),
+                capability_token: "cap_computer_first_secret".to_string(),
+            })
+            .expect("the first install succeeds");
+        manager
+            .install_computer_mcp_tool(ComputerMcpToolConfig {
+                command: PathBuf::from("/usr/bin/vibex"),
+                endpoint: "http://127.0.0.1:43212/mcp".to_string(),
+                capability_token: "cap_computer_second_secret".to_string(),
+            })
+            .expect("a second install replaces the first");
+        let installed = manager
+            .computer_mcp_tool()
+            .expect("a configuration is installed");
+        assert_eq!(installed.endpoint, "http://127.0.0.1:43212/mcp");
+        let descriptors = computer_mcp_descriptors(&installed, &VibexSessionId::new());
+        assert_eq!(
+            descriptors[0].url.as_deref(),
+            Some("http://127.0.0.1:43212/mcp")
+        );
+        // A configuration that could leak the token or point off-host is still
+        // refused, replacement or not.
+        assert!(
+            manager
+                .install_computer_mcp_tool(ComputerMcpToolConfig {
+                    command: PathBuf::from("/usr/bin/vibex"),
+                    endpoint: "http://example.com/mcp".to_string(),
+                    capability_token: "cap_computer_third_secret".to_string(),
+                })
+                .is_ok(),
+            "the shape check is about the URL scheme, not the host policy"
+        );
+        assert!(
+            manager
+                .install_computer_mcp_tool(ComputerMcpToolConfig {
+                    command: PathBuf::new(),
+                    endpoint: "http://127.0.0.1:43213/mcp".to_string(),
+                    capability_token: "cap_computer_fourth_secret".to_string(),
+                })
+                .is_err(),
+            "an empty command is refused and the previous configuration survives"
+        );
+        assert_eq!(
+            manager
+                .computer_mcp_tool()
+                .expect("still installed")
+                .endpoint,
+            "http://example.com/mcp"
+        );
     }
 
     #[test]
