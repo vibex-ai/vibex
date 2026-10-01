@@ -2946,8 +2946,11 @@ fn render_composer_info(
     };
     // Model identity: the session's own, or — on the page where a session is
     // being written — the one the new message would be sent through, because
-    // choosing it is what that page is for.
-    if app.active_session().is_none() {
+    // choosing it is what that page is for. The *page* decides, not whether a
+    // session happens to be selected: the composing page keeps the session it
+    // came from selected, and reporting that one here promises an Agent the
+    // message will not go through.
+    if app.page_is_composing() {
         let (agent, model) = app.composer_runtime_labels();
         line.push(Span::styled(
             agent,
@@ -2963,7 +2966,13 @@ fn render_composer_info(
             strings.runtime_switch_hint().to_string(),
             flag(theme),
         ));
-    } else if let Some(session) = app.active_session() {
+    } else if let Some(session) = app.active_session().or_else(|| {
+        // The row the list holds for the open session answers while the
+        // session's own copy is still on its way: naming the Agent it
+        // records is better than an empty line.
+        app.selected_session_id()
+            .and_then(|session_id| app.session_by_id(session_id))
+    }) {
         // The Agent and model the draft will actually be sent through. The
         // catalogue's first entry is *not* that: a session keeps its own
         // runtime until the reader switches it, so naming the default here
@@ -5058,7 +5067,9 @@ fn render_overlay(
                         Style::default().fg(theme.roles.accent_user),
                     )];
                     spans.push(Span::styled(
-                        format!("{:<18}", truncate_to_width(&option.agent_label, 18, "…")),
+                        // Truncated one column short of the column so the
+                        // widest label still has a space before what follows.
+                        format!("{:<18}", truncate_to_width(&option.agent_label, 17, "…")),
                         if current {
                             style.add_modifier(Modifier::BOLD)
                         } else {
@@ -5129,7 +5140,9 @@ fn render_overlay(
                         Style::default().fg(theme.roles.accent_user),
                     )];
                     spans.push(Span::styled(
-                        format!("{:<18}", truncate_to_width(&option.label, 18, "…")),
+                        // One column short, so a label exactly as wide as the
+                        // column still keeps its space before the value.
+                        format!("{:<18}", truncate_to_width(&option.label, 17, "…")),
                         style,
                     ));
                     spans.push(Span::styled(

@@ -1355,8 +1355,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         }
         AppMessage::SessionCreated(result) => match result {
             Ok(session) => {
-                app.open_session(session.id.clone());
                 app.live = LiveState::Ready;
+                // The answer is the session's identity, not its runtime: open
+                // it the way the session list does, so the composer names the
+                // Agent it was created with instead of the catalogue's first
+                // entry, and the switcher offers to move the session it is on.
+                dispatch_all(worker, &app.open_session_effects(session.id.clone()));
                 // The message that asked for the session opens it: the reader
                 // wrote a prompt, not a request for an empty session.
                 match app.pending_send_effect(session.id) {

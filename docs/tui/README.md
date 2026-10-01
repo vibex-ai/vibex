@@ -482,6 +482,18 @@ the page is the one the session is born with — created with it, rather than
 moved to it afterwards — and `Esc` leaves the page with the words still in the
 box, so the gesture is repeatable.
 
+The page names what it will create, at every step: the Agent and model on the
+page, on the composer's line and in the switcher's caption are read from the
+page's own choice, never from the session the reader came from, and that same
+choice is what the creation carries. `Ctrl+G` opens the switcher — `↑↓` walk the
+Agents, accounts and models the runtime publishes, and the row in effect is
+marked — and `Tab` shows the run options of the row the cursor is on: thinking
+depth, conversation mode, then the session features that Agent advertises.
+Choosing a row on this page (with `Enter`, or by pressing `Tab` on it) makes it
+the runtime the new session is born with, so the run options that open belong to
+the Agent the reader just picked; a page that has chosen nothing names — and
+creates with — the catalogue's first available entry.
+
 The mark is drawn from characters — block glyphs where the terminal has them,
 two rows of ASCII where it does not — and a light sweeps across it while the
 page waits. It is the client's only animation that is not a turn's spinner, and

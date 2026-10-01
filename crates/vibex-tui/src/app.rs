@@ -253,6 +253,20 @@ pub enum RunOptionKind {
     Text,
 }
 
+/// Whether a catalogue entry describes a runtime selection.
+///
+/// Identity is the Agent, the authentication source and the model: the feature
+/// values an entry was published with are not part of it, so a selection the
+/// reader has tuned with a run option still belongs to the entry it came from.
+fn option_is_selection(
+    option: &vibex_core::SessionRuntimeOption,
+    selection: &vibex_core::SessionRuntimeSelection,
+) -> bool {
+    option.selection.agent_id == selection.agent_id
+        && option.selection.auth_source == selection.auth_source
+        && option.selection.model == selection.model
+}
+
 /// A catalogue value as words: its label when it has one, its wire value
 /// otherwise.
 fn session_config_value_label(value: &vibex_core::SessionConfigValue) -> String {
@@ -1258,34 +1272,27 @@ impl App {
             .map(|state| &state.desired)
     }
 
-    /// Whether a catalogue entry is the one the open session is on.
+    /// Whether a catalogue entry is the one this page's message would go
+    /// through.
+    ///
+    /// The *page* answers, through [`Self::page_runtime_selection`]: on the page
+    /// where a session is being written that is the choice the page holds — the
+    /// reader's pick, or the catalogue's first available entry, which is what
+    /// the session would be created with — and never the entry the session
+    /// behind the page is running on.
     ///
     /// Matching is by Agent, authentication source and model rather than by
     /// whole-selection equality: the catalogue's choice carries the feature
-    /// values it was published with, and a session that has since been tuned
-    /// is still on that choice.
+    /// values it was published with, and a choice that has since been tuned with
+    /// a run option is still that choice.
     pub fn runtime_option_is_current(&self, option: &vibex_core::SessionRuntimeOption) -> bool {
-        self.session_runtime_selection().is_some_and(|selection| {
-            option.selection.agent_id == selection.agent_id
-                && option.selection.auth_source == selection.auth_source
-                && option.selection.model == selection.model
-        })
+        self.page_runtime_selection()
+            .is_some_and(|selection| option_is_selection(option, &selection))
     }
 
-    /// The index of the open session's runtime choice in the loaded catalogue.
+    /// The index of this page's runtime choice in the loaded catalogue.
     pub fn current_runtime_option_index(&self) -> Option<usize> {
         let catalog = self.runtime_options.as_ref()?;
-        // On the page where a session is being written, the row that is current
-        // is the one the reader chose for it — not the one the session behind
-        // the page is running on.
-        if (self.page == Page::NewSession || self.active_session().is_none())
-            && let Some(chosen) = self.new_session_runtime.as_ref()
-        {
-            return catalog
-                .options
-                .iter()
-                .position(|option| &option.selection == chosen);
-        }
         catalog
             .options
             .iter()
@@ -1301,11 +1308,7 @@ impl App {
             .as_ref()?
             .options
             .iter()
-            .find(|option| {
-                option.selection.agent_id == selection.agent_id
-                    && option.selection.auth_source == selection.auth_source
-                    && option.selection.model == selection.model
-            })
+            .find(|option| option_is_selection(option, selection))
     }
 
     /// The first catalogue entry a session may be created or switched on.
@@ -1324,9 +1327,11 @@ impl App {
     /// page has to return there — so anything that asks "which session?" while
     /// it is up answers with the session behind the page rather than with what
     /// the reader is writing. Reading a runtime choice, and applying one, both
-    /// have to ask the *page* first.
+    /// have to ask the *page* first; the session is what answers only when there
+    /// is no page holding a session of its own and no session selected at all.
     pub fn page_is_composing(&self) -> bool {
-        self.page == Page::NewSession || self.active_session().is_none()
+        self.page == Page::NewSession
+            || (self.selected_session_id().is_none() && self.active_session().is_none())
     }
 
     /// The runtime selection this page's next message would go through.
@@ -1339,13 +1344,21 @@ impl App {
     /// gets none rather than the catalogue's first entry, which would offer
     /// another Agent's options over it.
     pub fn page_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
-        if self.page_is_composing() {
+        if self.page == Page::NewSession {
             return self
                 .new_session_runtime
                 .clone()
                 .or_else(|| self.default_runtime_selection());
         }
-        self.session_runtime_selection().cloned()
+        if let Some(selection) = self.session_runtime_selection() {
+            return Some(selection.clone());
+        }
+        // Nothing is selected to answer with: a client with no session in front
+        // of it names the entry a creation with no choice would use.
+        if self.selected_session_id().is_some() {
+            return None;
+        }
+        self.default_runtime_selection()
     }
 
     /// The run options the page's selected Agent publishes.
@@ -1528,42 +1541,49 @@ impl App {
 
     /// The Agent and model a message from this page will be sent through.
     ///
-    /// Read from the session's own runtime selection rather than from the
-    /// catalogue's first entry: a session keeps the runtime it was created with
-    /// until the reader switches it, and the page has to name that one.
+    /// The *page's* own selection answers ([`Self::page_runtime_selection`]):
+    /// on the page where a session is being written that is the runtime
+    /// [`Effect::CreateSession`] will carry, and it is deliberately not read
+    /// from the session behind the page — naming that one is what promised an
+    /// Agent the message would not go through. A choice the reader has tuned
+    /// with a run option is still named by the entry it belongs to.
     pub fn composer_runtime_labels(&self) -> (String, String) {
-        if let Some(option) = self
-            .current_runtime_option_index()
-            .and_then(|index| self.runtime_options.as_ref()?.options.get(index))
-        {
-            return (option.agent_label.clone(), option.model_label.clone());
+        if let Some(selection) = self.page_runtime_selection() {
+            if let Some(option) = self.runtime_option_for(&selection) {
+                return (option.agent_label.clone(), option.model_label.clone());
+            }
+            // The catalogue no longer publishes this selection (an Agent that
+            // has since gone away): its own words still name it.
+            return (
+                selection.agent_id.to_string(),
+                selection
+                    .model
+                    .model_id()
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+            );
         }
-        let agent = self
-            .session_runtime_selection()
-            .map(|selection| selection.agent_id.to_string())
-            .or_else(|| {
-                self.active_session()
-                    .map(|session| session.agent_id.to_string())
-            })
-            .or_else(|| {
-                self.runtime_options
-                    .as_ref()
-                    .and_then(|catalog| catalog.options.first())
-                    .map(|option| option.agent_label.clone())
-            })
-            .unwrap_or_else(|| self.strings.runtime_unavailable().to_string());
-        let model = self
-            .session_runtime_selection()
-            .and_then(|selection| selection.model.model_id())
-            .map(str::to_string)
-            .or_else(|| {
-                self.runtime_options
-                    .as_ref()
-                    .and_then(|catalog| catalog.options.first())
-                    .map(|option| option.model_label.clone())
-            })
-            .unwrap_or_default();
-        (agent, model)
+        // Nothing is selected to read: an open session — or the row the list
+        // holds for it, while its runtime state is still arriving — still names
+        // its Agent, and a client with no session at all falls back to the
+        // catalogue's first entry, which is what a creation would use.
+        if let Some(session) = self.active_session().or_else(|| {
+            self.selected_session_id()
+                .and_then(|session_id| self.session_by_id(session_id))
+        }) {
+            return (session.agent_id.to_string(), String::new());
+        }
+        match self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| catalog.options.first())
+        {
+            Some(option) => (option.agent_label.clone(), option.model_label.clone()),
+            None => (
+                self.strings.runtime_unavailable().to_string(),
+                String::new(),
+            ),
+        }
     }
 
     /// Whether the page's mark is lit: it shines only on a page that waits.
@@ -4073,8 +4093,10 @@ pub enum Effect {
     CreateSession {
         workspace_root: String,
         title: Option<String>,
-        /// The runtime chosen on the composing page, when the reader made a
-        /// choice there: a session is created *with* an Agent, not moved to one.
+        /// The runtime the composing page names: the reader's choice, or the
+        /// catalogue's first available entry when the page chose none. `None`
+        /// only when there was no catalogue to read one from — a session is
+        /// created *with* an Agent, not moved to one.
         runtime: Option<vibex_core::SessionRuntimeSelection>,
     },
     RenameSession {

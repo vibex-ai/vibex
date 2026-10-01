@@ -11,7 +11,7 @@ use vibex_core::{
     ElicitationResolution, ElicitationResolutionAction, ForkAgentSessionRequest,
     PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SteerAgentMessageRequest, WorkspaceMode,
+    SteerAgentMessageRequest, VibexSessionId, WorkspaceMode,
 };
 
 use crate::action::Intent;
@@ -275,24 +275,7 @@ impl App {
                 // The controller issues the load ticket before the fetch, so
                 // the snapshot is applied in the generation it was requested
                 // for and live events for the session stop being stale.
-                let ticket = match self.agent.begin_session_load(session_id.clone()) {
-                    Ok(ticket) => ticket,
-                    Err(error) => {
-                        self.toast(Toast::danger(error.message));
-                        return Outcome::quiet();
-                    }
-                };
-                self.open_session(session_id.clone());
-                // The composer's info line names the Agent and model the
-                // session is on, and the switcher needs the same catalogue, so
-                // it is fetched on the way in rather than only when the picker
-                // is opened. It is a read; a failure leaves the line naming the
-                // Agent alone.
-                let mut effects = vec![Effect::OpenSession { session_id, ticket }];
-                if self.runtime_options.is_none() && self.runtime_catalog_available() {
-                    effects.push(Effect::ListRuntimeOptions);
-                }
-                Outcome::effects(effects)
+                self.open_session_effects(session_id)
             }
             Intent::EnterSession => {
                 let outcome = self.perform(Intent::OpenSelectedSession);
@@ -1339,10 +1322,22 @@ impl App {
                     Outcome::effects(vec![])
                 }
                 // `Tab` is the two halves of the switcher: the catalogue, and
-                // the run options of the entry in effect. They are views rather
-                // than one list because the catalogue is as long as the machine
-                // has models.
+                // the run options of the entry the reader has picked. They are
+                // views rather than one list because the catalogue is as long as
+                // the machine has models.
                 Intent::OverlayNextField => {
+                    // On the page where a session is being written there is no
+                    // live session to move, so the row under the cursor is a
+                    // pending choice rather than a highlight: the page takes it
+                    // first, or `Tab` would answer with the run options of the
+                    // entry the page happened to start on instead of the Agent
+                    // the reader is looking at.
+                    if view == RuntimePickerView::Choices
+                        && self.page_is_composing()
+                        && !self.adopt_runtime_picker_row(selected)
+                    {
+                        return Outcome::quiet();
+                    }
                     self.show_runtime_picker_view(RuntimePickerView::Options)
                 }
                 Intent::OverlayPreviousField => {
@@ -1934,6 +1929,34 @@ impl App {
             .map(|worktree| worktree.worktree_path.clone())
     }
 
+    /// The effects that open a session: the snapshot, which carries the
+    /// session's own runtime selection, and the catalogue the composer names it
+    /// from.
+    ///
+    /// One place owns it because two do the same thing: the reader opening a
+    /// session from the list, and the answer to a creation landing in the
+    /// session it made. Without the second, a session created on one Agent was
+    /// described by the catalogue's first entry — the composer named another
+    /// Agent, and the switcher offered to move the session to it.
+    pub fn open_session_effects(&mut self, session_id: VibexSessionId) -> Outcome {
+        // The controller issues the load ticket before the fetch, so the
+        // snapshot is applied in the generation it was requested for and live
+        // events for the session stop being stale.
+        let ticket = match self.agent.begin_session_load(session_id.clone()) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.toast(Toast::danger(error.message));
+                return Outcome::quiet();
+            }
+        };
+        self.open_session(session_id.clone());
+        let mut effects = vec![Effect::OpenSession { session_id, ticket }];
+        if self.runtime_options.is_none() && self.runtime_catalog_available() {
+            effects.push(Effect::ListRuntimeOptions);
+        }
+        Outcome::effects(effects)
+    }
+
     /// Land on the page a new session starts on.
     ///
     /// A page rather than a dialog: the reader asked to start writing, and the
@@ -1945,7 +1968,16 @@ impl App {
         self.page = Page::NewSession;
         self.focus = Focus::Composer;
         self.workspace_path = None;
-        Outcome::effects(vec![Effect::ListWorkspaces])
+        let mut effects = vec![Effect::ListWorkspaces];
+        // The page names the Agent the session will be created with and offers
+        // its run options, so the catalogue is read on the way in rather than
+        // only when the switcher is opened — otherwise the page spends its
+        // first moments saying the runtime is unavailable. It is a read; a
+        // failure leaves the page naming the Agent it can.
+        if self.runtime_options.is_none() && self.runtime_catalog_available() {
+            effects.push(Effect::ListRuntimeOptions);
+        }
+        Outcome::effects(effects)
     }
 
     /// Ask for a session and keep the draft that will open it.
@@ -1975,6 +2007,10 @@ impl App {
                     .map(|workspace| workspace.workspace.root_path.clone())
             })
             .unwrap_or_default();
+        // Read before the page is left: the selection the page names is what the
+        // session is created with, and `enter_creating_session` is what clears
+        // the view of the session it came from.
+        let runtime = self.page_runtime_selection();
         self.pending_new_session = Some(outgoing.clone());
         // The reader leaves the page with the message: the session view is
         // where it will be answered, so waiting on the page for the runtime to
@@ -1992,7 +2028,10 @@ impl App {
         Outcome::effects(vec![Effect::CreateSession {
             workspace_root,
             title: None,
-            runtime: self.new_session_runtime.clone(),
+            // The page's own selection, materialised: the session is created on
+            // what the page named rather than on whatever the runtime reaches
+            // for when the choice arrives empty.
+            runtime,
         }])
     }
 
@@ -2292,6 +2331,34 @@ impl App {
         }
         self.overlay = Some(Overlay::RuntimePicker { view, selected });
         Outcome::effects(vec![])
+    }
+
+    /// Take the catalogue row the picker's cursor is on for the composing page.
+    ///
+    /// The page where a session is being written has no live session to switch,
+    /// so a row the reader has moved to is a pending choice: taking it is what
+    /// makes the run-options view answer with *that* Agent's options. An entry
+    /// the catalogue says is unavailable is refused exactly as `Enter` refuses
+    /// it, and answers whether the view may turn at all.
+    fn adopt_runtime_picker_row(&mut self, row: usize) -> bool {
+        let Some(option) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| catalog.options.get(row))
+            .cloned()
+        else {
+            // No catalogue row to take: the view still turns, and says for
+            // itself that there is nothing in it.
+            return true;
+        };
+        if option.availability != vibex_core::RuntimeOptionAvailability::Available {
+            self.toast(Toast::warning(
+                self.strings.runtime_unavailable().to_string(),
+            ));
+            return false;
+        }
+        self.new_session_runtime = Some(option.selection);
+        true
     }
 
     /// Act on the switcher row the reader confirmed.
@@ -3752,6 +3819,159 @@ mod tests {
             .expect("the page kept no runtime");
         assert_eq!(chosen.mode_id.as_deref(), Some("plan"));
         assert_eq!(chosen.agent_id, agent_id);
+    }
+
+    /// The one runtime a creation asked for.
+    fn created_runtime(outcome: &Outcome) -> Option<vibex_core::SessionRuntimeSelection> {
+        outcome.effects.iter().find_map(|effect| match effect {
+            Effect::CreateSession { runtime, .. } => runtime.clone(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_composing_page_reads_the_catalogue_on_the_way_in() {
+        // The page names the Agent the session will be created with and offers
+        // its run options, so the catalogue is read when the page opens rather
+        // than only when the switcher is asked for: the page otherwise spends
+        // its first moments saying the runtime is unavailable.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        assert!(app.runtime_options.is_none());
+        let opened = app.perform(Intent::NewSession);
+        assert!(
+            opened
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListRuntimeOptions)),
+            "the page did not read the catalogue: {opened:?}"
+        );
+
+        // A catalogue already in hand is not read again.
+        app.runtime_options = Some(run_option_catalog());
+        let reopened = app.perform(Intent::NewSession);
+        assert!(
+            !reopened
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListRuntimeOptions)),
+            "the page read a catalogue it already had: {reopened:?}"
+        );
+    }
+
+    #[test]
+    fn the_composing_page_names_the_runtime_it_will_create_with() {
+        // The page answers for itself. A reader who left a session to write a
+        // new one is shown the entry the creation will carry — with nothing
+        // chosen on the page, the catalogue's first available entry — and never
+        // the Agent of the session behind the page, which is what promised an
+        // Agent the message would not go through.
+        let mut app = app_with_run_options(Page::Agent);
+        assert_eq!(app.composer_runtime_labels().0, "codex");
+
+        app.navigate_to(Page::NewSession);
+        assert_eq!(
+            app.composer_runtime_labels(),
+            ("claude".to_string(), "claude-sonnet".to_string()),
+            "the page named the session behind it"
+        );
+        // The picker's cursor is on the same entry, so "current" answers the
+        // question the page asked.
+        assert_eq!(app.current_runtime_option_index(), Some(0));
+        assert!(app.runtime_option_is_current(&app.runtime_options.as_ref().unwrap().options[0]));
+        assert!(!app.runtime_option_is_current(&app.runtime_options.as_ref().unwrap().options[1]));
+
+        app.composer.insert_str("a new thing");
+        let created = created_runtime(&app.perform(Intent::SubmitComposer))
+            .expect("the page named a runtime and created with none");
+        assert_eq!(
+            created.model.model_id(),
+            Some("claude-sonnet"),
+            "the creation did not carry what the page named"
+        );
+    }
+
+    #[test]
+    fn a_run_option_set_on_the_page_keeps_the_agent_it_belongs_to() {
+        // Tuning the choice must not change *whose* choice it is: the page
+        // still names the Agent the reader picked, and the session is created
+        // with that Agent and the value.
+        let mut app = app_with_run_options(Page::NewSession);
+        let agent_id = app.runtime_options.as_ref().expect("catalogue").options[1]
+            .selection
+            .agent_id
+            .clone();
+
+        // The page is on the entry the reader picked, and the picker says so.
+        assert_eq!(app.current_runtime_option_index(), Some(1));
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Options,
+            selected: 0,
+        });
+        app.perform(Intent::ConfirmOverlay);
+        app.perform(Intent::SelectNext);
+        app.perform(Intent::SelectNext);
+        app.perform(Intent::ConfirmOverlay);
+
+        let chosen = app
+            .new_session_runtime
+            .as_ref()
+            .expect("no choice was kept");
+        assert_eq!(chosen.agent_id, agent_id);
+        assert_eq!(chosen.reasoning_effort.as_deref(), Some("high"));
+        // The tuned choice is still the entry it came from: the page names it,
+        // and the picker marks it rather than falling back to another Agent.
+        assert_eq!(
+            app.composer_runtime_labels(),
+            ("codex".to_string(), "gpt-5".to_string())
+        );
+        assert_eq!(app.current_runtime_option_index(), Some(1));
+
+        app.composer.insert_str("write something");
+        let created = created_runtime(&app.perform(Intent::SubmitComposer))
+            .expect("the page named a runtime and created with none");
+        assert_eq!(created.agent_id, agent_id);
+        assert_eq!(created.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn the_options_view_belongs_to_the_row_the_reader_picked() {
+        // `Tab` on the page where a session is being written takes the row the
+        // cursor is on: there is no live session to move, so the row is the
+        // choice, and the options that open are *its* options rather than the
+        // ones belonging to the entry the page happened to start on.
+        let mut app = app_with_run_options(Page::NewSession);
+        app.new_session_runtime = None;
+        app.show_runtime_picker();
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: 0,
+            }),
+            "the catalogue did not open on the page's own entry"
+        );
+
+        // Down to the entry that publishes run options, and `Tab`.
+        app.perform(Intent::SelectNext);
+        let outcome = app.perform(Intent::OverlayNextField);
+        assert!(outcome.effects.is_empty(), "{outcome:?}");
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Options,
+                selected: 0,
+            }),
+            "the row's run options did not open"
+        );
+        assert_eq!(
+            app.new_session_runtime
+                .as_ref()
+                .map(|selection| selection.agent_id.clone()),
+            Some(vibex_core::AgentId::parse("codex").expect("agent id")),
+            "the page did not take the row the reader picked"
+        );
+        assert_eq!(app.composer_runtime_labels().0, "codex");
     }
 
     #[test]

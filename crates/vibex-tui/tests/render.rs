@@ -3660,6 +3660,74 @@ fn the_composing_page_chooses_the_runtime_the_session_is_born_with() {
 }
 
 #[test]
+fn the_new_session_page_names_the_agent_it_will_be_created_with() {
+    // The reader leaves the open session to write a new one. The page answers
+    // for itself: it names the entry the creation carries — with nothing chosen
+    // on the page, the catalogue's first available entry — and never the Agent
+    // of the session behind it, which is how a page came to promise an Agent
+    // the session was never created with.
+    use vibex_tui::action::Intent;
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bal".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let open = seeded_session("session_page000001", "the session behind the page");
+    app.agent
+        .apply_sessions(Ok(vec![open.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(open.id.clone());
+    app.agent.state.active_session.resolve(open);
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![option("claude", "claude-sonnet"), option("codex", "gpt-5")],
+    });
+    // The session behind the page is on the *second* entry, so a page that read
+    // the session instead of itself would name codex.
+    let desired = app.runtime_options.as_ref().expect("catalogue").options[1]
+        .selection
+        .clone();
+    app.agent
+        .state
+        .runtime_selection
+        .resolve(vibex_core::AgentSessionRuntimeSelectionState {
+            desired: desired.clone(),
+            effective: desired,
+            status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+            session_revision: 1,
+            selection_revision: 1,
+            current_binding_id: None,
+            activation_generation: 1,
+            pending_switch_id: None,
+            actionable_error: None,
+        });
+
+    app.perform(Intent::NewSession);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("claude"),
+        "the page does not name the entry it will be created with:\n{screen}"
+    );
+    assert!(
+        !screen.contains("codex"),
+        "the page named the session behind it:\n{screen}"
+    );
+}
+
+#[test]
 fn the_composing_page_can_choose_the_directory_it_works_in() {
     use vibex_tui::action::Intent;
     let mut app = app(100, 30);

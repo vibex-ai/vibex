@@ -451,7 +451,11 @@ is never a column count.
   `RuntimePickerView::Options`, `selected` indexes the rows of whichever view is
   up (`App::runtime_picker_row_count()`), the options view opens on a caption
   naming whose options they are, and a view with nothing in it says so rather
-  than swallowing the key. A row opens a value list whose first entry is the
+  than swallowing the key. On the composing page `Tab` first takes the row the
+  cursor is on, because there is no live session to move: the reader who has
+  just picked an Agent gets *that* Agent's options rather than the ones belonging
+  to the entry the page started on, and the page's choice becomes the row the
+  cursor was on. A row opens a value list whose first entry is the
   Agent's own default (`On`/`Off` for a switch, free text for a string feature,
   which the prompt overlay collects); `Esc` steps out one view at a time — value
   list, run options, catalogue, closed — and the value list carries the option
@@ -581,7 +585,12 @@ is never a column count.
   becomes the session view — otherwise the reader watches a logo and concludes
   nothing happened. The projection is drawn while no session is open, is
   stamped with the id when the runtime answers, and a failed creation withdraws
-  it and puts the draft back on the page.
+  it and puts the draft back on the page. The answer opens the session the way
+  the list does (`App::open_session_effects`: the snapshot, which carries the
+  session's own runtime selection, and the catalogue), because a creation answer
+  names the session and not the runtime it was made with: without that read the
+  composer fell back to the catalogue's first entry and the switcher offered to
+  move the brand-new session onto it.
 * **A key does what the surface advertising it says.** The composing page's
   line names `Ctrl+W` as "change the workspace", so that key opens the directory
   picker there — the old `SwitchWorkspace` listed workspaces into state nothing
@@ -597,6 +606,13 @@ is never a column count.
   empty and the session was created on the catalogue's first entry. Decide by
   the *page* (`page == Page::NewSession`), not by whether a session is
   selected, and keep the choice on the page until `CreateSession` carries it.
+  The reading side is the same rule, or the page lies about what it will make:
+  the Agent and model the page and the composer's info line name, the entry the
+  picker opens on and marks as current, and the run options a view lists all
+  come from `App::page_runtime_selection()` — the page's own choice, or the
+  catalogue's first available entry, which is what a creation with no choice
+  uses — and `Effect::CreateSession` carries that same selection instead of
+  leaving the runtime to reach for a default of its own.
 * **A new session is a page, not a dialog.** The reader who asks for one asked
   to write, so the gesture lands on a page that hands them the composer and
   names what the message will be sent through — Agent, model, workspace — with
