@@ -782,16 +782,20 @@ impl ComputerRuntime {
     pub async fn detect_driver(&self) -> DriverState {
         let state = match vibex_computer::CuaDriverCli::discover() {
             Some(driver) => {
-                // Asking for the tool list is what tells a driver apart from a
-                // file with the right name: the call is read-only and never
-                // touches the desktop.
-                match driver.tool_surface().await {
-                    Ok(surface) => DriverState::Installed {
+                // The driver's own probe is what tells a driver apart from a
+                // file with the right name, and it reports the version the
+                // settings show. Read-only: no daemon, no desktop, no prompt.
+                match driver.probe().await {
+                    Ok(probe) => DriverState::Installed {
                         path: driver.executable().to_path_buf(),
-                        version: Some(format!(
-                            "{} tools",
-                            surface.split(',').filter(|n| !n.is_empty()).count()
-                        )),
+                        version: probe.engine.or_else(|| {
+                            probe.tool_surface.map(|surface| {
+                                format!(
+                                    "{} tools",
+                                    surface.split(',').filter(|name| !name.is_empty()).count()
+                                )
+                            })
+                        }),
                         responsive: true,
                     },
                     Err(_) => DriverState::Installed {

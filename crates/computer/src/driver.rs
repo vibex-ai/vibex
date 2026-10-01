@@ -31,7 +31,8 @@ use tokio::process::Command;
 
 use vibex_core::{
     ComputerApplication, ComputerPermissionReport, ComputerPermissionState, ComputerPlatform,
-    ComputerRect, ComputerScreenshot, ComputerUnverifiedReason, ComputerWindow,
+    ComputerRect, ComputerScreenshot, ComputerUnavailableReason, ComputerUnverifiedReason,
+    ComputerWindow,
 };
 
 use crate::engine::{
@@ -46,11 +47,20 @@ pub const DRIVER_PATH_ENV: &str = "VIBEX_COMPUTER_DRIVER";
 pub const DRIVER_COMMAND: &str = "cua-driver";
 /// Per-invocation deadline.
 pub const DRIVER_TIMEOUT_MS: u64 = 20_000;
+/// The same deadline as a `Duration`, for the calls that use `tokio::time`.
+const DRIVER_PROBE_TIMEOUT_DURATION: Duration = Duration::from_millis(DRIVER_PROBE_TIMEOUT_MS);
 /// Deadline for the readiness probe, which must never hold startup.
 pub const DRIVER_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 /// A driver binary that speaks the CLI protocol.
-#[derive(Debug, Clone)]
+///
+/// The driver is a daemon plus a client: `list-tools`, `doctor` and `status`
+/// answer on their own, while a tool call goes through `call <tool> <json>` on a
+/// socket. `serve` is what starts that daemon, and this client starts it as its
+/// own child when needed — the process that spawns the daemon is the process
+/// the operating system attaches its screen and accessibility grants to, so a
+/// daemon started here carries the helper's identity rather than a shell's.
+#[derive(Debug)]
 pub struct CuaDriverCli {
     executable: PathBuf,
     /// Environment the driver needs. The Wayland opt-in is the one that
@@ -58,6 +68,24 @@ pub struct CuaDriverCli {
     /// pretending to work, and the runtime passes the user's choice through
     /// instead of deciding for them.
     extra_env: Vec<(String, String)>,
+    /// The socket the daemon listens on. `None` uses the driver's own default,
+    /// which is what lets it share a daemon the user already started.
+    socket: Option<PathBuf>,
+    /// The daemon this client started, kept so it dies with the helper.
+    daemon: tokio::sync::Mutex<Option<tokio::process::Child>>,
+}
+
+impl Clone for CuaDriverCli {
+    fn clone(&self) -> Self {
+        Self {
+            executable: self.executable.clone(),
+            extra_env: self.extra_env.clone(),
+            socket: self.socket.clone(),
+            // A clone is a second handle on the same daemon, not a second
+            // daemon: the child stays with the original.
+            daemon: tokio::sync::Mutex::new(None),
+        }
+    }
 }
 
 impl CuaDriverCli {
@@ -66,6 +94,21 @@ impl CuaDriverCli {
         Self {
             executable: executable.into(),
             extra_env: Vec::new(),
+            socket: None,
+            daemon: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Uses a specific daemon socket instead of the driver's default.
+    pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.socket = Some(socket.into());
+        self
+    }
+
+    fn socket_args(&self) -> Vec<String> {
+        match &self.socket {
+            Some(socket) => vec!["--socket".to_string(), socket.to_string_lossy().to_string()],
+            None => Vec::new(),
         }
     }
 
@@ -108,9 +151,108 @@ impl CuaDriverCli {
     }
 
     /// Runs one driver tool and returns its parsed reply.
+    ///
+    /// A call that finds no daemon starts one and retries once: the daemon is
+    /// part of the engine, and asking the user to start it by hand would make
+    /// the settings page's Install button a half-measure.
     async fn invoke(&self, tool: &str, params: &Value) -> ComputerResult<Value> {
-        self.invoke_with_timeout(tool, params, DRIVER_TIMEOUT_MS)
+        match self
+            .invoke_with_timeout(tool, params, DRIVER_TIMEOUT_MS)
             .await
+        {
+            Ok(reply) => Ok(reply),
+            Err(error) if error.code == "computer_driver_daemon_missing" => {
+                self.ensure_daemon().await?;
+                self.invoke_with_timeout(tool, params, DRIVER_TIMEOUT_MS)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Starts the engine's daemon if nothing is listening yet.
+    async fn ensure_daemon(&self) -> ComputerResult<()> {
+        let mut guard = self.daemon.lock().await;
+        if self.daemon_is_running().await {
+            return Ok(());
+        }
+        let mut command = tokio::process::Command::new(&self.executable);
+        command
+            .arg("serve")
+            .args(self.socket_args())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // The daemon holds the desktop session; it must not outlive the
+            // helper that owns it.
+            .kill_on_drop(true);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().map_err(|error| {
+            ComputerError::process(
+                codes::HELPER_FAILED,
+                "the desktop driver daemon could not be started",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        *guard = Some(child);
+        // Readiness is the daemon answering, not the process existing.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if self.daemon_is_running().await {
+                return Ok(());
+            }
+        }
+        Err(ComputerError::process(
+            codes::HELPER_FAILED,
+            "the desktop driver daemon did not become ready",
+        ))
+    }
+
+    /// Reads the driver's own permission report (macOS).
+    ///
+    /// Read-only: the probe never prompts, because a permission dialog belongs
+    /// to a click in the settings rather than to a startup path.
+    async fn run_permissions_status(&self) -> Option<Value> {
+        let mut command = tokio::process::Command::new(&self.executable);
+        command
+            .arg("permissions")
+            .arg("status")
+            .arg("--json")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        serde_json::from_slice(&output.stdout).ok()
+    }
+
+    /// Whether the driver reports a live daemon.
+    pub async fn daemon_is_running(&self) -> bool {
+        let mut command = tokio::process::Command::new(&self.executable);
+        command
+            .arg("status")
+            .args(self.socket_args())
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let Ok(output) = tokio::time::timeout(Duration::from_secs(5), command.output()).await
+        else {
+            return false;
+        };
+        let Ok(output) = output else { return false };
+        let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        text.contains("daemon is running")
     }
 
     async fn invoke_with_timeout(
@@ -128,8 +270,10 @@ impl CuaDriverCli {
         })?;
         let mut command = Command::new(&self.executable);
         command
+            .arg("call")
             .arg(tool)
             .arg(&encoded)
+            .args(self.socket_args())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -159,6 +303,19 @@ impl CuaDriverCli {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let bounded = bounded_text(&stderr, 400);
+            // A daemon that is not up is not a rejected action: the engine is
+            // installed and simply has not been started yet, and the caller
+            // starts it and retries.
+            if bounded
+                .to_ascii_lowercase()
+                .contains("daemon is not running")
+            {
+                return Err(ComputerError::capability(
+                    "computer_driver_daemon_missing",
+                    "the desktop driver is installed but its daemon is not running",
+                )
+                .with_diagnostic("stderr", bounded));
+            }
             // The driver reports an unsupported background delivery as a
             // distinct failure; mapping it here is what lets the approval flow
             // offer a foreground escalation instead of a generic error.
@@ -192,11 +349,46 @@ impl CuaDriverCli {
     }
 
     /// Reads the driver's own tool list, for the pinned surface fingerprint.
+    ///
+    /// `list-tools` is a subcommand that answers on its own, so this doubles as
+    /// the cheapest proof that the binary really is the engine: it needs no
+    /// daemon and touches no desktop.
     pub async fn tool_surface(&self) -> ComputerResult<String> {
-        let reply = self
-            .invoke_with_timeout("list-tools", &json!({}), DRIVER_PROBE_TIMEOUT_MS)
-            .await?;
-        let names = collect_tool_names(&reply);
+        let mut command = tokio::process::Command::new(&self.executable);
+        command
+            .arg("list-tools")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+            .await
+            .map_err(|_| {
+                ComputerError::process(
+                    codes::HELPER_FAILED,
+                    "the desktop driver did not answer before its deadline",
+                )
+            })?
+            .map_err(|error| {
+                ComputerError::process(
+                    codes::ENGINE_MISSING,
+                    "the desktop driver could not be started",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+        if !output.status.success() {
+            return Err(ComputerError::process(
+                codes::HELPER_FAILED,
+                "the desktop driver refused to list its tools",
+            )
+            .with_diagnostic(
+                "stderr",
+                bounded_text(&String::from_utf8_lossy(&output.stderr), 400),
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let names = collect_tool_names_from_listing(&stdout);
         if names.is_empty() {
             return Err(ComputerError::process(
                 codes::HELPER_FAILED,
@@ -210,47 +402,41 @@ impl CuaDriverCli {
 #[async_trait]
 impl ComputerEngine for CuaDriverCli {
     async fn probe(&self) -> ComputerResult<EngineProbe> {
-        let health = self
-            .invoke_with_timeout(
-                "health_report",
-                &json!({ "include": ["bundle_identity", "permissions", "degraded"] }),
-                DRIVER_PROBE_TIMEOUT_MS,
-            )
-            .await;
-        let permissions_reply = self
-            .invoke_with_timeout(
-                "check_permissions",
-                &json!({ "prompt": false }),
-                DRIVER_PROBE_TIMEOUT_MS,
-            )
-            .await;
+        // `doctor` answers without a daemon and reports the whole readiness
+        // picture: the binary, the display server, the X connection and the
+        // accessibility bus. That is the same question this probe exists to
+        // answer, so it is asked once, in the driver's own vocabulary.
+        let doctor = self.run_doctor().await.ok();
+        let daemon_running = self.daemon_is_running().await;
         let platform = detect_platform();
-        let engine = health
-            .as_ref()
-            .ok()
-            .and_then(|value| string_at(value, &["version", "driver_version", "engine_version"]))
-            .map(|version| format!("{DRIVER_COMMAND} {version}"));
-        let permissions = match permissions_reply {
-            Ok(reply) => parse_permissions(&reply, platform),
-            Err(_) => ComputerPermissionReport::unsupported(),
+        // macOS gates screen capture and accessibility through TCC, and the
+        // driver is the only process whose answer carries the granted identity.
+        // Elsewhere the three are not gated per application, and the readiness
+        // that matters is in the doctor probes above.
+        let permissions = if platform == ComputerPlatform::Macos {
+            match self.run_permissions_status().await {
+                Some(reply) => parse_permissions(&reply, platform),
+                None => ComputerPermissionReport::unsupported(),
+            }
+        } else {
+            ComputerPermissionReport::unsupported()
         };
         let mut degraded = Vec::new();
         let mut unavailable_reason = None;
-        if let Ok(health) = &health {
-            if let Some(items) = array_at(health, &["degraded", "degraded_reasons"]) {
-                for item in items {
-                    if let Some(text) = item.as_str() {
-                        degraded.push(text.to_string());
-                    }
-                }
-            }
-            if let Some(reason) = string_at(health, &["degraded_reason", "reason"]) {
-                degraded.push(reason);
+        if let Some(doctor) = &doctor {
+            degraded.extend(doctor.degraded.iter().cloned());
+            if let Some(reason) = doctor.unavailable_reason {
+                unavailable_reason = Some(reason);
             }
         }
-        // The driver refuses to draw background input on Wayland unless the
-        // opt-in is exported; saying so up front is more useful than failing
-        // every action later.
+        if !daemon_running {
+            // A driver whose daemon is not up is still a working installation:
+            // the first tool call starts it. Saying so beats leaving the reader
+            // to guess why nothing has happened yet.
+            degraded.push(
+                "the driver daemon is not running yet; it starts with the first action".to_string(),
+            );
+        }
         if platform == ComputerPlatform::LinuxWayland
             && std::env::var_os(ComputerPlatform::wayland_opt_in_variable()).is_none()
         {
@@ -260,12 +446,16 @@ impl ComputerEngine for CuaDriverCli {
                     .to_string(),
             );
         }
-        if !permissions.structured_usable() {
+        if unavailable_reason.is_none() && !permissions.structured_usable() {
             unavailable_reason = permissions.blocking_reason();
         }
         let tool_surface = self.tool_surface().await.ok();
+        let engine = doctor
+            .as_ref()
+            .and_then(|doctor| doctor.version.clone())
+            .or_else(|| Some(DRIVER_COMMAND.to_string()));
         Ok(EngineProbe {
-            engine: engine.or_else(|| Some(DRIVER_COMMAND.to_string())),
+            engine,
             platform,
             permissions,
             tool_surface,
@@ -455,6 +645,142 @@ impl ComputerEngine for CuaDriverCli {
             .await
             .map(|_| ())
     }
+}
+
+/// What the driver's own readiness report said.
+#[derive(Debug, Clone, Default)]
+struct DriverDoctor {
+    version: Option<String>,
+    degraded: Vec<String>,
+    unavailable_reason: Option<ComputerUnavailableReason>,
+}
+
+impl CuaDriverCli {
+    /// Runs the driver's own doctor and reads it into this crate's vocabulary.
+    ///
+    /// Read-only, needs no daemon, and it is the only place that knows what
+    /// this platform's readiness actually depends on.
+    async fn run_doctor(&self) -> ComputerResult<DriverDoctor> {
+        let mut command = tokio::process::Command::new(&self.executable);
+        command
+            .arg("doctor")
+            .arg("--json")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+            .await
+            .map_err(|_| {
+                ComputerError::process(
+                    codes::HELPER_FAILED,
+                    "the desktop driver did not answer before its deadline",
+                )
+            })?
+            .map_err(|error| {
+                ComputerError::process(
+                    codes::ENGINE_MISSING,
+                    "the desktop driver could not be started",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+        if !output.status.success() {
+            return Err(ComputerError::process(
+                codes::HELPER_FAILED,
+                "the desktop driver reported that it is not healthy",
+            )
+            .with_diagnostic(
+                "stderr",
+                bounded_text(&String::from_utf8_lossy(&output.stderr), 400),
+            ));
+        }
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            ComputerError::process(
+                codes::HELPER_FAILED,
+                "the desktop driver returned an unreadable readiness report",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(parse_doctor(&value))
+    }
+}
+
+/// Reads the doctor payload.
+///
+/// The probe labels are the driver's own; the mapping to this crate's
+/// `ComputerUnavailableReason` is what the settings page shows, so a failing
+/// probe becomes a named reason instead of a log line.
+fn parse_doctor(value: &Value) -> DriverDoctor {
+    let mut doctor = DriverDoctor::default();
+    let Some(probes) = value.get("probes").and_then(Value::as_array) else {
+        return doctor;
+    };
+    for probe in probes {
+        let label = string_at(probe, &["label"]).unwrap_or_default();
+        let status = string_at(probe, &["status"]).unwrap_or_default();
+        let message = string_at(probe, &["message"]).unwrap_or_default();
+        let detail = string_at(probe, &["detail"]).unwrap_or_default();
+        match label.as_str() {
+            "binary" => doctor.version = Some(message.clone()),
+            "display server" => {
+                if !status.eq_ignore_ascii_case("ok") {
+                    doctor.unavailable_reason = Some(ComputerUnavailableReason::NoDesktopSession);
+                    doctor.degraded.push(format!("display server: {message}"));
+                }
+            }
+            "AT-SPI" => {
+                if !status.eq_ignore_ascii_case("ok") {
+                    doctor.unavailable_reason =
+                        Some(ComputerUnavailableReason::AccessibilityBridgeMissing);
+                    doctor
+                        .degraded
+                        .push(format!("accessibility bus: {message}"));
+                }
+            }
+            _ => {
+                if !status.eq_ignore_ascii_case("ok") {
+                    // A warning is a degradation the user should see; a failure
+                    // is a capability gap. Both are worth keeping, neither is
+                    // turned into "unsupported" on its own.
+                    let text = if detail.is_empty() { message } else { detail };
+                    doctor.degraded.push(format!("{label}: {text}"));
+                }
+            }
+        }
+    }
+    doctor
+}
+
+/// Reads the tool names out of `list-tools`.
+///
+/// The command prints one `name: description` line per tool, so the parser
+/// accepts that shape and a JSON array, because a driver that grows a `--json`
+/// flag should not break the pin.
+fn collect_tool_names_from_listing(stdout: &str) -> Vec<String> {
+    let trimmed = stdout.trim();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Some(value) = parse_driver_reply(trimmed)
+    {
+        let names = collect_tool_names(&value);
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    let mut names: Vec<String> = trimmed
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim().to_string())
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Parses a driver reply, accepting both a bare document and the `{"result":…}`
@@ -983,6 +1309,63 @@ mod tests {
     }
 
     #[test]
+    fn the_tool_listing_parses_both_shapes() {
+        let listing = "bring_to_front: Persistently activate a window\n\
+                       list_apps: List Linux apps\n\
+                       list_apps: duplicate\n";
+        assert_eq!(
+            collect_tool_names_from_listing(listing),
+            vec!["bring_to_front".to_string(), "list_apps".to_string()]
+        );
+        let json_listing = r#"{"tools":[{"name":"click"},"list_apps"]}"#;
+        assert_eq!(
+            collect_tool_names_from_listing(json_listing),
+            vec!["click".to_string(), "list_apps".to_string()]
+        );
+        assert!(collect_tool_names_from_listing("").is_empty());
+        // The usage banner is not a tool list.
+        assert!(collect_tool_names_from_listing("cua-driver 0.31.0 — cross-platform").is_empty());
+    }
+
+    #[test]
+    fn the_doctor_payload_becomes_named_reasons() {
+        let healthy = parse_doctor(&json!({
+            "ok": true,
+            "probes": [
+                { "label": "binary", "status": "ok", "message": "cua-driver 0.31.0 (x86_64-linux)" },
+                { "label": "display server", "status": "ok", "message": "Wayland+XWayland" },
+                { "label": "AT-SPI", "status": "ok", "message": "org.a11y.Bus reachable" },
+                { "label": "X11 connection", "status": "warn", "message": "no top-level windows" }
+            ]
+        }));
+        assert_eq!(
+            healthy.version.as_deref(),
+            Some("cua-driver 0.31.0 (x86_64-linux)")
+        );
+        assert!(healthy.unavailable_reason.is_none());
+        assert_eq!(healthy.degraded.len(), 1);
+        assert!(healthy.degraded[0].contains("X11 connection"));
+
+        let no_display = parse_doctor(&json!({
+            "ok": false,
+            "probes": [{ "label": "display server", "status": "fail", "message": "no display" }]
+        }));
+        assert_eq!(
+            no_display.unavailable_reason,
+            Some(ComputerUnavailableReason::NoDesktopSession)
+        );
+
+        let no_bus = parse_doctor(&json!({
+            "ok": true,
+            "probes": [{ "label": "AT-SPI", "status": "fail", "message": "not reachable" }]
+        }));
+        assert_eq!(
+            no_bus.unavailable_reason,
+            Some(ComputerUnavailableReason::AccessibilityBridgeMissing)
+        );
+    }
+
+    #[test]
     fn applications_parse_a_list_and_a_single_document() {
         let list = parse_applications(&json!({
             "apps": [
@@ -1124,6 +1507,53 @@ mod tests {
         let mut changed = element.clone();
         changed.name = "Delete".to_string();
         assert_ne!(first, digest_elements(&[changed]));
+    }
+
+    /// The Phase 0 check: does this crate's view of a real driver match?
+    ///
+    /// Ignored by default because it needs an installed engine and a desktop
+    /// session; run it with `--ignored` on a machine that has both.
+    #[tokio::test]
+    #[ignore = "requires the desktop driver and a desktop session"]
+    async fn a_real_driver_answers_this_crates_probe() {
+        let driver = CuaDriverCli::discover().expect("the driver is installed on this machine");
+        let probe = driver
+            .probe()
+            .await
+            .expect("the driver answers its own probe");
+        assert!(
+            probe.engine.is_some(),
+            "the driver reports which binary answered"
+        );
+        assert!(
+            probe.tool_surface.is_some(),
+            "the tool listing parses; a real driver prints `name: description` lines"
+        );
+        let surface = probe.tool_surface.unwrap();
+        assert!(surface.contains("list_apps"), "{surface}");
+        // The doctor's own vocabulary is what the settings page shows.
+        for entry in &probe.degraded {
+            assert!(!entry.is_empty());
+        }
+    }
+
+    /// The other half of the Phase 0 check: a tool call reaches the desktop.
+    ///
+    /// Ignored by default; run with `--ignored` where the engine is installed.
+    /// The daemon is started by this call and dies with the process.
+    #[tokio::test]
+    #[ignore = "requires the desktop driver and a desktop session"]
+    async fn a_real_driver_lists_applications() {
+        let driver = CuaDriverCli::discover().expect("the driver is installed on this machine");
+        let apps = driver.list_apps().await.expect("list_apps answers");
+        assert!(
+            !apps.is_empty(),
+            "a running desktop reports at least one application"
+        );
+        assert!(
+            apps.iter().all(|app| !app.display_name.is_empty()),
+            "every application carries a name the model can address"
+        );
     }
 
     #[test]

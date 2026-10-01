@@ -240,6 +240,46 @@ that must hold on every desktop environment:
 `--computer-doctor` answers all three plus the engine and permission state, and
 maps each failure onto a named `ComputerUnavailableReason` instead of a boolean.
 
+## The driver protocol, as the engine actually speaks it
+
+Verified against `cua-driver 0.31.0` on Linux; the same shape holds on macOS and
+Windows. The engine is **a daemon plus a client**, and the difference matters at
+three points:
+
+| Question | Command | Needs the daemon |
+| --- | --- | --- |
+| what can it do | `list-tools` — one `name: description` line per tool | no |
+| is this machine ready | `doctor --json` — probes with `label`/`status`/`message` | no |
+| is it running | `status` — prints `Cua Driver daemon is running` | no |
+| do something | `call <tool> '<json>'` | **yes** |
+| start it | `serve --socket <path>` | — |
+
+Three consequences the implementation lives with:
+
+1. **A tool call needs a running daemon, so the helper starts one.** It runs
+   `serve` as its own child with `kill_on_drop`, after the driver reports no
+   daemon, and retries the call once. The process that spawns the daemon is the
+   process the operating system attaches the screen and accessibility grants to,
+   so this is also why the daemon is not left to the user's shell. If a daemon is
+   already running under the driver's own default socket, it is reused and none
+   is started.
+2. **A missing daemon is not a rejected action.** The client maps the driver's
+   `daemon is not running` to its own `computer_driver_daemon_missing` before the
+   generic rejection branch, because the caller has to start one and retry rather
+   than report a failure to the model.
+3. **Readiness is asked in the driver's vocabulary.** `doctor --json` reports the
+   probes this platform actually depends on — display server, X11 connection,
+   accessibility bus — and the adapter maps a failing probe to a named
+   `ComputerUnavailableReason` (`NoDesktopSession`, `AccessibilityBridgeMissing`)
+   instead of paraphrasing a log. `list-tools` and `doctor` are what tell a real
+   driver apart from a file with the right name: both are read-only, need no
+   daemon, and touch no desktop.
+
+The engine's permission model is macOS-specific: `permissions status --json`
+answers with the daemon's own TCC identity, so it is read there and reported as
+not-required elsewhere. The probe never prompts — a permission dialog belongs to
+a click in the settings, not to a startup path.
+
 ## Settings and installation
 
 The settings page is the product's front door for this feature. Nothing about
