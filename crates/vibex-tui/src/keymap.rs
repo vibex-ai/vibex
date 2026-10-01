@@ -962,6 +962,16 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::AttachImage,
         "Image",
     ),
+    // The reader's own paste gesture. A terminal in bracketed-paste mode never
+    // sends this key — it pastes the text itself — so the binding only fires on
+    // the terminals that forward it, where a clipboard holding an image would
+    // otherwise paste nothing at all.
+    binding(
+        Scope::Composer,
+        Chord::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        Intent::PasteClipboard,
+        "Paste",
+    ),
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Char('a'), KeyModifiers::ALT),

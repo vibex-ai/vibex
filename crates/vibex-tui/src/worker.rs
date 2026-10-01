@@ -24,6 +24,18 @@ use crate::reduce::payloads;
 
 /// One message from the worker back to the UI thread.
 ///
+/// What the system clipboard held when the reader pressed paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    Image {
+        mime_type: String,
+        bytes: Vec<u8>,
+    },
+    Text(String),
+    /// Nothing pasteable: no image, no text.
+    Empty,
+}
+
 /// The variants differ a lot in size because they carry whole catalogues and
 /// timelines. Boxing them would add an allocation per message for a value that
 /// is moved through the channel exactly once, so the payloads stay inline.
@@ -34,6 +46,8 @@ pub enum AppMessage {
     /// An image off the system clipboard: its media type and bytes, or `None`
     /// when there is none or the desktop offers no way to read one.
     ClipboardImage(Option<(String, Vec<u8>)>),
+    /// What the system clipboard held when the reader pressed paste.
+    Pasted(ClipboardContent),
     SessionOpened {
         ticket: vibex_ui::AgentSessionLoadTicket,
         result: BackendResult<vibex_ui::AgentSessionSnapshot>,
@@ -303,6 +317,22 @@ impl Dispatch {
                     Ok(_) => self.ok("send_message"),
                     Err(error) => self.failure("send_message", error),
                 }
+            }
+            Effect::ReadClipboard => {
+                // Image first: a clipboard can hold both, and the picture is
+                // the half a terminal cannot paste by itself.
+                let content = tokio::task::spawn_blocking(|| {
+                    if let Some((mime_type, bytes)) = crate::terminal::read_clipboard_image() {
+                        return ClipboardContent::Image { mime_type, bytes };
+                    }
+                    match crate::terminal::read_clipboard_text() {
+                        Some(text) if !text.is_empty() => ClipboardContent::Text(text),
+                        _ => ClipboardContent::Empty,
+                    }
+                })
+                .await
+                .unwrap_or(ClipboardContent::Empty);
+                self.send(AppMessage::Pasted(content));
             }
             Effect::ReadClipboardImage => {
                 // Talking to a clipboard owner can block for the whole

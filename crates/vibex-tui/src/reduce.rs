@@ -602,6 +602,7 @@ impl App {
                 Outcome::effects(effects)
             }
             Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboardImage]),
+            Intent::PasteClipboard => Outcome::effects(vec![Effect::ReadClipboard]),
             Intent::ToggleDock => {
                 self.dock_open = !self.dock_open;
                 if self.dock_open {

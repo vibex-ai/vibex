@@ -2337,20 +2337,64 @@ impl App {
         });
     }
 
-    /// Whether a paste is a path to an image file, and should be attached.
+    /// The image paths a paste names, in the order they appear.
     ///
-    /// Only a single existing file with an image extension qualifies: anything
-    /// else — a paragraph, a list of paths, a directory — is text the reader
-    /// meant to put in the draft.
-    pub fn image_path_from_paste(text: &str) -> Option<String> {
-        let trimmed = text.trim().trim_matches('"');
-        if trimmed.is_empty() || text.contains('\n') || trimmed.len() > 4096 {
-            return None;
+    /// A paste that names a picture is a request to attach it, not to write its
+    /// name into the prompt. Terminals and file managers spell a path in more
+    /// than one way — quoted, `file://`-prefixed, with escaped spaces, with a
+    /// `~` — and a screenshot is often dropped in as a path *plus* a sentence,
+    /// so each line is judged on its own.
+    pub fn image_paths_from_paste(text: &str) -> Vec<String> {
+        if text.len() > 64 * 1024 {
+            return Vec::new();
         }
-        crate::composer::image_mime_for_path(trimmed)?;
-        std::path::Path::new(trimmed)
-            .is_file()
-            .then(|| trimmed.to_string())
+        text.lines()
+            .map(pasted_path)
+            .filter(|path| !path.is_empty())
+            .filter(|path| crate::composer::image_mime_for_path(path).is_some())
+            .filter(|path| std::path::Path::new(path).is_file())
+            .collect()
+    }
+
+    /// Whether a paste names exactly one image, and should be attached.
+    ///
+    /// The single-path case is kept as its own question because the answer
+    /// decides whether the paste becomes an attachment or a draft: a paste of
+    /// anything else — a paragraph, a directory, a list of mixed paths — is
+    /// text the reader meant to put in the prompt.
+    pub fn image_path_from_paste(text: &str) -> Option<String> {
+        let paths = Self::image_paths_from_paste(text);
+        (paths.len() == 1 && text.trim().lines().count() == 1).then(|| paths[0].clone())
+    }
+
+    /// Route a paste, wherever it came from.
+    ///
+    /// One path in: the reader's paste gesture is shared by the terminal's own
+    /// bracketed paste and by the client's clipboard reader, and both have to
+    /// treat a picture path and a paragraph the same way.
+    pub fn insert_pasted_text(&mut self, text: &str) {
+        let paths = Self::image_paths_from_paste(text);
+        if !paths.is_empty() {
+            let mut attached = Vec::new();
+            let mut failure = None;
+            for path in paths {
+                match self.attach_image_path(&path) {
+                    Ok(label) => attached.push(label),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            if let Some(error) = failure {
+                self.toast(Toast::warning(error));
+            } else if !attached.is_empty() {
+                let message = format!("{} {}", self.strings.image_attached(), attached.join(", "));
+                self.toast(Toast::success(message));
+            }
+            return;
+        }
+        // A big paste collapses into a chip so the draft stays readable; the
+        // bytes are put back when it is sent.
+        self.composer.insert_paste(text);
+        self.refresh_completion();
     }
 
     /// Attach an image from a path on the authority host or the local machine.
@@ -2622,6 +2666,46 @@ impl AppOptions {
     }
 }
 
+/// Normalise one pasted line into a filesystem path.
+///
+/// Handles what a terminal, a file manager or a browser actually puts on the
+/// clipboard: surrounding quotes, a `file://` URL, backslash-escaped spaces,
+/// and a `~` home prefix.
+fn pasted_path(line: &str) -> String {
+    let mut text = line.trim();
+    if let Some(rest) = text
+        .strip_prefix("file://")
+        .or_else(|| text.strip_prefix("file:"))
+    {
+        text = rest;
+        // `file:///Users/me/a.png` keeps its leading slash; `file://host/path`
+        // does not name anything on this machine and is left to fail.
+        if let Some(unescaped) = text.strip_prefix('/')
+            && text.starts_with("//")
+        {
+            text = unescaped;
+        }
+    }
+    let text = text.trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            text.strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .unwrap_or(text);
+    // A shell escapes a space in a drag-and-dropped path; nobody types the
+    // backslashes themselves, so unescaping them is never wrong here.
+    let unescaped = text.replace("\\ ", " ");
+    if let Some(rest) = unescaped.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::Path::new(&home).join(rest).display().to_string();
+    }
+    unescaped
+}
+
 /// Whether a projected row earns a row in the transcript.
 ///
 /// A timeline carries bookkeeping as well as conversation, and a character grid
@@ -2749,6 +2833,11 @@ pub enum Effect {
     ContinueTurn {
         session_id: VibexSessionId,
     },
+    /// Ask the worker for whatever the system clipboard holds.
+    ///
+    /// An image is attached; text is pasted. Reading a clipboard is I/O and
+    /// belongs to the worker, so the reducer only asks.
+    ReadClipboard,
     /// Ask the host for an image on the system clipboard.
     ///
     /// Reading a clipboard is I/O and belongs to the worker; the reducer asks
@@ -2944,6 +3033,7 @@ impl Effect {
             Effect::ArchiveSession { .. } => "archive_session",
             Effect::DeleteSession { .. } => "delete_session",
             Effect::ForkSession { .. } => "fork_session",
+            Effect::ReadClipboard => "read_clipboard",
             Effect::ReadClipboardImage => "read_clipboard_image",
             Effect::SendMessage { .. } => "send_message",
             Effect::ContinueTurn { .. } => "continue_turn",
@@ -3091,6 +3181,72 @@ mod tests {
                 .is_none(),
             "an app without a path still wrote something"
         );
+    }
+
+    #[test]
+    fn the_ways_a_terminal_spells_a_path_all_attach() {
+        let directory = tempfile::tempdir().unwrap();
+        let spaces = directory.path().join("Screenshot 2026-10-01.png");
+        std::fs::write(&spaces, b"png").unwrap();
+        let plain = directory.path().join("shot.png");
+        std::fs::write(&plain, b"png").unwrap();
+        let display = spaces.display().to_string();
+
+        for spelling in [
+            display.clone(),
+            format!("  {display}  "),
+            format!("\"{display}\""),
+            format!("'{display}'"),
+            display.replace(' ', "\\ "),
+        ] {
+            assert_eq!(
+                App::image_paths_from_paste(&spelling),
+                vec![display.clone()],
+                "{spelling} did not resolve"
+            );
+        }
+        let url = format!("file://{}", plain.display());
+        assert_eq!(
+            App::image_paths_from_paste(&url),
+            vec![plain.display().to_string()]
+        );
+        // A `file://host/path` names another machine, which has no file here.
+        assert!(App::image_paths_from_paste("file://elsewhere/tmp/a.png").is_empty());
+    }
+
+    #[test]
+    fn a_paste_can_carry_several_pictures_and_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("one.png");
+        let second = directory.path().join("two.jpg");
+        std::fs::write(&first, b"png").unwrap();
+        std::fs::write(&second, b"jpg").unwrap();
+
+        let both = format!("{}\n{}", first.display(), second.display());
+        assert_eq!(
+            App::image_paths_from_paste(&both),
+            vec![first.display().to_string(), second.display().to_string()]
+        );
+        // Two files on two lines is not one path: it is a paste that happens to
+        // name pictures, and only the plural question can answer for it.
+        assert_eq!(App::image_path_from_paste(&both), None);
+        // A picture named inside a sentence stays a sentence.
+        assert!(
+            App::image_paths_from_paste(&format!("look at {}", first.display())).is_empty(),
+            "a sentence was read as a path"
+        );
+    }
+
+    #[test]
+    fn a_home_relative_paste_is_expanded() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = std::path::Path::new(&home).join("vibex-paste-probe.png");
+        std::fs::write(&path, b"png").unwrap();
+        let expanded = App::image_paths_from_paste("~/vibex-paste-probe.png");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(expanded, vec![path.display().to_string()]);
     }
 
     #[test]

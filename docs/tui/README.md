@@ -200,15 +200,30 @@ the cursor steps over it, one `Backspace` removes it, and pasting the same bytes
 again expands it in place rather than adding a second copy. What is sent is the
 original bytes, not the label.
 
-`Alt+I` attaches an image: the client asks the desktop clipboard for one
-(`wl-paste`, `xclip` or `pngpaste`, each with a deadline) and falls back to
-asking for a path when there is none. Pasting a path that names an existing
-image file attaches it too, rather than typing the path into the prompt. The
-image becomes a second kind of chip, `[Image #1]`, numbered monotonically for
-the draft and capped at ten per prompt; the label is stripped from the message
-text and the picture travels as an attachment — by path when the runtime can
-read it, as a data URL when it came from the clipboard. The info line under the
-draft reports how many are attached.
+`Alt+I` attaches an image: the client asks the desktop clipboard for one and
+falls back to asking for a path when there is none. The clipboard decides what
+kind of image it holds — a screenshot is a PNG, a picture copied out of a
+browser is usually a JPEG — so the offered types are listed first and the bytes
+are read back under the type the owner offers. The reader is whichever tool the
+desktop provides: `wl-paste` on Wayland, `xclip` under X11, `pngpaste` or the
+system script host on macOS, PowerShell on Windows. Each has a deadline, and a
+machine with none of them has no clipboard images rather than an error.
+
+`Ctrl+V` pastes: an image on the clipboard becomes an attachment, text goes into
+the draft, and an empty clipboard says so. Terminals that paste by themselves
+never send this key — that is what the terminal's own paste is for — so the
+binding exists for the ones that forward it, where the picture a clipboard holds
+would otherwise paste nothing at all. A terminal paste that names an existing
+image file attaches it too, rather than typing the path into the prompt: quoted,
+`file://`-prefixed, `~`-relative and backslash-escaped paths all count, several
+pictures in one paste attach together, and a path mentioned inside a sentence
+stays a sentence.
+
+The image becomes a second kind of chip, `[Image #1]`, numbered monotonically
+for the draft and capped at ten per prompt; the label is stripped from the
+message text and the picture travels as an attachment — by path when the runtime
+can read it, as a data URL when it came from the clipboard. The info line under
+the draft reports how many are attached.
 
 A draft can also be selected. `Shift` plus the motion keys extends the
 selection, `Alt+A` takes the whole draft and `Alt+C` copies the selected part;

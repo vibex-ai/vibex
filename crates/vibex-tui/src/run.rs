@@ -137,21 +137,10 @@ fn event_loop(
                             search.set_query(query);
                         }
                         app.refresh_search_matches();
-                    } else if let Some(path) = crate::app::App::image_path_from_paste(&text) {
-                        // A pasted path to a picture is a request to attach it,
-                        // not to write its name into the prompt.
-                        match app.attach_image_path(&path) {
-                            Ok(label) => {
-                                let message = format!("{} {label}", app.strings.image_attached());
-                                app.toast(Toast::success(message));
-                            }
-                            Err(error) => app.toast(Toast::warning(error)),
-                        }
                     } else {
-                        // A big paste collapses into a chip so the draft stays
-                        // readable; the bytes are put back when it is sent.
-                        app.composer.insert_paste(&text);
-                        app.refresh_completion();
+                        // One route for every paste: a path to a picture is a
+                        // request to attach it, anything else is draft text.
+                        app.insert_pasted_text(&text);
                     }
                     dirty = true;
                 }
@@ -1172,6 +1161,24 @@ fn mouse_cell_clamped(app: &mut App, column: u16, row: u16) -> Option<(usize, u1
 
 fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
     match message {
+        AppMessage::Pasted(content) => {
+            use crate::worker::ClipboardContent;
+            match content {
+                ClipboardContent::Image { mime_type, bytes } => {
+                    match app.attach_image_bytes(mime_type, bytes) {
+                        Ok(label) => {
+                            let message = format!("{} {label}", app.strings.image_attached());
+                            app.toast(Toast::success(message));
+                        }
+                        Err(error) => app.toast(Toast::warning(error)),
+                    }
+                }
+                ClipboardContent::Text(text) => app.insert_pasted_text(&text),
+                ClipboardContent::Empty => {
+                    app.toast(Toast::info(app.strings.clipboard_empty().to_string()));
+                }
+            }
+        }
         AppMessage::ClipboardImage(image) => match image {
             Some((mime_type, bytes)) => match app.attach_image_bytes(mime_type, bytes) {
                 Ok(label) => {

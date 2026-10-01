@@ -434,11 +434,22 @@ is never a column count.
   together because the message is one value. Labels are numbered monotonically
   per draft and never recycled, `IMAGE_CAP` bounds a prompt, and clipboard bytes
   travel as a shared `Arc` so the undo snapshots do not copy the pixels.
-* **Clipboard reading is the worker's job, never the reducer's.** `Effect::
-  ReadClipboardImage` runs on `spawn_blocking`, shells out to the desktop's
-  clipboard tool with a deadline and a kill, and answers with an `AppMessage`.
-  The client still *writes* the clipboard only over OSC 52; reading is an
+* **Clipboard reading is the worker's job, never the reducer's.**
+  `Effect::ReadClipboardImage` and `Effect::ReadClipboard` run on
+  `spawn_blocking`, shell out to the desktop's clipboard tool with a deadline
+  and a kill, and answer with an `AppMessage`. The read is *type-aware*: the
+  owner lists what it offers and the bytes come back under the type it offers,
+  because asking for PNG and nothing else finds nothing on a clipboard holding a
+  JPEG. The client still *writes* the clipboard only over OSC 52; reading is an
   enhancement that degrades to "name a file instead" when no tool exists.
+* **One paste route, whoever pasted.** The terminal's bracketed paste and the
+  client's own clipboard reader both end in `App::insert_pasted_text`: a picture
+  named as a path becomes an attachment — quoted, `file://`, `~`-relative and
+  backslash-escaped spellings all count, several pictures attach together, and a
+  path inside a sentence stays a sentence — and anything else becomes draft
+  text. `Ctrl+V` is bound to it in the composer scope: a terminal
+  in bracketed-paste mode never sends the key, so the binding only fires where
+  the terminal forwards it — and there it is the only way to paste a picture.
 * **A selection in the draft is byte offsets plus a sticky anchor.** `Shift`
   motions extend it, `Alt+A`/`Alt+C` select and copy it, a mouse press-drag
   selects it, and every mutation consumes it first, so typing replaces it.

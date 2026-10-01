@@ -151,6 +151,7 @@ intents! {
     ComposerLineStart => { scope: Composer, id: "composer_line_start", label: "Line start", help: "Move the cursor to the start of the line." },
     ComposerLineEnd => { scope: Composer, id: "composer_line_end", label: "Line end", help: "Move the cursor to the end of the line." },
     AttachImage => { scope: Composer, id: "composer_image", label: "Image", help: "Attach an image from the clipboard, or name a file to attach." },
+    PasteClipboard => { scope: Composer, id: "composer_paste", label: "Paste", help: "Paste the clipboard: an image becomes an attachment, text goes into the draft." },
     SelectAllDraft => { scope: Composer, id: "composer_select_all", label: "Select all", help: "Select the whole draft so typing replaces it." },
     CopyDraftSelection => { scope: Composer, id: "composer_copy_draft", label: "Copy draft", help: "Copy the selected part of the draft to the clipboard." },
 

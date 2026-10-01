@@ -266,34 +266,193 @@ pub fn copy_to_clipboard(text: &str) -> BackendResult<()> {
 /// How long a clipboard helper may take before it is killed.
 ///
 /// These programs talk to a clipboard owner that may be gone; a request that
-/// has not answered in a moment is not going to.
-const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+/// has not answered in a moment is not going to. The budget has to fit the
+/// slowest helper, which is the shell on macOS and Windows that has to start an
+/// interpreter first — and it is spent on a worker thread, so the interface
+/// never waits for it.
+const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+
+/// Image types the composer can attach, in the order a clipboard is asked for
+/// them. PNG first: a screenshot is always one.
+const IMAGE_TYPES: [&str; 5] = [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+];
 
 /// Read an image off the system clipboard, if there is one.
 ///
 /// A terminal gives a client no way to ask for pixels, so this shells out to
 /// whichever clipboard tool the desktop provides: `wl-paste` on Wayland,
-/// `xclip` under X11, `pngpaste` on macOS. A machine with none of them simply
-/// has no clipboard images, which is reported as `None` rather than an error —
-/// the reader can still attach a file by path.
+/// `xclip` under X11, `pngpaste` or `osascript` on macOS, PowerShell on
+/// Windows. A machine with none of them simply has no clipboard images, which
+/// is reported as `None` rather than an error — the reader can still attach a
+/// file by path.
+///
+/// The clipboard decides what kind of image it holds — a screenshot is a PNG,
+/// a picture copied out of a browser or a photo library is usually a JPEG — so
+/// the offered types are listed first and the bytes are read back under the
+/// type the owner offers. Asking for PNG and nothing else finds nothing on half
+/// the clipboards it meets.
 pub fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
-    for (program, args) in [
-        ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
-        (
+    // Wayland. A clipboard that lists no image is not a reason to stop: an X11
+    // application's copy may only be visible through the compatibility layer.
+    let wayland = list_clipboard_types("wl-paste", &["--list-types"])
+        .and_then(|listing| first_image_type(&listing));
+    if let Some(mime) = wayland
+        && let Some(bytes) = run_clipboard_command(
+            "wl-paste",
+            &[
+                "--no-newline".to_string(),
+                "--type".to_string(),
+                mime.clone(),
+            ],
+        )
+    {
+        return Some((mime, bytes));
+    }
+    // X11.
+    let x11 = list_clipboard_types("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        .and_then(|listing| first_image_type(&listing));
+    if let Some(mime) = x11
+        && let Some(bytes) = run_clipboard_command(
             "xclip",
-            vec!["-selection", "clipboard", "-t", "image/png", "-o"],
-        ),
-        ("pngpaste", vec!["-"]),
+            &[
+                "-selection".to_string(),
+                "clipboard".to_string(),
+                "-t".to_string(),
+                mime.clone(),
+                "-o".to_string(),
+            ],
+        )
+    {
+        return Some((mime, bytes));
+    }
+    // macOS: `pngpaste` when it is installed, otherwise the system script host,
+    // which can write the clipboard's PNG to a file and needs no install.
+    if let Some(bytes) = run_clipboard_command("pngpaste", &["-".to_string()]) {
+        return Some(("image/png".to_string(), bytes));
+    }
+    if let Some(bytes) = read_clipboard_image_via_file(&macos_clipboard_script()) {
+        return Some(("image/png".to_string(), bytes));
+    }
+    // Windows.
+    let script = windows_clipboard_script(&clipboard_temp_path())?;
+    read_clipboard_image_via_file(&[
+        "powershell".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        script,
+    ])
+    .map(|bytes| ("image/png".to_string(), bytes))
+}
+
+/// Read the clipboard's text, if it has any.
+///
+/// The reader's own paste gesture: a terminal in bracketed-paste mode never
+/// sends the key, so this exists for the ones that do, and for a client that
+/// wants to paste without a terminal's help.
+pub fn read_clipboard_text() -> Option<String> {
+    for (program, args) in [
+        ("wl-paste", vec!["--no-newline"]),
+        ("xclip", vec!["-selection", "clipboard", "-o"]),
+        ("pbpaste", vec![]),
     ] {
-        if let Some(bytes) = run_clipboard_command(program, &args) {
-            return Some(("image/png".to_string(), bytes));
+        let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+        if let Some(bytes) = run_clipboard_command(program, &args)
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            return Some(text);
         }
     }
     None
 }
 
+/// A path in the temp directory for a clipboard helper to write into.
+fn clipboard_temp_path() -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("vibex-clipboard-{}.png", std::process::id()));
+    path
+}
+
+/// The first image type a clipboard offers, in [`IMAGE_TYPES`] order.
+///
+/// Pure, so the parsing is testable without a clipboard.
+fn first_image_type(listing: &str) -> Option<String> {
+    let offered = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    IMAGE_TYPES
+        .iter()
+        .find(|wanted| offered.contains(wanted))
+        .map(|mime| (*mime).to_string())
+}
+
+/// The clipboard's offered types, one per line, or `None` without a helper.
+fn list_clipboard_types(program: &str, args: &[&str]) -> Option<String> {
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let bytes = run_clipboard_command(program, &args)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Run a helper that writes the clipboard image to
+/// [`clipboard_temp_path`], then read and remove that file.
+fn read_clipboard_image_via_file(args: &[String]) -> Option<Vec<u8>> {
+    let path = clipboard_temp_path();
+    let _ = std::fs::remove_file(&path);
+    // `args` is built here, never by the reader, so the path in the script
+    // cannot carry a quote out of it.
+    let args = args
+        .iter()
+        .map(|arg| arg.replace("{path}", &path.display().to_string()))
+        .collect::<Vec<_>>();
+    let ran = run_clipboard_command(&args[0], &args[1..]);
+    let bytes = std::fs::read(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    ran?;
+    bytes.filter(|bytes| !bytes.is_empty())
+}
+
+/// AppleScript that writes the clipboard's PNG to `{path}`.
+fn macos_clipboard_script() -> Vec<String> {
+    vec![
+        "osascript".to_string(),
+        "-e".to_string(),
+        "set outFile to POSIX file \"{path}\"".to_string(),
+        "-e".to_string(),
+        "set theImage to (the clipboard as «class PNGf»)".to_string(),
+        "-e".to_string(),
+        "set fh to open for access outFile with write permission".to_string(),
+        "-e".to_string(),
+        "set eof fh to 0".to_string(),
+        "-e".to_string(),
+        "write theImage to fh".to_string(),
+        "-e".to_string(),
+        "close access fh".to_string(),
+    ]
+}
+
+/// PowerShell that saves the clipboard image to `{path}`.
+fn windows_clipboard_script(path: &std::path::Path) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    Some(format!(
+        "Add-Type -AssemblyName System.Windows.Forms;          $image = [System.Windows.Forms.Clipboard]::GetImage();          if ($image) {{ $image.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png) }}",
+        path.display()
+    ))
+}
+
 /// Run one clipboard helper, with a deadline and a size cap.
-fn run_clipboard_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+fn run_clipboard_command(program: &str, args: &[String]) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::process::{Command, Stdio};
 
@@ -375,6 +534,51 @@ pub fn non_interactive_help() -> &'static str {
     "vibex tui needs an interactive terminal.\n\
      Run it from a terminal, or use a non-interactive entry point such as\n\
      `vibex --help`."
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn the_offered_image_type_is_the_one_that_is_read_back() {
+        // A screenshot is a PNG, a picture from a browser is usually a JPEG,
+        // and a client that only ever asks for PNG finds nothing on half the
+        // clipboards it meets.
+        // PNG is preferred when the clipboard offers it, and JPEG is taken when
+        // that is all there is.
+        let listing = "text/plain\nTEXT\nimage/jpeg\nimage/png\n";
+        assert_eq!(first_image_type(listing).as_deref(), Some("image/png"));
+        assert_eq!(
+            first_image_type("text/plain\nimage/jpeg").as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            first_image_type("image/png\nimage/jpeg").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(first_image_type("text/plain\nTEXT\n"), None);
+        assert_eq!(first_image_type(""), None);
+        // A type the composer cannot attach is not a type it asks for.
+        assert_eq!(first_image_type("image/tiff\nimage/svg+xml"), None);
+        assert_eq!(
+            first_image_type("  image/webp  \n"),
+            Some("image/webp".to_string())
+        );
+    }
+
+    #[test]
+    fn the_clipboard_scripts_name_the_file_they_write() {
+        let macos = macos_clipboard_script();
+        assert_eq!(macos[0], "osascript");
+        assert!(macos.iter().any(|part| part.contains("{path}")));
+        assert!(macos.iter().any(|part| part.contains("PNGf")));
+        // The Windows script only exists on Windows, where it can be run.
+        assert_eq!(
+            windows_clipboard_script(std::path::Path::new("x.png")).is_some(),
+            cfg!(windows)
+        );
+    }
 }
 
 #[cfg(test)]

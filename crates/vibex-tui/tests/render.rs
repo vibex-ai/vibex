@@ -2616,3 +2616,47 @@ fn a_streamed_answer_grows_frame_by_frame() {
     );
     assert!(heights.last() > heights.first(), "{heights:?}");
 }
+
+#[test]
+fn a_clipboard_image_paste_becomes_an_attachment_not_a_draft() {
+    // The route the client's own clipboard reader takes: the worker reports
+    // bytes and the composer shows a chip. The chip's label is part of the
+    // draft — it is what the reader sees and can delete — but the *path* of a
+    // pasted picture never becomes prose the Agent reads.
+    let mut app = app(110, 30);
+    app.navigate_to(Page::Agent);
+    assert!(app.composer.text().is_empty());
+
+    let label = app
+        .attach_image_bytes("image/png", vec![0x89, b'P', b'N', b'G'])
+        .expect("clipboard bytes attach");
+    assert!(label.starts_with("[Image #"), "{label}");
+    assert_eq!(app.composer.image_count(), 1);
+    assert_eq!(app.composer.text(), label);
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let shot = directory.path().join("shot.png");
+    std::fs::write(&shot, b"png").expect("write");
+    app.insert_pasted_text(&shot.display().to_string());
+    assert_eq!(app.composer.image_count(), 2);
+    assert!(
+        !app.composer.text().contains("shot.png"),
+        "the pasted path leaked into the draft: {:?}",
+        app.composer.text()
+    );
+
+    // Text still goes into the draft, after the chips.
+    app.insert_pasted_text("a pasted sentence");
+    assert!(
+        app.composer.text().ends_with("a pasted sentence"),
+        "{:?}",
+        app.composer.text()
+    );
+
+    // And the chips are what the screen shows.
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(
+        screen.contains("[Image #1]"),
+        "the attachment is not on screen:\n{screen}"
+    );
+}

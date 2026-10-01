@@ -291,6 +291,11 @@ strings! {
         "一条消息最多附加 10 张图片",
         "一則訊息最多附加 10 張圖片"
     },
+    clipboard_empty => {
+        "Nothing to paste",
+        "剪贴板里没有可粘贴的内容",
+        "剪貼簿裡沒有可貼上的內容"
+    },
     image_clipboard_empty => {
         "No image on the clipboard — type a path instead",
         "剪贴板里没有图片 — 请改为输入路径",
