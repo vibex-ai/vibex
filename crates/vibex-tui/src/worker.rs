@@ -22,6 +22,11 @@ use vibex_core::{AgentSession, VibexSessionId};
 use crate::app::Effect;
 use crate::reduce::payloads;
 
+/// How much of a session's history a probe reads: the tail of the latest turn
+/// is all the answer needs, and the same page is what the Desktop asks for when
+/// it probes.
+const AUTO_CONTINUE_PROBE_LIMIT: u32 = 500;
+
 /// One message from the worker back to the UI thread.
 ///
 /// What the system clipboard held when the reader pressed paste.
@@ -43,6 +48,12 @@ pub enum ClipboardContent {
 #[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
     Sessions(BackendResult<Vec<AgentSession>>),
+    /// What a session's latest turn did, asked for by auto-continue.
+    AutoContinueTurnStatus {
+        session_id: VibexSessionId,
+        updated_at_ms: i64,
+        ended_normally: Option<bool>,
+    },
     /// The arrangement the authority draws its sidebar from, when it has one.
     SidebarOrganization(BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot>),
     /// The arrangement after a change this client asked for.
@@ -231,6 +242,30 @@ impl Dispatch {
             Effect::ListSessions { include_archived } => {
                 let result = self.facade.agent().list_sessions(include_archived).await;
                 self.send(AppMessage::Sessions(result));
+            }
+            Effect::ProbeAutoContinue {
+                session_id,
+                updated_at_ms,
+            } => {
+                // The latest page is what "the last turn" means: the answer is
+                // read off its tail, the way the Desktop reads its own.
+                let request = vibex_core::FetchTimelineRequest {
+                    session_id: session_id.clone(),
+                    after_sequence: None,
+                    before_sequence: None,
+                    limit: AUTO_CONTINUE_PROBE_LIMIT,
+                };
+                let page = self.facade.agent().fetch_timeline(request).await;
+                let ended_normally = page.ok().and_then(|page| {
+                    (page.session_id == session_id)
+                        .then(|| vibex_core::latest_timeline_turn_ended_normally(&page.items))
+                        .flatten()
+                });
+                self.send(AppMessage::AutoContinueTurnStatus {
+                    session_id,
+                    updated_at_ms,
+                    ended_normally,
+                });
             }
             Effect::LoadSidebarOrganization => {
                 let result = self.facade.sidebar().sidebar_organization().await;

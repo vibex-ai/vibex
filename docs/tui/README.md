@@ -371,10 +371,10 @@ band from the least important end.
 ### Sessions
 
 Each row carries what the desktop's sidebar row carries, in terminal terms: the
-Agent's mark, an unread dot, the title, the state, and how long ago the session
-last said anything. The state and the time are aligned on their right edge in
-columns measured in terminal cells, so neither a double-width title nor a
-longer word pushes a column out of line.
+Agent's mark, an unread dot, the title, the state as a single mark, whether the
+session continues itself, and how long ago it last said anything. The marks and
+the time are aligned on their right edge in columns measured in terminal cells,
+so neither a double-width title nor a longer value pushes a column out of line.
 
 - **The Agent's mark** is its label's first letter, coloured from the label, so
   the same Agent keeps its colour across sessions and machines without a table
@@ -388,9 +388,15 @@ longer word pushes a column out of line.
 - **The pin** (`★`, or `*` on a terminal without box drawing) marks a session
   the authority has hoisted above the rest. It leads the row because a pinned
   session is the one the reader asked to keep in view.
-- **State** is a mark and a word: `▶` running, `✗` failed, `·` idle, `◆` waiting
-  on the reader, `▤` archived. The shape carries the meaning on its own; the
-  colour says it a second time.
+- **State** is one mark, not a word: `▶` running, `✗` failed, `·` idle, `◆`
+  waiting on the reader, `▤` archived. The shapes are a small vocabulary the
+  reader learns once, and spelling them out cost the title a third of the row
+  for information the mark already carried. The shape carries the meaning on
+  its own; the colour says it a second time.
+- **Auto-continue** is a mark of its own before the state: `↻` when the session
+  will continue itself, `↻3` while it counts down. `t` works it: it stops a
+  countdown, resumes a suspended session, or switches auto-continue on or off —
+  each of those is a control the desktop has.
 - **The time** is coarse — `now`, `3m`, `5h`, `2d` — because a list separates
   "a moment ago" from "a while ago", and a timestamp to the second is a column
   of noise.
@@ -404,6 +410,29 @@ body. `g` folds the headings away for one flat run. `/` filters — a search ope
 closed folders rather than hiding what it matched. `Enter` opens, `n` starts a
 new one, `r` renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A`
 includes archived sessions.
+
+### Auto-continue
+
+A session with auto-continue on continues itself when a turn stops without an
+answer: the Agent errored, or went idle without producing a final message. The
+rule is the desktop's — the same predicate decides whether a turn needs
+continuing, the same reading of the timeline decides whether it ended normally,
+and the same five-second countdown precedes the send — so the two surfaces
+agree about which sessions are running themselves.
+
+The countdown is the reader's escape hatch: a message that appears by itself
+with no warning is indistinguishable from a runaway Agent, so the row shows
+`↻5`, `↻4`, … and `t` stops it. Stopping a turn (`Esc` on a running session)
+suspends auto-continue for that session rather than letting it restart the turn
+the reader just cancelled; sending a message resumes it; a continuation that
+has already gone out is not sent twice for the same turn. A session waiting on
+the reader (`◆`) is never continued: answering a question is the reader's job.
+
+The preference itself travels in the sidebar arrangement's auto-continue
+fields, so switching a session on here switches it on in the desktop, and a
+project whose default is on continues its sessions here too. With no authority
+to write to (no runtime arrangement loaded), the switch is this client's alone
+for the run.
 
 `p` pins the selected session, `Enter` on a heading folds it, and
 `Alt+↑`/`Alt+↓` move a session through the order; all three are sent to the

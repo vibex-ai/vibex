@@ -894,7 +894,7 @@ impl SidebarBackend for NativeBackend {
             // behind our back.
             let store = UiStateStore::new(runtime.ui_state_path());
             let state = store.load_read_only().map_err(sidebar_state_error)?;
-            Ok(SidebarOrganizationView::from_sidebar_ui_state(&state.state.sidebar).to_remote())
+            Ok(SidebarOrganizationView::from_desktop_ui_state(&state.state).to_remote())
         })
     }
 
@@ -908,7 +908,7 @@ impl SidebarBackend for NativeBackend {
             runtime.ensure_accepting_actions()?;
             let store = UiStateStore::new(runtime.ui_state_path());
             let mut state = store.load_read_only().map_err(sidebar_state_error)?.state;
-            let mut view = SidebarOrganizationView::from_sidebar_ui_state(&state.sidebar);
+            let mut view = SidebarOrganizationView::from_desktop_ui_state(&state);
             if expected_revision.is_some_and(|revision| revision != view.revision) {
                 return Err(sidebar_mutation_error(
                     "remote_sidebar_organization_stale_revision",
@@ -952,7 +952,7 @@ impl SidebarBackend for NativeBackend {
                     ));
                 }
             }
-            view.apply_to_sidebar_ui_state(&mut state.sidebar);
+            view.apply_to_desktop_ui_state(&mut state);
             store.save(&state).map_err(sidebar_state_error)?;
             // Answer with the arrangement as it now reads, not with the one
             // this call happened to hold: saving normalizes, and a snapshot
@@ -960,7 +960,7 @@ impl SidebarBackend for NativeBackend {
             // by the very next change — a reader would have to press twice for
             // every collapse.
             let saved = store.load_read_only().map_err(sidebar_state_error)?;
-            Ok(SidebarOrganizationView::from_sidebar_ui_state(&saved.state.sidebar).to_remote())
+            Ok(SidebarOrganizationView::from_desktop_ui_state(&saved.state).to_remote())
         })
     }
 }

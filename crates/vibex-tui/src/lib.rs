@@ -32,6 +32,7 @@
 
 pub mod action;
 pub mod app;
+pub mod auto_continue;
 pub mod composer;
 pub mod console;
 pub mod glyphs;

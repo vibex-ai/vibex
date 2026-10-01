@@ -195,6 +195,10 @@ strings! {
     dock_hidden_done => { "Finished work hidden", "已隐藏已完成项", "已隱藏已完成項" },
     dock_shown_done => { "Finished work shown", "已显示已完成项", "已顯示已完成項" },
     sidebar_pinned => { "Pinned to the top", "已置顶", "已置頂" },
+    auto_continue_enabled => { "Auto-continue on", "已开启自动继续", "已開啟自動繼續" },
+    auto_continue_disabled => { "Auto-continue off", "已关闭自动继续", "已關閉自動繼續" },
+    auto_continue_paused => { "Auto-continue paused", "自动继续已暂停", "自動繼續已暫停" },
+    auto_continue_resumed => { "Auto-continue resumed", "自动继续已恢复", "自動繼續已恢復" },
     sidebar_unpinned => { "Pin removed", "已取消置顶", "已取消置頂" },
     sidebar_pinned_first => {
         "Pinned sessions always come first — unpin one to move past it",

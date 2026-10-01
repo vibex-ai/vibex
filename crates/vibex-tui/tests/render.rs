@@ -1736,13 +1736,26 @@ fn the_session_state_column_lines_up_on_every_row() {
         .expect("sessions apply");
     app.perform(vibex_tui::action::Intent::GotoSessions);
     let buffer = render_buffer(&mut app, 120, 40);
-    let mut columns = Vec::new();
-    for row in 0..40 {
-        if let Some(column) = column_of(&buffer, row, "Idle") {
-            columns.push(column);
-        }
-    }
-    assert!(columns.len() >= 3, "not every session row was drawn");
+    // The state mark, not a word: every row's mark has to start at the same
+    // cell however wide its title is. Measured on the buffer rather than on
+    // extracted text, because a wide character occupies two cells and only the
+    // buffer knows which.
+    let row_text = |row: u16| {
+        (0..120)
+            .filter_map(|column| buffer.cell((column, row)))
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>()
+    };
+    // Every session here last spoke the same time ago, and only session rows
+    // carry it.
+    let columns = (0..40)
+        .filter(|row| row_text(*row).contains("365d"))
+        .filter_map(|row| column_of(&buffer, row, "·"))
+        .collect::<Vec<_>>();
+    assert!(
+        columns.len() >= 3,
+        "not every session row was drawn:\n{columns:?}"
+    );
     assert!(
         columns.windows(2).all(|pair| pair[0] == pair[1]),
         "the state column is ragged: {columns:?}"
@@ -4733,15 +4746,28 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
         1,
         "more than one row claims something new:\n{screen}"
     );
-    // States are told apart by shape as well as by colour.
+    // States are told apart by shape as well as by colour — and by shape
+    // *only*: the word is gone from the row, which is what gives the titles
+    // their width back.
     for mark in ['▶', '✗', '·'] {
         assert!(
             screen.contains(mark),
             "missing the {mark:?} mark:\n{screen}"
         );
     }
-    for word in ["Running", "Failed", "Idle"] {
-        assert!(screen.contains(word), "missing {word:?}:\n{screen}");
+    for (title, word) in [
+        ("fix the flaky test", "Running"),
+        ("the one that failed", "Failed"),
+        ("what is this project?", "Idle"),
+    ] {
+        let row = screen
+            .lines()
+            .find(|line| line.contains(title))
+            .unwrap_or_else(|| panic!("no row for {title:?}:\n{screen}"));
+        assert!(
+            !row.contains(word),
+            "the state word is back on the row: {row:?}"
+        );
     }
 }
 
@@ -5006,5 +5032,65 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
         lines[kept].contains('★'),
         "the pinned row lost its marker: {:?}",
         lines[kept]
+    );
+}
+
+/// State is a mark and auto-continue is a mark: the list no longer spells the
+/// state out, which is what gives the titles their width back, and a session
+/// that is about to continue itself says so with the seconds it has left.
+#[test]
+fn the_session_list_marks_state_and_auto_continue_without_words() {
+    let mut running = seeded_session("session_marks0001", "still working");
+    running.state = vibex_core::AgentSessionState::Running;
+    let mut idle = seeded_session("session_marks0002", "watching this one");
+    idle.project_id = running.project_id.clone();
+    idle.workspace_id = running.workspace_id.clone();
+    idle.workspace_root = running.workspace_root.clone();
+    let sessions = vec![running.clone(), idle.clone()];
+
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(sessions.clone()))
+        .expect("sessions apply");
+    // The authority has auto-continue on for the idle session, and its last
+    // turn stopped without an answer.
+    app.auto_continue.apply_authority(
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeSet::from([idle.id.as_str().to_string()]),
+        &std::collections::BTreeSet::new(),
+        &sessions,
+    );
+    app.auto_continue
+        .note_status(&idle.id, idle.updated_at_ms, Some(false));
+    app.sync_auto_continue();
+    let screen = text(&render(&mut app, 110, 24));
+
+    let row = screen
+        .lines()
+        .find(|line| line.contains("watching this one"))
+        .unwrap_or_else(|| panic!("no row for the idle session:\n{screen}"));
+    assert!(
+        row.contains("↻5"),
+        "the countdown is not on the row: {row:?}"
+    );
+    assert!(
+        !row.contains("Idle"),
+        "the state word is back on the row: {row:?}"
+    );
+
+    let row = screen
+        .lines()
+        .find(|line| line.contains("still working"))
+        .unwrap_or_else(|| panic!("no row for the running session:\n{screen}"));
+    assert!(row.contains('▶'), "the running mark is missing: {row:?}");
+    assert!(
+        !row.contains("Running"),
+        "the state word is back on the row: {row:?}"
+    );
+    assert!(
+        !row.contains('↻'),
+        "a session without it was marked: {row:?}"
     );
 }

@@ -398,6 +398,42 @@ impl App {
                 }
                 Outcome::effects(vec![])
             }
+            Intent::ToggleAutoContinue => {
+                let Some(row) = self.selected_sidebar_row() else {
+                    return Outcome::quiet();
+                };
+                let Some(session_id) = row.session_id.clone() else {
+                    // A heading owns no turn to continue. The Desktop's
+                    // project-level default is its own menu.
+                    return Outcome::quiet();
+                };
+                let now_ms = vibex_core::unix_timestamp_ms();
+                // One key, four states, each of them a control the Desktop
+                // has: stop a countdown, resume a suspension, switch off,
+                // switch on.
+                let message = if self.auto_continue.is_counting_down(&session_id) {
+                    self.auto_continue.pause(&session_id, now_ms);
+                    self.strings.auto_continue_paused()
+                } else if self.auto_continue.is_paused(&session_id) {
+                    self.auto_continue.resume(&session_id);
+                    self.strings.auto_continue_resumed()
+                } else if self.auto_continue.is_enabled(&session_id) {
+                    self.auto_continue.set_enabled(&session_id, false);
+                    self.strings.auto_continue_disabled()
+                } else {
+                    self.auto_continue.set_enabled(&session_id, true);
+                    self.strings.auto_continue_enabled()
+                };
+                let enabled = self.auto_continue.is_enabled(&session_id);
+                self.toast(Toast::success(message.to_string()));
+                // The preference is the authority's when one owns the tree: it
+                // travels in the sidebar arrangement, so the desktop shows it
+                // and the next session here adopts it.
+                match self.sidebar_auto_continue_effect(&session_id, enabled) {
+                    Some(effect) => Outcome::effects(vec![effect]),
+                    None => Outcome::quiet(),
+                }
+            }
             // Up the screen is a smaller row index.
             Intent::MoveSessionUp => self.move_session(-1),
             Intent::MoveSessionDown => self.move_session(1),
@@ -475,6 +511,17 @@ impl App {
                     ));
                     return Outcome::quiet();
                 }
+                // A manual continuation is a reactivation: it resumes a
+                // suspension and settles the turn, exactly as the Desktop's own
+                // Continue button does.
+                if let Some(updated_at_ms) = self
+                    .session_by_id(&session_id)
+                    .map(|session| session.updated_at_ms)
+                {
+                    self.auto_continue
+                        .note_continued(&session_id, updated_at_ms);
+                }
+                self.auto_continue.resume(&session_id);
                 Outcome::effects(vec![Effect::ContinueTurn { session_id }])
             }
             Intent::ToggleBlockExpanded => {
@@ -618,6 +665,8 @@ impl App {
                     });
                 }
                 self.history.push(text.clone());
+                // The message is the reactivation that lifts a suspension.
+                self.auto_continue.resume(&session_id);
                 effects.push(Effect::SendMessage {
                     session_id,
                     text,
@@ -1755,6 +1804,11 @@ impl App {
             let Some(session_id) = self.selected_session_id().cloned() else {
                 return Outcome::quiet();
             };
+            // Stopping a turn stops the continuation that was about to follow
+            // it: continuing a turn the reader just cancelled is the one thing
+            // auto-continue must never do.
+            let now_ms = vibex_core::unix_timestamp_ms();
+            self.auto_continue.pause(&session_id, now_ms);
             return Outcome::effects(vec![Effect::Interrupt { session_id }]);
         }
         self.confirm_quit()
@@ -2080,6 +2134,8 @@ impl App {
         // trip away. Until it lands the send is projected locally — a reader who
         // pressed Enter must not be left wondering whether it worked.
         self.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
+        // Sending is a reactivation: whatever was suspended is wanted again.
+        self.auto_continue.resume(&session_id);
         Outcome::effects(vec![Effect::SendMessage {
             session_id,
             text,
@@ -4084,6 +4140,123 @@ mod tests {
         // The local arrangement is not what the reader is looking at, so it is
         // not what the pin edits.
         assert!(app.projection.sidebar.pinned_ids.is_empty());
+    }
+
+    #[test]
+    fn the_auto_continue_key_switches_the_session_on_the_authority() {
+        let mut app = arranged_app();
+        // Row 2 is the first (unpinned) session in the arrangement.
+        app.set_selection(crate::keymap::Scope::Sessions, 2);
+        let outcome = app.perform(Intent::ToggleAutoContinue);
+        let [Effect::MutateSidebarOrganization { mutation, .. }] = outcome.effects.as_slice()
+        else {
+            panic!("expected one sidebar mutation, got {outcome:?}");
+        };
+        assert_eq!(
+            mutation,
+            &vibex_core::RemoteSidebarOrganizationMutation::SetSessionAutoContinue {
+                session_id: "session_org000001".to_string(),
+                enabled: true,
+            }
+        );
+        assert!(
+            app.auto_continue
+                .is_enabled(&vibex_core::VibexSessionId::parse("session_org000001").unwrap())
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some(app.strings.auto_continue_enabled())
+        );
+
+        // The same key switches it off again.
+        let outcome = app.perform(Intent::ToggleAutoContinue);
+        let [Effect::MutateSidebarOrganization { mutation, .. }] = outcome.effects.as_slice()
+        else {
+            panic!("expected one sidebar mutation, got {outcome:?}");
+        };
+        assert_eq!(
+            mutation,
+            &vibex_core::RemoteSidebarOrganizationMutation::SetSessionAutoContinue {
+                session_id: "session_org000001".to_string(),
+                enabled: false,
+            }
+        );
+        assert!(
+            !app.auto_continue
+                .is_enabled(&vibex_core::VibexSessionId::parse("session_org000001").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_session_left_without_an_answer_probes_then_counts_down() {
+        let mut app = arranged_app();
+        let session_id = vibex_core::VibexSessionId::parse("session_org000001").unwrap();
+        let updated_at_ms = app
+            .session_by_id(&session_id)
+            .expect("the session is loaded")
+            .updated_at_ms;
+        // The authority has this session switched on, which is where the client
+        // learns it from.
+        let mut snapshot = arranged_snapshot();
+        snapshot.auto_continue_session_ids = vec!["session_org000001".to_string()];
+        app.apply_sidebar_organization(&snapshot);
+        assert!(app.auto_continue.is_enabled(&session_id));
+
+        // The list cannot say whether the last turn ended normally, so the
+        // first move is a question to the runtime.
+        let effects = app.sync_auto_continue();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::ProbeAutoContinue {
+                    session_id: probed,
+                    updated_at_ms: at_ms,
+                }] if probed == &session_id && *at_ms == updated_at_ms
+            ),
+            "the session was not probed: {effects:?}"
+        );
+        // Asked once per revision, not once per message.
+        assert!(app.sync_auto_continue().is_empty());
+
+        // The answer is a turn that stopped without an answer: the countdown
+        // starts, and the reader can see it on the row.
+        app.auto_continue
+            .note_status(&session_id, updated_at_ms, Some(false));
+        assert!(app.sync_auto_continue().is_empty());
+        assert_eq!(app.auto_continue.countdown_seconds(&session_id), Some(5));
+
+        // An answer that says the turn ended normally is not continued.
+        let mut app = arranged_app();
+        app.apply_sidebar_organization(&snapshot);
+        app.sync_auto_continue();
+        app.auto_continue
+            .note_status(&session_id, updated_at_ms, Some(true));
+        app.sync_auto_continue();
+        assert_eq!(app.auto_continue.countdown_seconds(&session_id), None);
+    }
+
+    #[test]
+    fn stopping_a_turn_stops_the_continuation_that_would_follow_it() {
+        let mut app = arranged_app();
+        let session_id = vibex_core::VibexSessionId::parse("session_org000001").unwrap();
+        let updated_at_ms = app.session_by_id(&session_id).unwrap().updated_at_ms;
+        let mut snapshot = arranged_snapshot();
+        snapshot.auto_continue_session_ids = vec!["session_org000001".to_string()];
+        app.apply_sidebar_organization(&snapshot);
+        app.auto_continue
+            .note_status(&session_id, updated_at_ms, Some(false));
+        app.sync_auto_continue();
+        assert!(app.auto_continue.countdown_seconds(&session_id).is_some());
+
+        // The reader stops the session: the pending continuation goes with it.
+        app.auto_continue
+            .pause(&session_id, vibex_core::unix_timestamp_ms());
+        assert_eq!(app.auto_continue.countdown_seconds(&session_id), None);
+        assert!(
+            !app.sync_auto_continue()
+                .iter()
+                .any(|effect| matches!(effect, Effect::ContinueTurn { .. }))
+        );
     }
 
     #[test]

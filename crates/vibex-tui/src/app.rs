@@ -639,6 +639,8 @@ pub struct App {
     pub agent: AgentWorkflowController,
     pub management: ManagementWorkflowController,
     pub projection: ProjectionState,
+    /// The reader's auto-continue preferences and the turns they act on.
+    pub auto_continue: crate::auto_continue::AutoContinue,
     pub transcript: Transcript,
     pub scroll: ScrollState,
 
@@ -1066,6 +1068,7 @@ impl App {
             navigation,
             agent,
             management,
+            auto_continue: crate::auto_continue::AutoContinue::default(),
             projection: ProjectionState {
                 sidebar_organization: None,
                 sidebar: arrangement.sidebar,
@@ -1724,6 +1727,27 @@ impl App {
         &mut self,
         snapshot: &vibex_core::RemoteSidebarOrganizationSnapshot,
     ) -> bool {
+        // The auto-continue preferences travel with the tree but do not depend
+        // on it: a reader who has switched a session on has said so whether or
+        // not they have also arranged folders.
+        let sessions = self
+            .agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default();
+        self.auto_continue.apply_authority(
+            &snapshot.auto_continue_project_ids.iter().cloned().collect(),
+            &snapshot.auto_continue_session_overrides.clone(),
+            &snapshot.auto_continue_session_ids.iter().cloned().collect(),
+            &snapshot
+                .auto_continue_paused_session_ids
+                .iter()
+                .cloned()
+                .collect(),
+            sessions,
+        );
         let view = vibex_desktop_model::SidebarOrganizationView::from_remote(snapshot);
         if !view.arranges_anything() {
             return self.projection.sidebar_organization.take().is_some();
@@ -1761,6 +1785,26 @@ impl App {
         };
         Some(Effect::MutateSidebarOrganization {
             mutation,
+            expected_revision: Some(view.revision),
+        })
+    }
+
+    /// The authority change that switches auto-continue on or off.
+    ///
+    /// `None` when there is no arrangement loaded: the preference is then this
+    /// client's alone, which is all a client with no authority to write to can
+    /// honestly claim.
+    pub fn sidebar_auto_continue_effect(
+        &self,
+        session_id: &VibexSessionId,
+        enabled: bool,
+    ) -> Option<Effect> {
+        let view = self.projection.sidebar_organization.as_ref()?;
+        Some(Effect::MutateSidebarOrganization {
+            mutation: vibex_core::RemoteSidebarOrganizationMutation::SetSessionAutoContinue {
+                session_id: session_id.as_str().to_string(),
+                enabled,
+            },
             expected_revision: Some(view.revision),
         })
     }
@@ -1827,6 +1871,33 @@ impl App {
             cursor += delta;
         }
         Some(SidebarMove::AtEdge)
+    }
+
+    /// What auto-continue wants to do now, as effects for the worker.
+    ///
+    /// Called after anything that could have moved a turn: a session update, a
+    /// timeline event, a list refresh, a mutation's answer.
+    pub fn sync_auto_continue(&mut self) -> Vec<Effect> {
+        let sessions = self.agent.state.sessions.value.clone().unwrap_or_default();
+        let pending = self.pending_sessions(&sessions);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        let actions = self.auto_continue.sync(&sessions, now_ms, |session_id| {
+            pending.contains(session_id.as_str())
+        });
+        actions.into_iter().map(auto_continue_effect).collect()
+    }
+
+    /// The sessions a send is in flight for, so a continuation does not
+    /// interleave with one.
+    fn pending_sessions(
+        &self,
+        sessions: &[vibex_core::AgentSession],
+    ) -> std::collections::BTreeSet<String> {
+        sessions
+            .iter()
+            .filter(|session| self.session_is_running(&session.id))
+            .map(|session| session.id.as_str().to_string())
+            .collect()
     }
 
     /// Keep the selected session pinned above the rest, or let it go.
@@ -2508,12 +2579,29 @@ impl App {
             || self.composing_page_shines()
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> crate::reduce::Outcome {
+        // A visible toast keeps the frames coming: it is transient content, and
+        // the tick is what takes it away.
+        let mut dirty = self.toast.is_some();
         if let Some(toast) = self.toast.as_mut() {
             toast.ttl = toast.ttl.saturating_sub(1);
             if toast.ttl == 0 {
                 self.toast = None;
+                dirty = true;
             }
+        }
+        // The countdown to a continuation is the one thing on the session list
+        // that changes without an event: it is what the reader watches to
+        // decide whether to stop it.
+        let sessions = self.agent.state.sessions.value.clone().unwrap_or_default();
+        let pending = self.pending_sessions(&sessions);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        let (actions, moved) = self.auto_continue.tick(&sessions, now_ms, |session_id| {
+            pending.contains(session_id.as_str())
+        });
+        crate::reduce::Outcome {
+            effects: actions.into_iter().map(auto_continue_effect).collect(),
+            dirty: dirty || moved,
         }
     }
 
@@ -3958,6 +4046,12 @@ pub enum Effect {
     },
     /// Read the arrangement the authority draws its own sidebar from.
     LoadSidebarOrganization,
+    /// Ask the runtime what one session's latest turn did. The session list
+    /// cannot say whether a turn ended normally; the timeline can.
+    ProbeAutoContinue {
+        session_id: VibexSessionId,
+        updated_at_ms: i64,
+    },
     /// Apply one arrangement change on the authority, which answers with the
     /// tree it now holds.
     MutateSidebarOrganization {
@@ -4191,12 +4285,30 @@ pub enum Effect {
     },
 }
 
+/// The effect that carries out one auto-continue decision.
+fn auto_continue_effect(action: crate::auto_continue::AutoContinueAction) -> Effect {
+    use crate::auto_continue::AutoContinueAction;
+    match action {
+        AutoContinueAction::Probe {
+            session_id,
+            updated_at_ms,
+        } => Effect::ProbeAutoContinue {
+            session_id,
+            updated_at_ms,
+        },
+        // The continuation itself is the same request the manual key sends:
+        // the runtime does not care who asked.
+        AutoContinueAction::Continue { session_id, .. } => Effect::ContinueTurn { session_id },
+    }
+}
+
 impl Effect {
     /// Whether the effect is a mutation, so the UI can show a pending marker.
     pub fn key(&self) -> &'static str {
         match self {
             Effect::ListSessions { .. } => "sessions",
             Effect::LoadSidebarOrganization => "sidebar_organization",
+            Effect::ProbeAutoContinue { .. } => "auto_continue_probe",
             Effect::MutateSidebarOrganization { .. } => "sidebar_organization_mutation",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",

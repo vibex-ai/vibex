@@ -230,11 +230,11 @@ fn event_loop(
         };
         if last_tick.elapsed() >= period {
             last_tick = Instant::now();
-            let had_toast = app.toast.is_some();
-            app.tick();
-            if had_toast {
+            let outcome = app.tick();
+            if outcome.dirty {
                 dirty = true;
             }
+            dispatch_all(worker, &outcome);
             if app.advance_transcript_animation() {
                 dirty = true;
             }
@@ -1257,6 +1257,29 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             app.reconcile_sidebar_arrangement();
             app.live = LiveState::Ready;
         }
+        AppMessage::AutoContinueTurnStatus {
+            session_id,
+            updated_at_ms,
+            ended_normally,
+        } => {
+            // The runtime could not answer; when the session is the one on
+            // screen, this client's own copy of the timeline can. That is the
+            // same fallback the Desktop makes when its probe fails.
+            let ended_normally = ended_normally.or_else(|| {
+                let timeline = &app.agent.state.timeline;
+                (timeline.session_id.as_ref() == Some(&session_id))
+                    .then(|| vibex_core::latest_timeline_turn_ended_normally(&timeline.items))
+                    .flatten()
+            });
+            // An answer for a revision the session has left is dropped by the
+            // state machine; nothing here has to judge it.
+            app.auto_continue
+                .note_status(&session_id, updated_at_ms, ended_normally);
+            let effects = app.sync_auto_continue();
+            for effect in effects {
+                worker.dispatch(effect);
+            }
+        }
         AppMessage::SidebarOrganization(result) => {
             // A failure is not an interface failure: the list falls back to the
             // sessions' own order, which is what a client with no authority
@@ -1796,6 +1819,13 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 Toast::info(text)
             });
         }
+    }
+    // A message is how the client learns a turn moved — a session update, a
+    // timeline item, a list refresh, a mutation's answer. Auto-continue decides
+    // again after every one of them, which is what keeps its behaviour tied to
+    // the session list rather than to a timer of its own.
+    for effect in app.sync_auto_continue() {
+        worker.dispatch(effect);
     }
     Ok(())
 }

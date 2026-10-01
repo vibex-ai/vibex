@@ -1059,24 +1059,33 @@ fn render_session_view(
     }
     let selected = app.selection_for(Scope::Sessions);
     let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
-    // One state column for the whole list. The widest label decides its edge,
-    // so every row's state starts at the same cell instead of wherever its
-    // title happened to end -- which, with double-width CJK titles padded by
-    // character count, is what made the column look attached to the wrong row.
-    let state_column = rows
-        .iter()
-        .filter_map(|row| row.state)
-        .map(|state| display_width(session_state_label(state, strings)))
-        .max()
-        .unwrap_or(0)
-        .min(usize::from(list_area.width) / 3);
-    // The state mark sits in front of its word, so the column is the widest
-    // label plus the mark and the space after it.
-    let state_width = if state_column > 0 {
-        state_column + 3
+    // State is one mark, not a word: the shapes are the vocabulary the reader
+    // learns once (`▶` running, `✗` failed, `·` idle, `◆` waiting, `▤`
+    // archived), and spelling them out cost the title a third of the row for
+    // information the mark already carried.
+    let state_width = if rows.iter().any(|row| row.state.is_some()) {
+        2
     } else {
         0
     };
+    // Auto-continue is a mark of its own before the state: `↻` when the session
+    // will continue itself, `↻3` while it counts down, so the reader can see
+    // what is about to happen and stop it.
+    let auto_labels = rows
+        .iter()
+        .map(|row| {
+            row.session_id
+                .as_ref()
+                .and_then(|session_id| auto_continue_label(app, session_id))
+        })
+        .collect::<Vec<_>>();
+    let auto_column = auto_labels
+        .iter()
+        .flatten()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0);
+    let auto_width = if auto_column > 0 { auto_column + 1 } else { 0 };
     // When the session last said anything, right-aligned: the reader scanning
     // the list is looking for what changed, and a wall of identical rows says
     // nothing about that. The column is measured from what will be drawn, so a
@@ -1179,7 +1188,9 @@ fn render_session_view(
             // two cells per character and a `{:<width$}` pad would push the
             // state off the row.
             let name_width = usize::from(list_area.width)
-                .saturating_sub(usize::from(row.depth) * 2 + 2 + state_width + time_width + 2)
+                .saturating_sub(
+                    usize::from(row.depth) * 2 + 2 + auto_width + state_width + time_width + 2,
+                )
                 .max(8);
             let label = truncate_to_width(&row.label, name_width, "…");
             let padding = name_width.saturating_sub(display_width(&label));
@@ -1215,19 +1226,29 @@ fn render_session_view(
                 format!("{label}{}", " ".repeat(padding)),
                 label_style,
             ));
+            if let Some(Some(label)) = auto_labels.get(index) {
+                let padding = auto_column.saturating_sub(display_width(label));
+                // Counting down is the one part of this the reader must not
+                // miss, so it is drawn in the attention colour rather than
+                // dimmed like the rest of the row's furniture.
+                let counting = row.session_id.as_ref().is_some_and(|session_id| {
+                    app.auto_continue.countdown_seconds(session_id).is_some()
+                });
+                spans.push(Span::styled(
+                    format!("{label}{} ", " ".repeat(padding)),
+                    if index == selected || hovered {
+                        style
+                    } else if counting {
+                        Style::default().fg(theme.roles.accent_attention)
+                    } else {
+                        Style::default().fg(theme.roles.accent_success)
+                    },
+                ));
+            } else if auto_width > 0 {
+                spans.push(Span::styled(" ".repeat(auto_width), style));
+            }
             if let Some(state) = row.state {
-                let label = session_state_label(state, strings);
                 let mark = crate::glyphs::state_marker(state_marker_key(state), app.glyph_tier());
-                let padding = state_column.saturating_sub(display_width(label));
-                let state_style = if index == selected || hovered {
-                    // The state is part of the row, so it rides the band rather
-                    // than disappearing into a dim colour on top of it.
-                    style
-                } else if active {
-                    Style::default().fg(theme.roles.accent_user)
-                } else {
-                    Style::default().fg(theme.roles.gray_dim)
-                };
                 spans.push(Span::styled(
                     format!("{mark} "),
                     if index == selected || hovered {
@@ -1235,10 +1256,6 @@ fn render_session_view(
                     } else {
                         Style::default().fg(state_marker_colour(state, theme))
                     },
-                ));
-                spans.push(Span::styled(
-                    format!("{}{label}", " ".repeat(padding)),
-                    state_style,
                 ));
             }
             if let Some(Some(time)) = time_labels.get(index) {
@@ -1273,6 +1290,17 @@ fn render_session_view(
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected.min(rows.len().saturating_sub(1))));
     frame.render_stateful_widget(List::new(items), list_area, &mut state);
+}
+
+/// The auto-continue mark for one row: `↻` when the session will continue
+/// itself, `↻3` while it counts down, and nothing when it will not.
+fn auto_continue_label(app: &App, session_id: &vibex_core::VibexSessionId) -> Option<String> {
+    if let Some(seconds) = app.auto_continue.countdown_seconds(session_id) {
+        return Some(format!("↻{seconds}"));
+    }
+    app.auto_continue
+        .is_enabled(session_id)
+        .then(|| "↻".to_string())
 }
 
 /// A human-readable session state, rather than the variant name.

@@ -496,7 +496,24 @@ is never a column count.
   authority's own unread set is folded in beside it. Marks are one column at
   every glyph tier and their shape carries the meaning, or a reader who cannot
   tell the colours apart loses the state: `★` pinned (ASCII `*`), `●` unread,
-  and the state's own `▶`/`✗`/`·`/`◆`/`▤`.
+  the state's own `▶`/`✗`/`·`/`◆`/`▤`, and `↻`/`↻N` for auto-continue. The
+  state is *only* a mark: the words were removed once the shapes were learned,
+  because they cost the title a third of the row and said nothing the mark did
+  not.
+* **Auto-continue is the desktop's rule, not a second one.** A session the
+  reader switched on continues itself when a turn stops without an answer, and
+  "without an answer" is read the way the desktop reads it: the shared
+  `agent_session_turn_requires_continuation` decides, and
+  `latest_timeline_turn_ended_normally` over the session's timeline — asked for
+  with a probe when the session is not open — supplies the answer. The same
+  five-second countdown precedes the send, the same per-turn bookkeeping stops
+  a second send for one turn, a session waiting on the reader is never
+  continued, and a turn the reader stopped suspends the continuation instead of
+  restarting it. A send in flight holds the countdown at zero rather than
+  interleaving two turns. The preference rides the sidebar arrangement's
+  auto-continue fields, so it is the same preference on every surface; a
+  suspension this client makes is local, because the protocol has no pause
+  change — only the enable/disable that clears one.
 * **The list draws the authority's arrangement, and edits it there.** Folders,
   the order of projects and sessions, the pinned band, collapsed headings and
   unread marks are the Desktop's: `SidebarBackend` reads them as a

@@ -592,6 +592,12 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Sessions,
+        Chord::plain(KeyCode::Char('t')),
+        Intent::ToggleAutoContinue,
+        "Auto-continue",
+    ),
+    binding(
+        Scope::Sessions,
         Chord::new(KeyCode::Up, KeyModifiers::ALT),
         Intent::MoveSessionUp,
         "Move up",

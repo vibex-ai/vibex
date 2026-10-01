@@ -87,6 +87,7 @@ intents! {
     CollapseSessionCards => { scope: Sessions, id: "session_card_collapse", label: "Close cards", help: "Close every open session detail card." },
     CopySessionRow => { scope: Sessions, id: "session_copy", label: "Copy", help: "Copy the selected session's details to the clipboard." },
     PinSession => { scope: Sessions, id: "session_pin", label: "Pin", help: "Keep the selected session above the rest of the list." },
+    ToggleAutoContinue => { scope: Sessions, id: "session_auto_continue", label: "Auto-continue", help: "Let the selected session continue itself when a turn stops without an answer." },
     MoveSessionUp => { scope: Sessions, id: "session_move_up", label: "Move up", help: "Move the selected session one place earlier in the list." },
     MoveSessionDown => { scope: Sessions, id: "session_move_down", label: "Move down", help: "Move the selected session one place later in the list." },
     ToggleSidebarGrouping => { scope: Sessions, id: "sidebar_grouping", label: "Grouping", help: "Group the list by workspace, or show every session in one run." },

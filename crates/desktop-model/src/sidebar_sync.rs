@@ -331,29 +331,43 @@ impl SidebarOrganizationView {
     /// A shell that owns the runtime but has no Desktop attached — the
     /// character-grid client on a machine where the app is not running — reads
     /// the arrangement from the file the app writes, so both surfaces draw the
-    /// tree the reader arranged rather than two different ones. Live-only
-    /// fields (unread badges, auto-continue bookkeeping) have no persisted
-    /// form and come back empty; they are the Desktop's to publish, and a
-    /// client with no Desktop attached has nothing else claiming them.
-    pub fn from_sidebar_ui_state(state: &crate::SidebarUiState) -> Self {
+    /// tree the reader arranged rather than two different ones. The persisted
+    /// auto-continue preferences travel with it: they are the reader's, not the
+    /// Desktop's, and a session the Desktop would continue by itself must be
+    /// continued by whichever shell is running. Live-only fields (unread
+    /// badges, in-flight countdowns) have no persisted form and come back empty.
+    pub fn from_desktop_ui_state(state: &crate::DesktopUiStateV1) -> Self {
+        let sidebar = &state.sidebar;
         let mut view = Self {
             revision: 0,
-            organization: state.organization.clone(),
-            collapsed_project_ids: state.collapsed_project_ids.clone(),
-            collapsed_workspace_ids: state.collapsed_workspace_ids.clone(),
-            pinned_session_ids: state.pinned_session_ids.clone(),
-            session_order: state.session_order.clone(),
-            session_order_anchored_at_ms: state.session_order_anchored_at_ms,
-            hierarchy_mode: state.hierarchy_mode,
-            project_order: state.project_order.clone(),
-            workspace_order: state.workspace_order.clone(),
-            project_appearances: state.project_appearances.clone(),
-            worktree_titles: state.worktree_titles.clone(),
-            project_location_preferences: state.project_location_preferences.clone(),
-            auto_continue_project_ids: BTreeSet::new(),
-            auto_continue_session_overrides: BTreeMap::new(),
-            auto_continue_session_ids: BTreeSet::new(),
-            auto_continue_paused_session_ids: BTreeSet::new(),
+            organization: sidebar.organization.clone(),
+            collapsed_project_ids: sidebar.collapsed_project_ids.clone(),
+            collapsed_workspace_ids: sidebar.collapsed_workspace_ids.clone(),
+            pinned_session_ids: sidebar.pinned_session_ids.clone(),
+            session_order: sidebar.session_order.clone(),
+            session_order_anchored_at_ms: sidebar.session_order_anchored_at_ms,
+            hierarchy_mode: sidebar.hierarchy_mode,
+            project_order: sidebar.project_order.clone(),
+            workspace_order: sidebar.workspace_order.clone(),
+            project_appearances: sidebar.project_appearances.clone(),
+            worktree_titles: sidebar.worktree_titles.clone(),
+            project_location_preferences: sidebar.project_location_preferences.clone(),
+            auto_continue_project_ids: state.session.auto_continue_project_ids.clone(),
+            auto_continue_session_overrides: state.session.auto_continue_session_overrides.clone(),
+            // The effective set is derived, not persisted: the Desktop
+            // materialises a project default into an override when it enables
+            // one, and these are the overrides that are still on.
+            auto_continue_session_ids: state
+                .session
+                .auto_continue_session_overrides
+                .iter()
+                .filter(|(_, enabled)| **enabled)
+                .map(|(session_id, _)| session_id.clone())
+                .collect(),
+            auto_continue_paused_session_ids: state
+                .session
+                .auto_continue_paused_session_ids
+                .clone(),
             unread_session_ids: BTreeSet::new(),
         };
         view.refresh_revision();
@@ -362,23 +376,31 @@ impl SidebarOrganizationView {
 
     /// Write this arrangement back into the UI state it came from.
     ///
-    /// The inverse of [`Self::from_sidebar_ui_state`], and the only writer a
-    /// shell without a Desktop attached has. Live-only fields (unread badges,
-    /// auto-continue bookkeeping) are the Desktop's and are left alone: this
-    /// call owns the tree, not the badges.
-    pub fn apply_to_sidebar_ui_state(&self, state: &mut crate::SidebarUiState) {
-        state.organization = self.organization.clone();
-        state.collapsed_project_ids = self.collapsed_project_ids.clone();
-        state.collapsed_workspace_ids = self.collapsed_workspace_ids.clone();
-        state.pinned_session_ids = self.pinned_session_ids.clone();
-        state.session_order = self.session_order.clone();
-        state.session_order_anchored_at_ms = self.session_order_anchored_at_ms;
-        state.hierarchy_mode = self.hierarchy_mode;
-        state.project_order = self.project_order.clone();
-        state.workspace_order = self.workspace_order.clone();
-        state.worktree_titles = self.worktree_titles.clone();
-        state.project_location_preferences = self.project_location_preferences.clone();
-        state.project_appearances = self.project_appearances.clone();
+    /// The inverse of [`Self::from_desktop_ui_state`], and the only writer a
+    /// shell without a Desktop attached has. The auto-continue preferences are
+    /// the reader's, so they are written back too; the effective set is derived
+    /// on the next read. Live-only fields (unread badges, in-flight countdowns)
+    /// are the Desktop's and are left alone: this call owns the tree, not the
+    /// badges.
+    pub fn apply_to_desktop_ui_state(&self, state: &mut crate::DesktopUiStateV1) {
+        let sidebar = &mut state.sidebar;
+        sidebar.organization = self.organization.clone();
+        sidebar.collapsed_project_ids = self.collapsed_project_ids.clone();
+        sidebar.collapsed_workspace_ids = self.collapsed_workspace_ids.clone();
+        sidebar.pinned_session_ids = self.pinned_session_ids.clone();
+        sidebar.session_order = self.session_order.clone();
+        sidebar.session_order_anchored_at_ms = self.session_order_anchored_at_ms;
+        sidebar.hierarchy_mode = self.hierarchy_mode;
+        sidebar.project_order = self.project_order.clone();
+        sidebar.workspace_order = self.workspace_order.clone();
+        sidebar.worktree_titles = self.worktree_titles.clone();
+        sidebar.project_location_preferences = self.project_location_preferences.clone();
+        sidebar.project_appearances = self.project_appearances.clone();
+        state.session.auto_continue_project_ids = self.auto_continue_project_ids.clone();
+        state.session.auto_continue_session_overrides =
+            self.auto_continue_session_overrides.clone();
+        state.session.auto_continue_paused_session_ids =
+            self.auto_continue_paused_session_ids.clone();
     }
 
     /// Whether this arrangement says anything at all about where rows go.
@@ -1072,8 +1094,8 @@ mod tests {
         // A shell that owns the runtime without a Desktop attached reads the
         // arrangement the app persisted; it has to come back as the same tree
         // the app would draw.
-        let mut ui_state = crate::SidebarUiState::default();
-        ui_state.organization.folders.insert(
+        let mut ui_state = crate::DesktopUiStateV1::default();
+        ui_state.sidebar.organization.folders.insert(
             "folder-1".to_string(),
             crate::SidebarFolderUiState {
                 name: "Archive".to_string(),
@@ -1083,6 +1105,7 @@ mod tests {
             },
         );
         ui_state
+            .sidebar
             .organization
             .placements
             .push(crate::SidebarOrganizationPlacement {
@@ -1090,19 +1113,41 @@ mod tests {
                 parent_folder_id: None,
             });
         ui_state
+            .sidebar
             .organization
             .collapsed_folder_ids
             .insert("folder-1".to_string());
-        ui_state.project_order = vec!["project-1".to_string()];
-        ui_state.session_order = vec!["session-a".to_string()];
-        ui_state.session_order_anchored_at_ms = 42;
-        ui_state.pinned_session_ids.insert("session-a".to_string());
+        ui_state.sidebar.project_order = vec!["project-1".to_string()];
+        ui_state.sidebar.session_order = vec!["session-a".to_string()];
+        ui_state.sidebar.session_order_anchored_at_ms = 42;
         ui_state
+            .sidebar
+            .pinned_session_ids
+            .insert("session-a".to_string());
+        ui_state
+            .sidebar
             .collapsed_project_ids
             .insert("project-2".to_string());
-        ui_state.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        ui_state.sidebar.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        // Auto-continue is the reader's preference and travels with the tree.
+        ui_state
+            .session
+            .auto_continue_project_ids
+            .insert("project-1".to_string());
+        ui_state
+            .session
+            .auto_continue_session_overrides
+            .insert("session-a".to_string(), true);
+        ui_state
+            .session
+            .auto_continue_session_overrides
+            .insert("session-b".to_string(), false);
+        ui_state
+            .session
+            .auto_continue_paused_session_ids
+            .insert("session-a".to_string());
 
-        let view = SidebarOrganizationView::from_sidebar_ui_state(&ui_state);
+        let view = SidebarOrganizationView::from_desktop_ui_state(&ui_state);
         assert!(view.arranges_anything());
         assert_eq!(
             view.organization
@@ -1123,11 +1168,31 @@ mod tests {
         // client's echoed revision be checked against it.
         assert_eq!(
             view.revision,
-            SidebarOrganizationView::from_sidebar_ui_state(&ui_state).revision
+            SidebarOrganizationView::from_desktop_ui_state(&ui_state).revision
         );
-        let other = crate::SidebarUiState::default();
+        assert!(view.auto_continue_project_ids.contains("project-1"));
+        assert_eq!(
+            view.auto_continue_session_overrides.get("session-b"),
+            Some(&false)
+        );
         assert!(
-            !SidebarOrganizationView::from_sidebar_ui_state(&other).arranges_anything(),
+            view.auto_continue_session_ids.contains("session-a"),
+            "an enabled override is the effective set"
+        );
+        assert!(!view.auto_continue_session_ids.contains("session-b"));
+        assert!(view.auto_continue_paused_session_ids.contains("session-a"));
+        // And writing it back is the same translation in reverse, so a shell
+        // that owns the runtime persists a tree the next read reconstructs
+        // exactly — the revision included.
+        let mut written = crate::DesktopUiStateV1::default();
+        view.apply_to_desktop_ui_state(&mut written);
+        assert_eq!(
+            SidebarOrganizationView::from_desktop_ui_state(&written),
+            view
+        );
+        let other = crate::DesktopUiStateV1::default();
+        assert!(
+            !SidebarOrganizationView::from_desktop_ui_state(&other).arranges_anything(),
             "an arrangement nobody made claimed to arrange something"
         );
     }
