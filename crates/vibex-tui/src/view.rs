@@ -597,9 +597,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
 /// What the frame wants on screen, given the current state.
 fn band_request(app: &App) -> crate::layout::BandRequest {
-    let running = app
-        .active_session()
-        .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running);
+    // A send the runtime has not answered yet counts as running: the reader
+    // pressed Enter, and the round trip must not read as "idle, message lost".
+    let running = app.turn_reads_running();
     // The turn line is present whenever there is something to say about the
     // turn: it is running, or it is waiting on the reader.
     // Present whenever there is something to say about the turn: it is running,
@@ -1395,9 +1395,7 @@ fn render_turn_status(
     let tier = app.glyph_tier();
     let phase = app.animation_phase();
 
-    let running = app
-        .active_session()
-        .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running);
+    let running = app.turn_reads_running();
     let approvals = app.pending_permission_count();
     let questions = app.pending_elicitations();
 
@@ -2415,9 +2413,7 @@ fn render_composer(
     strings: Strings,
 ) {
     let focused = app.focus == crate::app::Focus::Composer;
-    let running = app
-        .active_session()
-        .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running);
+    let running = app.turn_reads_running();
 
     // Rail colour: the user's own accent when this is where typing lands, the
     // dim grey otherwise.

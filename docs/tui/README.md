@@ -386,6 +386,16 @@ two rows of ASCII where it does not — and a light sweeps across it while the
 page waits. It is the client's only animation that is not a turn's spinner, and
 it stops the moment the reader leaves.
 
+`Enter` puts the message in the transcript immediately. The runtime owns the
+timeline, so its own copy of the reader's message is a round trip away — and a
+client that waits for it looks like one that dropped the message. The send is
+projected locally as the row it will become, and the turn line reads running
+from the moment Enter is pressed rather than from the moment the runtime
+answers. The projection is dropped as soon as the echo lands (the reader sees
+one message, never two), when the send is refused, or after ninety seconds —
+whichever comes first. Nothing else is released into that gap: a held message
+waits for the turn the runtime reports, not for the one the client hopes for.
+
 A message written while a turn is running is *held*, not dropped: it waits in
 the queue band above the composer until the turn ends, and then goes out on its
 own. The queue belongs to the session it was written for — leaving for another

@@ -260,6 +260,18 @@ impl Transcript {
         self.blocks.is_empty()
     }
 
+    /// The newest timeline sequence the transcript holds.
+    ///
+    /// A send is confirmed by a row *newer* than everything the reader could
+    /// already see, which is what this measures.
+    pub fn newest_sequence(&self) -> i64 {
+        self.blocks
+            .iter()
+            .map(|block| block.sequence)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn block(&self, index: usize) -> Option<&Block> {
         self.blocks.get(index)
     }

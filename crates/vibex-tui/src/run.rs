@@ -170,6 +170,20 @@ fn event_loop(
             }
         }
 
+        // ---- the projected send -------------------------------------------
+        // A send stops being projected once the runtime's own copy of it is in
+        // the timeline, or once it has waited longer than a send could take.
+        if app.settle_pending_send() {
+            app.sync_transcript();
+            dirty = true;
+        }
+        // The turn clock follows the session's state, so the elapsed readout
+        // starts when the turn does and stops when it ends, whatever path the
+        // state took to get there.
+        if app.sync_turn_clock() {
+            dirty = true;
+        }
+
         // ---- the banner row ----------------------------------------------
         // The banner is a condition rather than an event: refreshing it here
         // means a message that is no longer true withdraws itself.
@@ -196,6 +210,10 @@ fn event_loop(
                     who
                 )));
             }
+            // A released message is projected exactly like a typed one: it was
+            // written for this session a while ago, and it should appear the
+            // moment it goes out rather than a round trip later.
+            app.mark_send_dispatched(&session_id, text.clone(), attachments.clone());
             worker.dispatch(crate::app::Effect::SendMessage {
                 session_id,
                 text,
@@ -1306,6 +1324,11 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         },
         AppMessage::Mutation { key, result } => {
             app.pending.remove(&key);
+            if key == "send_message" && result.is_err() {
+                // The projected row is a promise this client could not keep.
+                app.abandon_pending_send();
+                app.sync_transcript();
+            }
             match result {
                 Ok(()) => {
                     if key == "resolve_permission" {

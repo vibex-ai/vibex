@@ -464,6 +464,16 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **A send is projected until the runtime echoes it.** The client does not own
+  the timeline: the reader's own message comes back a round trip later, so it is
+  drawn locally as the row it will become (`PendingSend::row`) and the session
+  reads as running (`turn_reads_running`) from Enter rather than from the
+  runtime's answer. The projection is confirmed against the *timeline* — a
+  newer item with the same text and attachments — and otherwise withdrawn on
+  refusal or after the timeout. Its row identity is a serial, not a clock: the
+  transcript diffs by id. The turn clock is derived (`sync_turn_clock`) rather
+  than set by events, so no path leaves the client repainting after a turn
+  stopped, and nothing drains into the gap the projection covers.
 * **The send queue is per session, and drains by session.** A held message
   carries the id it was written for: switching sessions must not release it,
   hide it, or send it anywhere else, and it goes out when *its* session's turn

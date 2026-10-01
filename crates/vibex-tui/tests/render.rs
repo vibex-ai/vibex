@@ -3661,3 +3661,153 @@ fn a_typed_space_moves_the_caret_with_it() {
     let (row, column) = app.composer.cursor_cell(60);
     assert_eq!((row, column), (0, 3), "{:?}", app.regions.composer);
 }
+
+#[test]
+fn a_sent_message_is_on_screen_before_the_runtime_echoes_it() {
+    // The client does not own the timeline: the authoritative copy of the
+    // reader's own message arrives a round trip later. A transcript that waits
+    // for it reads as a client that dropped the message, and a status band that
+    // still says idle reads as one that ignored Enter.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let session = seeded_session("session_pending0001", "pending send");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session.clone());
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+
+    app.composer.insert_str("what is the plan?");
+    let outcome = app.perform(Intent::SubmitComposer);
+    assert!(outcome.effects.iter().any(|effect| matches!(
+        effect,
+        vibex_tui::Effect::SendMessage { text, .. } if text == "what is the plan?"
+    )));
+
+    // Immediately: the message is in the transcript, and the turn reads running.
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("what is the plan?"),
+        "the message is not on screen yet:\n{screen}"
+    );
+    assert!(
+        app.turn_reads_running(),
+        "the session reads idle while the send is in flight"
+    );
+    // A held message must not be released into the round trip either: the
+    // runtime has not reported the turn yet, so releasing now would interleave
+    // two turns.
+    app.enqueue_message("held for later".to_string());
+    assert!(
+        app.drain_queue().is_empty(),
+        "the queue ran while the first message was still in flight"
+    );
+    assert_eq!(queued_texts(&app), vec!["held for later".to_string()]);
+    assert!(app.is_animating(), "nothing is turning while it waits");
+
+    // The echo lands: the projection is dropped, and the message is still there
+    // exactly once — the reader sees one message, not two.
+    app.agent.state.timeline.replace_authoritative(
+        session.id.clone(),
+        vec![seeded_item(
+            &session.id,
+            1,
+            vibex_core::TimelineItemKind::UserMessage,
+            vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: "what is the plan?".to_string(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        )],
+    );
+    assert!(
+        app.settle_pending_send(),
+        "the echo did not settle the send"
+    );
+    app.sync_transcript();
+    // The clock and the animation stop with the send: an idle client is back to
+    // zero frames rather than repainting for the rest of the session.
+    app.sync_turn_clock();
+    assert!(!app.turn_reads_running());
+    assert!(app.turn_elapsed().is_none(), "the elapsed readout ran on");
+    assert!(
+        !app.is_animating(),
+        "the client is still animating while idle"
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    assert_eq!(
+        screen.matches("what is the plan?").count(),
+        1,
+        "the message was drawn twice:\n{screen}"
+    );
+}
+
+#[test]
+fn a_send_the_runtime_refuses_stops_being_projected() {
+    // The projected row is a promise. When the send fails, the promise has to
+    // be withdrawn — a message that never landed must not sit in the
+    // transcript.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let session = seeded_session("session_pending0002", "refused send");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.insert_str("this one fails");
+    let _ = app.perform(Intent::SubmitComposer);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("this one fails"), "{screen}");
+
+    assert!(app.abandon_pending_send());
+    app.sync_transcript();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        !screen.contains("this one fails"),
+        "a refused send kept its row:\n{screen}"
+    );
+    assert!(!app.turn_reads_running());
+}
+
+#[test]
+fn the_send_that_is_still_in_flight_reads_as_running() {
+    // The reader's only evidence that Enter worked is the transcript row and the
+    // turn line. Both have to answer before the runtime does.
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let session = seeded_session("session_pending0004", "pending indicator");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+
+    // Idle before the send, and the turn line says so.
+    assert!(!app.turn_reads_running());
+    app.composer.insert_str("go");
+    app.perform(Intent::SubmitComposer);
+    assert!(
+        app.turn_reads_running(),
+        "the send is not counted as running"
+    );
+
+    let screen = text(&render(&mut app, 100, 30));
+    assert!(screen.contains("go"), "{screen}");
+    // The running label, not the idle mark: the band is the second half of the
+    // feedback, and it is the half the reader looks at when the transcript is
+    // scrolled away.
+    assert!(
+        screen.contains(app.strings.running()),
+        "the turn line still reads idle:\n{screen}"
+    );
+}

@@ -401,6 +401,81 @@ pub struct QueuedMessage {
     pub images: Vec<(crate::composer::ImageAttachment, u32)>,
 }
 
+/// A message the reader has sent that the runtime has not echoed back yet.
+///
+/// The client does not own the timeline: the authoritative copy of the reader's
+/// own message arrives with the next snapshot or event, which is long enough for
+/// a send to look like it failed. The send is projected locally until the row it
+/// becomes shows up, and it counts as a running turn in the meantime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSend {
+    pub session_id: VibexSessionId,
+    /// Distinguishes this send's projected row from the next one's. The row has
+    /// to keep one identity across frames — the transcript diffs by id, and the
+    /// scroll anchor holds one — so it cannot be derived from the clock.
+    pub serial: u64,
+    pub text: String,
+    /// The message as it went on the wire, labels stripped: the echo re-derives
+    /// what the reader saw from these, exactly as the sent row will.
+    pub attachments: Vec<vibex_core::MessageAttachment>,
+    /// The newest timeline sequence the client knew when the message was sent,
+    /// so only a *newer* row can be the one that confirms it.
+    pub after_sequence: i64,
+    pub submitted_at: std::time::Instant,
+}
+
+impl PendingSend {
+    /// How long a send may be projected before the client stops pretending.
+    ///
+    /// Long enough for a slow runtime to answer, short enough that a message
+    /// that never landed does not sit in the transcript forever.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+    /// The row the send is drawn as until the runtime's own copy arrives.
+    ///
+    /// It is built to look exactly like the row the echo will become: same kind,
+    /// same body, so the reader sees one message that stays put rather than one
+    /// that is replaced by a different-looking one a moment later.
+    fn row(&self) -> TimelineRow {
+        TimelineRow {
+            id: format!("pending-send:{}:{}", self.session_id, self.serial),
+            kind: vibex_desktop_model::TimelineRowKind::UserMessage,
+            item_ids: Vec::new(),
+            turn_id: None,
+            turn_item_count: 0,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: self.after_sequence.saturating_add(1),
+            last_sequence: self.after_sequence.saturating_add(1),
+            title: "You".to_string(),
+            body: self.text.clone(),
+            streaming: false,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        }
+    }
+
+    /// Whether the runtime has echoed this message back into the timeline.
+    fn is_confirmed_by(&self, items: &[vibex_core::TimelineItem]) -> bool {
+        items.iter().any(|item| self.is_confirmed_item(item))
+    }
+
+    /// Whether one timeline item is the echo of this send.
+    fn is_confirmed_item(&self, item: &vibex_core::TimelineItem) -> bool {
+        item.sequence > self.after_sequence
+            && matches!(
+                &item.payload,
+                vibex_core::TimelinePayload::UserMessage(message)
+                    if message.text.trim() == self.text.trim()
+                        && message.attachments == self.attachments
+            )
+    }
+}
+
 /// The whole application.
 pub struct App {
     pub facade: BackendFacade,
@@ -521,6 +596,15 @@ pub struct App {
     pub queued_messages: Vec<QueuedMessage>,
     /// Which queued message the queue band's cursor is on.
     pub queue_selection: Option<usize>,
+    /// The message that has been sent but not yet echoed back by the runtime.
+    ///
+    /// The timeline belongs to the runtime, and its copy of the reader's own
+    /// message arrives a round trip later. Until it does, the send is projected
+    /// here — so the message is on screen the moment Enter is pressed, and the
+    /// session reads as running rather than as having swallowed the message.
+    pub pending_send: Option<PendingSend>,
+    /// Bumped for every send, so each projected row keeps its own identity.
+    pub pending_send_serial: u64,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -894,6 +978,8 @@ impl App {
             last_click: None,
             queued_messages: Vec::new(),
             queue_selection: None,
+            pending_send: None,
+            pending_send_serial: 0,
             banner: None,
             turn_started: None,
             turn_tokens: None,
@@ -1816,14 +1902,37 @@ impl App {
         // The spinner runs while a turn is running or while the reader is being
         // asked for something; the composing page's mark shines while it waits.
         // Nothing else in the interface moves on its own.
-        if self.turn_started.is_none()
-            && self.pending_permission_count() == 0
+        if self.pending_permission_count() == 0
+            && self.pending_send_for_active().is_none()
             && !self.composing_page_shines()
         {
             return false;
         }
         self.animation_phase = self.animation_phase.wrapping_add(1);
         true
+    }
+
+    /// Keep the turn clock in step with what the session actually is.
+    ///
+    /// The elapsed readout and the spinner answer to "is a turn running", which
+    /// is a property of the session rather than an event. Deriving it here means
+    /// no path can leave the clock running after the turn stopped — which would
+    /// keep the client repainting for the rest of the session — or leave it at
+    /// zero while the runtime works.
+    pub fn sync_turn_clock(&mut self) -> bool {
+        let running = self.turn_reads_running() || self.transcript.is_animating();
+        match (running, self.turn_started.is_some()) {
+            (true, false) => {
+                self.turn_started = Some(std::time::Instant::now());
+                true
+            }
+            (false, true) => {
+                self.turn_started = None;
+                self.turn_tokens = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Whether a repaint is due without any input or event.
@@ -1957,7 +2066,14 @@ impl App {
         // `transcript_rows` rather than the state-free projection: a turn the
         // runtime has finished must stop claiming to stream, or the client
         // draws a spinner over a finished answer for the rest of the session.
-        let rows = self.agent.state.transcript_rows();
+        let mut rows = self.agent.state.transcript_rows();
+        // A send the runtime has not echoed yet is projected as the row it will
+        // become. It goes last because that is where the echo will land, and it
+        // is only drawn for the session it belongs to: another session's client
+        // state is not this transcript.
+        if let Some(pending) = self.pending_send_for_active() {
+            rows.push(pending.row());
+        }
         self.projection.rows = rows.clone();
         let blocks: Vec<Block> = rows
             .iter()
@@ -2203,6 +2319,81 @@ impl App {
             .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running)
     }
 
+    /// Whether the open session *reads* as running.
+    ///
+    /// A send that the runtime has not answered yet counts: the reader pressed
+    /// Enter, and a client that shows "idle" for the round trip reads as one
+    /// that dropped the message.
+    pub fn turn_reads_running(&self) -> bool {
+        self.session_running() || self.pending_send_for_active().is_some()
+    }
+
+    /// The unconfirmed send for the open session, if there is one.
+    pub fn pending_send_for_active(&self) -> Option<&PendingSend> {
+        let session_id = self.selected_session_id()?;
+        self.pending_send
+            .as_ref()
+            .filter(|pending| &pending.session_id == session_id)
+    }
+
+    /// Forget a send the runtime has echoed, or one that has waited too long.
+    ///
+    /// Called after the timeline changes and on every tick: the confirmation is
+    /// a property of the timeline, and the timeout is the only thing standing
+    /// between a dropped message and a row that never goes away.
+    pub fn settle_pending_send(&mut self) -> bool {
+        let Some(pending) = self.pending_send.as_ref() else {
+            return false;
+        };
+        if pending.submitted_at.elapsed() > PendingSend::TIMEOUT {
+            self.pending_send = None;
+            return true;
+        }
+        // A send is confirmed by the timeline on screen. A reader who has left
+        // the session keeps the projection until the timeout — it is not drawn
+        // anywhere else, and the timeline is refetched when they come back, so
+        // it settles then rather than showing a phantom row in another session.
+        let confirmed = pending.is_confirmed_by(&self.agent.state.timeline.items);
+        if confirmed {
+            self.pending_send = None;
+            return true;
+        }
+        false
+    }
+
+    /// Drop a send the runtime refused, so no phantom row is left behind.
+    pub fn abandon_pending_send(&mut self) -> bool {
+        let had = self.pending_send.take().is_some();
+        if had {
+            self.turn_started = None;
+        }
+        had
+    }
+
+    /// Record a message that has been dispatched but not yet echoed.
+    pub fn mark_send_dispatched(
+        &mut self,
+        session_id: &VibexSessionId,
+        text: String,
+        attachments: Vec<vibex_core::MessageAttachment>,
+    ) {
+        self.pending_send_serial = self.pending_send_serial.wrapping_add(1);
+        self.pending_send = Some(PendingSend {
+            session_id: session_id.clone(),
+            serial: self.pending_send_serial,
+            text,
+            attachments,
+            after_sequence: self.transcript.newest_sequence(),
+            submitted_at: std::time::Instant::now(),
+        });
+        self.turn_started = Some(std::time::Instant::now());
+        self.scroll.follow = true;
+        // The projection is part of the transcript, so it is put there now
+        // rather than at the next event — waiting for one is the delay this
+        // exists to remove.
+        self.sync_transcript();
+    }
+
     /// Hold a message until the running turn ends, for the open session.
     ///
     /// Answers whether it was held: a client with no session in front of it has
@@ -2427,6 +2618,16 @@ impl App {
     /// reader is *not* looking at, which is exactly the case a queue has to get
     /// right.
     fn session_is_running(&self, session_id: &VibexSessionId) -> bool {
+        // A send that is still in flight counts: the runtime has not reported
+        // the turn yet, and releasing the next held message into that gap would
+        // interleave two turns.
+        if self
+            .pending_send
+            .as_ref()
+            .is_some_and(|pending| &pending.session_id == session_id)
+        {
+            return true;
+        }
         let running = |session: &AgentSession| {
             &session.id == session_id && session.state == vibex_core::AgentSessionState::Running
         };

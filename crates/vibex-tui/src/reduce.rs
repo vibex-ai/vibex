@@ -1957,6 +1957,10 @@ impl App {
         self.history.push(text.clone());
         self.scroll.follow = true;
         let attachments = self.wire_attachments(&images);
+        // The runtime owns the timeline, so its copy of this message is a round
+        // trip away. Until it lands the send is projected locally — a reader who
+        // pressed Enter must not be left wondering whether it worked.
+        self.mark_send_dispatched(&session_id, text.clone(), attachments.clone());
         Outcome::effects(vec![Effect::SendMessage {
             session_id,
             text,
