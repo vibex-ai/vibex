@@ -3030,6 +3030,20 @@ fn render_composer_info(
         };
         line.push(Span::styled(page.to_string(), flag(theme)));
     }
+    // A continuation counting down is drawn where the reader is looking when
+    // they are inside the session — the Desktop puts the same seconds on its
+    // composer — so a message that is about to be sent on its own never
+    // arrives unannounced.
+    if let Some(seconds) = app
+        .selected_session_id()
+        .and_then(|session_id| app.auto_continue.countdown_seconds(session_id))
+    {
+        line.push(sep(theme));
+        line.push(Span::styled(
+            format!("↻{seconds}"),
+            Style::default().fg(theme.roles.accent_attention),
+        ));
+    }
     if running {
         line.push(sep(theme));
         line.push(Span::styled(

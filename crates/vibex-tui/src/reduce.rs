@@ -399,13 +399,24 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::ToggleAutoContinue => {
-                let Some(row) = self.selected_sidebar_row() else {
-                    return Outcome::quiet();
-                };
-                let Some(session_id) = row.session_id.clone() else {
+                // On the list the key acts on the row under the cursor; inside a
+                // session it acts on the session being read, which is where the
+                // countdown is visible.
+                let session_id = if self.page == Page::Sessions {
+                    let Some(row) = self.selected_sidebar_row() else {
+                        return Outcome::quiet();
+                    };
                     // A heading owns no turn to continue. The Desktop's
                     // project-level default is its own menu.
-                    return Outcome::quiet();
+                    let Some(session_id) = row.session_id.clone() else {
+                        return Outcome::quiet();
+                    };
+                    session_id
+                } else {
+                    let Some(session_id) = self.selected_session_id().cloned() else {
+                        return Outcome::quiet();
+                    };
+                    session_id
                 };
                 let now_ms = vibex_core::unix_timestamp_ms();
                 // One key, four states, each of them a control the Desktop

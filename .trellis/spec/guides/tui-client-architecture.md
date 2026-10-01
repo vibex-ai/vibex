@@ -510,7 +510,9 @@ is never a column count.
   a second send for one turn, a session waiting on the reader is never
   continued, and a turn the reader stopped suspends the continuation instead of
   restarting it. A send in flight holds the countdown at zero rather than
-  interleaving two turns. The preference rides the sidebar arrangement's
+  interleaving two turns. The countdown is drawn wherever the reader is: the
+  row's `↻N` on the list, and the composer's info line inside the session, which
+  is where the Desktop puts the same seconds. The preference rides the sidebar arrangement's
   auto-continue fields, so it is the same preference on every surface; a
   suspension this client makes is local, because the protocol has no pause
   change — only the enable/disable that clears one.

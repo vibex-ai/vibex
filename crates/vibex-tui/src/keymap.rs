@@ -677,6 +677,14 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ToggleReasoningExpanded,
         "Toggle reasoning",
     ),
+    // The countdown to a continuation is only visible while the reader is in
+    // the session, so the key that stops it has to work there too.
+    binding(
+        Scope::Agent,
+        Chord::plain(KeyCode::Char('t')),
+        Intent::ToggleAutoContinue,
+        "Auto-continue",
+    ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('y')),

@@ -5094,3 +5094,36 @@ fn the_session_list_marks_state_and_auto_continue_without_words() {
         "a session without it was marked: {row:?}"
     );
 }
+
+/// Inside the session, the countdown is on the composer's info line — the same
+/// edge the desktop puts its "Continue (Ns)" button on — so a continuation the
+/// reader is inside of is never a surprise.
+#[test]
+fn the_session_view_shows_the_continuation_countdown() {
+    let mut app = app(110, 24);
+    let mut idle = seeded_session("session_count0001", "watching this one");
+    idle.state = vibex_core::AgentSessionState::Idle;
+    let sessions = vec![idle.clone()];
+    app.agent
+        .apply_sessions(Ok(sessions.clone()))
+        .expect("sessions apply");
+    app.agent.state.active_session.resolve(idle.clone());
+    app.agent.state.selected_session_id = Some(idle.id.clone());
+    app.navigate_to(Page::Agent);
+    app.auto_continue.apply_authority(
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeSet::from([idle.id.as_str().to_string()]),
+        &std::collections::BTreeSet::new(),
+        &sessions,
+    );
+    app.auto_continue
+        .note_status(&idle.id, idle.updated_at_ms, Some(false));
+    app.sync_auto_continue();
+
+    let screen = text(&render(&mut app, 110, 24));
+    assert!(
+        screen.contains("↻5"),
+        "the countdown is not beside the composer:\n{screen}"
+    );
+}

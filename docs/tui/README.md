@@ -422,7 +422,8 @@ agree about which sessions are running themselves.
 
 The countdown is the reader's escape hatch: a message that appears by itself
 with no warning is indistinguishable from a runaway Agent, so the row shows
-`↻5`, `↻4`, … and `t` stops it. Stopping a turn (`Esc` on a running session)
+`↻5`, `↻4`, … — and inside the session it rides the composer's info line, where
+the desktop puts its own Continue button — while `t` stops it. Stopping a turn (`Esc` on a running session)
 suspends auto-continue for that session rather than letting it restart the turn
 the reader just cancelled; sending a message resumes it; a continuation that
 has already gone out is not sent twice for the same turn. A session waiting on
