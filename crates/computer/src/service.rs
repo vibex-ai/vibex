@@ -36,8 +36,8 @@ use vibex_core::{
     COMPUTER_OBSERVE_MAX_MAX_ELEMENTS, COMPUTER_OBSERVE_MIN_MAX_ELEMENTS, ComputerActionKind,
     ComputerActionRecord, ComputerApplication, ComputerApprovalGranularity, ComputerAvailability,
     ComputerDeliveryMode, ComputerElement, ComputerExecutionSource, ComputerFrame,
-    ComputerObservation, ComputerOperationStatus, ComputerPlatform, ComputerRiskClass,
-    ComputerScreenshot, ComputerSession, ComputerSessionId, ComputerSessionState, ComputerToolTier,
+    ComputerObservation, ComputerOperationStatus, ComputerRiskClass, ComputerScreenshot,
+    ComputerSession, ComputerSessionId, ComputerSessionState, ComputerToolTier,
     ComputerUnavailableReason, ComputerUnverifiedReason, ComputerVerification, RequestId,
     VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
@@ -67,6 +67,24 @@ pub struct ComputerRuntimeSettings {
     pub approval_policy: vibex_core::ComputerApprovalPolicy,
     pub allow_self_target: bool,
     pub call_timeout_ms: u64,
+    /// Whether the engine's experimental Wayland backend is on for this host.
+    ///
+    /// `None` means the process environment decides, which is what a host with
+    /// no settings page (CLI, TUI, diagnostics) does: the variable is the
+    /// user's own export. A host with a settings page resolves its own answer —
+    /// including the automatic detection — and stores it here, so the
+    /// capability statement the page shows describes what the helper was
+    /// actually started with instead of an environment variable nobody set.
+    pub wayland_opt_in: Option<bool>,
+}
+
+impl ComputerRuntimeSettings {
+    /// Whether the engine's Wayland backend is on for this host.
+    pub fn wayland_backend_enabled(&self) -> bool {
+        self.wayland_opt_in.unwrap_or_else(|| {
+            std::env::var_os(vibex_core::ComputerPlatform::wayland_opt_in_variable()).is_some()
+        })
+    }
 }
 
 impl Default for ComputerRuntimeSettings {
@@ -76,6 +94,7 @@ impl Default for ComputerRuntimeSettings {
             approval_policy: vibex_core::ComputerApprovalPolicy::Ask,
             allow_self_target: false,
             call_timeout_ms: vibex_core::COMPUTER_CALL_TIMEOUT_DEFAULT_MS,
+            wayland_opt_in: None,
         }
     }
 }
@@ -565,7 +584,7 @@ impl ComputerService {
                     platform: probe.platform,
                     support: vibex_core::ComputerPlatformSupport::for_platform(
                         probe.platform,
-                        std::env::var_os(ComputerPlatform::wayland_opt_in_variable()).is_some(),
+                        self.runtime_settings().wayland_backend_enabled(),
                     ),
                     permissions: probe.permissions,
                     engine: probe.engine,
@@ -598,7 +617,7 @@ impl ComputerService {
             platform,
             support: vibex_core::ComputerPlatformSupport::for_platform(
                 platform,
-                std::env::var_os(ComputerPlatform::wayland_opt_in_variable()).is_some(),
+                self.runtime_settings().wayland_backend_enabled(),
             ),
             permissions: vibex_core::ComputerPermissionReport::unsupported(),
             engine: None,
@@ -1025,6 +1044,7 @@ impl ComputerService {
         }
         match name {
             tools::NAMES_LIST_APPS => self.tool_list_apps(context).await,
+            tools::NAMES_LAUNCH_APP => self.tool_launch_app(context, arguments).await,
             tools::NAMES_GET_APP_STATE => self.tool_get_app_state(context, arguments).await,
             tools::NAMES_CLICK => self.tool_click(context, arguments).await,
             tools::NAMES_TYPE_TEXT => self.tool_type_text(context, arguments).await,
@@ -1080,6 +1100,74 @@ impl ComputerService {
             apps.len(),
             vibex_core::fence_untrusted_screen_content(&body)
         )))
+    }
+
+    /// Starts an application that is installed but not running.
+    ///
+    /// The launch is a real action with a real card: the engine spawns a
+    /// process the user did not start, and the approval names the application.
+    /// The result is deliberately not `verified` unless the engine reported a
+    /// live process for it — "the launcher returned" is not "the window is
+    /// ready", and the model is told to observe before acting.
+    async fn tool_launch_app(
+        &self,
+        context: &ComputerToolContext,
+        arguments: &Value,
+    ) -> ComputerResult<ComputerToolOutcome> {
+        let app_selector = required_str(arguments, "app")?;
+        let app = self.resolve_app(&app_selector).await?;
+        self.refuse_self_target_app(&app).await?;
+        let risk = match self
+            .gate(
+                context,
+                ComputerActionKind::LaunchApp,
+                &app,
+                None,
+                false,
+                false,
+            )
+            .await?
+        {
+            Gate::Proceed { risk } => risk,
+            Gate::Ask { outcome } => return Ok(*outcome),
+            Gate::Deny { error, risk } => {
+                self.record_blocked(context, ComputerActionKind::LaunchApp, &app, &error, risk)
+                    .await;
+                return Err(error);
+            }
+        };
+        let engine = self.engine()?;
+        let launched = engine.launch_app(&app.app_id).await;
+        let result = launched
+            .as_ref()
+            .map_err(|error| error.clone())
+            .map(|launched| {
+                EngineActionResult {
+                    // The engine resolving a live process is a post-check of the
+                    // launch; anything less is a dispatch whose effect is unproven.
+                    asserted: launched.pid.is_some(),
+                    unverified_reason: launched
+                        .pid
+                        .is_none()
+                        .then_some(ComputerUnverifiedReason::MissingMetadata),
+                    detail: Some(match launched.pid {
+                        Some(pid) => format!("started {} (pid {pid})", launched.display_name),
+                        None => format!("started {}", launched.display_name),
+                    }),
+                    cursor: None,
+                    tree_digest_after: None,
+                }
+            });
+        self.finish_action(
+            context,
+            ComputerActionKind::LaunchApp,
+            &app,
+            ComputerDeliveryMode::Background,
+            format!("started {} on the desktop", app.display_name),
+            result,
+            risk,
+        )
+        .await
     }
 
     async fn tool_get_app_state(
@@ -1272,7 +1360,7 @@ impl ComputerService {
         arguments: &Value,
     ) -> ComputerResult<ComputerToolOutcome> {
         let app_selector = required_str(arguments, "app")?;
-        let text = required_str(arguments, "text")?;
+        let text = required_text(arguments, "text")?;
         let app = self.resolve_app(&app_selector).await?;
         self.refuse_self_target_app(&app).await?;
         let reference = arguments
@@ -2269,6 +2357,21 @@ fn required_str(arguments: &Value, key: &str) -> ComputerResult<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ComputerError::validation("computer_arguments_invalid", format!("`{key}` is required"))
+        })
+}
+
+/// Reads a text argument, which is not an identifier.
+///
+/// Whitespace is text: a space is a keystroke a model may legitimately send,
+/// and answering "`text` is required" to one is a lie about what happened.
+fn required_text(arguments: &Value, key: &str) -> ComputerResult<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             ComputerError::validation("computer_arguments_invalid", format!("`{key}` is required"))
         })

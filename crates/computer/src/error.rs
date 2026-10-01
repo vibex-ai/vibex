@@ -33,6 +33,15 @@ pub mod codes {
     pub const CONCURRENT_USER: &str = "computer_concurrent_user_activity";
     /// An element reference outlived its observation.
     pub const STALE_REFERENCE: &str = "computer_element_reference_stale";
+    /// The engine will not act on an element, and observing again will not
+    /// change that.
+    ///
+    /// Distinct from [`STALE_REFERENCE`] on purpose: a stale reference is fixed
+    /// by observing again, while a window whose accessibility identity the
+    /// engine cannot prove has nothing to observe — it issues no handles at
+    /// all, or keeps no snapshot for the ones it does issue. Reporting both as
+    /// "stale" is how a model is sent into an observe/act/fail loop.
+    pub const ELEMENT_NOT_ADDRESSABLE: &str = "computer_element_not_addressable";
     /// The observation digest no longer matches the live tree.
     pub const STALE_TREE: &str = "computer_tree_changed";
     /// The tier does not include screenshots.
@@ -49,6 +58,13 @@ pub mod codes {
     pub const PLATFORM_UNSUPPORTED: &str = "computer_platform_unsupported";
     /// The helper refused or dropped the request.
     pub const HELPER_FAILED: &str = "computer_helper_failed";
+    /// The engine answered, and its answer was a refusal.
+    ///
+    /// Distinct from [`HELPER_FAILED`] on purpose: a refused call carries the
+    /// engine's own reason, while a broken channel has none. Collapsing the two
+    /// is how a precise "unknown argument `app`" becomes an unreadable
+    /// "the helper failed".
+    pub const DRIVER_REFUSED: &str = "computer_driver_refused";
     /// The engine reported the background delivery unavailable.
     pub const BACKGROUND_UNAVAILABLE: &str = "computer_background_unavailable";
     /// The feature is switched off.

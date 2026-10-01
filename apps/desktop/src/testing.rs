@@ -580,6 +580,9 @@ pub struct ComputerUseContractProbe {
     pub disconnect_has_two_thresholds: bool,
     /// True when Wayland is graded rather than claimed.
     pub wayland_is_graded: bool,
+    /// True when starting an application is an approved action that may be
+    /// remembered for the session, and the surface actually offers it.
+    pub launch_is_approved_and_offered: bool,
 }
 
 pub fn computer_use_contract_probe() -> ComputerUseContractProbe {
@@ -804,6 +807,25 @@ pub fn computer_use_contract_probe() -> ComputerUseContractProbe {
     let wayland = ComputerPlatformSupport::for_platform(ComputerPlatform::LinuxWayland, false);
     let wayland_is_graded = !wayland.background_input && !wayland.set_window_frame;
 
+    // Starting an application is reversible, so it may be approved once and
+    // remembered for the session — and the surface has to offer the action the
+    // risk model already defines, or a stopped application is unreachable.
+    let launch_outcome = vibex_computer::policy::assess(&vibex_computer::PolicyRequest {
+        kind: vibex_core::ComputerActionKind::LaunchApp,
+        app: ordinary_app.clone(),
+        element: None,
+        label: None,
+        delivery: vibex_core::ComputerDeliveryMode::Background,
+        writes_text: false,
+        target_is_frontmost: false,
+        user_activity_age_ms: Some(60_000),
+        self_target: false,
+    });
+    let launch_is_approved_and_offered = launch_outcome.policy
+        == ComputerRiskPolicy::RequiresApproval
+        && launch_outcome.risk == ComputerRiskClass::LaunchApp
+        && tool_names.contains(&"computer_launch_app");
+
     ComputerUseContractProbe {
         schema_version: "computer-use-contract.v1",
         tool_count: tool_names.len(),
@@ -827,5 +849,6 @@ pub fn computer_use_contract_probe() -> ComputerUseContractProbe {
         stop_is_terminal,
         disconnect_has_two_thresholds: vibex_core::COMPUTER_DISCONNECT_SOFT_MS > 0,
         wayland_is_graded: wayland_is_graded && screenshot_probe,
+        launch_is_approved_and_offered,
     }
 }

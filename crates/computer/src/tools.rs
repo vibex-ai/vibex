@@ -1,4 +1,4 @@
-//! The tool surface: eight tools, written by Vibex, with the rules in the
+//! The tool surface: nine tools, written by Vibex, with the rules in the
 //! descriptions.
 //!
 //! The surface is Vibex's own on purpose. Passing the engine's tool list
@@ -28,6 +28,7 @@ use vibex_core::{
 /// error at the dispatch site.
 pub mod names {
     pub const LIST_APPS: &str = "computer_list_apps";
+    pub const LAUNCH_APP: &str = "computer_launch_app";
     pub const GET_APP_STATE: &str = "computer_get_app_state";
     pub const CLICK: &str = "computer_click";
     pub const TYPE_TEXT: &str = "computer_type_text";
@@ -39,9 +40,9 @@ pub mod names {
 
 // Re-exported under the names the service uses.
 pub use names::{
-    CLICK as NAMES_CLICK, GET_APP_STATE as NAMES_GET_APP_STATE, LIST_APPS as NAMES_LIST_APPS,
-    PERMISSIONS as NAMES_PERMISSIONS, PRESS_KEY as NAMES_PRESS_KEY, SCROLL as NAMES_SCROLL,
-    SET_VALUE as NAMES_SET_VALUE, TYPE_TEXT as NAMES_TYPE_TEXT,
+    CLICK as NAMES_CLICK, GET_APP_STATE as NAMES_GET_APP_STATE, LAUNCH_APP as NAMES_LAUNCH_APP,
+    LIST_APPS as NAMES_LIST_APPS, PERMISSIONS as NAMES_PERMISSIONS, PRESS_KEY as NAMES_PRESS_KEY,
+    SCROLL as NAMES_SCROLL, SET_VALUE as NAMES_SET_VALUE, TYPE_TEXT as NAMES_TYPE_TEXT,
 };
 
 /// The shared tail every computer tool description carries.
@@ -80,6 +81,26 @@ pub fn tools_list_payload(tier: ComputerToolTier) -> Value {
                 untrusted_notice()
             ),
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": names::LAUNCH_APP,
+            "description": format!(
+                "Start an application that is installed but not running, addressed by the id \
+                 computer_list_apps reports. Starting an application is approved once and \
+                 remembered for the session. A launch is dispatched, not verified: the process \
+                 was started, and whether its window is ready is unverified — observe it with \
+                 computer_get_app_state before acting on it, and never report a launch as a \
+                 success on its own.{}",
+                untrusted_notice()
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": string_property("Application id from computer_list_apps."),
+                },
+                "required": ["app"],
+                "additionalProperties": false
+            },
         }),
         json!({
             "name": names::GET_APP_STATE,
@@ -279,18 +300,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_surface_is_exactly_eight_tools() {
+    fn the_surface_is_a_small_fixed_set_of_tools() {
         for tier in [ComputerToolTier::Structured, ComputerToolTier::Visual] {
             let payload = tools_list_payload(tier);
             let tools = payload["tools"].as_array().unwrap();
-            assert_eq!(tools.len(), 8, "the surface is eight tools, not a god tool");
+            assert_eq!(tools.len(), 9, "the surface is nine tools, not a god tool");
             let names: Vec<&str> = tools
                 .iter()
                 .map(|tool| tool["name"].as_str().unwrap())
                 .collect();
             assert!(names.contains(&names::CLICK));
             assert!(names.contains(&names::GET_APP_STATE));
+            assert!(names.contains(&names::LAUNCH_APP));
         }
+    }
+
+    /// Launching an application is the one action that needs no element
+    /// reference, so it carries the launch rule instead of the reference rule.
+    #[test]
+    fn the_launch_tool_requires_an_application_and_says_what_it_does_not_prove() {
+        let payload = tools_list_payload(ComputerToolTier::Visual);
+        let launch = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == names::LAUNCH_APP)
+            .expect("the launch tool is offered");
+        assert_eq!(launch["inputSchema"]["required"], json!(["app"]));
+        assert_eq!(launch["inputSchema"]["additionalProperties"], false);
+        let description = launch["description"].as_str().unwrap();
+        assert!(
+            description.contains("unverified"),
+            "a launch is dispatched, not verified: {description}"
+        );
+        assert!(
+            description.contains("computer_get_app_state"),
+            "the launch tool must tell the model to observe before acting: {description}"
+        );
     }
 
     #[test]
@@ -338,7 +384,10 @@ mod tests {
                     "{name} returns screen-derived content and must say it is untrusted"
                 );
             }
-            if !matches!(name, names::LIST_APPS | names::PERMISSIONS) {
+            if !matches!(
+                name,
+                names::LIST_APPS | names::PERMISSIONS | names::LAUNCH_APP
+            ) {
                 assert!(
                     description.contains("short-lived"),
                     "{name} must carry the reference rule"

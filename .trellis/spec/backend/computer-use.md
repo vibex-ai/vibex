@@ -57,10 +57,11 @@ engine never changes what a model sees or what an approval card says.
 
 ## The tool surface
 
-Eight tools, deliberately not a god tool:
+Nine tools, deliberately not a god tool:
 
 ```
 computer_list_apps       → canonical identities, with the id to address them by
+computer_launch_app      → start an installed application (approved once per session)
 computer_get_app_state   → accessibility tree + element references (+ screenshot by tier)
 computer_click           → element reference first, coordinates as a fallback
 computer_type_text       → semantic write when an element is named, typing otherwise
@@ -69,6 +70,16 @@ computer_press_key       → a key or a chord
 computer_scroll          →
 computer_permissions     → what the OS actually granted
 ```
+
+Launching is a tool rather than a favour the reader does by hand because a
+stopped application has **no window to observe and no addressable launcher**: on
+Wayland the shell's launcher is a layer-shell surface the engine cannot list, and
+the desktop's own launcher may need a keyboard chord the compositor refuses. The
+risk model already classified it (`LaunchApp`, approved once and remembered for
+the session), so the surface was the only thing missing. The result is
+`verified` **only** when the engine reported a live process for it; a launcher
+that returned has not proven the window exists, and the tool's description tells
+the model to observe before acting.
 
 Three rules live in the descriptions themselves, because tool descriptions
 travel with the tool while a context handover does not:
@@ -92,6 +103,15 @@ then re-reads the tree digest:
 
 A stale reference is never resolved against the new element list. "The click
 landed on whatever moved into that position" is the failure this prevents.
+
+A third refusal exists and is kept apart: `computer_element_not_addressable`.
+An engine that cannot prove which window a tree belongs to will either issue no
+element handles at all or keep no snapshot for the ones it does issue — on Linux
+that is a window with no accessibility tree, which leaves the driver holding an
+X11 property fallback it refuses to act on. Observing again cannot help there,
+so it must not be reported as a stale reference: that is exactly how a model is
+sent into an observe/act/fail loop. The policy stays the same — a window the
+engine will not prove is a window it will not act on.
 
 ## Verification
 
@@ -130,7 +150,7 @@ on. An ambiguous name is an error, not a coin flip.
 | Foreground takeover | approval | once | never |
 | Concurrent human activity | approval (a conflict question) | once | never |
 | Quitting an application | approval | once | never |
-| Launching an application | approval | session | yes |
+| Launching an application (`computer_launch_app`, `vibex computer launch`) | approval | session | yes |
 | Clipboard write | approval | session | yes |
 | Ordinary semantic action | allowed | none | — |
 
@@ -228,7 +248,7 @@ copy follows the list rather than hard-coding a number.
 | macOS | supported; accessibility and screen-recording permission required, and screen recording needs an application restart on recent versions |
 | Windows | supported; background input fails more often (occluded windows, some toolkits) and those cases return an explicit background-unavailable result that needs a foreground escalation; elevated and UWP targets are out of scope |
 | Linux X11 | supported: accessibility actions, unfocused input injection, window capture |
-| Linux Wayland | **graded**: standard Wayland has no protocol for raw input to an occluded surface, so those calls return background-unavailable and need a foreground takeover; setting another window's geometry is refused; the experimental path requires an explicit opt-in |
+| Linux Wayland | **graded**: standard Wayland has no protocol for raw input to an occluded surface, so those calls return background-unavailable and need a foreground takeover; setting another window's geometry is refused; native Wayland windows are only visible through the driver's experimental backend, which Vibex measures and turns on by itself when the session has them (see "The Wayland backend") |
 
 Do not say "supports Linux" without the display server. A deployment checklist
 that must hold on every desktop environment:
@@ -280,6 +300,67 @@ answers with the daemon's own TCC identity, so it is read there and reported as
 not-required elsewhere. The probe never prompts — a permission dialog belongs to
 a click in the settings, not to a startup path.
 
+### The argument mapping, which is not this crate's vocabulary
+
+Vibex's tool vocabulary and the driver's are **different languages**, and the
+driver enforces the difference: every one of its tool schemas is
+`additionalProperties: false`, so a key it does not know is refused before
+anything touches the desktop. Sending Vibex's own words (`app`,
+`element_index`, `delta_x`) therefore fails *every* call with the same opaque
+error, which is exactly the failure this table exists to prevent.
+
+| Vibex asks for | The adapter sends |
+| --- | --- |
+| an application | `pid` — resolved from `list_apps`, never from a name |
+| a window | the **integer** `window_id`; a pid alone does not resolve on Wayland |
+| an element | `element_token` — the driver's opaque per-snapshot handle, mapped from the index the service uses |
+| a coordinate click | `pid` + `x`/`y` + `coordinate_frame: "desktop"` (the driver's default frame is window-local pixels) |
+| a chord | `hotkey` with one `keys` array, not `press_key` plus `modifiers` |
+| a scroll | `direction` + `amount` (1–50), derived from the delta pair: the dominant axis is the gesture |
+| `launch_app` | `launch_path` from the directory, falling back to `name` |
+| `kill_app` | `pid` — and it resolves a pid even when the application has no window left |
+| an observation | `get_window_state` with `pid` + `window_id`; the driver's `get_accessibility_tree` is a *desktop* snapshot and takes no application |
+| a screenshot | `get_window_state` with `include_accessibility_tree: false`, or `get_desktop_state` for the whole display |
+
+Four properties of the engine's replies are load-bearing:
+
+1. **A refusal is a document, not an empty failure — and it is written to
+   stdout.** Argument problems arrive as
+   `{"refusal": {"code", "message"}, "status": "refused"}`; capability problems
+   as a bare `{"code", "detail", "escalation"}`. Both come with a non-zero exit
+   *and empty stderr*, so an adapter that reads only stderr turns "unknown
+   argument `app`" into "the helper failed". The adapter parses both envelopes,
+   keeps the engine's own message on the error, and maps
+   `background_unavailable` / `wm_chord_unavailable` onto
+   `computer_background_unavailable` with the engine's escalation as the
+   recovery hint — that hint is what tells the model to retry in the
+   foreground, which is the documented Wayland path.
+2. **A non-zero exit is not always a failure.** The engine exits non-zero for a
+   *partial* answer too: a capture-only `get_window_state` whose pixels could
+   not be attributed to the window (Wayland's `surface_identity_unproven`)
+   returns `screenshot_error` and exit 1. A refusal and a capability failure are
+   distinguishable — they carry `refusal` or a top-level `code` — so the
+   adapter accepts a bare document as an answer for the screenshot paths, and a
+   tree that arrived without its pixels is marked degraded with the engine's own
+   reason rather than silently returning no image.
+3. **Element handles belong to one snapshot.** The driver's `element_token` is
+   stale as soon as the next `get_window_state` of the same window replaces its
+   snapshot, and the service validates a reference by re-observing. The
+   index→token map therefore lives in the adapter, is replaced (never merged) by
+   each observation, and is bounded in size. Nothing above the seam sees a
+   driver handle.
+4. **An empty tree needs a reason.** A reply with no elements and no
+   `degraded`/`degraded_reason` is an error (`computer_accessibility_bridge_missing`),
+   never an empty window. Trees the driver recovers through the X11 property
+   fallback set `degraded`, and the observation carries that through.
+
+`release_all_keys` is a deliberate no-op against this engine: it has no
+release-all primitive, and every input tool Vibex can reach is an atomic
+press-and-release (the only held-input pair, `mouse_button_down` /
+`mouse_button_up`, is not on this crate's tool surface). The helper's exit path
+and the emergency stop still call it, and it truthfully reports that there is
+nothing held.
+
 ## Settings and installation
 
 The settings page is the product's front door for this feature. Nothing about
@@ -324,7 +405,8 @@ says four things:
 - **Approval, calls and this platform.** The approval policy (allow / ask /
   deny), the switch that permits operating Vibex's own windows, the call
   timeout, and one row per capability family so a platform that cannot do
-  something says so next to the switch that would have used it.
+  something says so next to the switch that would have used it. On Wayland that
+  group also carries the window row described below.
 
 Three limits on the approval policy are deliberate and are stated on the page:
 
@@ -341,6 +423,64 @@ Three limits on the approval policy are deliberate and are stated on the page:
 The call timeout is bounded to the offered choices and snaps up, so a
 hand-edited settings file cannot shorten every action to nothing or set it to
 unlimited.
+
+### The Wayland backend
+
+On a Wayland session the driver sees X11 windows by default and native Wayland
+windows only through its experimental backend, so a session can look empty while
+several applications are plainly open. Making the reader find an environment
+variable to fix that is the wrong shape for a settings page, so Vibex measures
+and decides:
+
+- **The measurement is a comparison.** The configured view (what the live daemon
+  already sees) against a short-lived probe daemon started with the opt-in on a
+  **private socket**, plus the compositor's own `wayland_backend` health check.
+  A session whose windows appear either way needs nothing; a compositor that does
+  not advertise the wlroots manager globals can never offer them, and the page
+  says that rather than promising a switch will help. The probe daemon is killed
+  by dropping it, so the live daemon is never disturbed.
+- **The row offers Automatic, On and Off.** Automatic is the default and the
+  store holds no value for it; On and Off are the reader's own decision.
+- **Precedence is the reader's before the machine's**: the environment variable
+  (how someone exports the opt-in by hand, and what a host with no settings page
+  uses), then the stored setting, then the measurement. An unmeasured session is
+  not evidence of native windows, so it stays off.
+- **The answer travels through the helper's environment**, because the helper is
+  what spawns the driver daemon and the daemon is what reads the variable. A
+  change to it rebuilds the helper for the same reason a timeout change does.
+- **A daemon whose backend does not match the setting is stopped first.** The
+  engine reuses whatever daemon already owns its socket, and a daemon outlives
+  the helper that started it — it is spawned with kill-on-drop, but a helper
+  that is killed never runs its destructors, so the daemon is reparented and
+  keeps running. Without this, turning the backend on would be silently ignored:
+  the new helper would reuse the old daemon and every native Wayland window
+  would stay invisible while the settings said otherwise. The same check runs in
+  reverse, so turning it off is not defeated by a daemon left running with it.
+- **The resolved value is written back into the runtime settings**, so the
+  capability statement the page shows describes the helper that is actually
+  running instead of an environment variable nobody set.
+- The measurement is cached per driver check; *Check again* drops it, so a window
+  that opened since the last look can change the answer.
+
+**Seeing windows is not driving them.** Both halves have to hold, and on a
+compositor the driver has no input backend for, only the first one does:
+
+- On Hyprland the pinned engine routes foreground input through its own
+  compositor plugin and **refuses to downgrade** to XTest/libei
+  (`production Hyprland input plugin is unavailable`; `no fallback or downgrade
+  is permitted`). Background delivery is refused for the opposite reason: a
+  virtual pointer injects at the compositor's focus, so it cannot address an
+  occluded window. The driver's own `health_report` still reports every check as
+  passing — `virtual-pointer=true` is about a global that exists, not about
+  input the engine will deliver — so the settings page must not promise input on
+  the strength of that report. Until the plugin exists for the installed
+  compositor, computer use on such a session is read-only, and the honest answer
+  to a model is the driver's own refusal, not a retry.
+- A window whose accessibility tree the engine cannot prove (a terminal, a
+  custom-drawn toolkit, anything without AT-SPI on Linux) is one it will not act
+  on: it issues no handles, or keeps no snapshot for the ones it issues. That
+  surfaces as `computer_element_not_addressable` — never as a stale reference —
+  and an Agent that keeps observing will keep getting the same answer.
 
 ## Degradation vocabulary
 

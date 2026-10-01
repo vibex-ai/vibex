@@ -109,6 +109,32 @@ pub fn has_desktop_session() -> bool {
         || std::env::var_os("XDG_SESSION_TYPE").is_some()
 }
 
+/// The Wayland backend value this host should run with.
+///
+/// The order is the reader's own, and only then the machine's:
+///
+/// 1. the environment variable, which is how someone exports the opt-in by
+///    hand and what a host with no settings page (CLI, TUI, diagnostics) has;
+/// 2. the stored setting, when the settings page wrote one — a concrete value
+///    is a decision and is never overridden;
+/// 3. the measurement: native Wayland windows the driver cannot otherwise see
+///    turn the backend on by themselves, because a session full of invisible
+///    windows is not a setting a reader should have to find.
+fn resolve_wayland_decision(
+    configured_by_environment: bool,
+    setting: Option<bool>,
+    measured: Option<vibex_computer::driver::WaylandWindowDetection>,
+) -> bool {
+    if configured_by_environment {
+        return true;
+    }
+    setting.unwrap_or_else(|| {
+        measured
+            .map(|measured| measured.wants_opt_in())
+            .unwrap_or(false)
+    })
+}
+
 /// Per-run computer-use state held by the runtime.
 pub struct ComputerRuntime {
     service: ComputerService,
@@ -133,6 +159,14 @@ pub struct ComputerRuntime {
     /// The platform's own directory the engine installs into, shown in the
     /// settings so the user can see where "install" writes.
     driver: Mutex<DriverState>,
+    /// The last Wayland measurement, reused until the driver is checked again.
+    ///
+    /// Measuring starts two probe daemons, so it is cached rather than run on
+    /// every settings render; the Check again action drops it through
+    /// [`Self::forget_wayland_detection`].
+    wayland_detection: Mutex<Option<vibex_computer::driver::WaylandWindowDetection>>,
+    /// The Wayland backend value the current helper was started with.
+    wayland_opt_in: Mutex<Option<bool>>,
 }
 
 /// The inputs a start needs, kept for a late start.
@@ -226,6 +260,8 @@ impl ComputerRuntime {
             unavailable: Mutex::new(None),
             launch: std::sync::RwLock::new(None),
             driver: Mutex::new(DriverState::Unknown),
+            wayland_detection: Mutex::new(None),
+            wayland_opt_in: Mutex::new(None),
         })
     }
 
@@ -338,18 +374,42 @@ impl ComputerRuntime {
             return None;
         };
         let driver = vibex_computer::CuaDriverCli::discover();
-        let helper = Arc::new(
-            HelperEngine::new(
-                command,
-                vibex_core::computer_helper_token(&self.capability_token),
-            )
-            .with_driver(
-                driver
-                    .as_ref()
-                    .map(|driver| driver.executable().to_path_buf()),
-            )
-            .with_owner_file(Some(self.home_dir.join("computer-helper.owner"))),
-        );
+        // The Wayland decision is resolved here as well as in `apply_settings`,
+        // because the very first start can happen before any settings were
+        // applied. The value travels to the helper as an environment variable:
+        // the helper is what spawns the driver daemon, and the daemon is what
+        // reads it.
+        let mut settings = self.service.runtime_settings();
+        let wayland = self.resolve_wayland_opt_in(&mut settings).await;
+        self.service.apply_runtime_settings(settings);
+        // A daemon that outlived an earlier helper was started with the other
+        // backend setting, and the helper would silently reuse it. Stopping the
+        // mismatch is what makes the setting real; the helper starts the next
+        // daemon, because the process that spawns it is the process the
+        // operating system attaches its grants to.
+        if let Some(driver) = driver.as_ref()
+            && let Err(error) = driver.align_daemon_wayland_backend(wayland).await
+        {
+            tracing::warn!(
+                target: "vibex_computer",
+                code = %error.code,
+                "the desktop driver daemon could not be aligned with the Wayland setting"
+            );
+        }
+        let mut helper = HelperEngine::new(
+            command,
+            vibex_core::computer_helper_token(&self.capability_token),
+        )
+        .with_driver(
+            driver
+                .as_ref()
+                .map(|driver| driver.executable().to_path_buf()),
+        )
+        .with_owner_file(Some(self.home_dir.join("computer-helper.owner")));
+        if wayland {
+            helper = helper.with_env(vibex_core::ComputerPlatform::wayland_opt_in_variable(), "1");
+        }
+        let helper = Arc::new(helper);
         // A probe is the only way to learn whether the engine is actually
         // usable here; it is read-only and never installs anything.
         match helper.probe().await {
@@ -743,6 +803,12 @@ impl ComputerRuntime {
         enabled: bool,
     ) -> VibexResult<()> {
         settings.enabled = enabled;
+        // The Wayland decision is resolved before anything reads the settings:
+        // the capability statement and the helper's own environment both
+        // depend on it, and a value that changed means the helper the desktop
+        // is currently driven by was started with the other one.
+        let previous_wayland = *self.wayland_opt_in.lock().await;
+        let wayland = self.resolve_wayland_opt_in(&mut settings).await;
         self.service.apply_runtime_settings(settings);
         // The timeout lives on the helper client, which is created with the
         // engine; the next start picks it up, and a running one is restarted
@@ -756,6 +822,7 @@ impl ComputerRuntime {
                 helper.timeout() != std::time::Duration::from_millis(settings.call_timeout_ms)
             })
             .unwrap_or(false);
+        let wayland_changed = previous_wayland.is_some_and(|previous| previous != wayland);
         if !enabled {
             self.shutdown().await;
             self.mark_unavailable(
@@ -765,13 +832,14 @@ impl ComputerRuntime {
             .await;
             return Ok(());
         }
-        if self.endpoint_url.lock().await.is_some() && !timeout_changed {
+        if self.endpoint_url.lock().await.is_some() && !timeout_changed && !wayland_changed {
             *self.unavailable.lock().await = None;
             return Ok(());
         }
-        if timeout_changed {
-            // Rebuilding the helper is the honest way to change a deadline that
-            // is baked into its client; the desktop is released first.
+        if timeout_changed || wayland_changed {
+            // Rebuilding the helper is the honest way to change a deadline or
+            // an environment value that is baked into its client; the desktop
+            // is released first.
             self.shutdown().await;
         }
         *self.unavailable.lock().await = None;
@@ -780,6 +848,72 @@ impl ComputerRuntime {
             return Ok(());
         };
         self.start(inputs.sidecar_command, inputs.headless).await
+    }
+
+    /// Whether this session has native Wayland windows the driver can only see
+    /// with its experimental backend.
+    ///
+    /// Only on Wayland, and measured once per driver check: the measurement
+    /// starts a short-lived probe daemon, so it is cached rather than repeated
+    /// for every settings render.
+    pub async fn detect_wayland_windows(
+        &self,
+    ) -> Option<vibex_computer::driver::WaylandWindowDetection> {
+        if vibex_computer::driver::detect_platform() != vibex_core::ComputerPlatform::LinuxWayland {
+            return None;
+        }
+        if let Some(measured) = *self.wayland_detection.lock().await {
+            return Some(measured);
+        }
+        let driver = vibex_computer::CuaDriverCli::discover()?;
+        let measured = driver.detect_wayland_windows().await.ok()?;
+        *self.wayland_detection.lock().await = Some(measured);
+        Some(measured)
+    }
+
+    /// Drops the cached Wayland measurement so the next look takes a fresh one.
+    ///
+    /// The measurement is a snapshot of the desktop — a window that opened
+    /// since the last look has to be able to change the answer — so the Check
+    /// again action drops it rather than serving the previous minute's session.
+    pub async fn forget_wayland_detection(&self) {
+        *self.wayland_detection.lock().await = None;
+    }
+
+    /// Resolves the Wayland backend value for this host and records it.
+    ///
+    /// The order of precedence is the user's own, and only then the machine's:
+    ///
+    /// 1. the environment variable, which is how someone exports the opt-in by
+    ///    hand and which a runtime with no settings page uses;
+    /// 2. the settings value, when the settings page stored one;
+    /// 3. the measurement — native Wayland windows the driver cannot otherwise
+    ///    see turn the backend on by themselves, because a session full of
+    ///    invisible windows is not a setting a reader should have to find.
+    ///
+    /// The answer is stored on the way through: the capability statement the
+    /// settings show has to describe the helper that was actually started, not
+    /// an environment variable nobody set. An `None` on the way in therefore
+    /// means "decide automatically", and any concrete value means the reader
+    /// already decided.
+    async fn resolve_wayland_opt_in(
+        &self,
+        settings: &mut vibex_computer::service::ComputerRuntimeSettings,
+    ) -> bool {
+        let configured_by_environment =
+            std::env::var_os(vibex_core::ComputerPlatform::wayland_opt_in_variable()).is_some();
+        let measured = if configured_by_environment || settings.wayland_opt_in.is_some() {
+            None
+        } else {
+            // Only measured when it can matter: the probe starts a daemon, and
+            // a decision the reader already made must not pay for it.
+            self.detect_wayland_windows().await
+        };
+        let resolved =
+            resolve_wayland_decision(configured_by_environment, settings.wayland_opt_in, measured);
+        settings.wayland_opt_in = Some(resolved);
+        *self.wayland_opt_in.lock().await = Some(resolved);
+        resolved
     }
 
     /// Probes the desktop driver and remembers what it found.
@@ -1531,5 +1665,49 @@ mod tests {
         assert_eq!(row.verification, "unverified(synthetic_input)");
         assert_eq!(row.delivery_mode.as_deref(), Some("background"));
         assert!(!row.summary.contains("hunter2"));
+    }
+
+    #[test]
+    fn the_wayland_decision_is_the_readers_before_the_machines() {
+        use vibex_computer::driver::WaylandWindowDetection;
+
+        let native_windows = WaylandWindowDetection {
+            configured_windows: 0,
+            wayland_windows: 2,
+            backend_available: true,
+        };
+        let only_x11 = WaylandWindowDetection {
+            configured_windows: 3,
+            wayland_windows: 3,
+            backend_available: true,
+        };
+        let no_protocol = WaylandWindowDetection {
+            configured_windows: 0,
+            wayland_windows: 0,
+            backend_available: false,
+        };
+
+        // The environment is the reader's own export and outranks everything.
+        assert!(resolve_wayland_decision(true, Some(false), None));
+        assert!(resolve_wayland_decision(true, None, Some(no_protocol)));
+
+        // A stored decision is a decision: the measurement never overrides it.
+        assert!(!resolve_wayland_decision(
+            false,
+            Some(false),
+            Some(native_windows)
+        ));
+        assert!(resolve_wayland_decision(
+            false,
+            Some(true),
+            Some(no_protocol)
+        ));
+
+        // Automatic follows the measurement.
+        assert!(resolve_wayland_decision(false, None, Some(native_windows)));
+        assert!(!resolve_wayland_decision(false, None, Some(only_x11)));
+        assert!(!resolve_wayland_decision(false, None, Some(no_protocol)));
+        // Nothing measured is not evidence of native windows.
+        assert!(!resolve_wayland_decision(false, None, None));
     }
 }

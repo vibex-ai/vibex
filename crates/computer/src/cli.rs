@@ -46,6 +46,7 @@ vibex computer <command> [options]
 
 Commands:
   apps                                   list applications on the desktop
+  launch --app <id>                      start an installed application
   state --app <id> [--window <id>] [--screenshot] [--extended]
                                          read an application's accessibility tree
   click --app <id> (--element <ref> | --x <n> --y <n>) [--right] [--double]
@@ -96,6 +97,10 @@ pub fn parse(arguments: &[String]) -> Result<CliInvocation, ComputerError> {
         "apps" => CliInvocation {
             tool: crate::tools::names::LIST_APPS.to_string(),
             arguments: json!({}),
+        },
+        "launch" => CliInvocation {
+            tool: crate::tools::names::LAUNCH_APP.to_string(),
+            arguments: json!({ "app": require(&flag, "--app")? }),
         },
         "state" => {
             let mut arguments = json!({ "app": require(&flag, "--app")? });
@@ -357,6 +362,9 @@ mod tests {
     fn commands_map_onto_the_same_tools_the_mcp_server_exposes() {
         let invocation = parse(&args(&["apps"])).unwrap();
         assert_eq!(invocation.tool, crate::tools::names::LIST_APPS);
+        let invocation = parse(&args(&["launch", "--app", "com.example.notes"])).unwrap();
+        assert_eq!(invocation.tool, crate::tools::names::LAUNCH_APP);
+        assert_eq!(invocation.arguments["app"], "com.example.notes");
         let invocation = parse(&args(&["state", "--app", "com.example.notes"])).unwrap();
         assert_eq!(invocation.tool, crate::tools::names::GET_APP_STATE);
         assert_eq!(invocation.arguments["app"], "com.example.notes");

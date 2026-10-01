@@ -2,9 +2,10 @@
 //!
 //! These are the user's decisions, not the runtime's state: whether the feature
 //! may run at all, how much approval the Agent needs, whether it may drive
-//! Vibex's own window, and how long one desktop call may take. They live in the
-//! desktop UI state because they are edited in the settings and read at startup
-//! — the runtime is handed the answer rather than owning it.
+//! Vibex's own window, how long one desktop call may take, and whether the
+//! driver's experimental Wayland backend is used. They live in the desktop UI
+//! state because they are edited in the settings and read at startup — the
+//! runtime is handed the answer rather than owning it.
 //!
 //! Everything here has a conservative default. The feature ships **off**, the
 //! policy ships as "ask", and driving Vibex's own window ships disabled,
@@ -17,7 +18,7 @@ use vibex_core::{
     normalize_call_timeout_ms,
 };
 
-/// The four decisions the settings own.
+/// The decisions the settings own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputerUiState {
@@ -37,6 +38,15 @@ pub struct ComputerUiState {
     /// How long one desktop call may take, in milliseconds.
     #[serde(default = "default_call_timeout_ms")]
     pub call_timeout_ms: u64,
+    /// Whether the engine's experimental Wayland backend is on.
+    ///
+    /// `None` — the default, and the right answer on every platform that is
+    /// not Wayland — means "decide from the machine": the runtime measures
+    /// whether this session has native Wayland windows the driver cannot see
+    /// without its experimental backend, and turns it on when it does. A
+    /// concrete value is the reader's own decision and is never overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wayland_opt_in: Option<bool>,
 }
 
 fn default_call_timeout_ms() -> u64 {
@@ -50,6 +60,7 @@ impl Default for ComputerUiState {
             approval_policy: ComputerApprovalPolicy::Ask,
             allow_self_target: false,
             call_timeout_ms: COMPUTER_CALL_TIMEOUT_DEFAULT_MS,
+            wayland_opt_in: None,
         }
     }
 }
@@ -125,10 +136,28 @@ mod tests {
             approval_policy: ComputerApprovalPolicy::Allow,
             allow_self_target: true,
             call_timeout_ms: 120_000,
+            wayland_opt_in: Some(false),
         };
         let encoded = serde_json::to_string(&state).unwrap();
         let decoded: ComputerUiState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, state);
         assert_eq!(state.policy_label(), "allow");
+    }
+
+    #[test]
+    fn automatic_is_the_default_and_is_not_written_to_disk() {
+        // Automatic is the absence of a decision, so a state that has one has
+        // to survive a round trip and a state that does not must not grow one.
+        assert_eq!(ComputerUiState::default().wayland_opt_in, None);
+        let automatic = serde_json::to_string(&ComputerUiState::default()).unwrap();
+        assert!(!automatic.contains("waylandOptIn"), "{automatic}");
+        let forced = serde_json::to_string(&ComputerUiState {
+            wayland_opt_in: Some(true),
+            ..ComputerUiState::default()
+        })
+        .unwrap();
+        assert!(forced.contains("\"waylandOptIn\":true"), "{forced}");
+        let decoded: ComputerUiState = serde_json::from_str(&forced).unwrap();
+        assert_eq!(decoded.wayland_opt_in, Some(true));
     }
 }

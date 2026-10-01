@@ -32245,25 +32245,33 @@ impl VibexWorkbench {
                             approval_policy: settings.approval_policy,
                             allow_self_target: settings.allow_self_target,
                             call_timeout_ms: settings.call_timeout_ms,
+                            wayland_opt_in: settings.wayland_opt_in,
                         };
                         let applied = runtime
                             .apply_settings(runtime_settings, settings.enabled)
                             .await;
+                        // Applying resolved the Wayland decision and cached the
+                        // measurement it made it from, so this is the same
+                        // number the helper was started with.
+                        let wayland = runtime.detect_wayland_windows().await;
                         let driver = runtime.detect_driver().await;
                         let availability = runtime.availability().await;
-                        Some((applied, driver, availability))
+                        Some((applied, driver, availability, wayland))
                     })
                     .await
                     .ok()
                     .flatten(),
                 None => None,
             };
-            let (note, driver, availability) = match outcome {
-                Some((Ok(()), driver, availability)) => (None, driver, Some(availability)),
-                Some((Err(error), driver, availability)) => (
+            let (note, driver, availability, wayland) = match outcome {
+                Some((Ok(()), driver, availability, wayland)) => {
+                    (None, driver, Some(availability), wayland)
+                }
+                Some((Err(error), driver, availability, wayland)) => (
                     Some(format!("{}: {}", error.code, error.message)),
                     driver,
                     Some(availability),
+                    wayland,
                 ),
                 None => (
                     Some(
@@ -32276,6 +32284,7 @@ impl VibexWorkbench {
                     ),
                     DriverState::Unknown,
                     None,
+                    None,
                 ),
             };
             let _ = entity.update(cx, |this, cx| {
@@ -32283,6 +32292,7 @@ impl VibexWorkbench {
                     driver,
                     availability,
                     note,
+                    wayland,
                     busy: false,
                 });
                 cx.notify();
@@ -32306,11 +32316,16 @@ impl VibexWorkbench {
             let Some(handle) = handle else {
                 return;
             };
-            let (driver, availability) = handle
+            let (driver, availability, wayland) = handle
                 .spawn(async move {
+                    // Check again means "look at the desktop now": the cached
+                    // Wayland measurement goes first, so a window opened since
+                    // the last look can change the answer.
+                    runtime.forget_wayland_detection().await;
                     let driver = runtime.detect_driver().await;
+                    let wayland = runtime.detect_wayland_windows().await;
                     let availability = runtime.availability().await;
-                    (driver, availability)
+                    (driver, availability, wayland)
                 })
                 .await
                 .unwrap_or((
@@ -32319,6 +32334,7 @@ impl VibexWorkbench {
                         ComputerUnavailableReason::EngineMissing,
                         Some("the runtime did not answer".to_string()),
                     ),
+                    None,
                 ));
             let note = match &driver {
                 DriverState::Installed { path, .. } => Some(format!(
@@ -32349,6 +32365,7 @@ impl VibexWorkbench {
                     driver,
                     availability: Some(availability),
                     note,
+                    wayland,
                     busy: false,
                 });
                 cx.notify();
@@ -32379,11 +32396,14 @@ impl VibexWorkbench {
             let Some(handle) = handle else {
                 return;
             };
-            let (driver, availability) = handle
+            let (driver, availability, wayland) = handle
                 .spawn(async move {
                     let driver = runtime.install_driver().await;
+                    // A fresh driver is a fresh look at the desktop.
+                    runtime.forget_wayland_detection().await;
+                    let wayland = runtime.detect_wayland_windows().await;
                     let availability = runtime.availability().await;
-                    (driver, availability)
+                    (driver, availability, wayland)
                 })
                 .await
                 .unwrap_or((
@@ -32392,6 +32412,7 @@ impl VibexWorkbench {
                         ComputerUnavailableReason::EngineMissing,
                         Some("the runtime did not answer".to_string()),
                     ),
+                    None,
                 ));
             let note = match &driver {
                 DriverState::Installed {
@@ -32436,6 +32457,7 @@ impl VibexWorkbench {
                     driver,
                     availability: Some(availability),
                     note,
+                    wayland,
                     busy: false,
                 });
                 cx.notify();
@@ -32468,6 +32490,17 @@ impl VibexWorkbench {
     fn set_computer_call_timeout(&mut self, timeout_ms: u64, cx: &mut Context<Self>) {
         self.ui_state.computer.call_timeout_ms = timeout_ms;
         self.ui_state.computer.normalize();
+        self.queue_ui_state();
+        self.apply_computer_settings(cx);
+    }
+
+    /// Stores the Wayland backend decision.
+    ///
+    /// `None` is the automatic answer: the runtime measures the session and
+    /// turns the experimental backend on exactly when it reveals native
+    /// Wayland windows the driver cannot otherwise see.
+    fn set_computer_wayland_opt_in(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        self.ui_state.computer.wayland_opt_in = value;
         self.queue_ui_state();
         self.apply_computer_settings(cx);
     }
@@ -66268,6 +66301,28 @@ impl FoundationSettings {
         );
 
         let mut platform_rows = vec![computer_platform_note(status.availability.as_ref())];
+        // The Wayland backend is a machine decision, so it stands with the
+        // platform's capabilities rather than with the feature's switches. It
+        // is only offered where it means something and where this window owns
+        // the runtime that would apply it.
+        let runtime_platform = status
+            .availability
+            .as_ref()
+            .map(|availability| availability.platform)
+            .unwrap_or_else(vibex_computer::driver::detect_platform);
+        if local && runtime_platform == vibex_core::ComputerPlatform::LinuxWayland {
+            // The environment outranks this row, so the row says so instead of
+            // claiming a decision it does not get to make.
+            let from_environment =
+                std::env::var_os(vibex_core::ComputerPlatform::wayland_opt_in_variable()).is_some();
+            platform_rows.push(computer_wayland_row(
+                status.wayland,
+                settings.wayland_opt_in,
+                from_environment,
+                stacked,
+                cx,
+            ));
+        }
         platform_rows.extend(
             computer_capability_rows(status.availability.as_ref())
                 .into_iter()
@@ -68383,6 +68438,11 @@ struct ComputerSettingsStatus {
     availability: Option<ComputerAvailability>,
     /// The last message from an install or a check, shown inline.
     note: Option<String>,
+    /// What this session's Wayland backend shows, when it is a Wayland session.
+    ///
+    /// The measurement is what the automatic opt-in acts on, so the page shows
+    /// the same number the runtime decided from instead of a bare switch.
+    wayland: Option<vibex_computer::driver::WaylandWindowDetection>,
     busy: bool,
 }
 
@@ -68392,6 +68452,7 @@ impl Default for ComputerSettingsStatus {
             driver: DriverState::Unknown,
             availability: None,
             note: None,
+            wayland: None,
             busy: false,
         }
     }
@@ -68849,6 +68910,127 @@ fn computer_capability_rows(
             supported: background || foreground,
         },
     ]
+}
+
+/// The Wayland backend row: what this session shows, and who decided.
+///
+/// Wayland has no portable protocol for driving an occluded window, and the
+/// driver's native window backend is experimental, so the decision is offered
+/// rather than hidden. The default is automatic — the runtime measures whether
+/// this session has native Wayland windows the driver cannot otherwise see —
+/// and a reader who wants to decide for themselves gets On and Off.
+fn computer_wayland_row(
+    measurement: Option<vibex_computer::driver::WaylandWindowDetection>,
+    choice: Option<bool>,
+    from_environment: bool,
+    stacked: bool,
+    cx: &mut Context<FoundationSettings>,
+) -> AnyElement {
+    let detail = if from_environment {
+        locale::text(
+            "Set by the environment (CUA_DRIVER_RS_ENABLE_WAYLAND), which outranks this row: the \
+             driver's experimental Wayland backend is on.",
+            "由环境变量 CUA_DRIVER_RS_ENABLE_WAYLAND 指定，优先级高于本行设置：驱动的实验性 Wayland 后端处于开启状态。",
+            "由環境變數 CUA_DRIVER_RS_ENABLE_WAYLAND 指定，優先級高於本列設定：驅動的實驗性 Wayland 後端處於開啟狀態。",
+        )
+        .to_string()
+    } else {
+        computer_wayland_detail(choice, measurement)
+    };
+    let options = vec![
+        settings_segmented_option(
+            locale::text("Automatic", "自动", "自動"),
+            choice.is_none(),
+            cx.listener(|this, _, _, cx| {
+                let _ = this.workbench.update(cx, |workbench, cx| {
+                    workbench.set_computer_wayland_opt_in(None, cx)
+                });
+            }),
+        ),
+        settings_segmented_option(
+            locale::text("On", "开", "開"),
+            choice == Some(true),
+            cx.listener(|this, _, _, cx| {
+                let _ = this.workbench.update(cx, |workbench, cx| {
+                    workbench.set_computer_wayland_opt_in(Some(true), cx)
+                });
+            }),
+        ),
+        settings_segmented_option(
+            locale::text("Off", "关", "關"),
+            choice == Some(false),
+            cx.listener(|this, _, _, cx| {
+                let _ = this.workbench.update(cx, |workbench, cx| {
+                    workbench.set_computer_wayland_opt_in(Some(false), cx)
+                });
+            }),
+        ),
+    ];
+    setting_row(
+        locale::text("Wayland windows", "Wayland 窗口", "Wayland 視窗"),
+        detail,
+        settings_segmented_control("computer-wayland-opt-in", options),
+        stacked,
+        cx,
+    )
+}
+
+/// What the Wayland row says about the current decision and measurement.
+fn computer_wayland_detail(
+    choice: Option<bool>,
+    measurement: Option<vibex_computer::driver::WaylandWindowDetection>,
+) -> String {
+    match (choice, measurement) {
+        (Some(false), _) => locale::text(
+            "Off for this machine: the driver will not see native Wayland windows.",
+            "已为本机关闭：驱动将看不到原生 Wayland 窗口。",
+            "已為本機關閉：驅動將看不到原生 Wayland 視窗。",
+        )
+        .to_string(),
+        (Some(true), _) => locale::text(
+            "On for this machine: the driver uses its experimental Wayland backend, whether or \
+             not a native Wayland window has been detected.",
+            "已为本机开启：无论是否检测到原生 Wayland 窗口，驱动都会使用实验性 Wayland 后端。",
+            "已為本機開啟：無論是否偵測到原生 Wayland 視窗，驅動都會使用實驗性 Wayland 後端。",
+        )
+        .to_string(),
+        (None, Some(measured)) if measured.wants_opt_in() => format!(
+            "{}{}{}",
+            locale::text(
+                "Native Wayland windows were detected: ",
+                "检测到原生 Wayland 窗口：",
+                "偵測到原生 Wayland 視窗：",
+            ),
+            measured.wayland_windows,
+            locale::text(
+                ". The driver only sees them with its experimental backend, so it was turned on \
+                 automatically.",
+                " 个。驱动只有通过实验性后端才能看到它们，因此已自动开启。",
+                " 個。驅動只有透過實驗性後端才能看到它們，因此已自動開啟。",
+            ),
+        ),
+        (None, Some(measured)) if !measured.backend_available => locale::text(
+            "This compositor does not advertise the native Wayland window protocol the driver \
+             needs; the driver reads X11 windows instead.",
+            "当前合成器没有提供驱动所需的原生 Wayland 窗口协议，驱动只能读取 X11 窗口。",
+            "目前合成器沒有提供驅動所需的原生 Wayland 視窗協定，驅動只能讀取 X11 視窗。",
+        )
+        .to_string(),
+        (None, Some(_)) => locale::text(
+            "No native Wayland windows were detected; the driver reads X11 windows. Automatic \
+             turns the backend on if that changes.",
+            "没有检测到原生 Wayland 窗口，驱动读取的是 X11 窗口。之后如果出现，自动模式会开启该后端。",
+            "沒有偵測到原生 Wayland 視窗，驅動讀取的是 X11 視窗。之後如果出現，自動模式會開啟該後端。",
+        )
+        .to_string(),
+        (None, None) => locale::text(
+            "Check the driver to measure this session. Automatic turns the backend on when it \
+             reveals native Wayland windows the driver cannot otherwise see.",
+            "检测驱动后会测量本会话。自动模式会在原生 Wayland 窗口只能靠该后端看到时开启它。",
+            "偵測驅動後會測量本工作階段。自動模式會在原生 Wayland 視窗只能靠該後端看到時開啟它。",
+        )
+        .to_string(),
+    }
 }
 
 /// One labeled section of a settings page.

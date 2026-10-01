@@ -392,6 +392,12 @@ mod tests {
     }
 
     async fn handler_with_host(decision: ComputerPermissionDecision) -> Arc<ComputerMcpHandler> {
+        handler_and_host(decision).await.0
+    }
+
+    async fn handler_and_host(
+        decision: ComputerPermissionDecision,
+    ) -> (Arc<ComputerMcpHandler>, Arc<ApprovalHost>) {
         let service = ComputerService::new(ComputerServiceConfig::new("/tmp/vibex-computer-mcp"));
         service.install_engine(Arc::new(FixtureEngine::default()));
         let host = Arc::new(ApprovalHost {
@@ -399,7 +405,10 @@ mod tests {
             asked: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
-        Arc::new(ComputerMcpHandler::new(service).with_host(host))
+        (
+            Arc::new(ComputerMcpHandler::new(service).with_host(host.clone())),
+            host,
+        )
     }
 
     fn session() -> ComputerMcpSession {
@@ -452,7 +461,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 9);
     }
 
     #[tokio::test]
@@ -607,5 +616,80 @@ mod tests {
         let mut output = Vec::new();
         write_stdio_message(&mut output, &json!({ "id": 3 })).unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "{\"id\":3}\n");
+    }
+
+    /// Whitespace is text: a space is a keystroke a model may send, and
+    /// answering "`text` is required" to one is a lie about what happened.
+    #[tokio::test]
+    async fn typing_a_space_is_not_a_missing_text_argument() {
+        let handler = handler_with_host(ComputerPermissionDecision::Approve).await;
+        let session = session();
+        let typed = handler
+            .handle_message(
+                &session,
+                json!({
+                    "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                    "params": {
+                        "name": "computer_type_text",
+                        "arguments": { "app": "com.example.notes", "text": " " }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let text = typed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("`text` is required"), "{text}");
+        // An actually empty argument is still refused.
+        let empty = handler
+            .handle_message(
+                &session,
+                json!({
+                    "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                    "params": {
+                        "name": "computer_type_text",
+                        "arguments": { "app": "com.example.notes", "text": "" }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty["result"]["isError"], true);
+    }
+
+    /// Starting an application is an approved action, not a free one, and the
+    /// denial is the human's answer rather than a failure to hide.
+    #[tokio::test]
+    async fn launching_an_application_goes_through_the_approval_card() {
+        let (handler, host) = handler_and_host(ComputerPermissionDecision::Approve).await;
+        let session = session();
+        let launch = json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": "computer_launch_app",
+                "arguments": { "app": "com.example.notes" }
+            }
+        });
+        let launched = handler
+            .handle_message(&session, launch.clone())
+            .await
+            .unwrap();
+        assert_eq!(launched["result"]["isError"], false);
+        let text = launched["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("started Notes"),
+            "the engine's own report reaches the model: {text}"
+        );
+        assert_eq!(
+            host.asked.lock().unwrap().as_slice(),
+            ["launch_app"],
+            "the launch class is what the human approved"
+        );
+
+        let (handler, host) = handler_and_host(ComputerPermissionDecision::Deny).await;
+        let denied = handler.handle_message(&session, launch).await.unwrap();
+        assert_eq!(denied["result"]["isError"], true);
+        let text = denied["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("computer_permission_denied"), "{text}");
+        assert_eq!(host.asked.lock().unwrap().as_slice(), ["launch_app"]);
     }
 }
