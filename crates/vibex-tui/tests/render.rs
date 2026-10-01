@@ -343,6 +343,16 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
     let desired = app.runtime_options.as_ref().unwrap().options[1]
         .selection
         .clone();
+    // The page shows this session, which is what the info line answers for:
+    // without a selected session the page is writing a new one and names the
+    // entry that creation would use.
+    app.agent.state.selected_session_id = app
+        .agent
+        .state
+        .active_session
+        .value
+        .as_ref()
+        .map(|session| session.id.clone());
     app.agent
         .state
         .runtime_selection
@@ -522,6 +532,45 @@ fn the_switcher_keeps_the_run_options_one_key_away_from_the_catalogue() {
     assert!(
         !screen.contains("claude-sonnet"),
         "the run-option view still lists the catalogue:\n{screen}"
+    );
+}
+
+#[test]
+fn the_switcher_names_the_session_a_choice_will_move() {
+    // The runtime key is global, so the surface it opens has to say what the
+    // choice applies to: on a session's own page it moves that session, and on a
+    // page showing no session — the list, or the page writing a new one — it is
+    // the Agent the *next* session will be created with. Nothing else may move,
+    // which is what keeps the two independent.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+    app.show_runtime_picker();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Runtime") && !screen.contains("Next session"),
+        "a session's own picker claims to be for another session:\n{screen}"
+    );
+
+    // The reader steps back to the list, where no session is shown: the same key
+    // now chooses for the session they are about to write.
+    app.overlay = None;
+    app.navigate_to(Page::Sessions);
+    app.show_runtime_picker();
+    // The picker opens on the page's own answer, not on the Agent of the
+    // session the list has open behind it.
+    assert!(
+        app.runtime_option_is_current(&app.runtime_options.as_ref().expect("catalogue").options[0]),
+        "the list's picker opened on the session behind it"
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Next session"),
+        "the list's picker does not say what the choice is for:\n{screen}"
     );
 }
 

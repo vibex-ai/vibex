@@ -514,6 +514,10 @@ strings! {
     runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },
     runtime_current => { "Current", "当前", "目前" },
     runtime_unavailable => { "Unavailable", "不可用", "無法使用" },
+    // Where a runtime choice lands when the page shows no session to move: it
+    // is the Agent the *next* session will be created with. Read as a caption
+    // ("Runtime · Next session") and as a toast ("Next session: Agent · model").
+    runtime_next_session => { "Next session", "下一个会话", "下一個工作階段" },
     // A creation is named by the Agent it will run on; until the catalogue has
     // arrived there is nothing to name, so the message waits.
     runtime_catalogue_reading => {

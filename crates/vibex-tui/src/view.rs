@@ -5027,8 +5027,21 @@ fn render_overlay(
                 .unwrap_or_default();
             let run_options = app.run_options();
             let show_choices = *view == crate::app::RuntimePickerView::Choices;
+            // The title names what the choice moves. A page showing no session —
+            // the list, or the page where a session is being written — has
+            // nothing to move, so the choice is the next session's, and saying
+            // so here is what keeps the reader from expecting the session
+            // behind the page to change.
+            let target = if app.page_shows_session() {
+                None
+            } else {
+                Some(strings.runtime_next_session())
+            };
             let title = if show_choices {
-                strings.runtime_title().to_string()
+                match target {
+                    Some(target) => format!("{} · {target}", strings.runtime_title()),
+                    None => strings.runtime_title().to_string(),
+                }
             } else {
                 format!(
                     "{} · {}",

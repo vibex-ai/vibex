@@ -609,8 +609,9 @@ is never a column count.
   switched the session the reader was leaving — failing with "selected Agent
   runtime configuration is unavailable" — while `new_session_runtime` stayed
   empty and the session was created on the catalogue's first entry. Decide by
-  the *page* (`page == Page::NewSession`), not by whether a session is
-  selected, and keep the choice on the page until `CreateSession` carries it.
+  the page that is *shown* (the picker-target rule below), not by whether a
+  session happens to be selected, and keep the choice on the page until
+  `CreateSession` carries it.
   The reading side is the same rule, or the page lies about what it will make:
   the Agent and model the page and the composer's info line name, the entry the
   picker opens on and marks as current, and the run options a view lists all
@@ -635,6 +636,28 @@ is never a column count.
   the reader presses `Enter` again once the Agent has a name. Only a backend
   that publishes no catalogue at all keeps the runtime's fallback, because there
   is nothing there for the page to name.
+* **A runtime choice moves the session the page is showing, and nothing else.**
+  `Ctrl+G` is a global key, so its *target* has to come from the page rather
+  than from "is a session selected?": the client keeps a session selected behind
+  the list and behind the composing page, and moving that unseen session is how
+  a codex session turned into the Agent the reader had picked for the session
+  they were about to write. `App::page_shows_session()` is the predicate — a
+  session page with a session selected — and `App::page_runtime_selection()` is
+  its reading side: a page that shows one answers with that session's durable
+  selection, and a page that shows none answers with the choice the page holds,
+  or the entry a creation with no choice falls back to. `apply_runtime_selection`
+  and `apply_run_option` follow it, so a choice made on the list or while writing
+  a new session becomes the *next* session's Agent (`runtime_next_session` says
+  so in the picker's title and in the toast) and the open session is untouched;
+  a choice made on a session's page switches only that session and is never
+  carried into the next session.
+* **A list key acts on the row the cursor is on.** The list shows rows, and the
+  session the client has open behind it is not always the one the reader pointed
+  at: rename, fork, archive and delete all resolve their target through
+  `App::list_session_target()`, and the prompt and the confirm re-read it — the
+  cursor cannot move while an overlay is up — so a key can never change a
+  session nobody selected. `Enter` already worked this way; a heading row owns no
+  session and the action is inert there.
 * **A new session is a page, not a dialog.** The reader who asks for one asked
   to write, so the gesture lands on a page that hands them the composer and
   names what the message will be sent through — Agent, model, workspace — with

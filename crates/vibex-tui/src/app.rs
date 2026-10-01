@@ -1264,6 +1264,22 @@ impl App {
         }
     }
 
+    /// Whether the page in front of the reader is *showing* a session.
+    ///
+    /// This is what a runtime choice moves, and what a run option tunes: the
+    /// picker is one global key, so its target has to be the session on screen
+    /// and never one the reader cannot see. The session list is the case that
+    /// bit: the client still had a session selected behind it, so a choice made
+    /// while looking at the list — or while writing a new session — moved that
+    /// unseen session. Deciding by the page keeps the two independent: a page
+    /// showing no session has nothing to move, so the choice is the *next*
+    /// session's, and a session's own page moves only itself.
+    pub fn page_shows_session(&self) -> bool {
+        self.page_owns_session()
+            && self.page.is_session_page()
+            && self.selected_session_id().is_some()
+    }
+
     /// Open the session view for a session that does not exist yet.
     ///
     /// The reader sent the first message and the runtime is still making the
@@ -1371,36 +1387,21 @@ impl App {
 
     /// The runtime selection this page's next message would go through.
     ///
-    /// The composing page answers with the choice it is holding — falling back
-    /// to the catalogue's first available entry, which is what
-    /// [`Effect::CreateSession`] uses when the page chose nothing — while an
-    /// open session answers with its own durable desired selection. A session
-    /// whose runtime has never been activated has no selection to read, so it
-    /// gets none rather than the catalogue's first entry, which would offer
-    /// another Agent's options over it.
+    /// A page that is showing a session answers with that session's own durable
+    /// desired selection — a choice made here moves *it*. A session whose
+    /// runtime has never been reported has no selection to read, so it gets
+    /// none rather than the catalogue's first entry, which would offer another
+    /// Agent's options over it.
     ///
-    /// The view that waits for a session being created has neither: the session
-    /// it comes from is gone and the new one has no snapshot yet. The choice
-    /// the page held is what that creation was made with, so it answers in the
-    /// gap — naming the catalogue's default there would name an Agent this
-    /// client is not using.
+    /// A page that shows no session — the list, the management pages, the page
+    /// where a session is being written, and the view that waits for one being
+    /// created — answers with the choice the page holds, falling back to the
+    /// entry a creation with no choice would use. Its picker is therefore
+    /// about the *next* session, and the session the client still has selected
+    /// behind it is not what the page names or moves.
     pub fn page_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
-        if self.page == Page::NewSession {
-            return self
-                .new_session_runtime
-                .clone()
-                .or_else(|| self.default_runtime_selection());
-        }
-        if let Some(selection) = self.session_runtime_selection() {
-            return Some(selection.clone());
-        }
-        // Nothing is selected to answer with. A session the client has selected
-        // but not loaded yet answers none, so the switcher cannot offer another
-        // Agent's options over it; a client with no session in front of it
-        // answers with the choice its page held, or with the entry a creation
-        // with no choice would use.
-        if self.selected_session_id().is_some() {
-            return None;
+        if self.page_shows_session() {
+            return self.session_runtime_selection().cloned();
         }
         self.new_session_runtime
             .clone()
@@ -1616,10 +1617,11 @@ impl App {
                     .unwrap_or_default(),
             );
         }
-        // Nothing is selected to read. An open session — or the row the list
-        // holds for it, while its runtime state is still arriving — still names
-        // its Agent, but only on that session's own page.
-        if self.page_owns_session()
+        // A page showing a session whose runtime state has not arrived yet — or
+        // the row the list holds for it — still names the Agent it records. No
+        // other page does: a page that shows no session names the entry a
+        // creation with no choice would use, never the one behind it.
+        if self.page_shows_session()
             && let Some(session) = self.active_session().or_else(|| {
                 self.selected_session_id()
                     .and_then(|session_id| self.session_by_id(session_id))
@@ -2164,6 +2166,18 @@ impl App {
         let open = self.session_cards.len();
         self.session_cards.clear();
         open
+    }
+
+    /// The session a key pressed on the session list acts on.
+    ///
+    /// The list shows rows and its cursor is on one of them, so rename, fork,
+    /// archive and delete answer for *that* row — never for the session the
+    /// client happens to have open behind the list. The reader may be looking
+    /// at a row that is not the one they are working in, and an action that
+    /// silently hit the other one is how a session got archived that nobody
+    /// pointed at.
+    pub fn list_session_target(&self) -> Option<VibexSessionId> {
+        self.selected_session_row_id()
     }
 
     /// The session the session-list selection points at, when it points at one.

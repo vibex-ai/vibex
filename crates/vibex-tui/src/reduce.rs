@@ -291,7 +291,10 @@ impl App {
             Intent::NewSession => self.begin_new_session(),
             Intent::BeginRenameSession => self.begin_rename_session(),
             Intent::ForkSession => {
-                let Some(session_id) = self.selected_session_id().cloned() else {
+                // The row the cursor is on, not the session the client has open
+                // behind the list: the list shows rows, so its keys act on the
+                // row they point at.
+                let Some(session_id) = self.list_session_target() else {
                     return Outcome::quiet();
                 };
                 let message = format!(
@@ -303,29 +306,27 @@ impl App {
                 Outcome::effects(vec![Effect::ForkSession { session_id }])
             }
             Intent::ArchiveSession => {
-                let Some(session_id) = self.selected_session_id().cloned() else {
+                if self.list_session_target().is_none() {
                     return Outcome::quiet();
-                };
+                }
                 self.overlay = Some(Overlay::Confirm {
                     title: self.strings.session_archive().to_string(),
                     body: self.strings.session_confirm_archive().to_string(),
                     confirm: Intent::ArchiveSession,
                 });
                 self.set_selection(Scope::Overlay, 0);
-                let _ = session_id;
                 Outcome::effects(vec![])
             }
             Intent::DeleteSession => {
-                let Some(session_id) = self.selected_session_id().cloned() else {
+                if self.list_session_target().is_none() {
                     return Outcome::quiet();
-                };
+                }
                 self.overlay = Some(Overlay::Confirm {
                     title: self.strings.session_delete().to_string(),
                     body: self.strings.session_confirm_delete().to_string(),
                     confirm: Intent::DeleteSession,
                 });
                 self.set_selection(Scope::Overlay, 0);
-                let _ = session_id;
                 Outcome::effects(vec![])
             }
             Intent::ToggleShowArchived => {
@@ -1520,13 +1521,13 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::DeleteSession => {
-                let Some(session_id) = self.selected_session_id().cloned() else {
+                let Some(session_id) = self.list_session_target() else {
                     return Outcome::quiet();
                 };
                 Outcome::effects(vec![Effect::DeleteSession { session_id }])
             }
             Intent::ArchiveSession => {
-                let Some(session_id) = self.selected_session_id().cloned() else {
+                let Some(session_id) = self.list_session_target() else {
                     return Outcome::quiet();
                 };
                 Outcome::effects(vec![Effect::ArchiveSession { session_id }])
@@ -1570,7 +1571,9 @@ impl App {
         let trimmed = value.trim().to_string();
         match field {
             PromptField::RenameSession => {
-                let Some(session_id) = self.selected_session_id().cloned() else {
+                // The prompt was opened on a list row, and the cursor cannot
+                // move while it is up: the row it pointed at is what is renamed.
+                let Some(session_id) = self.list_session_target() else {
                     return Outcome::quiet();
                 };
                 if trimmed.is_empty() {
@@ -2058,10 +2061,14 @@ impl App {
     }
 
     fn begin_rename_session(&mut self) -> Outcome {
-        let Some(session) = self.active_session() else {
+        // The row the cursor is on: the reader asked to rename the session they
+        // pointed at, which is not necessarily the one open behind the list.
+        let Some(session_id) = self.list_session_target() else {
             return Outcome::quiet();
         };
-        let title = session.title.clone();
+        let title = self
+            .session_title(&session_id)
+            .unwrap_or_else(|| self.strings.session_untitled().to_string());
         self.overlay = Some(Overlay::Prompt {
             title: self.strings.session_rename().to_string(),
             field: PromptField::RenameSession,
@@ -2495,12 +2502,13 @@ impl App {
                 }
             },
         }
-        // The composing page keeps the choice for the session it is about to
-        // create; an open session is moved with a compare-and-set switch, which
-        // is the same path a runtime change takes. The page is asked first:
-        // while it is up, the session behind it is not what the reader is
-        // tuning.
-        if self.page_is_composing() {
+        // A page that shows a session moves *that* session with a
+        // compare-and-set switch, which is the same path a runtime change
+        // takes. A page that shows none — the list, the management pages, the
+        // page where a session is being written — has nothing to move: the
+        // choice belongs to the next session, and the session the client still
+        // has selected behind it is not the reader's target.
+        if !self.page_shows_session() {
             self.new_session_runtime = Some(next);
             let value = self.run_option_value_label(&option, value.as_deref());
             self.toast(Toast::success(format!("{}: {value}", option.label)));
@@ -2539,15 +2547,17 @@ impl App {
             self.toast(Toast::warning(message));
             return Outcome::quiet();
         }
-        // The composing page is answered first, and by the *page* rather than by
-        // whether a session happens to be selected: the reader is writing a new
-        // session, so the choice belongs to the one about to be created — not to
-        // the session behind the page, which the reader is leaving.
-        if self.page == Page::NewSession || self.selected_session_id().is_none() {
+        // A page that shows a session moves *that* session; a page that shows
+        // none — the session list, the management pages, the page where a
+        // session is being written — has nothing to move, so the choice belongs
+        // to the next session. The page decides, never "is a session selected?",
+        // because the client keeps a session selected behind every one of those
+        // pages and moving it is exactly what the reader did not ask for.
+        if !self.page_shows_session() {
             self.new_session_runtime = Some(option.selection.clone());
             let message = format!(
                 "{}: {} · {}",
-                self.strings.session_runtime_label(),
+                self.strings.runtime_next_session(),
                 option.agent_label,
                 option.model_label
             );
@@ -3260,6 +3270,9 @@ mod tests {
     fn the_switcher_reads_the_catalogue_then_opens_on_the_current_choice() {
         let mut app = capable_app();
         app.live = crate::app::LiveState::Ready;
+        // The reader is *in* a session: the picker moves the session its page
+        // shows, so the choice it opens on is that session's.
+        app.agent.state.selected_session_id = Some(VibexSessionId::new());
         app.navigate_to(Page::Agent);
         assert!(app.runtime_options.is_none());
 
@@ -3365,6 +3378,9 @@ mod tests {
         app.live = crate::app::LiveState::Ready;
         let session_id = VibexSessionId::new();
         app.agent.state.selected_session_id = Some(session_id.clone());
+        // The reader is on that session's own page: the picker moves what the
+        // page shows, so this is the page it opens on.
+        app.navigate_to(Page::Agent);
         app.runtime_options = Some(runtime_catalog());
         // The session is on the *second* entry, which is also unavailable: the
         // picker must still start there and say so rather than silently
@@ -3965,6 +3981,174 @@ mod tests {
             .expect("the page named a runtime and created with none");
         assert_eq!(created.agent_id, agent_id);
         assert_eq!(created.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_choice_made_away_from_a_session_does_not_move_one() {
+        // The runtime picker is one global key, so what it moves has to be the
+        // session the page is *showing* — never one the reader cannot see. A
+        // choice made from the session list is a choice for the next session;
+        // the session the client still has selected is left alone. This is the
+        // one that used to turn an existing codex session into the Agent the
+        // reader picked for the session they were about to write.
+        let mut app = capable_app();
+        let catalog = run_option_catalog();
+        let claude = catalog.options[0].selection.clone();
+        let codex = catalog.options[1].selection.clone();
+        app.runtime_options = Some(catalog);
+        app.new_session_runtime = None;
+        session_on(&mut app, claude.clone());
+        app.navigate_to(Page::Sessions);
+
+        // The picker opens on the page's own answer rather than on the Agent of
+        // the session it does not show.
+        app.show_runtime_picker();
+        assert_eq!(app.current_runtime_option_index(), Some(0));
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: 1,
+        });
+        let chosen = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            switched(&chosen).is_none(),
+            "a choice made off a session moved one: {chosen:?}"
+        );
+        assert!(
+            chosen.effects.is_empty(),
+            "a choice made off a session issued work: {chosen:?}"
+        );
+        assert_eq!(
+            app.new_session_runtime
+                .as_ref()
+                .map(|selection| selection.agent_id.clone()),
+            Some(codex.agent_id.clone()),
+            "the choice did not become the next session's"
+        );
+        assert_eq!(
+            app.session_runtime_selection()
+                .map(|selection| selection.agent_id.clone()),
+            Some(claude.agent_id),
+            "the session behind the page was moved"
+        );
+
+        // A run option is the same choice seen from the other side: off a
+        // session it tunes the next session's Agent, not that session's.
+        let tuned = app.apply_run_option(&RunOptionKey::ReasoningEffort, Some("high".to_string()));
+        assert!(
+            switched(&tuned).is_none(),
+            "a run option off a session moved one: {tuned:?}"
+        );
+        assert_eq!(
+            app.new_session_runtime
+                .as_ref()
+                .and_then(|selection| selection.reasoning_effort.as_deref()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn a_list_key_acts_on_the_row_the_cursor_is_on() {
+        // The list shows rows, and the session the client has open behind it is
+        // not always the one the reader pointed at. Archive, delete, fork and
+        // rename answer for the row under the cursor, so a list key can never
+        // change a session nobody selected.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        let open = openable_session("session_row0000001");
+        let mut other = openable_session("session_row0000002");
+        other.title = "the other session".to_string();
+        app.agent
+            .apply_sessions(Ok(vec![open.clone(), other.clone()]))
+            .expect("sessions apply");
+        app.navigate_to(Page::Sessions);
+        // The open session is one row; the cursor is on the other.
+        app.agent.state.selected_session_id = Some(open.id.clone());
+        app.agent.state.active_session.resolve(open.clone());
+        let cursor = app
+            .sidebar_rows()
+            .iter()
+            .position(|row| row.session_id.as_ref() == Some(&other.id))
+            .expect("the other session has a row");
+        app.set_selection(Scope::Sessions, cursor);
+
+        let forked = app.perform(Intent::ForkSession);
+        let [Effect::ForkSession { session_id }] = forked.effects.as_slice() else {
+            panic!("expected one fork, got {forked:?}");
+        };
+        assert_eq!(
+            session_id, &other.id,
+            "the fork took the session behind the list"
+        );
+
+        app.perform(Intent::ArchiveSession);
+        let archived = app.perform(Intent::ConfirmOverlay);
+        let [Effect::ArchiveSession { session_id }] = archived.effects.as_slice() else {
+            panic!("expected one archive, got {archived:?}");
+        };
+        assert_eq!(
+            session_id, &other.id,
+            "the archive took the session behind the list"
+        );
+
+        app.perform(Intent::BeginRenameSession);
+        let Some(Overlay::Prompt { value, .. }) = app.overlay.clone() else {
+            panic!("the rename prompt did not open: {:?}", app.overlay);
+        };
+        assert_eq!(value, "the other session");
+        assert_eq!(
+            app.selected_session_id(),
+            Some(&open.id),
+            "the list key moved the reader's session"
+        );
+    }
+
+    #[test]
+    fn a_choice_on_a_session_moves_only_that_session() {
+        // And the other direction: a choice made on a session's own page moves
+        // that session and nothing else. It is not carried into the page where
+        // the next session is written, which answers with its own choice — so
+        // the two can never inherit each other's Agent.
+        let mut app = capable_app();
+        let catalog = run_option_catalog();
+        let claude = catalog.options[0].selection.clone();
+        let codex = catalog.options[1].selection.clone();
+        app.runtime_options = Some(catalog);
+        app.new_session_runtime = None;
+        session_on(&mut app, claude.clone());
+        let session_id = app.selected_session_id().cloned().expect("a session");
+        app.navigate_to(Page::Agent);
+
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: 1,
+        });
+        let chosen = app.perform(Intent::ConfirmOverlay);
+        let [
+            Effect::SwitchRuntime {
+                session_id: target,
+                selection,
+            },
+        ] = chosen.effects.as_slice()
+        else {
+            panic!("expected one runtime switch, got {chosen:?}");
+        };
+        assert_eq!(target, &session_id);
+        assert_eq!(selection.agent_id, codex.agent_id);
+        assert!(
+            app.new_session_runtime.is_none(),
+            "the session's move became the next session's choice"
+        );
+
+        // The page where the next session is written answers with the
+        // catalogue's own entry, never with the Agent the open session moved to.
+        app.perform(Intent::NewSession);
+        assert_eq!(app.composer_runtime_labels().0, "claude");
+        assert_eq!(
+            app.page_runtime_selection()
+                .map(|selection| selection.agent_id),
+            Some(claude.agent_id),
+            "the writing page inherited the session's choice"
+        );
     }
 
     #[test]
