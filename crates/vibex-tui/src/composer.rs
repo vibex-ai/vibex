@@ -2024,6 +2024,22 @@ mod tests {
     }
 
     #[test]
+    fn typing_a_space_moves_the_caret_and_the_space_lands() {
+        // Regression: a row that ended at the last word dropped the space the
+        // reader had just typed, so the caret did not move and nothing appeared
+        // until the next word arrived.
+        let mut draft = buffer("hello");
+        draft.move_to_end();
+        assert_eq!(draft.cursor_cell(80).1, 5);
+        draft.insert_char(' ');
+        assert_eq!(draft.cursor_cell(80).1, 6, "the caret follows the space");
+        assert_eq!(draft.display_lines(80)[0].0, "hello ");
+        draft.insert_char('x');
+        assert_eq!(draft.cursor_cell(80).1, 7);
+        assert_eq!(draft.display_lines(80)[0].0, "hello x");
+    }
+
+    #[test]
     fn a_caret_after_a_collapsed_space_run_does_not_panic() {
         // Regression: the composer wrapped with `wrap_text`, whose lines are
         // rendered text rather than source slices. A run of spaces before an

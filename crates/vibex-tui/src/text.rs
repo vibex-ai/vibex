@@ -301,10 +301,15 @@ fn wrap_source_paragraph(
     }
 
     if started {
+        // The rest of the paragraph is the whitespace the tokenizer consumed
+        // after the last word, and it belongs to this row. Nothing draws it, but
+        // the caret after it does: a row that stopped at the last word would
+        // leave a reader who just typed a space with a caret that has not moved
+        // and no space on screen until the next word arrives.
         lines.push(source_line(
             source,
             line_start,
-            line_end,
+            paragraph_offset + paragraph.len(),
             LineJoiner::Newline,
         ));
     }
@@ -767,6 +772,31 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[1].text, "   ");
         assert_eq!(lines[1].source_start, 2);
+    }
+
+    #[test]
+    fn a_trailing_space_stays_on_the_row_it_was_typed_on() {
+        // Regression: the row ended at the last word, so a draft that ended in a
+        // space painted nothing and its caret stayed one column short.
+        let lines = wrap_source_text("hello ", 20);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "hello ");
+        assert_eq!(lines[0].source_start, 0);
+        // Every row is still the slice it claims to be, trailing space included.
+        let source = "hello ";
+        assert_eq!(
+            &source[lines[0].source_start..lines[0].source_start + lines[0].text.len()],
+            "hello "
+        );
+        // The wrap of a longer paragraph keeps its own trailing space as well.
+        let lines = wrap_source_text("alpha beta ", 6);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "alpha ");
+        assert_eq!(lines[1].text, "beta ");
+        // A draft of nothing but spaces was already a row of its own.
+        let lines = wrap_source_text("   ", 8);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "   ");
     }
 
     #[test]

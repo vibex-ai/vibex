@@ -3623,3 +3623,41 @@ fn a_held_message_is_released_while_the_reader_is_elsewhere() {
     assert!(app.drain_queue().is_empty());
     assert_eq!(queued_texts(&app), vec!["second".to_string()]);
 }
+
+#[test]
+fn a_typed_space_moves_the_caret_with_it() {
+    // The caret is the reader's only feedback about where the next character
+    // lands, and a space is the one character that draws nothing. When the row
+    // stopped at the last *word*, typing a space left the caret where it was
+    // and the space invisible until the next word arrived.
+    let mut app = app(100, 30);
+    app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_space0001");
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.insert_str("hello");
+    assert_eq!(app.composer.cursor_cell(60).1, 5);
+
+    for (after, column) in [(' ', 6), (' ', 7), ('x', 8)] {
+        app.composer.insert_char(after);
+        assert_eq!(
+            app.composer.cursor_cell(60).1,
+            column,
+            "the caret did not follow {after:?}"
+        );
+    }
+    // And the row the frame paints carries the spaces, so the caret is drawn
+    // past them rather than on top of the last letter.
+    let row = &app.composer.display_lines(60)[0].0;
+    assert_eq!(row, "hello  x");
+
+    // A draft that is nothing but spaces is still a row for the caret to sit on.
+    app.composer.set_text("   ");
+    app.composer.move_to_end();
+    assert_eq!(app.composer.cursor_cell(60).1, 3);
+
+    // The frame still draws, and the terminal cursor is asked for the right
+    // cell: this is the reader-visible half of the same claim.
+    let _ = render(&mut app, 100, 30);
+    let (row, column) = app.composer.cursor_cell(60);
+    assert_eq!((row, column), (0, 3), "{:?}", app.regions.composer);
+}
