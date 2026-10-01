@@ -493,6 +493,15 @@ is never a column count.
   to see or act on here. `session_is_running` consults the open session first
   and the session list second: the sessions the reader is *not* looking at are
   exactly the case the queue has to get right.
+* **Sending from the composing page lands in the session view at once.** The
+  session it is sent into does not exist for a round trip, so the message is
+  projected with no session id (`PendingSend.session_id: None`), the view is
+  emptied of the session the reader came from (`enter_creating_session` clears
+  the selection, the active session and the timeline model), and the page
+  becomes the session view — otherwise the reader watches a logo and concludes
+  nothing happened. The projection is drawn while no session is open, is
+  stamped with the id when the runtime answers, and a failed creation withdraws
+  it and puts the draft back on the page.
 * **A page answers for itself before the session behind it does.** The
   composing page keeps the client's session *selected* (leaving it must return
   there), so anything that asks "which session?" answers wrongly on that page.

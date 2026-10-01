@@ -2731,7 +2731,7 @@ fn render_composer_info(
     // Model identity: the session's own, or — on the page where a session is
     // being written — the one the new message would be sent through, because
     // choosing it is what that page is for.
-    if app.page == Page::NewSession && app.active_session().is_none() {
+    if app.active_session().is_none() {
         let (agent, model) = app.composer_runtime_labels();
         line.push(Span::styled(
             agent,

@@ -409,7 +409,10 @@ pub struct QueuedMessage {
 /// becomes shows up, and it counts as a running turn in the meantime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingSend {
-    pub session_id: VibexSessionId,
+    /// The session it was sent to, absent while that session is still being
+    /// created: the reader pressed Enter on the page that *asks* for one, and
+    /// the message has to be on screen before the runtime has answered.
+    pub session_id: Option<VibexSessionId>,
     /// Distinguishes this send's projected row from the next one's. The row has
     /// to keep one identity across frames — the transcript diffs by id, and the
     /// scroll anchor holds one — so it cannot be derived from the clock.
@@ -438,7 +441,14 @@ impl PendingSend {
     /// that is replaced by a different-looking one a moment later.
     fn row(&self) -> TimelineRow {
         TimelineRow {
-            id: format!("pending-send:{}:{}", self.session_id, self.serial),
+            id: format!(
+                "pending-send:{}:{}",
+                self.session_id
+                    .as_ref()
+                    .map(VibexSessionId::as_str)
+                    .unwrap_or("new"),
+                self.serial
+            ),
             kind: vibex_desktop_model::TimelineRowKind::UserMessage,
             item_ids: Vec::new(),
             turn_id: None,
@@ -1059,6 +1069,27 @@ impl App {
         self.agent.state.active_session.value.as_ref()
     }
 
+    /// Open the session view for a session that does not exist yet.
+    ///
+    /// The reader sent the first message and the runtime is still making the
+    /// session it belongs to. They are moved into the session view at once —
+    /// waiting on the page reads as nothing having happened — and the view is
+    /// emptied of the session they came from, because what is about to appear
+    /// there is a new one. The message itself is projected into it until the
+    /// runtime's own copy arrives.
+    pub fn enter_creating_session(&mut self) {
+        if self.agent.state.selected_session_id.take().is_some() {
+            self.agent.state.active_session.clear();
+            self.agent.state.timeline = vibex_desktop_model::TimelineModel::default();
+            self.agent.state.timeline_has_older = false;
+        }
+        self.transcript.set_blocks(Vec::new());
+        self.scroll = ScrollState::default();
+        self.page = Page::Agent;
+        self.focus = Focus::Composer;
+        self.workspace_path = None;
+    }
+
     /// The runtime selection the open session is on: its Agent, the account or
     /// provider profile that authenticates it, and the model.
     ///
@@ -1094,7 +1125,7 @@ impl App {
         // On the page where a session is being written, the row that is current
         // is the one the reader chose for it — not the one the session behind
         // the page is running on.
-        if self.page == Page::NewSession
+        if (self.page == Page::NewSession || self.active_session().is_none())
             && let Some(chosen) = self.new_session_runtime.as_ref()
         {
             return catalog
@@ -2020,6 +2051,9 @@ impl App {
             return None;
         }
         let attachments = self.wire_attachments(&outgoing.images);
+        if let Some(pending) = self.pending_send.as_mut() {
+            pending.session_id = Some(session_id.clone());
+        }
         Some(Effect::SendMessage {
             session_id,
             text: outgoing.text,
@@ -2332,11 +2366,16 @@ impl App {
     }
 
     /// The unconfirmed send for the open session, if there is one.
+    ///
+    /// A send whose session is still being created belongs to the reader as
+    /// well: they are looking at the page the session will open on, and the
+    /// message they just wrote is the only thing on it.
     pub fn pending_send_for_active(&self) -> Option<&PendingSend> {
-        let session_id = self.selected_session_id()?;
-        self.pending_send
-            .as_ref()
-            .filter(|pending| &pending.session_id == session_id)
+        let pending = self.pending_send.as_ref()?;
+        match pending.session_id.as_ref() {
+            None => Some(pending),
+            Some(session_id) => (self.selected_session_id() == Some(session_id)).then_some(pending),
+        }
     }
 
     /// Forget a send the runtime has echoed, or one that has waited too long.
@@ -2356,6 +2395,11 @@ impl App {
         // the session keeps the projection until the timeout — it is not drawn
         // anywhere else, and the timeline is refetched when they come back, so
         // it settles then rather than showing a phantom row in another session.
+        // A send whose session does not exist yet has no timeline to appear in;
+        // the timeout is what settles it if the creation never answers.
+        if pending.session_id.is_none() {
+            return false;
+        }
         let confirmed = pending.is_confirmed_by(&self.agent.state.timeline.items);
         if confirmed {
             self.pending_send = None;
@@ -2376,13 +2420,13 @@ impl App {
     /// Record a message that has been dispatched but not yet echoed.
     pub fn mark_send_dispatched(
         &mut self,
-        session_id: &VibexSessionId,
+        session_id: Option<&VibexSessionId>,
         text: String,
         attachments: Vec<vibex_core::MessageAttachment>,
     ) {
         self.pending_send_serial = self.pending_send_serial.wrapping_add(1);
         self.pending_send = Some(PendingSend {
-            session_id: session_id.clone(),
+            session_id: session_id.cloned(),
             serial: self.pending_send_serial,
             text,
             attachments,
@@ -2627,7 +2671,8 @@ impl App {
         if self
             .pending_send
             .as_ref()
-            .is_some_and(|pending| &pending.session_id == session_id)
+            .and_then(|pending| pending.session_id.as_ref())
+            .is_some_and(|pending| pending == session_id)
         {
             return true;
         }

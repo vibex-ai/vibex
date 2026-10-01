@@ -1804,7 +1804,20 @@ impl App {
                     .map(|workspace| workspace.workspace.root_path.clone())
             })
             .unwrap_or_default();
-        self.pending_new_session = Some(outgoing);
+        self.pending_new_session = Some(outgoing.clone());
+        // The reader leaves the page with the message: the session view is
+        // where it will be answered, so waiting on the page for the runtime to
+        // create one reads as nothing having happened at all. The message is
+        // projected there — the session id arrives with the runtime's answer,
+        // and the send follows it.
+        // The wire form is what the runtime will echo back, so it is what the
+        // projection is confirmed against; writing the same bytes twice is a
+        // no-op, and the send itself re-derives it when the session exists.
+        let projected = self.wire_attachments(&outgoing.images);
+        // The view is emptied *before* the message is projected into it, or the
+        // projection is what gets cleared.
+        self.enter_creating_session();
+        self.mark_send_dispatched(None, outgoing.text, projected);
         Outcome::effects(vec![Effect::CreateSession {
             workspace_root,
             title: None,
@@ -1960,7 +1973,7 @@ impl App {
         // The runtime owns the timeline, so its copy of this message is a round
         // trip away. Until it lands the send is projected locally — a reader who
         // pressed Enter must not be left wondering whether it worked.
-        self.mark_send_dispatched(&session_id, text.clone(), attachments.clone());
+        self.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
         Outcome::effects(vec![Effect::SendMessage {
             session_id,
             text,
@@ -2111,7 +2124,7 @@ impl App {
         // whether a session happens to be selected: the reader is writing a new
         // session, so the choice belongs to the one about to be created — not to
         // the session behind the page, which the reader is leaving.
-        if self.page == Page::NewSession {
+        if self.page == Page::NewSession || self.selected_session_id().is_none() {
             self.new_session_runtime = Some(option.selection.clone());
             let message = format!(
                 "{}: {} · {}",

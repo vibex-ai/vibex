@@ -4016,3 +4016,174 @@ fn the_runtime_chosen_on_the_new_session_page_is_not_the_old_sessions() {
         vibex_core::AgentId::parse("deepseek").unwrap()
     );
 }
+
+#[test]
+fn sending_from_the_new_session_page_lands_in_the_session() {
+    // The page asked for a session and the runtime takes a moment to make one.
+    // Waiting on the page for that answer reads as nothing having happened at
+    // all — the reader sent a message and watched a logo — so the send moves
+    // them into the session view, with the message already on its timeline.
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let old = seeded_session("session_landing0001", "the session behind the page");
+    app.agent
+        .apply_sessions(Ok(vec![old.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(old.id.clone());
+    app.agent.state.active_session.resolve(old);
+
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("what is this project?");
+    app.perform(Intent::SubmitComposer);
+
+    // Straight into the session view, with the message on the timeline and the
+    // turn reading as running — the session itself is still being created.
+    assert_eq!(app.page, vibex_tui::app::Page::Agent);
+    assert!(
+        app.pending_send
+            .as_ref()
+            .is_some_and(|pending| pending.session_id.is_none()),
+        "the message is not projected while the session is created"
+    );
+    assert!(
+        app.turn_reads_running(),
+        "the turn does not read as running"
+    );
+    assert!(app.is_animating(), "nothing is turning");
+    // The session the reader came from is not on screen: what is about to
+    // appear here is a new one, and its history is not this session's.
+    assert!(
+        app.selected_session_id().is_none(),
+        "a session is still selected"
+    );
+    assert!(app.active_session().is_none());
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(
+        screen.contains("what is this project?"),
+        "the message is not on the timeline:\n{screen}"
+    );
+    assert!(
+        !screen.contains("the session behind the page"),
+        "the old session's view is still on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("New session") && !screen.contains("新建会话"),
+        "the composing page is still on screen:\n{screen}"
+    );
+    // The composer's own line names the runtime the session will be created
+    // with, so the reader can see it took their choice.
+    assert!(
+        screen.contains("Runtime") || screen.contains("Ctrl+G"),
+        "{screen}"
+    );
+
+    // The runtime answers: the session opens, the message is sent into it, and
+    // the projection moves to the session it belongs to.
+    let created = seeded_session("session_landing0002", "what is this project?");
+    let effect = app
+        .pending_send_effect(created.id.clone())
+        .expect("the held message is sent");
+    match effect {
+        vibex_tui::Effect::SendMessage {
+            session_id, text, ..
+        } => {
+            assert_eq!(session_id, created.id);
+            assert_eq!(text, "what is this project?");
+        }
+        other => panic!("unexpected effect: {other:?}"),
+    }
+    app.open_session(created.id.clone());
+    app.agent
+        .apply_sessions(Ok(vec![created.clone()]))
+        .expect("sessions apply");
+    app.agent.state.active_session.resolve(created.clone());
+    assert!(
+        app.pending_send
+            .as_ref()
+            .is_some_and(|pending| pending.session_id.as_ref() == Some(&created.id)),
+        "the projection did not follow the session it was sent to"
+    );
+    app.sync_transcript();
+    let screen = text(&render(&mut app, 110, 30));
+    assert_eq!(
+        screen.matches("what is this project?").count(),
+        1,
+        "the message is not drawn exactly once:\n{screen}"
+    );
+}
+
+#[test]
+fn a_new_session_that_could_not_be_created_goes_back_to_its_page() {
+    // The other half of landing in the session: if the runtime never makes the
+    // session, the reader is put back where the message can be sent again —
+    // with the words still in the box, and no phantom session view.
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("this one will not be created");
+    app.perform(Intent::SubmitComposer);
+    assert_eq!(app.page, vibex_tui::app::Page::Agent);
+
+    // What `AppMessage::SessionCreated(Err(..))` does: withdraw the projection,
+    // put the draft back, and return to the page.
+    app.abandon_pending_send();
+    app.restore_pending_new_session();
+    app.page = vibex_tui::app::Page::NewSession;
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.sync_transcript();
+    assert_eq!(app.composer.text(), "this one will not be created");
+    assert!(app.pending_send.is_none());
+    assert!(!app.turn_reads_running());
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(screen.contains("New session"), "{screen}");
+}
+
+#[test]
+fn the_creating_session_view_waits_for_its_session() {
+    // The landing has to survive the round trip: the view names the runtime the
+    // session is being made with, the turn reads as running, the message is on
+    // screen — and an `Esc` there does not walk the reader into another
+    // session's view, which does not exist yet.
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![vibex_core::SessionRuntimeOption {
+            selection: vibex_core::SessionRuntimeSelection::provider(
+                vibex_core::AgentId::parse("deepseek").expect("agent id"),
+                vibex_core::ProviderProfileId::new(),
+                "deepseek-v4.1-flash",
+            ),
+            agent_label: "DeepSeek Harness".to_string(),
+            auth_source_label: "bai".to_string(),
+            model_label: "deepseek-v4.1-flash".to_string(),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+        }],
+    });
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("first message");
+    app.perform(Intent::SubmitComposer);
+
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(screen.contains("first message"), "{screen}");
+    assert!(
+        screen.contains("DeepSeek Harness"),
+        "the runtime being used is not named:\\n{screen}"
+    );
+    assert!(
+        screen.contains(app.strings.running()) || screen.contains("ctrl"),
+        "the view does not read as working:\\n{screen}"
+    );
+    // Nothing about a session that does not exist yet is selectable state: the
+    // view is the new session's, and only its own message is in it.
+    assert!(app.active_session().is_none());
+    assert_eq!(app.transcript.len(), 1);
+}

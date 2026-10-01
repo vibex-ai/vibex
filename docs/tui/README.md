@@ -400,7 +400,13 @@ for the directory). The draft's own vocabulary is spelled out there too, because
 this is the one screen where a reader has nothing else to read.
 
 The session is created by *sending*, not by answering a dialog: the title comes
-from the message, which is where a title comes from anyway. A runtime chosen on
+from the message, which is where a title comes from anyway. Sending leaves the
+page at once — waiting there for the runtime to make the session reads as
+nothing having happened — so the reader lands in the session view with their
+message already on its timeline and the turn already running. The view is
+emptied of the session they came from first: it is a *new* session they are
+about to be in, and its history is not the old one's. If the creation fails, the
+draft goes back into the composer and the reader goes back to the page. A runtime chosen on
 the page is the one the session is born with — created with it, rather than
 moved to it afterwards — and `Esc` leaves the page with the words still in the
 box, so the gesture is repeatable.

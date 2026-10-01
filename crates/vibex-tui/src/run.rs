@@ -213,7 +213,7 @@ fn event_loop(
             // A released message is projected exactly like a typed one: it was
             // written for this session a while ago, and it should appear the
             // moment it goes out rather than a round trip later.
-            app.mark_send_dispatched(&session_id, text.clone(), attachments.clone());
+            app.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
             worker.dispatch(crate::app::Effect::SendMessage {
                 session_id,
                 text,
@@ -1316,9 +1316,15 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
             Err(error) => {
-                // The draft is kept rather than sent nowhere: the reader can ask
-                // for the session again with the words still in the box.
+                // The draft is kept rather than sent nowhere, and the reader is
+                // put back on the page that asked for the session: it is where
+                // the runtime (and the workspace) can be looked at before
+                // trying again.
+                app.abandon_pending_send();
                 app.restore_pending_new_session();
+                app.page = crate::app::Page::NewSession;
+                app.focus = crate::app::Focus::Composer;
+                app.sync_transcript();
                 app.toast(Toast::danger(error.message));
             }
         },
