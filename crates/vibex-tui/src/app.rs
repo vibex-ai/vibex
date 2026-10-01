@@ -649,6 +649,18 @@ pub struct FrameRegions {
     pub hints: Vec<(ratatui::layout::Rect, crate::action::Intent)>,
 }
 
+impl FrameRegions {
+    /// Start a frame: the row-per-something lists are rewritten, not extended.
+    ///
+    /// A rect describes where something was when the frame drew it. Keeping the
+    /// previous frame's rects would let a click land on a row that has moved or
+    /// gone, and the lists would grow with every frame the reader leaves open.
+    pub fn begin_frame(&mut self) {
+        self.turns.clear();
+        self.hints.clear();
+    }
+}
+
 /// A clickable list drawn by a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListRegion {
@@ -1624,8 +1636,18 @@ impl App {
     ///
     /// The wheel and the keyboard share this, so neither can walk the viewport
     /// past the end of the session.
+    ///
+    /// The step starts from where the frame actually is, not from the state's
+    /// offset: while the viewport is following the tail, the offset it was last
+    /// dragged to is not the offset being drawn, and stepping from it threw the
+    /// reader to the top of the session — a different turn — on the first
+    /// scroll after opening it.
     pub fn scroll_lines(&mut self, delta: i64) {
-        let current = self.scroll.offset as i64;
+        let current = if self.scroll.follow {
+            self.transcript.scroll_offset()
+        } else {
+            self.scroll.offset
+        } as i64;
         self.scroll.offset = (current + delta).max(0) as usize;
         let bottom = self.transcript.bottom_offset(
             self.transcript_band_rows.max(1),
@@ -1640,26 +1662,6 @@ impl App {
         } else {
             self.scroll.follow = false;
         }
-    }
-
-    /// The vertical scrollbar thumb, as a (start, length) pair in rows.
-    pub fn scroll_thumb(&mut self, rows: usize) -> (usize, usize) {
-        let total = self.transcript.total_height();
-        if total <= rows || rows == 0 {
-            return (0, rows);
-        }
-        let viewport = self.transcript_band_rows.max(1);
-        let bottom = self
-            .transcript
-            .bottom_offset(viewport, &self.theme, self.strings);
-        let offset = if self.scroll.follow {
-            bottom
-        } else {
-            self.scroll.offset.min(bottom)
-        };
-        let length = (rows * rows / total.max(1)).max(1);
-        let start = (offset * rows / total.max(1)).min(rows.saturating_sub(length));
-        (start, length)
     }
 
     /// Whether the transcript has a running block worth animating.

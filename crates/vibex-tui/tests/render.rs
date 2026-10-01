@@ -579,16 +579,20 @@ fn a_session_with_turns_gets_a_turn_rail_in_the_gutter() {
 }
 
 #[test]
-fn one_turn_falls_back_to_a_scrollbar() {
+fn a_single_turn_draws_one_tick() {
+    // The rail counts turns. Falling back to a scrollbar in the same columns
+    // made a one-turn session show a mark that stood for nothing the reader
+    // could name — and a long one, a thumb they read as a turn.
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
     app.transcript
         .set_blocks(vec![block("a", "turn-1"), block("b", "turn-1")]);
     let lines = render(&mut app, 120, 40);
-    let has_rail = lines
+    let ticks = lines
         .iter()
-        .any(|line| line.trim_end().ends_with('•') || line.trim_end().ends_with('▪'));
-    assert!(!has_rail, "a single turn drew a navigation rail");
+        .filter(|line| line.trim_end().ends_with('•') || line.trim_end().ends_with('▪'))
+        .count();
+    assert_eq!(ticks, 1, "a single turn is not one tick:\n{}", text(&lines));
 }
 
 fn block(id: &str, turn: &str) -> vibex_tui::transcript::Block {
@@ -2807,4 +2811,146 @@ fn scrolling_down_stops_at_the_bottom_of_the_session() {
         last_content.contains("message 11"),
         "the band ends below the last message:\n{screen}"
     );
+}
+
+#[test]
+fn a_new_session_shows_one_tick_per_turn_and_nothing_when_empty() {
+    use vibex_desktop_model::TimelineRowKind;
+    let rail = |app: &mut App, width: u16, rows: u16| {
+        let buffer = render_buffer(app, width, rows);
+        (0..rows)
+            .filter(|row| {
+                (0..width).any(|column| {
+                    buffer
+                        .cell((column, *row))
+                        .is_some_and(|cell| matches!(cell.symbol(), "•" | "▪" | "┃"))
+                })
+            })
+            .count()
+    };
+
+    // A session with nothing in it has nothing to draw on its rail: a bar
+    // beside an empty transcript is a mark the reader counts for a turn that
+    // does not exist.
+    let mut empty = app(100, 24);
+    empty.navigate_to(Page::Agent);
+    assert_eq!(rail(&mut empty, 100, 24), 0, "an empty session drew a rail");
+
+    // One turn is one tick — including when it is the turn the reader is on.
+    let mut single = app(100, 24);
+    single.navigate_to(Page::Agent);
+    single.transcript.set_blocks(vec![
+        seeded_block("a", TimelineRowKind::UserMessage, "hello"),
+        seeded_block("b", TimelineRowKind::AgentMessage, "hi there"),
+    ]);
+    assert_eq!(rail(&mut single, 100, 24), 1, "one turn is not one tick");
+
+    // Two turns are two ticks, in conversation order.
+    let mut pair = app(100, 24);
+    pair.navigate_to(Page::Agent);
+    pair.transcript.set_blocks(
+        [(0, "first"), (1, "second")]
+            .into_iter()
+            .flat_map(|(turn, text)| {
+                [TimelineRowKind::UserMessage, TimelineRowKind::AgentMessage]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, kind)| {
+                        let mut block = seeded_block(&format!("{turn}-{index}"), kind, text);
+                        block.turn_id = Some(format!("turn-{turn}"));
+                        block
+                    })
+            })
+            .collect(),
+    );
+    assert_eq!(rail(&mut pair, 100, 24), 2, "two turns are not two ticks");
+}
+
+#[test]
+fn the_first_scroll_after_opening_a_session_is_a_step_not_a_leap() {
+    use vibex_desktop_model::TimelineRowKind;
+    let mut app = app(100, 24);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(
+        (0..8)
+            .flat_map(|turn| {
+                [TimelineRowKind::UserMessage, TimelineRowKind::AgentMessage]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, kind)| {
+                        let mut block = seeded_block(
+                            &format!("turn{turn}-{index}"),
+                            kind,
+                            &format!("turn {turn} row {index} with text in it"),
+                        );
+                        block.turn_id = Some(format!("turn-{turn}"));
+                        block.collapsible = false;
+                        block
+                    })
+            })
+            .collect(),
+    );
+    // Opening a session follows its tail.
+    let _ = render(&mut app, 100, 24);
+    let rows = app.transcript_band_rows;
+    let bottom = app.transcript.total_height() - rows;
+    assert!(app.scroll.follow);
+    assert_eq!(
+        app.scroll.offset, bottom,
+        "the state's offset is not where the frame is"
+    );
+
+    // One scroll up is one step up. Stepping from the offset the state was last
+    // dragged to — zero, for a viewport that has only ever followed — threw the
+    // reader into a different turn at the top of the session.
+    app.scroll_lines(-3);
+    assert_eq!(
+        app.scroll.offset,
+        bottom - 3,
+        "the first scroll up jumped instead of stepping"
+    );
+    assert!(!app.scroll.follow, "scrolling up still follows the tail");
+
+    // And one step down from the top of a session stops there.
+    app.scroll_lines(-10_000);
+    assert_eq!(app.scroll.offset, 0);
+    app.scroll_lines(3);
+    assert_eq!(app.scroll.offset, 3);
+}
+
+#[test]
+fn the_frames_click_regions_do_not_accumulate() {
+    // Rect coordinates are per-frame: the previous frame's rows describe a
+    // layout that no longer exists, and a list that only ever grows both leaks
+    // and lets a click land on a row that has moved.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    let _ = render(&mut app, 120, 40);
+    let hints = app.regions.hints.len();
+    let turns = app.regions.turns.len();
+    for _ in 0..3 {
+        let _ = render(&mut app, 120, 40);
+    }
+    assert!(hints > 0, "the frame published no hints");
+    assert_eq!(app.regions.hints.len(), hints, "the hint list grew");
+    assert_eq!(app.regions.turns.len(), turns, "the turn list grew");
+
+    // A session with turns publishes one rect per visible tick, and no more.
+    app.transcript.set_blocks(
+        (0..3)
+            .map(|turn| {
+                let mut block = seeded_block(
+                    &format!("t{turn}"),
+                    vibex_desktop_model::TimelineRowKind::AgentMessage,
+                    "body",
+                );
+                block.turn_id = Some(format!("turn-{turn}"));
+                block
+            })
+            .collect(),
+    );
+    let _ = render(&mut app, 120, 40);
+    assert_eq!(app.regions.turns.len(), 3, "one rect per turn");
+    let _ = render(&mut app, 120, 40);
+    assert_eq!(app.regions.turns.len(), 3, "the turn list grew");
 }

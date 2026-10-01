@@ -95,14 +95,8 @@ impl Bands {
     }
 }
 
-/// Columns reserved for the turn rail and the scrollbar share one gutter.
+/// Columns the turn rail owns.
 pub const GUTTER_WIDTH: u16 = 2;
-
-/// The fewest turns worth drawing a navigation rail for.
-///
-/// A single-turn session has nowhere to navigate, so the gutter falls back to a
-/// scrollbar rather than drawing one lonely tick.
-pub const MIN_RAIL_TURNS: usize = 2;
 
 /// Below this transcript width the gutter is returned to the content.
 ///

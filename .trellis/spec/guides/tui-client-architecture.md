@@ -216,9 +216,11 @@ Structure is carried by four devices, in this order of importance:
    blocks read as one striped edge rather than as one bar per block. A block is
    identified by what it says — the prompt mark on the reader's own words, the
    bullet on a work item, the colour of the text — not by a stripe beside it.
-2. **The turn rail.** One tick per turn in the gutter, positioned by
-   conversation order, with chevrons to jump a turn at a time. It maps the
-   session, not the buffer.
+2. **The turn rail.** One tick per turn in the gutter, in conversation order: a
+   count of the session as much as a map of it, with the turn the viewport
+   starts on drawn heavier. More turns than rows window the ticks around the
+   active one. A transcript with no turns draws nothing — a scrollbar in those
+   columns is counted as turns, which is the mistake the rail exists to avoid.
 3. **Layered surfaces.** `surface` / `surface_raised` / `surface_highlight` step
    away from `background`, so a plane change is visible without a border.
 4. **A three-step grey scale.** `gray_dim` for punctuation and chrome, `gray`
@@ -255,14 +257,21 @@ Rules that follow:
   glyph's fallback and the width invariant it must keep. The prompt arrow is
   always two columns and every spinner frame always one, so a degradation never
   shifts the layout.
+* **A frame's click regions are per-frame.** A rect describes where something
+  was when the frame drew it, so the lists the frame rewrites — the turn ticks
+  and the shortcut hints — are cleared at the start of every frame. A list that
+  only grows leaks memory and lets a click land on a row that has moved or gone.
 * **A scroll offset is clamped to the transcript, not to itself.** The bottom is
   the last row of content at the last row of the viewport, and it is measured
   against the band the frame actually drew — the bands above and below take
   their rows first. A reader who scrolls past it would be scrolling into blank
   space and could keep going forever, since an offset has no ceiling of its own;
   reaching the bottom resumes following the tail, because that is what scrolling
-  to the newest line asks for. The keyboard, the wheel and the scrollbar share
-  one clamped path.
+  to the newest line asks for. The keyboard and the wheel share one clamped
+  path, and a step starts from the row the frame is actually showing: following
+  the tail is a *position*, so the state's offset is kept on it — a step from
+  the offset the state was last dragged to threw the reader to the top of the
+  session, a different turn, on the first scroll after opening it.
 * **A turn the runtime has finished cannot still be streaming.** The state-free
   row projection cannot know that, so a provider that streams its answer as
   deltas and never sends a final message leaves a row marked `streaming` for the

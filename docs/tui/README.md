@@ -123,11 +123,13 @@ canvas. The grey scale has three steps — dim for punctuation and chrome, mediu
 for muted body, bright for secondary labels — because one grey cannot do three
 jobs without everything competing.
 
-**The turn rail.** One tick per turn in the right gutter, positioned by
-conversation order rather than scroll proportion, so it maps the session rather
-than the buffer. Chevrons either end jump a turn at a time. It shares the two
-columns the scrollbar would use, and a single-turn session falls back to a
-scrollbar because a lone tick is noise.
+**The turn rail.** One tick per turn in the right gutter, in conversation order
+rather than by scroll proportion, so it is a count of the session as much as a
+map of it: a reader can see how many turns there are and which one the viewport
+starts on. When there are more turns than rows the ticks window around the
+active one. A session with no turns draws nothing there — a scrollbar in the
+same columns would be counted as turns, which is the one thing the rail must not
+do.
 
 **Focus is a fade, not a switch.** Panes that do not have the keyboard keep
 their colour and drop in weight, and the composer's rail goes from the accent to
@@ -234,8 +236,10 @@ it loses the hints before it loses the runtime.
 
 Scrolling stops at the bottom of the session: the last line of the transcript
 rests on the last row of the band, and reaching it resumes following the tail.
-The wheel, the keyboard and the scrollbar share that ceiling, so none of them
-can walk the viewport into blank space.
+The wheel and the keyboard share that ceiling, so neither can walk the viewport
+into blank space, and a scroll starts from the row the frame is actually showing
+— following the tail is a position, not the absence of one, so the first scroll
+after opening a session is a step rather than a leap to the top.
 
 A draft can also be selected. `Shift` plus the motion keys extends the
 selection, `Alt+A` takes the whole draft and `Alt+C` copies the selected part;

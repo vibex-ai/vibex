@@ -120,7 +120,10 @@ pub fn pin_marker(tier: GlyphTier) -> &'static str {
     }
 }
 
-/// Chevrons for jumping a turn at a time. One column.
+/// A chevron pointing at what is not shown yet. One column.
+///
+/// It survives the turn rail it was written for, which no longer jumps a turn
+/// at a time: the dock's "and N more" row points down with it.
 pub fn chevron(up: bool, tier: GlyphTier) -> &'static str {
     match (up, tier) {
         (true, GlyphTier::Full) => "▴",

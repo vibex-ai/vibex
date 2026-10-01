@@ -24,7 +24,7 @@ use crate::app::{
     ToastTone,
 };
 use crate::keymap::Scope;
-use crate::layout::{Bands, MIN_RAIL_TURNS};
+use crate::layout::Bands;
 use crate::locale::Strings;
 use crate::modal::{self, ModalChrome, ModalHint, ModalSizing};
 use crate::text::{display_width, truncate_to_width};
@@ -497,6 +497,7 @@ pub fn block_detail_text(
 /// skipped, so an idle session shows the transcript the whole height of the
 /// screen rather than the top third of it.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    app.regions.begin_frame();
     let area = frame.area();
     app.shell = crate::app::shell_for_columns(area.width);
     let theme = app.theme.clone();
@@ -805,6 +806,12 @@ fn render_scrollback(
         pattern.as_ref(),
         search_highlight_style(theme),
     );
+    // Following the tail is a *position*, not an absence of one. Keeping the
+    // state's offset on the row the frame starts at is what makes a scroll up
+    // from the tail a step instead of a leap to the top of the session.
+    if app.scroll.follow {
+        app.scroll.offset = app.transcript.scroll_offset();
+    }
     // The selection is painted last so it wins over a search highlight on the
     // same cells: the reader's most recent gesture is the one they mean.
     if let Some(selection) = app.text_selection {
@@ -1274,47 +1281,28 @@ fn render_management_view(
     }
 }
 
-/// The right gutter: a turn rail, or a scrollbar when the rail is not useful.
+/// The right gutter: one tick per turn.
 ///
-/// One tick per turn, positioned by conversation order rather than scroll
-/// proportion, so the rail is a map of the session rather than of the buffer.
-/// Chevrons at each end jump a turn at a time when the viewport is between
-/// turns. Both live in the same two columns the scrollbar would use, because a
-/// terminal cannot afford to show two navigators at once.
+/// A tick stands for a turn, in conversation order, and the turn the viewport
+/// starts on wears the heavier one — so the count of the reader's conversation
+/// and their place in it are the same object, and the rail is a map of the
+/// session rather than of the buffer. Nothing else is drawn there: a scrollbar
+/// in the same columns would be counted as turns, which is exactly the mistake
+/// the rail exists to prevent. When there are more turns than rows the ticks
+/// window around the active one, because an unwindowed rail would fold many
+/// turns onto a single row.
 fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     let turns = app.transcript.turn_count();
     let tier = app.glyph_tier();
-    let rail_width = usize::from(area.width);
-    if rail_width == 0 || area.height == 0 {
+    let rows = usize::from(area.height);
+    if area.width == 0 || rows == 0 || turns == 0 {
         return;
     }
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height));
-
-    if turns < MIN_RAIL_TURNS {
-        // A one-turn session has nothing to navigate, so the gutter falls back
-        // to a scrollbar. Only the thumb is drawn: a full track of blocks is as
-        // loud as the content and twice as wide as it needs to be.
-        let (thumb_start, thumb_len) = app.scroll_thumb(usize::from(area.height));
-        let thumb = crate::glyphs::accent_bar(tier);
-        for row in 0..usize::from(area.height) {
-            let in_thumb = row >= thumb_start && row < thumb_start + thumb_len;
-            if in_thumb {
-                lines.push(Line::from(Span::styled(
-                    thumb,
-                    Style::default().fg(theme.roles.gray_dim),
-                )));
-            } else {
-                lines.push(Line::from(""));
-            }
-        }
-        frame.render_widget(Paragraph::new(Text::from(lines)), area);
-        return;
-    }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
 
     let active = app.transcript.active_turn();
     // Window the ticks when there are more turns than rows, keeping the active
     // turn visible: an unwindowed rail would fold many turns onto one row.
-    let rows = usize::from(area.height);
     let window_start = if turns <= rows {
         0
     } else {
