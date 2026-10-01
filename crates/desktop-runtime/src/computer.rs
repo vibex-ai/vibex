@@ -983,12 +983,18 @@ impl ComputerRuntime {
                 return state;
             }
         };
+        let mut installer = tokio::process::Command::new(&command.program);
+        installer
+            .args(&command.args)
+            .stdin(std::process::Stdio::null());
+        // The installer is a console program and Vibex is a GUI one, so without
+        // this the whole install — minutes of it — runs behind a black window
+        // on the reader's desktop.
+        #[cfg(windows)]
+        installer.creation_flags(WINDOWS_CREATE_NO_WINDOW);
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(DRIVER_INSTALL_TIMEOUT_SECS),
-            tokio::process::Command::new(command.program)
-                .args(&command.args)
-                .stdin(std::process::Stdio::null())
-                .output(),
+            installer.output(),
         )
         .await;
         let state = match outcome {
@@ -1028,6 +1034,11 @@ impl ComputerRuntime {
 
 /// How long the vendor installer may take.
 const DRIVER_INSTALL_TIMEOUT_SECS: u64 = 600;
+
+/// `CREATE_NO_WINDOW`, the creation flag that keeps a console program from
+/// being given a console window it would show over the reader's desktop.
+#[cfg(windows)]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The fixed installer for one platform.
 ///

@@ -419,6 +419,13 @@ says four things:
 
   A window paired with a runtime on **another machine** says so and offers
   neither button: the driver belongs to the machine that owns the desktop.
+
+  The engine is a console program and Vibex is a GUI one, so on Windows every
+  spawn carries `CREATE_NO_WINDOW`: without it the reader gets a black window
+  over their desktop for each probe, each `status`, each tool call and the
+  installer itself, and the daemon's window stays for as long as the daemon
+  runs. The flag is per spawn and touches no stream, so every answer is still
+  read from the pipe it was written to.
 - **The system permissions.** A read-only line with the three states the
   operating system reports, because Vibex cannot consent on the user's behalf
   and a permission that needs a restart must not look like a denial.

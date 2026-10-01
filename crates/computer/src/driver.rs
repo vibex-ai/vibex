@@ -78,6 +78,10 @@ pub const DRIVER_PROBE_TIMEOUT_MS: u64 = 5_000;
 /// be addressed from a stale id, and the directory is one extra driver call
 /// when it does expire.
 const DRIVER_DIRECTORY_TTL: Duration = Duration::from_secs(2);
+/// `CREATE_NO_WINDOW`, the creation flag that keeps a console program from
+/// being given a console window it would show over the reader's desktop.
+#[cfg(windows)]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// A driver binary that speaks the CLI protocol.
 ///
@@ -206,6 +210,24 @@ impl CuaDriverCli {
         self
     }
 
+    /// One `cua-driver` invocation, carrying the environment this client holds.
+    ///
+    /// The engine is a console program and Vibex is a GUI one, so a spawn with
+    /// no creation flags hands it a console window of its own: a black window
+    /// over the reader's desktop for every probe, every `status` and every tool
+    /// call, and one that stays up for as long as the daemon runs. The flag is
+    /// per spawn and takes only that window — the streams stay exactly the
+    /// pipes each caller sets, which is where the driver's answers are read.
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.executable);
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        #[cfg(windows)]
+        command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+        command
+    }
+
     /// Locates the driver: explicit override first, then `PATH`, then the
     /// install locations the project documents.
     ///
@@ -264,7 +286,7 @@ impl CuaDriverCli {
         if self.daemon_is_running().await {
             return Ok(());
         }
-        let mut command = tokio::process::Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("serve")
             .args(self.socket_args())
@@ -274,9 +296,6 @@ impl CuaDriverCli {
             // The daemon holds the desktop session; it must not outlive the
             // helper that owns it.
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let child = command.spawn().map_err(|error| {
             ComputerError::process(
                 codes::HELPER_FAILED,
@@ -303,16 +322,13 @@ impl CuaDriverCli {
     /// Read-only: the probe never prompts, because a permission dialog belongs
     /// to a click in the settings rather than to a startup path.
     async fn run_permissions_status(&self) -> Option<Value> {
-        let mut command = tokio::process::Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("permissions")
             .arg("status")
             .arg("--json")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
             .await
             .ok()?
@@ -325,15 +341,12 @@ impl CuaDriverCli {
 
     /// Whether the driver reports a live daemon.
     pub async fn daemon_is_running(&self) -> bool {
-        let mut command = tokio::process::Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("status")
             .args(self.socket_args())
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let Ok(output) = tokio::time::timeout(Duration::from_secs(5), command.output()).await
         else {
             return false;
@@ -383,7 +396,7 @@ impl CuaDriverCli {
 
     /// Stops the daemon this client would talk to.
     async fn stop_daemon(&self) -> ComputerResult<()> {
-        let mut command = tokio::process::Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("stop")
             .args(self.socket_args())
@@ -391,9 +404,6 @@ impl CuaDriverCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
             .await
             .map_err(|_| {
@@ -454,7 +464,7 @@ impl CuaDriverCli {
             )
             .with_diagnostic("error", error.to_string())
         })?;
-        let mut command = Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("call")
             .arg(tool)
@@ -464,9 +474,6 @@ impl CuaDriverCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let output = tokio::time::timeout(Duration::from_millis(timeout_ms), command.output())
             .await
             .map_err(|_| {
@@ -511,14 +518,11 @@ impl CuaDriverCli {
     /// the cheapest proof that the binary really is the engine: it needs no
     /// daemon and touches no desktop.
     pub async fn tool_surface(&self) -> ComputerResult<String> {
-        let mut command = tokio::process::Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("list-tools")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
             .await
             .map_err(|_| {
@@ -1429,15 +1433,12 @@ impl CuaDriverCli {
     /// Read-only, needs no daemon, and it is the only place that knows what
     /// this platform's readiness actually depends on.
     async fn run_doctor(&self) -> ComputerResult<DriverDoctor> {
-        let mut command = tokio::process::Command::new(&self.executable);
+        let mut command = self.command();
         command
             .arg("doctor")
             .arg("--json")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
         let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
             .await
             .map_err(|_| {
