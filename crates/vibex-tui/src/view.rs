@@ -790,6 +790,9 @@ fn render_scrollback(
         }
         None => (content, height),
     };
+    // The scroll ceiling is measured against the band the reader can actually
+    // see, so the frame that drew it is the one that records it.
+    app.transcript_band_rows = height;
     let pattern = app
         .search
         .as_ref()
@@ -2495,11 +2498,15 @@ fn render_history_search(
     frame.render_widget(Paragraph::new(Text::from(lines)), body);
 }
 
-/// The composer's info line: context on the left, mode on the right.
+/// The composer's info line, against the right edge.
 ///
 /// This is deliberately the bottom border rather than a separate row: a
 /// terminal has no room for chrome that only carries status, and a divider that
-/// also informs is free.
+/// also informs is free. It sits on the *right* because that is where a reader
+/// looks for it and where it costs the draft nothing: the left of the line is
+/// the rule the eye follows into the box, and the runtime a message will go
+/// through belongs beside the box's far corner, not on top of the text it is
+/// about.
 fn render_composer_info(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2532,7 +2539,7 @@ fn render_composer_info(
         })
     };
 
-    let mut left = vec![Span::raw(" ")];
+    let mut line = Vec::new();
     // Model identity, when the session has one.
     if let Some(session) = app.active_session() {
         // The Agent and model the draft will actually be sent through. The
@@ -2546,12 +2553,12 @@ fn render_composer_info(
         });
         match current {
             Some(option) => {
-                left.push(Span::styled(
+                line.push(Span::styled(
                     option.agent_label.clone(),
                     flag(theme).add_modifier(Modifier::BOLD),
                 ));
-                left.push(sep(theme));
-                left.push(Span::styled(
+                line.push(sep(theme));
+                line.push(Span::styled(
                     format!("{}/{}", option.auth_source_label, option.model_label),
                     flag(theme),
                 ));
@@ -2560,7 +2567,7 @@ fn render_composer_info(
             // selection still names the Agent and the model, so say what is
             // known rather than guessing at the rest.
             None => {
-                left.push(Span::styled(
+                line.push(Span::styled(
                     app.session_runtime_selection()
                         .map(|selection| selection.agent_id.to_string())
                         .unwrap_or_else(|| session.agent_id.to_string()),
@@ -2570,8 +2577,8 @@ fn render_composer_info(
                     .session_runtime_selection()
                     .and_then(|selection| selection.model.model_id())
                 {
-                    left.push(sep(theme));
-                    left.push(Span::styled(model.to_string(), flag(theme)));
+                    line.push(sep(theme));
+                    line.push(Span::styled(model.to_string(), flag(theme)));
                 }
             }
         }
@@ -2579,8 +2586,8 @@ fn render_composer_info(
         // line already names the runtime, so it also names the key that moves it.
         // A backend that cannot honour the key explains itself with a toast
         // rather than silently dropping the entry point.
-        left.push(sep(theme));
-        left.push(Span::styled(
+        line.push(sep(theme));
+        line.push(Span::styled(
             strings.runtime_switch_hint().to_string(),
             flag(theme),
         ));
@@ -2598,11 +2605,11 @@ fn render_composer_info(
             Page::Help => strings.nav_help(),
             _ => strings.nav_management(),
         };
-        left.push(Span::styled(page.to_string(), flag(theme)));
+        line.push(Span::styled(page.to_string(), flag(theme)));
     }
     if running {
-        left.push(sep(theme));
-        left.push(Span::styled(
+        line.push(sep(theme));
+        line.push(Span::styled(
             strings.running().to_string(),
             Style::default().fg(theme.roles.accent_running),
         ));
@@ -2611,56 +2618,44 @@ fn render_composer_info(
     // info line is where the count becomes a number the reader can check.
     let images = app.composer.image_count();
     if images > 0 {
-        left.push(sep(theme));
-        left.push(Span::styled(
+        line.push(sep(theme));
+        line.push(Span::styled(
             format!("🖼 {images} {}", strings.image_count()),
             flag(theme),
         ));
     }
     let pending = app.pending_permission_count();
     if pending > 0 {
-        left.push(sep(theme));
-        left.push(Span::styled(
+        line.push(sep(theme));
+        line.push(Span::styled(
             format!("⚠ {pending} {}", strings.approval_title()),
             theme.warning().add_modifier(Modifier::BOLD),
         ));
     }
-    left.push(Span::raw(" "));
-
-    let mut right = Vec::new();
+    // The mode hints trail the context: the reader who wants them already knows
+    // what the session is, and the reader who does not is not stopped by them.
     if app.composer.line_count() > 1 {
-        right.push(Span::styled(
+        line.push(sep(theme));
+        line.push(Span::styled(
             strings.settings_keys().to_string(),
             flag(theme),
         ));
     }
     if focused {
-        right.push(Span::styled(
+        line.push(Span::styled(
             "▏",
             Style::default().fg(theme.roles.accent_user),
         ));
     }
-    if !right.is_empty() {
-        right.push(Span::raw(" "));
-    }
+    line.push(Span::raw(" "));
 
-    // Render into a scratch line so the right-hand side can be placed against
-    // the far edge without the two halves colliding in a narrow terminal.
-    let left_line = Line::from(left);
-    let left_width = left_line.width() as u16;
-    let right_line = Line::from(right);
-    let right_width = right_line.width() as u16;
-    if left_width + right_width >= area.width {
-        frame.render_widget(Paragraph::new(left_line), area);
-        return;
-    }
-    frame.render_widget(Paragraph::new(left_line), area);
-    let right_area = Rect {
-        x: area.x + area.width - right_width,
-        width: right_width,
-        ..area
-    };
-    frame.render_widget(Paragraph::new(right_line), right_area);
+    // Right-aligned: when the line is wider than the box, ratatui clips the
+    // tail, so a narrow terminal loses the mode hints before it loses the
+    // runtime the message will be sent through.
+    frame.render_widget(
+        Paragraph::new(Line::from(line)).alignment(Alignment::Right),
+        area,
+    );
 }
 
 /// The completion popup, drawn directly above the composer.

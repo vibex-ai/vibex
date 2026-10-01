@@ -1667,14 +1667,15 @@ impl App {
     }
 
     fn scroll_by(&mut self, direction: i64, page: bool) {
+        // A page leaves a margin of overlap so the reader keeps their place;
+        // half a screen is the smallest step that reads as a scroll rather than
+        // a jump.
         let step = if page {
-            usize::from(self.viewport.1).saturating_sub(4).max(1)
+            self.transcript_band_rows.saturating_sub(4).max(1)
         } else {
-            (usize::from(self.viewport.1) / 2).max(1)
+            (self.transcript_band_rows / 2).max(1)
         };
-        let current = self.scroll.offset as i64;
-        self.scroll.follow = false;
-        self.scroll.offset = (current + direction * step as i64).max(0) as usize;
+        self.scroll_lines(direction * step as i64);
     }
 
     fn set_overlay_scroll(&mut self, value: usize) {

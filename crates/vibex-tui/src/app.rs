@@ -427,6 +427,12 @@ pub struct App {
     /// The crossterm-reported terminal size, used by renderers that need to
     /// make a layout decision before the frame buffer exists.
     pub viewport: (u16, u16),
+    /// Rows the transcript band had in the last frame.
+    ///
+    /// The scroll ceiling is only as good as the viewport it is measured
+    /// against, and the band is not the terminal: the bands above and below it
+    /// take their rows first. The renderer records what it actually drew.
+    pub transcript_band_rows: usize,
     /// Regions the last frame published for mouse hit-testing: the transcript
     /// band and the close affordance of the modal, when one is open.
     pub regions: FrameRegions,
@@ -815,6 +821,7 @@ impl App {
             diff_text: None,
             text_view: None,
             viewport: (120, 40),
+            transcript_band_rows: 20,
             regions: FrameRegions::default(),
             runtime_options: None,
             runtime_picker_pending: false,
@@ -1613,18 +1620,42 @@ impl App {
         }
     }
 
+    /// Scroll by `delta` rows, clamped to the transcript.
+    ///
+    /// The wheel and the keyboard share this, so neither can walk the viewport
+    /// past the end of the session.
+    pub fn scroll_lines(&mut self, delta: i64) {
+        let current = self.scroll.offset as i64;
+        self.scroll.offset = (current + delta).max(0) as usize;
+        let bottom = self.transcript.bottom_offset(
+            self.transcript_band_rows.max(1),
+            &self.theme,
+            self.strings,
+        );
+        if self.scroll.offset >= bottom {
+            // At the bottom the reader is following the tail again: the newest
+            // line is what they scrolled to.
+            self.scroll.offset = bottom;
+            self.scroll.follow = true;
+        } else {
+            self.scroll.follow = false;
+        }
+    }
+
     /// The vertical scrollbar thumb, as a (start, length) pair in rows.
     pub fn scroll_thumb(&mut self, rows: usize) -> (usize, usize) {
         let total = self.transcript.total_height();
         if total <= rows || rows == 0 {
             return (0, rows);
         }
-        let height = self.transcript.total_height();
-        let viewport = self.viewport.1 as usize;
+        let viewport = self.transcript_band_rows.max(1);
+        let bottom = self
+            .transcript
+            .bottom_offset(viewport, &self.theme, self.strings);
         let offset = if self.scroll.follow {
-            height.saturating_sub(viewport)
+            bottom
         } else {
-            self.scroll.offset.min(height.saturating_sub(1))
+            self.scroll.offset.min(bottom)
         };
         let length = (rows * rows / total.max(1)).max(1);
         let start = (offset * rows / total.max(1)).min(rows.saturating_sub(length));
@@ -1751,13 +1782,12 @@ impl App {
     /// is anchored to the block that was under the first visible line rather
     /// than to the absolute line offset it used to sit at.
     pub fn sync_transcript(&mut self) {
-        let view = self
-            .agent
-            .state
-            .view(&self.projection.sidebar, "", self.shell);
-        self.projection.rows = view.timeline_rows.clone();
-        let blocks: Vec<Block> = view
-            .timeline_rows
+        // `transcript_rows` rather than the state-free projection: a turn the
+        // runtime has finished must stop claiming to stream, or the client
+        // draws a spinner over a finished answer for the rest of the session.
+        let rows = self.agent.state.transcript_rows();
+        self.projection.rows = rows.clone();
+        let blocks: Vec<Block> = rows
             .iter()
             .filter(|row| row_is_rendered(row))
             .map(block_from_row)

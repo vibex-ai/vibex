@@ -225,6 +225,18 @@ message text and the picture travels as an attachment — by path when the runti
 can read it, as a data URL when it came from the clipboard. The info line under
 the draft reports how many are attached.
 
+The info line under the draft is right-aligned: the runtime a message will go
+through, the Agent and model it names, and the key that switches it sit against
+the box's far corner, where a reader looks for them, and the rule on the left is
+the line the eye follows into the prompt. Attached images, a waiting approval
+and the multi-line hint ride the same line, and a terminal too narrow for all of
+it loses the hints before it loses the runtime.
+
+Scrolling stops at the bottom of the session: the last line of the transcript
+rests on the last row of the band, and reaching it resumes following the tail.
+The wheel, the keyboard and the scrollbar share that ceiling, so none of them
+can walk the viewport into blank space.
+
 A draft can also be selected. `Shift` plus the motion keys extends the
 selection, `Alt+A` takes the whole draft and `Alt+C` copies the selected part;
 the mouse works the same way — press, drag, release copies — and typing over a

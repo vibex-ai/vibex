@@ -255,6 +255,21 @@ Rules that follow:
   glyph's fallback and the width invariant it must keep. The prompt arrow is
   always two columns and every spinner frame always one, so a degradation never
   shifts the layout.
+* **A scroll offset is clamped to the transcript, not to itself.** The bottom is
+  the last row of content at the last row of the viewport, and it is measured
+  against the band the frame actually drew — the bands above and below take
+  their rows first. A reader who scrolls past it would be scrolling into blank
+  space and could keep going forever, since an offset has no ceiling of its own;
+  reaching the bottom resumes following the tail, because that is what scrolling
+  to the newest line asks for. The keyboard, the wheel and the scrollbar share
+  one clamped path.
+* **A turn the runtime has finished cannot still be streaming.** The state-free
+  row projection cannot know that, so a provider that streams its answer as
+  deltas and never sends a final message leaves a row marked `streaming` for the
+  rest of the session — and a client that draws a spinner from that flag says
+  "running" over a finished answer, forever. `transcript_rows` settles it once
+  for every client: only the last turn can be live, and only while the session
+  state (or an accepted send) says so.
 * **A band that reports progress derives it from the projection, not from what
   is drawn.** `App::todo_progress` reads the last plan-shaped *timeline row*'s
   `Status: title` lines. Reading the transcript instead would tie a progress bar

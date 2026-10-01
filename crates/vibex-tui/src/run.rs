@@ -920,8 +920,7 @@ fn handle_composer_key(
 fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.scroll.follow = false;
-            app.scroll.offset = app.scroll.offset.saturating_sub(3);
+            app.scroll_lines(-3);
             // The wheel is the other way to reach the top of the loaded
             // window; the controller ignores the ask when there is nothing
             // older or a page is already on its way.
@@ -933,7 +932,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::ScrollDown => {
-            app.scroll.offset = app.scroll.offset.saturating_add(3);
+            app.scroll_lines(3);
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {

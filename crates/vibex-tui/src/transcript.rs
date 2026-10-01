@@ -464,6 +464,22 @@ impl Transcript {
         self.scroll_offset
     }
 
+    /// The lowest offset a viewport of `height` rows can hold.
+    ///
+    /// The bottom of the transcript is the last row of content at the last row
+    /// of the viewport, not the last row at the top of it: a reader who scrolls
+    /// past the bottom would be scrolling into blank space, and would keep
+    /// scrolling, because an offset has no ceiling of its own. The tail is
+    /// measured first, so the answer is the real height rather than an estimate
+    /// of blocks that have never been drawn.
+    pub fn bottom_offset(&mut self, height: usize, theme: &TuiTheme, strings: Strings) -> usize {
+        if height == 0 {
+            return 0;
+        }
+        self.measure_tail(height, theme, strings);
+        self.total_height().saturating_sub(height)
+    }
+
     /// Whether any block is currently working.
     pub fn is_animating(&self) -> bool {
         self.blocks.iter().any(|block| block.streaming)
@@ -762,18 +778,17 @@ impl Transcript {
             return Vec::new();
         }
         self.set_selected(scroll.selected);
-        if scroll.follow {
-            // Following the tail means the tail must be measured first;
-            // otherwise the window is positioned against estimates for blocks
-            // that were never sized.
-            self.measure_tail(height, theme, strings);
-        }
+        // The tail is measured whichever way the reader is scrolling: the
+        // bottom of the transcript is what an offset is clamped against, and
+        // an estimate of an undrawn block would clamp it in the wrong place.
+        self.measure_tail(height, theme, strings);
         self.ensure_layout();
         let total = self.offsets.last().copied().unwrap_or(0);
+        let bottom = total.saturating_sub(height);
         let offset = if scroll.follow {
-            total.saturating_sub(height)
+            bottom
         } else {
-            scroll.offset.min(total.saturating_sub(1))
+            scroll.offset.min(bottom)
         };
         let end = (offset + height).min(total);
         self.scroll_offset = offset;

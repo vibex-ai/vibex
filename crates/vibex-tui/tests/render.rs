@@ -367,6 +367,27 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
         !screen.contains("bal/claude-sonnet"),
         "the prompt named a catalogue entry the session is not on:\n{screen}"
     );
+    // It rides the far end of the bottom border: the reader looks for the
+    // runtime beside the box's corner, and the rule on the left is the line the
+    // eye follows into the prompt.
+    let info_row = lines
+        .iter()
+        .find(|line| line.contains("bal/gpt-5"))
+        .expect("the info line is on screen");
+    let start = info_row
+        .char_indices()
+        .find(|(_, character)| !matches!(character, '─' | ' ' | '│' | '╰' | '╭'))
+        .map(|(index, _)| index)
+        .expect("the info line has content");
+    assert!(
+        start > 60,
+        "the runtime is still on the left of the box: column {start}\n{screen}"
+    );
+    assert!(
+        info_row[start..].starts_with("codex · bal/gpt-5"),
+        "the info line starts with something else: {:?}",
+        &info_row[start..]
+    );
 }
 
 #[test]
@@ -2658,5 +2679,132 @@ fn a_clipboard_image_paste_becomes_an_attachment_not_a_draft() {
     assert!(
         screen.contains("[Image #1]"),
         "the attachment is not on screen:\n{screen}"
+    );
+}
+
+#[test]
+fn a_finished_turn_stops_claiming_to_stream() {
+    let session_id = vibex_core::VibexSessionId::new();
+    let correlation = vibex_core::CorrelationId::new();
+    let mut user = seeded_item(
+        &session_id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "question".into(),
+            attachments: Vec::new(),
+            ..Default::default()
+        }),
+    );
+    user.correlation_id = Some(correlation.clone());
+    let mut delta = seeded_item(
+        &session_id,
+        2,
+        vibex_core::TimelineItemKind::AgentMessage,
+        vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+            text_delta: "the answer".into(),
+            chunk_index: 0,
+            phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+        }),
+    );
+    delta.correlation_id = Some(correlation.clone());
+
+    let build = |state: vibex_core::AgentSessionState| {
+        let mut app = app(120, 30);
+        app.navigate_to(Page::Agent);
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        let mut session = seeded_session("session_probe", "probe");
+        session.id = session_id.clone();
+        session.state = state;
+        app.agent
+            .apply_sessions(Ok(vec![session.clone()]))
+            .expect("apply");
+        app.agent.state.active_session.resolve(session);
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(session_id.clone(), vec![user.clone(), delta.clone()]);
+        app.sync_transcript();
+        app
+    };
+
+    // The runtime says the turn is over, so the row cannot still be arriving:
+    // a client that believed it would draw a spinner over a finished answer.
+    let mut settled = build(vibex_core::AgentSessionState::Idle);
+    assert!(
+        !settled.transcript_animating(),
+        "a settled turn still animates"
+    );
+    let screen = text(&render(&mut settled, 120, 30));
+    assert!(
+        !screen.contains("运行中") && !screen.contains("Running"),
+        "a settled session is drawn as running:\\n{screen}"
+    );
+
+    // While the runtime says it is running, the same rows do stream.
+    let mut running = build(vibex_core::AgentSessionState::Running);
+    assert!(
+        running.transcript_animating(),
+        "a running turn stopped streaming"
+    );
+    let screen = text(&render(&mut running, 120, 30));
+    assert!(
+        screen.contains("运行中") || screen.contains("Running"),
+        "a running session is not drawn as running:\\n{screen}"
+    );
+}
+
+#[test]
+fn scrolling_down_stops_at_the_bottom_of_the_session() {
+    use vibex_desktop_model::TimelineRowKind;
+    let mut app = transcript_app(100, 24);
+    app.transcript.set_blocks(
+        (0..12)
+            .map(|index| {
+                let mut block = seeded_block(
+                    &format!("block-{index}"),
+                    TimelineRowKind::AgentMessage,
+                    &format!("message {index} with enough words to wrap at least once"),
+                );
+                block.collapsible = false;
+                block
+            })
+            .collect(),
+    );
+    // One frame publishes the band height the clamp is measured against.
+    let _ = render(&mut app, 100, 24);
+
+    // A reader holding the wheel down walks the offset into blank space: the
+    // offset has no ceiling of its own, so each click went further past the end.
+    for _ in 0..200 {
+        app.scroll_lines(3);
+    }
+    let rows = app.transcript_band_rows;
+    let total = app.transcript.total_height();
+    assert!(
+        total > rows,
+        "the fixture must outgrow the band: {total} rows"
+    );
+    assert_eq!(
+        app.scroll.offset,
+        total - rows,
+        "the viewport is not resting on the bottom"
+    );
+    assert!(app.scroll.follow, "reaching the bottom resumes following");
+
+    // The band ends on the last line of the session rather than on blank rows.
+    let screen = text(&render(&mut app, 100, 24));
+    assert!(screen.contains("message 11"), "{screen}");
+    let band = app.regions.scrollback;
+    let rows_on_screen = screen.lines().collect::<Vec<_>>();
+    let band_rows = rows_on_screen[usize::from(band.y)..usize::from(band.y + band.height)].to_vec();
+    let last_content = band_rows
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("the band has content");
+    assert!(
+        last_content.contains("message 11"),
+        "the band ends below the last message:\n{screen}"
     );
 }

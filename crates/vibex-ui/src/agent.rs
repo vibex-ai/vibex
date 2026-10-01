@@ -345,6 +345,60 @@ impl AgentWorkflowState {
         self.conversation_turns_with_reasoning_mode(ReasoningDisplayMode::LatestAtBottom)
     }
 
+    /// Whether the last turn could still be receiving output.
+    ///
+    /// The runtime's session state is the authority, and a just-accepted send
+    /// counts as running while the snapshot catches up — the same rule the
+    /// conversation projection applies.
+    fn turn_is_live(&self) -> bool {
+        let pending_turn = self.pending_mutations.values().any(|kind| {
+            matches!(
+                kind,
+                AgentMutationKind::SendMessage | AgentMutationKind::ContinueTurn
+            )
+        });
+        if pending_turn {
+            return true;
+        }
+        !matches!(
+            self.active_session.value.as_ref().map(|session| session.state),
+            Some(
+                AgentSessionState::Idle
+                    | AgentSessionState::Error
+                    | AgentSessionState::Closed
+                    | AgentSessionState::Archived
+            )
+        )
+    }
+
+    /// The timeline as rows, with the liveness of each turn settled.
+    ///
+    /// [`crate::TimelineModel::rows`] is state-free: it cannot know that the
+    /// runtime has finished the turn, so a provider that streams its answer as
+    /// deltas and never sends a final message leaves a row marked `streaming`
+    /// for the rest of the session — and a client that draws a spinner from
+    /// that flag keeps saying "running" over a finished answer. Only the last
+    /// turn can still be live, and only while the runtime says so; everything
+    /// else is settled here, once, for every client that renders rows.
+    pub fn transcript_rows(&self) -> Vec<vibex_desktop_model::TimelineRow> {
+        let mut rows = self.timeline.rows();
+        let live = self.turn_is_live();
+        let last_turn = rows
+            .iter()
+            .filter_map(|row| row.turn_id.clone())
+            .next_back();
+        for row in &mut rows {
+            if !row.streaming {
+                continue;
+            }
+            let is_last_turn = row.turn_id.is_some() && row.turn_id == last_turn;
+            if !live || !is_last_turn {
+                row.streaming = false;
+            }
+        }
+        rows
+    }
+
     /// Project the authoritative timeline using an explicit presentation mode
     /// so clients rendering the full timeline do not fall back to the legacy
     /// bottom-only reasoning adapter.
