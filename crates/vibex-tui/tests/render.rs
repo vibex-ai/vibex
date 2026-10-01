@@ -2954,3 +2954,35 @@ fn the_frames_click_regions_do_not_accumulate() {
     let _ = render(&mut app, 120, 40);
     assert_eq!(app.regions.turns.len(), 3, "the turn list grew");
 }
+
+/// A pointer can land anywhere, including where nothing is drawn.
+///
+/// The terminal reports motion for the whole window, so the mouse path has to
+/// survive coordinates outside every band. This walks the public entry points
+/// with corners and past-the-end values; the bug it guards against was an
+/// arithmetic overflow inside a guard that only *looked* like it protected the
+/// computation.
+#[test]
+fn mouse_coordinates_outside_every_band_are_harmless() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    // A held message publishes the queue band, and the dock publishes its own.
+    app.enqueue_message("held".to_string());
+    app.perform(Intent::ToggleDock);
+    let _ = render(&mut app, 120, 40);
+
+    for column in [0u16, 1, 60, 119, 120, 400] {
+        for row in [0u16, 1, 20, 39, 40, 200] {
+            app.begin_text_selection(row as usize, column);
+            app.extend_text_selection(row as usize, column);
+            let _ = app.finish_text_selection();
+            let _ = app.select_word_at(row as usize, column);
+            let _ = app.drag_draft_selection(column, row);
+            let _ = app.clear_text_selection();
+        }
+    }
+    // The frame still draws, which is the reader-visible half of "harmless".
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("held"), "{screen}");
+}

@@ -447,6 +447,14 @@ is never a column count.
   so they stay testable without a terminal. A modifier chord is never text:
   every printable-key arm excludes `Ctrl` and `Alt`, so a binding such as
   `Alt+B` reaches the table instead of typing a `b`.
+* **A guard protects the arithmetic beside it, not just the branch.**
+  `bool::then_some(value)` and `map_or(value, …)` evaluate `value` whatever the
+  condition says, so a subtraction inside one runs on coordinates the check just
+  rejected. The mouse is where this bites: a terminal reports motion for the
+  whole window, most of which is outside every band, and a pointer above the
+  queue band subtracted past zero and killed the client. Containment checks wrap
+  the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
+  and a test walks the corners of every band to keep it that way.
 * **A paste over the threshold collapses into a chip.** `PASTE_CHIP_LINES` /
   `PASTE_CHIP_BYTES` decide; the buffer's text holds the label and the original
   bytes ride in a `Chip`. A chip is atomic — the cursor steps over it, one

@@ -1059,22 +1059,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Moved => {
-            let hover = app
-                .regions
-                .list
-                .as_ref()
-                .and_then(|region| {
-                    crate::app::list_row_at(region, mouse.column, mouse.row)
-                        .map(|index| (region.scope, index))
-                })
-                .or_else(|| {
-                    app.regions.queue.and_then(|region| {
-                        rect_contains(region, mouse.column, mouse.row).then_some((
-                            crate::keymap::Scope::Agent,
-                            usize::from(mouse.row - region.y),
-                        ))
-                    })
-                });
+            let hover = hover_target(app, mouse.column, mouse.row);
             if app.hover != hover {
                 app.hover = hover;
                 return true;
@@ -1120,6 +1105,23 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
 
 /// How long two clicks count as one double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// The row a pointer is over, if it is over one.
+///
+/// A pointer that is inside no band is the common case — the terminal reports
+/// motion for the whole window, and most of the window is not a list — so every
+/// arm is a *guard* around its arithmetic rather than a computation the guard
+/// only appears to protect.
+fn hover_target(app: &App, column: u16, row: u16) -> Option<(crate::keymap::Scope, usize)> {
+    if let Some((scope, index)) = app.regions.list.as_ref().and_then(|region| {
+        crate::app::list_row_at(region, column, row).map(|index| (region.scope, index))
+    }) {
+        return Some((scope, index));
+    }
+    let region = app.regions.queue?;
+    rect_contains(region, column, row)
+        .then(|| (crate::keymap::Scope::Agent, usize::from(row - region.y)))
+}
 
 fn rect_contains(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
@@ -1740,5 +1742,53 @@ mod tests {
     #[test]
     fn exit_reasons_are_distinguishable() {
         assert_ne!(ExitReason::UserQuit, ExitReason::ConnectionLost);
+    }
+
+    /// An `App` with nothing behind it, sized like a terminal.
+    fn test_app(columns: u16, rows: u16) -> App {
+        let mut app = App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            crate::app::AppOptions {
+                seat: crate::view::SeatKind::Remote,
+                capability: crate::theme::ColorCapability {
+                    mode: crate::theme::ColorMode::TrueColor,
+                    glyphs: crate::theme::GlyphMode::Unicode,
+                },
+                theme_id: Some("vibex-dark".to_string()),
+                mode: vibex_ui::GpuiThemeMode::Dark,
+                locale: crate::locale::Locale::En,
+                sidebar_path: None,
+            },
+        );
+        app.resize(columns, rows);
+        app
+    }
+
+    #[test]
+    fn a_pointer_outside_a_band_is_not_a_row_in_it() {
+        // The terminal reports motion for the whole window, so most of it is
+        // outside every list. The row arithmetic used to run whatever the
+        // containment check said — `then_some` evaluates its argument — and a
+        // pointer above the queue band subtracted past zero and killed the
+        // client with an overflow.
+        let mut app = test_app(120, 40);
+        app.navigate_to(crate::app::Page::Agent);
+        app.regions.queue = Some(ratatui::layout::Rect {
+            x: 2,
+            y: 30,
+            width: 116,
+            height: 1,
+        });
+        assert_eq!(hover_target(&app, 40, 2), None, "a row above the band");
+        assert_eq!(
+            hover_target(&app, 200, 2),
+            None,
+            "a column outside the band"
+        );
+        assert_eq!(
+            hover_target(&app, 40, 30),
+            Some((crate::keymap::Scope::Agent, 0))
+        );
+        assert_eq!(hover_target(&app, 40, 31), None, "a row below the band");
     }
 }
