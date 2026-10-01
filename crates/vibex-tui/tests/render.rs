@@ -4187,3 +4187,110 @@ fn the_creating_session_view_waits_for_its_session() {
     assert!(app.active_session().is_none());
     assert_eq!(app.transcript.len(), 1);
 }
+
+#[test]
+fn an_answer_reaches_the_timeline_as_it_is_written() {
+    // The question this answers: a streamed answer is not buffered until the
+    // turn ends. Each delta the runtime sends grows the row on screen, and the
+    // client keeps repainting while they arrive.
+    let session_id = vibex_core::VibexSessionId::new();
+    let correlation = vibex_core::CorrelationId::new();
+    let mut user = seeded_item(
+        &session_id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "explain the density rule".into(),
+            attachments: Vec::new(),
+            ..Default::default()
+        }),
+    );
+    user.correlation_id = Some(correlation.clone());
+    let delta = |sequence: i64, chunk: u32, text: &str| {
+        let mut item = seeded_item(
+            &session_id,
+            sequence,
+            vibex_core::TimelineItemKind::AgentMessage,
+            vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                text_delta: text.to_string(),
+                chunk_index: chunk,
+                phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        item.correlation_id = Some(correlation.clone());
+        item
+    };
+
+    let mut app = app(120, 30);
+    app.navigate_to(Page::Agent);
+    let mut session = seeded_session("session_probe", "streaming");
+    session.id = session_id.clone();
+    session.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("apply");
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.active_session.resolve(session.clone());
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id.clone(), vec![user.clone()]);
+    app.sync_transcript();
+
+    // Three deltas, three frames: each one shows more than the last, on the
+    // same row — the answer is being written, not assembled in secret.
+    let mut seen = String::new();
+    for (sequence, chunk) in [
+        (2, "The rule is "),
+        (3, "one row per work item"),
+        (4, ", detail on demand."),
+    ] {
+        app.agent
+            .state
+            .timeline
+            .apply_live(vibex_core::TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence,
+                item: delta(sequence, sequence as u32 - 2, chunk),
+            });
+        app.sync_transcript();
+        assert!(
+            app.is_animating(),
+            "the client stopped repainting mid-answer"
+        );
+        // Compared with whitespace folded: the frame wraps the answer, so a
+        // phrase can straddle two display rows.
+        let screen = text(&render(&mut app, 120, 30));
+        let folded = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = format!("{seen}{chunk}");
+        let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            folded.contains(&expected),
+            "the frame does not show the answer so far ({expected:?}):\n{screen}"
+        );
+        seen.push_str(chunk);
+    }
+
+    // One row, not three: the deltas merge into the message being written.
+    assert_eq!(
+        app.transcript
+            .blocks()
+            .iter()
+            .filter(|block| block.kind == vibex_desktop_model::TimelineRowKind::AgentMessage)
+            .count(),
+        1,
+        "each delta became its own row"
+    );
+
+    // And when the runtime says the turn is over, the row stops claiming to
+    // stream — the last frame is not a spinner over a finished answer.
+    let mut settled = session.clone();
+    settled.state = vibex_core::AgentSessionState::Idle;
+    app.agent.state.active_session.resolve(settled.clone());
+    app.agent.apply_sessions(Ok(vec![settled])).expect("apply");
+    app.sync_transcript();
+    assert!(
+        !app.transcript_animating(),
+        "a finished answer still streams"
+    );
+}
