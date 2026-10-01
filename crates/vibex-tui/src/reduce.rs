@@ -398,9 +398,13 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::SwitchWorkspace => {
-                self.page = Page::Sessions;
-                self.toast(Toast::info(self.strings.workspace_pick().to_string()));
-                Outcome::effects(vec![Effect::ListWorkspaces])
+                // The key is on the composing page's own line, so it has to do
+                // what that line says: open the picker over the runtime's
+                // listing. Listing workspaces into state nothing drew was a
+                // gesture with no result — and it moved the reader off the page
+                // they were writing on.
+                self.overlay = Some(Overlay::WorkspacePicker { selected: 0 });
+                Outcome::effects(vec![Effect::BrowseDirectories { path: None }])
             }
             Intent::OpenWorkspaceBrowser => {
                 self.overlay = Some(Overlay::WorkspacePicker { selected: 0 });
@@ -428,10 +432,16 @@ impl App {
                     return Outcome::quiet();
                 };
                 let path = entry.path.clone();
+                let composing = self.page == Page::NewSession;
                 self.workspace_path = Some(path);
                 self.overlay = None;
-                self.page = Page::NewSession;
-                self.focus = Focus::Composer;
+                // The picker answers the page that opened it: a reader writing
+                // a new session stays there with the directory chosen, and a
+                // reader who opened it from the session list stays there too.
+                if composing {
+                    self.page = Page::NewSession;
+                    self.focus = Focus::Composer;
+                }
                 Outcome::effects(vec![])
             }
 

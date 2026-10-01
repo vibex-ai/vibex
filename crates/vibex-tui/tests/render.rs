@@ -4294,3 +4294,103 @@ fn an_answer_reaches_the_timeline_as_it_is_written() {
         "a finished answer still streams"
     );
 }
+
+#[test]
+fn the_workspace_key_on_the_new_session_page_picks_a_directory() {
+    // The page names the directory and offers the key that changes it. The key
+    // used to list workspaces into state nothing drew, and moved the reader off
+    // the page while it did: pressing it looked like nothing happened, which is
+    // exactly what the page's own hint promised it would not.
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    app.composer.insert_str("keep my draft");
+    let page = app.page;
+
+    // Ctrl+W: the picker opens over the runtime's listing, on this page.
+    let outcome = app.perform(Intent::SwitchWorkspace);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(vibex_tui::app::Overlay::WorkspacePicker { .. })
+        ),
+        "no picker opened: {:?}",
+        app.overlay
+    );
+    assert_eq!(app.page, page, "the reader was moved off the page");
+    assert!(
+        outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, vibex_tui::Effect::BrowseDirectories { .. })),
+        "the listing was not asked for: {:?}",
+        outcome.effects
+    );
+    // The page is still readable behind the picker, with the draft intact.
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy".to_string(),
+        parent: Some("/home".to_string()),
+        entries: vec![vibex_core::RemoteWorkspaceDirectoryEntry {
+            name: "vibex-dev".to_string(),
+            path: "/home/peatboy/vibex-dev".to_string(),
+        }],
+    });
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(
+        screen.contains("vibex-dev"),
+        "the listing is not drawn:\n{screen}"
+    );
+
+    // Enter chooses it, and the page names the directory it will use.
+    app.perform(Intent::ConfirmOverlay);
+    assert!(app.overlay.is_none());
+    assert_eq!(
+        app.new_session_workspace(),
+        "/home/peatboy/vibex-dev",
+        "the chosen directory was not kept"
+    );
+    assert_eq!(app.page, page);
+    assert_eq!(app.composer.text(), "keep my draft", "the draft was lost");
+
+    // And the session is created in it.
+    let created = app
+        .perform(Intent::SubmitComposer)
+        .effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            vibex_tui::Effect::CreateSession { workspace_root, .. } => Some(workspace_root),
+            _ => None,
+        })
+        .expect("no session was asked for");
+    assert_eq!(created, "/home/peatboy/vibex-dev");
+}
+
+#[test]
+fn the_workspace_key_from_the_session_list_does_not_move_the_reader() {
+    // The same key is global. Wherever it is pressed, the picker answers that
+    // page — a reader choosing a directory from the list is not asking to be
+    // dropped into a new session.
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.navigate_to(Page::Sessions);
+    app.perform(Intent::SwitchWorkspace);
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy".to_string(),
+        parent: Some("/home".to_string()),
+        entries: vec![vibex_core::RemoteWorkspaceDirectoryEntry {
+            name: "notes".to_string(),
+            path: "/home/peatboy/notes".to_string(),
+        }],
+    });
+    app.perform(Intent::ConfirmOverlay);
+    assert_eq!(
+        app.page,
+        Page::Sessions,
+        "the reader was moved to a new session"
+    );
+    assert_eq!(app.workspace_path.as_deref(), Some("/home/peatboy/notes"));
+}

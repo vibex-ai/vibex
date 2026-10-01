@@ -385,10 +385,12 @@ The arrangement — pins, order, folded groups and headings — is the reader's
 preference rather than the runtime's state, so it is written to
 `~/.vibex/tui-sidebar.json` beside the key file. A client with nowhere to write
 keeps it in memory for the run. Session creation picks a workspace through
-the authority's own directory browser — `Ctrl+W` opens the picker over the
-runtime's listing, `u` climbs out of a directory, `Enter` chooses — so a remote
-client chooses a path that exists where the Agent runs, rather than typing one
-from memory.
+the authority's own directory browser — `Ctrl+W` (or `b` on the session list)
+opens the picker over the runtime's listing, `u` climbs out of a directory,
+`Enter` chooses — so a remote client chooses a path that exists where the Agent
+runs, rather than typing one from memory. The picker answers the page that
+opened it: a reader writing a new session stays on that page with the directory
+chosen, and one who opened it from the list stays on the list.
 
 ### New session
 

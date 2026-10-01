@@ -502,6 +502,12 @@ is never a column count.
   nothing happened. The projection is drawn while no session is open, is
   stamped with the id when the runtime answers, and a failed creation withdraws
   it and puts the draft back on the page.
+* **A key does what the surface advertising it says.** The composing page's
+  line names `Ctrl+W` as "change the workspace", so that key opens the directory
+  picker there — the old `SwitchWorkspace` listed workspaces into state nothing
+  drew *and* navigated away from the page, which is a gesture with no visible
+  result. A picker answers the page that opened it rather than the flow it was
+  first written for.
 * **A page answers for itself before the session behind it does.** The
   composing page keeps the client's session *selected* (leaving it must return
   there), so anything that asks "which session?" answers wrongly on that page.
