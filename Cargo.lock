@@ -10390,6 +10390,7 @@ dependencies = [
  "tokio",
  "vibex-browser",
  "vibex-core",
+ "vibex-desktop-model",
  "vibex-desktop-runtime",
 ]
 

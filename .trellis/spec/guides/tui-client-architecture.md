@@ -492,9 +492,26 @@ is never a column count.
   from the label so no table is needed), an unread dot, a state mark *and* word,
   and a coarse relative time. Unread is the client's own notion — a final
   `AgentMessage` for a session the reader was not looking at (`note_activity`),
-  cleared by `open_session` — because the runtime does not track "read". Marks
-  are one column at every glyph tier and their shape carries the meaning, or a
-  reader who cannot tell the colours apart loses the state.
+  cleared by `open_session` — because the runtime does not track "read"; the
+  authority's own unread set is folded in beside it. Marks are one column at
+  every glyph tier and their shape carries the meaning, or a reader who cannot
+  tell the colours apart loses the state.
+* **The list draws the authority's arrangement, and edits it there.** Folders,
+  the order of projects and sessions, the pinned band, collapsed headings and
+  unread marks are the Desktop's: `SidebarBackend` reads them as a
+  `RemoteSidebarOrganizationSnapshot` (the remote service when a Desktop is
+  attached, the persisted UI state when this process owns the runtime) and the
+  rows are walked from it with the same `sidebar_root_items` /
+  `sidebar_project_items_for_workspace` / `sort_sidebar_sessions` helpers the
+  Desktop and the phone use. So `p`, a heading's collapse and a reorder are sent
+  back as `MutateSidebarOrganization` with the rendered revision, and the answer
+  replaces the tree; a refusal says so and re-reads. An arrangement that
+  arranges nothing (no folders, no order, no pins) is refused as a source — it
+  carries no information, and adopting it would replace recency with an
+  arbitrary id order — and this client keeps its own fallback projection, as it
+  does when the capability is unsupported. Two arrangements are never mixed:
+  while one is loaded, the local `tui-sidebar.json` state is not what the list
+  draws.
 * **A running turn is what the spinner animates on.** `is_animating` is the
   single question the loop asks before repainting on its own, and it answers
   yes while a turn reads as running (`turn_reads_running`), not only while

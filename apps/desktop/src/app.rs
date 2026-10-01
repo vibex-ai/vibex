@@ -2828,22 +2828,11 @@ impl SidebarAnimationState {
 /// a drag so a layout that changed on the Desktop in the meantime rejects the
 /// stale move instead of silently reordering something else.
 ///
-/// Only layout-bearing state participates. A move is revalidated against the
-/// full tree on the Desktop anyway, so folding pure display state — unread
-/// badges, auto-continue markers, per-session activity timestamps that move a
-/// row without the user arranging anything — into the revision would reject
-/// moves that are still valid, surfacing errors during ordinary streaming.
-fn sidebar_organization_revision(view: &SidebarOrganizationView) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    view.organization.hash(&mut hasher);
-    view.session_order.hash(&mut hasher);
-    view.session_order_anchored_at_ms.hash(&mut hasher);
-    view.project_order.hash(&mut hasher);
-    view.workspace_order.hash(&mut hasher);
-    view.hierarchy_mode.hash(&mut hasher);
-    hasher.finish()
+/// The rule itself lives in [`SidebarOrganizationView::refresh_revision`], so
+/// a shell that owns the runtime without a Desktop attached (the
+/// character-grid client) fingerprints the same arrangement identically.
+fn sidebar_organization_revision(view: &mut SidebarOrganizationView) {
+    view.refresh_revision();
 }
 
 fn sidebar_mutation_error(rejection: SidebarMutationRejection) -> vibex_core::VibexError {
@@ -8862,7 +8851,7 @@ impl VibexWorkbench {
         // The revision is a content fingerprint rather than a counter so that
         // Desktop-side edits invalidate a client's pending drag too, without
         // instrumenting every local mutation site.
-        view.revision = sidebar_organization_revision(&view);
+        sidebar_organization_revision(&mut view);
         view
     }
 

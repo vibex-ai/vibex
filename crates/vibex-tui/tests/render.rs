@@ -4678,10 +4678,11 @@ fn the_spinner_turns_through_the_quiet_parts_of_a_turn() {
     assert!(!app.advance_transcript_animation());
 }
 
-/// The session list is the desktop's sidebar in a terminal: the same order and
-/// the same folders from the shared projection, with each row carrying what the
-/// desktop's row carries — who is answering, what state it is in, whether
-/// anything is new, and when it last said anything.
+/// A list row carries what the desktop's sidebar row carries — who is
+/// answering, what state it is in, whether anything is new, and when it last
+/// said anything. Order and folders come from the arrangement the desktop
+/// publishes (see the arrangement test below); this one covers the row's own
+/// contents, which are the same either way.
 #[test]
 fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     let now = vibex_core::unix_timestamp_ms();
@@ -4890,5 +4891,120 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
             .filter(|line| line.contains("Failed") || line.contains("Running"))
             .all(|line| line.is_ascii()),
         "a legacy console was handed a glyph it cannot draw:\n{screen}"
+    );
+}
+
+/// The list a reader arranged on the desktop is the list this client draws:
+/// the same folders, in the same order, with the pins where they left them.
+#[test]
+fn the_session_list_draws_the_arrangement_the_desktop_published() {
+    let mut first = seeded_session("session_arranged001", "recent answer");
+    first.last_message_at_ms = 1_759_251_200_000;
+    let mut second = seeded_session("session_arranged002", "kept on top");
+    second.project_id = first.project_id.clone();
+    second.last_message_at_ms = 1_759_251_100_000;
+    let mut third = seeded_session("session_arranged003", "put away");
+    third.project_id = first.project_id.clone();
+    third.last_message_at_ms = 1_759_251_000_000;
+
+    let project_id = first.project_id.as_str().to_string();
+    let snapshot = vibex_core::RemoteSidebarOrganizationSnapshot {
+        revision: 5,
+        folders: vec![vibex_core::RemoteSidebarFolder {
+            id: "folder-archive".to_string(),
+            name: "archive".to_string(),
+            project_id: Some(project_id.clone()),
+            workspace_id: None,
+            auto_archive_after_days: None,
+        }],
+        groups: Vec::new(),
+        placements: vec![
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Project,
+                    id: project_id.clone(),
+                },
+                parent_folder_id: None,
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Session,
+                    id: "session_arranged001".to_string(),
+                },
+                parent_folder_id: None,
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Folder,
+                    id: "folder-archive".to_string(),
+                },
+                parent_folder_id: None,
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Session,
+                    id: "session_arranged003".to_string(),
+                },
+                parent_folder_id: Some("folder-archive".to_string()),
+            },
+        ],
+        collapsed_folder_ids: Vec::new(),
+        collapsed_group_ids: Vec::new(),
+        collapsed_project_ids: Vec::new(),
+        collapsed_workspace_ids: Vec::new(),
+        pinned_session_ids: vec!["session_arranged002".to_string()],
+        session_order: vec![
+            "session_arranged001".to_string(),
+            "session_arranged002".to_string(),
+            "session_arranged003".to_string(),
+        ],
+        session_order_anchored_at_ms: i64::MAX,
+        hierarchy_mode: vibex_core::RemoteSidebarHierarchyMode::Compact,
+        project_order: Vec::new(),
+        workspace_order: std::collections::BTreeMap::new(),
+        project_appearances: std::collections::BTreeMap::new(),
+        worktree_titles: std::collections::BTreeMap::new(),
+        project_new_session_locations: std::collections::BTreeMap::new(),
+        auto_continue_project_ids: Vec::new(),
+        auto_continue_session_overrides: std::collections::BTreeMap::new(),
+        auto_continue_session_ids: Vec::new(),
+        auto_continue_paused_session_ids: Vec::new(),
+        unread_session_ids: Vec::new(),
+    };
+
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![first, second, third]))
+        .expect("sessions apply");
+    assert!(app.apply_sidebar_organization(&snapshot));
+    let screen = text(&render(&mut app, 110, 24));
+
+    // The folder is a row of its own, and it sits where the arrangement put it:
+    // after the two sessions, before the one inside it.
+    let lines = screen.lines().collect::<Vec<_>>();
+    let row_of = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle:?}:\n{screen}"))
+    };
+    let kept = row_of("kept on top");
+    let archive = row_of("archive");
+    let recent = row_of("recent answer");
+    assert!(
+        kept < recent && recent < archive,
+        "the arrangement's order was not drawn:\n{screen}"
+    );
+    assert!(
+        row_of("put away") > archive,
+        "the folder's child was drawn outside it:\n{screen}"
+    );
+    // The pinned row is hoisted above the manual order and carries the flag.
+    assert!(kept < recent, "the pin did not hoist the row:\n{screen}");
+    assert!(
+        lines[kept].contains('⚑'),
+        "the pinned row lost its marker: {:?}",
+        lines[kept]
     );
 }

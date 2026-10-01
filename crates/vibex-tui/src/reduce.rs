@@ -143,9 +143,7 @@ impl App {
             Intent::ContextualCancel => self.contextual_cancel(),
             Intent::GotoSessions => {
                 self.select_global(vibex_ui::shell::GlobalDestination::Sessions);
-                Outcome::effects(vec![Effect::ListSessions {
-                    include_archived: self.show_archived,
-                }])
+                Outcome::effects(self.session_page_effects())
             }
             Intent::GotoManagement => {
                 self.select_global(vibex_ui::shell::GlobalDestination::Management);
@@ -260,11 +258,17 @@ impl App {
             Intent::OpenSelectedSession => {
                 let rows = self.sidebar_rows();
                 let index = self.selection_for(Scope::Sessions);
-                let Some(row) = rows.get(index) else {
+                let Some(row) = rows.get(index).cloned() else {
                     return Outcome::quiet();
                 };
                 let Some(session_id) = row.session_id.clone() else {
-                    // A project header toggles instead of opening.
+                    // A heading -- a project, or a folder the reader made --
+                    // toggles instead of opening. When the authority owns the
+                    // arrangement, so does the toggle: a collapse the desktop
+                    // would not see is not a collapse.
+                    if let Some(effect) = self.sidebar_collapse_effect(&row) {
+                        return Outcome::effects(vec![effect]);
+                    }
                     self.toggle_sidebar_collapsed_for(&row.project_id);
                     return Outcome::effects(vec![]);
                 };
@@ -343,9 +347,7 @@ impl App {
             }
             Intent::ToggleShowArchived => {
                 self.show_archived = !self.show_archived;
-                Outcome::effects(vec![Effect::ListSessions {
-                    include_archived: self.show_archived,
-                }])
+                Outcome::effects(self.session_page_effects())
             }
             Intent::ToggleSessionCard => {
                 let Some(session_id) = self.selected_session_row_id() else {
@@ -375,6 +377,18 @@ impl App {
                 Outcome::effects(vec![Effect::Clipboard { text }])
             }
             Intent::PinSession => {
+                let selected = self.selected_sidebar_row();
+                if let Some(row) = selected.as_ref()
+                    && let Some(effect) = self.sidebar_pin_effect(row)
+                {
+                    let message = if row.pinned {
+                        self.strings.sidebar_unpinned()
+                    } else {
+                        self.strings.sidebar_pinned()
+                    };
+                    self.toast(Toast::success(message));
+                    return Outcome::effects(vec![effect]);
+                }
                 if self.toggle_session_pin() {
                     let message = match self.selected_sidebar_row() {
                         Some(row) if row.pinned => self.strings.sidebar_pinned(),
@@ -1427,9 +1441,7 @@ impl App {
             Intent::Back | Intent::CloseOverlay | Intent::ContextualCancel => {
                 self.filtering = false;
                 self.filter.clear();
-                Outcome::effects(vec![Effect::ListSessions {
-                    include_archived: self.show_archived,
-                }])
+                Outcome::effects(self.session_page_effects())
             }
             Intent::ConfirmOverlay => {
                 self.filtering = false;
@@ -2387,14 +2399,28 @@ impl App {
         )
     }
 
+    /// What entering the session list reads: the sessions themselves, and the
+    /// arrangement the authority draws its own sidebar from.
+    ///
+    /// They travel together because the list is the arrangement applied to the
+    /// sessions; a client that fetched one without the other would draw a tree
+    /// that is already stale on arrival.
+    fn session_page_effects(&self) -> Vec<Effect> {
+        vec![
+            Effect::ListSessions {
+                include_archived: self.show_archived,
+            },
+            // Project rows are named by the runtime's project records, which is
+            // what the desktop's sidebar shows; the session list alone would
+            // spell the directory instead.
+            Effect::ListWorkspaces,
+            Effect::LoadSidebarOrganization,
+        ]
+    }
+
     fn refresh_current_page(&mut self) -> Outcome {
         match self.page {
-            Page::NewSession => Outcome::effects(vec![Effect::ListSessions {
-                include_archived: self.show_archived,
-            }]),
-            Page::Sessions => Outcome::effects(vec![Effect::ListSessions {
-                include_archived: self.show_archived,
-            }]),
+            Page::NewSession | Page::Sessions => Outcome::effects(self.session_page_effects()),
             Page::Agent => Outcome::effects(vec![Effect::RefreshTimeline]),
             Page::Devices => Outcome::effects(vec![Effect::ListDevices]),
             Page::Providers => Outcome::effects(vec![Effect::ListProfiles]),
@@ -2609,6 +2635,17 @@ impl App {
     ///
     /// `delta` is in row-index space, so `-1` is up the screen.
     fn move_session(&mut self, delta: isize) -> Outcome {
+        // The authority owns the order when an arrangement is loaded; moving
+        // the local copy instead would show the reader a list nobody else has.
+        match self.sidebar_move(delta) {
+            Some(crate::app::SidebarMove::Remote(effect)) => return Outcome::effects(vec![effect]),
+            Some(crate::app::SidebarMove::Blocked) => {
+                self.toast(Toast::warning(self.strings.sidebar_pinned_first()));
+                return Outcome::quiet();
+            }
+            Some(crate::app::SidebarMove::AtEdge) => return Outcome::quiet(),
+            None => {}
+        }
         match self.move_session_row(delta) {
             Some(true) => Outcome::effects(vec![]),
             Some(false) => {
@@ -2936,6 +2973,7 @@ mod tests {
         let backend = std::sync::Arc::new(vibex_backend::DisconnectedBackend);
         let facade = vibex_backend::BackendFacade::new(
             vibex_backend::BackendCapabilitySnapshot::desktop_native_v1(),
+            backend.clone(),
             backend.clone(),
             backend.clone(),
             backend.clone(),
@@ -3902,6 +3940,214 @@ mod tests {
         assert_eq!(
             draft.answer_for("flag", 0, &field, 0),
             Some(ElicitationAnswerValue::Boolean(false))
+        );
+    }
+
+    /// Two sessions in one project, so the list has one heading and two rows.
+    fn two_sessions() -> (vibex_core::AgentSession, vibex_core::AgentSession) {
+        let mut first = openable_session("session_org000001");
+        first.title = "first".to_string();
+        first.last_message_at_ms = 1_759_251_200_000;
+        let mut second = openable_session("session_org000002");
+        second.title = "second".to_string();
+        second.project_id = first.project_id.clone();
+        second.workspace_id = first.workspace_id.clone();
+        second.workspace_root = first.workspace_root.clone();
+        second.last_message_at_ms = 1_759_251_100_000;
+        (first, second)
+    }
+
+    /// What a desktop publishes when it has pinned the second session and put
+    /// the first one after it by hand.
+    fn arranged_snapshot() -> vibex_core::RemoteSidebarOrganizationSnapshot {
+        vibex_core::RemoteSidebarOrganizationSnapshot {
+            revision: 11,
+            folders: Vec::new(),
+            groups: Vec::new(),
+            placements: Vec::new(),
+            collapsed_folder_ids: Vec::new(),
+            collapsed_group_ids: Vec::new(),
+            collapsed_project_ids: Vec::new(),
+            collapsed_workspace_ids: Vec::new(),
+            pinned_session_ids: vec!["session_org000002".to_string()],
+            session_order: vec![
+                "session_org000001".to_string(),
+                "session_org000002".to_string(),
+            ],
+            session_order_anchored_at_ms: i64::MAX,
+            hierarchy_mode: vibex_core::RemoteSidebarHierarchyMode::Compact,
+            project_order: Vec::new(),
+            workspace_order: std::collections::BTreeMap::new(),
+            project_appearances: std::collections::BTreeMap::new(),
+            worktree_titles: std::collections::BTreeMap::new(),
+            project_new_session_locations: std::collections::BTreeMap::new(),
+            auto_continue_project_ids: Vec::new(),
+            auto_continue_session_overrides: std::collections::BTreeMap::new(),
+            auto_continue_session_ids: Vec::new(),
+            auto_continue_paused_session_ids: Vec::new(),
+            unread_session_ids: vec!["session_org000001".to_string()],
+        }
+    }
+
+    fn arranged_app_with(snapshot: &vibex_core::RemoteSidebarOrganizationSnapshot) -> App {
+        let mut app = capable_app();
+        let (first, second) = two_sessions();
+        app.agent
+            .apply_sessions(Ok(vec![first, second]))
+            .expect("sessions apply");
+        app.page = Page::Sessions;
+        assert!(
+            app.apply_sidebar_organization(snapshot),
+            "the arrangement was not adopted"
+        );
+        app
+    }
+
+    fn arranged_app() -> App {
+        arranged_app_with(&arranged_snapshot())
+    }
+
+    #[test]
+    fn the_authority_arrangement_is_the_order_the_list_draws() {
+        let app = arranged_app();
+        let rows = app.sidebar_rows();
+        // Pinned above the manual order, and the unread mark comes from the
+        // authority rather than from this client's own bookkeeping.
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vibex-reduce-workspace", "second", "first"],
+            "the list did not follow the arrangement: {rows:#?}"
+        );
+        assert!(rows[1].pinned, "the pin did not reach the row");
+        assert!(
+            app.session_is_unread(&vibex_core::VibexSessionId::parse("session_org000001").unwrap())
+        );
+    }
+
+    #[test]
+    fn an_arrangement_that_arranges_nothing_leaves_the_local_order_alone() {
+        let mut app = capable_app();
+        let (first, second) = two_sessions();
+        app.agent
+            .apply_sessions(Ok(vec![first, second]))
+            .expect("sessions apply");
+        let empty = vibex_core::RemoteSidebarOrganizationSnapshot {
+            revision: 0,
+            ..arranged_snapshot()
+        };
+        let empty = vibex_core::RemoteSidebarOrganizationSnapshot {
+            pinned_session_ids: Vec::new(),
+            session_order: Vec::new(),
+            unread_session_ids: Vec::new(),
+            ..empty
+        };
+        app.apply_sidebar_organization(&empty);
+        assert!(
+            app.sidebar_organization().is_none(),
+            "an empty arrangement replaced the fallback"
+        );
+        // No pin, and recency still decides: the fallback list is unchanged.
+        assert!(
+            app.sidebar_rows().iter().all(|row| !row.pinned),
+            "a pin appeared from nowhere"
+        );
+    }
+
+    #[test]
+    fn a_pin_is_asked_of_the_authority_that_owns_the_list() {
+        let mut app = arranged_app();
+        app.set_selection(crate::keymap::Scope::Sessions, 2);
+        let outcome = app.perform(Intent::PinSession);
+        let [
+            Effect::MutateSidebarOrganization {
+                mutation,
+                expected_revision,
+            },
+        ] = outcome.effects.as_slice()
+        else {
+            panic!("expected one sidebar mutation, got {outcome:?}");
+        };
+        assert_eq!(
+            mutation,
+            &vibex_core::RemoteSidebarOrganizationMutation::SetSessionPinned {
+                session_id: "session_org000001".to_string(),
+                pinned: true,
+            }
+        );
+        assert_eq!(
+            *expected_revision,
+            Some(11),
+            "the change must name its tree"
+        );
+        // The local arrangement is not what the reader is looking at, so it is
+        // not what the pin edits.
+        assert!(app.projection.sidebar.pinned_ids.is_empty());
+    }
+
+    #[test]
+    fn a_collapsed_heading_toggles_on_the_authority() {
+        let mut app = arranged_app();
+        app.set_selection(crate::keymap::Scope::Sessions, 0);
+        let outcome = app.perform(Intent::OpenSelectedSession);
+        let [Effect::MutateSidebarOrganization { mutation, .. }] = outcome.effects.as_slice()
+        else {
+            panic!("expected one sidebar mutation, got {outcome:?}");
+        };
+        assert!(
+            matches!(
+                mutation,
+                vibex_core::RemoteSidebarOrganizationMutation::SetProjectCollapsed {
+                    collapsed: true,
+                    ..
+                }
+            ),
+            "a heading did not ask the authority to close: {mutation:?}"
+        );
+    }
+
+    #[test]
+    fn a_move_asks_the_authority_for_the_new_order() {
+        let mut snapshot = arranged_snapshot();
+        snapshot.pinned_session_ids.clear();
+        let mut app = arranged_app_with(&snapshot);
+        // The manual order is what the list draws, so the first session is the
+        // one under the cursor and the second is its neighbour.
+        app.set_selection(crate::keymap::Scope::Sessions, 1);
+        let outcome = app.perform(Intent::MoveSessionDown);
+        let [Effect::MutateSidebarOrganization { mutation, .. }] = outcome.effects.as_slice()
+        else {
+            panic!("expected one sidebar mutation, got {outcome:?}");
+        };
+        let vibex_core::RemoteSidebarOrganizationMutation::MoveItems {
+            items,
+            anchor,
+            position,
+            ..
+        } = mutation
+        else {
+            panic!("a reorder must move the session: {mutation:?}");
+        };
+        assert_eq!(items[0].id, "session_org000001");
+        assert_eq!(anchor.as_ref().expect("an anchor").id, "session_org000002");
+        assert_eq!(position, &vibex_core::RemoteSidebarDropPosition::After);
+    }
+
+    #[test]
+    fn a_move_across_the_pinned_band_says_so_instead_of_asking() {
+        let mut app = arranged_app();
+        // The pinned session leads the band; the row under it is not pinned,
+        // and no arrangement can put one above the other.
+        app.set_selection(crate::keymap::Scope::Sessions, 2);
+        let outcome = app.perform(Intent::MoveSessionUp);
+        assert!(
+            outcome.effects.is_empty(),
+            "an impossible move was sent anyway: {outcome:?}"
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some(app.strings.sidebar_pinned_first())
         );
     }
 }

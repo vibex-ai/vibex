@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     AgentBackend, BackendCapabilitySnapshot, BrowserBackend, DeviceBackend, FileBackend,
-    GitBackend, ManagementBackend, TerminalBackend, WorkspaceBackend,
+    GitBackend, ManagementBackend, SidebarBackend, TerminalBackend, WorkspaceBackend,
 };
 
 #[derive(Clone)]
@@ -16,6 +16,7 @@ pub struct BackendFacade {
     browser: Arc<dyn BrowserBackend>,
     management: Arc<dyn ManagementBackend>,
     device: Arc<dyn DeviceBackend>,
+    sidebar: Arc<dyn SidebarBackend>,
 }
 
 impl BackendFacade {
@@ -30,6 +31,7 @@ impl BackendFacade {
         browser: Arc<dyn BrowserBackend>,
         management: Arc<dyn ManagementBackend>,
         device: Arc<dyn DeviceBackend>,
+        sidebar: Arc<dyn SidebarBackend>,
     ) -> Self {
         Self::new_shared(
             Arc::new(Mutex::new(capabilities)),
@@ -41,6 +43,7 @@ impl BackendFacade {
             browser,
             management,
             device,
+            sidebar,
         )
     }
 
@@ -55,6 +58,7 @@ impl BackendFacade {
         browser: Arc<dyn BrowserBackend>,
         management: Arc<dyn ManagementBackend>,
         device: Arc<dyn DeviceBackend>,
+        sidebar: Arc<dyn SidebarBackend>,
     ) -> Self {
         Self {
             capabilities,
@@ -66,6 +70,7 @@ impl BackendFacade {
             browser,
             management,
             device,
+            sidebar,
         }
     }
 
@@ -113,5 +118,9 @@ impl BackendFacade {
 
     pub fn device(&self) -> &Arc<dyn DeviceBackend> {
         &self.device
+    }
+
+    pub fn sidebar(&self) -> &Arc<dyn SidebarBackend> {
+        &self.sidebar
     }
 }

@@ -45,6 +45,7 @@ pub mod onboarding;
 pub mod reduce;
 pub mod run;
 pub mod search;
+pub mod sessions;
 pub mod settings;
 pub mod terminal;
 pub mod text;

@@ -326,6 +326,81 @@ impl SidebarOrganizationView {
         }
     }
 
+    /// The arrangement a Desktop persisted to its UI state, as a view.
+    ///
+    /// A shell that owns the runtime but has no Desktop attached — the
+    /// character-grid client on a machine where the app is not running — reads
+    /// the arrangement from the file the app writes, so both surfaces draw the
+    /// tree the reader arranged rather than two different ones. Live-only
+    /// fields (unread badges, auto-continue bookkeeping) have no persisted
+    /// form and come back empty; they are the Desktop's to publish, and a
+    /// client with no Desktop attached has nothing else claiming them.
+    pub fn from_sidebar_ui_state(state: &crate::SidebarUiState) -> Self {
+        let mut view = Self {
+            revision: 0,
+            organization: state.organization.clone(),
+            collapsed_project_ids: state.collapsed_project_ids.clone(),
+            collapsed_workspace_ids: state.collapsed_workspace_ids.clone(),
+            pinned_session_ids: state.pinned_session_ids.clone(),
+            session_order: state.session_order.clone(),
+            session_order_anchored_at_ms: state.session_order_anchored_at_ms,
+            hierarchy_mode: state.hierarchy_mode,
+            project_order: state.project_order.clone(),
+            workspace_order: state.workspace_order.clone(),
+            project_appearances: state.project_appearances.clone(),
+            worktree_titles: state.worktree_titles.clone(),
+            project_location_preferences: state.project_location_preferences.clone(),
+            auto_continue_project_ids: BTreeSet::new(),
+            auto_continue_session_overrides: BTreeMap::new(),
+            auto_continue_session_ids: BTreeSet::new(),
+            auto_continue_paused_session_ids: BTreeSet::new(),
+            unread_session_ids: BTreeSet::new(),
+        };
+        view.refresh_revision();
+        view
+    }
+
+    /// Whether this arrangement says anything at all about where rows go.
+    ///
+    /// A reader who has never arranged the sidebar has an empty organization:
+    /// no folders, no manual order, no pins. Such a view carries no
+    /// information, and a client that adopted it would replace its own
+    /// (recency-and-project) ordering with an arbitrary id order — so callers
+    /// keep their fallback until there is an arrangement to mirror.
+    pub fn arranges_anything(&self) -> bool {
+        !self.organization.folders.is_empty()
+            || !self.organization.groups.is_empty()
+            || !self.organization.placements.is_empty()
+            || !self.collapsed_project_ids.is_empty()
+            || !self.collapsed_workspace_ids.is_empty()
+            || !self.pinned_session_ids.is_empty()
+            || !self.session_order.is_empty()
+            || !self.project_order.is_empty()
+            || !self.workspace_order.is_empty()
+            || !self.organization.collapsed_folder_ids.is_empty()
+    }
+
+    /// Content fingerprint of the tree, for optimistic-concurrency checks.
+    ///
+    /// Only layout-bearing state participates. A move is revalidated against
+    /// the full tree by whoever applies it anyway, so folding pure display
+    /// state — unread badges, auto-continue markers, per-session activity
+    /// timestamps that move a row without the user arranging anything — into
+    /// the revision would reject moves that are still valid, surfacing errors
+    /// during ordinary streaming.
+    pub fn refresh_revision(&mut self) {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.organization.hash(&mut hasher);
+        self.session_order.hash(&mut hasher);
+        self.session_order_anchored_at_ms.hash(&mut hasher);
+        self.project_order.hash(&mut hasher);
+        self.workspace_order.hash(&mut hasher);
+        self.hierarchy_mode.hash(&mut hasher);
+        self.revision = hasher.finish();
+    }
+
     /// Applies a client-originated change. `new_folder_id` is supplied by the
     /// caller so id minting stays with the Desktop, which owns the tree.
     /// Returns the fields that changed so callers persist only what moved.
@@ -969,6 +1044,71 @@ mod tests {
             view.organization.placements
         );
         assert_eq!(restored.revision, view.revision);
+    }
+
+    #[test]
+    fn a_persisted_arrangement_reads_back_as_the_view_it_was() {
+        // A shell that owns the runtime without a Desktop attached reads the
+        // arrangement the app persisted; it has to come back as the same tree
+        // the app would draw.
+        let mut ui_state = crate::SidebarUiState::default();
+        ui_state.organization.folders.insert(
+            "folder-1".to_string(),
+            crate::SidebarFolderUiState {
+                name: "Archive".to_string(),
+                project_id: Some("project-1".to_string()),
+                workspace_id: None,
+                auto_archive_after_days: Some(3),
+            },
+        );
+        ui_state
+            .organization
+            .placements
+            .push(crate::SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Folder("folder-1".to_string()),
+                parent_folder_id: None,
+            });
+        ui_state
+            .organization
+            .collapsed_folder_ids
+            .insert("folder-1".to_string());
+        ui_state.project_order = vec!["project-1".to_string()];
+        ui_state.session_order = vec!["session-a".to_string()];
+        ui_state.session_order_anchored_at_ms = 42;
+        ui_state.pinned_session_ids.insert("session-a".to_string());
+        ui_state
+            .collapsed_project_ids
+            .insert("project-2".to_string());
+        ui_state.hierarchy_mode = SidebarHierarchyMode::Detailed;
+
+        let view = SidebarOrganizationView::from_sidebar_ui_state(&ui_state);
+        assert!(view.arranges_anything());
+        assert_eq!(
+            view.organization
+                .folders
+                .get("folder-1")
+                .map(|folder| (folder.name.as_str(), folder.auto_archive_after_days)),
+            Some(("Archive", Some(3)))
+        );
+        assert!(view.organization.collapsed_folder_ids.contains("folder-1"));
+        assert_eq!(view.project_order, vec!["project-1".to_string()]);
+        assert_eq!(view.session_order, vec!["session-a".to_string()]);
+        assert_eq!(view.session_order_anchored_at_ms, 42);
+        assert!(view.pinned_session_ids.contains("session-a"));
+        assert!(view.collapsed_project_ids.contains("project-2"));
+        assert_eq!(view.hierarchy_mode, SidebarHierarchyMode::Detailed);
+        // The revision is a content fingerprint, not a stored counter: two
+        // reads of the same arrangement compare equal, which is what lets a
+        // client's echoed revision be checked against it.
+        assert_eq!(
+            view.revision,
+            SidebarOrganizationView::from_sidebar_ui_state(&ui_state).revision
+        );
+        let other = crate::SidebarUiState::default();
+        assert!(
+            !SidebarOrganizationView::from_sidebar_ui_state(&other).arranges_anything(),
+            "an arrangement nobody made claimed to arrange something"
+        );
     }
 
     #[test]

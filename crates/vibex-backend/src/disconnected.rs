@@ -78,8 +78,8 @@ use crate::{
     BrowserFrameSubscription, BrowserInputRequest, BrowserSessionOpenRequest,
     BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest, DeviceBackend, FileBackend,
     GitBackend, ManagementBackend, ManagementProfileSelectionRequest, MutationRequest,
-    RelayStatusSummary, TerminalBackend, TerminalFrameSubscription, WorkspaceBackend,
-    WorkspaceSummary,
+    RelayStatusSummary, SidebarBackend, TerminalBackend, TerminalFrameSubscription,
+    WorkspaceBackend, WorkspaceSummary,
 };
 
 macro_rules! disconnected_future {
@@ -99,6 +99,7 @@ impl DisconnectedBackend {
         let backend = Arc::new(Self);
         BackendFacade::new(
             BackendCapabilitySnapshot::disconnected_v1(),
+            backend.clone(),
             backend.clone(),
             backend.clone(),
             backend.clone(),
@@ -283,6 +284,22 @@ impl WorkspaceBackend for DisconnectedBackend {
     }
 
     fn ensure_temporary_session_root(&self) -> BackendFuture<'_, String> {
+        disconnected_future!()
+    }
+}
+
+impl SidebarBackend for DisconnectedBackend {
+    fn sidebar_organization(
+        &self,
+    ) -> BackendFuture<'_, vibex_core::RemoteSidebarOrganizationSnapshot> {
+        disconnected_future!()
+    }
+
+    fn mutate_sidebar_organization(
+        &self,
+        _mutation: vibex_core::RemoteSidebarOrganizationMutation,
+        _expected_revision: Option<u64>,
+    ) -> BackendFuture<'_, vibex_core::RemoteSidebarOrganizationSnapshot> {
         disconnected_future!()
     }
 }

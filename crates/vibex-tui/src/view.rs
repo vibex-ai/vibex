@@ -1130,7 +1130,8 @@ fn render_session_view(
                 Style::default().fg(theme.roles.foreground)
             };
             let marker = match row.kind {
-                vibex_desktop_model::AgentSidebarRowKind::Project => {
+                vibex_desktop_model::AgentSidebarRowKind::Folder
+                | vibex_desktop_model::AgentSidebarRowKind::Project => {
                     crate::glyphs::disclosure(!row.collapsed, app.glyph_tier())
                 }
                 // A pinned session keeps its place above the rest, and the list
@@ -1139,6 +1140,21 @@ fn render_session_view(
                     crate::glyphs::pin_marker(app.glyph_tier())
                 }
                 vibex_desktop_model::AgentSidebarRowKind::Session => " ",
+            };
+            // A folder is the reader's own container around whatever they put
+            // in it, so its heading is drawn as one: brighter than the body,
+            // and independent of the colour a selected row carries.
+            let heading_style = if index == selected || hovered {
+                style
+            } else {
+                Style::default()
+                    .fg(theme.roles.gray_bright)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let label_style = if row.kind == vibex_desktop_model::AgentSidebarRowKind::Folder {
+                heading_style
+            } else {
+                style
             };
             // The session's Agent, marked the way the desktop's sidebar marks
             // it: one cell that says *who* is answering, before the title.
@@ -1167,7 +1183,14 @@ fn render_session_view(
                 .max(8);
             let label = truncate_to_width(&row.label, name_width, "…");
             let padding = name_width.saturating_sub(display_width(&label));
-            let mut spans = vec![Span::styled(format!("{indent}{marker} "), style)];
+            let mut spans = vec![Span::styled(
+                format!("{indent}{marker} "),
+                if row.kind == vibex_desktop_model::AgentSidebarRowKind::Folder {
+                    heading_style
+                } else {
+                    style
+                },
+            )];
             if let Some((initial, mark_style)) = agent_mark.clone() {
                 spans.push(Span::styled(
                     format!("{initial} "),
@@ -1190,7 +1213,7 @@ fn render_session_view(
             let padding = padding.saturating_sub(taken);
             spans.push(Span::styled(
                 format!("{label}{}", " ".repeat(padding)),
-                style,
+                label_style,
             ));
             if let Some(state) = row.state {
                 let label = session_state_label(state, strings);

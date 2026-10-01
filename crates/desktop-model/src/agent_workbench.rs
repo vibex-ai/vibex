@@ -13,6 +13,8 @@ use crate::{ReasoningDisplayMode, SidebarState};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSidebarRowKind {
+    /// A user-created folder holding projects, sessions or other folders.
+    Folder,
     Project,
     Session,
 }
@@ -31,6 +33,10 @@ pub struct AgentSidebarRow {
     pub selected: bool,
     pub collapsed: bool,
     pub state: Option<AgentSessionState>,
+    /// The folder this row sits in, when it sits in one. Two rows are siblings
+    /// only when this matches, which is what a reorder acts on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 pub fn project_sidebar_rows(
@@ -108,6 +114,7 @@ pub fn project_sidebar_rows(
             selected: false,
             collapsed,
             state: None,
+            parent_id: None,
         });
         if !collapsed || !query.is_empty() {
             rows.extend(visible_sessions.into_iter().map(|session| AgentSidebarRow {
@@ -122,6 +129,7 @@ pub fn project_sidebar_rows(
                 selected: state.selected_ids.contains(session.id.as_str()),
                 collapsed: false,
                 state: Some(session.state),
+                parent_id: None,
             }));
         }
     }

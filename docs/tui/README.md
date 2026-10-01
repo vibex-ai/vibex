@@ -391,20 +391,32 @@ longer word pushes a column out of line.
   "a moment ago" from "a while ago", and a timestamp to the second is a column
   of noise.
 
-Order and folders are the shared projection's: pinned sessions above the rest,
-manual order within it, grouped by workspace and project, folded with `g`.
-The sidebar groups sessions by workspace and project — `g` folds the headings
-away for one flat run. `/` filters, `Enter` opens, `n` starts a new one, `r`
-renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A` includes
-archived sessions.
-`p` pins the selected session above the rest, and `Alt+↑`/`Alt+↓` move it
-through a manual order. Pinned rows always sort first, so a move across that
-line is refused with a message rather than silently doing nothing.
+Order and folders are the desktop's, because they are the desktop's to own: the
+list draws the arrangement the authority publishes — its folders (nested, with
+whatever is folded), the order of projects and sessions, the pinned band, and
+the unread marks the desktop has already cleared. A session inside a folder is
+indented under it; the folder itself is drawn as a heading, brighter than the
+body. `g` folds the headings away for one flat run. `/` filters — a search opens
+closed folders rather than hiding what it matched. `Enter` opens, `n` starts a
+new one, `r` renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A`
+includes archived sessions.
 
-The arrangement — pins, order, folded groups and headings — is the reader's
-preference rather than the runtime's state, so it is written to
-`~/.vibex/tui-sidebar.json` beside the key file. A client with nowhere to write
-keeps it in memory for the run. Session creation picks a workspace through
+`p` pins the selected session, `Enter` on a heading folds it, and
+`Alt+↑`/`Alt+↓` move a session through the order; all three are sent to the
+authority, which owns the tree and answers with it, so the desktop shows the
+change too and the next desktop-side edit shows up here (the runtime publishes a
+sidebar invalidation, and the client re-reads). Pinned rows always sort first,
+so a move across that line is refused with a message rather than silently doing
+nothing. When the authority refuses a change — a tree that moved on, a move it
+will not make — the refusal is reported and the tree is re-read.
+
+When no arrangement is available — no runtime yet, a runtime with no desktop
+attached, or a reader who has never arranged anything — the list falls back to
+projecting the sessions themselves: pinned first, then recency, grouped by
+workspace and project. That fallback arrangement (pins, order, folded headings)
+is the reader's own preference, so it is written to `~/.vibex/tui-sidebar.json`
+beside the key file; a client with nowhere to write keeps it in memory for the
+run. Session creation picks a workspace through
 the authority's own directory browser — `Ctrl+W` (or `b` on the session list)
 opens the picker over the runtime's listing, `u` climbs out of a directory,
 `Enter` chooses — so a remote client chooses a path that exists where the Agent

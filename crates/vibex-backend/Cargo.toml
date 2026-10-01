@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-native = ["dep:tokio", "dep:vibex-desktop-runtime"]
+native = ["dep:tokio", "dep:vibex-desktop-runtime", "dep:vibex-desktop-model"]
 
 [dependencies]
 serde.workspace = true
@@ -19,6 +19,7 @@ vibex-core = { path = "../core" }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, optional = true }
 vibex-desktop-runtime = { path = "../desktop-runtime", optional = true }
+vibex-desktop-model = { path = "../desktop-model", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

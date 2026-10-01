@@ -19,6 +19,7 @@ mod file;
 mod git;
 mod management;
 mod mutation;
+mod sidebar;
 mod terminal;
 mod workspace;
 
@@ -38,6 +39,7 @@ pub use management::*;
 pub use mutation::*;
 #[cfg(all(feature = "native", not(target_family = "wasm")))]
 pub use native::*;
+pub use sidebar::*;
 pub use terminal::*;
 pub use workspace::*;
 

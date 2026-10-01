@@ -878,7 +878,7 @@ pub fn sidebar_project_projections_with_workspace_order(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                sort_sessions(
+                sort_sidebar_sessions(
                     &mut workspace_sessions,
                     session_order,
                     session_order_anchored_at_ms,
@@ -935,7 +935,7 @@ pub fn sidebar_project_projections_with_workspace_order(
                 .iter()
                 .flat_map(|workspace| workspace.sessions.iter().cloned())
                 .collect::<Vec<_>>();
-            sort_sessions(
+            sort_sidebar_sessions(
                 &mut compact_sessions,
                 session_order,
                 session_order_anchored_at_ms,
@@ -959,7 +959,11 @@ pub fn sidebar_project_projections_with_workspace_order(
 /// under stale manual entries. Sessions absent from `order` always sort by
 /// recency within the band. Pinned sessions stay in their own band above
 /// everything else.
-fn sort_sessions(
+///
+/// Every shell that draws a session band calls this — the Desktop's own tree,
+/// the compact clients mirroring it, and the character-grid client — so the
+/// order a reader arranged on one surface is the order the others show.
+pub fn sort_sidebar_sessions(
     sessions: &mut [AgentSession],
     order: &[String],
     anchored_at_ms: i64,

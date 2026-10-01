@@ -498,9 +498,25 @@ impl SidebarArrangement {
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionState {
     pub sidebar: SidebarState,
+    /// The arrangement the authority draws its own sidebar from, when this
+    /// client has one. It replaces the local arrangement above: the desktop
+    /// owns the tree, and two arrangements would mean the reader sees a list
+    /// neither surface agreed on.
+    pub sidebar_organization: Option<vibex_desktop_model::SidebarOrganizationView>,
     pub rows: Vec<TimelineRow>,
     /// Whether the sidebar pane is collapsed by the user.
     pub sidebar_collapsed: bool,
+}
+
+/// What a session reorder did.
+#[derive(Debug, Clone)]
+pub enum SidebarMove {
+    /// Send this change to the authority, which owns the order.
+    Remote(Effect),
+    /// The move would cross the pinned band, which sorts above everything.
+    Blocked,
+    /// Already against the end of its band.
+    AtEdge,
 }
 
 /// A message waiting for the running turn to end.
@@ -1051,6 +1067,7 @@ impl App {
             agent,
             management,
             projection: ProjectionState {
+                sidebar_organization: None,
                 sidebar: arrangement.sidebar,
                 rows: Vec::new(),
                 sidebar_collapsed: false,
@@ -1585,15 +1602,41 @@ impl App {
 
     /// Sidebar rows for the current filter, with the reader's grouping applied.
     pub fn sidebar_rows(&self) -> Vec<vibex_desktop_model::AgentSidebarRow> {
-        let mut rows = self
-            .agent
-            .state
-            .view(&self.projection.sidebar, &self.filter, self.shell)
-            .sessions;
+        let mut rows = match self.projection.sidebar_organization.as_ref() {
+            Some(view) => {
+                let sessions = self
+                    .agent
+                    .state
+                    .sessions
+                    .value
+                    .as_deref()
+                    .unwrap_or_default();
+                crate::sessions::session_list_rows(&crate::sessions::SessionListInput {
+                    view,
+                    sessions,
+                    projects: &crate::sessions::project_entries(&self.workspace_rows, sessions),
+                    unread_session_ids: &self.unread_sessions,
+                    query: &self.filter,
+                })
+            }
+            // No arrangement to mirror: the list is projected from the
+            // sessions themselves, which is all a client without a desktop
+            // can honestly say about the order.
+            None => {
+                self.agent
+                    .state
+                    .view(&self.projection.sidebar, &self.filter, self.shell)
+                    .sessions
+            }
+        };
         if !self.sidebar_grouped {
-            // Flat mode keeps the order the projection computed -- pinned
-            // first, then the manual order -- and only drops the headings.
-            rows.retain(|row| row.kind != vibex_desktop_model::AgentSidebarRowKind::Project);
+            // Flat mode keeps the order the tree computed -- pinned first, then
+            // the arrangement's positions -- and drops the headings: nothing
+            // nests, so nothing is indented under a row that is not there.
+            rows.retain(|row| row.kind == vibex_desktop_model::AgentSidebarRowKind::Session);
+            for row in &mut rows {
+                row.depth = 0;
+            }
         }
         rows
     }
@@ -1665,6 +1708,125 @@ impl App {
             .filter_map(|row| row.session_id.map(|id| id.to_string()))
             .collect::<Vec<_>>();
         self.projection.sidebar.reconcile(ids);
+    }
+
+    /// The arrangement the authority draws its sidebar from, when loaded.
+    pub fn sidebar_organization(&self) -> Option<&vibex_desktop_model::SidebarOrganizationView> {
+        self.projection.sidebar_organization.as_ref()
+    }
+
+    /// Fold an authority snapshot into the projection.
+    ///
+    /// An arrangement that arranges nothing — no folders, no manual order, no
+    /// pins — is dropped rather than adopted: it carries no information, and
+    /// adopting it would replace this client's ordering with an arbitrary one.
+    pub fn apply_sidebar_organization(
+        &mut self,
+        snapshot: &vibex_core::RemoteSidebarOrganizationSnapshot,
+    ) -> bool {
+        let view = vibex_desktop_model::SidebarOrganizationView::from_remote(snapshot);
+        if !view.arranges_anything() {
+            return self.projection.sidebar_organization.take().is_some();
+        }
+        let changed = self.projection.sidebar_organization.as_ref() != Some(&view);
+        self.projection.sidebar_organization = Some(view);
+        changed
+    }
+
+    /// The authority change that opens or closes the row the cursor is on.
+    ///
+    /// `None` when there is no arrangement loaded, which is the caller's signal
+    /// to fold the change into the local fallback arrangement instead.
+    pub fn sidebar_collapse_effect(
+        &self,
+        row: &vibex_desktop_model::AgentSidebarRow,
+    ) -> Option<Effect> {
+        use vibex_desktop_model::AgentSidebarRowKind;
+
+        let view = self.projection.sidebar_organization.as_ref()?;
+        let mutation = match row.kind {
+            AgentSidebarRowKind::Folder => {
+                vibex_core::RemoteSidebarOrganizationMutation::SetFolderCollapsed {
+                    folder_id: row.id.strip_prefix("folder:")?.to_string(),
+                    collapsed: !row.collapsed,
+                }
+            }
+            AgentSidebarRowKind::Project => {
+                vibex_core::RemoteSidebarOrganizationMutation::SetProjectCollapsed {
+                    project_id: row.project_id.clone(),
+                    collapsed: !row.collapsed,
+                }
+            }
+            AgentSidebarRowKind::Session => return None,
+        };
+        Some(Effect::MutateSidebarOrganization {
+            mutation,
+            expected_revision: Some(view.revision),
+        })
+    }
+
+    /// The authority change that pins or unpins the row the cursor is on.
+    pub fn sidebar_pin_effect(&self, row: &vibex_desktop_model::AgentSidebarRow) -> Option<Effect> {
+        let view = self.projection.sidebar_organization.as_ref()?;
+        let session_id = row.session_id.as_ref()?.as_str().to_string();
+        Some(Effect::MutateSidebarOrganization {
+            mutation: vibex_core::RemoteSidebarOrganizationMutation::SetSessionPinned {
+                session_id,
+                pinned: !row.pinned,
+            },
+            expected_revision: Some(view.revision),
+        })
+    }
+
+    /// The authority change that moves the selected session one place.
+    ///
+    /// `None` when there is no arrangement loaded: the caller moves through the
+    /// local order instead.
+    pub fn sidebar_move(&self, delta: isize) -> Option<SidebarMove> {
+        let view = self.projection.sidebar_organization.as_ref()?;
+        let rows = self.sidebar_rows();
+        let index = self.selection_for(Scope::Sessions);
+        let row = rows.get(index)?;
+        let moving_id = row.session_id.as_ref()?.as_str().to_string();
+        let project_id = row.project_id.clone();
+        let parent_id = row.parent_id.clone();
+        let mut cursor = index as isize + delta;
+        while cursor >= 0 && (cursor as usize) < rows.len() {
+            let candidate = &rows[cursor as usize];
+            if let Some(target_id) = candidate.session_id.as_ref()
+                && candidate.project_id == project_id
+                && candidate.parent_id == parent_id
+            {
+                // Pinned rows sort above the rest whatever the arrangement
+                // says, so a move across that line would look like nothing
+                // happened. Saying so is better than silently disagreeing.
+                if candidate.pinned != row.pinned {
+                    return Some(SidebarMove::Blocked);
+                }
+                let mutation = vibex_core::RemoteSidebarOrganizationMutation::MoveItems {
+                    items: vec![vibex_core::RemoteSidebarItemRef {
+                        kind: vibex_core::RemoteSidebarItemKind::Session,
+                        id: moving_id,
+                    }],
+                    anchor: Some(vibex_core::RemoteSidebarItemRef {
+                        kind: vibex_core::RemoteSidebarItemKind::Session,
+                        id: target_id.as_str().to_string(),
+                    }),
+                    position: if delta > 0 {
+                        vibex_core::RemoteSidebarDropPosition::After
+                    } else {
+                        vibex_core::RemoteSidebarDropPosition::Before
+                    },
+                    project_id: Some(project_id),
+                };
+                return Some(SidebarMove::Remote(Effect::MutateSidebarOrganization {
+                    mutation,
+                    expected_revision: Some(view.revision),
+                }));
+            }
+            cursor += delta;
+        }
+        Some(SidebarMove::AtEdge)
     }
 
     /// Keep the selected session pinned above the rest, or let it go.
@@ -3081,6 +3243,11 @@ impl App {
     /// Whether the session list marks this session as having something new.
     pub fn session_is_unread(&self, session_id: &VibexSessionId) -> bool {
         self.unread_sessions.contains(session_id.as_str())
+            || self
+                .projection
+                .sidebar_organization
+                .as_ref()
+                .is_some_and(|view| view.unread_session_ids.contains(session_id.as_str()))
     }
 
     /// The title of a session by id, when the client has listed it.
@@ -3789,6 +3956,14 @@ pub enum Effect {
     ListSessions {
         include_archived: bool,
     },
+    /// Read the arrangement the authority draws its own sidebar from.
+    LoadSidebarOrganization,
+    /// Apply one arrangement change on the authority, which answers with the
+    /// tree it now holds.
+    MutateSidebarOrganization {
+        mutation: vibex_core::RemoteSidebarOrganizationMutation,
+        expected_revision: Option<u64>,
+    },
     OpenSession {
         session_id: VibexSessionId,
         /// Issued by the shared controller before the fetch starts, so the
@@ -4021,6 +4196,8 @@ impl Effect {
     pub fn key(&self) -> &'static str {
         match self {
             Effect::ListSessions { .. } => "sessions",
+            Effect::LoadSidebarOrganization => "sidebar_organization",
+            Effect::MutateSidebarOrganization { .. } => "sidebar_organization_mutation",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",

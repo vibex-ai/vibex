@@ -1257,6 +1257,28 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             app.reconcile_sidebar_arrangement();
             app.live = LiveState::Ready;
         }
+        AppMessage::SidebarOrganization(result) => {
+            // A failure is not an interface failure: the list falls back to the
+            // sessions' own order, which is what a client with no authority
+            // arrangement has always drawn. Saying anything would only report a
+            // capability the reader never asked for.
+            if let Ok(snapshot) = result {
+                app.apply_sidebar_organization(&snapshot);
+            }
+        }
+        AppMessage::SidebarOrganizationMutated(result) => match result {
+            Ok(snapshot) => {
+                app.apply_sidebar_organization(&snapshot);
+            }
+            Err(error) => {
+                // The change did not land -- a stale revision, a move the
+                // authority will not make. Say so, then re-read the tree so the
+                // list stops showing the arrangement the reader thought they
+                // were editing.
+                app.toast(Toast::warning(error.message));
+                worker.dispatch(crate::app::Effect::LoadSidebarOrganization);
+            }
+        },
         AppMessage::SessionOpened { ticket, result } => {
             let failure = result.as_ref().err().map(|error| error.message.clone());
             // The shared controller owns the projection: applying the snapshot
@@ -1725,6 +1747,17 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::Event(event) => {
+            // A sidebar invalidated on the authority means the tree this client
+            // is drawing is out of date: the reader rearranged it somewhere
+            // else, or another client did.
+            if matches!(
+                &event,
+                vibex_backend::BackendEvent::ProjectionInvalidated(
+                    vibex_backend::BackendProjection::Sidebar
+                )
+            ) {
+                worker.dispatch(crate::app::Effect::LoadSidebarOrganization);
+            }
             // The unread mark is the client's own: the event says what arrived,
             // and the list says where the reader was when it did.
             if let vibex_backend::BackendEvent::Timeline(item) = &event

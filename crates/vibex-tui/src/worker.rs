@@ -43,6 +43,10 @@ pub enum ClipboardContent {
 #[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
     Sessions(BackendResult<Vec<AgentSession>>),
+    /// The arrangement the authority draws its sidebar from, when it has one.
+    SidebarOrganization(BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot>),
+    /// The arrangement after a change this client asked for.
+    SidebarOrganizationMutated(BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot>),
     /// An image off the system clipboard: its media type and bytes, or `None`
     /// when there is none or the desktop offers no way to read one.
     ClipboardImage(Option<(String, Vec<u8>)>),
@@ -227,6 +231,21 @@ impl Dispatch {
             Effect::ListSessions { include_archived } => {
                 let result = self.facade.agent().list_sessions(include_archived).await;
                 self.send(AppMessage::Sessions(result));
+            }
+            Effect::LoadSidebarOrganization => {
+                let result = self.facade.sidebar().sidebar_organization().await;
+                self.send(AppMessage::SidebarOrganization(result));
+            }
+            Effect::MutateSidebarOrganization {
+                mutation,
+                expected_revision,
+            } => {
+                let result = self
+                    .facade
+                    .sidebar()
+                    .mutate_sidebar_organization(mutation, expected_revision)
+                    .await;
+                self.send(AppMessage::SidebarOrganizationMutated(result));
             }
             Effect::OpenSession { session_id, ticket } => {
                 let result = self.load_session(session_id, ticket.after_sequence).await;

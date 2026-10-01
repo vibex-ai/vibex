@@ -11,8 +11,9 @@ use vibex_backend::{
     BrowserFrameSubscription, BrowserInputRequest, BrowserSessionOpenRequest,
     BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest, DeviceBackend,
     DomainCapabilities, FileBackend, GitBackend, ManagementBackend,
-    ManagementProfileSelectionRequest, MutationRequest, RelayStatusSummary, TerminalBackend,
-    TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    ManagementProfileSelectionRequest, MutationRequest, RelayStatusSummary, SidebarBackend,
+    TerminalBackend, TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend,
+    WorkspaceSummary,
 };
 use vibex_core::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
@@ -649,6 +650,7 @@ impl WebRemoteBackend {
         let _ = self.capability_snapshot();
         BackendFacade::new_shared(
             self.capabilities.clone(),
+            self.clone(),
             self.clone(),
             self.clone(),
             self.clone(),
@@ -1865,6 +1867,26 @@ impl AgentBackend for WebRemoteBackend {
                 .await?;
             Ok(decode::<RemoteAgentCancelRuntimeSwitchResponse>(value)?.state)
         })
+    }
+}
+
+impl SidebarBackend for WebRemoteBackend {
+    fn sidebar_organization(
+        &self,
+    ) -> BackendFuture<'_, vibex_core::RemoteSidebarOrganizationSnapshot> {
+        Box::pin(WebRemoteBackend::sidebar_organization(self))
+    }
+
+    fn mutate_sidebar_organization(
+        &self,
+        mutation: vibex_core::RemoteSidebarOrganizationMutation,
+        expected_revision: Option<u64>,
+    ) -> BackendFuture<'_, vibex_core::RemoteSidebarOrganizationSnapshot> {
+        Box::pin(WebRemoteBackend::mutate_sidebar_organization(
+            self,
+            mutation,
+            expected_revision,
+        ))
     }
 }
 

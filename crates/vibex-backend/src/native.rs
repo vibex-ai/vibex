@@ -65,6 +65,7 @@ use vibex_core::{
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemoteProviderManagementSnapshot, RemoteRenameDeviceRequest, RemoteRevokeDeviceRequest,
+    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot,
     RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
     ResolvePermissionRequest, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
     ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
@@ -91,9 +92,11 @@ use crate::{
     BrowserDialogResolution, BrowserFrameBatch, BrowserFrameSubscription, BrowserInputRequest,
     BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
     DeviceBackend, FileBackend, GitBackend, ManagementBackend, ManagementProfileSelectionRequest,
-    MutationRequest, RelayConnectionState, RelayStatusSummary, TerminalBackend, TerminalFrame,
-    TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    MutationRequest, RelayConnectionState, RelayStatusSummary, SidebarBackend, TerminalBackend,
+    TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend,
+    WorkspaceSummary,
 };
+use vibex_desktop_model::{SidebarMutationOutcome, SidebarOrganizationView, UiStateStore};
 
 #[derive(Clone)]
 pub struct NativeBackend {
@@ -129,6 +132,7 @@ impl NativeBackend {
     pub fn facade(self: &Arc<Self>) -> BackendFacade {
         BackendFacade::new(
             self.capability_snapshot(),
+            self.clone(),
             self.clone(),
             self.clone(),
             self.clone(),
@@ -863,6 +867,106 @@ impl AgentBackend for NativeBackend {
                 .cancel_switch(request.payload)
                 .await
                 .map_err(Into::into)
+        })
+    }
+}
+
+/// A backend error for a sidebar change the authority would not make.
+///
+/// The stable code matches the one the Desktop's remote service answers with,
+/// so a client recognises both without a second vocabulary.
+fn sidebar_mutation_error(code: &'static str, message: &'static str) -> BackendError {
+    BackendError::failed(code, message)
+}
+
+fn sidebar_state_error(error: vibex_desktop_model::UiStateError) -> BackendError {
+    BackendError::failed("sidebar_organization_unreadable", error.to_string())
+}
+
+impl SidebarBackend for NativeBackend {
+    fn sidebar_organization(&self) -> BackendFuture<'_, RemoteSidebarOrganizationSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            // The arrangement belongs to the Desktop shell, which is not
+            // running here: this process holds the home lock, so the file the
+            // shell writes is the user's arrangement and nobody is editing it
+            // behind our back.
+            let store = UiStateStore::new(runtime.ui_state_path());
+            let state = store.load_read_only().map_err(sidebar_state_error)?;
+            Ok(SidebarOrganizationView::from_sidebar_ui_state(&state.state.sidebar).to_remote())
+        })
+    }
+
+    fn mutate_sidebar_organization(
+        &self,
+        mutation: RemoteSidebarOrganizationMutation,
+        expected_revision: Option<u64>,
+    ) -> BackendFuture<'_, RemoteSidebarOrganizationSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let store = UiStateStore::new(runtime.ui_state_path());
+            let mut state = store.load_read_only().map_err(sidebar_state_error)?.state;
+            let mut view = SidebarOrganizationView::from_sidebar_ui_state(&state.sidebar);
+            if expected_revision.is_some_and(|revision| revision != view.revision) {
+                return Err(sidebar_mutation_error(
+                    "remote_sidebar_organization_stale_revision",
+                    "the sidebar changed since this client rendered it",
+                ));
+            }
+            let sessions = runtime.agent().list_sessions(false).await?;
+            let session_projects = sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.id.as_str().to_string(),
+                        session.project_id.as_str().to_string(),
+                    )
+                })
+                .collect();
+            let session_workspaces = sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.id.as_str().to_string(),
+                        session.workspace_id.as_str().to_string(),
+                    )
+                })
+                .collect();
+            let folder_id = vibex_core::RequestId::new().to_string();
+            let group_id = vibex_core::RequestId::new().to_string();
+            match view.apply_remote(
+                &mutation,
+                &session_projects,
+                &session_workspaces,
+                &folder_id,
+                &group_id,
+            ) {
+                Ok(SidebarMutationOutcome::Applied(_))
+                | Ok(SidebarMutationOutcome::AlreadyApplied) => {}
+                Err(rejection) => {
+                    return Err(sidebar_mutation_error(
+                        rejection.stable_code(),
+                        rejection.message(),
+                    ));
+                }
+            }
+            let sidebar = &mut state.sidebar;
+            sidebar.organization = view.organization.clone();
+            sidebar.collapsed_project_ids = view.collapsed_project_ids.clone();
+            sidebar.collapsed_workspace_ids = view.collapsed_workspace_ids.clone();
+            sidebar.pinned_session_ids = view.pinned_session_ids.clone();
+            sidebar.session_order = view.session_order.clone();
+            sidebar.session_order_anchored_at_ms = view.session_order_anchored_at_ms;
+            sidebar.hierarchy_mode = view.hierarchy_mode;
+            sidebar.project_order = view.project_order.clone();
+            sidebar.workspace_order = view.workspace_order.clone();
+            sidebar.worktree_titles = view.worktree_titles.clone();
+            sidebar.project_location_preferences = view.project_location_preferences.clone();
+            sidebar.project_appearances = view.project_appearances.clone();
+            store.save(&state).map_err(sidebar_state_error)?;
+            Ok(view.to_remote())
         })
     }
 }
