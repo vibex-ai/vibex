@@ -3931,3 +3931,88 @@ fn a_running_session_reads_as_rows() {
         "the reader's own message is attributed to a runtime:\n{screen}"
     );
 }
+
+#[test]
+fn the_runtime_chosen_on_the_new_session_page_is_not_the_old_sessions() {
+    // With a session open, pressing `n` opens the composing page — and the
+    // client still has that session selected. The picker was answering the
+    // selected session first, so choosing an Agent for the *new* session
+    // switched the old one's runtime instead (and failed, if the old session
+    // could not move), leaving the new session to be created on whatever the
+    // catalogue happened to offer first.
+    use vibex_tui::action::Intent;
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bai".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let open = seeded_session("session_runtime0001", "the session behind the page");
+    app.agent
+        .apply_sessions(Ok(vec![open.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(open.id.clone());
+    app.agent.state.active_session.resolve(open.clone());
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![
+            option("claude", "claude-sonnet"),
+            option("deepseek", "deepseek-v4.1-flash"),
+        ],
+    });
+
+    app.perform(Intent::NewSession);
+    assert_eq!(app.page, vibex_tui::app::Page::NewSession);
+    // The picker opens on the page's own choice, and a choice made there stays
+    // on the page: nothing is dispatched at the session behind it.
+    app.show_runtime_picker();
+    app.perform(Intent::SelectNext);
+    let outcome = app.perform(Intent::ConfirmOverlay);
+    assert!(
+        outcome.effects.is_empty(),
+        "the choice was applied to a session: {:?}",
+        outcome.effects
+    );
+    assert_eq!(
+        app.new_session_runtime
+            .as_ref()
+            .and_then(|selection| selection.model.model_id())
+            .map(str::to_string),
+        Some("deepseek-v4.1-flash".to_string()),
+        "the page's choice was not kept"
+    );
+
+    // And it is what the session is created with.
+    app.composer.insert_str("what is this project?");
+    let created = app
+        .perform(Intent::SubmitComposer)
+        .effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            vibex_tui::Effect::CreateSession { runtime, .. } => Some(runtime),
+            _ => None,
+        })
+        .expect("no session was asked for")
+        .expect("the page's choice was dropped");
+    assert_eq!(
+        created.model.model_id(),
+        Some("deepseek-v4.1-flash"),
+        "the session would be created on another runtime"
+    );
+    assert_eq!(
+        created.agent_id,
+        vibex_core::AgentId::parse("deepseek").unwrap()
+    );
+}

@@ -2107,19 +2107,22 @@ impl App {
             self.toast(Toast::warning(message));
             return Outcome::quiet();
         }
+        // The composing page is answered first, and by the *page* rather than by
+        // whether a session happens to be selected: the reader is writing a new
+        // session, so the choice belongs to the one about to be created — not to
+        // the session behind the page, which the reader is leaving.
+        if self.page == Page::NewSession {
+            self.new_session_runtime = Some(option.selection.clone());
+            let message = format!(
+                "{}: {} · {}",
+                self.strings.session_runtime_label(),
+                option.agent_label,
+                option.model_label
+            );
+            self.toast(Toast::success(message));
+            return Outcome::quiet();
+        }
         let Some(session_id) = self.selected_session_id().cloned() else {
-            // No session yet: the choice belongs to the one about to be created.
-            if self.page == Page::NewSession {
-                self.new_session_runtime = Some(option.selection.clone());
-                let message = format!(
-                    "{}: {} · {}",
-                    self.strings.session_runtime_label(),
-                    option.agent_label,
-                    option.model_label
-                );
-                self.toast(Toast::success(message));
-                return Outcome::quiet();
-            }
             return Outcome::quiet();
         };
         self.guard(

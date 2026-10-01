@@ -493,6 +493,15 @@ is never a column count.
   to see or act on here. `session_is_running` consults the open session first
   and the session list second: the sessions the reader is *not* looking at are
   exactly the case the queue has to get right.
+* **A page answers for itself before the session behind it does.** The
+  composing page keeps the client's session *selected* (leaving it must return
+  there), so anything that asks "which session?" answers wrongly on that page.
+  The runtime picker is the case that bit: it took the session-switch path and
+  switched the session the reader was leaving — failing with "selected Agent
+  runtime configuration is unavailable" — while `new_session_runtime` stayed
+  empty and the session was created on the catalogue's first entry. Decide by
+  the *page* (`page == Page::NewSession`), not by whether a session is
+  selected, and keep the choice on the page until `CreateSession` carries it.
 * **A new session is a page, not a dialog.** The reader who asks for one asked
   to write, so the gesture lands on a page that hands them the composer and
   names what the message will be sent through — Agent, model, workspace — with

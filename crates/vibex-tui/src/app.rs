@@ -1091,7 +1091,10 @@ impl App {
     /// The index of the open session's runtime choice in the loaded catalogue.
     pub fn current_runtime_option_index(&self) -> Option<usize> {
         let catalog = self.runtime_options.as_ref()?;
-        if self.active_session().is_none()
+        // On the page where a session is being written, the row that is current
+        // is the one the reader chose for it — not the one the session behind
+        // the page is running on.
+        if self.page == Page::NewSession
             && let Some(chosen) = self.new_session_runtime.as_ref()
         {
             return catalog
