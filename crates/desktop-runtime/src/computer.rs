@@ -147,10 +147,15 @@ pub struct ComputerLaunchInputs {
 pub enum DriverState {
     /// Never probed.
     Unknown,
-    /// Present at this path, with the version the driver reported.
+    /// Present at this path.
+    ///
+    /// `responsive` is whether it answered as a driver: a file with the right
+    /// name that does not answer is a different problem from a missing driver,
+    /// and it sends the reader to a different button.
     Installed {
         path: PathBuf,
         version: Option<String>,
+        responsive: bool,
     },
     /// Not found on this machine.
     Missing,
@@ -161,8 +166,20 @@ pub enum DriverState {
 }
 
 impl DriverState {
-    pub fn is_installed(&self) -> bool {
+    /// Whether a driver is present at all, responsive or not.
+    pub fn is_present(&self) -> bool {
         matches!(self, Self::Installed { .. })
+    }
+
+    /// Whether a driver is present *and* answered.
+    pub fn is_installed(&self) -> bool {
+        matches!(
+            self,
+            Self::Installed {
+                responsive: true,
+                ..
+            }
+        )
     }
 }
 
@@ -765,15 +782,23 @@ impl ComputerRuntime {
     pub async fn detect_driver(&self) -> DriverState {
         let state = match vibex_computer::CuaDriverCli::discover() {
             Some(driver) => {
-                let version = driver.tool_surface().await.ok().map(|surface| {
-                    format!(
-                        "{} tools",
-                        surface.split(',').filter(|n| !n.is_empty()).count()
-                    )
-                });
-                DriverState::Installed {
-                    path: driver.executable().to_path_buf(),
-                    version,
+                // Asking for the tool list is what tells a driver apart from a
+                // file with the right name: the call is read-only and never
+                // touches the desktop.
+                match driver.tool_surface().await {
+                    Ok(surface) => DriverState::Installed {
+                        path: driver.executable().to_path_buf(),
+                        version: Some(format!(
+                            "{} tools",
+                            surface.split(',').filter(|n| !n.is_empty()).count()
+                        )),
+                        responsive: true,
+                    },
+                    Err(_) => DriverState::Installed {
+                        path: driver.executable().to_path_buf(),
+                        version: None,
+                        responsive: false,
+                    },
                 }
             }
             None => DriverState::Missing,
@@ -825,7 +850,14 @@ impl ComputerRuntime {
             Ok(Ok(output)) if output.status.success() => {
                 let detected = self.detect_driver().await;
                 match detected {
-                    DriverState::Installed { .. } => detected,
+                    DriverState::Installed {
+                        responsive: true, ..
+                    } => detected,
+                    DriverState::Installed { .. } => DriverState::InstallFailed {
+                        detail: "the installer finished, but the driver it left behind does not \
+                                 answer"
+                            .to_string(),
+                    },
                     _ => DriverState::InstallFailed {
                         detail: "the installer finished but no driver was found on this machine"
                             .to_string(),
@@ -1425,14 +1457,21 @@ mod tests {
 
     #[test]
     fn a_driver_state_answers_whether_the_step_is_done() {
-        assert!(
-            DriverState::Installed {
-                path: PathBuf::from("/usr/bin/cua-driver"),
-                version: None,
-            }
-            .is_installed()
-        );
-        assert!(!DriverState::Missing.is_installed());
+        let present = DriverState::Installed {
+            path: PathBuf::from("/usr/bin/cua-driver"),
+            version: Some("28 tools".to_string()),
+            responsive: true,
+        };
+        assert!(present.is_installed() && present.is_present());
+        // A file that does not answer is present but not usable, and the
+        // settings send the reader to a different button for it.
+        let silent = DriverState::Installed {
+            path: PathBuf::from("/usr/bin/cua-driver"),
+            version: None,
+            responsive: false,
+        };
+        assert!(!silent.is_installed() && silent.is_present());
+        assert!(!DriverState::Missing.is_installed() && !DriverState::Missing.is_present());
         assert!(!DriverState::Unknown.is_installed());
         assert!(!DriverState::Installing.is_installed());
         assert!(

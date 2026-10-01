@@ -255,10 +255,29 @@ says four things:
 - **The driver.** Its row carries the state of this machine and the two actions
   that change it: Install and Check again. Installing runs a fixed, documented
   installer for the platform, only after the button is pressed, and never from
-  anything a model wrote. The sentence under the buttons names the one thing
-  still missing — a driver, a permission, the switch — or the driver in use, and
-  it is derived from the machine rather than remembered, so a reinstall or a
-  revoked permission moves it back.
+  anything a model wrote.
+
+  Its sentence names exactly one state, and the states are kept apart because
+  they send the reader to different buttons:
+
+  | State | Sentence | Install |
+  | --- | --- | --- |
+  | never probed | not checked on this machine yet | enabled |
+  | no executable found | no driver on this machine yet | enabled, primary |
+  | found but silent | a driver file was found but did not answer as a driver, with its path | enabled |
+  | present, runtime refuses (no desktop session, root, unsupported platform, engine did not start) | driver found, but *that reason*, with its path and detail | disabled |
+  | present, OS permission missing or restart-pending | the permission is in place or still needed, with the path | disabled |
+  | present, everything in place, switch off | ready at *path* | disabled |
+  | running | running with *path* | disabled, labelled Installed |
+
+  **A driver that is present is never reported as missing**, even when the
+  runtime refuses for another reason: that sentence is what a reader acts on,
+  and a second install is the wrong action for every state below the third row.
+  Detection asks the driver for its own tool list, which is how a file with the
+  right name is told apart from a working engine.
+
+  A window paired with a runtime on **another machine** says so and offers
+  neither button: the driver belongs to the machine that owns the desktop.
 - **The system permissions.** A read-only line with the three states the
   operating system reports, because Vibex cannot consent on the user's behalf
   and a permission that needs a restart must not look like a denial.

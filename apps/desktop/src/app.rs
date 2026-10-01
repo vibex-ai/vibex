@@ -32405,7 +32405,11 @@ impl VibexWorkbench {
                     ),
                 ));
             let note = match &driver {
-                DriverState::Installed { path, version } => Some(match version {
+                DriverState::Installed {
+                    path,
+                    version,
+                    responsive: true,
+                } => Some(match version {
                     Some(version) => format!(
                         "{} {version} — {}",
                         locale::text("Installed", "已安装", "已安裝"),
@@ -66050,7 +66054,15 @@ impl FoundationSettings {
             Ok(pair) => pair,
             Err(_) => return div().into_any_element(),
         };
-        let step = computer_setup_step(
+        // Only the window that owns the local runtime can install anything: a
+        // paired remote seat has no driver of its own to manage, and a button
+        // that silently does nothing is worse than one that is plainly off.
+        let local = self
+            .workbench
+            .read_with(cx, |workbench, _| workbench.computer_runtime.is_some())
+            .unwrap_or(false);
+        let readiness = computer_readiness(
+            local,
             &status.driver,
             status.availability.as_ref(),
             settings.enabled,
@@ -66096,8 +66108,15 @@ impl FoundationSettings {
                         .child(
                             Button::new("computer-install-driver")
                                 .small()
-                                .label(locale::text("Install", "安装", "安裝"))
-                                .disabled(status.busy || status.driver.is_installed())
+                                .when(readiness.installs_driver() && local, |button| {
+                                    button.primary()
+                                })
+                                .label(if readiness.driver_present() {
+                                    locale::text("Installed", "已安装", "已安裝")
+                                } else {
+                                    locale::text("Install", "安装", "安裝")
+                                })
+                                .disabled(status.busy || !local || !readiness.installs_driver())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let _ = this.workbench.update(cx, |workbench, cx| {
                                         workbench.install_computer_driver(cx)
@@ -66109,7 +66128,7 @@ impl FoundationSettings {
                                 .small()
                                 .outline()
                                 .label(locale::text("Check again", "重新检测", "重新偵測"))
-                                .disabled(status.busy)
+                                .disabled(status.busy || !local)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let _ = this.workbench.update(cx, |workbench, cx| {
                                         workbench.detect_computer_driver(cx)
@@ -66123,7 +66142,7 @@ impl FoundationSettings {
                         .text_xs()
                         .whitespace_normal()
                         .text_color(cx.theme().muted_foreground)
-                        .child(computer_readiness_note(step, &status)),
+                        .child(computer_readiness_note(&readiness, &status)),
                 ),
             stacked,
             cx,
@@ -66142,7 +66161,10 @@ impl FoundationSettings {
                 .text_xs()
                 .whitespace_normal()
                 .text_color(cx.theme().muted_foreground)
-                .child(computer_permission_summary(status.availability.as_ref())),
+                .child(computer_permission_summary(
+                    status.availability.as_ref(),
+                    settings.enabled,
+                )),
             stacked,
             cx,
         );
@@ -68386,54 +68408,158 @@ impl Default for ComputerSettingsStatus {
     }
 }
 
-/// Which setup step the reader is on.
+/// What this machine actually needs before an Agent can act, and why.
 ///
-/// Derived from the machine rather than remembered: the page must show what is
-/// actually true after a reinstall, a permission change or a restart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComputerSetupStep {
-    InstallDriver,
-    GrantPermission,
-    TurnOn,
-    Done,
+/// Derived from the machine on every render rather than remembered, so a
+/// reinstall, a revoked permission or a restart moves it. The variants are kept
+/// apart on purpose: "no driver" and "a driver this configuration refuses to
+/// use" look the same to a reader only if the page makes them look the same,
+/// and the second one is not fixed by pressing Install again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComputerReadiness {
+    /// The runtime this window talks to is on another machine. Nothing here can
+    /// install or drive it.
+    RemoteRuntime,
+    /// No driver executable was found on this machine.
+    DriverMissing,
+    /// A driver executable was found but did not answer as a driver: a stale
+    /// file, the wrong build, or a wrapper that is not the engine.
+    DriverUnresponsive { path: std::path::PathBuf },
+    /// A driver is present and the runtime still refuses, for a reason no
+    /// amount of installing will change.
+    Blocked {
+        path: std::path::PathBuf,
+        reason: ComputerUnavailableReason,
+        detail: Option<String>,
+    },
+    /// The operating system has not granted what the driver needs.
+    PermissionPending {
+        path: std::path::PathBuf,
+        restart_required: bool,
+    },
+    /// Everything is in place; the switch is off.
+    Off {
+        path: std::path::PathBuf,
+        version: Option<String>,
+    },
+    /// Running.
+    Ready {
+        path: std::path::PathBuf,
+        version: Option<String>,
+    },
 }
 
-fn computer_setup_step(
+impl ComputerReadiness {
+    /// Whether pressing Install is the action that changes this state.
+    ///
+    /// A driver that does not answer is reinstalled: the file is already there,
+    /// so "install it" is still the right instruction, while the sentence says
+    /// what was actually found.
+    fn installs_driver(&self) -> bool {
+        matches!(self, Self::DriverMissing | Self::DriverUnresponsive { .. })
+    }
+
+    /// Whether the driver is present, whatever else is wrong.
+    fn driver_present(&self) -> bool {
+        !matches!(
+            self,
+            Self::DriverMissing | Self::DriverUnresponsive { .. } | Self::RemoteRuntime
+        )
+    }
+}
+
+/// Reads the readiness out of the three facts the runtime reported.
+fn computer_readiness(
+    local: bool,
     driver: &DriverState,
     availability: Option<&ComputerAvailability>,
     enabled: bool,
-) -> ComputerSetupStep {
-    if !driver.is_installed() {
-        return ComputerSetupStep::InstallDriver;
+) -> ComputerReadiness {
+    if !local {
+        return ComputerReadiness::RemoteRuntime;
     }
-    if let Some(availability) = availability {
-        match availability.unavailable_reason {
-            // These are the OS permissions the second step exists for.
-            Some(ComputerUnavailableReason::PermissionPending)
-            | Some(ComputerUnavailableReason::PermissionRestartRequired)
-            | Some(ComputerUnavailableReason::AccessibilityBridgeMissing) => {
-                return ComputerSetupStep::GrantPermission;
-            }
-            // Anything else the engine reports is not a step the reader can
-            // walk through, so the page stops pretending there is a queue.
-            Some(_) => return ComputerSetupStep::InstallDriver,
-            None => {}
+    let (path, version) = match driver {
+        DriverState::Installed {
+            path,
+            version,
+            responsive: true,
+        } => (path.clone(), version.clone()),
+        // A file with the right name that does not answer is its own state:
+        // telling the reader to install a driver they already have, or that
+        // everything is fine, would both be wrong.
+        DriverState::Installed {
+            path,
+            responsive: false,
+            ..
+        } => {
+            return ComputerReadiness::DriverUnresponsive { path: path.clone() };
         }
+        DriverState::InstallFailed { .. } | DriverState::Unknown | DriverState::Installing => {
+            return ComputerReadiness::DriverMissing;
+        }
+        DriverState::Missing => return ComputerReadiness::DriverMissing,
+    };
+    let Some(availability) = availability else {
+        // The driver is there and nothing has been probed yet: the switch is
+        // the next thing that matters.
+        return if enabled {
+            ComputerReadiness::Ready { path, version }
+        } else {
+            ComputerReadiness::Off { path, version }
+        };
+    };
+    match availability.unavailable_reason {
+        None => {
+            if enabled {
+                ComputerReadiness::Ready { path, version }
+            } else {
+                ComputerReadiness::Off { path, version }
+            }
+        }
+        // The switch is off, so the runtime reports the feature as disabled
+        // rather than probing permissions. That is a state, not a failure.
+        Some(ComputerUnavailableReason::FeatureDisabled) => {
+            ComputerReadiness::Off { path, version }
+        }
+        Some(ComputerUnavailableReason::PermissionPending) => {
+            ComputerReadiness::PermissionPending {
+                path,
+                restart_required: false,
+            }
+        }
+        Some(ComputerUnavailableReason::PermissionRestartRequired) => {
+            ComputerReadiness::PermissionPending {
+                path,
+                restart_required: true,
+            }
+        }
+        Some(reason) => ComputerReadiness::Blocked {
+            path,
+            reason,
+            detail: availability.detail.clone(),
+        },
     }
-    if !enabled {
-        return ComputerSetupStep::TurnOn;
-    }
-    ComputerSetupStep::Done
 }
 
 /// The one-line readiness sentence under the driver buttons.
 ///
-/// It replaces a numbered checklist with a sentence about this machine: what is
-/// missing, in the order the steps have to happen, and nothing at all once the
-/// feature is running.
-fn computer_readiness_note(step: ComputerSetupStep, status: &ComputerSettingsStatus) -> String {
-    match step {
-        ComputerSetupStep::InstallDriver => match &status.driver {
+/// It names the one thing that is missing, or the driver in use. It never
+/// claims a missing driver when one was found: that is the sentence a reader
+/// acts on, and acting on the wrong one costs them an install they did not
+/// need.
+fn computer_readiness_note(
+    readiness: &ComputerReadiness,
+    status: &ComputerSettingsStatus,
+) -> String {
+    match readiness {
+        ComputerReadiness::RemoteRuntime => locale::text(
+            "This window is paired with a runtime on another machine. Install and manage computer \
+             use there.",
+            "当前窗口连接的是另一台机器上的 runtime，请在那边安装和管理电脑操作。",
+            "目前視窗連接的是另一台機器上的 runtime，請在那邊安裝和管理電腦操作。",
+        )
+        .to_string(),
+        ComputerReadiness::DriverMissing => match &status.driver {
             DriverState::InstallFailed { detail } => format!(
                 "{} {detail}",
                 locale::text(
@@ -68448,6 +68574,12 @@ fn computer_readiness_note(step: ComputerSetupStep, status: &ComputerSettingsSta
                 "正在安裝，可能需要幾分鐘。",
             )
             .to_string(),
+            DriverState::Unknown => locale::text(
+                "Not checked on this machine yet.",
+                "尚未在本机检测。",
+                "尚未在本機偵測。",
+            )
+            .to_string(),
             _ => locale::text(
                 "No driver on this machine yet.",
                 "本机还没有驱动。",
@@ -68455,42 +68587,151 @@ fn computer_readiness_note(step: ComputerSetupStep, status: &ComputerSettingsSta
             )
             .to_string(),
         },
-        ComputerSetupStep::GrantPermission => locale::text(
-            "The driver is in place; the operating system still has to allow it.",
-            "驱动已就位，还需要操作系统的授权。",
-            "驅動已就位，還需要作業系統的授權。",
-        )
-        .to_string(),
-        ComputerSetupStep::TurnOn => locale::text(
-            "Everything is in place. Turn computer use on above.",
-            "准备工作已完成，打开上面的开关即可使用。",
-            "準備工作已完成，開啟上面的開關即可使用。",
-        )
-        .to_string(),
-        ComputerSetupStep::Done => match &status.driver {
-            DriverState::Installed { path, version } => match version {
-                Some(version) => format!(
-                    "{} {version} — {}",
-                    locale::text("Running with", "正在使用", "正在使用"),
-                    path.display()
+        ComputerReadiness::DriverUnresponsive { path } => format!(
+            "{} {}",
+            locale::text(
+                "A driver file was found but did not answer as a driver:",
+                "找到了驱动文件，但它没有作为驱动响应：",
+                "找到了驅動檔案，但它沒有作為驅動回應：",
+            ),
+            path.display()
+        ),
+        ComputerReadiness::Blocked {
+            path,
+            reason,
+            detail,
+        } => {
+            let reason = match reason {
+                ComputerUnavailableReason::NoDesktopSession => locale::text(
+                    "this machine has no desktop session to act on",
+                    "本机没有可操作的桌面会话",
+                    "本機沒有可操作的桌面工作階段",
                 ),
-                None => format!(
-                    "{} — {}",
-                    locale::text("Running with", "正在使用", "正在使用"),
-                    path.display()
+                ComputerUnavailableReason::AccessibilityBridgeMissing => locale::text(
+                    "the accessibility bridge is not running",
+                    "无障碍总线没有运行",
+                    "無障礙匯流排沒有執行",
                 ),
-            },
-            _ => locale::text("Running.", "正在运行。", "正在執行。").to_string(),
+                ComputerUnavailableReason::PlatformUnsupported => locale::text(
+                    "this platform cannot be driven",
+                    "本平台不支持被操作",
+                    "本平台不支援被操作",
+                ),
+                ComputerUnavailableReason::RunningAsRoot => locale::text(
+                    "the runtime is running as root, which is refused",
+                    "runtime 以 root 身份运行，已被拒绝",
+                    "runtime 以 root 身分執行，已被拒絕",
+                ),
+                ComputerUnavailableReason::EngineMissing => locale::text(
+                    "the engine did not start",
+                    "引擎没有启动起来",
+                    "引擎沒有啟動起來",
+                ),
+                ComputerUnavailableReason::RemoteRuntimeUnsupported => locale::text(
+                    "the paired runtime is remote",
+                    "配对的 runtime 在远端",
+                    "配對的 runtime 在遠端",
+                ),
+                ComputerUnavailableReason::FeatureDisabled => locale::text(
+                    "the feature is switched off for this runtime",
+                    "该功能在这个 runtime 上被关闭",
+                    "該功能在這個 runtime 上被關閉",
+                ),
+                ComputerUnavailableReason::PermissionPending
+                | ComputerUnavailableReason::PermissionRestartRequired => locale::text(
+                    "the system permission is not usable yet",
+                    "系统权限还不可用",
+                    "系統權限還不可用",
+                ),
+            };
+            let mut note = format!(
+                "{} — {} ({})",
+                locale::text("Driver found, but", "已找到驱动，但", "已找到驅動，但"),
+                reason,
+                path.display()
+            );
+            if let Some(detail) = detail {
+                note.push_str(&format!(" · {detail}"));
+            }
+            note
+        }
+        ComputerReadiness::PermissionPending {
+            path,
+            restart_required,
+        } => {
+            let what = if *restart_required {
+                locale::text(
+                    "The permission is granted but needs a restart of Vibex before it applies.",
+                    "权限已授予，但需要重启 Vibex 才生效。",
+                    "權限已授予，但需要重新啟動 Vibex 才生效。",
+                )
+            } else {
+                locale::text(
+                    "The driver is in place; the operating system still has to allow it.",
+                    "驱动已就位，还需要操作系统的授权。",
+                    "驅動已就位，還需要作業系統的授權。",
+                )
+            };
+            format!("{what} ({})", path.display())
+        }
+        ComputerReadiness::Off { path, version } => match version {
+            Some(version) => format!(
+                "{version} {} — {}",
+                locale::text("ready at", "已就绪：", "已就緒："),
+                path.display()
+            ),
+            None => format!(
+                "{} — {}",
+                locale::text("Ready at", "已就绪：", "已就緒："),
+                path.display()
+            ),
+        },
+        ComputerReadiness::Ready { path, version } => match version {
+            Some(version) => format!(
+                "{} {version} — {}",
+                locale::text("Running with", "正在使用", "正在使用"),
+                path.display()
+            ),
+            None => format!(
+                "{} — {}",
+                locale::text("Running with", "正在使用", "正在使用"),
+                path.display()
+            ),
         },
     }
 }
 
 /// The three permission states, on one line, without inventing a fourth.
-fn computer_permission_summary(availability: Option<&ComputerAvailability>) -> String {
+///
+/// Nothing is probed while the feature is off, and a platform that gates none
+/// of the three says so once instead of three times.
+fn computer_permission_summary(
+    availability: Option<&ComputerAvailability>,
+    enabled: bool,
+) -> String {
+    if !enabled {
+        return locale::text(
+            "Checked once computer use is on.",
+            "打开电脑操作后才会探测。",
+            "開啟電腦操作後才會偵測。",
+        )
+        .to_string();
+    }
     let Some(availability) = availability else {
         return locale::text("Not checked yet.", "尚未检测。", "尚未偵測。").to_string();
     };
     let permissions = availability.permissions;
+    if permissions.accessibility == vibex_core::ComputerPermissionState::NotRequired
+        && permissions.screen_recording == vibex_core::ComputerPermissionState::NotRequired
+        && permissions.input_injection == vibex_core::ComputerPermissionState::NotRequired
+    {
+        return locale::text(
+            "This platform does not gate these through a system permission.",
+            "本平台不通过系统授权控制这些能力。",
+            "本平台不透過系統授權控制這些能力。",
+        )
+        .to_string();
+    }
     let name = |state: vibex_core::ComputerPermissionState| -> &'static str {
         match state {
             vibex_core::ComputerPermissionState::Granted => {
@@ -69613,52 +69854,159 @@ mod tests {
         TimelineRedactionState, TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
+    fn installed_driver() -> DriverState {
+        DriverState::Installed {
+            path: std::path::PathBuf::from("/usr/bin/cua-driver"),
+            version: Some("28 tools".to_string()),
+            responsive: true,
+        }
+    }
+
+    fn availability_with(reason: Option<ComputerUnavailableReason>) -> ComputerAvailability {
+        match reason {
+            Some(reason) => ComputerAvailability {
+                unavailable_reason: Some(reason),
+                ..ComputerAvailability::unavailable(reason, None)
+            },
+            None => ComputerAvailability {
+                unavailable_reason: None,
+                ..ComputerAvailability::unavailable(ComputerUnavailableReason::EngineMissing, None)
+            },
+        }
+    }
+
     #[test]
-    fn the_computer_setup_step_follows_the_machine_not_the_mouse() {
-        let installed = DriverState::Installed {
+    fn the_readiness_model_keeps_the_reasons_apart() {
+        // A remote seat can be told apart before anything else is considered:
+        // no button here can install a driver on another machine.
+        assert_eq!(
+            computer_readiness(false, &DriverState::Missing, None, false),
+            ComputerReadiness::RemoteRuntime
+        );
+        // Nothing found.
+        assert_eq!(
+            computer_readiness(true, &DriverState::Unknown, None, false),
+            ComputerReadiness::DriverMissing
+        );
+        // Found but silent: its own state, and Install is still the fix.
+        let silent = DriverState::Installed {
             path: std::path::PathBuf::from("/usr/bin/cua-driver"),
             version: None,
+            responsive: false,
         };
-        // Nothing installed: the driver is the step.
-        assert_eq!(
-            computer_setup_step(&DriverState::Missing, None, false),
-            ComputerSetupStep::InstallDriver
+        let readiness = computer_readiness(true, &silent, None, false);
+        assert!(
+            matches!(readiness, ComputerReadiness::DriverUnresponsive { .. }),
+            "{readiness:?}"
         );
-        // A driver with an ungranted permission is the second step even when
-        // the switch is already on, because turning it on changes nothing.
-        let pending = ComputerAvailability {
-            unavailable_reason: Some(ComputerUnavailableReason::PermissionPending),
-            ..ComputerAvailability::unavailable(ComputerUnavailableReason::PermissionPending, None)
+        assert!(readiness.installs_driver());
+        // A driver the runtime refuses: the sentence must not send the reader
+        // back to Install, and the button must not invite a second install.
+        for reason in [
+            ComputerUnavailableReason::NoDesktopSession,
+            ComputerUnavailableReason::RunningAsRoot,
+            ComputerUnavailableReason::PlatformUnsupported,
+            ComputerUnavailableReason::EngineMissing,
+        ] {
+            let readiness = computer_readiness(
+                true,
+                &installed_driver(),
+                Some(&availability_with(Some(reason))),
+                true,
+            );
+            assert!(
+                matches!(readiness, ComputerReadiness::Blocked { .. }),
+                "{reason:?} produced {readiness:?}"
+            );
+            assert!(
+                !readiness.installs_driver(),
+                "{reason:?} is not an install problem"
+            );
+            assert!(readiness.driver_present());
+        }
+        // A permission is the one blocked-looking state that a person clears.
+        let readiness = computer_readiness(
+            true,
+            &installed_driver(),
+            Some(&availability_with(Some(
+                ComputerUnavailableReason::PermissionRestartRequired,
+            ))),
+            true,
+        );
+        assert!(matches!(
+            readiness,
+            ComputerReadiness::PermissionPending {
+                restart_required: true,
+                ..
+            }
+        ));
+        // Ready, and the switch simply off.
+        assert!(matches!(
+            computer_readiness(
+                true,
+                &installed_driver(),
+                Some(&availability_with(None)),
+                true
+            ),
+            ComputerReadiness::Ready { .. }
+        ));
+        assert!(matches!(
+            computer_readiness(
+                true,
+                &installed_driver(),
+                Some(&availability_with(Some(
+                    ComputerUnavailableReason::FeatureDisabled
+                ))),
+                false
+            ),
+            ComputerReadiness::Off { .. }
+        ));
+    }
+
+    #[test]
+    fn the_readiness_note_never_claims_a_missing_driver_that_is_present() {
+        let mut status = ComputerSettingsStatus {
+            driver: DriverState::Missing,
+            ..ComputerSettingsStatus::default()
         };
-        assert_eq!(
-            computer_setup_step(&installed, Some(&pending), true),
-            ComputerSetupStep::GrantPermission
+        let note = computer_readiness_note(&ComputerReadiness::DriverMissing, &status);
+        assert!(note.contains("No driver"), "{note}");
+        // Never probed is its own sentence: "no driver" would be a claim the
+        // page cannot make before a check.
+        let unchecked = ComputerSettingsStatus::default();
+        let note = computer_readiness_note(&ComputerReadiness::DriverMissing, &unchecked);
+        assert!(note.contains("Not checked"), "{note}");
+        status.driver = installed_driver();
+        // The bug this test exists for: a driver that is there, with the
+        // runtime refusing for another reason, must not be reported as absent
+        // while the Install button is disabled.
+        let blocked = computer_readiness(
+            true,
+            &status.driver,
+            Some(&availability_with(Some(
+                ComputerUnavailableReason::RunningAsRoot,
+            ))),
+            true,
         );
-        // Driver and permission in place, switch off: the last step is the user's.
-        let ready = ComputerAvailability {
-            unavailable_reason: None,
-            ..ComputerAvailability::unavailable(ComputerUnavailableReason::EngineMissing, None)
+        let note = computer_readiness_note(&blocked, &status);
+        assert!(note.contains("/usr/bin/cua-driver"), "{note}");
+        assert!(note.contains("root"), "{note}");
+        assert!(!note.contains("No driver"), "{note}");
+        // A silent file says so, and names the path it found.
+        let silent = DriverState::Installed {
+            path: std::path::PathBuf::from("/opt/stale/cua-driver"),
+            version: None,
+            responsive: false,
         };
-        assert_eq!(
-            computer_setup_step(&installed, Some(&ready), false),
-            ComputerSetupStep::TurnOn
+        let note = computer_readiness_note(
+            &computer_readiness(true, &silent, None, false),
+            &ComputerSettingsStatus {
+                driver: silent,
+                ..ComputerSettingsStatus::default()
+            },
         );
-        assert_eq!(
-            computer_setup_step(&installed, Some(&ready), true),
-            ComputerSetupStep::Done
-        );
-        // A reason no step can fix must not pretend there is a queue.
-        let unsupported = ComputerAvailability {
-            unavailable_reason: Some(ComputerUnavailableReason::PlatformUnsupported),
-            ..ComputerAvailability::unavailable(
-                ComputerUnavailableReason::PlatformUnsupported,
-                None,
-            )
-        };
-        assert_eq!(
-            computer_setup_step(&installed, Some(&unsupported), true),
-            ComputerSetupStep::InstallDriver
-        );
+        assert!(note.contains("/opt/stale/cua-driver"), "{note}");
+        assert!(!note.contains("No driver"), "{note}");
     }
 
     #[test]
@@ -69722,42 +70070,23 @@ mod tests {
             permissions: report,
             ..ComputerAvailability::unavailable(ComputerUnavailableReason::PermissionPending, None)
         };
-        let summary = computer_permission_summary(Some(&availability));
+        let summary = computer_permission_summary(Some(&availability), true);
         assert!(summary.contains("granted"));
         assert!(summary.contains("restart needed"));
         assert!(summary.contains("not required"));
-        assert!(computer_permission_summary(None).contains("Not checked"));
-    }
-
-    #[test]
-    fn the_readiness_note_says_what_is_missing_and_nothing_more() {
-        let mut status = ComputerSettingsStatus::default();
+        // Nothing is probed while the switch is off, and the page says that
+        // rather than reporting three permissions that were never read.
         assert!(
-            computer_readiness_note(ComputerSetupStep::InstallDriver, &status)
-                .contains("No driver")
+            computer_permission_summary(Some(&availability), false)
+                .contains("once computer use is on")
         );
-        status.driver = DriverState::InstallFailed {
-            detail: "curl: (7) connection refused".to_string(),
+        assert!(computer_permission_summary(None, true).contains("Not checked"));
+        // A platform that gates none of the three says it once.
+        let free = ComputerAvailability {
+            permissions: ComputerPermissionReport::unsupported(),
+            ..ComputerAvailability::unavailable(ComputerUnavailableReason::FeatureDisabled, None)
         };
-        assert!(
-            computer_readiness_note(ComputerSetupStep::InstallDriver, &status)
-                .contains("connection refused")
-        );
-        status.driver = DriverState::Installed {
-            path: std::path::PathBuf::from("/usr/bin/cua-driver"),
-            version: Some("0.28.0".to_string()),
-        };
-        assert!(
-            computer_readiness_note(ComputerSetupStep::GrantPermission, &status)
-                .contains("operating system")
-        );
-        assert!(
-            computer_readiness_note(ComputerSetupStep::TurnOn, &status)
-                .contains("Turn computer use on")
-        );
-        let ready = computer_readiness_note(ComputerSetupStep::Done, &status);
-        assert!(ready.contains("/usr/bin/cua-driver"));
-        assert!(ready.contains("0.28.0"));
+        assert!(computer_permission_summary(Some(&free), true).contains("does not gate"));
     }
 
     #[test]
