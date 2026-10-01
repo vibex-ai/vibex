@@ -113,10 +113,16 @@ pub fn disclosure(open: bool, tier: GlyphTier) -> &'static str {
 }
 
 /// The marker beside a row the reader has pinned. One column.
+///
+/// A star rather than a flag: this column already carries the Agent's letter in
+/// the next cell, and a flag beside a letter read as two pieces of the same
+/// word. The star is the shape every list uses for "kept", it is one cell in
+/// the same width class as the other marks, and at the legacy tier it degrades
+/// to the ASCII star.
 pub fn pin_marker(tier: GlyphTier) -> &'static str {
     match tier {
-        GlyphTier::Full => "⚑",
-        GlyphTier::Legacy => "!",
+        GlyphTier::Full => "★",
+        GlyphTier::Legacy => "*",
     }
 }
 

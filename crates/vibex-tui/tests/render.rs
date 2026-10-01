@@ -5003,7 +5003,7 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
     // The pinned row is hoisted above the manual order and carries the flag.
     assert!(kept < recent, "the pin did not hoist the row:\n{screen}");
     assert!(
-        lines[kept].contains('⚑'),
+        lines[kept].contains('★'),
         "the pinned row lost its marker: {:?}",
         lines[kept]
     );

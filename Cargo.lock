@@ -10386,6 +10386,7 @@ version = "0.1.0-rc.7"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "vibex-browser",

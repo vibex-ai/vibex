@@ -360,6 +360,27 @@ impl SidebarOrganizationView {
         view
     }
 
+    /// Write this arrangement back into the UI state it came from.
+    ///
+    /// The inverse of [`Self::from_sidebar_ui_state`], and the only writer a
+    /// shell without a Desktop attached has. Live-only fields (unread badges,
+    /// auto-continue bookkeeping) are the Desktop's and are left alone: this
+    /// call owns the tree, not the badges.
+    pub fn apply_to_sidebar_ui_state(&self, state: &mut crate::SidebarUiState) {
+        state.organization = self.organization.clone();
+        state.collapsed_project_ids = self.collapsed_project_ids.clone();
+        state.collapsed_workspace_ids = self.collapsed_workspace_ids.clone();
+        state.pinned_session_ids = self.pinned_session_ids.clone();
+        state.session_order = self.session_order.clone();
+        state.session_order_anchored_at_ms = self.session_order_anchored_at_ms;
+        state.hierarchy_mode = self.hierarchy_mode;
+        state.project_order = self.project_order.clone();
+        state.workspace_order = self.workspace_order.clone();
+        state.worktree_titles = self.worktree_titles.clone();
+        state.project_location_preferences = self.project_location_preferences.clone();
+        state.project_appearances = self.project_appearances.clone();
+    }
+
     /// Whether this arrangement says anything at all about where rows go.
     ///
     /// A reader who has never arranged the sidebar has an empty organization:

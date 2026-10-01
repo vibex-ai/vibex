@@ -380,10 +380,14 @@ longer word pushes a column out of line.
   the same Agent keeps its colour across sessions and machines without a table
   to maintain. It leads the row because "who is answering" is the first thing a
   reader scanning several sessions wants.
-- **The unread dot** appears on a session whose answer finished while the reader
-  was looking elsewhere — the client's own notion, cleared by opening it. The
-  dot and the pin are different shapes, not only different colours: they share
-  the leading column, and a monochrome terminal has to tell them apart.
+- **The unread dot** (`●`) appears on a session whose answer finished while the
+  reader was looking elsewhere — the client's own notion, cleared by opening
+  it. The dot and the pin are different shapes, not only different colours:
+  they share the leading column, and a monochrome terminal has to tell them
+  apart.
+- **The pin** (`★`, or `*` on a terminal without box drawing) marks a session
+  the authority has hoisted above the rest. It leads the row because a pinned
+  session is the one the reader asked to keep in view.
 - **State** is a mark and a word: `▶` running, `✗` failed, `·` idle, `◆` waiting
   on the reader, `▤` archived. The shape carries the meaning on its own; the
   colour says it a second time.
@@ -405,7 +409,10 @@ includes archived sessions.
 `Alt+↑`/`Alt+↓` move a session through the order; all three are sent to the
 authority, which owns the tree and answers with it, so the desktop shows the
 change too and the next desktop-side edit shows up here (the runtime publishes a
-sidebar invalidation, and the client re-reads). Pinned rows always sort first,
+sidebar invalidation, and the client re-reads). The answer carries the revision
+of the tree it now holds, not the one from before the change: that revision is
+what the client echoes with its next change, so a stale one would make every
+second keystroke look like a race. Pinned rows always sort first,
 so a move across that line is refused with a message rather than silently doing
 nothing. When the authority refuses a change — a tree that moved on, a move it
 will not make — the refusal is reported and the tree is re-read.

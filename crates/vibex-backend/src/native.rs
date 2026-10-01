@@ -952,21 +952,15 @@ impl SidebarBackend for NativeBackend {
                     ));
                 }
             }
-            let sidebar = &mut state.sidebar;
-            sidebar.organization = view.organization.clone();
-            sidebar.collapsed_project_ids = view.collapsed_project_ids.clone();
-            sidebar.collapsed_workspace_ids = view.collapsed_workspace_ids.clone();
-            sidebar.pinned_session_ids = view.pinned_session_ids.clone();
-            sidebar.session_order = view.session_order.clone();
-            sidebar.session_order_anchored_at_ms = view.session_order_anchored_at_ms;
-            sidebar.hierarchy_mode = view.hierarchy_mode;
-            sidebar.project_order = view.project_order.clone();
-            sidebar.workspace_order = view.workspace_order.clone();
-            sidebar.worktree_titles = view.worktree_titles.clone();
-            sidebar.project_location_preferences = view.project_location_preferences.clone();
-            sidebar.project_appearances = view.project_appearances.clone();
+            view.apply_to_sidebar_ui_state(&mut state.sidebar);
             store.save(&state).map_err(sidebar_state_error)?;
-            Ok(view.to_remote())
+            // Answer with the arrangement as it now reads, not with the one
+            // this call happened to hold: saving normalizes, and a snapshot
+            // carrying a pre-normalization revision would be refused as stale
+            // by the very next change — a reader would have to press twice for
+            // every collapse.
+            let saved = store.load_read_only().map_err(sidebar_state_error)?;
+            Ok(SidebarOrganizationView::from_sidebar_ui_state(&saved.state.sidebar).to_remote())
         })
     }
 }

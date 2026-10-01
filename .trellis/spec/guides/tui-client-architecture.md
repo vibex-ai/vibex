@@ -495,7 +495,8 @@ is never a column count.
   cleared by `open_session` — because the runtime does not track "read"; the
   authority's own unread set is folded in beside it. Marks are one column at
   every glyph tier and their shape carries the meaning, or a reader who cannot
-  tell the colours apart loses the state.
+  tell the colours apart loses the state: `★` pinned (ASCII `*`), `●` unread,
+  and the state's own `▶`/`✗`/`·`/`◆`/`▤`.
 * **The list draws the authority's arrangement, and edits it there.** Folders,
   the order of projects and sessions, the pinned band, collapsed headings and
   unread marks are the Desktop's: `SidebarBackend` reads them as a
@@ -505,7 +506,11 @@ is never a column count.
   `sidebar_project_items_for_workspace` / `sort_sidebar_sessions` helpers the
   Desktop and the phone use. So `p`, a heading's collapse and a reorder are sent
   back as `MutateSidebarOrganization` with the rendered revision, and the answer
-  replaces the tree; a refusal says so and re-reads. An arrangement that
+  replaces the tree; a refusal says so and re-reads. The revision is the
+  content's fingerprint, so an answer must carry the fingerprint of the tree it
+  actually holds — the shell that owns the runtime re-reads after saving rather
+  than answering with the view it applied, or the client's next echo is refused
+  and every second keystroke looks like a race. An arrangement that
   arranges nothing (no folders, no order, no pins) is refused as a source — it
   carries no information, and adopting it would replace recency with an
   arbitrary id order — and this client keeps its own fallback projection, as it

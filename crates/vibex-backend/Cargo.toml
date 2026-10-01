@@ -23,3 +23,4 @@ vibex-desktop-model = { path = "../desktop-model", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
