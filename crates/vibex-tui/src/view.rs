@@ -38,6 +38,12 @@ fn bordered(theme: &TuiTheme) -> Block<'static> {
     modal::border_block(theme)
 }
 
+/// Draft rows the composer grows to before it scrolls instead.
+///
+/// The band is `borders + a blank row + these rows`; capping it is what keeps a
+/// pasted document from taking the whole screen away from the transcript.
+const MAX_COMPOSER_DRAFT_ROWS: usize = 8;
+
 /// Which seat the client is attached by. Decided by the composition root, not
 /// by the library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,7 +511,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     frame.render_widget(Block::default().style(theme.base()), area);
 
-    let bands = crate::layout::compute(area, band_request(app));
+    // The composer's height depends on the width the layout gives it: a draft
+    // that is one logical line can still wrap to several display rows. The
+    // first pass measures the prompt band, the second sizes it.
+    let mut request = band_request(app);
+    request.prompt = composer_height(app, crate::layout::compute(area, request).prompt.width);
+    let bands = crate::layout::compute(area, request);
 
     render_status_band(frame, bands.status, app, &theme, strings);
     if Bands::is_visible(bands.tasks) {
@@ -635,21 +646,39 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         },
         // The composer belongs to a session. On a page with no session context
         // there is nothing to send, so the band is not allocated and the
-        // transcript gets its rows instead.
-        prompt: if app.page.is_session_page() {
-            // Borders (2) + one blank row above the draft + the draft itself,
-            // capped so a long paste cannot take the whole screen. The info line
-            // rides on the bottom border rather than taking a row.
-            (app.composer.line_count().min(8) as u16 + 3).max(4)
-        } else {
-            0
-        },
+        // transcript gets its rows instead. Its height is left at zero here and
+        // measured by [`composer_height`] once the band's width is known.
+        prompt: 0,
         prompt_gap: u16::from(app.page.is_session_page()),
         shortcuts: 1,
         status_line: u16::from(
             app.settings.status_line && app.page.is_session_page() && app.viewport.1 > 24,
         ),
     }
+}
+
+/// The composer band's height at `width` columns, borders included.
+///
+/// The draft is wrapped at the same width the renderer paints at, so a line
+/// wider than the box grows the box rather than being clipped to its first row.
+/// [`crate::layout::compute`] squeezes this back down on a short terminal —
+/// the transcript's minimum rows are kept first — and the composer scrolls
+/// under a shorter box instead of losing the caret.
+fn composer_height(app: &App, width: u16) -> u16 {
+    if !app.page.is_session_page() {
+        return 0;
+    }
+    // The block's two border columns, then the prompt arrow's two.
+    let text_width = usize::from(width)
+        .saturating_sub(2)
+        .saturating_sub(crate::glyphs::PROMPT_ARROW_WIDTH);
+    let rows = app
+        .composer
+        .display_row_count(text_width)
+        .min(MAX_COMPOSER_DRAFT_ROWS);
+    // Borders (2) + one blank row above the draft + the draft itself. The info
+    // line rides on the bottom border rather than taking a row.
+    (rows as u16 + 3).max(4)
 }
 
 /// A one-line band summarising background work.
@@ -2273,6 +2302,7 @@ fn render_composer(
 
     let prompt_width = crate::glyphs::PROMPT_ARROW_WIDTH;
     let width = usize::from(text_area.width).saturating_sub(prompt_width);
+    let caret = app.composer.cursor_cell(width);
     let tier = app.glyph_tier();
     // The prefix says what the draft will do: `❯` sends to the Agent, `!` runs a
     // shell command, `?` searches history.
@@ -2289,6 +2319,10 @@ fn render_composer(
     // border rows only take focus, since there is no cell to place a caret on.
     app.regions.composer = Some(text_area);
     app.regions.composer_band = Some(area);
+    // Display rows the draft has scrolled past the top of the box, which is what
+    // maps a click on a visible row back to the row the draft wrapped to.
+    let mut scroll = 0usize;
+    app.regions.composer_scroll = 0;
     if app.composer.text().is_empty() {
         // The placeholder explains the mode rather than the product: the mode is
         // the thing the reader cannot guess from an empty box.
@@ -2311,22 +2345,30 @@ fn render_composer(
             text_area,
         );
     } else {
-        let (cursor_line, _) = app.composer.cursor_line_column();
         let chips = app.composer.chip_ranges();
         let selection = app.composer.selection();
         let rows = app.composer.display_rows(width);
+        let visible = usize::from(text_area.height).max(1);
+        // A draft taller than the box scrolls under it, anchored to the caret:
+        // the row being typed on is always the row that is shown.
+        scroll = (usize::from(caret.0) + 1).saturating_sub(visible);
+        app.regions.composer_scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
         let lines = rows
             .into_iter()
             .enumerate()
+            .skip(scroll)
+            .take(visible)
             .map(|(index, row)| {
+                // The draft's first row carries the prompt mark; when it scrolls
+                // away the visible rows are continuations and keep the indent.
                 let gutter = if index == 0 {
                     Span::styled(prefix.to_string(), prefix_style)
                 } else {
                     Span::raw(" ".repeat(prompt_width))
                 };
-                // The cursor's line is drawn at full strength; the rest of a
+                // The caret's row is drawn at full strength; the rest of a
                 // long draft recedes so the eye stays where typing happens.
-                let style = if index == cursor_line && row.cursor_line {
+                let style = if index == usize::from(caret.0) {
                     theme.base()
                 } else {
                     theme.base().add_modifier(Modifier::DIM)
@@ -2350,9 +2392,9 @@ fn render_composer(
     // character will occupy. A composer that only highlights itself leaves the
     // reader guessing where typing will land.
     if focused {
-        let (row, column) = app.composer.cursor_cell(width);
-        let x = text_area.x + prompt_width as u16 + column;
-        let y = text_area.y + row;
+        let row = usize::from(caret.0).saturating_sub(scroll);
+        let x = text_area.x + prompt_width as u16 + caret.1;
+        let y = text_area.y + u16::try_from(row).unwrap_or(u16::MAX);
         if x < text_area.right() && y < text_area.bottom() {
             frame.set_cursor_position((x, y));
         }

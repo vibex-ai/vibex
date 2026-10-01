@@ -145,7 +145,7 @@ outer padding (1 row top/bottom, 2 columns each side)
   [gap] [banner]       transient messages
   [gap] [dock]         the running-work panel, while it is open
   prompt gap           1 row
-  prompt               borders + one blank row + the draft
+  prompt               borders + one blank row + the draft's wrapped rows
   shortcut band        1 row, always last
 outer padding
 ```
@@ -175,6 +175,15 @@ Rules that make this work:
 * **Session-view bands only exist on session pages.** `band_request` gives the
   plan, queue, turn-status and dock bands zero height when the page has no
   session context, so the session list cannot wear the active session's chrome.
+* **The composer is sized in wrapped rows, not newlines.** A draft that is one
+  logical line can be several rows on screen, so `band_request` cannot know the
+  prompt's height on its own: `render` computes the frame once to learn the
+  band's width, then `composer_height` measures `display_row_count(width)` —
+  the same `wrap_source_text` the renderer paints with — and computes the frame
+  again. The band is capped at `MAX_COMPOSER_DRAFT_ROWS`; past that the box
+  scrolls under the caret and republishes the rows it scrolled as
+  `FrameRegions::composer_scroll`, which is what a click adds back to map a
+  visible row onto the row the draft wrapped to.
 * **A list column is measured in cells, never in characters.** Padding a row
   with `{:<width$}` counts characters, so a double-width title overflows its
   column and drags everything after it out of alignment; the session list

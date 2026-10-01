@@ -632,6 +632,12 @@ pub struct FrameRegions {
     pub modal_close: Option<ratatui::layout::Rect>,
     /// The composer's text rows, for click-to-place-the-cursor.
     pub composer: Option<ratatui::layout::Rect>,
+    /// Display rows the composer has scrolled past the top of its text area.
+    ///
+    /// The draft is wrapped to the box, and one taller than the box scrolls
+    /// under it; without this a click on a visible row would place the caret on
+    /// the row that row would have been at with no scrolling.
+    pub composer_scroll: u16,
     /// The queue band's rows, for click-to-select.
     pub queue: Option<ratatui::layout::Rect>,
     /// The dock panel's rows, for click-to-select.
@@ -1771,8 +1777,12 @@ impl App {
         }
         self.focus = Focus::Composer;
         if in_text {
-            self.composer
-                .move_cursor_to_cell(row - text_area.y, column - text_area.x);
+            // The published row counts from the top of the text area, so the
+            // rows the box scrolled past have to be added back.
+            self.composer.move_cursor_to_cell(
+                row - text_area.y + self.regions.composer_scroll,
+                column - text_area.x,
+            );
             self.composer.begin_selection();
             self.draft_selecting = true;
         }

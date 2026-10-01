@@ -74,14 +74,8 @@ fn content_end_column(buffer: &ratatui::buffer::Buffer, row: u16) -> Option<u16>
     })
 }
 
-/// Draw one frame and return the screen as text, one line per row.
-fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal
-        .draw(|frame| vibex_tui::view::render(frame, app))
-        .expect("frame draws");
-    let buffer = terminal.backend().buffer().clone();
+/// The screen as text, one line per row.
+fn buffer_lines(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<String> {
     (0..height)
         .map(|row| {
             (0..width)
@@ -96,6 +90,17 @@ fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// Draw one frame and return the screen as text, one line per row.
+fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, app))
+        .expect("frame draws");
+    let buffer = terminal.backend().buffer().clone();
+    buffer_lines(&buffer, width, height)
 }
 
 fn text(lines: &[String]) -> String {
@@ -1601,6 +1606,106 @@ fn the_composer_places_the_terminal_cursor_on_the_draft() {
     assert!(
         wrapped.y > region.y || wrapped.x > position.x,
         "the caret did not follow the draft"
+    );
+}
+
+#[test]
+fn a_wrapped_draft_keeps_every_row_on_screen() {
+    // Regression: the composer's band counted newlines, so one draft line that
+    // wrapped was one row tall and the renderer clipped everything past it.
+    let mut app = app(80, 24);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.set_text(
+        "the quick brown fox jumps over the lazy dog and keeps on running past the edge of the box",
+    );
+    let lines = render(&mut app, 80, 24);
+    let screen = text(&lines);
+    assert!(
+        screen.contains("quick"),
+        "the draft's first row is missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("edge of the box"),
+        "the wrapped draft was clipped to its first row:\n{screen}"
+    );
+    let region = app
+        .regions
+        .composer
+        .expect("the composer published its rows");
+    assert!(region.height >= 2, "the box did not grow: {region:?}");
+    // The box grew by exactly the rows it drew: the bottom border still sits on
+    // the row after the last text row.
+    assert_eq!(
+        usize::from(region.bottom()),
+        lines
+            .iter()
+            .position(|line| line.contains('╰'))
+            .expect("the composer has a bottom border"),
+        "the box and its rows disagree:\n{screen}"
+    );
+}
+
+#[test]
+fn a_draft_taller_than_the_composer_scrolls_to_the_caret() {
+    let mut app = app(80, 24);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    let draft = (1..=40)
+        .map(|row| format!("row {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.composer.set_text(&draft);
+    app.composer.move_to_end();
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, &mut app))
+        .expect("frame draws");
+    let region = app
+        .regions
+        .composer
+        .expect("the composer published its rows");
+    // The window followed the caret rather than showing the head of the draft.
+    assert!(
+        app.regions.composer_scroll > 0,
+        "a draft forty rows tall did not scroll"
+    );
+    let screen = text(&buffer_lines(terminal.backend().buffer(), 80, 24));
+    assert!(screen.contains("row 40"), "{screen}");
+    assert!(
+        !screen.contains("row 1\n"),
+        "the box did not scroll:\n{screen}"
+    );
+    // The caret is on the last row inside the box, not clipped off the bottom.
+    let caret = terminal.get_cursor_position().expect("the caret is placed");
+    assert_eq!(caret.y, region.bottom() - 1);
+}
+
+#[test]
+fn a_click_in_a_scrolled_composer_lands_on_the_row_that_was_clicked() {
+    let mut app = app(80, 24);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    let draft = (1..=40)
+        .map(|row| format!("row {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.composer.set_text(&draft);
+    app.composer.move_to_end();
+    let _ = render(&mut app, 80, 24);
+    let region = app
+        .regions
+        .composer
+        .expect("the composer published its rows");
+    // A click on the first visible row is the row the box scrolled to, not the
+    // draft's first row.
+    assert!(app.click_composer(region.x, region.y));
+    let width = usize::from(region.width) - vibex_tui::glyphs::PROMPT_ARROW_WIDTH;
+    assert_eq!(
+        app.composer.cursor_cell(width).0,
+        app.regions.composer_scroll,
+        "the click did not map through the scroll offset"
     );
 }
 

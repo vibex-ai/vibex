@@ -1336,6 +1336,21 @@ impl ComposerBuffer {
         self.text.matches('\n').count() + 1
     }
 
+    /// How many rows the draft fills when wrapped to `width`.
+    ///
+    /// [`ComposerBuffer::line_count`] counts newlines, so one long line is one
+    /// line to it and several rows on screen. The composer's band is sized from
+    /// this instead: a draft that wraps needs the rows it wraps to, or the
+    /// renderer paints the first one and clips the rest.
+    pub fn display_row_count(&self, width: usize) -> usize {
+        let width = width.max(1);
+        self.text
+            .split('\n')
+            .map(|line| crate::text::wrap_source_text(line, width).len())
+            .sum::<usize>()
+            .max(1)
+    }
+
     /// The byte range of a line, without its newline.
     pub fn line_range(&self, line: usize) -> (usize, usize) {
         let mut start = 0usize;
@@ -1988,6 +2003,24 @@ mod tests {
         assert!(lines.last().unwrap().1);
         draft.move_to_start();
         assert!(draft.display_lines(10).first().unwrap().1);
+    }
+
+    #[test]
+    fn display_row_count_counts_wrapped_rows_not_newlines() {
+        // The band is sized from this, so one long line has to report the rows
+        // it will be drawn on rather than the one newline-separated line it is.
+        let draft = buffer("word word word word word");
+        assert_eq!(draft.line_count(), 1);
+        assert_eq!(draft.display_row_count(9), 3);
+        // The same text at a width it fits reports one row.
+        assert_eq!(draft.display_row_count(80), 1);
+        // A newline is a row of its own, including a trailing one.
+        assert_eq!(buffer("a\nb").display_row_count(80), 2);
+        assert_eq!(buffer("a\n").display_row_count(80), 2);
+        // An empty draft still occupies the row the caret sits on.
+        assert_eq!(buffer("").display_row_count(80), 1);
+        // A width of zero is one column, never a division by zero.
+        assert_eq!(buffer("abc").display_row_count(0), 3);
     }
 
     #[test]
