@@ -1933,13 +1933,7 @@ impl App {
     /// Streaming text does not need one: a delta marks the app dirty by itself,
     /// so a transcript with no other animation stays at zero frames.
     pub fn advance_transcript_animation(&mut self) -> bool {
-        // The spinner runs while a turn is running or while the reader is being
-        // asked for something; the composing page's mark shines while it waits.
-        // Nothing else in the interface moves on its own.
-        if self.pending_permission_count() == 0
-            && self.pending_send_for_active().is_none()
-            && !self.composing_page_shines()
-        {
+        if !self.is_animating() {
             return false;
         }
         self.animation_phase = self.animation_phase.wrapping_add(1);
@@ -1969,11 +1963,20 @@ impl App {
         }
     }
 
-    /// Whether a repaint is due without any input or event.
+    /// Whether anything on screen is moving without the reader's input.
+    ///
+    /// The turn line's spinner turns the whole time a turn is running — the
+    /// quiet parts of a turn included, which is when it matters most: a spinner
+    /// held on one frame while the runtime starts up reads as a frozen client.
+    /// The composing page's mark shines while it waits, and a question waiting
+    /// on the reader pulses. Everything else holds still, which is what keeps an
+    /// idle session at zero frames.
     pub fn is_animating(&self) -> bool {
         self.transcript.is_animating()
-            || self.turn_started.is_some()
+            || self.turn_reads_running()
             || self.pending_permission_count() > 0
+            || self.pending_elicitations() > 0
+            || self.composing_page_shines()
     }
 
     pub fn tick(&mut self) {

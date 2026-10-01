@@ -464,6 +464,14 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **A running turn is what the spinner animates on.** `is_animating` is the
+  single question the loop asks before repainting on its own, and it answers
+  yes while a turn reads as running (`turn_reads_running`), not only while
+  text streams: the quiet stretches — runtime startup, thinking, a slow tool —
+  are exactly when a held frame reads as a frozen client. A question waiting on
+  the reader and the composing page's mark animate too; everything else holds
+  still, and that is what keeps an idle session at zero frames (the PTY
+  `an_idle_interface_writes_nothing` contract).
 * **Work is evidence: rows while it runs, detail on demand.** A streaming dense
   row is still one row — its newest line (`live_row`: the tail for prose, the
   action for a tool) — because a running session that prints whole reasoning

@@ -4394,3 +4394,59 @@ fn the_workspace_key_from_the_session_list_does_not_move_the_reader() {
     );
     assert_eq!(app.workspace_path.as_deref(), Some("/home/peatboy/notes"));
 }
+
+#[test]
+fn the_spinner_turns_through_the_quiet_parts_of_a_turn() {
+    // The runtime spends whole seconds starting up, thinking, or waiting on a
+    // tool, with nothing streaming into the transcript. A spinner held on one
+    // frame for that stretch reads as a frozen client — which is exactly what
+    // the turn line is there to disprove.
+    let mut app = app(110, 30);
+    app.navigate_to(Page::Agent);
+    let mut session = seeded_session("session_spinner0001", "quiet turn");
+    session.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session);
+    // Nothing else moves: no stream, no question, no send in flight.
+    app.sync_transcript();
+    assert!(!app.transcript_animating(), "the transcript is idle");
+    assert!(app.is_animating(), "a running turn is not animating");
+
+    // The spinner is a function of the phase, so a moving one is a phase that
+    // moves — and the frame drawn at each phase has to differ.
+    let glyph = |app: &mut App| {
+        let screen = text(&render(app, 110, 30));
+        screen
+            .chars()
+            .find(|character| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(*character))
+            .unwrap_or_else(|| panic!("no spinner on screen:\n{screen}"))
+    };
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        assert!(
+            app.advance_transcript_animation(),
+            "the client stopped animating mid-turn"
+        );
+        seen.push(glyph(&mut app));
+    }
+    assert!(
+        seen.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+        "the spinner never changed frame: {seen:?}"
+    );
+
+    // And the idle contract still holds: a session with nothing running costs
+    // no frames at all.
+    let mut idle = seeded_session("session_spinner0002", "idle");
+    idle.state = vibex_core::AgentSessionState::Idle;
+    app.agent
+        .apply_sessions(Ok(vec![idle.clone()]))
+        .expect("sessions apply");
+    app.agent.state.active_session.resolve(idle);
+    app.agent.state.selected_session_id = Some(vibex_core::VibexSessionId::new());
+    app.sync_transcript();
+    assert!(!app.is_animating(), "an idle session is animating");
+    assert!(!app.advance_transcript_animation());
+}
