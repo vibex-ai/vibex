@@ -1950,7 +1950,7 @@ impl App {
         // A message written while a turn is running is held rather than sent:
         // the runtime would have to interleave it with work already in flight.
         if self.session_running() {
-            self.enqueue(text, images);
+            self.enqueue(session_id.clone(), text, images);
             self.toast(Toast::info(self.strings.queue_held().to_string()));
             return Outcome::effects(vec![]);
         }

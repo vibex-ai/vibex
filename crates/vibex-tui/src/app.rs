@@ -388,6 +388,12 @@ pub struct ProjectionState {
 /// the reader composed, and the composer is emptied the moment it is held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedMessage {
+    /// The session the message was written for.
+    ///
+    /// A queue is per session, not per client: switching to another session
+    /// and back must find the same held messages, and a message must never be
+    /// released into a session it was not written for.
+    pub session_id: VibexSessionId,
     pub text: String,
     /// The pre-wire form of the images, so pulling the message back into the
     /// composer restores exactly what was there — and where each of them sat in
@@ -1554,21 +1560,24 @@ impl App {
             }
         }
 
-        if !self.queued_messages.is_empty() {
+        if !self.queued_for_active().is_empty() {
+            let held = self.queued_for_active();
             rows.push(DockRow::Header {
                 section: DockSection::Queue,
-                count: self.queued_messages.len(),
+                count: held.len(),
             });
             if !self.dock_collapsed.contains(&DockSection::Queue) {
-                rows.extend(
-                    self.queued_messages
-                        .iter()
-                        .enumerate()
-                        .map(|(index, message)| DockRow::Queue {
-                            index,
-                            text: message.text.lines().next().unwrap_or_default().to_string(),
-                        }),
-                );
+                rows.extend(held.into_iter().enumerate().map(|(index, at)| {
+                    DockRow::Queue {
+                        index,
+                        text: self.queued_messages[at]
+                            .text
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    }
+                }));
             }
         }
         rows
@@ -2166,7 +2175,7 @@ impl App {
             );
         }
         self.clear_banner(BannerPriority::Warning);
-        if !self.queued_messages.is_empty() && self.page == Page::Agent {
+        if !self.queued_for_active().is_empty() && self.page == Page::Agent {
             let text = format!(
                 "{} · {}",
                 self.strings.queue_held(),
@@ -2194,42 +2203,84 @@ impl App {
             .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running)
     }
 
-    /// Hold a message until the running turn ends.
-    pub fn enqueue_message(&mut self, text: String) {
-        self.enqueue(text, Vec::new());
+    /// Hold a message until the running turn ends, for the open session.
+    ///
+    /// Answers whether it was held: a client with no session in front of it has
+    /// nowhere to hold a message, and saying so is better than queuing one that
+    /// no turn will ever release.
+    pub fn enqueue_message(&mut self, text: String) -> bool {
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return false;
+        };
+        self.enqueue(session_id, text, Vec::new());
+        true
     }
 
     /// Hold a message -- text and images together -- until the turn ends.
-    pub fn enqueue(&mut self, text: String, images: Vec<(crate::composer::ImageAttachment, u32)>) {
-        self.queued_messages.push(QueuedMessage { text, images });
-        self.queue_selection = Some(self.queued_messages.len() - 1);
+    ///
+    /// The session it was written for is part of the message: the reader may
+    /// leave and come back, and the queue must still know where it belongs.
+    pub fn enqueue(
+        &mut self,
+        session_id: VibexSessionId,
+        text: String,
+        images: Vec<(crate::composer::ImageAttachment, u32)>,
+    ) {
+        self.queued_messages.push(QueuedMessage {
+            session_id,
+            text,
+            images,
+        });
+        self.queue_selection = Some(self.queued_for_active().len().saturating_sub(1));
+    }
+
+    /// Indices into [`Self::queued_messages`] that belong to the open session,
+    /// oldest first.
+    ///
+    /// The list is one client-wide vector — the reader's queue is one gesture
+    /// away wherever they are — but what they see and act on is the queue of
+    /// the session in front of them.
+    pub fn queued_for_active(&self) -> Vec<usize> {
+        let Some(session_id) = self.selected_session_id() else {
+            return Vec::new();
+        };
+        self.queued_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, queued)| &queued.session_id == session_id)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The row of the open session's queue the cursor is on, as an index into
+    /// the client-wide vector.
+    fn selected_queued_index(&self) -> Option<usize> {
+        let rows = self.queued_for_active();
+        let cursor = self.queue_selection?;
+        rows.get(cursor).copied()
     }
 
     /// Move the queue cursor, entering the queue at its newest row.
     pub fn move_queue_selection(&mut self, delta: isize) {
-        if self.queued_messages.is_empty() {
+        let last = self.queued_for_active().len();
+        if last == 0 {
             self.queue_selection = None;
             return;
         }
-        let last = self.queued_messages.len() - 1;
+        let last = last - 1;
         let current = self.queue_selection.unwrap_or(last) as isize;
         self.queue_selection = Some((current + delta).clamp(0, last as isize) as usize);
     }
 
     /// Take the selected queued message back into the composer to edit it.
     pub fn edit_queued_message(&mut self) -> bool {
-        let Some(index) = self
-            .queue_selection
-            .filter(|index| *index < self.queued_messages.len())
-        else {
+        let Some(index) = self.selected_queued_index() else {
             return false;
         };
         let queued = self.queued_messages.remove(index);
-        self.queue_selection = if self.queued_messages.is_empty() {
-            None
-        } else {
-            Some(index.min(self.queued_messages.len() - 1))
-        };
+        let remaining = self.queued_for_active().len();
+        self.queue_selection =
+            (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
         // A draft already in the composer is not thrown away: it goes to the
         // front of the queue, which is where the reader would look for it.
         let outgoing = self.composer.outgoing();
@@ -2239,6 +2290,7 @@ impl App {
             self.queued_messages.insert(
                 index,
                 QueuedMessage {
+                    session_id: queued.session_id.clone(),
                     text: draft,
                     images,
                 },
@@ -2252,34 +2304,30 @@ impl App {
 
     /// Drop the selected queued message.
     pub fn delete_queued_message(&mut self) -> bool {
-        let Some(index) = self
-            .queue_selection
-            .filter(|index| *index < self.queued_messages.len())
-        else {
+        let Some(index) = self.selected_queued_index() else {
             return false;
         };
         self.queued_messages.remove(index);
-        self.queue_selection = if self.queued_messages.is_empty() {
-            None
-        } else {
-            Some(index.min(self.queued_messages.len() - 1))
-        };
+        let remaining = self.queued_for_active().len();
+        self.queue_selection =
+            (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
         true
     }
 
     /// Swap the selected queued message with its neighbour.
     pub fn move_queued_message(&mut self, delta: isize) -> bool {
-        let Some(index) = self
-            .queue_selection
-            .filter(|index| *index < self.queued_messages.len())
-        else {
+        let rows = self.queued_for_active();
+        let Some(cursor) = self.queue_selection else {
             return false;
         };
-        let target = index as isize + delta;
-        if target < 0 || target >= self.queued_messages.len() as isize {
+        let Some(index) = rows.get(cursor).copied() else {
+            return false;
+        };
+        let target = cursor as isize + delta;
+        if target < 0 || target >= rows.len() as isize {
             return false;
         }
-        self.queued_messages.swap(index, target as usize);
+        self.queued_messages.swap(index, rows[target as usize]);
         self.queue_selection = Some(target as usize);
         true
     }
@@ -2303,40 +2351,96 @@ impl App {
 
     /// Take the selected queued message out, to be sent immediately.
     pub fn take_queued_message(&mut self) -> Option<(String, Vec<vibex_core::MessageAttachment>)> {
-        let index = self
-            .queue_selection
-            .filter(|index| *index < self.queued_messages.len())?;
+        let index = self.selected_queued_index()?;
         let queued = self.queued_messages.remove(index);
-        self.queue_selection = if self.queued_messages.is_empty() {
-            None
-        } else {
-            Some(index.min(self.queued_messages.len() - 1))
-        };
+        let remaining = self.queued_for_active().len();
+        self.queue_selection =
+            (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
         let attachments = self.wire_attachments(&queued.images);
         Some((queued.text, attachments))
     }
 
-    /// Send the next held message once the turn has ended.
+    /// The messages whose session has finished its turn and can take another.
     ///
-    /// Called after every worker message rather than on a special "turn ended"
-    /// event: the client has no such event, and a queue that only drains on one
-    /// signal would stall the moment that signal changed shape.
-    pub fn drain_queue(&mut self) -> Option<(String, Vec<vibex_core::MessageAttachment>)> {
-        if self.queued_messages.is_empty() || self.session_running() {
-            return None;
+    /// Every session with a queue is asked, not only the one on screen: a
+    /// message is released when *its* turn ends, wherever the reader happens to
+    /// be looking. Called after every worker message rather than on a special
+    /// "turn ended" event — the client has no such event, and a queue that only
+    /// drains on one signal would stall the moment that signal changed shape.
+    pub fn drain_queue(
+        &mut self,
+    ) -> Vec<(VibexSessionId, String, Vec<vibex_core::MessageAttachment>)> {
+        if !self.live.is_live() || self.queued_messages.is_empty() {
+            return Vec::new();
         }
-        if !self.live.is_live() {
-            return None;
+        let mut ready: Vec<VibexSessionId> = Vec::new();
+        for queued in &self.queued_messages {
+            if ready.contains(&queued.session_id) {
+                continue;
+            }
+            if self.session_is_running(&queued.session_id) {
+                continue;
+            }
+            ready.push(queued.session_id.clone());
         }
-        let queued = self.queued_messages.remove(0);
-        self.queue_selection = if self.queued_messages.is_empty() {
-            None
-        } else {
-            Some(0)
+        let mut released = Vec::new();
+        for session_id in ready {
+            // One message per session per pass: the next one waits until the
+            // runtime has taken this turn and reported the session running.
+            let Some(index) = self
+                .queued_messages
+                .iter()
+                .position(|queued| queued.session_id == session_id)
+            else {
+                continue;
+            };
+            let queued = self.queued_messages.remove(index);
+            if session_id == self.selected_session_id().cloned().unwrap_or_default() {
+                let remaining = self.queued_for_active().len();
+                self.queue_selection =
+                    (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
+            }
+            self.history.push(queued.text.clone());
+            let attachments = self.wire_attachments(&queued.images);
+            released.push((session_id, queued.text, attachments));
+        }
+        released
+    }
+
+    /// The title of a session by id, when the client has listed it.
+    pub fn session_title(&self, session_id: &VibexSessionId) -> Option<String> {
+        self.agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| session.title.clone())
+    }
+
+    /// Whether one session has a turn running, by id.
+    ///
+    /// The open session is checked first because it is the copy the rest of the
+    /// interface reads from; the list is what knows about the sessions the
+    /// reader is *not* looking at, which is exactly the case a queue has to get
+    /// right.
+    fn session_is_running(&self, session_id: &VibexSessionId) -> bool {
+        let running = |session: &AgentSession| {
+            &session.id == session_id && session.state == vibex_core::AgentSessionState::Running
         };
-        self.history.push(queued.text.clone());
-        let attachments = self.wire_attachments(&queued.images);
-        Some((queued.text, attachments))
+        if self.active_session().is_some_and(running) {
+            return true;
+        }
+        self.agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(running)
     }
 
     // ---- composer history search ----------------------------------------
@@ -3494,10 +3598,14 @@ mod tests {
                 crate::composer::ImageSource::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
             )
             .expect("the image attaches");
+        // The reader is in a session; that is where a held message belongs.
+        let session_id = VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(session_id.clone());
         let outgoing = app.composer.take_outgoing();
-        app.enqueue(outgoing.text, outgoing.images);
+        app.enqueue(session_id.clone(), outgoing.text, outgoing.images);
         assert_eq!(app.queued_messages.len(), 1);
         assert_eq!(app.queued_messages[0].images.len(), 1);
+        assert_eq!(app.queued_messages[0].session_id, session_id);
 
         // Pulling it back restores the picture, not just the words.
         app.queue_selection = Some(0);
@@ -3507,12 +3615,14 @@ mod tests {
 
         // And holding it again carries it a second time.
         let outgoing = app.composer.take_outgoing();
-        app.enqueue(outgoing.text, outgoing.images);
+        app.enqueue(session_id.clone(), outgoing.text, outgoing.images);
         app.live = LiveState::Ready;
-        let drained = app.drain_queue().expect("the queue releases the message");
-        assert_eq!(drained.1.len(), 1);
+        let drained = app.drain_queue();
+        assert_eq!(drained.len(), 1, "the queue releases the message");
+        assert_eq!(drained[0].0, session_id, "and to its own session");
+        assert_eq!(drained[0].2.len(), 1);
         assert_eq!(
-            drained.1[0].uri.as_deref(),
+            drained[0].2[0].uri.as_deref(),
             Some("data:image/png;base64,AQID")
         );
     }

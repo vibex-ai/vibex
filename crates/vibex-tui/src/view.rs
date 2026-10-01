@@ -612,7 +612,10 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
             || app.active_session().is_some()
             || app.turn_started.is_some(),
     );
-    let queued = app.queued_messages.len() as u16;
+    // Only the open session's queue is drawn: the band is above *this*
+    // composer, and a message held for another session is not this reader's to
+    // see or act on here.
+    let queued = app.queued_for_active().len() as u16;
     // Everything from the turn line down belongs to the session view. On the
     // session list the active session's plan and turn state are not what the
     // reader is looking at, and printing them above the list is how a global
@@ -1547,16 +1550,12 @@ fn render_queue_band(
     let visible = usize::from(area.height).saturating_sub(1);
     // Scroll the window so the cursor stays visible: a queue can be longer than
     // the three rows the band allows.
+    let held = app.queued_for_active();
     let selected = app.queue_selection.unwrap_or(0);
     let offset = selected.saturating_sub(visible.saturating_sub(1));
-    for (index, message) in app
-        .queued_messages
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible)
-    {
-        let active = app.queue_selection == Some(index);
+    for (row, at) in held.iter().enumerate().skip(offset).take(visible) {
+        let message = &app.queued_messages[*at];
+        let active = app.queue_selection == Some(row);
         let prefix = if active { "▸ " } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(
@@ -1564,7 +1563,7 @@ fn render_queue_band(
                 Style::default().fg(theme.roles.accent_user),
             ),
             Span::styled(
-                format!("#{} ", index + 1),
+                format!("#{} ", row + 1),
                 Style::default().fg(theme.roles.gray_dim),
             ),
             Span::styled(

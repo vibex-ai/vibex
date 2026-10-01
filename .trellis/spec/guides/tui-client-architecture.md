@@ -464,6 +464,15 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **The send queue is per session, and drains by session.** A held message
+  carries the id it was written for: switching sessions must not release it,
+  hide it, or send it anywhere else, and it goes out when *its* session's turn
+  ends — including while the reader is looking at another one. The band, the
+  dock's queue rows and every queue key read the open session's subset
+  (`queued_for_active`), because a message held elsewhere is not this reader's
+  to see or act on here. `session_is_running` consults the open session first
+  and the session list second: the sessions the reader is *not* looking at are
+  exactly the case the queue has to get right.
 * **A new session is a page, not a dialog.** The reader who asks for one asked
   to write, so the gesture lands on a page that hands them the composer and
   names what the message will be sent through — Agent, model, workspace — with

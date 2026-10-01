@@ -178,12 +178,24 @@ fn event_loop(
         }
 
         // ---- the send queue ----------------------------------------------
-        // A turn that has ended releases the next held message. Checked here,
+        // A turn that has ended releases the next held message — for *its* own
+        // session, which is not necessarily the one on screen. Checked here,
         // after worker results have been applied, because that is the only
-        // moment the session's state can have changed.
-        if let Some((text, attachments)) = app.drain_queue()
-            && let Some(session_id) = app.selected_session_id().cloned()
-        {
+        // moment a session's state can have changed.
+        for (session_id, text, attachments) in app.drain_queue() {
+            // A message released into the session on screen needs no
+            // announcement — it is about to appear in the transcript. One
+            // released elsewhere is the only way the reader can learn it went.
+            if Some(&session_id) != app.selected_session_id() {
+                let who = app
+                    .session_title(&session_id)
+                    .unwrap_or_else(|| app.strings.session_untitled().to_string());
+                app.toast(Toast::info(format!(
+                    "{} · {}",
+                    app.strings.queue_released(),
+                    who
+                )));
+            }
             worker.dispatch(crate::app::Effect::SendMessage {
                 session_id,
                 text,

@@ -386,6 +386,14 @@ two rows of ASCII where it does not — and a light sweeps across it while the
 page waits. It is the client's only animation that is not a turn's spinner, and
 it stops the moment the reader leaves.
 
+A message written while a turn is running is *held*, not dropped: it waits in
+the queue band above the composer until the turn ends, and then goes out on its
+own. The queue belongs to the session it was written for — leaving for another
+session and coming back finds it exactly where it was, the band shows only the
+open session's rows, and a message is never released into a session it was not
+written for. A message released while the reader is elsewhere announces itself,
+because that is the only way they can learn it went.
+
 `e` opens a detail card under the selected row — id, workspace, state, agent,
 model when it is known, the timestamps, and the message and turn counts for the
 open session. `c` closes every open card and `y` copies the selected session's

@@ -1104,11 +1104,24 @@ fn column_of(buffer: &ratatui::buffer::Buffer, row: u16, needle: &str) -> Option
 }
 
 /// The text of each held message, for the tests that only care about words.
+/// The queue of the session in front of the reader, which is what the UI
+/// shows and what its keys act on.
 fn queued_texts(app: &App) -> Vec<String> {
-    app.queued_messages
-        .iter()
-        .map(|message| message.text.clone())
+    app.queued_for_active()
+        .into_iter()
+        .map(|index| app.queued_messages[index].text.clone())
         .collect()
+}
+
+/// Open a session: a message can only be held for one, so the queue's own
+/// tests have to be inside one.
+fn enter_session(app: &mut App, id: &str) {
+    let session = seeded_session(id, "queue fixture");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session);
 }
 
 fn settings_app(width: u16, height: u16) -> App {
@@ -1166,6 +1179,7 @@ fn the_dock_lists_the_plan_and_the_held_queue() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0001");
     seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.enqueue_message("fix the flake".to_string());
     app.perform(Intent::ToggleDock);
@@ -1195,6 +1209,7 @@ fn the_dock_cursor_skips_headings_and_takes_a_held_message_back() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0001");
     seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.enqueue_message("fix the flake".to_string());
     app.perform(Intent::ToggleDock);
@@ -1227,6 +1242,7 @@ fn a_long_dock_says_how_much_it_is_not_showing() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0007");
     // Ten held messages, against a dock that can show seven rows besides its
     // title: the rest must be counted rather than silently dropped.
     for index in 0..10 {
@@ -1520,6 +1536,7 @@ fn the_session_list_does_not_wear_the_agent_pages_chrome() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.agent.apply_sessions(Ok(session_pair())).expect("apply");
+    enter_session(&mut app, "session_queue0002");
     seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.enqueue_message("held while listing".to_string());
     app.perform(Intent::GotoSessions);
@@ -2062,6 +2079,7 @@ fn a_drag_inside_the_composer_extends_the_draft_selection() {
 fn the_queue_band_shows_the_cursor_and_its_keys() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0003");
     app.enqueue_message("first held message".to_string());
     app.enqueue_message("second held message".to_string());
     let screen = text(&render(&mut app, 120, 40));
@@ -2077,6 +2095,7 @@ fn the_queue_band_shows_the_cursor_and_its_keys() {
 fn queue_editing_moves_a_message_back_into_the_draft() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0004");
     app.enqueue_message("first".to_string());
     app.enqueue_message("second".to_string());
     app.queue_selection = Some(1);
@@ -2093,6 +2112,7 @@ fn queue_editing_moves_a_message_back_into_the_draft() {
 #[test]
 fn queue_reordering_and_dropping_keep_the_cursor_sane() {
     let mut app = app(120, 40);
+    enter_session(&mut app, "session_queue0005");
     for message in ["one", "two", "three"] {
         app.enqueue_message(message.to_string());
     }
@@ -2115,13 +2135,16 @@ fn a_held_message_is_sent_once_the_turn_ends() {
     app.agent
         .apply_sessions(Ok(vec![session.clone()]))
         .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
     app.agent.state.active_session.resolve(session.clone());
     // Idle: the queue drains immediately.
     app.enqueue_message("held".to_string());
+    let released = app.drain_queue();
     assert_eq!(
-        app.drain_queue().map(|(text, _)| text).as_deref(),
+        released.first().map(|(_, text, _)| text.as_str()),
         Some("held")
     );
+    assert_eq!(released[0].0, session.id);
     assert!(app.queued_messages.is_empty());
 
     // Running: nothing drains until the state changes.
@@ -2129,11 +2152,14 @@ fn a_held_message_is_sent_once_the_turn_ends() {
     running.state = vibex_core::AgentSessionState::Running;
     app.agent.state.active_session.resolve(running.clone());
     app.enqueue_message("waits".to_string());
-    assert!(app.drain_queue().is_none());
+    assert!(app.drain_queue().is_empty());
     running.state = vibex_core::AgentSessionState::Idle;
-    app.agent.state.active_session.resolve(running);
+    app.agent.state.active_session.resolve(running.clone());
+    app.agent
+        .apply_sessions(Ok(vec![running]))
+        .expect("sessions apply");
     assert_eq!(
-        app.drain_queue().map(|(text, _)| text).as_deref(),
+        app.drain_queue().first().map(|(_, text, _)| text.as_str()),
         Some("waits")
     );
 }
@@ -3073,6 +3099,7 @@ fn mouse_coordinates_outside_every_band_are_harmless() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
     // A held message publishes the queue band, and the dock publishes its own.
+    enter_session(&mut app, "session_queue0006");
     app.enqueue_message("held".to_string());
     app.perform(Intent::ToggleDock);
     let _ = render(&mut app, 120, 40);
@@ -3489,4 +3516,110 @@ fn the_composing_page_owns_the_keyboard_it_shows() {
     app.perform(Intent::BeginTranscriptSearch);
     assert_eq!(app.page, before, "`/` navigated away from an empty page");
     assert!(app.search.is_none());
+}
+
+#[test]
+fn a_message_held_for_one_session_waits_for_that_session() {
+    // The queue used to be one list for the whole client. A message written
+    // while session A's turn ran was released into whatever session the reader
+    // happened to be looking at when that turn ended — so leaving and coming
+    // back found the queue gone, and the message was sent somewhere it was
+    // never written for.
+    use vibex_core::AgentSessionState;
+    let state_of = |session: &vibex_core::AgentSession, state| {
+        let mut copy = session.clone();
+        copy.state = state;
+        copy
+    };
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let first = seeded_session("session_queue0100", "first");
+    let second = seeded_session("session_queue0101", "second");
+    let running = state_of(&first, AgentSessionState::Running);
+    let settled = state_of(&first, AgentSessionState::Idle);
+    app.agent
+        .apply_sessions(Ok(vec![running.clone(), second.clone()]))
+        .expect("sessions apply");
+
+    // Session A is running, so the message is held for it.
+    app.agent.state.selected_session_id = Some(running.id.clone());
+    app.agent.state.active_session.resolve(running.clone());
+    app.enqueue_message("for the first session".to_string());
+    assert_eq!(
+        queued_texts(&app),
+        vec!["for the first session".to_string()]
+    );
+
+    // The reader moves to session B, which is idle. A's message is not B's to
+    // send, and does not vanish from A's queue.
+    app.agent.state.selected_session_id = Some(second.id.clone());
+    app.agent.state.active_session.resolve(second.clone());
+    assert!(
+        queued_texts(&app).is_empty(),
+        "another session's queue is shown here"
+    );
+    assert!(
+        app.drain_queue().is_empty(),
+        "a message was released into a session it was not written for"
+    );
+    assert_eq!(app.queued_messages.len(), 1, "the held message was lost");
+
+    // Back on A, with its turn over: the held message is released — into A.
+    app.agent
+        .apply_sessions(Ok(vec![settled.clone(), second.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(settled.id.clone());
+    app.agent.state.active_session.resolve(settled.clone());
+    let released = app.drain_queue();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].0, settled.id, "released into the wrong session");
+    assert_eq!(released[0].1, "for the first session");
+    assert!(app.queued_messages.is_empty());
+}
+
+#[test]
+fn a_held_message_is_released_while_the_reader_is_elsewhere() {
+    // The other half of the same bug: the message belongs to its session, so it
+    // goes out when *that* turn ends — even if the reader has moved on and is
+    // looking at another session when it does.
+    use vibex_core::AgentSessionState;
+    let state_of = |session: &vibex_core::AgentSession, state| {
+        let mut copy = session.clone();
+        copy.state = state;
+        copy
+    };
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let busy = seeded_session("session_queue0110", "busy");
+    let elsewhere = seeded_session("session_queue0111", "elsewhere");
+    let running = state_of(&busy, AgentSessionState::Running);
+    let settled = state_of(&busy, AgentSessionState::Idle);
+    let busy_elsewhere = state_of(&elsewhere, AgentSessionState::Running);
+    app.agent
+        .apply_sessions(Ok(vec![running.clone(), elsewhere.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(running.id.clone());
+    app.agent.state.active_session.resolve(running.clone());
+    app.enqueue_message("release me".to_string());
+
+    // The reader is on the other session when the first one's turn ends.
+    app.agent
+        .apply_sessions(Ok(vec![settled.clone(), elsewhere.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(elsewhere.id.clone());
+    app.agent.state.active_session.resolve(elsewhere.clone());
+    let released = app.drain_queue();
+    assert_eq!(released.len(), 1, "the queue did not follow its session");
+    assert_eq!(released[0].0, settled.id);
+    assert_eq!(released[0].1, "release me");
+
+    // A session that is still running keeps what was written for it.
+    app.agent
+        .apply_sessions(Ok(vec![settled.clone(), busy_elsewhere.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(busy_elsewhere.id.clone());
+    app.agent.state.active_session.resolve(busy_elsewhere);
+    app.enqueue_message("second".to_string());
+    assert!(app.drain_queue().is_empty());
+    assert_eq!(queued_texts(&app), vec!["second".to_string()]);
 }
