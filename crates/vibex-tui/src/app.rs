@@ -1294,7 +1294,12 @@ impl App {
             scopes.push(Scope::Global);
             return scopes;
         }
-        if self.focus == Focus::Composer && self.page == Page::Agent {
+        // The composer owns the keyboard on every page that has one — including
+        // the page where a session is being written, which has no session yet.
+        // Without this the page's keys fell through to the Agent scope, where
+        // a printable character is a *binding*: typing did nothing, and `/`
+        // searched the transcript of a session the reader was leaving.
+        if self.focus == Focus::Composer && self.page.is_composing_page() {
             scopes.push(Scope::Composer);
         }
         if self.overlay.is_none() {
@@ -1309,7 +1314,7 @@ impl App {
         if self.overlay.is_some() {
             return vec![Scope::Overlay, Scope::Global];
         }
-        if self.focus == Focus::Composer && self.page == Page::Agent {
+        if self.focus == Focus::Composer && self.page.is_composing_page() {
             return vec![Scope::Composer, Scope::Global];
         }
         vec![self.page.scope(), Scope::Global]

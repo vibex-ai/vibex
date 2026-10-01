@@ -590,8 +590,7 @@ fn handle_key(
                 return Ok(false);
             }
         }
-    } else if app.focus == Focus::Composer
-        && app.page == Page::Agent
+    } else if composer_takes_keys(app)
         && let Some(exit) = handle_composer_key(app, worker, key)?
     {
         return Ok(exit);
@@ -740,6 +739,17 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Composer editing keys. Returns `Some(true)` to exit the program.
+/// Whether the composer's own text path handles this key before the binding
+/// table does.
+///
+/// The page matters as much as the focus does. The page where a session is
+/// written has no session yet — but it has a composer, and there a printable
+/// key is *text*: without this the keys fell through to the Agent scope, where
+/// typing did nothing and `/` meant "search the transcript" and left the page.
+fn composer_takes_keys(app: &App) -> bool {
+    app.focus == Focus::Composer && app.page.is_composing_page()
+}
+
 fn handle_composer_key(
     app: &mut App,
     worker: &Worker,
@@ -1772,6 +1782,52 @@ mod tests {
         );
         app.resize(columns, rows);
         app
+    }
+
+    #[test]
+    fn the_composing_page_types_into_its_own_box() {
+        // The composer's text path runs before the binding table, but only on a
+        // page whose scope list starts with `Composer`. The page where a session
+        // is written did not, so a printable key fell through to the *Agent*
+        // scope: typing did nothing, and `/` — "search the transcript" there —
+        // took the reader to a session they had not opened.
+        let (worker, _messages) = Worker::start(vibex_backend::DisconnectedBackend::facade())
+            .expect("a worker over a client with no backend");
+        let mut app = test_app(100, 30);
+        app.live = crate::app::LiveState::Ready;
+        app.perform(crate::action::Intent::NewSession);
+        assert_eq!(app.page, crate::app::Page::NewSession);
+        assert!(
+            composer_takes_keys(&app),
+            "the page's composer does not own the keyboard it shows"
+        );
+
+        for character in ['h', 'i', '/'] {
+            let handled = handle_composer_key(
+                &mut app,
+                &worker,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .expect("the key is handled");
+            assert_eq!(handled, Some(false), "{character} was not consumed");
+        }
+        assert_eq!(
+            app.composer.text(),
+            "hi/",
+            "the page did not type into its own composer"
+        );
+        assert_eq!(
+            app.page,
+            crate::app::Page::NewSession,
+            "a printable key navigated away"
+        );
+
+        // A page with no composer keeps its own bindings: the composer is not
+        // a scope that swallows keys everywhere.
+        app.perform(crate::action::Intent::Back);
+        assert_eq!(app.page, crate::app::Page::Sessions);
+        app.focus = crate::app::Focus::Composer;
+        assert!(!composer_takes_keys(&app));
     }
 
     #[test]

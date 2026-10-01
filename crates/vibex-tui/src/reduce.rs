@@ -637,10 +637,15 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::BeginTranscriptSearch => {
-                self.page = Page::Agent;
+                // The page follows the search, not the other way round: a
+                // transcript with nothing in it has nothing to search, and
+                // moving there first is how `/` used to leave the page a reader
+                // was writing on for a session they had not opened.
                 if !self.begin_search() {
                     self.toast(Toast::info(self.strings.transcript_empty()));
+                    return Outcome::effects(vec![]);
                 }
+                self.page = Page::Agent;
                 Outcome::effects(vec![])
             }
             Intent::SearchNext => {
@@ -1668,7 +1673,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i64) -> Outcome {
-        let scope = if self.page == Page::Agent {
+        let scope = if self.page.is_composing_page() {
             Scope::Agent
         } else if self.overlay.is_some() {
             Scope::Overlay

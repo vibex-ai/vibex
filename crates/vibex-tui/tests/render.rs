@@ -3446,3 +3446,47 @@ fn the_composing_page_can_choose_the_directory_it_works_in() {
         "the chosen directory is not named on the page:\n{screen}"
     );
 }
+
+#[test]
+fn the_composing_page_owns_the_keyboard_it_shows() {
+    // The composer's text path is tried before the binding table, but only for
+    // pages whose scope list starts with `Composer`. On the page where a
+    // session is written the list did not: a printable key found the *Agent*
+    // scope instead, where `/` is "search the transcript" — so typing did
+    // nothing and `/` left the page for a session the reader had not opened.
+    use vibex_tui::action::Intent;
+    use vibex_tui::keymap::Scope;
+    let chord = |character: char| {
+        vibex_tui::keymap::Chord::plain(ratatui::crossterm::event::KeyCode::Char(character))
+    };
+
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
+
+    let scopes = app.active_scopes();
+    assert_eq!(
+        scopes.first(),
+        Some(&Scope::Composer),
+        "the composer does not own the keyboard on its own page: {scopes:?}"
+    );
+    assert_eq!(
+        app.documented_scopes().first(),
+        Some(&Scope::Composer),
+        "the key bar advertises another page's keys"
+    );
+    // The text path is tried before the table, so `/` is a character the
+    // composer inserts — but the table's own meaning for it is checked here,
+    // because that is what a reader on another page would get.
+    assert_eq!(
+        app.keymap.resolve(&[Scope::Agent], chord('/')),
+        Some(Intent::BeginTranscriptSearch)
+    );
+    // And that meaning no longer moves the reader: with no transcript to
+    // search, `/` says so where they are.
+    let before = app.page;
+    app.perform(Intent::BeginTranscriptSearch);
+    assert_eq!(app.page, before, "`/` navigated away from an empty page");
+    assert!(app.search.is_none());
+}
