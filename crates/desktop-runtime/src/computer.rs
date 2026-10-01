@@ -1055,6 +1055,17 @@ pub fn driver_install_command(platform: ComputerPlatform) -> Option<DriverInstal
             program: "powershell".to_string(),
             args: vec![
                 "-NoProfile".to_string(),
+                // The installer reaches us as text piped into `iex`, which no
+                // execution policy governs, but the vendor script then saves
+                // its helper module to a temp file and imports it — and every
+                // policy governs that. Windows PowerShell on a client defaults
+                // to Restricted, so without this the install dies inside the
+                // vendor's own `Import-Module` as UnauthorizedAccess while
+                // Linux and macOS have no such gate. Bypass lasts for this
+                // process only: nothing is written to the machine's policy,
+                // and the Install press is the same consent either way.
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
                 "-Command".to_string(),
                 "irm https://cua.ai/driver/install.ps1 | iex".to_string(),
             ],
@@ -1597,6 +1608,11 @@ mod tests {
             driver_install_command(ComputerPlatform::Windows).expect("Windows has an installer");
         assert_eq!(windows.program, "powershell");
         assert!(windows.args.join(" ").contains("cua.ai/driver/install.ps1"));
+        // The vendor script imports a module it saves to disk, and the default
+        // Restricted policy refuses exactly that; the lift is per process and
+        // has to be on the command line, since the failure happens inside a
+        // script we do not own.
+        assert!(windows.args.join(" ").contains("-ExecutionPolicy Bypass"));
         assert!(driver_install_command(ComputerPlatform::Unknown).is_none());
     }
 

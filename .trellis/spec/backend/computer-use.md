@@ -397,6 +397,26 @@ says four things:
   Detection asks the driver for its own tool list, which is how a file with the
   right name is told apart from a working engine.
 
+  Installing on Windows is the one place the platform's own policy has to be
+  lifted, and only for the process that runs the installer:
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm
+  https://cua.ai/driver/install.ps1 | iex"`. The vendor script arrives as text
+  piped into `iex`, which no execution policy governs, but it then saves a
+  helper module to a temp file and imports it, which every policy governs — and
+  a Windows client defaults to Restricted. Without the flag the install dies
+  inside the vendor's own `Import-Module` as `UnauthorizedAccess`; Linux and
+  macOS have no such gate, which is why the same action worked there and not
+  here. The flag is a parameter of the process we spawn and writes nothing to
+  the machine.
+
+  Where the binary lands is platform-specific too, and the lookup cannot wait
+  for a restart to learn it. On Windows the installer publishes the binary
+  through two junctions — `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin` and
+  `%USERPROFILE%\.cua-driver\packages\current` — and puts only the first on the
+  user PATH. A process that was already running when the install finished still
+  holds the environment it started with, so both paths are read directly;
+  without that, a successful install reads back as "no driver was found".
+
   A window paired with a runtime on **another machine** says so and offers
   neither button: the driver belongs to the machine that owns the desktop.
 - **The system permissions.** A read-only line with the three states the

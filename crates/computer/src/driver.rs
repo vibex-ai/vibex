@@ -2273,10 +2273,34 @@ fn discover_well_known() -> Option<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
+        // The installer publishes the binary through two junctions and puts
+        // only the visible one on the user PATH. A process that was already
+        // running when the install happened has the old environment, so the
+        // PATH entry is invisible to it and these paths are the only reason
+        // the driver it just installed can be found without a restart.
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(
+                PathBuf::from(&local)
+                    .join("Programs")
+                    .join("Cua")
+                    .join("cua-driver")
+                    .join("bin")
+                    .join(format!("{DRIVER_COMMAND}.exe")),
+            );
             candidates.push(
                 PathBuf::from(local)
                     .join("CuaDriver")
+                    .join(format!("{DRIVER_COMMAND}.exe")),
+            );
+        }
+        // The package home, which an install keeps even when the reader moved
+        // the visible bin directory with CUA_DRIVER_RS_INSTALL_DIR.
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            candidates.push(
+                PathBuf::from(profile)
+                    .join(".cua-driver")
+                    .join("packages")
+                    .join("current")
                     .join(format!("{DRIVER_COMMAND}.exe")),
             );
         }
