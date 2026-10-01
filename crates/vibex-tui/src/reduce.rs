@@ -1867,7 +1867,8 @@ impl App {
             ));
             return Outcome::quiet();
         }
-        let (text, images) = self.composer.take_with_attachments();
+        let outgoing = self.composer.take_outgoing();
+        let (text, images) = (outgoing.text, outgoing.images);
         self.completion = None;
         // A message written while a turn is running is held rather than sent:
         // the runtime would have to interleave it with work already in flight.
@@ -1878,10 +1879,7 @@ impl App {
         }
         self.history.push(text.clone());
         self.scroll.follow = true;
-        let attachments = images
-            .iter()
-            .map(crate::composer::message_attachment)
-            .collect();
+        let attachments = self.wire_attachments(&images);
         Outcome::effects(vec![Effect::SendMessage {
             session_id,
             text,
@@ -1897,7 +1895,8 @@ impl App {
         let Some(session_id) = self.selected_session_id().cloned() else {
             return Outcome::quiet();
         };
-        let (text, images) = self.composer.take_with_attachments();
+        let outgoing = self.composer.take_outgoing();
+        let (text, images) = (outgoing.text, outgoing.images);
         self.history.push(text.clone());
         // Remote seats have no steering RPC, so the worker falls back to
         // interrupt + resend and says so.
@@ -1907,10 +1906,7 @@ impl App {
                 self.strings.composer_steer_unavailable().to_string(),
             ));
         }
-        let attachments = images
-            .iter()
-            .map(crate::composer::message_attachment)
-            .collect();
+        let attachments = self.wire_attachments(&images);
         Outcome::effects(vec![Effect::SteerMessage {
             session_id,
             text,

@@ -372,8 +372,9 @@ pub struct ProjectionState {
 pub struct QueuedMessage {
     pub text: String,
     /// The pre-wire form of the images, so pulling the message back into the
-    /// composer restores exactly what was there.
-    pub images: Vec<crate::composer::ImageAttachment>,
+    /// composer restores exactly what was there — and where each of them sat in
+    /// the text, which the wire needs to put the picture back in its place.
+    pub images: Vec<(crate::composer::ImageAttachment, u32)>,
 }
 
 /// The whole application.
@@ -2039,7 +2040,7 @@ impl App {
     }
 
     /// Hold a message -- text and images together -- until the turn ends.
-    pub fn enqueue(&mut self, text: String, images: Vec<crate::composer::ImageAttachment>) {
+    pub fn enqueue(&mut self, text: String, images: Vec<(crate::composer::ImageAttachment, u32)>) {
         self.queued_messages.push(QueuedMessage { text, images });
         self.queue_selection = Some(self.queued_messages.len() - 1);
     }
@@ -2071,8 +2072,9 @@ impl App {
         };
         // A draft already in the composer is not thrown away: it goes to the
         // front of the queue, which is where the reader would look for it.
-        let draft = self.composer.text().to_string();
-        let images = self.composer.images();
+        let outgoing = self.composer.outgoing();
+        let draft = outgoing.text;
+        let images = outgoing.images;
         if !draft.trim().is_empty() || !images.is_empty() {
             self.queued_messages.insert(
                 index,
@@ -2122,6 +2124,23 @@ impl App {
         true
     }
 
+    /// The wire form of a draft's images, with the place each one sat in.
+    ///
+    /// Clipboard bytes are written to a file only when this client *is* the
+    /// authority: the runtime that has to read them is then this host, and a
+    /// path is the only form the desktop can draw. On a remote seat the bytes
+    /// travel as a data URL instead, which the runtime materialises itself.
+    pub fn wire_attachments(
+        &self,
+        images: &[(crate::composer::ImageAttachment, u32)],
+    ) -> Vec<vibex_core::MessageAttachment> {
+        let materialise = self.seat == crate::view::SeatKind::Authority;
+        images
+            .iter()
+            .map(|(image, offset)| crate::composer::message_attachment(image, *offset, materialise))
+            .collect()
+    }
+
     /// Take the selected queued message out, to be sent immediately.
     pub fn take_queued_message(&mut self) -> Option<(String, Vec<vibex_core::MessageAttachment>)> {
         let index = self
@@ -2133,11 +2152,7 @@ impl App {
         } else {
             Some(index.min(self.queued_messages.len() - 1))
         };
-        let attachments = queued
-            .images
-            .iter()
-            .map(crate::composer::message_attachment)
-            .collect();
+        let attachments = self.wire_attachments(&queued.images);
         Some((queued.text, attachments))
     }
 
@@ -2160,11 +2175,7 @@ impl App {
             Some(0)
         };
         self.history.push(queued.text.clone());
-        let attachments = queued
-            .images
-            .iter()
-            .map(crate::composer::message_attachment)
-            .collect();
+        let attachments = self.wire_attachments(&queued.images);
         Some((queued.text, attachments))
     }
 
@@ -3320,8 +3331,8 @@ mod tests {
                 crate::composer::ImageSource::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
             )
             .expect("the image attaches");
-        let (text, images) = app.composer.take_with_attachments();
-        app.enqueue(text, images);
+        let outgoing = app.composer.take_outgoing();
+        app.enqueue(outgoing.text, outgoing.images);
         assert_eq!(app.queued_messages.len(), 1);
         assert_eq!(app.queued_messages[0].images.len(), 1);
 
@@ -3332,8 +3343,8 @@ mod tests {
         assert!(app.composer.text().contains("[Image #1]"));
 
         // And holding it again carries it a second time.
-        let (text, images) = app.composer.take_with_attachments();
-        app.enqueue(text, images);
+        let outgoing = app.composer.take_outgoing();
+        app.enqueue(outgoing.text, outgoing.images);
         app.live = LiveState::Ready;
         let drained = app.drain_queue().expect("the queue releases the message");
         assert_eq!(drained.1.len(), 1);

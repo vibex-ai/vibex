@@ -474,6 +474,18 @@ is never a column count.
   because asking for PNG and nothing else finds nothing on a clipboard holding a
   JPEG. The client still *writes* the clipboard only over OSC 52; reading is an
   enhancement that degrades to "name a file instead" when no tool exists.
+* **An attachment travels with its place in the message.** The chip label is
+  dropped from the text, so the offset — `inline_text_offset`, in UTF-16 units
+  of the *sent* text — is the only thing that says where the picture was: a
+  reader that does not get one appends the picture at the end of the paragraph.
+  The URI has to resolve for the client that draws it as well as for the runtime
+  that reads it: an absolute `file://` URI for a file, and for clipboard bytes a
+  file written beside the message when this client *is* the authority — the
+  desktop can only draw a path — with the data URL kept for a remote seat, where
+  no file of ours is reachable and the runtime materialises the bytes itself.
+  `outgoing()` computes the offsets from the chips in one walk, so an expanded
+  paste in front of an image moves it, and the queue carries the pairs so a held
+  message does not lose them.
 * **One paste route, whoever pasted.** The terminal's bracketed paste and the
   client's own clipboard reader both end in `App::insert_pasted_text`: a picture
   named as a path becomes an attachment — quoted, `file://`, `~`-relative and

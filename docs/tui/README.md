@@ -222,10 +222,20 @@ pictures in one paste attach together, and a path mentioned inside a sentence
 stays a sentence.
 
 The image becomes a second kind of chip, `[Image #1]`, numbered monotonically
-for the draft and capped at ten per prompt; the label is stripped from the
-message text and the picture travels as an attachment — by path when the runtime
-can read it, as a data URL when it came from the clipboard. The info line under
-the draft reports how many are attached.
+for the draft and capped at ten per prompt. The info line under the draft
+reports how many are attached.
+
+The label is stripped from the message text — the Agent is not told about a
+placeholder it cannot see — and the picture travels as an attachment that names
+both the bytes and its place: `inline_text_offset` is where the chip sat in the
+text, in UTF-16 units, which is what puts the picture back between the words
+rather than at the end of the paragraph on every other client. A file the
+runtime can read is sent as an absolute `file://` URI, the form the desktop
+writes itself; a clipboard image on an authority seat is written beside the
+message and sent the same way, because a path is the only form the desktop can
+draw. On a remote seat, where no file of ours is reachable, the bytes travel as
+a data URL that the runtime materialises on its own host. A message pulled back
+out of the queue puts its chips where they were, not stacked at the end.
 
 The info line under the draft is right-aligned: the runtime a message will go
 through, the Agent and model it names, and the key that switches it sit against

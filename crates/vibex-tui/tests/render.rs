@@ -2986,3 +2986,77 @@ fn mouse_coordinates_outside_every_band_are_harmless() {
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("held"), "{screen}");
 }
+
+#[test]
+fn a_sent_image_keeps_its_place_in_the_message() {
+    // The wire contract the desktop draws from: an attachment with no offset is
+    // appended at the end of the message, and a URI the reader's client cannot
+    // resolve is a label with no picture behind it. Both were wrong in the same
+    // way — the picture arrived, but not where it was written and not in a form
+    // the desktop could show.
+    use vibex_tui::action::Intent;
+    let send = |seat: vibex_tui::view::SeatKind| {
+        let mut app = app(100, 30);
+        app.navigate_to(Page::Agent);
+        app.live = vibex_tui::app::LiveState::Ready;
+        app.seat = seat;
+        let session = seeded_session("session_image0001", "image message");
+        app.agent
+            .apply_sessions(Ok(vec![session.clone()]))
+            .expect("sessions apply");
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.composer.insert_str("before ");
+        let label = app
+            .attach_image_bytes("image/png", vec![0x89, b'P', b'N', b'G'])
+            .expect("the image attaches");
+        app.composer.insert_str(" after");
+        let outcome = app.perform(Intent::SubmitComposer);
+        let effect = outcome
+            .effects
+            .into_iter()
+            .find(|effect| matches!(effect, vibex_tui::Effect::SendMessage { .. }))
+            .expect("the message was sent");
+        match effect {
+            vibex_tui::Effect::SendMessage {
+                text, attachments, ..
+            } => (text, attachments, label),
+            _ => unreachable!(),
+        }
+    };
+
+    // The authority writes the clipboard's bytes beside the message, because
+    // the runtime that has to read them is this host and a path is the only
+    // form the desktop can draw.
+    let (text, attachments, label) = send(vibex_tui::view::SeatKind::Authority);
+    assert_eq!(text, "before  after", "the label stays out of the text");
+    assert!(!text.contains(&label));
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        attachments[0].inline_text_offset,
+        Some(7),
+        "the picture was not placed where it was written"
+    );
+    let uri = attachments[0].uri.clone().expect("a uri");
+    let path = uri
+        .strip_prefix("file://")
+        .unwrap_or_else(|| panic!("a client cannot draw {uri}"));
+    assert_eq!(
+        std::fs::read(path).expect("the bytes were written beside the message"),
+        vec![0x89, b'P', b'N', b'G']
+    );
+    let _ = std::fs::remove_file(path);
+
+    // A remote seat has no file the runtime can reach, so the bytes travel with
+    // the message — but the place is still named.
+    let (_, attachments, _) = send(vibex_tui::view::SeatKind::Remote);
+    assert_eq!(attachments[0].inline_text_offset, Some(7));
+    assert!(
+        attachments[0]
+            .uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("data:image/png;base64,")),
+        "{:?}",
+        attachments[0].uri
+    );
+}

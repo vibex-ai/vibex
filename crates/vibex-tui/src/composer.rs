@@ -649,22 +649,37 @@ impl ComposerBuffer {
 
     /// The text to send: every chip replaced by what was actually pasted.
     pub fn expanded_text(&self) -> String {
-        let mut out = String::with_capacity(self.text.len());
+        self.outgoing().text
+    }
+
+    /// The message as it will be sent, with every image's place in it.
+    ///
+    /// A label is dropped from the text — the Agent is not told about a
+    /// placeholder it cannot see — so the place the label occupied has to travel
+    /// beside it, as an offset the other clients can put the picture back at.
+    /// The wire counts that offset in UTF-16 units, and it counts it in the text
+    /// *after* this expansion, which is why the offset is taken here rather than
+    /// from the draft: a paste expanded in front of an image moves it.
+    pub fn outgoing(&self) -> Outgoing {
+        let mut text = String::with_capacity(self.text.len());
+        let mut images = Vec::new();
         let mut cursor = 0usize;
         for chip in &self.chips {
             if chip.start < cursor || chip.end > self.text.len() {
                 continue;
             }
-            out.push_str(&self.text[cursor..chip.start]);
-            // An image chip is an attachment, not text: its label is dropped so
-            // the Agent is not told about a placeholder it cannot see.
-            if let ChipPayload::Paste(content) = &chip.payload {
-                out.push_str(content);
+            text.push_str(&self.text[cursor..chip.start]);
+            match &chip.payload {
+                ChipPayload::Paste(content) => text.push_str(content),
+                ChipPayload::Image(image) => images.push((
+                    image.clone(),
+                    u32::try_from(text.encode_utf16().count()).unwrap_or(u32::MAX),
+                )),
             }
             cursor = chip.end;
         }
-        out.push_str(&self.text[cursor..]);
-        out
+        text.push_str(&self.text[cursor..]);
+        Outgoing { text, images }
     }
 
     /// The images the draft carries, in the order they were attached.
@@ -728,10 +743,22 @@ impl ComposerBuffer {
     ///
     /// The labels are regenerated rather than remembered: a label is only a
     /// number, and what matters is that the picture reaches the Agent.
-    pub fn set_draft(&mut self, text: impl Into<String>, images: Vec<ImageAttachment>) {
+    pub fn set_draft(&mut self, text: impl Into<String>, images: Vec<(ImageAttachment, u32)>) {
         self.set_text(text);
-        for image in images {
-            self.insert_image(image.mime_type, image.source);
+        // The offsets are the wire's — UTF-16 units into this same text — so a
+        // message pulled back out of the queue gets its pictures where they
+        // were, not stacked at the end of the paragraph. Each label inserted in
+        // front of a later one moves it, so they are placed in order and the
+        // shift is carried.
+        let mut images = images;
+        images.sort_by_key(|(_, offset)| *offset);
+        let mut shift = 0usize;
+        for (image, offset) in images {
+            let byte = utf16_offset_to_byte(self.text(), offset as usize) + shift;
+            self.cursor = byte.min(self.text.len());
+            if let Some(label) = self.insert_image(image.mime_type, image.source) {
+                shift += label.len();
+            }
         }
     }
 
@@ -741,13 +768,31 @@ impl ComposerBuffer {
     /// that took the text and then asked for the images could lose them to an
     /// intervening edit.
     pub fn take_with_attachments(&mut self) -> (String, Vec<ImageAttachment>) {
-        let images = self.images();
-        (self.take_expanded(), images)
+        let outgoing = self.take_outgoing();
+        (
+            outgoing.text,
+            outgoing
+                .images
+                .into_iter()
+                .map(|(image, _)| image)
+                .collect(),
+        )
+    }
+
+    /// Take the outgoing message out, leaving an empty buffer.
+    pub fn take_outgoing(&mut self) -> Outgoing {
+        let outgoing = self.outgoing();
+        self.clear_taken();
+        outgoing
     }
 
     /// Take the expanded text out, leaving an empty buffer.
     pub fn take_expanded(&mut self) -> String {
-        let text = self.expanded_text();
+        let outgoing = self.take_outgoing();
+        outgoing.text
+    }
+
+    fn clear_taken(&mut self) {
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
@@ -755,7 +800,6 @@ impl ComposerBuffer {
         self.chips.clear();
         self.next_image_number = 1;
         self.record(EditKind::Block);
-        text
     }
 
     /// How many pastes are currently collapsed.
@@ -1506,26 +1550,94 @@ impl ComposerBuffer {
     }
 }
 
+/// A draft on its way out: the text, and every image with its place in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    pub text: String,
+    /// Each attached image and the UTF-16 offset in `text` where it sat.
+    pub images: Vec<(ImageAttachment, u32)>,
+}
+
 /// The wire form of an attached image.
 ///
+/// Two things have to be right for the other clients to *show* the picture
+/// rather than mention it. The URI has to name something they can read: a
+/// `file://` URI — the same form the desktop writes — absolute so a client with
+/// a different working directory still finds it. And the offset has to say where
+/// in the message the picture was, or every reader that honours it puts it at
+/// the end of the paragraph instead of where it was written.
+///
 /// An image read from the clipboard has nowhere to live but the message, so it
-/// travels as a data URL; a file the runtime can read itself is passed by path
-/// and never copied through the client.
-pub fn message_attachment(image: &ImageAttachment) -> vibex_core::MessageAttachment {
+/// travels as a data URL — unless this client *is* the authority, in which case
+/// the bytes are written beside it and the file is named instead: the runtime
+/// that has to read them is this host, and a path is the only form the desktop
+/// can draw.
+pub fn message_attachment(
+    image: &ImageAttachment,
+    inline_text_offset: u32,
+    materialise_bytes: bool,
+) -> vibex_core::MessageAttachment {
     let uri = match &image.source {
-        ImageSource::Path(path) => path.clone(),
-        ImageSource::Bytes(bytes) => format!(
-            "data:{};base64,{}",
-            image.mime_type,
-            crate::terminal::encode_base64(bytes)
-        ),
+        ImageSource::Path(path) => file_uri(path),
+        ImageSource::Bytes(bytes) if materialise_bytes => {
+            materialise_attachment(&image.mime_type, bytes)
+                .map(|path| file_uri(&path))
+                .unwrap_or_else(|| data_uri(&image.mime_type, bytes))
+        }
+        ImageSource::Bytes(bytes) => data_uri(&image.mime_type, bytes),
     };
     vibex_core::MessageAttachment {
         label: image.label.clone(),
         mime_type: Some(image.mime_type.clone()),
         uri: Some(uri),
-        inline_text_offset: None,
+        inline_text_offset: Some(inline_text_offset),
     }
+}
+
+fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
+    format!(
+        "data:{};base64,{}",
+        mime_type,
+        crate::terminal::encode_base64(bytes)
+    )
+}
+
+/// A path as a `file://` URI, absolute so any client can resolve it.
+fn file_uri(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    let absolute = path
+        .is_absolute()
+        .then(|| path.to_path_buf())
+        .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(path)));
+    match absolute {
+        Some(path) => format!("file://{}", path.display()),
+        None => format!("file://{path}", path = path.display()),
+    }
+}
+
+/// Write clipboard bytes to a file the runtime and the desktop can both read.
+///
+/// Named by content, so attaching the same screenshot twice writes it once, and
+/// beside the OS's own temporary files, which is where a message's bytes belong
+/// when the message is the only owner. `None` when the platform will not have
+/// it: the data URL still reaches the Agent, it is only the picture that the
+/// other clients cannot draw.
+fn materialise_attachment(mime_type: &str, bytes: &[u8]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    mime_type.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    let extension = crate::composer::image_mime_for_path(mime_type)
+        .or_else(|| mime_type.strip_prefix("image/").map(|_| mime_type))
+        .map(|mime| mime.rsplit('/').next().unwrap_or("png").to_string())
+        .unwrap_or_else(|| "png".to_string());
+    let directory = std::env::temp_dir().join("vibex-attachments");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join(format!("{:016x}.{}", hasher.finish(), extension));
+    if !path.exists() {
+        std::fs::write(&path, bytes).ok()?;
+    }
+    Some(path.display().to_string())
 }
 
 /// The image type for a path, when its extension names one.
@@ -1542,6 +1654,22 @@ pub fn image_mime_for_path(path: &str) -> Option<&'static str> {
         "bmp" => Some("image/bmp"),
         _ => None,
     }
+}
+
+/// The byte index in `text` of a UTF-16 offset, clamped to its length.
+///
+/// `inline_text_offset` is counted in UTF-16 units because that is what the
+/// other clients — and the web platform they were written against — count in;
+/// the buffer counts bytes, and a message full of CJK is where the two disagree.
+pub fn utf16_offset_to_byte(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0usize;
+    for (byte, character) in text.char_indices() {
+        if utf16 >= offset {
+            return byte;
+        }
+        utf16 += character.len_utf16();
+    }
+    text.len()
 }
 
 fn byte_offset_for_column(line: &str, column: usize) -> usize {
@@ -2370,38 +2498,125 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_form_of_an_image_is_a_path_or_a_data_url() {
-        let path = message_attachment(&ImageAttachment {
-            label: "[Image #1]".into(),
-            mime_type: "image/png".into(),
-            source: ImageSource::Path("/tmp/shot.png".into()),
-        });
-        assert_eq!(path.uri.as_deref(), Some("/tmp/shot.png"));
+    fn the_wire_form_of_an_image_names_a_file_or_carries_the_bytes() {
+        // A path becomes a `file://` URI and an absolute one, because the
+        // client that draws it may have a different working directory.
+        let path = message_attachment(
+            &ImageAttachment {
+                label: "[Image #1]".into(),
+                mime_type: "image/png".into(),
+                source: ImageSource::Path("/tmp/shot.png".into()),
+            },
+            7,
+            true,
+        );
+        assert_eq!(path.uri.as_deref(), Some("file:///tmp/shot.png"));
         assert_eq!(path.mime_type.as_deref(), Some("image/png"));
         assert_eq!(path.label, "[Image #1]");
-
-        let bytes = message_attachment(&ImageAttachment {
-            label: "[Image #2]".into(),
-            mime_type: "image/png".into(),
-            source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
-        });
         assert_eq!(
-            bytes.uri.as_deref(),
+            path.inline_text_offset,
+            Some(7),
+            "the place in the message is what stops the picture moving to the end"
+        );
+
+        // A relative path is resolved against the client's directory.
+        let relative = message_attachment(
+            &ImageAttachment {
+                label: "[Image #2]".into(),
+                mime_type: "image/png".into(),
+                source: ImageSource::Path("shot.png".into()),
+            },
+            0,
+            true,
+        );
+        let uri = relative.uri.expect("a uri");
+        assert!(uri.starts_with("file:///"), "{uri}");
+        assert!(uri.ends_with("/shot.png"), "{uri}");
+
+        // Clipboard bytes on a remote seat travel with the message.
+        let remote = message_attachment(
+            &ImageAttachment {
+                label: "[Image #3]".into(),
+                mime_type: "image/png".into(),
+                source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+            },
+            0,
+            false,
+        );
+        assert_eq!(
+            remote.uri.as_deref(),
             Some("data:image/png;base64,iVBORw0KGgo=")
         );
+
+        // On the authority they become a file the desktop can draw.
+        let local = message_attachment(
+            &ImageAttachment {
+                label: "[Image #4]".into(),
+                mime_type: "image/png".into(),
+                source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+            },
+            0,
+            true,
+        );
+        let uri = local.uri.expect("a uri");
+        let path = uri.strip_prefix("file://").expect("a file uri");
+        assert_eq!(
+            std::fs::read(path).expect("the bytes were written"),
+            png_bytes()
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn restoring_a_draft_puts_its_images_back() {
+    fn an_image_carries_the_offset_it_sat_at() {
+        // The offset is in the text as it is *sent*: a paste expanded in front
+        // of an image moves the image, and a double-width character counts as
+        // what the wire counts it as.
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("前面 ");
+        buffer
+            .insert_image("image/png", ImageSource::Path("/tmp/a.png".into()))
+            .expect("the image attaches");
+        buffer.insert_str(" 后面");
+        let outgoing = buffer.outgoing();
+        assert_eq!(outgoing.text, "前面  后面");
+        assert_eq!(outgoing.images.len(), 1);
+        assert_eq!(
+            outgoing.images[0].1, 3,
+            "the offset counts UTF-16 units: {:?}",
+            outgoing.text
+        );
+
+        // An image at the end of the message is still an offset, not a guess.
+        let mut trailing = ComposerBuffer::default();
+        trailing.insert_str("hi ");
+        trailing
+            .insert_image("image/png", ImageSource::Path("/tmp/b.png".into()))
+            .expect("the image attaches");
+        assert_eq!(trailing.outgoing().images[0].1, 3);
+    }
+
+    #[test]
+    fn restoring_a_draft_puts_its_images_back_where_they_were() {
         let mut buffer = ComposerBuffer::default();
         let image = ImageAttachment {
             label: "[Image #1]".into(),
             mime_type: "image/png".into(),
             source: ImageSource::Path("/tmp/shot.png".into()),
         };
-        buffer.set_draft("see this ", vec![image]);
-        assert_eq!(buffer.text(), "see this [Image #1]");
+        // The offset is where the picture sat in the text as it was sent; the
+        // label goes back there, not at the end of the paragraph.
+        buffer.set_draft("look at  then continue", vec![(image.clone(), 8)]);
+        assert_eq!(buffer.text(), "look at [Image #1] then continue");
         assert_eq!(buffer.image_count(), 1);
+
+        // Two images keep their order and their places.
+        let mut second = image.clone();
+        second.label = "[Image #2]".into();
+        let mut pair = ComposerBuffer::default();
+        pair.set_draft("a  b  c", vec![(second, 5), (image, 2)]);
+        assert_eq!(pair.text(), "a [Image #1] b [Image #2] c");
+        assert_eq!(pair.image_count(), 2);
     }
 
     #[test]
