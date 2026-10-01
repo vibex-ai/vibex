@@ -3811,3 +3811,123 @@ fn the_send_that_is_still_in_flight_reads_as_running() {
         "the turn line still reads idle:\n{screen}"
     );
 }
+
+/// A running session is a list of rows, not a wall of text.
+///
+/// Every reasoning paragraph in full, every tool call with its JSON payload,
+/// and the runtime's name repeated on each row: the three of them together are
+/// what made a working session unreadable — the rows the reader is scanning for
+/// were buried in the evidence.
+#[test]
+fn a_running_session_reads_as_rows() {
+    let mut app = app(110, 26);
+    app.navigate_to(Page::Agent);
+    let session_id = vibex_core::VibexSessionId::new();
+    let attribution = Some("DeepSeek Harness · bai · deepseek-v4.1-flash".to_string());
+    let tool = |index: i64, command: &str, status: vibex_core::ToolCallStatus| {
+        seeded_item(
+            &session_id,
+            index,
+            vibex_core::TimelineItemKind::ToolCall,
+            vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: format!("call-{index}"),
+                tool_name: "execute".to_string(),
+                status,
+                summary: "execute".to_string(),
+                input_summary: Some(format!("{{\"command\":\"{command}\"}}")),
+                output_summary: None,
+                raw_extension: None,
+            }),
+        )
+    };
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.timeline.replace_authoritative(
+        session_id.clone(),
+        vec![
+            seeded_item(
+                &session_id,
+                1,
+                vibex_core::TimelineItemKind::UserMessage,
+                vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                    text: "optimise the timeline".to_string(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            seeded_item(
+                &session_id,
+                2,
+                vibex_core::TimelineItemKind::Reasoning,
+                vibex_core::TimelinePayload::Reasoning(vibex_core::ReasoningPayload {
+                    text: "The timeline shows every reasoning paragraph in full. \n Each tool call prints its whole JSON payload. \n The fix is to keep a dense row one row tall while it streams.".to_string(),
+                    is_final: false,
+                }),
+            ),
+            tool(
+                3,
+                "cd /home/peatboy/code/peatboy/vibex-dev/vibex && git diff -- crates/vibex-tui/src/app.rs",
+                vibex_core::ToolCallStatus::Started,
+            ),
+            tool(
+                4,
+                "cargo test -p vibex-tui --offline --test render",
+                vibex_core::ToolCallStatus::Completed,
+            ),
+            tool(
+                5,
+                "cargo clippy -p vibex-tui --all-targets --offline",
+                vibex_core::ToolCallStatus::Completed,
+            ),
+        ],
+    );
+    app.sync_transcript();
+    // Every row of a real session carries the runtime that produced it; the
+    // projection fills this in from the item's execution attribution.
+    let mut blocks = app.transcript.blocks().to_vec();
+    for block in &mut blocks {
+        block.runtime_attribution = attribution.clone();
+    }
+    app.transcript.set_blocks(blocks);
+    let screen = text(&render(&mut app, 110, 26));
+
+    // The reasoning row is its newest line, not the whole thought.
+    assert!(
+        screen.contains("one row tall while it streams"),
+        "the live line is missing:\n{screen}"
+    );
+    assert!(
+        !screen.contains("shows every reasoning paragraph in full"),
+        "the whole reasoning block is on screen:\n{screen}"
+    );
+    // A tool row names its action; the payload stays behind the fold. The run's
+    // head is the row that carries it, and the rest are counted beside it.
+    assert!(
+        screen.contains("git diff -- crates/vibex-tui/src/app.rs"),
+        "the tool's command is not on its row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("\"command\""),
+        "a raw payload is on screen:\n{screen}"
+    );
+    // Three work items in a row are a run, with the rest counted.
+    assert!(screen.contains("+2"), "the run is not folded:\n{screen}");
+    // The runtime is named once for the run, not on every row of it — and not
+    // under the reader's own message, which no runtime wrote.
+    assert_eq!(
+        screen.matches("DeepSeek Harness").count(),
+        1,
+        "the attribution repeats:\n{screen}"
+    );
+    let user_row = screen
+        .lines()
+        .position(|line| line.contains("optimise the timeline"))
+        .expect("the reader's message");
+    assert!(
+        !screen
+            .lines()
+            .nth(user_row + 1)
+            .unwrap_or_default()
+            .contains("DeepSeek"),
+        "the reader's own message is attributed to a runtime:\n{screen}"
+    );
+}

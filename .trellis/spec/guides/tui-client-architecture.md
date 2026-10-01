@@ -464,6 +464,16 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **Work is evidence: rows while it runs, detail on demand.** A streaming dense
+  row is still one row — its newest line (`live_row`: the tail for prose, the
+  action for a tool) — because a running session that prints whole reasoning
+  blocks and raw tool payloads buries the rows the reader is scanning for. A
+  tool payload is summarised by what it does (`tool_action`, JSON string fields
+  in the order that answers "what is it doing"), the runtime is named once per
+  run and again where it changes, and a run never folds across runtimes. The
+  estimate in `estimate_height` must agree with that shape, or scrolling jumps
+  as rows come into view; a block whose neighbour changed is therefore
+  re-measured (the gap and the attribution are decided by the neighbours).
 * **A send is projected until the runtime echoes it.** The client does not own
   the timeline: the reader's own message comes back a round trip later, so it is
   drawn locally as the row it will become (`PendingSend::row`) and the session

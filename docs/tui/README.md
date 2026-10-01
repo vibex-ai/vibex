@@ -284,6 +284,30 @@ for a case that a terminal rarely reaches. Undo coalesces consecutive typing
 into one step and breaks the batch on a cursor move, so undo removes what was
 just typed rather than moving text out from under a cursor placed on purpose.
 
+### Running work
+
+A session that is working is mostly *evidence*: reasoning, and the tool calls and
+commands the turn makes. It is drawn as rows rather than as sections, and the
+rule holds while it streams — the three things that made a running session
+unreadable were all of them about volume:
+
+- **A work item stays one row while it arrives.** A reasoning block prints its
+  *newest* line, because the head of a thought still being written is not a
+  summary of it; a tool call prints its action. The full text is behind the fold
+  (`e`, or the block's detail view) and one keypress away.
+- **A tool row shows what it does, not what it was sent.** A call arrives as
+  JSON — `{"command":"cargo test -p vibex-tui"}` — and the row shows the
+  command; the file a file operation touches, or what a search looks for, when
+  that is the payload. The rest is payload, and payload is what the fold is for.
+- **A run names its runtime once.** Consecutive work items of one kind from one
+  runtime fold into their first row with a `+N` count. The runtime's name rides
+  that row, and appears again only where it *changes* — a run from another Agent
+  is a different run, so it does not fold in. The reader's own message is never
+  attributed: they wrote it.
+
+An answer still streams in full. It is the content rather than the evidence for
+it, and the reader is reading it as it lands.
+
 ### Markdown
 
 Agent messages are markdown, and the interface interprets it rather than echoing

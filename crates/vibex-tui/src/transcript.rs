@@ -112,6 +112,7 @@ impl Block {
         self.collapsible.hash(&mut hasher);
         self.file_path.hash(&mut hasher);
         self.group.hash(&mut hasher);
+        self.runtime_attribution.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -369,6 +370,24 @@ impl Transcript {
             .collect::<std::collections::HashSet<_>>();
         self.live.retain(|id, _| present.contains(id.as_str()));
 
+        // A dense row's rendering depends on its neighbours as well as on
+        // itself: the gap it leaves is decided by whether the row after it is
+        // also a work item, and whether it carries the runtime's name by the row
+        // before. A block that changed therefore makes its *predecessor* stale —
+        // but only when either of them is a work item, which is the case the
+        // neighbours decide.
+        for index in 1..next_blocks.len() {
+            let changed = next_heights[index] == UNMEASURED;
+            let neighbouring =
+                is_dense_row(next_blocks[index].kind) || is_dense_row(next_blocks[index - 1].kind);
+            if !changed || !neighbouring || next_heights[index - 1] == UNMEASURED {
+                continue;
+            }
+            next_heights[index - 1] = UNMEASURED;
+            reused_rendered.remove(&(index - 1));
+            reused_recency.retain(|value| *value != index - 1);
+        }
+
         self.blocks = next_blocks;
         self.heights = next_heights;
         self.keys = next_keys;
@@ -398,9 +417,14 @@ impl Transcript {
             }
             let start = index;
             let kind = self.blocks[start].kind;
+            // A run is one kind of work *by one runtime*: folding a row that
+            // came from somewhere else into this run would hide the only thing
+            // the attribution is there to say.
+            let attribution = self.blocks[start].runtime_attribution.clone();
             while index < self.blocks.len()
                 && eligible_for_group(&self.blocks[index])
                 && self.blocks[index].kind == kind
+                && self.blocks[index].runtime_attribution == attribution
             {
                 index += 1;
             }
@@ -633,9 +657,11 @@ impl Transcript {
         ) && !block.body.is_empty();
         let header = usize::from(!headerless);
         let body_lines = if block.body.is_empty() || (dense && !open && !block.streaming) {
-            // A dense row's body is behind the fold; a streaming one is being
-            // written, so its whole body is drawn.
+            // A dense row's body is behind the fold, and a streaming one shows a
+            // single live line rather than the whole body.
             0
+        } else if dense && !open {
+            1
         } else if open || block.streaming {
             // Count newlines plus a wrap allowance per line.
             let explicit = block.body.matches('\n').count() + 1;
@@ -723,12 +749,31 @@ impl Transcript {
             theme.prose()
         };
         let body_width = chrome::content_width(self.width.max(8)).max(8);
-        self.refresh_stream(&block, theme, strings, body_width, prose);
+        // Only a body that will be drawn is worth parsing as it arrives: a
+        // dense row shows one live line, and re-rendering the whole thought to
+        // keep a renderer it never reads is work the session does not need.
+        let body_shown = !block.body.is_empty() && (!is_dense_row(block.kind) || block.expanded);
+        if body_shown {
+            self.refresh_stream(&block, theme, strings, body_width, prose);
+        } else {
+            self.live.remove(&block.id);
+        }
         // Borrowed after the renderer has been advanced, so a delta never has
         // to copy the rows that are already settled.
         let streamed = self.live.get(&block.id).map(|live| live.rendered());
         self.stats.blocks_rendered += 1;
-        render_block_in_run_with_body(
+        // A run of rows from one runtime names it once, on the row where it
+        // starts — or where it changes.
+        let show_attribution = block.runtime_attribution.is_some()
+            && block.kind != TimelineRowKind::UserMessage
+            && self
+                .blocks
+                .get(index.wrapping_sub(1))
+                .is_none_or(|previous| {
+                    !is_dense_row(previous.kind)
+                        || previous.runtime_attribution != block.runtime_attribution
+                });
+        render_block_with_attribution(
             &block,
             next.as_ref(),
             streamed,
@@ -736,6 +781,7 @@ impl Transcript {
             self.width,
             strings,
             self.last_selected == Some(index),
+            show_attribution,
         )
     }
 
@@ -1548,22 +1594,124 @@ fn shows_kind_label(kind: TimelineRowKind, title: &str, label: &str) -> bool {
 ///
 /// This is the detail that identifies the row — a path, a match count, the
 /// first line of output — not the beginning of a report: the body stays behind
-/// the fold.
+/// the fold. A tool call is the case worth naming: its body is a payload, and
+/// printing the payload turns every row into a wall of JSON, so the *action* is
+/// what the row shows.
 fn dense_summary(block: &Block) -> Option<String> {
     let body = block.body.trim();
     if body.is_empty() {
         return None;
     }
-    let first = body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim();
+    let first = match is_tool_item(block.kind) {
+        true => tool_action(body),
+        false => body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    };
+    let first = first.trim();
     if first.is_empty() {
         return None;
     }
     // A summary that only repeats the title says nothing.
     (!first.eq_ignore_ascii_case(block.title.trim())).then(|| first.to_string())
+}
+
+/// Whether a kind's body is a tool payload rather than prose.
+fn is_tool_item(kind: TimelineRowKind) -> bool {
+    matches!(
+        kind,
+        TimelineRowKind::ToolCall
+            | TimelineRowKind::Command
+            | TimelineRowKind::FileOperation
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::ImageGeneration
+    )
+}
+
+/// The action inside a tool payload, in the terms a reader thinks in.
+///
+/// A call arrives as JSON — `{"command":"cargo test -p vibex-tui"}` — and the
+/// interesting part is one string field. The fields are tried in the order that
+/// answers "what is it doing": the command it runs, the file it touches, the
+/// thing it looks for, then whatever prose the caller sent with it. A body that
+/// is not JSON (already-rendered output, a plain command) is its own summary.
+fn tool_action(body: &str) -> String {
+    let trimmed = body.trim();
+    if !trimmed.starts_with('{') {
+        return trimmed
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    const FIELDS: [&str; 7] = [
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+    ];
+    for field in FIELDS {
+        let Some(found) = value.get(field) else {
+            continue;
+        };
+        let text = match found {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            other => other.to_string(),
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
+    // Nothing recognisable: the payload as it came, on one line.
+    trimmed.lines().next().unwrap_or_default().to_string()
+}
+
+/// The newest line of a body that is still arriving.
+///
+/// Prose is read forwards, so the head of a thought still being written is not
+/// a summary of it — but the *tail* says what the model is doing right now,
+/// which is the only question a running row has to answer.
+fn live_tail(block: &Block) -> Option<String> {
+    let body = block.body.trim_end();
+    if body.is_empty() {
+        return None;
+    }
+    let last = body
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    (!last.is_empty()).then(|| last.to_string())
+}
+
+/// The one line a dense row shows while its body is still arriving.
+///
+/// A dense row stays a row: a tool call that dumps its whole output, or a
+/// reasoning block that prints a paragraph at a time, is a wall of text that
+/// buries the rows around it — and the rows around it are what the reader is
+/// scanning for. The full text is one keypress away.
+fn live_row(block: &Block) -> Option<String> {
+    if is_tool_item(block.kind) {
+        dense_summary(block)
+    } else {
+        live_tail(block)
+    }
 }
 
 /// The blank rows that follow a block.
@@ -1624,6 +1772,26 @@ pub fn render_block_in_run_with_body(
     width: usize,
     strings: Strings,
     selected: bool,
+) -> RenderedBlock {
+    render_block_with_attribution(block, next, streamed, theme, width, strings, selected, true)
+}
+
+/// As [`render_block_in_run_with_body`], told whether this row carries the
+/// runtime's name.
+///
+/// A session's rows usually come from one runtime, and printing its name on
+/// every one of them is the same three words a hundred times: it is worth a row
+/// only where it *changes*, which is where the reader learns something.
+#[allow(clippy::too_many_arguments)]
+pub fn render_block_with_attribution(
+    block: &Block,
+    next: Option<&Block>,
+    streamed: Option<&crate::markdown::RenderedMarkdown>,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    selected: bool,
+    show_attribution: bool,
 ) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
@@ -1735,10 +1903,15 @@ pub fn render_block_in_run_with_body(
     }
 
     // A dense row is one row: its body is what the fold is for, and the detail
-    // overlay can show all of it. A streaming row is the exception — it is the
-    // answer arriving, so it renders as it is written.
-    let shows_body = !body.is_empty() && (!dense || open || block.streaming);
-    if shows_body {
+    // overlay can show all of it. A streaming dense row is still one row — its
+    // newest line, so the reader can see it working without the session turning
+    // into a wall of text. An answer arriving (not dense) is different: it *is*
+    // the content, so it renders as it is written.
+    let shows_body = !body.is_empty() && (!dense || open);
+    let live_line = (dense && !open && block.streaming)
+        .then(|| live_row(block))
+        .flatten();
+    if shows_body || live_line.is_some() {
         // A lifted band behind a work body separates blocks that sit next to
         // each other without spending a row on a separator.
         let body_background = body_band(block, theme);
@@ -1750,12 +1923,27 @@ pub fn render_block_in_run_with_body(
         } else {
             theme.prose()
         };
-        let mut rendered = match streamed {
-            Some(rendered) => rendered.clone(),
-            None if is_markdown(block.kind) => {
-                crate::markdown::render_markdown_with(body, theme, body_width, strings, prose)
+        let mut rendered = if shows_body {
+            match streamed {
+                Some(rendered) => rendered.clone(),
+                None if is_markdown(block.kind) => {
+                    crate::markdown::render_markdown_with(body, theme, body_width, strings, prose)
+                }
+                None => render_plain(body, theme, body_width),
             }
-            None => render_plain(body, theme, body_width),
+        } else {
+            // The live line of a row that is still arriving: one row, so the
+            // transcript keeps its shape while the work happens.
+            match live_line {
+                Some(text) => crate::markdown::RenderedMarkdown {
+                    lines: vec![Line::from(Span::raw(text.clone()))],
+                    plain: vec![text],
+                },
+                None => crate::markdown::RenderedMarkdown {
+                    lines: Vec::new(),
+                    plain: Vec::new(),
+                },
+            }
         };
         let style = body_style(block, theme);
         // Markdown separates paragraphs with a blank row, including the last
@@ -1822,7 +2010,10 @@ pub fn render_block_in_run_with_body(
             theme.warning().add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(runtime) = &block.runtime_attribution {
+    // The reader's own message has no runtime: they wrote it, and naming the
+    // Agent under their words says the opposite of what happened.
+    let attributed = show_attribution && block.kind != TimelineRowKind::UserMessage;
+    if let Some(runtime) = block.runtime_attribution.as_ref().filter(|_| attributed) {
         // Attribution rides the header of a dense row rather than spending a
         // row of its own: it is a label, not a sentence.
         if dense {
@@ -2587,5 +2778,212 @@ mod tests {
                 "a row overflowed the chrome: {line:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod density_tests {
+    use super::*;
+    use crate::locale::Locale;
+
+    fn strings() -> Strings {
+        Strings::for_locale(Locale::En)
+    }
+
+    fn theme() -> TuiTheme {
+        TuiTheme::resolve(
+            Some("vibex-dark"),
+            vibex_ui::GpuiThemeMode::Dark,
+            crate::theme::ColorCapability {
+                mode: crate::theme::ColorMode::TrueColor,
+                glyphs: crate::theme::GlyphMode::Unicode,
+            },
+        )
+    }
+
+    fn item(id: &str, kind: TimelineRowKind, body: &str, streaming: bool) -> Block {
+        Block {
+            id: id.to_string(),
+            kind,
+            title: match kind {
+                TimelineRowKind::Reasoning => "Thinking".to_string(),
+                TimelineRowKind::ToolCall => "execute".to_string(),
+                _ => id.to_string(),
+            },
+            body: body.to_string(),
+            turn_id: Some("turn-1".into()),
+            sequence: 1,
+            expanded: false,
+            collapsible: true,
+            streaming,
+            failed: false,
+            pending_permission: false,
+            file_path: None,
+            runtime_attribution: None,
+            conclusion: false,
+            group: GroupRole::Solo,
+        }
+    }
+
+    #[test]
+    fn a_work_item_that_is_still_arriving_stays_one_row() {
+        // The reader is scanning the rows, not reading the work: a reasoning
+        // block that prints itself a paragraph at a time, or a tool call that
+        // dumps its whole output, is a wall of text with the conversation
+        // buried in it.
+        let long = "first thought\nsecond thought\nthird thought\nfourth thought";
+        let streaming = item("r1", TimelineRowKind::Reasoning, long, true);
+        let rendered = render_block(&streaming, &theme(), 60, strings());
+        // Header, one live line, and the gap that follows a block.
+        assert_eq!(
+            rendered.height, 3,
+            "header plus one live line: {rendered:?}"
+        );
+        assert!(
+            rendered.plain[1].contains("fourth thought"),
+            "the live line is not the newest one: {:?}",
+            rendered.plain
+        );
+        assert!(
+            !rendered
+                .plain
+                .iter()
+                .any(|line| line.contains("first thought")),
+            "the whole thought is on screen: {:?}",
+            rendered.plain
+        );
+
+        // A tool call shows its action, and its payload stays behind the fold.
+        let tool = item(
+            "t1",
+            TimelineRowKind::ToolCall,
+            r#"{"command":"cargo test -p vibex-tui","description":"Run the tests"}"#,
+            true,
+        );
+        let rendered = render_block(&tool, &theme(), 60, strings());
+        assert_eq!(rendered.height, 3);
+        assert!(
+            rendered.plain[1].contains("cargo test -p vibex-tui"),
+            "{:?}",
+            rendered.plain
+        );
+        assert!(
+            !rendered.plain[1].contains("description"),
+            "the payload leaked into the row: {:?}",
+            rendered.plain
+        );
+
+        // Once it has stopped, the row is its summary and nothing else.
+        let settled = item(
+            "t1",
+            TimelineRowKind::ToolCall,
+            r#"{"command":"ls"}"#,
+            false,
+        );
+        assert_eq!(
+            render_block(&settled, &theme(), 60, strings()).height,
+            2,
+            "a finished work item is its summary and nothing else"
+        );
+
+        // The whole of it is one keypress away.
+        let mut opened = streaming;
+        opened.expanded = true;
+        let rendered = render_block(&opened, &theme(), 60, strings());
+        assert!(
+            rendered
+                .plain
+                .iter()
+                .any(|line| line.contains("first thought")),
+            "expanding lost the body: {:?}",
+            rendered.plain
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_still_arriving_is_measured_as_it_is_drawn() {
+        // The estimate only has to be close, but it must agree about *shape*:
+        // scrolling a session of streaming rows would jump as they came into
+        // view if the two disagreed.
+        let mut transcript = Transcript::new();
+        transcript.configure(60, &theme());
+        transcript.set_blocks(vec![
+            item(
+                "r1",
+                TimelineRowKind::Reasoning,
+                "one\ntwo\nthree\nfour",
+                true,
+            ),
+            item("t1", TimelineRowKind::ToolCall, "output\nmore\nmore", true),
+        ]);
+        let count = transcript.blocks().len();
+        let measured = (0..count)
+            .map(|index| {
+                transcript.measure(index, &theme(), strings());
+                transcript.heights[index] as usize
+            })
+            .collect::<Vec<_>>();
+        let estimated = (0..count)
+            .map(|index| transcript.estimate_height(index))
+            .collect::<Vec<_>>();
+        assert_eq!(measured, estimated, "estimate and render disagree");
+    }
+
+    #[test]
+    fn a_tool_payload_is_summarised_by_what_it_does() {
+        let action = |body: &str| tool_action(body);
+        assert_eq!(
+            action(r#"{"command":"cargo test","timeout_ms":10}"#),
+            "cargo test"
+        );
+        // A file operation names the file; a search names what it looks for.
+        assert_eq!(action(r#"{"file_path":"/tmp/a.rs"}"#), "/tmp/a.rs");
+        assert_eq!(action(r#"{"pattern":"fn main"}"#), "fn main");
+        // Lists arrive as lists.
+        assert_eq!(action(r#"{"command":["git","diff"]}"#), "git diff");
+        // Not JSON, or nothing recognisable: the first line as it came.
+        assert_eq!(action("cargo test -p vibex-tui"), "cargo test -p vibex-tui");
+        assert_eq!(action(r#"{"unknown":"kept"}"#), r#"{"unknown":"kept"}"#);
+    }
+
+    #[test]
+    fn a_run_names_the_runtime_once() {
+        // Three words repeated on every row of a session is noise; the row where
+        // the runtime *changes* is the one that says something.
+        let attribution = Some("DeepSeek Harness · bai · deepseek-v4.1-flash".to_string());
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let mut blocks = Vec::new();
+        for index in 0..3 {
+            let mut row = item(
+                &format!("t{index}"),
+                TimelineRowKind::ToolCall,
+                r#"{"command":"ls"}"#,
+                false,
+            );
+            row.runtime_attribution = attribution.clone();
+            blocks.push(row);
+        }
+        transcript.set_blocks(blocks);
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let named = lines
+            .iter()
+            .filter(|line| line.to_string().contains("DeepSeek Harness"))
+            .count();
+        assert_eq!(named, 1, "the runtime is named on every row");
+
+        // A switch is worth a row: the name reappears where it changes.
+        let mut blocks = transcript.blocks().to_vec();
+        blocks[2].runtime_attribution = Some("codex · gpt-5".to_string());
+        transcript.set_blocks(blocks);
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            text.iter().any(|line| line.contains("codex")),
+            "the new runtime is not named: {text:?}"
+        );
     }
 }
