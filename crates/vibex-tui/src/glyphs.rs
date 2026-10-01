@@ -115,8 +115,65 @@ pub fn disclosure(open: bool, tier: GlyphTier) -> &'static str {
 /// The marker beside a row the reader has pinned. One column.
 pub fn pin_marker(tier: GlyphTier) -> &'static str {
     match tier {
+        GlyphTier::Full => "⚑",
+        GlyphTier::Legacy => "!",
+    }
+}
+
+/// A session with something new in it. One column.
+///
+/// Distinct from the pin in shape rather than only in colour: the two sit in
+/// the same column, and a reader who cannot tell the colours apart still has to
+/// tell a kept session from an unread one.
+pub fn unread_marker(tier: GlyphTier) -> &'static str {
+    match tier {
         GlyphTier::Full => "●",
-        GlyphTier::Legacy => "*",
+        GlyphTier::Legacy => "o",
+    }
+}
+
+/// The mark beside a session's state. One column.
+///
+/// Colour carries the same distinction, but the shape does not depend on it: a
+/// failed session and a running one are told apart on a monochrome terminal.
+pub fn state_marker(state: &str, tier: GlyphTier) -> &'static str {
+    let unicode = tier == GlyphTier::Full;
+    match state {
+        "running" => {
+            if unicode {
+                "▶"
+            } else {
+                ">"
+            }
+        }
+        "failed" => {
+            if unicode {
+                "✗"
+            } else {
+                "x"
+            }
+        }
+        "waiting" => {
+            if unicode {
+                "◆"
+            } else {
+                "*"
+            }
+        }
+        "archived" => {
+            if unicode {
+                "▤"
+            } else {
+                "#"
+            }
+        }
+        _ => {
+            if unicode {
+                "·"
+            } else {
+                "."
+            }
+        }
     }
 }
 

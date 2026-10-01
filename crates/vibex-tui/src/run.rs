@@ -1717,6 +1717,14 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::Event(event) => {
+            // The unread mark is the client's own: the event says what arrived,
+            // and the list says where the reader was when it did.
+            if let vibex_backend::BackendEvent::Timeline(item) = &event
+                && app.note_activity(item)
+            {
+                // Deliberately not `dirty`: the frame is repainted when the
+                // event itself is applied below.
+            }
             let decision = app.agent.apply_event(event);
             match decision {
                 vibex_ui::AgentEventDecision::Applied => {

@@ -615,6 +615,11 @@ pub struct App {
     pub pending_send: Option<PendingSend>,
     /// Bumped for every send, so each projected row keeps its own identity.
     pub pending_send_serial: u64,
+    /// Sessions that finished a turn while the reader was looking elsewhere.
+    ///
+    /// The client's own notion, not the runtime's: it is what "unread" means in
+    /// a list of sessions, and it is cleared by opening the session.
+    pub unread_sessions: std::collections::BTreeSet<String>,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -990,6 +995,7 @@ impl App {
             queue_selection: None,
             pending_send: None,
             pending_send_serial: 0,
+            unread_sessions: std::collections::BTreeSet::new(),
             banner: None,
             turn_started: None,
             turn_tokens: None,
@@ -2028,6 +2034,7 @@ impl App {
     }
 
     pub fn open_session(&mut self, session_id: VibexSessionId) {
+        self.unread_sessions.remove(session_id.as_str());
         self.navigation.enter_session(session_id.as_str());
         self.navigate_to(Page::Agent);
         // Opening a session is a request to work in it, so the keyboard lands
@@ -2646,6 +2653,73 @@ impl App {
             released.push((session_id, queued.text, attachments));
         }
         released
+    }
+
+    /// Note a finished answer for a session the reader is not looking at.
+    ///
+    /// Called with the timeline item that arrived: a *final* answer is the
+    /// signal that the Agent stopped working, and it is only "unread" when it
+    /// landed somewhere the reader was not. Opening the session clears it.
+    pub fn note_activity(&mut self, event: &vibex_core::TimelineLiveEvent) -> bool {
+        if event.sequence != event.item.sequence || event.session_id != event.item.session_id {
+            return false;
+        }
+        if self
+            .agent
+            .state
+            .selected_session_id
+            .as_ref()
+            .is_some_and(|selected| selected == &event.session_id)
+        {
+            return false;
+        }
+        let final_answer = matches!(
+            &event.item.payload,
+            vibex_core::TimelinePayload::AgentMessage(message) if message.is_final
+        );
+        final_answer
+            && self
+                .unread_sessions
+                .insert(event.session_id.as_str().to_string())
+    }
+
+    /// The Agent a session runs on, named for the session list.
+    ///
+    /// The catalogue is where a display name lives; a session whose Agent is
+    /// not in it still gets its id, so the mark is never blank.
+    pub fn session_agent_label(&self, session: &AgentSession) -> String {
+        if let Some(agent) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == session.agent_id)
+            })
+            .map(|agent| agent.label.clone())
+        {
+            return agent;
+        }
+        if let Some(label) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .options
+                    .iter()
+                    .find(|option| option.selection.agent_id == session.agent_id)
+            })
+            .map(|option| option.agent_label.clone())
+        {
+            return label;
+        }
+        session.agent_id.to_string()
+    }
+
+    /// Whether the session list marks this session as having something new.
+    pub fn session_is_unread(&self, session_id: &VibexSessionId) -> bool {
+        self.unread_sessions.contains(session_id.as_str())
     }
 
     /// The title of a session by id, when the client has listed it.

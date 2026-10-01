@@ -4450,3 +4450,218 @@ fn the_spinner_turns_through_the_quiet_parts_of_a_turn() {
     assert!(!app.is_animating(), "an idle session is animating");
     assert!(!app.advance_transcript_animation());
 }
+
+/// The session list is the desktop's sidebar in a terminal: the same order and
+/// the same folders from the shared projection, with each row carrying what the
+/// desktop's row carries — who is answering, what state it is in, whether
+/// anything is new, and when it last said anything.
+#[test]
+fn the_session_list_names_the_agent_and_when_it_last_spoke() {
+    let now = vibex_core::unix_timestamp_ms();
+    let mut running = seeded_session("session_list0001", "fix the flaky test");
+    running.state = vibex_core::AgentSessionState::Running;
+    running.last_message_at_ms = now - 3 * 60 * 1000;
+    let mut idle = seeded_session("session_list0002", "what is this project?");
+    idle.last_message_at_ms = now - 5 * 60 * 60 * 1000;
+    let mut failed = seeded_session("session_list0003", "the one that failed");
+    failed.state = vibex_core::AgentSessionState::Error;
+    failed.last_message_at_ms = now - 20 * 1000;
+
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![running.clone(), idle.clone(), failed.clone()]))
+        .expect("sessions apply");
+    // One Agent for all of them: the catalogue is where its name lives.
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: vec![vibex_core::RuntimeAgentSummary {
+            agent_id: running.agent_id.clone(),
+            label: "Claude Code".to_string(),
+        }],
+        auth_sources: Vec::new(),
+        options: Vec::new(),
+    });
+    app.unread_sessions.insert(idle.id.as_str().to_string());
+    let screen = text(&render(&mut app, 110, 24));
+
+    // The Agent's mark leads the row, and the time it last spoke trails it.
+    assert!(screen.contains("C fix the flaky test"), "{screen}");
+    assert!(screen.contains("3m"), "no relative time:\n{screen}");
+    assert!(screen.contains("5h"), "{screen}");
+    assert!(screen.contains("now"), "{screen}");
+    // The unread mark belongs to the session that has something new, and to no
+    // other row.
+    let unread_row = screen
+        .lines()
+        .find(|line| line.contains("what is this project?"))
+        .expect("the unread session's row");
+    assert!(
+        unread_row.contains('●'),
+        "the unread session is not marked: {unread_row:?}"
+    );
+    assert_eq!(
+        screen.matches('●').count(),
+        1,
+        "more than one row claims something new:\n{screen}"
+    );
+    // States are told apart by shape as well as by colour.
+    for mark in ['▶', '✗', '·'] {
+        assert!(
+            screen.contains(mark),
+            "missing the {mark:?} mark:\n{screen}"
+        );
+    }
+    for word in ["Running", "Failed", "Idle"] {
+        assert!(screen.contains(word), "missing {word:?}:\n{screen}");
+    }
+}
+
+/// The columns of the list line up, measured in cells rather than bytes: the
+/// rows carry box drawing and geometric glyphs, and the eye scans columns.
+#[test]
+fn the_session_list_columns_line_up() {
+    let now = vibex_core::unix_timestamp_ms();
+    let mut first = seeded_session("session_columns0001", "short");
+    first.state = vibex_core::AgentSessionState::Running;
+    first.last_message_at_ms = now - 3 * 60 * 1000;
+    let mut second = seeded_session("session_columns0002", "a much longer title than that one");
+    second.state = vibex_core::AgentSessionState::Error;
+    second.last_message_at_ms = now - 5 * 60 * 60 * 1000;
+
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![first, second]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    let column_of = |line: &str, needle: &str| {
+        line.find(needle)
+            .map(|at| vibex_tui::text::display_width(&line[..at]))
+    };
+    let mark_column = |needle: &str| {
+        screen
+            .lines()
+            .find(|line| line.contains(needle))
+            .and_then(|line| column_of(line, needle))
+    };
+    let running_at = mark_column("▶").expect("the running row");
+    let failed_at = mark_column("✗").expect("the failed row");
+    assert_eq!(
+        running_at, failed_at,
+        "the state column drifts with the length of a title:\n{screen}"
+    );
+    let time_edge = |needle: &str| {
+        screen
+            .lines()
+            .find(|line| line.contains(needle))
+            .and_then(|line| column_of(line, needle).map(|at| at + needle.chars().count()))
+    };
+    assert_eq!(
+        time_edge("3m"),
+        time_edge("5h"),
+        "the time column drifts:\n{screen}"
+    );
+}
+
+#[test]
+fn an_unread_session_is_marked_until_it_is_opened() {
+    // Unread is the client's own notion: the event says an answer finished, and
+    // the list knows where the reader was when it did.
+    let session_id = vibex_core::VibexSessionId::parse("session_unread0001").unwrap();
+    let other = vibex_core::VibexSessionId::parse("session_unread0002").unwrap();
+    // A completion is the *final* message item, exactly as the desktop reads it
+    // for its own unread marks; a delta is still work in progress.
+    let answer = |session_id: &vibex_core::VibexSessionId, finished: bool| {
+        let payload = if finished {
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "done".to_string(),
+                is_final: true,
+            })
+        } else {
+            vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                text_delta: "work".to_string(),
+                chunk_index: 0,
+                phase: None,
+            })
+        };
+        vibex_core::TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 7,
+            item: seeded_item(
+                session_id,
+                7,
+                vibex_core::TimelineItemKind::AgentMessage,
+                payload,
+            ),
+        }
+    };
+
+    let mut app = app(110, 24);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let mut busy = seeded_session("session_unread0001", "elsewhere");
+    busy.id = session_id.clone();
+    let mut open = seeded_session("session_unread0002", "in front of me");
+    open.id = other.clone();
+    app.agent
+        .apply_sessions(Ok(vec![busy, open]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(other.clone());
+
+    // A finished answer for the session on screen is not unread.
+    assert!(!app.note_activity(&answer(&other, true)));
+    assert!(!app.session_is_unread(&other));
+    // A delta is not a completion either.
+    assert!(!app.note_activity(&answer(&session_id, false)));
+    assert!(!app.session_is_unread(&session_id));
+    // A finished answer elsewhere is.
+    assert!(app.note_activity(&answer(&session_id, true)));
+    assert!(app.session_is_unread(&session_id));
+    // And opening that session clears it.
+    app.open_session(session_id.clone());
+    assert!(!app.session_is_unread(&session_id));
+}
+
+#[test]
+fn the_session_list_marks_degrade_to_a_legacy_terminal() {
+    // The marks are part of the row's meaning, so they have to survive a
+    // console font: single column, and no character it cannot draw.
+    let mut app = App::new(
+        DisconnectedBackend::facade(),
+        AppOptions {
+            seat: SeatKind::Authority,
+            capability: ColorCapability {
+                mode: ColorMode::TrueColor,
+                glyphs: GlyphMode::Ascii,
+            },
+            theme_id: None,
+            mode: vibex_ui::GpuiThemeMode::Dark,
+            locale: Locale::En,
+            sidebar_path: None,
+        },
+    );
+    app.resize(110, 24);
+    app.navigate_to(Page::Sessions);
+    let mut failed = seeded_session("session_list0101", "the one that failed");
+    failed.state = vibex_core::AgentSessionState::Error;
+    let mut running = seeded_session("session_list0102", "working");
+    running.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![failed, running.clone()]))
+        .expect("sessions apply");
+    app.unread_sessions.insert(running.id.as_str().to_string());
+    let screen = text(&render(&mut app, 110, 24));
+    for mark in ['x', '>', 'o'] {
+        assert!(
+            screen.contains(mark),
+            "missing the {mark:?} mark:\n{screen}"
+        );
+    }
+    assert!(
+        screen
+            .lines()
+            .filter(|line| line.contains("Failed") || line.contains("Running"))
+            .all(|line| line.is_ascii()),
+        "a legacy console was handed a glyph it cannot draw:\n{screen}"
+    );
+}

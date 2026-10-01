@@ -1070,11 +1070,40 @@ fn render_session_view(
         .max()
         .unwrap_or(0)
         .min(usize::from(list_area.width) / 3);
+    // The state mark sits in front of its word, so the column is the widest
+    // label plus the mark and the space after it.
     let state_width = if state_column > 0 {
-        state_column + 1
+        state_column + 3
     } else {
         0
     };
+    // When the session last said anything, right-aligned: the reader scanning
+    // the list is looking for what changed, and a wall of identical rows says
+    // nothing about that. The column is measured from what will be drawn, so a
+    // list of sessions from today spends no width on days.
+    let now_ms = vibex_core::unix_timestamp_ms();
+    let time_labels = rows
+        .iter()
+        .map(|row| {
+            row.session_id
+                .as_ref()
+                .and_then(|session_id| {
+                    sessions
+                        .iter()
+                        .find(|session| &session.id == session_id)
+                        .map(|session| session.last_message_at_ms)
+                })
+                .map(|at_ms| relative_time_label(at_ms, now_ms, strings))
+        })
+        .collect::<Vec<_>>();
+    let time_column = time_labels
+        .iter()
+        .flatten()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(list_area.width) / 4);
+    let time_width = if time_column > 0 { time_column + 1 } else { 0 };
     let items = rows
         .iter()
         .enumerate()
@@ -1111,22 +1140,61 @@ fn render_session_view(
                 }
                 vibex_desktop_model::AgentSidebarRowKind::Session => " ",
             };
+            // The session's Agent, marked the way the desktop's sidebar marks
+            // it: one cell that says *who* is answering, before the title.
+            let session = row
+                .session_id
+                .as_ref()
+                .and_then(|session_id| sessions.iter().find(|session| &session.id == session_id));
+            let agent_mark = session.map(|session| {
+                let label = app.session_agent_label(session);
+                let initial = label
+                    .trim()
+                    .chars()
+                    .next()
+                    .map(|character| character.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                (initial, agent_mark_style(&label, theme))
+            });
+            let unread = session.is_some_and(|session| app.session_is_unread(&session.id));
             let indent = " ".repeat(usize::from(row.depth) * 2);
             // The marker plus its space, then the title, then the state column.
             // Padding is counted in cells, not characters: a CJK title occupies
             // two cells per character and a `{:<width$}` pad would push the
             // state off the row.
             let name_width = usize::from(list_area.width)
-                .saturating_sub(usize::from(row.depth) * 2 + 2 + state_width)
+                .saturating_sub(usize::from(row.depth) * 2 + 2 + state_width + time_width + 2)
                 .max(8);
             let label = truncate_to_width(&row.label, name_width, "…");
             let padding = name_width.saturating_sub(display_width(&label));
-            let mut spans = vec![Span::styled(
-                format!("{indent}{marker} {label}{}", " ".repeat(padding)),
+            let mut spans = vec![Span::styled(format!("{indent}{marker} "), style)];
+            if let Some((initial, mark_style)) = agent_mark.clone() {
+                spans.push(Span::styled(
+                    format!("{initial} "),
+                    if index == selected { style } else { mark_style },
+                ));
+            }
+            if unread {
+                spans.push(Span::styled(
+                    format!("{} ", crate::glyphs::unread_marker(app.glyph_tier())),
+                    if index == selected {
+                        style
+                    } else {
+                        Style::default().fg(theme.roles.accent_attention)
+                    },
+                ));
+            }
+            // The unread mark and the Agent mark take cells the title budget
+            // was computed without, so the pad absorbs the difference.
+            let taken = usize::from(agent_mark.is_some()) * 2 + usize::from(unread) * 2;
+            let padding = padding.saturating_sub(taken);
+            spans.push(Span::styled(
+                format!("{label}{}", " ".repeat(padding)),
                 style,
-            )];
+            ));
             if let Some(state) = row.state {
                 let label = session_state_label(state, strings);
+                let mark = crate::glyphs::state_marker(state_marker_key(state), app.glyph_tier());
                 let padding = state_column.saturating_sub(display_width(label));
                 let state_style = if index == selected || hovered {
                     // The state is part of the row, so it rides the band rather
@@ -1138,8 +1206,27 @@ fn render_session_view(
                     Style::default().fg(theme.roles.gray_dim)
                 };
                 spans.push(Span::styled(
+                    format!("{mark} "),
+                    if index == selected || hovered {
+                        style
+                    } else {
+                        Style::default().fg(state_marker_colour(state, theme))
+                    },
+                ));
+                spans.push(Span::styled(
                     format!("{}{label}", " ".repeat(padding)),
                     state_style,
+                ));
+            }
+            if let Some(Some(time)) = time_labels.get(index) {
+                let padding = time_column.saturating_sub(display_width(time));
+                spans.push(Span::styled(
+                    format!(" {}{time}", " ".repeat(padding)),
+                    if index == selected || hovered {
+                        style
+                    } else {
+                        Style::default().fg(theme.roles.gray_dim)
+                    },
                 ));
             }
             let mut lines = vec![Line::from(spans)];
@@ -1166,6 +1253,74 @@ fn render_session_view(
 }
 
 /// A human-readable session state, rather than the variant name.
+/// The state's mark key, which is the state family rather than its word.
+///
+/// The word is localized and long; the family is what a mark can carry.
+fn state_marker_key(state: vibex_core::AgentSessionState) -> &'static str {
+    match state {
+        vibex_core::AgentSessionState::Running => "running",
+        vibex_core::AgentSessionState::Error => "failed",
+        vibex_core::AgentSessionState::NeedsInput => "waiting",
+        vibex_core::AgentSessionState::Archived => "archived",
+        _ => "idle",
+    }
+}
+
+/// The colour of a state's mark.
+fn state_marker_colour(
+    state: vibex_core::AgentSessionState,
+    theme: &TuiTheme,
+) -> ratatui::style::Color {
+    match state {
+        vibex_core::AgentSessionState::Running => theme.roles.accent_running,
+        vibex_core::AgentSessionState::Error => theme.roles.danger,
+        vibex_core::AgentSessionState::NeedsInput => theme.roles.accent_attention,
+        _ => theme.roles.gray_dim,
+    }
+}
+
+/// The colour of a session's Agent mark.
+///
+/// The Agent is identified by a letter, and the colour says the same thing a
+/// second time for a reader who is scanning rather than reading. It is derived
+/// from the label, so the same Agent keeps its colour across sessions and
+/// machines without anything having to agree on a table.
+fn agent_mark_style(label: &str, theme: &TuiTheme) -> Style {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    label.hash(&mut hasher);
+    let palette = [
+        theme.roles.accent_user,
+        theme.roles.accent,
+        theme.roles.command,
+        theme.roles.success,
+        theme.roles.accent_attention,
+    ];
+    let index = (hasher.finish() as usize) % palette.len();
+    Style::default().fg(palette[index])
+}
+
+/// How long ago a session last said anything, the way a list of them reads.
+///
+/// Deliberately coarse: the list separates "just now" from "a while ago", and a
+/// timestamp to the second would be a column of noise. Negative ages are clamped
+/// rather than printed, because a clock that moved backwards is not news.
+fn relative_time_label(at_ms: i64, now_ms: i64, strings: Strings) -> String {
+    let elapsed_seconds = ((now_ms - at_ms) / 1_000).max(0);
+    if elapsed_seconds < 60 {
+        return strings.time_just_now().to_string();
+    }
+    let minutes = elapsed_seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}{}", strings.time_minutes());
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}{}", strings.time_hours());
+    }
+    format!("{}{}", hours / 24, strings.time_days())
+}
+
 fn session_state_label(state: vibex_core::AgentSessionState, strings: Strings) -> &'static str {
     match state {
         vibex_core::AgentSessionState::Running => strings.running(),

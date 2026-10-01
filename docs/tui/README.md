@@ -370,9 +370,29 @@ band from the least important end.
 
 ### Sessions
 
-Each row is three columns: the marker, the title, and the session's state,
-right-aligned in one column whose edge is the same on every row — measured in
-terminal cells, so a double-width title does not push its state out of line.
+Each row carries what the desktop's sidebar row carries, in terminal terms: the
+Agent's mark, an unread dot, the title, the state, and how long ago the session
+last said anything. The state and the time are aligned on their right edge in
+columns measured in terminal cells, so neither a double-width title nor a
+longer word pushes a column out of line.
+
+- **The Agent's mark** is its label's first letter, coloured from the label, so
+  the same Agent keeps its colour across sessions and machines without a table
+  to maintain. It leads the row because "who is answering" is the first thing a
+  reader scanning several sessions wants.
+- **The unread dot** appears on a session whose answer finished while the reader
+  was looking elsewhere — the client's own notion, cleared by opening it. The
+  dot and the pin are different shapes, not only different colours: they share
+  the leading column, and a monochrome terminal has to tell them apart.
+- **State** is a mark and a word: `▶` running, `✗` failed, `·` idle, `◆` waiting
+  on the reader, `▤` archived. The shape carries the meaning on its own; the
+  colour says it a second time.
+- **The time** is coarse — `now`, `3m`, `5h`, `2d` — because a list separates
+  "a moment ago" from "a while ago", and a timestamp to the second is a column
+  of noise.
+
+Order and folders are the shared projection's: pinned sessions above the rest,
+manual order within it, grouped by workspace and project, folded with `g`.
 The sidebar groups sessions by workspace and project — `g` folds the headings
 away for one flat run. `/` filters, `Enter` opens, `n` starts a new one, `r`
 renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A` includes

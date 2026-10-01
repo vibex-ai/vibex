@@ -464,6 +464,15 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **A list row carries the same facts as the desktop's.** The session list
+  renders the shared projection's rows (order, pins, folders) and adds what the
+  desktop's sidebar row has: the Agent's mark (its label's initial, coloured
+  from the label so no table is needed), an unread dot, a state mark *and* word,
+  and a coarse relative time. Unread is the client's own notion — a final
+  `AgentMessage` for a session the reader was not looking at (`note_activity`),
+  cleared by `open_session` — because the runtime does not track "read". Marks
+  are one column at every glyph tier and their shape carries the meaning, or a
+  reader who cannot tell the colours apart loses the state.
 * **A running turn is what the spinner animates on.** `is_animating` is the
   single question the loop asks before repainting on its own, and it answers
   yes while a turn reads as running (`turn_reads_running`), not only while
