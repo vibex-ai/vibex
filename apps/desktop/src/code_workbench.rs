@@ -164,7 +164,7 @@ struct GitMutationNotification;
 
 fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
-        GitMutationKind::Fetch => Some(locale::text("Pull completed", "拉取已完成", "擷取已完成")),
+        GitMutationKind::Fetch => Some(locale::text("Pull completed", "拉取已完成", "拉取已完成")),
         GitMutationKind::Push => Some(locale::text("Push completed", "推送已完成", "推送已完成")),
         GitMutationKind::Revert => Some(locale::text(
             "Rollback completed",
@@ -177,7 +177,7 @@ fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
 
 fn git_mutation_failure_label(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
-        GitMutationKind::Fetch => Some(locale::text("Pull failed", "拉取失败", "擷取失敗")),
+        GitMutationKind::Fetch => Some(locale::text("Pull failed", "拉取失败", "拉取失敗")),
         GitMutationKind::Push => Some(locale::text("Push failed", "推送失败", "推送失敗")),
         GitMutationKind::Revert => Some(locale::text("Rollback failed", "回滚失败", "回復失敗")),
         _ => None,
@@ -14376,7 +14376,7 @@ impl CodeRightRail {
                                 .p_0()
                                 .icon(Icon::default().path("icons/vibex/download.svg"))
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                                .tooltip(locale::text("Fetch", "获取", "擷取"))
+                                .tooltip(locale::text("Pull", "拉取", "拉取"))
                                 .loading(pending_kind == Some(GitMutationKind::Fetch))
                                 .disabled(pending)
                                 .on_click(cx.listener(|this, _, window, cx| {

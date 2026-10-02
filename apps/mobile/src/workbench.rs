@@ -1996,7 +1996,7 @@ impl MobileWorkbench {
                     .flex()
                     .items_center()
                     .child(
-                        icon_button("git-fetch", "icons/download.svg", "Fetch")
+                        icon_button("git-fetch", "icons/download.svg", "Pull")
                             .when(can_remote && !self.busy, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,

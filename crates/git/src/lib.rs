@@ -445,18 +445,7 @@ fn remote_action_inner(
     request: &GitRemoteActionRequest,
 ) -> VibexResult<GitRemoteActionResult> {
     let output = match request.kind {
-        GitRemoteActionKind::Fetch => {
-            let mut args = vec!["fetch".to_string()];
-            if let Some(remote) = request.remote.as_deref() {
-                validate_remote_name(remote)?;
-                args.push(remote.to_string());
-            }
-            if let Some(branch) = request.branch.as_deref() {
-                validate_ref_arg(branch)?;
-                args.push(branch.to_string());
-            }
-            run_git_owned(root, &args)?
-        }
+        GitRemoteActionKind::Fetch => fetch_output(root, request)?,
         GitRemoteActionKind::Push => push_output(root, request)?,
     };
     let status_after = status(workspace_id.clone(), root).ok();
@@ -2084,6 +2073,75 @@ fn commit_output(root: &Path, message: &str, paths: &[String], amend: bool) -> V
     run_git_owned(root, &args)
 }
 
+/// Fetch the requested refs and, for a plain fetch, advance the checked-out
+/// branch to its upstream when that move is a fast-forward.
+///
+/// The Git panel's fetch control is how a developer picks up commits a teammate
+/// pushed. Fetching alone leaves the local branch behind, showing a divergence
+/// the panel offers no way to resolve, so a plain fetch finishes the job with a
+/// `--ff-only` merge. That merge cannot invent a merge commit or a conflict: a
+/// branch that has diverged, has no upstream, or is mid-operation stays exactly
+/// where the fetch left it, and the panel's ahead/behind badges keep describing
+/// what remains. An explicit remote or branch target keeps pure fetch
+/// semantics, because the caller asked for that ref rather than for the branch.
+fn fetch_output(root: &Path, request: &GitRemoteActionRequest) -> VibexResult<String> {
+    let mut args = vec!["fetch".to_string()];
+    if let Some(remote) = request.remote.as_deref() {
+        validate_remote_name(remote)?;
+        args.push(remote.to_string());
+    }
+    if let Some(branch) = request.branch.as_deref() {
+        validate_ref_arg(branch)?;
+        args.push(branch.to_string());
+    }
+    let fetched = run_git_owned(root, &args)?;
+    if normalized_optional(&request.remote).is_some()
+        || normalized_optional(&request.branch).is_some()
+    {
+        return Ok(fetched);
+    }
+    // When the branch moves, the fast-forward is the answer the caller asked
+    // for; the ref plumbing the fetch printed is already implied by it.
+    Ok(fast_forward_upstream(root)?.unwrap_or(fetched))
+}
+
+/// Move the checked-out branch to its upstream when it is strictly behind and
+/// the move is a fast-forward.
+///
+/// Returns the merge output when the branch moved, and `None` when there was
+/// nothing to do or the move would need a decision this action must not make.
+fn fast_forward_upstream(root: &Path) -> VibexResult<Option<String>> {
+    let Some(upstream) = current_upstream(root)? else {
+        return Ok(None);
+    };
+    let (ahead, behind) = ahead_behind(root, "HEAD", &upstream)?;
+    if behind == 0 || ahead > 0 {
+        return Ok(None);
+    }
+    // A merge, rebase or cherry-pick in progress owns the working tree; keep
+    // the fetch useful instead of failing it on an operation the developer is
+    // already resolving.
+    if active_git_operation(root)?.is_some() {
+        return Ok(None);
+    }
+    let output = run_git_owned(
+        root,
+        &[
+            "merge".to_string(),
+            "--ff-only".to_string(),
+            "--no-edit".to_string(),
+            upstream.clone(),
+        ],
+    )?;
+    if resolve_head(root)? != resolve_ref_head(root, &upstream)? {
+        return Err(VibexError::conflict(
+            "git_pull_fast_forward_unproven",
+            "the fetch did not advance the local branch to its upstream",
+        ));
+    }
+    Ok(Some(output))
+}
+
 fn push_output(root: &Path, request: &GitRemoteActionRequest) -> VibexResult<String> {
     let remote = normalized_optional(&request.remote);
     let branch = normalized_optional(&request.branch);
@@ -3586,6 +3644,159 @@ mod tests {
         )
         .unwrap();
         assert!(result.summary.contains("fetch"));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(bare);
+    }
+
+    #[test]
+    fn plain_fetch_fast_forwards_the_current_branch() {
+        let root = temp_repo("fetch-fast-forward");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let bare = temp_repo("fetch-fast-forward-bare");
+        run_raw(&root, &["init", "--bare", bare.to_str().unwrap()]).unwrap();
+        run_raw(&root, &["remote", "add", "origin", bare.to_str().unwrap()]).unwrap();
+        let branch = current_branch(&root).unwrap().unwrap();
+        run_raw(&root, &["push", "-u", "origin", &branch]).unwrap();
+
+        commit_file_at(
+            &root,
+            "remote.txt",
+            "remote\n",
+            "remote commit",
+            1_700_000_100,
+        );
+        run_raw(&root, &["push", "origin", &branch]).unwrap();
+        run_raw(&root, &["reset", "--hard", "HEAD~1"]).unwrap();
+        let upstream = format!("origin/{branch}");
+        let upstream_head = resolve_ref_head(&root, &upstream).unwrap();
+        assert_ne!(resolve_head(&root).unwrap(), upstream_head);
+        assert!(!root.join("remote.txt").exists());
+
+        let workspace_id = WorkspaceId::new();
+        let result = remote_action(
+            workspace_id.clone(),
+            &root,
+            &GitRemoteActionRequest {
+                workspace_id,
+                kind: GitRemoteActionKind::Fetch,
+                remote: None,
+                branch: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.kind, GitRemoteActionKind::Fetch);
+        assert_eq!(resolve_head(&root).unwrap(), upstream_head);
+        assert!(root.join("remote.txt").exists());
+        let branches = branch_list(WorkspaceId::new(), &root).unwrap();
+        let current = branches
+            .branches
+            .iter()
+            .find(|branch| branch.current)
+            .unwrap();
+        assert_eq!((current.ahead, current.behind), (0, 0));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(bare);
+    }
+
+    #[test]
+    fn plain_fetch_leaves_a_diverged_branch_in_place() {
+        let root = temp_repo("fetch-diverged");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let bare = temp_repo("fetch-diverged-bare");
+        run_raw(&root, &["init", "--bare", bare.to_str().unwrap()]).unwrap();
+        run_raw(&root, &["remote", "add", "origin", bare.to_str().unwrap()]).unwrap();
+        let branch = current_branch(&root).unwrap().unwrap();
+        run_raw(&root, &["push", "-u", "origin", &branch]).unwrap();
+
+        commit_file_at(
+            &root,
+            "remote.txt",
+            "remote\n",
+            "remote commit",
+            1_700_000_100,
+        );
+        run_raw(&root, &["push", "origin", &branch]).unwrap();
+        run_raw(&root, &["reset", "--hard", "HEAD~1"]).unwrap();
+        commit_file_at(&root, "local.txt", "local\n", "local commit", 1_700_000_200);
+        let local_head = resolve_head(&root).unwrap();
+
+        let workspace_id = WorkspaceId::new();
+        remote_action(
+            workspace_id.clone(),
+            &root,
+            &GitRemoteActionRequest {
+                workspace_id,
+                kind: GitRemoteActionKind::Fetch,
+                remote: None,
+                branch: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolve_head(&root).unwrap(), local_head);
+        assert!(!root.join("remote.txt").exists());
+        let branches = branch_list(WorkspaceId::new(), &root).unwrap();
+        let current = branches
+            .branches
+            .iter()
+            .find(|branch| branch.current)
+            .unwrap();
+        assert_eq!((current.ahead, current.behind), (1, 1));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(bare);
+    }
+
+    #[test]
+    fn fetch_with_an_explicit_target_stays_fetch_only() {
+        let root = temp_repo("fetch-explicit");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let bare = temp_repo("fetch-explicit-bare");
+        run_raw(&root, &["init", "--bare", bare.to_str().unwrap()]).unwrap();
+        run_raw(&root, &["remote", "add", "origin", bare.to_str().unwrap()]).unwrap();
+        let branch = current_branch(&root).unwrap().unwrap();
+        run_raw(&root, &["push", "-u", "origin", &branch]).unwrap();
+
+        commit_file_at(
+            &root,
+            "remote.txt",
+            "remote\n",
+            "remote commit",
+            1_700_000_100,
+        );
+        run_raw(&root, &["push", "origin", &branch]).unwrap();
+        run_raw(&root, &["reset", "--hard", "HEAD~1"]).unwrap();
+        let local_head = resolve_head(&root).unwrap();
+        let upstream_head = resolve_ref_head(&root, &format!("origin/{branch}")).unwrap();
+        assert_ne!(local_head, upstream_head);
+
+        // An explicit target names the ref to fetch, so the branch stays put
+        // even though it is strictly behind its upstream.
+        let result = remote_action(
+            WorkspaceId::new(),
+            &root,
+            &GitRemoteActionRequest {
+                workspace_id: WorkspaceId::new(),
+                kind: GitRemoteActionKind::Fetch,
+                remote: Some("origin".to_string()),
+                branch: Some(branch.clone()),
+            },
+        )
+        .unwrap();
+
+        assert!(!result.summary.trim().is_empty());
+        assert_eq!(resolve_head(&root).unwrap(), local_head);
+        assert_eq!(
+            resolve_ref_head(&root, &format!("origin/{branch}")).unwrap(),
+            upstream_head
+        );
+        assert!(!root.join("remote.txt").exists());
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(bare);
