@@ -164,6 +164,17 @@ intents! {
     OverlayToggleValue => { scope: Overlay, id: "overlay_toggle", label: "Toggle", help: "Flip a boolean field or a multi-select option." },
     PaletteRun => { scope: Overlay, id: "palette_run", label: "Run", help: "Run the highlighted command." },
 
+    // ---- the runtime switcher -------------------------------------------
+    // These live in the overlay scope rather than a switcher-only one because
+    // every other overlay ignores what it does not use, and one shared scope is
+    // what keeps the switcher's keys remappable from the same file.
+    OverlayFoldOpen => { scope: Overlay, id: "overlay_fold_open", label: "Expand", help: "Expand the highlighted group, or step into it." },
+    OverlayFoldClosed => { scope: Overlay, id: "overlay_fold_close", label: "Fold", help: "Fold the highlighted group, or step out to its heading." },
+    StarRuntimeModel => { scope: Overlay, id: "overlay_star_model", label: "Star", help: "Star or unstar the highlighted model in the runtime switcher." },
+    ManageRuntimeAccount => { scope: Overlay, id: "overlay_manage_account", label: "Account", help: "Open the highlighted runtime's Agent account in the management pages." },
+    ApplyRuntimeEdit => { scope: Overlay, id: "overlay_apply_runtime", label: "Apply", help: "Apply the run options staged in the runtime switcher." },
+    ResetRunOption => { scope: Overlay, id: "overlay_reset_run_option", label: "Reset", help: "Stage the highlighted run option back to the Agent's own default." },
+
     // ---- approvals ------------------------------------------------------
     ApprovalApprove => { scope: Overlay, id: "approval_approve", label: "Allow", help: "Approve the pending request." },
     ApprovalDeny => { scope: Overlay, id: "approval_deny", label: "Deny", help: "Refuse the pending request." },
@@ -366,6 +377,16 @@ impl Intent {
                 | Intent::SettingPrevious
                 | Intent::SettingNext
                 | Intent::ResetSetting
+                // Folding the catalogue, starring a model and staging a run
+                // option are all local: the switcher can be read and arranged
+                // while the runtime is unreachable. Applying what was staged
+                // does need the runtime, which is why `ManageRuntimeAccount`
+                // is deliberately absent.
+                | Intent::OverlayFoldOpen
+                | Intent::OverlayFoldClosed
+                | Intent::StarRuntimeModel
+                | Intent::ApplyRuntimeEdit
+                | Intent::ResetRunOption
         )
     }
 }

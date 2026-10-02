@@ -736,6 +736,19 @@ pub struct App {
     /// overlay opens when it lands. A catalogue fetched for the composer's
     /// info line must not pop a modal over the session.
     pub runtime_picker_pending: bool,
+    /// What the switcher remembers between runs: the selection last applied,
+    /// each Agent's own answer, and how each model runs.
+    pub runtime_prefs: crate::runtime_prefs::RuntimePreferences,
+    /// Where the switcher's memory is written; `None` keeps it in memory only.
+    pub runtime_path: Option<std::path::PathBuf>,
+    /// The switcher's filter, folded groups and staged run options.
+    pub runtime_picker: crate::runtime_picker::RuntimePickerState,
+    /// The Agent whose row the Agents page should land on.
+    ///
+    /// A catalogue row whose account needs attention sends the reader to that
+    /// page; the list arrives after the page does, so the Agent waits here for
+    /// it rather than being selected by an index the page has not got yet.
+    pub pending_agent_focus: Option<vibex_core::AgentId>,
     /// The workspace chosen in the workspace browser, consumed by the
     /// new-session prompt.
     pub workspace_path: Option<String>,
@@ -976,6 +989,10 @@ pub struct FrameRegions {
     /// A row-per-index list the frame drew: its rect and the scope it selects
     /// in. Clicking row `n` selects entry `n`.
     pub list: Option<ListRegion>,
+    /// The runtime switcher's rows, when it is the modal on screen. Its cursor
+    /// indexes a window rather than a rect, so the region carries where the
+    /// window started as well as where it was drawn.
+    pub runtime_picker: Option<RuntimePickerRegion>,
     /// The turn rail's ticks, one rect per turn.
     pub turns: Vec<(ratatui::layout::Rect, usize)>,
     /// The shortcut band's hints, so a click runs the same intent as the key.
@@ -991,6 +1008,7 @@ impl FrameRegions {
     pub fn begin_frame(&mut self) {
         self.turns.clear();
         self.hints.clear();
+        self.runtime_picker = None;
     }
 }
 
@@ -1004,6 +1022,31 @@ pub struct ListRegion {
     pub rows: usize,
     /// Lines between the top of the rect and the first selectable row.
     pub first_line: usize,
+}
+
+/// Where the runtime switcher drew its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimePickerRegion {
+    pub rect: ratatui::layout::Rect,
+    /// The catalogue row drawn on the rect's first line.
+    pub offset: usize,
+    /// How many rows the view has, drawn or not.
+    pub rows: usize,
+}
+
+impl RuntimePickerRegion {
+    /// Which row a pointer is over, if any.
+    pub fn row_at(&self, column: u16, row: u16) -> Option<usize> {
+        if column < self.rect.x
+            || column >= self.rect.right()
+            || row < self.rect.y
+            || row >= self.rect.bottom()
+        {
+            return None;
+        }
+        let index = self.offset + usize::from(row - self.rect.y);
+        (index < self.rows).then_some(index)
+    }
 }
 
 /// Which row a pointer is over, if any.
@@ -1172,6 +1215,12 @@ impl App {
             regions: FrameRegions::default(),
             runtime_options: None,
             runtime_picker_pending: false,
+            runtime_prefs: crate::runtime_prefs::RuntimePreferences::load(
+                options.runtime_path.as_deref(),
+            ),
+            runtime_path: options.runtime_path,
+            runtime_picker: crate::runtime_picker::RuntimePickerState::default(),
+            pending_agent_focus: None,
             workspace_path: None,
             pending_creations: BTreeMap::new(),
             failed_creations: Vec::new(),
@@ -1399,13 +1448,15 @@ impl App {
 
     /// The catalogue entry a creation with no choice of its own would use.
     ///
-    /// This is the worker's own rule — the first entry the catalogue says is
-    /// available, else the first one it publishes — deliberately mirrored here
-    /// rather than guessed at: the entry this names is exactly the one
-    /// [`Effect::CreateSession`] falls back to when the choice arrives empty, so
-    /// the page and the session it creates can never name two different Agents.
+    /// A valid remembered preference is the default without becoming an
+    /// explicit edit to the new draft. Otherwise use the catalogue's first
+    /// available entry. Creation materializes this same displayed selection
+    /// into its immutable request.
     fn default_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
         let catalog = self.runtime_options.as_ref()?;
+        if let Some(selection) = self.runtime_prefs.preferred(catalog, None) {
+            return Some(selection);
+        }
         catalog
             .options
             .iter()
@@ -1467,9 +1518,23 @@ impl App {
         let Some(selection) = self.page_runtime_selection() else {
             return Vec::new();
         };
+        self.run_options_for(&selection)
+    }
+
+    /// The run options one selection publishes.
+    ///
+    /// Split from [`Self::run_options`] because the switcher reads its rows from
+    /// the *staged* selection while the composer's info line reads the applied
+    /// one: a reader who changed a thinking depth has not sent a message with it
+    /// yet, and the line behind the panel must not claim they have.
+    pub fn run_options_for(
+        &self,
+        selection: &vibex_core::SessionRuntimeSelection,
+    ) -> Vec<RunOption> {
         let Some(catalog) = self.runtime_options.as_ref() else {
             return Vec::new();
         };
+        let selection = selection.clone();
         let projection =
             vibex_desktop_model::RuntimeCascadeProjection::from_catalog(catalog, &selection);
         let mut options = Vec::new();
@@ -1562,21 +1627,6 @@ impl App {
             });
         }
         options
-    }
-
-    /// How many rows one view of the runtime switcher lists.
-    ///
-    /// The two views index their own rows: the catalogue by entry, the run
-    /// options by what the chosen entry publishes.
-    pub fn runtime_picker_row_count(&self, view: RuntimePickerView) -> usize {
-        match view {
-            RuntimePickerView::Choices => self
-                .runtime_options
-                .as_ref()
-                .map(|catalog| catalog.options.len())
-                .unwrap_or(0),
-            RuntimePickerView::Options => self.run_options().len(),
-        }
     }
 
     /// The value rows a run option's list offers: the Agent's own default
@@ -1779,12 +1829,30 @@ impl App {
     /// It sits beside the key file under the same home, so a reader who wants
     /// to reset the interface has one directory to clear.
     pub fn sidebar_arrangement_path() -> Option<std::path::PathBuf> {
-        if let Ok(explicit) = std::env::var("VIBEX_TUI_SIDEBAR")
+        Some(Self::interface_home()?.join("tui-sidebar.json"))
+    }
+
+    /// Where the runtime switcher's memory is written.
+    ///
+    /// Beside the arrangement, for the same reason: one home holds everything
+    /// this client remembers.
+    pub fn runtime_preferences_path() -> Option<std::path::PathBuf> {
+        if let Ok(explicit) = std::env::var("VIBEX_TUI_RUNTIME")
             && !explicit.trim().is_empty()
         {
             return Some(std::path::PathBuf::from(explicit));
         }
-        let home = std::env::var("VIBEX_HOME")
+        Some(Self::interface_home()?.join("tui-runtime.json"))
+    }
+
+    /// The directory the interface's own files live in.
+    fn interface_home() -> Option<std::path::PathBuf> {
+        if let Ok(explicit) = std::env::var("VIBEX_TUI_HOME")
+            && !explicit.trim().is_empty()
+        {
+            return Some(std::path::PathBuf::from(explicit));
+        }
+        std::env::var("VIBEX_HOME")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(std::path::PathBuf::from)
@@ -1793,8 +1861,7 @@ impl App {
                     .ok()
                     .filter(|value| !value.trim().is_empty())
                     .map(|value| std::path::PathBuf::from(value).join(".vibex"))
-            })?;
-        Some(home.join("tui-sidebar.json"))
+            })
     }
 
     /// Persist the arrangement. A failure is silent: losing a pin is not worth
@@ -2138,6 +2205,12 @@ impl App {
     /// The scopes consulted for key dispatch, most specific first.
     pub fn active_scopes(&self) -> Vec<Scope> {
         let mut scopes = Vec::new();
+        // The switcher sits *inside* the overlay scope: the overlay's shared
+        // keys (move, confirm, close) still apply, and the switcher's own keys
+        // win where the two would otherwise disagree.
+        if self.runtime_picker_is_open() {
+            scopes.push(Scope::Runtime);
+        }
         if self.overlay.is_some() {
             scopes.push(Scope::Overlay);
         }
@@ -2163,6 +2236,9 @@ impl App {
 
     /// The scopes whose bindings the key bar and `?` help should advertise.
     pub fn documented_scopes(&self) -> Vec<Scope> {
+        if self.runtime_picker_is_open() {
+            return vec![Scope::Runtime, Scope::Global];
+        }
         if self.overlay.is_some() {
             return vec![Scope::Overlay, Scope::Global];
         }
@@ -2850,6 +2926,9 @@ impl App {
     pub fn cancel_runtime_picker(&mut self) {
         self.runtime_picker_pending = false;
         self.runtime_picker_target = None;
+        self.runtime_picker.draft = None;
+        self.runtime_picker.option_row = 0;
+        self.runtime_picker.filtering = false;
         self.run_option_prompt = None;
         if matches!(
             self.overlay,
@@ -4297,6 +4376,12 @@ pub struct AppOptions {
     /// harness must not write into the developer's home, and a client with no
     /// writable home simply keeps the arrangement in memory for the run.
     pub sidebar_path: Option<std::path::PathBuf>,
+    /// Where the runtime switcher's memory is kept.
+    ///
+    /// Separate from the arrangement above for the same reason the arrangement
+    /// is separate from the key file: one file per concern, and a reader who
+    /// wants the switcher to forget everything deletes one of them.
+    pub runtime_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AppOptions {
@@ -4315,6 +4400,7 @@ impl AppOptions {
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
             sidebar_path: App::sidebar_arrangement_path(),
+            runtime_path: App::runtime_preferences_path(),
         }
     }
 }
@@ -4809,6 +4895,7 @@ mod tests {
             vibex_backend::DisconnectedBackend::facade(),
             AppOptions {
                 sidebar_path: Some(path.to_path_buf()),
+                runtime_path: None,
                 ..AppOptions::default()
             },
         )
@@ -4869,6 +4956,7 @@ mod tests {
             vibex_backend::DisconnectedBackend::facade(),
             AppOptions {
                 sidebar_path: None,
+                runtime_path: None,
                 ..AppOptions::default()
             },
         );

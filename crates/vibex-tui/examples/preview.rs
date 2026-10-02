@@ -74,6 +74,7 @@ fn main() {
             locale: Locale::En,
             // A preview must not leave state behind.
             sidebar_path: None,
+            runtime_path: None,
         },
     );
     app.resize(width, height);

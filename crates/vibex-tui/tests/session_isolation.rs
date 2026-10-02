@@ -12,6 +12,7 @@ fn app() -> App {
         facade,
         AppOptions {
             sidebar_path: None,
+            runtime_path: None,
             ..Default::default()
         },
     );

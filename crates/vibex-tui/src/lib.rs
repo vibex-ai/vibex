@@ -25,6 +25,8 @@
 //! transcript block cache, incremental layout, viewport-only rendering
 //! view      page shells, overlays, the key bar
 //! app       navigation and overlay state
+//! runtime_prefs what the switcher remembers between runs
+//! runtime_picker the switcher's catalogue, folded and filtered, and its staged run options
 //! reduce    the pure intent → effect reducer
 //! worker    the only place that performs I/O
 //! run       the event loop
@@ -45,6 +47,8 @@ pub mod modal;
 pub mod onboarding;
 pub mod reduce;
 pub mod run;
+pub mod runtime_picker;
+pub mod runtime_prefs;
 pub mod search;
 pub mod sessions;
 pub mod settings;
@@ -108,6 +112,7 @@ pub fn run(facade: BackendFacade, options: TuiOptions) -> BackendResult<ExitReas
             mode: options.mode,
             locale: options.locale,
             sidebar_path: App::sidebar_arrangement_path(),
+            runtime_path: App::runtime_preferences_path(),
         },
     );
     let result = run::run_loop(&mut app, &worker, &mut messages);

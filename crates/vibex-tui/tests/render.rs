@@ -29,6 +29,7 @@ fn app(columns: u16, rows: u16) -> App {
             // No arrangement file: a test must never write into the runner's
             // home directory, and each test wants a clean list.
             sidebar_path: None,
+            runtime_path: None,
         },
     );
     // Rendering fixtures assert the built-in bindings, independent of a
@@ -488,6 +489,24 @@ fn open_session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) 
         });
 }
 
+/// Put the switcher's cursor on one catalogue entry.
+///
+/// The list is a tree — an Agent heading above its entries, and the pinned
+/// recent and starred rows above those — so the row an entry is drawn on is not
+/// its index in the catalogue. Tests ask for the row the way the renderer finds
+/// it.
+fn pick_entry(app: &mut App, index: usize) {
+    let row = app
+        .runtime_picker_rows()
+        .iter()
+        .position(|row| row.entry() == Some(index))
+        .expect("the entry is on the list");
+    app.overlay = Some(vibex_tui::app::Overlay::RuntimePicker {
+        view: vibex_tui::app::RuntimePickerView::Choices,
+        selected: row,
+    });
+}
+
 #[test]
 fn the_switcher_keeps_the_run_options_one_key_away_from_the_catalogue() {
     // Picking an Agent is only half of "what will this message be sent
@@ -913,6 +932,7 @@ fn color_less_mode_still_renders_every_label() {
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
             sidebar_path: None,
+            runtime_path: None,
         },
     );
     app.resize(100, 30);
@@ -2050,6 +2070,10 @@ fn a_conflicting_rebind_is_refused_and_named() {
     use vibex_tui::app::Overlay;
     use vibex_tui::keymap::{Chord, Scope};
     let mut app = app(120, 40);
+    // The reader's own key file must not decide this: a rebind onto a chord
+    // their file has already moved is not the shadowing this test is about, and
+    // running the suite on a machine that has one would otherwise fail here.
+    app.keymap = vibex_tui::keymap::Keymap::built_in();
     app.overlay = Some(Overlay::Keys {
         query: String::new(),
         selected: 0,
@@ -3687,7 +3711,7 @@ fn the_composing_page_chooses_the_runtime_the_session_is_born_with() {
     // gated on the backend supporting a switch, which a client with no backend
     // cannot; the overlay and its confirm are what this test is about.)
     app.show_runtime_picker();
-    app.perform(Intent::SelectNext);
+    pick_entry(&mut app, 1);
     app.perform(Intent::ConfirmOverlay);
     assert!(app.overlay.is_none(), "the picker stayed open");
     assert_eq!(
@@ -4500,7 +4524,7 @@ fn the_runtime_chosen_on_the_new_session_page_is_not_the_old_sessions() {
     // The picker opens on the page's own choice, and a choice made there stays
     // on the page: nothing is dispatched at the session behind it.
     app.show_runtime_picker();
-    app.perform(Intent::SelectNext);
+    pick_entry(&mut app, 1);
     let outcome = app.perform(Intent::ConfirmOverlay);
     assert!(
         outcome.effects.is_empty(),
@@ -4688,7 +4712,7 @@ fn the_creating_session_view_waits_for_its_session() {
     });
     app.perform(Intent::NewSession);
     app.show_runtime_picker();
-    app.perform(Intent::SelectNext);
+    pick_entry(&mut app, 1);
     app.perform(Intent::ConfirmOverlay);
     assert_eq!(
         app.composer_runtime_labels().0,
@@ -5182,6 +5206,7 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
             sidebar_path: None,
+            runtime_path: None,
         },
     );
     app.resize(110, 24);

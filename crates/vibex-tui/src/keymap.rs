@@ -275,6 +275,8 @@ pub enum Scope {
     Composer,
     /// Active while a modal overlay (help, palette, confirm) is open.
     Overlay,
+    /// Active while the runtime switcher is open, on top of `Overlay`.
+    Runtime,
     Sessions,
     Agent,
     Files,
@@ -300,6 +302,7 @@ impl Scope {
         Scope::Global,
         Scope::Composer,
         Scope::Overlay,
+        Scope::Runtime,
         Scope::Sessions,
         Scope::Agent,
         Scope::Files,
@@ -324,6 +327,7 @@ impl Scope {
             Scope::Global => "global",
             Scope::Composer => "composer",
             Scope::Overlay => "overlay",
+            Scope::Runtime => "runtime",
             Scope::Sessions => "sessions",
             Scope::Agent => "agent",
             Scope::Files => "files",
@@ -350,7 +354,7 @@ impl Scope {
             Scope::Global => Category::Global,
             Scope::Agent => Category::Transcript,
             Scope::Composer => Category::Composer,
-            Scope::Overlay => Category::Modals,
+            Scope::Overlay | Scope::Runtime => Category::Modals,
             Scope::Sessions | Scope::Files | Scope::Changes | Scope::Terminal => {
                 Category::Workbench
             }
@@ -1035,11 +1039,103 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::SelectPrevious,
         "Previous",
     ),
+    // `j`/`k` are the list keys every other surface in this client answers to,
+    // and the switcher is a list: an overlay that types takes its characters
+    // before the table, so these only ever reach an overlay that wants them.
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('k')),
+        Intent::SelectPrevious,
+    ),
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('j')),
+        Intent::SelectNext,
+    ),
+    // Walking a long catalogue: the arrows move one row, these move a screen or
+    // an end of it.
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::PageUp),
+        Intent::ScrollPageUp,
+    ),
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::PageDown),
+        Intent::ScrollPageDown,
+    ),
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Home),
+        Intent::ScrollToTop,
+    ),
+    alias(
+        Scope::Overlay,
+        Chord::plain(KeyCode::End),
+        Intent::ScrollToBottom,
+    ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
         "Next",
+    ),
+    // ---- the runtime switcher --------------------------------------------
+    // A scope of its own because the overlay scope already spends `←`/`→` on
+    // the elicitation form and `a` on approving an approval card, and a key
+    // that means "fold this group" must not also mean "approve" depending on
+    // which modal happens to be up.
+    binding(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Left),
+        Intent::OverlayFoldClosed,
+        "Fold",
+    ),
+    alias(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Char('h')),
+        Intent::OverlayFoldClosed,
+    ),
+    binding(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Right),
+        Intent::OverlayFoldOpen,
+        "Expand",
+    ),
+    alias(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Char('l')),
+        Intent::OverlayFoldOpen,
+    ),
+    binding(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Char('/')),
+        Intent::BeginFilter,
+        "Search",
+    ),
+    binding(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Char('*')),
+        Intent::StarRuntimeModel,
+        "Star",
+    ),
+    binding(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Char('a')),
+        Intent::ManageRuntimeAccount,
+        "Account",
+    ),
+    binding(
+        Scope::Runtime,
+        Chord::ctrl('s'),
+        Intent::ApplyRuntimeEdit,
+        "Apply",
+    ),
+    binding(
+        Scope::Runtime,
+        Chord::plain(KeyCode::Char('r')),
+        Intent::ResetRunOption,
+        "Reset",
     ),
     // ---- deviceless pages ------------------------------------------------
     binding(

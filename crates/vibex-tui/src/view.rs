@@ -27,7 +27,8 @@ use crate::keymap::Scope;
 use crate::layout::Bands;
 use crate::locale::Strings;
 use crate::modal::{self, ModalChrome, ModalHint, ModalSizing};
-use crate::text::{display_width, truncate_to_width};
+use crate::runtime_picker::RuntimePickerRow;
+use crate::text::{display_width, pad_to_width, truncate_to_width};
 use crate::theme::TuiTheme;
 
 /// A block whose border glyphs match the terminal's capability.
@@ -5020,176 +5021,7 @@ fn render_overlay(
             render_pairing(frame, area, app, code, link, *permission, theme);
         }
         Overlay::RuntimePicker { view, selected } => {
-            let options = app
-                .runtime_options
-                .as_ref()
-                .map(|catalog| catalog.options.clone())
-                .unwrap_or_default();
-            let run_options = app.run_options();
-            let show_choices = *view == crate::app::RuntimePickerView::Choices;
-            // The title names what the choice moves. A page showing no session —
-            // the list, or the page where a session is being written — has
-            // nothing to move, so the choice is the next session's, and saying
-            // so here is what keeps the reader from expecting the session
-            // behind the page to change.
-            let target = if app.page_shows_session() {
-                None
-            } else {
-                Some(strings.runtime_next_session())
-            };
-            let title = if show_choices {
-                match target {
-                    Some(target) => format!("{} · {target}", strings.runtime_title()),
-                    None => strings.runtime_title().to_string(),
-                }
-            } else {
-                format!(
-                    "{} · {}",
-                    strings.runtime_title(),
-                    strings.runtime_run_options()
-                )
-            };
-            // The second view is one `Tab` away, and the footer is where that
-            // is legible: a catalogue as long as the machine has models would
-            // otherwise hide the run options at its end.
-            let mut hints = vec![ModalHint::new("↑↓", strings.hint_nav())];
-            if !run_options.is_empty() {
-                hints.push(ModalHint::new(
-                    "Tab",
-                    if show_choices {
-                        strings.runtime_run_options()
-                    } else {
-                        strings.runtime_title()
-                    },
-                ));
-            }
-            hints.push(ModalHint::new("Enter", strings.hint_select()));
-            hints.push(ModalHint::new(
-                "Esc",
-                if show_choices {
-                    strings.close()
-                } else {
-                    strings.hint_back()
-                },
-            ));
-            let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
-                return;
-            };
-            let mut items = Vec::new();
-            if show_choices {
-                // One row per Agent, authentication source and model the runtime
-                // publishes. The row the session is on is marked rather than
-                // merely listed first: "which Agent am I talking to" is the
-                // question this view exists to answer.
-                for (index, option) in options.iter().enumerate() {
-                    let style = if index == *selected {
-                        theme.selected()
-                    } else {
-                        theme.base()
-                    };
-                    let current = app.runtime_option_is_current(option);
-                    let mut spans = vec![Span::styled(
-                        if current { "● " } else { "  " }.to_string(),
-                        Style::default().fg(theme.roles.accent_user),
-                    )];
-                    spans.push(Span::styled(
-                        // Truncated one column short of the column so the
-                        // widest label still has a space before what follows.
-                        format!("{:<18}", truncate_to_width(&option.agent_label, 17, "…")),
-                        if current {
-                            style.add_modifier(Modifier::BOLD)
-                        } else {
-                            style
-                        },
-                    ));
-                    spans.push(Span::styled(
-                        truncate_to_width(
-                            &format!("{}/{}", option.auth_source_label, option.model_label),
-                            34,
-                            "…",
-                        ),
-                        theme.muted(),
-                    ));
-                    if current {
-                        spans.push(Span::styled(
-                            format!("  {}", strings.runtime_current()),
-                            Style::default().fg(theme.roles.accent_user),
-                        ));
-                    } else if option.availability
-                        != vibex_core::RuntimeOptionAvailability::Available
-                    {
-                        spans.push(Span::styled(
-                            format!("  {}", strings.runtime_unavailable()),
-                            Style::default().fg(theme.roles.gray_dim),
-                        ));
-                    }
-                    items.push(ListItem::new(Line::from(spans)));
-                }
-            } else {
-                // How the chosen entry runs, and nothing else: this view is
-                // short on purpose, so every row is reachable without scrolling.
-                // The caption names whose options these are — the point of the
-                // view is that the catalogue behind it is out of sight.
-                let (agent, model) = app.composer_runtime_labels();
-                let caption = if model.is_empty() {
-                    agent
-                } else {
-                    format!("{agent} · {model}")
-                };
-                let mut content = layout.content;
-                if content.height > 1 {
-                    frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            truncate_to_width(&caption, usize::from(content.width), "…"),
-                            theme.dimmed(theme.roles.gray),
-                        ))),
-                        Rect {
-                            height: 1,
-                            ..content
-                        },
-                    );
-                    content = Rect {
-                        y: content.y + 1,
-                        height: content.height - 1,
-                        ..content
-                    };
-                }
-                for (index, option) in run_options.iter().enumerate() {
-                    let style = if index == *selected {
-                        theme.selected()
-                    } else {
-                        theme.base()
-                    };
-                    let set = option.is_explicit();
-                    let mut spans = vec![Span::styled(
-                        if set { "● " } else { "  " }.to_string(),
-                        Style::default().fg(theme.roles.accent_user),
-                    )];
-                    spans.push(Span::styled(
-                        // One column short, so a label exactly as wide as the
-                        // column still keeps its space before the value.
-                        format!("{:<18}", truncate_to_width(&option.label, 17, "…")),
-                        style,
-                    ));
-                    spans.push(Span::styled(
-                        truncate_to_width(
-                            &option.resolved_label(strings.runtime_default()),
-                            34,
-                            "…",
-                        ),
-                        if set { style } else { theme.muted() },
-                    ));
-                    items.push(ListItem::new(Line::from(spans)));
-                }
-                let mut state = ratatui::widgets::ListState::default();
-                state.select(Some((*selected).min(items.len().saturating_sub(1))));
-                frame.render_stateful_widget(List::new(items), content, &mut state);
-                return;
-            }
-            let mut state = ratatui::widgets::ListState::default();
-            state.select(Some((*selected).min(items.len().saturating_sub(1))));
-            frame.render_stateful_widget(List::new(items), layout.content, &mut state);
+            render_runtime_picker(frame, area, app, *view, *selected, theme);
         }
         Overlay::RunOptionValues {
             selected, option, ..
@@ -5657,6 +5489,608 @@ fn render_text_view(
 }
 
 /// Build a modal's chrome, giving the margins back on a compact terminal.
+/// The runtime switcher.
+///
+/// Two views of one question. The catalogue is a tree — Agent headings with
+/// their accounts and models under them, and the pinned recent and starred
+/// entries above the lot — because a flat list of every model on the machine
+/// says nothing about which Agent is which. The run options are the other side
+/// of `Tab`: how the entry under the cursor runs.
+fn render_runtime_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    view: crate::app::RuntimePickerView,
+    selected: usize,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let show_choices = view == crate::app::RuntimePickerView::Choices;
+    let run_options = app.picker_run_options();
+    // The title names what the choice moves. A page showing no session — the
+    // list, or the page where a session is being written — has nothing to move,
+    // so the choice is the next session's, and saying so here is what keeps the
+    // reader from expecting the session behind the page to change.
+    let title = if show_choices {
+        match app.page_shows_session() {
+            true => strings.runtime_title().to_string(),
+            false => format!(
+                "{} · {}",
+                strings.runtime_title(),
+                strings.runtime_next_session()
+            ),
+        }
+    } else {
+        // The staged count rides in the title: the footer's hints are static
+        // words, and the one number a reader wants while editing is how much is
+        // waiting to be sent.
+        match app
+            .runtime_picker
+            .draft
+            .as_ref()
+            .filter(|draft| draft.is_dirty())
+        {
+            Some(draft) => format!(
+                "{} · {} ({})",
+                strings.runtime_title(),
+                strings.runtime_run_options(),
+                draft.change_count()
+            ),
+            None => format!(
+                "{} · {}",
+                strings.runtime_title(),
+                strings.runtime_run_options()
+            ),
+        }
+    };
+    let hints = if show_choices {
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("←→", strings.runtime_fold()),
+            ModalHint::new("/", strings.runtime_search()),
+            ModalHint::new("Tab", strings.runtime_run_options()),
+            ModalHint::new("Enter", strings.hint_select()),
+            ModalHint::new("Esc", strings.close()),
+        ]
+    } else {
+        let mut hints = vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("Enter", strings.hint_select()),
+            ModalHint::new("r", strings.runtime_reset()),
+        ];
+        hints.push(ModalHint::new("Ctrl+S", strings.runtime_apply()));
+        hints.push(ModalHint::new("Tab", strings.runtime_title()));
+        // Leaving the run options with something staged drops it, which is what
+        // the hint has to say: "back" would read as "keep them".
+        let dirty = app
+            .runtime_picker
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.is_dirty());
+        hints.push(ModalHint::new(
+            "Esc",
+            if dirty {
+                strings.cancel()
+            } else {
+                strings.hint_back()
+            },
+        ));
+        hints
+    };
+    let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
+    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+        return;
+    };
+    if show_choices {
+        render_runtime_catalogue(frame, layout.content, app, selected, theme);
+    } else {
+        render_runtime_options(frame, layout.content, app, selected, &run_options, theme);
+    }
+}
+
+/// The catalogue: a filter line, the tree, and a preview of what the entry under
+/// the cursor would run with.
+fn render_runtime_catalogue(
+    frame: &mut Frame<'_>,
+    content: Rect,
+    app: &mut App,
+    selected: usize,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let query = app.runtime_picker.query.clone();
+    let filtering = app.runtime_picker.filtering;
+    let rows = app.runtime_picker_rows();
+    let options = app
+        .runtime_options
+        .as_ref()
+        .map(|catalog| catalog.options.clone())
+        .unwrap_or_default();
+    let mut content = content;
+    if content.height == 0 {
+        return;
+    }
+    // The filter has its own line whenever it is being typed or has something in
+    // it, so a catalogue that is shorter than it looks says why.
+    if filtering || !query.is_empty() {
+        let line = if filtering {
+            Line::from(vec![
+                Span::styled("/ ", theme.accent()),
+                Span::styled(
+                    truncate_to_width(&query, usize::from(content.width.saturating_sub(3)), "…"),
+                    theme.base(),
+                ),
+                Span::styled("▏", theme.accent()),
+            ])
+        } else {
+            Line::from(Span::styled(
+                truncate_to_width(&format!("/ {query}"), usize::from(content.width), "…"),
+                theme.dimmed(theme.roles.gray),
+            ))
+        };
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                height: 1,
+                ..content
+            },
+        );
+        content = Rect {
+            y: content.y + 1,
+            height: content.height - 1,
+            ..content
+        };
+    }
+    if content.height == 0 {
+        return;
+    }
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_to_width(strings.runtime_no_match(), usize::from(content.width), "…"),
+                theme.dimmed(theme.roles.gray),
+            ))),
+            content,
+        );
+        app.runtime_picker.scroll = 0;
+        app.runtime_picker.page_rows = usize::from(content.height);
+        return;
+    }
+    // The preview line is the inspector this surface has: what the highlighted
+    // entry was last run with, one `Tab` away from being changed. It is only
+    // drawn when there is room for a list above it.
+    let preview = content.height >= 6;
+    if preview {
+        content.height -= 1;
+    }
+    let width = usize::from(content.width);
+    let mut lines = Vec::with_capacity(rows.len());
+    let mut in_group = false;
+    for (index, row) in rows.iter().enumerate() {
+        match row {
+            RuntimePickerRow::Section(section) => {
+                in_group = false;
+                lines.push(Line::from(Span::styled(
+                    truncate_to_width(&format!("  {}", section.label(&strings)), width, "…"),
+                    theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
+                )));
+            }
+            RuntimePickerRow::Agent { .. } => {
+                in_group = true;
+                lines.push(runtime_picker_heading_line(
+                    app,
+                    row,
+                    index == selected,
+                    width,
+                    theme,
+                ));
+            }
+            RuntimePickerRow::Entry { .. } => lines.push(runtime_picker_entry_line(
+                app,
+                &options,
+                row,
+                index == selected,
+                in_group,
+                width,
+                theme,
+            )),
+        }
+    }
+    // Keep the cursor on screen with the least movement: the window only moves
+    // when the cursor leaves it, which is what makes `↑↓` feel like a list
+    // rather than like a camera. The offset is recorded because the page keys
+    // and the scroll bar both need to know where the window ended up.
+    let selected = selected.min(rows.len().saturating_sub(1));
+    let height = usize::from(content.height);
+    let mut offset = app
+        .runtime_picker
+        .scroll
+        .min(rows.len().saturating_sub(height.min(rows.len())));
+    if selected < offset {
+        offset = selected;
+    }
+    if selected >= offset + height {
+        offset = (selected + 1).saturating_sub(height);
+    }
+    app.runtime_picker.scroll = offset;
+    app.runtime_picker.page_rows = height.max(1);
+    app.regions.runtime_picker = Some(crate::app::RuntimePickerRegion {
+        rect: content,
+        offset,
+        rows: rows.len(),
+    });
+
+    // The scroll bar is one column of the list rather than a widget: a reader
+    // who cannot see how long the catalogue is cannot tell a short list from a
+    // clipped one.
+    let bar = rows.len() > height && content.width > 4;
+    let list_area = if bar {
+        Rect {
+            width: content.width - 1,
+            ..content
+        }
+    } else {
+        content
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(height)
+                .collect::<Vec<_>>(),
+        )),
+        list_area,
+    );
+    if bar {
+        render_scroll_indicator(frame, content, offset, rows.len(), theme);
+    }
+    if preview {
+        let entry = rows.get(selected).and_then(|row| row.entry());
+        let body = runtime_picker_preview(
+            app,
+            entry.and_then(|index| options.get(index)),
+            usize::from(content.width),
+            theme,
+        );
+        frame.render_widget(
+            Paragraph::new(body),
+            Rect {
+                y: content.y + content.height,
+                height: 1,
+                ..content
+            },
+        );
+    }
+}
+
+/// One Agent's heading: what it holds, and whether it is the one in use.
+fn runtime_picker_heading_line(
+    app: &App,
+    row: &RuntimePickerRow,
+    selected: bool,
+    width: usize,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    let strings = app.strings;
+    let RuntimePickerRow::Agent {
+        label,
+        count,
+        folded,
+        current,
+        unavailable,
+        ..
+    } = row
+    else {
+        return Line::from("");
+    };
+    let mut spans = vec![
+        Span::styled(
+            if *folded { "▸ " } else { "▾ " }.to_string(),
+            theme.dimmed(theme.roles.gray),
+        ),
+        Span::styled(
+            truncate_to_width(label, width.saturating_sub(2), "…"),
+            theme.base().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {count}"), theme.muted()),
+    ];
+    if *current {
+        spans.push(Span::styled(
+            format!("  {}", strings.runtime_current()),
+            Style::default().fg(theme.roles.accent_user),
+        ));
+    }
+    if *unavailable > 0 {
+        spans.push(Span::styled(
+            format!("  {} {unavailable}", strings.runtime_unavailable()),
+            theme.dimmed(theme.roles.gray_dim),
+        ));
+    }
+    selected_line(spans, selected, width, theme)
+}
+
+/// One entry: its account and model, and what it says about itself.
+fn runtime_picker_entry_line(
+    app: &App,
+    options: &[vibex_core::SessionRuntimeOption],
+    row: &RuntimePickerRow,
+    selected: bool,
+    in_group: bool,
+    width: usize,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    let strings = app.strings;
+    let RuntimePickerRow::Entry { index, quick } = row else {
+        return Line::from("");
+    };
+    let Some(option) = options.get(*index) else {
+        return Line::from("");
+    };
+    let current = app.runtime_option_is_current(option);
+    let status = if current {
+        Some(strings.runtime_current().to_string())
+    } else {
+        app.runtime_entry_status(option)
+            .label(&strings)
+            .map(str::to_string)
+    };
+    let marker = match quick {
+        Some(digit) => digit.to_string(),
+        None if current => "●".to_string(),
+        None if app.runtime_prefs.is_favorite(option) => "★".to_string(),
+        None => " ".to_string(),
+    };
+    let indent = if in_group { 4 } else { 2 };
+    let status_width = status.as_deref().map(display_width).unwrap_or_default();
+    let gap = if status_width > 0 { 2 } else { 0 };
+    let available = width.saturating_sub(indent + 2 + status_width + gap);
+    // The model is what a reader scans for, so it takes the larger share and the
+    // account truncates first: "Default CLI account/…" names the provenance, but
+    // two rows of the same model on two accounts are still two rows.
+    let (auth_width, model_width) = runtime_columns(available);
+    let body = format!(
+        "{} · {}",
+        truncate_to_width(&option.auth_source_label, auth_width, "…"),
+        truncate_to_width(&option.model_label, model_width, "…"),
+    );
+    let mut spans = vec![
+        Span::styled(" ".repeat(indent), theme.base()),
+        Span::styled(
+            format!("{marker} "),
+            if current || quick.is_some() {
+                Style::default().fg(theme.roles.accent_user)
+            } else {
+                theme.dimmed(theme.roles.gray)
+            },
+        ),
+        Span::styled(
+            pad_to_width(&body, available),
+            if current { theme.base() } else { theme.muted() },
+        ),
+    ];
+    if let Some(status) = status {
+        spans.push(Span::styled(" ".repeat(gap), theme.base()));
+        spans.push(Span::styled(
+            status,
+            if current {
+                Style::default().fg(theme.roles.accent_user)
+            } else {
+                theme.dimmed(theme.roles.gray)
+            },
+        ));
+    }
+    selected_line(spans, selected, width, theme)
+}
+
+/// The preview of the highlighted entry: how it would run, and where that is
+/// changed. Drawn under the list rather than in it, so it cannot be mistaken for
+/// a row.
+fn runtime_picker_preview(
+    app: &App,
+    option: Option<&vibex_core::SessionRuntimeOption>,
+    width: usize,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    let strings = app.strings;
+    // A heading has no entry of its own, so the preview answers for the page's
+    // selection — which is exactly what `Tab` would show from there.
+    let run_options = match option {
+        Some(option) => app.run_options_for(&app.runtime_prefs.with_remembered_options(option)),
+        None => app.picker_run_options(),
+    };
+    if run_options.is_empty() {
+        return Line::from("");
+    }
+    let labels = run_options
+        .iter()
+        .filter(|option| option.is_explicit())
+        .map(|option| {
+            format!(
+                "{} {}",
+                option.label,
+                option.resolved_label(strings.runtime_default())
+            )
+        })
+        .collect::<Vec<_>>();
+    let body = if labels.is_empty() {
+        strings.runtime_default().to_string()
+    } else {
+        labels.join(" · ")
+    };
+    let text = format!(
+        "{}: {body} · {}",
+        strings.runtime_run_options(),
+        strings.runtime_summary_hint()
+    );
+    Line::from(Span::styled(
+        truncate_to_width(&text, width, "…"),
+        theme.dimmed(theme.roles.gray),
+    ))
+}
+
+/// The run options of the entry the page is on, with what the reader has staged
+/// marked as staged.
+fn render_runtime_options(
+    frame: &mut Frame<'_>,
+    content: Rect,
+    app: &mut App,
+    selected: usize,
+    run_options: &[crate::app::RunOption],
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let (agent, model) = app.composer_runtime_labels();
+    let mut content = content;
+    if content.height > 1 {
+        let caption = if model.is_empty() {
+            agent
+        } else {
+            format!("{agent} · {model}")
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_to_width(&caption, usize::from(content.width), "…"),
+                theme.dimmed(theme.roles.gray),
+            ))),
+            Rect {
+                height: 1,
+                ..content
+            },
+        );
+        content = Rect {
+            y: content.y + 1,
+            height: content.height - 1,
+            ..content
+        };
+    }
+    let width = usize::from(content.width);
+    let mut lines = Vec::with_capacity(run_options.len());
+    for (index, option) in run_options.iter().enumerate() {
+        let staged = app
+            .runtime_picker
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.changed(&option.key));
+        let set = option.is_explicit();
+        let value = option.resolved_label(strings.runtime_default());
+        let tag = if staged {
+            strings.runtime_modified()
+        } else {
+            ""
+        };
+        let tag_width = display_width(tag);
+        let gap = if tag_width > 0 { 2 } else { 0 };
+        let value_width = width.saturating_sub(2 + 18 + tag_width + gap);
+        let mut spans = vec![
+            Span::styled(
+                if set { "● " } else { "  " }.to_string(),
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                // One column short, so a label exactly as wide as the column
+                // still keeps its space before the value.
+                format!("{:<18}", truncate_to_width(&option.label, 17, "…")),
+                theme.base(),
+            ),
+            Span::styled(
+                pad_to_width(&truncate_to_width(&value, value_width, "…"), value_width),
+                if set { theme.base() } else { theme.muted() },
+            ),
+        ];
+        if tag_width > 0 {
+            spans.push(Span::styled(" ".repeat(gap), theme.base()));
+            spans.push(Span::styled(
+                tag.to_string(),
+                Style::default().fg(theme.roles.accent_user),
+            ));
+        }
+        lines.push(selected_line(spans, index == selected, width, theme));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)),
+        Rect {
+            height: content
+                .height
+                .min(u16::try_from(run_options.len()).unwrap_or(u16::MAX)),
+            ..content
+        },
+    );
+}
+
+/// Finish one row: highlight it across the full width when it is the cursor's.
+fn selected_line(
+    spans: Vec<Span<'static>>,
+    selected: bool,
+    width: usize,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    if !selected {
+        return Line::from(spans);
+    }
+    let used = spans
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum::<usize>();
+    let mut spans = spans;
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        theme.selected(),
+    ));
+    Line::from(spans).style(theme.selected())
+}
+
+/// Split the width left for "account · model" between the two names.
+fn runtime_columns(available: usize) -> (usize, usize) {
+    const SEPARATOR: usize = 3;
+    if available <= SEPARATOR {
+        return (0, available);
+    }
+    let body = available - SEPARATOR;
+    let model = (body * 3 / 5).max(4).min(body);
+    (body - model, model)
+}
+
+/// The scroll bar beside a list: a track with a thumb that says where the window
+/// is, so a long catalogue is legible as long rather than as clipped.
+fn render_scroll_indicator(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    offset: usize,
+    total: usize,
+    theme: &TuiTheme,
+) {
+    let bar = Rect {
+        x: area.x + area.width - 1,
+        width: 1,
+        ..area
+    };
+    let track = usize::from(bar.height);
+    if track == 0 || total <= track {
+        return;
+    }
+    let thumb = (track * track / total).max(1).min(track);
+    let travel = track - thumb;
+    // The thumb's position, rounded to the nearest row; a catalogue with
+    // nothing left to scroll has no travel to divide by.
+    let span = total - track;
+    let start = (offset * travel + span / 2)
+        .checked_div(span)
+        .unwrap_or(0)
+        .min(travel);
+    let lines = (0..track)
+        .map(|row| {
+            let style = if row >= start && row < start + thumb {
+                Style::default().fg(theme.roles.accent_user)
+            } else {
+                theme.dimmed(theme.roles.gray_dim)
+            };
+            Line::from(Span::styled("│", style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(lines)), bar);
+}
+
 fn modal_chrome<'a>(
     app: &App,
     title: &'a str,

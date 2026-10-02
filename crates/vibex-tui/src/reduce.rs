@@ -22,6 +22,7 @@ use crate::app::{
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
+use crate::runtime_picker::{PICKER_PAGE_ROWS, RuntimeDraft, RuntimePickerRow};
 use crate::view::block_detail_text;
 
 /// What an intent produced, for tests and for the event loop.
@@ -1131,6 +1132,17 @@ impl App {
             Intent::SettingPrevious => self.step_setting(-1),
             Intent::SettingNext => self.step_setting(1),
             Intent::ResetSetting => self.begin_reset_setting(),
+
+            // ---- the runtime switcher ----------------------------------------
+            // These are the switcher's own keys. Reaching the reducer with no
+            // overlay open means the switcher is not up, and there is nothing
+            // for them to act on: `Ctrl+G` is what puts it there.
+            Intent::OverlayFoldOpen
+            | Intent::OverlayFoldClosed
+            | Intent::StarRuntimeModel
+            | Intent::ManageRuntimeAccount
+            | Intent::ApplyRuntimeEdit
+            | Intent::ResetRunOption => Outcome::quiet(),
         }
     }
 
@@ -1187,10 +1199,30 @@ impl App {
                     Some(Overlay::RuntimePicker {
                         view: RuntimePickerView::Options,
                         ..
-                    }) => Some(Overlay::RuntimePicker {
+                    }) => {
+                        // Leaving the run options leaves what was staged on
+                        // them: the footer said so, and a switch the reader
+                        // never asked to apply must not be sent.
+                        if self.discard_runtime_draft() {
+                            self.toast(Toast::info(self.strings.runtime_discarded().to_string()));
+                        }
+                        Some(Overlay::RuntimePicker {
+                            view: RuntimePickerView::Choices,
+                            selected: self.runtime_picker_current_row(),
+                        })
+                    }
+                    Some(Overlay::RuntimePicker {
                         view: RuntimePickerView::Choices,
-                        selected: self.current_runtime_option_index().unwrap_or(0),
-                    }),
+                        ..
+                    }) => {
+                        // Closing the catalogue also drops the search: the next
+                        // `Ctrl+G` is a fresh question, and a filter left over
+                        // from the last one would answer it with a shorter list
+                        // than the reader asked for.
+                        self.runtime_picker.filtering = false;
+                        self.runtime_picker.query.clear();
+                        None
+                    }
                     // A cancelled text option takes its key with it, so the
                     // next prompt cannot submit a value for this one.
                     Some(Overlay::Prompt {
@@ -1328,49 +1360,9 @@ impl App {
                 _ => Outcome::quiet(),
             },
             Overlay::PairingCode { .. } => Outcome::quiet(),
-            Overlay::RuntimePicker { view, selected } => match intent {
-                Intent::ConfirmOverlay | Intent::ApprovalApprove => {
-                    self.activate_runtime_picker_row(view, selected)
-                }
-                Intent::SelectNext => {
-                    let count = self.runtime_picker_row_count(view);
-                    self.overlay = Some(Overlay::RuntimePicker {
-                        view,
-                        selected: (selected + 1) % count.max(1),
-                    });
-                    Outcome::effects(vec![])
-                }
-                Intent::SelectPrevious => {
-                    self.overlay = Some(Overlay::RuntimePicker {
-                        view,
-                        selected: selected.saturating_sub(1),
-                    });
-                    Outcome::effects(vec![])
-                }
-                // `Tab` is the two halves of the switcher: the catalogue, and
-                // the run options of the entry the reader has picked. They are
-                // views rather than one list because the catalogue is as long as
-                // the machine has models.
-                Intent::OverlayNextField => {
-                    // On the page where a session is being written there is no
-                    // live session to move, so the row under the cursor is a
-                    // pending choice rather than a highlight: the page takes it
-                    // first, or `Tab` would answer with the run options of the
-                    // entry the page happened to start on instead of the Agent
-                    // the reader is looking at.
-                    if view == RuntimePickerView::Choices
-                        && self.page_is_composing()
-                        && !self.adopt_runtime_picker_row(selected)
-                    {
-                        return Outcome::quiet();
-                    }
-                    self.show_runtime_picker_view(RuntimePickerView::Options)
-                }
-                Intent::OverlayPreviousField => {
-                    self.show_runtime_picker_view(RuntimePickerView::Choices)
-                }
-                _ => Outcome::quiet(),
-            },
+            Overlay::RuntimePicker { view, selected } => {
+                self.perform_runtime_picker(intent, view, selected)
+            }
             Overlay::RunOptionValues {
                 row,
                 selected,
@@ -1381,9 +1373,18 @@ impl App {
                     let Some((value, _)) = choices.get(selected) else {
                         return Outcome::quiet();
                     };
+                    // The value is staged rather than sent: the reader is
+                    // working on how one Agent runs, and each of those answers
+                    // is a row in the view behind this list. Staging keeps them
+                    // all in one place, and one apply moves the session once.
                     let value = value.clone();
-                    self.overlay = None;
-                    self.apply_run_option(&option.key, value)
+                    self.stage_run_option(&option.key, value);
+                    self.overlay = Some(Overlay::RuntimePicker {
+                        view: RuntimePickerView::Options,
+                        selected: row,
+                    });
+                    self.runtime_picker.option_row = row;
+                    Outcome::effects(vec![])
                 }
                 Intent::SelectNext => {
                     let count = self.run_option_choices(&option).len();
@@ -1395,9 +1396,33 @@ impl App {
                     Outcome::effects(vec![])
                 }
                 Intent::SelectPrevious => {
+                    let count = self.run_option_choices(&option).len();
                     self.overlay = Some(Overlay::RunOptionValues {
                         row,
-                        selected: selected.saturating_sub(1),
+                        selected: (selected + count.max(1) - 1) % count.max(1),
+                        option,
+                    });
+                    Outcome::effects(vec![])
+                }
+                // A value list is a list: a long one is walked with the same
+                // keys as every other list in the client rather than only with
+                // the arrow keys it happens to fit on screen.
+                Intent::ScrollPageUp
+                | Intent::ScrollPageDown
+                | Intent::ScrollToTop
+                | Intent::ScrollToBottom => {
+                    let count = self.run_option_choices(&option).len();
+                    let selected = match intent {
+                        Intent::ScrollPageUp => selected.saturating_sub(PICKER_PAGE_ROWS),
+                        Intent::ScrollPageDown => selected
+                            .saturating_add(PICKER_PAGE_ROWS)
+                            .min(count.saturating_sub(1)),
+                        Intent::ScrollToTop => 0,
+                        _ => count.saturating_sub(1),
+                    };
+                    self.overlay = Some(Overlay::RunOptionValues {
+                        row,
+                        selected,
                         option,
                     });
                     Outcome::effects(vec![])
@@ -1747,7 +1772,15 @@ impl App {
                     ));
                     return Outcome::quiet();
                 }
-                self.apply_run_option(&key, Some(trimmed))
+                // Staged like the closed-set values are: a typed option is one
+                // of the switcher's rows, and it is applied with the rest of
+                // them rather than on its own.
+                self.stage_run_option(&key, Some(trimmed.to_string()));
+                self.overlay = Some(Overlay::RuntimePicker {
+                    view: RuntimePickerView::Options,
+                    selected: self.runtime_picker.option_row,
+                });
+                Outcome::effects(vec![])
             }
         }
     }
@@ -2398,17 +2431,23 @@ impl App {
     ///
     /// It answers "what am I on" before it asks "what do you want", and a
     /// session with no matching entry (a catalogue that moved under it) opens
-    /// on the first row rather than on nothing.
+    /// on the first row rather than on nothing. The search from a previous
+    /// visit is dropped: `Ctrl+G` is a fresh question, and a filter left over
+    /// from the last one would answer it with a shorter list than the reader
+    /// asked for.
     pub fn show_runtime_picker(&mut self) {
+        self.runtime_picker.query.clear();
+        self.runtime_picker.filtering = false;
         self.show_runtime_picker_view(RuntimePickerView::Choices);
     }
 
     /// Put one view of the switcher on screen.
     ///
-    /// The catalogue opens on the choice the session is on; the run options
-    /// open on their first row, because which one the reader wants is not a
-    /// question the catalogue can answer. A view with nothing in it says so
-    /// rather than showing an empty box or swallowing the key.
+    /// The catalogue opens on the entry the page is on, unfolded so the row is
+    /// really there; the run options open where the reader left them, because a
+    /// reader who came back to a setting came back to *that* setting. A view
+    /// with nothing in it says so rather than showing an empty box or swallowing
+    /// the key.
     pub fn show_runtime_picker_view(&mut self, view: RuntimePickerView) -> Outcome {
         if self.runtime_picker_target.is_none() {
             self.runtime_picker_target = Some(self.runtime_target());
@@ -2417,17 +2456,378 @@ impl App {
             return Outcome::quiet();
         }
         let selected = match view {
-            RuntimePickerView::Choices => self.current_runtime_option_index().unwrap_or(0),
-            RuntimePickerView::Options => 0,
+            RuntimePickerView::Choices => self.runtime_picker_current_row(),
+            RuntimePickerView::Options => {
+                let count = self.picker_run_options().len();
+                if count == 0 {
+                    self.toast(Toast::warning(
+                        self.strings.runtime_no_run_options().to_string(),
+                    ));
+                    return Outcome::quiet();
+                }
+                self.begin_runtime_draft();
+                self.runtime_picker.option_row.min(count - 1)
+            }
         };
-        if view == RuntimePickerView::Options && self.run_options().is_empty() {
-            self.toast(Toast::warning(
-                self.strings.runtime_no_run_options().to_string(),
-            ));
-            return Outcome::quiet();
-        }
         self.overlay = Some(Overlay::RuntimePicker { view, selected });
         Outcome::effects(vec![])
+    }
+
+    /// The catalogue row the switcher opens on: the entry the page is on,
+    /// wherever the pinned sections and the folded groups have put it.
+    ///
+    /// The group is unfolded first: a folded group hides the entry the page is
+    /// on, and a picker that opens on the heading above it makes the reader open
+    /// the group to see what they are already using.
+    fn runtime_picker_current_row(&mut self) -> usize {
+        let Some(index) = self.current_runtime_option_index() else {
+            return self.first_runtime_picker_entry_row();
+        };
+        if let Some(agent_id) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| catalog.options.get(index))
+            .map(|option| option.selection.agent_id.clone())
+        {
+            self.runtime_picker.folded.remove(&agent_id);
+        }
+        self.runtime_picker_rows()
+            .iter()
+            .position(|row| row.entry() == Some(index))
+            .unwrap_or_else(|| self.first_runtime_picker_entry_row())
+    }
+
+    /// The first row a catalogue cursor may rest on: a heading has nothing to
+    /// choose, so an empty catalogue of headers still opens on an entry.
+    fn first_runtime_picker_entry_row(&self) -> usize {
+        self.runtime_picker_rows()
+            .iter()
+            .position(|row| !row.is_heading())
+            .unwrap_or(0)
+    }
+
+    /// One key of the runtime switcher.
+    ///
+    /// The two views answer different questions and so take different keys: the
+    /// catalogue walks a tree of headings and entries, and the run options stage
+    /// values onto the entry the page is on.
+    fn perform_runtime_picker(
+        &mut self,
+        intent: Intent,
+        view: RuntimePickerView,
+        selected: usize,
+    ) -> Outcome {
+        match view {
+            RuntimePickerView::Choices => self.perform_runtime_catalogue(intent, selected),
+            RuntimePickerView::Options => self.perform_runtime_options(intent, selected),
+        }
+    }
+
+    fn perform_runtime_catalogue(&mut self, intent: Intent, selected: usize) -> Outcome {
+        match intent {
+            Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                match self.runtime_picker_rows().get(selected).cloned() {
+                    Some(RuntimePickerRow::Entry { index, .. }) => {
+                        self.overlay = None;
+                        self.apply_runtime_selection(index)
+                    }
+                    // A heading is a control rather than a choice, and the one
+                    // thing it controls is whether its entries are on screen.
+                    Some(RuntimePickerRow::Agent {
+                        agent_id, folded, ..
+                    }) => {
+                        self.fold_runtime_group(&agent_id, !folded);
+                        Outcome::effects(vec![])
+                    }
+                    _ => Outcome::quiet(),
+                }
+            }
+            Intent::SelectNext => self.step_runtime_cursor(1),
+            Intent::SelectPrevious => self.step_runtime_cursor(-1),
+            Intent::ScrollPageUp => {
+                let page = self.runtime_picker_page_rows();
+                self.step_runtime_cursor(-page)
+            }
+            Intent::ScrollPageDown => {
+                let page = self.runtime_picker_page_rows();
+                self.step_runtime_cursor(page)
+            }
+            Intent::ScrollToTop => self.set_runtime_cursor(0),
+            Intent::ScrollToBottom => {
+                let last = self.runtime_picker_rows().len().saturating_sub(1);
+                self.set_runtime_cursor(last)
+            }
+            Intent::BeginFilter => {
+                self.runtime_picker.filtering = true;
+                Outcome::effects(vec![])
+            }
+            Intent::OverlayFoldOpen => self.fold_runtime_row(selected, false),
+            Intent::OverlayFoldClosed => self.fold_runtime_row(selected, true),
+            Intent::StarRuntimeModel => self.star_runtime_row(selected),
+            Intent::ManageRuntimeAccount => self.open_runtime_account(selected),
+            // `Tab` is the two halves of the switcher: the catalogue, and the
+            // run options of the entry the reader has picked. They are views
+            // rather than one list because the catalogue is as long as the
+            // machine has models.
+            Intent::OverlayNextField => {
+                // On the page where a session is being written there is no live
+                // session to move, so the row under the cursor is a pending
+                // choice rather than a highlight: the page takes it first, or
+                // `Tab` would answer with the run options of the entry the page
+                // happened to start on instead of the Agent the reader is
+                // looking at.
+                if self.page_is_composing() && !self.adopt_runtime_picker_row(selected) {
+                    return Outcome::quiet();
+                }
+                self.show_runtime_picker_view(RuntimePickerView::Options)
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn perform_runtime_options(&mut self, intent: Intent, selected: usize) -> Outcome {
+        match intent {
+            Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                let Some(option) = self.picker_run_options().into_iter().nth(selected) else {
+                    return Outcome::quiet();
+                };
+                match option.kind {
+                    RunOptionKind::Text => self.open_run_option_prompt(option, selected),
+                    RunOptionKind::Choice | RunOptionKind::Toggle => {
+                        // The cursor starts on the value in effect, which on a
+                        // fresh selection is the Agent's own default.
+                        let choices = self.run_option_choices(&option);
+                        let at = choices
+                            .iter()
+                            .position(|(value, _)| option.is_selected_value(value.as_deref()))
+                            .unwrap_or(0);
+                        self.overlay = Some(Overlay::RunOptionValues {
+                            row: selected,
+                            selected: at,
+                            option,
+                        });
+                        Outcome::effects(vec![])
+                    }
+                }
+            }
+            Intent::ResetRunOption => self.reset_run_option_row(selected),
+            Intent::ApplyRuntimeEdit => self.apply_runtime_draft(),
+            Intent::SelectNext => self.step_runtime_option_cursor(1),
+            Intent::SelectPrevious => self.step_runtime_option_cursor(-1),
+            Intent::ScrollPageUp => self.step_runtime_option_cursor(-(PICKER_PAGE_ROWS as isize)),
+            Intent::ScrollPageDown => self.step_runtime_option_cursor(PICKER_PAGE_ROWS as isize),
+            Intent::ScrollToTop => self.set_runtime_option_cursor(0),
+            Intent::ScrollToBottom => {
+                let last = self.picker_run_options().len().saturating_sub(1);
+                self.set_runtime_option_cursor(last)
+            }
+            // `Tab` toggles the two views in both directions: the footer names
+            // the one it moves to, and a key that only ever went one way is how
+            // a reader ends up pressing `Esc` to get back.
+            Intent::OverlayNextField | Intent::OverlayPreviousField => {
+                self.show_runtime_picker_view(RuntimePickerView::Choices)
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// Move the switcher's cursor without a key.
+    ///
+    /// The wheel and the pointer land on the same rows the arrows do, through
+    /// the same reducer: a mouse gesture that took a different path is how a
+    /// cursor ends up somewhere a key cannot reach.
+    pub fn step_runtime_picker(&mut self, delta: isize) -> Outcome {
+        match self.overlay {
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                ..
+            }) => self.step_runtime_cursor(delta),
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Options,
+                ..
+            }) => self.step_runtime_option_cursor(delta),
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// Put the switcher's cursor on one row, opting to activate it.
+    ///
+    /// Clicking is select-then-activate, the contract every other list in this
+    /// client keeps: the first click moves the cursor so the keys that follow
+    /// act where the reader pointed, and a second click on the same row does
+    /// what `Enter` would.
+    pub fn select_runtime_picker_row(&mut self, row: usize, activate: bool) -> Outcome {
+        let Some(Overlay::RuntimePicker { view, .. }) = self.overlay.clone() else {
+            return Outcome::quiet();
+        };
+        self.overlay = Some(Overlay::RuntimePicker {
+            view,
+            selected: row,
+        });
+        if view == RuntimePickerView::Options {
+            self.runtime_picker.option_row = row;
+        }
+        if activate {
+            return self.perform_runtime_picker(Intent::ConfirmOverlay, view, row);
+        }
+        Outcome::effects(vec![])
+    }
+
+    /// How far a page key moves the catalogue: the rows the last frame drew,
+    /// or a readable guess when the picker has not been on screen yet.
+    fn runtime_picker_page_rows(&self) -> isize {
+        match self.runtime_picker.page_rows {
+            0 => PICKER_PAGE_ROWS as isize,
+            rows => rows as isize,
+        }
+    }
+
+    /// The row the switcher's cursor is on, whichever view is up.
+    fn runtime_picker_selected(&self) -> usize {
+        match self.overlay {
+            Some(Overlay::RuntimePicker { selected, .. }) => selected,
+            _ => 0,
+        }
+    }
+
+    /// Move the catalogue cursor by `delta` rows, wrapping at both ends.
+    ///
+    /// Wrapping both ways is deliberate: the two directions had different rules
+    /// once, and a list that wraps downwards but stops at the top reads as a bug
+    /// rather than as a boundary.
+    fn step_runtime_cursor(&mut self, delta: isize) -> Outcome {
+        let count = self.runtime_picker_rows().len();
+        if count == 0 {
+            return Outcome::quiet();
+        }
+        let next = (self.runtime_picker_selected() as isize + delta).rem_euclid(count as isize);
+        self.set_runtime_cursor(next as usize)
+    }
+
+    fn set_runtime_cursor(&mut self, row: usize) -> Outcome {
+        if let Some(Overlay::RuntimePicker { view, .. }) = self.overlay.clone() {
+            self.overlay = Some(Overlay::RuntimePicker {
+                view,
+                selected: row,
+            });
+        }
+        Outcome::effects(vec![])
+    }
+
+    /// Move the run-option cursor by `delta` rows, wrapping at both ends.
+    fn step_runtime_option_cursor(&mut self, delta: isize) -> Outcome {
+        let count = self.picker_run_options().len();
+        if count == 0 {
+            return Outcome::quiet();
+        }
+        let next = (self.runtime_picker.option_row as isize + delta).rem_euclid(count as isize);
+        self.set_runtime_option_cursor(next as usize)
+    }
+
+    /// Move the run-option cursor and remember where it went, so `Tab` back into
+    /// the view lands on the row the reader was working on.
+    fn set_runtime_option_cursor(&mut self, row: usize) -> Outcome {
+        self.runtime_picker.option_row = row;
+        self.set_runtime_cursor(row)
+    }
+
+    /// Fold or unfold one Agent's group.
+    fn fold_runtime_group(&mut self, agent_id: &vibex_core::AgentId, folded: bool) {
+        if folded {
+            self.runtime_picker.folded.insert(agent_id.clone());
+        } else {
+            self.runtime_picker.folded.remove(agent_id);
+        }
+    }
+
+    /// `←`/`→` on a catalogue row: fold it, unfold it, or step in and out.
+    fn fold_runtime_row(&mut self, selected: usize, close: bool) -> Outcome {
+        let rows = self.runtime_picker_rows();
+        match rows.get(selected) {
+            Some(RuntimePickerRow::Agent {
+                agent_id, folded, ..
+            }) => {
+                let agent_id = agent_id.clone();
+                let folded = *folded;
+                if close {
+                    self.fold_runtime_group(&agent_id, true);
+                    Outcome::effects(vec![])
+                } else if folded {
+                    self.fold_runtime_group(&agent_id, false);
+                    Outcome::effects(vec![])
+                } else {
+                    // Already open: `→` steps into the group rather than doing
+                    // nothing, which is what it means in every other tree.
+                    self.step_runtime_cursor(1)
+                }
+            }
+            // `←` on an entry steps out to the Agent heading it belongs under.
+            Some(RuntimePickerRow::Entry { .. }) if close => {
+                match rows[..selected]
+                    .iter()
+                    .rposition(|row| matches!(row, RuntimePickerRow::Agent { .. }))
+                {
+                    Some(heading) => self.set_runtime_cursor(heading),
+                    None => Outcome::quiet(),
+                }
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// Star or unstar the highlighted model.
+    ///
+    /// The pinned section is drawn above the groups, so starring moves the row
+    /// the reader was on. The cursor follows the *entry* rather than the index
+    /// it happened to sit at, which is what makes the key usable twice in a row.
+    fn star_runtime_row(&mut self, selected: usize) -> Outcome {
+        let Some(index) = self.runtime_picker_entry(selected) else {
+            return Outcome::quiet();
+        };
+        let Some(option) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| catalog.options.get(index))
+            .cloned()
+        else {
+            return Outcome::quiet();
+        };
+        let starred = self.runtime_prefs.toggle_favorite(&option);
+        self.runtime_prefs.save(self.runtime_path.as_deref());
+        let row = self
+            .runtime_picker_rows()
+            .iter()
+            .position(|row| row.entry() == Some(index))
+            .unwrap_or(0);
+        self.set_runtime_cursor(row);
+        let marker = if starred { "★" } else { "☆" };
+        let message = format!("{marker} {} · {}", option.agent_label, option.model_label);
+        self.toast(Toast::success(message));
+        Outcome::effects(vec![])
+    }
+
+    /// Send the reader to the highlighted Agent's account in the management
+    /// pages.
+    ///
+    /// The catalogue can say that an account needs attention; it cannot sign in.
+    /// The Agents page owns that, and the Agent waits on the app for the list to
+    /// arrive so the page lands on the row the reader asked about instead of on
+    /// whichever Agent happened to be first.
+    fn open_runtime_account(&mut self, selected: usize) -> Outcome {
+        let Some(option) = self.runtime_picker_highlighted_entry(selected) else {
+            return Outcome::quiet();
+        };
+        let agent_id = option.selection.agent_id.clone();
+        let message = format!(
+            "{}: {}",
+            self.strings.runtime_manage_account(),
+            option.agent_label
+        );
+        self.overlay = None;
+        self.pending_agent_focus = Some(agent_id);
+        self.navigate_to(Page::Agents);
+        self.toast(Toast::info(message));
+        Outcome::effects(vec![Effect::ListAgents])
     }
 
     /// Take the catalogue row the picker's cursor is on for the composing page.
@@ -2441,14 +2841,41 @@ impl App {
         if !self.runtime_picker_is_current() {
             return false;
         }
-        let Some(option) = self
-            .runtime_options
-            .as_ref()
-            .and_then(|catalog| catalog.options.get(row))
-            .cloned()
-        else {
-            // No catalogue row to take: the view still turns, and says for
-            // itself that there is nothing in it.
+        let highlighted = self.runtime_picker_rows().get(row).cloned();
+        if let Some(RuntimePickerRow::Agent { agent_id, .. }) = highlighted {
+            // A heading is its entries seen at once, so taking it takes the
+            // Agent's own answer: the model the reader last used with it, or the
+            // first one it still publishes. Anything else would answer `Tab` on
+            // a heading with the options of an Agent the reader did not point
+            // at.
+            let selection = self.runtime_options.as_ref().and_then(|catalog| {
+                self.runtime_prefs
+                    .preferred(catalog, Some(&agent_id))
+                    .or_else(|| {
+                        catalog
+                            .options
+                            .iter()
+                            .find(|option| {
+                                option.availability
+                                    == vibex_core::RuntimeOptionAvailability::Available
+                                    && option.selection.agent_id == agent_id
+                            })
+                            .map(|option| self.runtime_prefs.with_remembered_options(option))
+                    })
+            });
+            let Some(selection) = selection else {
+                self.toast(Toast::warning(
+                    self.strings.runtime_unavailable().to_string(),
+                ));
+                return false;
+            };
+            self.new_session_runtime = Some(selection);
+            self.completion = None;
+            return true;
+        }
+        let Some(option) = self.runtime_picker_highlighted_entry(row) else {
+            // No catalogue row to take — a pinned section's title: the view
+            // still turns, and says for itself what it is showing.
             return true;
         };
         if option.availability != vibex_core::RuntimeOptionAvailability::Available {
@@ -2457,54 +2884,23 @@ impl App {
             ));
             return false;
         }
-        self.new_session_runtime = Some(option.selection);
+        // How this entry ran last time comes with it: the reader picked the
+        // Agent and the model, and the thinking depth they set on it is part of
+        // that answer rather than a second question.
+        let selection = self.runtime_prefs.with_remembered_options(&option);
+        self.new_session_runtime = Some(selection);
         self.completion = None;
         true
-    }
-
-    /// Act on the switcher row the reader confirmed.
-    ///
-    /// A catalogue row is a runtime change and closes the picker. A run option
-    /// is about the choice already in effect, so it opens what that option
-    /// accepts rather than closing the surface the reader is working in.
-    fn activate_runtime_picker_row(&mut self, view: RuntimePickerView, row: usize) -> Outcome {
-        match view {
-            RuntimePickerView::Choices => {
-                self.overlay = None;
-                self.apply_runtime_selection(row)
-            }
-            RuntimePickerView::Options => {
-                let Some(option) = self.run_options().into_iter().nth(row) else {
-                    return Outcome::quiet();
-                };
-                match option.kind {
-                    RunOptionKind::Text => self.open_run_option_prompt(option),
-                    RunOptionKind::Choice | RunOptionKind::Toggle => {
-                        // The cursor starts on the value in effect, which on a
-                        // fresh selection is the Agent's own default.
-                        let choices = self.run_option_choices(&option);
-                        let selected = choices
-                            .iter()
-                            .position(|(value, _)| option.is_selected_value(value.as_deref()))
-                            .unwrap_or(0);
-                        self.overlay = Some(Overlay::RunOptionValues {
-                            row,
-                            selected,
-                            option,
-                        });
-                        Outcome::effects(vec![])
-                    }
-                }
-            }
-        }
     }
 
     /// Ask for a free-text run option's value.
     ///
     /// The open prompt carries its field but not the option it belongs to, so
-    /// the key waits on the app for the one submission the prompt can make.
-    fn open_run_option_prompt(&mut self, option: RunOption) -> Outcome {
+    /// the key waits on the app for the one submission the prompt can make. The
+    /// row rides along too, so the answer lands back on the row that asked.
+    fn open_run_option_prompt(&mut self, option: RunOption, row: usize) -> Outcome {
         self.run_option_prompt = Some(option.key.clone());
+        self.runtime_picker.option_row = row;
         let title = option.label.clone();
         let value = option
             .explicit
@@ -2519,25 +2915,46 @@ impl App {
         Outcome::effects(vec![])
     }
 
-    /// Apply one run option to the page's runtime selection.
+    /// Start staging run options for the page's selection.
     ///
-    /// What the Agent publishes is the only thing that may be sent: a value the
-    /// catalogue no longer advertises is refused rather than moved onto the
-    /// session as a switch the runtime would reject. `None` clears the override,
-    /// which is what the value list's `Default` row means.
-    fn apply_run_option(&mut self, key: &RunOptionKey, value: Option<String>) -> Outcome {
+    /// A draft already open for the same entry stays: the reader may have staged
+    /// three rows, stepped back to the catalogue and returned, and the staged
+    /// values are still what they meant.
+    fn begin_runtime_draft(&mut self) {
         if !self.runtime_picker_is_current() {
-            return Outcome::quiet();
+            return;
         }
         let Some(selection) = self.page_runtime_selection() else {
-            return Outcome::quiet();
+            return;
+        };
+        let current =
+            self.runtime_picker.draft.as_ref().is_some_and(|draft| {
+                crate::runtime_prefs::identity_matches(&draft.base, &selection)
+            });
+        if !current {
+            self.runtime_picker.draft = Some(RuntimeDraft::new(selection));
+        }
+    }
+
+    /// Stage one run-option value, refusing what the Agent no longer publishes.
+    ///
+    /// The catalogue is the authority: a value it stopped advertising is refused
+    /// here rather than travelling to the runtime as a switch it would reject.
+    /// `None` clears the override, which is what the value list's `Default` row
+    /// means. Answers whether the staged selection moved.
+    fn stage_run_option(&mut self, key: &RunOptionKey, value: Option<String>) -> bool {
+        if !self.runtime_picker_is_current() {
+            return false;
+        }
+        let Some(selection) = self.picker_selection() else {
+            return false;
         };
         let Some(option) = self
-            .run_options()
+            .picker_run_options()
             .into_iter()
             .find(|option| &option.key == key)
         else {
-            return Outcome::quiet();
+            return false;
         };
         let accepted = match (key, value.as_deref()) {
             (_, None) => true,
@@ -2551,32 +2968,70 @@ impl App {
                 .any(|candidate| candidate.value == value),
         };
         if !accepted {
-            return Outcome::quiet();
+            return false;
         }
-        let mut next = selection;
+        self.begin_runtime_draft();
+        let Some(draft) = self.runtime_picker.draft.as_mut() else {
+            return false;
+        };
         match key {
-            RunOptionKey::ReasoningEffort => next.reasoning_effort = value.clone(),
-            RunOptionKey::Mode => next.mode_id = value.clone(),
-            RunOptionKey::Feature(id) => match value.clone() {
+            RunOptionKey::ReasoningEffort => draft.working.reasoning_effort = value,
+            RunOptionKey::Mode => draft.working.mode_id = value,
+            RunOptionKey::Feature(id) => match value {
                 Some(value) => {
-                    next.config_values.insert(id.clone(), value);
+                    draft.working.config_values.insert(id.clone(), value);
                 }
                 None => {
-                    next.config_values.remove(id);
+                    draft.working.config_values.remove(id);
                 }
             },
         }
-        // A page that shows a session moves *that* session with a
-        // compare-and-set switch, which is the same path a runtime change
-        // takes. A page that shows none — the list, the management pages, the
-        // page where a session is being written — has nothing to move: the
-        // choice belongs to the next session, and the session the client still
-        // has selected behind it is not the reader's target.
+        true
+    }
+
+    /// Stage the highlighted run option back to the Agent's own default.
+    fn reset_run_option_row(&mut self, selected: usize) -> Outcome {
+        let Some(option) = self.picker_run_options().into_iter().nth(selected) else {
+            return Outcome::quiet();
+        };
+        if self.stage_run_option(&option.key, None) {
+            let message = format!("{}: {}", option.label, self.strings.runtime_default());
+            self.toast(Toast::info(message));
+        }
+        Outcome::effects(vec![])
+    }
+
+    /// Drop what was staged, answering whether there was anything to drop.
+    fn discard_runtime_draft(&mut self) -> bool {
+        self.runtime_picker
+            .draft
+            .take()
+            .is_some_and(|draft| draft.is_dirty())
+    }
+
+    /// Apply the staged run options in one move.
+    ///
+    /// A page showing a session gets exactly one switch however many rows the
+    /// reader changed: the runtime is asked once, and a failure cannot leave
+    /// half of the changes applied. A page showing none has nothing to move, so
+    /// the staged selection becomes the next session's.
+    fn apply_runtime_draft(&mut self) -> Outcome {
+        if !self.runtime_picker_is_current() {
+            return Outcome::quiet();
+        }
+        let Some(draft) = self.runtime_picker.draft.clone() else {
+            return Outcome::quiet();
+        };
+        if !draft.is_dirty() {
+            self.toast(Toast::info(self.strings.runtime_no_change().to_string()));
+            return Outcome::quiet();
+        }
+        self.runtime_picker.draft = None;
+        self.remember_runtime_selection(&draft.working);
+        self.completion = None;
         if matches!(self.runtime_picker_target, Some(ComposerTarget::Draft(_))) {
-            self.new_session_runtime = Some(next);
-            self.completion = None;
-            let value = self.run_option_value_label(&option, value.as_deref());
-            self.toast(Toast::success(format!("{}: {value}", option.label)));
+            self.new_session_runtime = Some(draft.working);
+            self.toast(Toast::success(self.strings.runtime_applied().to_string()));
             return Outcome::quiet();
         }
         let Some(session_id) = self.selected_session_id().cloned() else {
@@ -2586,28 +3041,40 @@ impl App {
             BackendOperation::AgentSwitchRuntime,
             Effect::SwitchRuntime {
                 session_id,
-                selection: next,
+                selection: draft.working,
             },
         )
     }
 
-    /// The words for one value of a run option, for the acknowledgement.
-    fn run_option_value_label(&self, option: &RunOption, explicit: Option<&str>) -> String {
-        self.run_option_choices(option)
-            .into_iter()
-            .find(|(value, _)| value.as_deref() == explicit)
-            .map(|(_, label)| label)
-            .unwrap_or_else(|| self.strings.runtime_default().to_string())
+    /// Choose one of the pinned recent rows by its number.
+    ///
+    /// Answers `None` when the digit is not one of them, which is what lets the
+    /// caller fall through to the binding table: a key the reviewer did not
+    /// mean as a shortcut must not be swallowed by one.
+    pub fn quick_pick_runtime(&mut self, digit: char) -> Option<Outcome> {
+        let position = digit.to_digit(10)? as usize;
+        if position == 0 {
+            return None;
+        }
+        let rows = self.runtime_picker_rows();
+        let row = rows.iter().position(|row| {
+            matches!(row, RuntimePickerRow::Entry { quick: Some(quick), .. } if *quick == digit)
+        })?;
+        let index = rows[row].entry()?;
+        self.overlay = None;
+        Some(self.apply_runtime_selection(index))
     }
 
     fn apply_runtime_selection(&mut self, index: usize) -> Outcome {
         if !self.runtime_picker_is_current() {
             return Outcome::quiet();
         }
-        let Some(catalog) = self.runtime_options.as_ref() else {
-            return Outcome::quiet();
-        };
-        let Some(option) = catalog.options.get(index) else {
+        let Some(option) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| catalog.options.get(index))
+            .cloned()
+        else {
             return Outcome::quiet();
         };
         if option.availability != vibex_core::RuntimeOptionAvailability::Available {
@@ -2615,6 +3082,13 @@ impl App {
             self.toast(Toast::warning(message));
             return Outcome::quiet();
         }
+        // How this entry ran last time comes back with it, and it is written
+        // down again: the entry the reader just chose is now the one a new
+        // session starts from.
+        let selection = self.runtime_prefs.with_remembered_options(&option);
+        self.runtime_picker.draft = None;
+        self.remember_runtime_selection(&selection);
+        self.completion = None;
         // A page that shows a session moves *that* session; a page that shows
         // none — the session list, the management pages, the page where a
         // session is being written — has nothing to move, so the choice belongs
@@ -2622,8 +3096,7 @@ impl App {
         // because the client keeps a session selected behind every one of those
         // pages and moving it is exactly what the reader did not ask for.
         if matches!(self.runtime_picker_target, Some(ComposerTarget::Draft(_))) {
-            self.new_session_runtime = Some(option.selection.clone());
-            self.completion = None;
+            self.new_session_runtime = Some(selection);
             let message = format!(
                 "{}: {} · {}",
                 self.strings.runtime_next_session(),
@@ -2640,7 +3113,7 @@ impl App {
             BackendOperation::AgentSwitchRuntime,
             Effect::SwitchRuntime {
                 session_id,
-                selection: option.selection.clone(),
+                selection,
             },
         )
     }
@@ -3231,7 +3704,14 @@ mod tests {
             backend.clone(),
             backend,
         );
-        let mut app = App::new(facade, crate::app::AppOptions::default());
+        let mut app = App::new(
+            facade,
+            crate::app::AppOptions {
+                sidebar_path: None,
+                runtime_path: None,
+                ..Default::default()
+            },
+        );
         app.resize(100, 30);
         app
     }
@@ -3381,7 +3861,7 @@ mod tests {
             app.overlay,
             Some(Overlay::RuntimePicker {
                 view: RuntimePickerView::Choices,
-                selected: 1
+                selected: entry_row(&app, 1)
             })
         );
     }
@@ -3484,7 +3964,7 @@ mod tests {
             app.overlay,
             Some(Overlay::RuntimePicker {
                 view: RuntimePickerView::Choices,
-                selected: 1
+                selected: entry_row(&app, 1)
             })
         );
         assert!(app.runtime_option_is_current(&app.runtime_options.as_ref().unwrap().options[1]));
@@ -3498,7 +3978,7 @@ mod tests {
         app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
-            selected: 0,
+            selected: entry_row(&app, 0),
         });
         let switched = app.perform(Intent::ConfirmOverlay);
         let [
@@ -3619,19 +4099,44 @@ mod tests {
         })
     }
 
+    /// The catalogue row one entry is drawn on.
+    ///
+    /// The list is a tree — an Agent heading above its entries, and the pinned
+    /// recent and starred rows above those — so an entry's row is no longer its
+    /// index in the catalogue. Tests ask for the row the way the renderer finds
+    /// it rather than counting headings by hand.
+    fn entry_row(app: &App, index: usize) -> usize {
+        app.runtime_picker_rows()
+            .iter()
+            .position(|row| row.entry() == Some(index))
+            .expect("the entry is on the list")
+    }
+
+    /// Stage one run option and apply it, the way the switcher does.
+    fn stage_and_apply(app: &mut App, key: RunOptionKey, value: Option<&str>) -> Outcome {
+        app.show_runtime_picker_view(RuntimePickerView::Options);
+        assert!(
+            app.stage_run_option(&key, value.map(str::to_string)),
+            "the value was refused"
+        );
+        app.perform(Intent::ApplyRuntimeEdit)
+    }
+
     #[test]
     fn the_switcher_publishes_run_options_as_a_view_of_their_own() {
         // A catalogue is as long as the machine has models, so the run options
         // cannot be appended under it: they are the switcher's second view, and
         // `Tab` is what moves between them.
         let mut app = app_with_run_options(Page::Agent);
-        assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Choices), 2);
+        // One heading per Agent on top of the entries: the catalogue row count
+        // is not the catalogue's length any more.
+        assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Choices), 4);
         assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Options), 4);
 
         app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
-            selected: 1,
+            selected: entry_row(&app, 1),
         });
         let outcome = app.perform(Intent::OverlayNextField);
         assert!(outcome.effects.is_empty(), "{outcome:?}");
@@ -3648,7 +4153,7 @@ mod tests {
             app.overlay,
             Some(Overlay::RuntimePicker {
                 view: RuntimePickerView::Choices,
-                selected: 1,
+                selected: entry_row(&app, 1),
             })
         );
 
@@ -3749,10 +4254,32 @@ mod tests {
             vec!["Default", "Low", "High"]
         );
 
-        // Down to `High`, which is one past `Low`.
+        // Down to `High`, which is one past `Low`. Choosing it stages the
+        // value and comes back to the row it belongs to rather than closing the
+        // switcher: the reader is tuning one Agent, and every row they tune
+        // belongs to the same answer.
         app.perform(Intent::SelectNext);
         app.perform(Intent::SelectNext);
-        let outcome = app.perform(Intent::ConfirmOverlay);
+        let staged = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            staged.effects.is_empty(),
+            "staging a value issued work: {staged:?}"
+        );
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Options,
+                selected: 0,
+            })
+        );
+        let staged_change = app.runtime_picker.draft.clone().expect("a draft");
+        assert_eq!(
+            staged_change.working.reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        // One apply sends it, and sends one switch rather than one per row.
+        let outcome = app.perform(Intent::ApplyRuntimeEdit);
         let selection = switched(&outcome).expect("the choice did not switch the session");
         assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
         // The rest of the selection travels untouched: a run option is a
@@ -3760,7 +4287,7 @@ mod tests {
         assert_eq!(selection.agent_id, agent_id);
         assert_eq!(selection.mode_id, None);
         assert!(selection.config_values.is_empty());
-        assert_eq!(app.overlay, None);
+        assert!(app.runtime_picker.draft.is_none());
     }
 
     #[test]
@@ -3785,7 +4312,8 @@ mod tests {
         };
         app.perform(Intent::SelectPrevious);
         app.perform(Intent::SelectPrevious);
-        let outcome = app.perform(Intent::ConfirmOverlay);
+        app.perform(Intent::ConfirmOverlay);
+        let outcome = app.perform(Intent::ApplyRuntimeEdit);
         let selection =
             switched(&outcome).expect("clearing the override did not switch the session");
         assert_eq!(selection.reasoning_effort, None);
@@ -3817,7 +4345,8 @@ mod tests {
         // reader's next step is the explicit `Off`.
         app.perform(Intent::SelectNext);
         app.perform(Intent::SelectNext);
-        let outcome = app.perform(Intent::ConfirmOverlay);
+        app.perform(Intent::ConfirmOverlay);
+        let outcome = app.perform(Intent::ApplyRuntimeEdit);
         let selection = switched(&outcome).expect("the toggle did not switch the session");
         assert_eq!(
             selection
@@ -3901,7 +4430,7 @@ mod tests {
             app.overlay,
             Some(Overlay::RuntimePicker {
                 view: RuntimePickerView::Choices,
-                selected: 1,
+                selected: entry_row(&app, 1),
             })
         );
         // And the catalogue still closes.
@@ -3938,7 +4467,8 @@ mod tests {
         );
         app.perform(Intent::SelectNext);
         app.perform(Intent::SelectNext);
-        let outcome = app.perform(Intent::ConfirmOverlay);
+        app.perform(Intent::ConfirmOverlay);
+        let outcome = app.perform(Intent::ApplyRuntimeEdit);
         assert!(
             outcome.effects.is_empty(),
             "a page with no session issued work: {outcome:?}"
@@ -4034,15 +4564,11 @@ mod tests {
 
         // The page is on the entry the reader picked, and the picker says so.
         assert_eq!(app.current_runtime_option_index(), Some(1));
-        app.show_runtime_picker();
-        app.overlay = Some(Overlay::RuntimePicker {
-            view: RuntimePickerView::Options,
-            selected: 0,
-        });
-        app.perform(Intent::ConfirmOverlay);
-        app.perform(Intent::SelectNext);
-        app.perform(Intent::SelectNext);
-        app.perform(Intent::ConfirmOverlay);
+        let applied = stage_and_apply(&mut app, RunOptionKey::ReasoningEffort, Some("high"));
+        assert!(
+            applied.effects.is_empty(),
+            "a page with no session issued work: {applied:?}"
+        );
 
         let chosen = app
             .new_session_runtime
@@ -4058,6 +4584,12 @@ mod tests {
         );
         assert_eq!(app.current_runtime_option_index(), Some(1));
 
+        // The switcher stays up after an apply — the reader may want to tune
+        // the next row too — so leaving it is what puts the keyboard back in
+        // the composer.
+        app.perform(Intent::Back);
+        app.perform(Intent::Back);
+        assert_eq!(app.overlay, None);
         app.composer.insert_str("write something");
         let created = created_runtime(&app.perform(Intent::SubmitComposer))
             .expect("the page named a runtime and created with none");
@@ -4089,7 +4621,7 @@ mod tests {
         app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
-            selected: 1,
+            selected: entry_row(&app, 1),
         });
         let chosen = app.perform(Intent::ConfirmOverlay);
         assert!(
@@ -4115,8 +4647,11 @@ mod tests {
         );
 
         // A run option is the same choice seen from the other side: off a
-        // session it tunes the next session's Agent, not that session's.
-        let tuned = app.apply_run_option(&RunOptionKey::ReasoningEffort, Some("high".to_string()));
+        // session it tunes the next session's Agent, not that session's — and
+        // it is sent once, from the staging the switcher keeps.
+        app.show_runtime_picker_view(RuntimePickerView::Options);
+        assert!(app.stage_run_option(&RunOptionKey::ReasoningEffort, Some("high".to_string())));
+        let tuned = app.perform(Intent::ApplyRuntimeEdit);
         assert!(
             switched(&tuned).is_none(),
             "a run option off a session moved one: {tuned:?}"
@@ -4156,7 +4691,7 @@ mod tests {
         app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
-            selected: 2,
+            selected: entry_row(&app, 2),
         });
         let chosen = app.perform(Intent::ConfirmOverlay);
         assert!(switched(&chosen).is_none(), "{chosen:?}");
@@ -4291,7 +4826,7 @@ mod tests {
         app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
-            selected: 1,
+            selected: entry_row(&app, 1),
         });
         let chosen = app.perform(Intent::ConfirmOverlay);
         let [
@@ -4310,15 +4845,19 @@ mod tests {
             "the session's move became the next session's choice"
         );
 
-        // The page where the next session is written answers with the
-        // catalogue's own entry, never with the Agent the open session moved to.
+        // The next draft derives the remembered preference without becoming
+        // an explicit draft edit or changing the existing session's state.
         app.perform(Intent::NewSession);
-        assert_eq!(app.composer_runtime_labels().0, "claude");
+        assert!(app.new_session_runtime.is_none());
+        assert_eq!(app.composer_runtime_labels().0, "codex");
         assert_eq!(
             app.page_runtime_selection()
                 .map(|selection| selection.agent_id),
-            Some(claude.agent_id),
-            "the writing page inherited the session's choice"
+            Some(codex.agent_id),
+        );
+        assert_eq!(
+            app.session_runtime_selection().unwrap().agent_id,
+            claude.agent_id
         );
     }
 
@@ -4439,7 +4978,7 @@ mod tests {
             app.overlay,
             Some(Overlay::RuntimePicker {
                 view: RuntimePickerView::Choices,
-                selected: 0,
+                selected: entry_row(&app, 0),
             }),
             "the catalogue did not open on the page's own entry"
         );
@@ -4469,22 +5008,23 @@ mod tests {
     #[test]
     fn a_run_option_the_catalogue_stopped_publishing_is_not_sent() {
         let mut app = app_with_run_options(Page::Agent);
+        app.show_runtime_picker_view(RuntimePickerView::Options);
 
         // A stale value list (the catalogue moved under it) must not move the
         // session onto a setting no Agent advertises.
-        let refused = app.apply_run_option(
+        let refused = app.stage_run_option(
             &RunOptionKey::ReasoningEffort,
             Some("nonexistent".to_string()),
         );
-        assert!(refused.effects.is_empty(), "{refused:?}");
+        assert!(!refused, "a value no Agent publishes was staged");
         assert_eq!(
             app.session_runtime_selection()
                 .and_then(|selection| selection.reasoning_effort.clone()),
             None
         );
-        // A value the Agent does publish is sent.
-        let accepted =
-            app.apply_run_option(&RunOptionKey::ReasoningEffort, Some("high".to_string()));
+        // A value the Agent does publish is staged, and one apply sends it.
+        assert!(app.stage_run_option(&RunOptionKey::ReasoningEffort, Some("high".to_string())));
+        let accepted = app.perform(Intent::ApplyRuntimeEdit);
         assert_eq!(
             switched(&accepted).and_then(|selection| selection.reasoning_effort.clone()),
             Some("high".to_string())
@@ -5044,6 +5584,29 @@ mod tests {
         assert_eq!(
             app.toast.as_ref().map(|toast| toast.text.as_str()),
             Some(app.strings.sidebar_pinned_first())
+        );
+    }
+    #[test]
+    fn staged_runtime_options_are_discarded_when_switching_same_runtime_sessions() {
+        let mut app = app_with_run_options(Page::Agent);
+        let runtime = app.agent.state.runtime_selection.value.clone().unwrap();
+        app.show_runtime_picker_view(RuntimePickerView::Options);
+        assert!(app.stage_run_option(&RunOptionKey::ReasoningEffort, Some("high".into())));
+        assert!(app.runtime_picker.draft.as_ref().unwrap().is_dirty());
+        let mut other = openable_session("session_same0002");
+        other.agent_id = runtime.desired.agent_id.clone();
+        app.open_session_effects(other.id.clone());
+        app.agent.state.active_session.resolve(other);
+        app.agent.state.runtime_selection.resolve(runtime);
+        assert!(app.runtime_picker.draft.is_none());
+        app.show_runtime_picker_view(RuntimePickerView::Options);
+        assert!(!app.runtime_picker.draft.as_ref().unwrap().is_dirty());
+        assert!(app.perform(Intent::ApplyRuntimeEdit).effects.is_empty());
+        assert!(
+            app.session_runtime_selection()
+                .unwrap()
+                .reasoning_effort
+                .is_none()
         );
     }
 }

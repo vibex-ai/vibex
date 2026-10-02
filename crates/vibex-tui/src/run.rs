@@ -309,6 +309,29 @@ fn handle_key(
         handle_settings_mode_key(app, key);
         return Ok(false);
     }
+    // The runtime switcher's own filter is a second text field, opened with `/`
+    // on the catalogue. Arrows and the page keys still fall through to the
+    // binding table, so a reader can keep walking the list while narrowing it.
+    if app.runtime_picker_filtering() {
+        match key.code {
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.push_runtime_picker_query(character);
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                app.pop_runtime_picker_query();
+                return Ok(false);
+            }
+            KeyCode::Delete => {
+                app.clear_runtime_picker_query();
+                return Ok(false);
+            }
+            // The first `Esc` gives the query up; a second one, with nothing
+            // left to give up, closes the switcher the way `Esc` always does.
+            KeyCode::Esc if app.cancel_runtime_picker_filter() => return Ok(false),
+            _ => {}
+        }
+    }
     // While a filter or a prompt is being typed, printable characters are text.
     if app.filtering {
         match key.code {
@@ -612,6 +635,22 @@ fn handle_key(
                 // to the binding table, so the editor does not trap the reader.
                 _ => {}
             }
+        }
+        // The runtime switcher's recent rows are numbered, and a digit chooses
+        // one outright: a reader who wants what they were using a minute ago
+        // should not have to walk a catalogue to find it. A digit that names no
+        // row falls through, so nothing is swallowed by a shortcut that does not
+        // apply.
+        if let Some(Overlay::RuntimePicker {
+            view: crate::app::RuntimePickerView::Choices,
+            ..
+        }) = app.overlay
+            && !app.runtime_picker.filtering
+            && let KeyCode::Char(digit) = key.code
+            && let Some(outcome) = app.quick_pick_runtime(digit)
+        {
+            dispatch_all(worker, &outcome);
+            return Ok(false);
         }
         // The approval card accepts a digit as a direct option selection.
         if let Some(Overlay::Approval { .. }) = app.overlay
@@ -975,6 +1014,14 @@ fn handle_composer_key(
 fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
+            // The switcher owns the wheel while it is up: it is the list on
+            // screen, and scrolling the transcript behind a modal is not a
+            // gesture anyone means.
+            if app.runtime_picker_is_open() {
+                let outcome = app.step_runtime_picker(-3);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
             app.scroll_lines(-3);
             // The wheel is the other way to reach the top of the loaded
             // window; the controller ignores the ask when there is nothing
@@ -987,6 +1034,11 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::ScrollDown => {
+            if app.runtime_picker_is_open() {
+                let outcome = app.step_runtime_picker(3);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
             app.scroll_lines(3);
             true
         }
@@ -1010,6 +1062,17 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 let outcome = app.perform(crate::action::Intent::Back);
                 dispatch_all(worker, &outcome);
                 app.regions.modal_close = None;
+                return true;
+            }
+            // The switcher's rows select and activate exactly as the other
+            // lists do, headings included: a heading is the control that folds
+            // its group, and a double click is how the mouse presses it.
+            if let Some(region) = app.regions.runtime_picker
+                && let Some(row) = region.row_at(mouse.column, mouse.row)
+            {
+                let repeat = app.double_click_at(mouse.column, mouse.row);
+                let outcome = app.select_runtime_picker_row(row, repeat);
+                dispatch_all(worker, &outcome);
                 return true;
             }
             if app.overlay.is_some() {
@@ -1372,6 +1435,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     // reader opened. An unrelated prefetch cannot reorder it.
                     if !picker_open {
                         app.runtime_options = Some(catalog);
+                        app.reconcile_remembered_runtime();
                     }
                     if picker_waiting && app.overlay.is_none() {
                         app.show_runtime_picker();
@@ -1747,6 +1811,18 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Ok(agents) => {
                 app.management_data.agents = agents;
                 app.live = LiveState::Ready;
+                // The switcher sends a reader here for one Agent's account, and
+                // the list it needs only arrives now: without this the page
+                // lands on whichever Agent happens to be first.
+                if let Some(agent_id) = app.pending_agent_focus.take()
+                    && let Some(index) = app
+                        .management_data
+                        .agents
+                        .iter()
+                        .position(|agent| agent.id == agent_id)
+                {
+                    app.set_selection(crate::keymap::Scope::Management, index);
+                }
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
@@ -2005,6 +2081,7 @@ mod tests {
                 mode: vibex_ui::GpuiThemeMode::Dark,
                 locale: crate::locale::Locale::En,
                 sidebar_path: None,
+                runtime_path: None,
             },
         );
         app.resize(columns, rows);
@@ -2091,6 +2168,7 @@ mod tests {
             facade,
             crate::app::AppOptions {
                 sidebar_path: None,
+                runtime_path: None,
                 ..Default::default()
             },
         );
@@ -2158,6 +2236,15 @@ mod tests {
             .unwrap()
     }
 
+    fn isolation_highlight_runtime(app: &mut App, index: usize) {
+        let row = app
+            .runtime_picker_rows()
+            .iter()
+            .position(|row| row.entry() == Some(index))
+            .unwrap();
+        app.select_runtime_picker_row(row, false);
+    }
+
     fn isolation_worker() -> Worker {
         Worker::start(vibex_backend::DisconnectedBackend::facade())
             .unwrap()
@@ -2181,7 +2268,7 @@ mod tests {
             .unwrap();
         app.perform(Intent::NewSession);
         app.show_runtime_picker();
-        app.perform(Intent::SelectNext);
+        isolation_highlight_runtime(&mut app, 1);
         apply_message(
             &mut app,
             &worker,
@@ -2457,7 +2544,7 @@ mod tests {
         assert!(app.overlay.is_none());
         app.perform(Intent::NewSession);
         app.show_runtime_picker();
-        app.perform(Intent::SelectNext);
+        isolation_highlight_runtime(&mut app, 1);
         catalog.options.reverse();
         apply_message(&mut app, &worker, AppMessage::RuntimeOptions(Ok(catalog))).unwrap();
         app.perform(Intent::ConfirmOverlay);
@@ -2715,5 +2802,49 @@ mod tests {
         .unwrap();
         assert!(app.toast.is_none());
         assert!(app.completion.as_ref().unwrap().loading);
+    }
+    #[test]
+    fn remembered_default_and_late_catalogue_do_not_block_creation_recovery() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.perform(Intent::NewSession);
+        app.show_runtime_picker();
+        isolation_highlight_runtime(&mut app, 1);
+        app.perform(Intent::ConfirmOverlay);
+        app.composer.set_text("recover remembered agent");
+        app.perform(Intent::SubmitComposer);
+        let request_id = app.selected_session_id().unwrap().clone();
+        let catalog = app.runtime_options.clone().unwrap();
+        apply_message(&mut app, &worker, AppMessage::RuntimeOptions(Ok(catalog))).unwrap();
+        assert!(
+            app.new_session_runtime.is_none(),
+            "a default became an explicit draft edit"
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionCreated {
+                request_id,
+                result: Err(vibex_backend::BackendError::failed(
+                    "test",
+                    "creation failed",
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.page, crate::app::Page::NewSession);
+        assert_eq!(app.composer.text(), "recover remembered agent");
+        assert_eq!(
+            app.page_runtime_selection().unwrap().agent_id.as_str(),
+            "deepseek-harness"
+        );
+        app.perform(Intent::SubmitComposer);
+        app.perform(Intent::NewSession);
+        assert!(app.new_session_runtime.is_none());
+        assert_eq!(
+            app.page_runtime_selection().unwrap().agent_id.as_str(),
+            "deepseek-harness"
+        );
     }
 }

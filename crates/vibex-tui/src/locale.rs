@@ -544,6 +544,38 @@ strings! {
     runtime_on => { "On", "开", "開" },
     runtime_off => { "Off", "关", "關" },
     runtime_option_required => { "A value is required", "需要填写一个值", "需要填寫一個值" },
+    // The pinned sections above the Agent groups: what the reader used last,
+    // and what they starred.
+    runtime_recent => { "Recent", "最近使用", "最近使用" },
+    runtime_favorites => { "Starred", "已收藏", "已收藏" },
+    // Key-bar words for the catalogue view.
+    runtime_search => { "search", "搜索", "搜尋" },
+    runtime_fold => { "fold", "折叠", "摺疊" },
+    runtime_star => { "star", "收藏", "收藏" },
+    runtime_manage_account => { "account", "账号", "帳號" },
+    // Staged run options: several changes, one apply.
+    runtime_modified => { "changed", "已修改", "已修改" },
+    runtime_apply => { "apply", "应用", "套用" },
+    runtime_reset => { "reset", "重置", "重設" },
+    runtime_discarded => {
+        "Run options discarded",
+        "已放弃运行选项的修改",
+        "已放棄執行選項的修改"
+    },
+    runtime_applied => { "Run options applied", "运行选项已应用", "執行選項已套用" },
+    runtime_no_change => {
+        "Nothing to apply",
+        "没有需要应用的修改",
+        "沒有需要套用的修改"
+    },
+    // The row statuses, in the same column as "Current".
+    runtime_status_sign_in => { "Sign in", "需登录", "需登入" },
+    runtime_status_verifying => { "Checking…", "校验中…", "校驗中…" },
+    runtime_status_discovering => { "Listing models…", "发现模型中…", "探索模型中…" },
+    runtime_status_configure => { "Set up", "需配置", "需設定" },
+    runtime_status_failed => { "Failed", "切换失败", "切換失敗" },
+    runtime_no_match => { "No matching runtime", "没有匹配的运行时", "沒有符合的執行階段" },
+    runtime_summary_hint => { "Tab edits", "Tab 编辑", "Tab 編輯" },
 
     // ---- workspace ------------------------------------------------------
     workspace_pick => { "Choose a workspace", "选择工作区", "選擇工作區" },
