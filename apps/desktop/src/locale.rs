@@ -1616,6 +1616,18 @@ fn error_code_summary(locale: ResolvedLocale, code: &str) -> &'static str {
             "当前状态与此操作冲突",
             "目前狀態與此操作衝突",
         )
+    } else if code.contains("diverged") || code.contains("fast_forward") {
+        (
+            "The branch cannot fast-forward to its upstream",
+            "本地分支无法快进到远端",
+            "本地分支無法快進到遠端",
+        )
+    } else if code.contains("no_upstream") {
+        (
+            "The branch has no upstream to pull from",
+            "当前分支没有可拉取的远端分支",
+            "目前分支沒有可拉取的遠端分支",
+        )
     } else if code.contains("denied") || code.contains("permission") || code.contains("forbidden") {
         ("Permission was denied", "权限不足", "權限不足")
     } else if code.contains("timeout") || code.contains("timed_out") {
@@ -1851,6 +1863,13 @@ mod tests {
                 "worktree_path_exists: custom worktree path already exists",
             ),
             "worktree_path_exists: 自定义 Worktree 路径已存在"
+        );
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhCn,
+                "git_pull_diverged: the branch and its upstream have diverged; pull cannot fast-forward",
+            ),
+            "git_pull_diverged: 本地分支无法快进到远端"
         );
     }
 

@@ -265,6 +265,7 @@ pub struct GitBranchCheckoutRequest {
 #[serde(rename_all = "snake_case")]
 pub enum GitRemoteActionKind {
     Fetch,
+    Pull,
     Push,
 }
 

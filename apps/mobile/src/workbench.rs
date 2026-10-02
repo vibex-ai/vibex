@@ -1996,12 +1996,12 @@ impl MobileWorkbench {
                     .flex()
                     .items_center()
                     .child(
-                        icon_button("git-fetch", "icons/download.svg", "Pull")
+                        icon_button("git-pull", "icons/download.svg", "Pull")
                             .when(can_remote && !self.busy, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
-                                        this.run_git_remote_action(GitRemoteActionKind::Fetch, cx)
+                                        this.run_git_remote_action(GitRemoteActionKind::Pull, cx)
                                     }),
                                 )
                             })

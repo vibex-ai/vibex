@@ -164,7 +164,7 @@ struct GitMutationNotification;
 
 fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
-        GitMutationKind::Fetch => Some(locale::text("Pull completed", "拉取已完成", "拉取已完成")),
+        GitMutationKind::Pull => Some(locale::text("Pull completed", "拉取已完成", "拉取已完成")),
         GitMutationKind::Push => Some(locale::text("Push completed", "推送已完成", "推送已完成")),
         GitMutationKind::Revert => Some(locale::text(
             "Rollback completed",
@@ -177,7 +177,8 @@ fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
 
 fn git_mutation_failure_label(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
-        GitMutationKind::Fetch => Some(locale::text("Pull failed", "拉取失败", "拉取失敗")),
+        GitMutationKind::Fetch => Some(locale::text("Fetch failed", "获取失败", "取得失敗")),
+        GitMutationKind::Pull => Some(locale::text("Pull failed", "拉取失败", "拉取失敗")),
         GitMutationKind::Push => Some(locale::text("Push failed", "推送失败", "推送失敗")),
         GitMutationKind::Revert => Some(locale::text("Rollback failed", "回滚失败", "回復失敗")),
         _ => None,
@@ -7723,6 +7724,17 @@ impl CodeWorkbench {
         );
     }
 
+    /// The refresh control fetches, so the panel sees upstream commits without
+    /// moving the branch; a workspace with no repository to fetch from still
+    /// reloads what it has locally instead of failing on a fetch it cannot run.
+    pub(crate) fn fetch_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git.status.is_some() {
+            self.remote_action(GitRemoteActionKind::Fetch, window, cx);
+        } else {
+            self.refresh_git(cx);
+        }
+    }
+
     pub(crate) fn remote_action(
         &mut self,
         kind: GitRemoteActionKind,
@@ -7740,6 +7752,7 @@ impl CodeWorkbench {
         };
         let mutation_kind = match kind {
             GitRemoteActionKind::Fetch => GitMutationKind::Fetch,
+            GitRemoteActionKind::Pull => GitMutationKind::Pull,
             GitRemoteActionKind::Push => GitMutationKind::Push,
         };
         let status_workspace = workspace.id;
@@ -7830,6 +7843,11 @@ impl CodeWorkbench {
                         }
                         this.load_git_status(cx);
                         this.load_branches(cx);
+                        if mutation_kind == GitMutationKind::Fetch {
+                            // The refresh control is a fetch, so the panel it
+                            // refreshes includes the worktree lifecycle.
+                            this.load_worktree_lifecycle(cx);
+                        }
                         if this.git.mode == GitWorkbenchMode::History {
                             this.load_history(false, cx);
                         }
@@ -14367,7 +14385,7 @@ impl CodeRightRail {
                     })
                     .child(
                         h_flex().flex_none().items_center().gap_1().child(
-                            Button::new("git-fetch")
+                            Button::new("git-pull")
                                 .small()
                                 .ghost()
                                 .compact()
@@ -14377,12 +14395,12 @@ impl CodeRightRail {
                                 .icon(Icon::default().path("icons/vibex/download.svg"))
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                                 .tooltip(locale::text("Pull", "拉取", "拉取"))
-                                .loading(pending_kind == Some(GitMutationKind::Fetch))
+                                .loading(pending_kind == Some(GitMutationKind::Pull))
                                 .disabled(pending)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.update_workbench(cx, |workbench, cx| {
                                         workbench.remote_action(
-                                            GitRemoteActionKind::Fetch,
+                                            GitRemoteActionKind::Pull,
                                             window,
                                             cx,
                                         )
@@ -14426,9 +14444,12 @@ impl CodeRightRail {
                             .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
                             .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                             .tooltip(locale::text("Refresh Git", "刷新 Git", "重新整理 Git"))
-                            .loading(status_loading)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_workbench(cx, |workbench, cx| workbench.refresh_git(cx))
+                            .loading(status_loading || pending_kind == Some(GitMutationKind::Fetch))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.fetch_git(window, cx)
+                                })
                             })),
                     )
                     .when(history_active, |this| {
@@ -19349,7 +19370,7 @@ mod tests {
     #[test]
     fn git_mutation_feedback_is_top_centered_and_action_specific() {
         assert_eq!(
-            git_mutation_result_notice(GitMutationKind::Fetch),
+            git_mutation_result_notice(GitMutationKind::Pull),
             Some("Pull completed")
         );
         assert_eq!(
@@ -19361,8 +19382,13 @@ mod tests {
             Some("Rollback completed")
         );
         assert_eq!(git_mutation_result_notice(GitMutationKind::Commit), None);
+        assert_eq!(git_mutation_result_notice(GitMutationKind::Fetch), None);
         assert_eq!(
             git_mutation_failure_label(GitMutationKind::Fetch),
+            Some("Fetch failed")
+        );
+        assert_eq!(
+            git_mutation_failure_label(GitMutationKind::Pull),
             Some("Pull failed")
         );
 
@@ -19371,6 +19397,7 @@ mod tests {
             source.contains("Theme::global_mut(cx).notification.placement = Anchor::TopCenter;")
         );
         assert!(source.contains("pending_kind == Some(GitMutationKind::Fetch)"));
+        assert!(source.contains("pending_kind == Some(GitMutationKind::Pull)"));
         assert!(source.contains("pending_kind == Some(GitMutationKind::Push)"));
         assert!(source.contains("pending_kind == Some(GitMutationKind::Revert)"));
         assert!(source.contains("push_git_mutation_result_notice"));
