@@ -60,9 +60,15 @@ pub enum AppMessage {
     SidebarOrganizationMutated(BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot>),
     /// An image off the system clipboard: its media type and bytes, or `None`
     /// when there is none or the desktop offers no way to read one.
-    ClipboardImage(Option<(String, Vec<u8>)>),
+    ClipboardImage {
+        ticket: crate::app::ComposerTicket,
+        image: Option<(String, Vec<u8>)>,
+    },
     /// What the system clipboard held when the reader pressed paste.
-    Pasted(ClipboardContent),
+    Pasted {
+        ticket: crate::app::ComposerTicket,
+        content: ClipboardContent,
+    },
     SessionOpened {
         ticket: vibex_ui::AgentSessionLoadTicket,
         result: BackendResult<vibex_ui::AgentSessionSnapshot>,
@@ -74,13 +80,29 @@ pub enum AppMessage {
     },
     TimelineRefreshed(BackendResult<i64>),
     RuntimeOptions(BackendResult<vibex_core::SessionRuntimeOptionCatalog>),
-    SessionCreated(BackendResult<AgentSession>),
+    SessionCreated {
+        request_id: VibexSessionId,
+        result: BackendResult<AgentSession>,
+    },
+    SessionForked {
+        request_id: VibexSessionId,
+        result: BackendResult<AgentSession>,
+    },
+    MessageSent {
+        session_id: VibexSessionId,
+        send_id: u64,
+        result: BackendResult<Vec<vibex_core::TimelineItem>>,
+    },
     Mutation {
         key: String,
         result: BackendResult<()>,
     },
     Workspaces(Vec<vibex_backend::WorkspaceSummary>),
-    WorkspaceOpened(BackendResult<vibex_backend::WorkspaceSummary>),
+    WorkspaceOpened {
+        draft_id: VibexSessionId,
+        navigation_serial: u64,
+        result: BackendResult<vibex_backend::WorkspaceSummary>,
+    },
     DirectoryListing(BackendResult<vibex_core::RemoteWorkspaceDirectoryListing>),
     FileTree(BackendResult<Vec<vibex_core::FileTreeEntry>>),
     FileContents(BackendResult<vibex_core::FileReadResponse>),
@@ -103,12 +125,18 @@ pub enum AppMessage {
     Skills(BackendResult<Vec<vibex_core::Skill>>),
     Prompts(BackendResult<Vec<vibex_core::Prompt>>),
     Hooks(BackendResult<Vec<vibex_core::Hook>>),
-    Completions(BackendResult<Box<vibex_core::AgentCommandDiscovery>>),
+    Completions {
+        ticket: crate::app::ComposerTicket,
+        result: BackendResult<Box<vibex_core::AgentCommandDiscovery>>,
+    },
     Usage(BackendResult<Box<UsageReport>>),
     Recovery(BackendResult<String>),
     BackupList(BackendResult<Vec<vibex_core::BackupCreateOutcome>>),
     Clipboard(BackendResult<()>),
-    EditorFinished(BackendResult<Option<String>>),
+    EditorFinished {
+        ticket: Option<crate::app::ComposerTicket>,
+        result: BackendResult<Option<String>>,
+    },
     Event(vibex_backend::BackendEvent),
     /// The subscription ended; the connection is gone.
     SubscriptionEnded,
@@ -309,6 +337,7 @@ impl Dispatch {
                 self.send(AppMessage::RuntimeOptions(result));
             }
             Effect::CreateSession {
+                request_id,
                 workspace_root,
                 title,
                 runtime,
@@ -320,16 +349,19 @@ impl Dispatch {
                     None => match self.current_runtime_selection().await {
                         Ok(selection) => selection,
                         Err(error) => {
-                            self.failure("create_session", error);
+                            self.send(AppMessage::SessionCreated {
+                                request_id,
+                                result: Err(error),
+                            });
                             return;
                         }
                     },
                 };
-                let request = payloads::create_session(workspace_root, title, runtime);
-                match self.facade.agent().create_session(request).await {
-                    Ok(session) => self.send(AppMessage::SessionCreated(Ok(session))),
-                    Err(error) => self.send(AppMessage::SessionCreated(Err(error))),
-                }
+                let mut request = payloads::create_session(workspace_root, title, runtime);
+                request.payload.session_id = Some(request_id.clone());
+                request.payload.defer_runtime_materialization = true;
+                let result = self.facade.agent().create_session(request).await;
+                self.send(AppMessage::SessionCreated { request_id, result });
             }
             Effect::RenameSession { session_id, title } => {
                 let request = payloads::rename_session(session_id, title);
@@ -352,33 +384,37 @@ impl Dispatch {
                     Err(error) => self.failure("delete_session", error),
                 }
             }
-            Effect::ForkSession { session_id } => {
+            Effect::ForkSession {
+                request_id,
+                session_id,
+            } => {
                 let request = payloads::fork_session(session_id);
-                match self.facade.agent().fork_session(request).await {
-                    Ok(session) => self.send(AppMessage::SessionCreated(Ok(session))),
-                    Err(error) => self.send(AppMessage::SessionCreated(Err(error))),
-                }
+                let result = self.facade.agent().fork_session(request).await;
+                self.send(AppMessage::SessionForked { request_id, result });
             }
             Effect::SendMessage {
                 session_id,
+                send_id,
+                correlation_id,
                 text,
                 attachments,
             } => {
-                let runtime = match self.session_runtime_selection(&session_id).await {
-                    Ok(selection) => selection,
-                    Err(error) => {
-                        self.failure("send_message", error);
-                        return;
+                let result = match self.session_runtime_selection(&session_id).await {
+                    Ok(runtime) => {
+                        let mut request =
+                            payloads::send_message(session_id.clone(), text, attachments, runtime);
+                        request.payload.correlation_id = Some(correlation_id);
+                        self.facade.agent().send_message(request).await
                     }
+                    Err(error) => Err(error),
                 };
-                let request =
-                    payloads::send_message(session_id, text, attachments.clone(), runtime);
-                match self.facade.agent().send_message(request).await {
-                    Ok(_) => self.ok("send_message"),
-                    Err(error) => self.failure("send_message", error),
-                }
+                self.send(AppMessage::MessageSent {
+                    session_id,
+                    send_id,
+                    result,
+                });
             }
-            Effect::ReadClipboard => {
+            Effect::ReadClipboard { ticket } => {
                 // Image first: a clipboard can hold both, and the picture is
                 // the half a terminal cannot paste by itself.
                 let content = tokio::task::spawn_blocking(|| {
@@ -392,16 +428,16 @@ impl Dispatch {
                 })
                 .await
                 .unwrap_or(ClipboardContent::Empty);
-                self.send(AppMessage::Pasted(content));
+                self.send(AppMessage::Pasted { ticket, content });
             }
-            Effect::ReadClipboardImage => {
+            Effect::ReadClipboardImage { ticket } => {
                 // Talking to a clipboard owner can block for the whole
                 // deadline, so it runs off the worker's own thread.
                 let image = tokio::task::spawn_blocking(crate::terminal::read_clipboard_image)
                     .await
                     .ok()
                     .flatten();
-                self.send(AppMessage::ClipboardImage(image));
+                self.send(AppMessage::ClipboardImage { ticket, image });
             }
             Effect::ContinueTurn { session_id } => {
                 let request = payloads::continue_turn(session_id);
@@ -538,14 +574,26 @@ impl Dispatch {
                 let result = self.facade.workspace().list_workspaces().await;
                 self.send(AppMessage::Workspaces(result.unwrap_or_default()));
             }
-            Effect::OpenWorkspace { root_path } => {
+            Effect::OpenWorkspace {
+                draft_id,
+                navigation_serial,
+                root_path,
+            } => {
                 let request = MutationRequest::new(vibex_core::OpenWorkspaceRequest {
                     root_path,
                     mode: None,
                 });
                 match self.facade.workspace().open_workspace(request).await {
-                    Ok(summary) => self.send(AppMessage::WorkspaceOpened(Ok(summary))),
-                    Err(error) => self.send(AppMessage::WorkspaceOpened(Err(error))),
+                    Ok(summary) => self.send(AppMessage::WorkspaceOpened {
+                        draft_id,
+                        navigation_serial,
+                        result: Ok(summary),
+                    }),
+                    Err(error) => self.send(AppMessage::WorkspaceOpened {
+                        draft_id,
+                        navigation_serial,
+                        result: Err(error),
+                    }),
                 }
             }
             Effect::BrowseDirectories { path } => {
@@ -1046,14 +1094,27 @@ impl Dispatch {
                     Err(error) => self.send(AppMessage::Recovery(Err(error))),
                 }
             }
-            Effect::DiscoverCompletions { trigger, query } => {
+            Effect::DiscoverCompletions {
+                ticket,
+                trigger,
+                query,
+            } => {
                 // The authority owns the command catalogue: `/` merges the
                 // Agent's own commands with Vibex Prompts, `@` resolves
                 // workspace files, and `$` resolves Skills. None of that is
                 // local knowledge, so the composer asks rather than guessing.
-                let session = self.current_session().await;
+                let session = match ticket.target.as_ref() {
+                    Some(crate::app::ComposerTarget::Session(id)) => {
+                        self.facade.agent().open_session(id.clone()).await.ok()
+                    }
+                    _ => None,
+                };
                 let request = vibex_core::AgentCommandDiscoverRequest {
-                    agent_id: session.as_ref().map(|session| session.agent_id.clone()),
+                    agent_id: ticket
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.agent_id.clone())
+                        .or_else(|| session.as_ref().map(|session| session.agent_id.clone())),
                     provider_profile_id: None,
                     session_id: session.as_ref().map(|session| session.id.clone()),
                     workspace_id: session.as_ref().map(|session| session.workspace_id.clone()),
@@ -1072,12 +1133,19 @@ impl Dispatch {
                     limit: Some(50),
                 };
                 let result = self.facade.agent().discover_agent_commands(request).await;
-                self.send(AppMessage::Completions(result.map(Box::new)));
+                self.send(AppMessage::Completions {
+                    ticket,
+                    result: result.map(Box::new),
+                });
             }
             Effect::CheckDrift => {}
-            Effect::EditExternally { title, body } => {
+            Effect::EditExternally {
+                ticket,
+                title,
+                body,
+            } => {
                 let result = crate::terminal::edit_in_editor(&title, &body);
-                self.send(AppMessage::EditorFinished(result));
+                self.send(AppMessage::EditorFinished { ticket, result });
             }
             Effect::Clipboard { text } => {
                 let result = crate::terminal::copy_to_clipboard(&text);
@@ -1247,18 +1315,6 @@ impl Dispatch {
                 provider_options: None,
             },
         ))
-    }
-
-    /// The session the composer is composing into, used to scope discovery to
-    /// the right workspace and Agent.
-    async fn current_session(&self) -> Option<vibex_core::AgentSession> {
-        self.facade
-            .agent()
-            .list_sessions(false)
-            .await
-            .ok()?
-            .into_iter()
-            .next()
     }
 
     /// Apply a management entry rename through the domain-specific update call.

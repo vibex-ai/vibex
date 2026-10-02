@@ -714,6 +714,17 @@ impl AgentWorkflowController {
     ) -> BackendResult<AgentSessionLoadTicket> {
         self.require(BackendOperation::AgentOpenSession)?;
         self.require(BackendOperation::AgentFetchTimeline)?;
+        Ok(self.select_session_for_load(session_id))
+    }
+
+    /// Reserve the client's selected route before creation is acknowledged.
+    /// This shares normal navigation's cache and generation invalidation, but
+    /// performs no backend read against a session that does not exist yet.
+    pub fn select_pending_session(&mut self, session_id: VibexSessionId) {
+        self.select_session_for_load(session_id);
+    }
+
+    fn select_session_for_load(&mut self, session_id: VibexSessionId) -> AgentSessionLoadTicket {
         let switching_session = self.state.selected_session_id.as_ref() != Some(&session_id);
         if switching_session {
             self.cache_live_session_snapshot();
@@ -774,11 +785,11 @@ impl AgentWorkflowController {
         } else {
             0
         };
-        Ok(AgentSessionLoadTicket {
+        AgentSessionLoadTicket {
             generation,
             session_id,
             after_sequence,
-        })
+        }
     }
 
     /// Preserves the outgoing session's authoritative projection so switching

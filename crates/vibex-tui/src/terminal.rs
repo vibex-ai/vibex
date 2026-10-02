@@ -213,24 +213,54 @@ pub fn edit_in_editor(title: &str, body: &str) -> BackendResult<Option<String>> 
         })
         .unwrap_or_else(|| "vi".to_string());
 
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vibex-tui-{}-{}.md",
-        sanitize(title),
-        std::process::id()
-    ));
-    std::fs::write(&path, body)
+    let scratch = EditorScratch::create(title, body)
         .map_err(|error| BackendError::failed("tui_editor_scratch_failed", error.to_string()))?;
 
     let mut parts = editor.split_whitespace();
     let program = parts.next().unwrap_or("vi").to_string();
     let mut arguments = parts.map(str::to_string).collect::<Vec<_>>();
-    arguments.push(path.to_string_lossy().to_string());
+    arguments.push(scratch.path.to_string_lossy().to_string());
     let status = run_child(&program, &arguments);
-    let edited = std::fs::read_to_string(&path).ok();
-    let _ = std::fs::remove_file(&path);
+    let edited = std::fs::read_to_string(&scratch.path).ok();
     status?;
     Ok(edited)
+}
+
+/// Each editor invocation owns its scratch file, even when sessions use the
+/// same title. Cleanup follows that invocation on success and failure alike.
+struct EditorScratch {
+    path: std::path::PathBuf,
+}
+
+impl EditorScratch {
+    fn create(title: &str, body: &str) -> io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-tui-{}-{}-{}.md",
+            sanitize(title),
+            std::process::id(),
+            vibex_core::RequestId::new()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        let scratch = Self { path };
+        let written = file.write_all(body.as_bytes());
+        // Close before cleanup on a failed write, including on Windows.
+        drop(file);
+        written?;
+        Ok(scratch)
+    }
+}
+
+impl Drop for EditorScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn sanitize(value: &str) -> String {
@@ -611,6 +641,37 @@ mod tests {
         assert_eq!(sanitize("Hello World!"), "Hello-World-");
         assert_eq!(sanitize("../../etc/passwd"), "------etc-passwd");
         assert!(sanitize(&"x".repeat(100)).len() <= 24);
+    }
+
+    #[test]
+    fn simultaneous_editors_with_the_same_title_own_separate_scratch_files() {
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| EditorScratch::create("New session", "first draft"));
+            let second = scope.spawn(|| EditorScratch::create("New session", "second draft"));
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_ne!(first.path, second.path);
+        assert_eq!(std::fs::read_to_string(&first.path).unwrap(), "first draft");
+        assert_eq!(
+            std::fs::read_to_string(&second.path).unwrap(),
+            "second draft"
+        );
+
+        std::fs::write(&first.path, "edited first draft").unwrap();
+        let first_path = first.path.clone();
+        drop(first);
+        assert!(!first_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&second.path).unwrap(),
+            "second draft"
+        );
+
+        let second_path = second.path.clone();
+        drop(second);
+        assert!(!second_path.exists());
     }
 
     #[test]

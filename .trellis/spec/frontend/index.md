@@ -19,6 +19,7 @@ Primary evidence:
 | [Directory Structure](./directory-structure.md) | Creating shells, feature modules, shared UI, or client protocol code. |
 | [Component Guidelines](./component-guidelines.md) | Building timeline cards, panels, dialogs, and mobile screens. |
 | [State Management](./state-management.md) | Deciding local UI state, remote snapshots, streaming buffers, or persisted preferences. |
+| [TUI Session State](./tui-session-state.md) | Changing TUI drafts, creation, runtime picker targets, async replies, or transcript ownership. |
 | [Type Safety](./type-safety.md) | Adding protocol types, timeline events, capabilities, or form models. |
 | [Quality Guidelines](./quality-guidelines.md) | Reviewing UI behavior, accessibility, responsiveness, and dark mode. |
 

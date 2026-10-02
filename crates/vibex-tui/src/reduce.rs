@@ -16,8 +16,9 @@ use vibex_core::{
 
 use crate::action::Intent;
 use crate::app::{
-    App, Availability, Effect, Focus, ManagementRow, Overlay, Page, PromptField, RecoveryAction,
-    RunOption, RunOptionKey, RunOptionKind, RuntimePickerView, Toast,
+    App, Availability, ComposerTarget, Effect, Focus, ManagementRow, Overlay, Page,
+    PendingCreation, PromptField, RecoveryAction, RunOption, RunOptionKey, RunOptionKind,
+    RuntimePickerView, Toast,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
@@ -130,8 +131,8 @@ impl App {
             Intent::Back => self.go_back(),
             Intent::FocusNext => {
                 self.focus = self.focus.next();
-                if self.focus == Focus::Composer {
-                    self.page = Page::Agent;
+                if self.focus == Focus::Composer && self.page != Page::NewSession {
+                    self.navigate_to(Page::Agent);
                 }
                 Outcome::effects(vec![])
             }
@@ -150,7 +151,7 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::GotoUsage => {
-                self.page = Page::Usage;
+                self.navigate_to(Page::Usage);
                 self.navigation.level = vibex_ui::shell::NavigationLevel::Global;
                 Outcome::effects(vec![Effect::LoadUsage])
             }
@@ -303,7 +304,13 @@ impl App {
                     self.strings.confirm()
                 );
                 self.toast(Toast::info(message));
-                Outcome::effects(vec![Effect::ForkSession { session_id }])
+                let request_id = VibexSessionId::new();
+                self.pending_forks
+                    .insert(request_id.clone(), self.navigation_serial);
+                Outcome::effects(vec![Effect::ForkSession {
+                    request_id,
+                    session_id,
+                }])
             }
             Intent::ArchiveSession => {
                 if self.list_session_target().is_none() {
@@ -492,7 +499,9 @@ impl App {
 
             // ---- agent transcript ----------------------------------------
             Intent::FocusComposer => {
-                self.page = Page::Agent;
+                if self.page != Page::NewSession {
+                    self.navigate_to(Page::Agent);
+                }
                 self.focus = Focus::Composer;
                 Outcome::effects(vec![])
             }
@@ -644,6 +653,12 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::QueueSendNow => {
+                if self
+                    .selected_session_id()
+                    .is_some_and(|id| self.session_is_uncreated(id))
+                {
+                    return Outcome::quiet();
+                }
                 let Some((text, attachments)) = self.take_queued_message() else {
                     return Outcome::quiet();
                 };
@@ -662,15 +677,23 @@ impl App {
                 self.history.push(text.clone());
                 // The message is the reactivation that lifts a suspension.
                 self.auto_continue.resume(&session_id);
+                let send_id =
+                    self.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
                 effects.push(Effect::SendMessage {
                     session_id,
+                    send_id,
+                    correlation_id: self.pending_sends[&send_id].correlation_id.clone(),
                     text,
                     attachments,
                 });
                 Outcome::effects(effects)
             }
-            Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboardImage]),
-            Intent::PasteClipboard => Outcome::effects(vec![Effect::ReadClipboard]),
+            Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboardImage {
+                ticket: self.composer_ticket(),
+            }]),
+            Intent::PasteClipboard => Outcome::effects(vec![Effect::ReadClipboard {
+                ticket: self.composer_ticket(),
+            }]),
             Intent::ToggleDock => {
                 self.dock_open = !self.dock_open;
                 if self.dock_open {
@@ -713,7 +736,7 @@ impl App {
                     self.toast(Toast::info(self.strings.transcript_empty()));
                     return Outcome::effects(vec![]);
                 }
-                self.page = Page::Agent;
+                self.navigate_to(Page::Agent);
                 Outcome::effects(vec![])
             }
             Intent::SearchNext => {
@@ -751,6 +774,7 @@ impl App {
             Intent::EditComposerExternally => {
                 let body = self.composer.text().to_string();
                 Outcome::effects(vec![Effect::EditExternally {
+                    ticket: Some(self.composer_ticket()),
                     title: self.strings.composer_placeholder().to_string(),
                     body,
                 }])
@@ -966,6 +990,7 @@ impl App {
                 match self.file_rows.get(index).cloned() {
                     Some(entry) if entry.kind == vibex_core::FileEntryKind::File => {
                         Outcome::effects(vec![Effect::EditExternally {
+                            ticket: None,
                             title: entry.name.clone(),
                             body: entry.path.clone(),
                         }])
@@ -1587,9 +1612,11 @@ impl App {
                     title: trimmed,
                 }])
             }
-            PromptField::WorkspacePath => {
-                Outcome::effects(vec![Effect::OpenWorkspace { root_path: trimmed }])
-            }
+            PromptField::WorkspacePath => Outcome::effects(vec![Effect::OpenWorkspace {
+                draft_id: self.new_draft_id.clone(),
+                navigation_serial: self.navigation_serial,
+                root_path: trimmed,
+            }]),
             PromptField::ImagePath => {
                 match self.attach_image_path(&trimmed) {
                     Ok(label) => {
@@ -1738,6 +1765,7 @@ impl App {
 
     fn go_back(&mut self) -> Outcome {
         if self.overlay.is_some() {
+            self.cancel_runtime_picker();
             self.overlay = None;
             return Outcome::effects(vec![]);
         }
@@ -1775,7 +1803,7 @@ impl App {
         // created, not the draft: the words stay in the composer, so `n` again
         // finds them.
         if self.page == Page::NewSession {
-            self.page = Page::Sessions;
+            self.navigate_to(Page::Sessions);
             self.focus = Focus::Main;
             return Outcome::effects(vec![]);
         }
@@ -1799,6 +1827,7 @@ impl App {
 
     fn contextual_cancel(&mut self) -> Outcome {
         if self.overlay.is_some() {
+            self.cancel_runtime_picker();
             self.overlay = None;
             return Outcome::effects(vec![]);
         }
@@ -1953,6 +1982,7 @@ impl App {
             }
         };
         self.open_session(session_id.clone());
+        self.sync_transcript();
         let mut effects = vec![Effect::OpenSession { session_id, ticket }];
         if self.runtime_options.is_none() && self.runtime_catalog_available() {
             effects.push(Effect::ListRuntimeOptions);
@@ -1976,7 +2006,10 @@ impl App {
     /// page a reader returns to afterwards names the directory of the session
     /// they are in rather than one chosen for a session that already exists.
     fn begin_new_session(&mut self) -> Outcome {
-        self.page = Page::NewSession;
+        self.navigate_to(Page::NewSession);
+        if !self.new_draft_has_content_or_choices() && !self.failed_creations.is_empty() {
+            self.restore_failed_creation();
+        }
         self.focus = Focus::Composer;
         let mut effects = vec![Effect::ListWorkspaces];
         // The page names the Agent the session will be created with and offers
@@ -1995,8 +2028,8 @@ impl App {
     /// The title is not asked for: it comes from the message, which is where a
     /// title comes from anyway, and a reader who has just written a paragraph
     /// should not then be asked to name it. The message waits in
-    /// [`App::pending_new_session`] because a send needs a session id, and the
-    /// id only exists once the runtime answers.
+    /// [`App::pending_creations`] until the authority acknowledges its reserved
+    /// session identity. Another request cannot take its message or choices.
     ///
     /// The Agent is not asked for either, at this point: a session is created
     /// *with* one, so a page that cannot name one reads the catalogue rather
@@ -2043,26 +2076,27 @@ impl App {
                     .map(|workspace| workspace.workspace.root_path.clone())
             })
             .unwrap_or_default();
-        self.pending_new_session = Some(outgoing.clone());
-        // The reader leaves the page with the message: the session view is
-        // where it will be answered, so waiting on the page for the runtime to
-        // create one reads as nothing having happened at all. The message is
-        // projected there — the session id arrives with the runtime's answer,
-        // and the send follows it.
-        // The wire form is what the runtime will echo back, so it is what the
-        // projection is confirmed against; writing the same bytes twice is a
-        // no-op, and the send itself re-derives it when the session exists.
+        let request_id = self.new_draft_id.clone();
+        // Select the reserved identity synchronously. There is no fetch until
+        // the authority acknowledges creation, and no old timeline survives.
+        self.agent.select_pending_session(request_id.clone());
+        self.enter_creating_session(request_id.clone());
         let projected = self.wire_attachments(&outgoing.images);
-        // The view is emptied *before* the message is projected into it, or the
-        // projection is what gets cleared.
-        self.enter_creating_session();
-        self.mark_send_dispatched(None, outgoing.text, projected);
+        let send_id =
+            self.mark_send_dispatched(Some(&request_id), outgoing.text.clone(), projected);
+        self.pending_creations.insert(
+            request_id.clone(),
+            PendingCreation {
+                outgoing,
+                runtime: runtime.clone(),
+                workspace_root: workspace_root.clone(),
+                send_id,
+            },
+        );
         Outcome::effects(vec![Effect::CreateSession {
+            request_id,
             workspace_root,
             title: None,
-            // The page's own selection, materialised: the session is created on
-            // what the page named rather than on whatever the runtime reaches
-            // for when the choice arrives empty.
             runtime,
         }])
     }
@@ -2208,7 +2242,7 @@ impl App {
         self.completion = None;
         // A message written while a turn is running is held rather than sent:
         // the runtime would have to interleave it with work already in flight.
-        if self.session_running() {
+        if self.turn_reads_running() || self.session_is_uncreated(&session_id) {
             self.enqueue(session_id.clone(), text, images);
             self.toast(Toast::info(self.strings.queue_held().to_string()));
             return Outcome::effects(vec![]);
@@ -2219,11 +2253,14 @@ impl App {
         // The runtime owns the timeline, so its copy of this message is a round
         // trip away. Until it lands the send is projected locally — a reader who
         // pressed Enter must not be left wondering whether it worked.
-        self.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
+        let send_id =
+            self.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
         // Sending is a reactivation: whatever was suspended is wanted again.
         self.auto_continue.resume(&session_id);
         Outcome::effects(vec![Effect::SendMessage {
             session_id,
+            send_id,
+            correlation_id: self.pending_sends[&send_id].correlation_id.clone(),
             text,
             attachments,
         }])
@@ -2340,6 +2377,13 @@ impl App {
         if let Some(outcome) = self.unavailable_outcome(BackendOperation::AgentSwitchRuntime) {
             return outcome;
         }
+        if self
+            .selected_session_id()
+            .is_some_and(|id| self.page_shows_session() && self.session_is_uncreated(id))
+        {
+            return Outcome::quiet();
+        }
+        self.runtime_picker_target = Some(self.runtime_target());
         if self.runtime_options.is_none() {
             // Opening the picker is what asked for the catalogue; the message
             // that carries it is what opens the overlay.
@@ -2366,6 +2410,12 @@ impl App {
     /// question the catalogue can answer. A view with nothing in it says so
     /// rather than showing an empty box or swallowing the key.
     pub fn show_runtime_picker_view(&mut self, view: RuntimePickerView) -> Outcome {
+        if self.runtime_picker_target.is_none() {
+            self.runtime_picker_target = Some(self.runtime_target());
+        }
+        if !self.runtime_picker_is_current() {
+            return Outcome::quiet();
+        }
         let selected = match view {
             RuntimePickerView::Choices => self.current_runtime_option_index().unwrap_or(0),
             RuntimePickerView::Options => 0,
@@ -2388,6 +2438,9 @@ impl App {
     /// the catalogue says is unavailable is refused exactly as `Enter` refuses
     /// it, and answers whether the view may turn at all.
     fn adopt_runtime_picker_row(&mut self, row: usize) -> bool {
+        if !self.runtime_picker_is_current() {
+            return false;
+        }
         let Some(option) = self
             .runtime_options
             .as_ref()
@@ -2405,6 +2458,7 @@ impl App {
             return false;
         }
         self.new_session_runtime = Some(option.selection);
+        self.completion = None;
         true
     }
 
@@ -2472,6 +2526,9 @@ impl App {
     /// session as a switch the runtime would reject. `None` clears the override,
     /// which is what the value list's `Default` row means.
     fn apply_run_option(&mut self, key: &RunOptionKey, value: Option<String>) -> Outcome {
+        if !self.runtime_picker_is_current() {
+            return Outcome::quiet();
+        }
         let Some(selection) = self.page_runtime_selection() else {
             return Outcome::quiet();
         };
@@ -2515,8 +2572,9 @@ impl App {
         // page where a session is being written — has nothing to move: the
         // choice belongs to the next session, and the session the client still
         // has selected behind it is not the reader's target.
-        if !self.page_shows_session() {
+        if matches!(self.runtime_picker_target, Some(ComposerTarget::Draft(_))) {
             self.new_session_runtime = Some(next);
+            self.completion = None;
             let value = self.run_option_value_label(&option, value.as_deref());
             self.toast(Toast::success(format!("{}: {value}", option.label)));
             return Outcome::quiet();
@@ -2543,6 +2601,9 @@ impl App {
     }
 
     fn apply_runtime_selection(&mut self, index: usize) -> Outcome {
+        if !self.runtime_picker_is_current() {
+            return Outcome::quiet();
+        }
         let Some(catalog) = self.runtime_options.as_ref() else {
             return Outcome::quiet();
         };
@@ -2560,8 +2621,9 @@ impl App {
         // to the next session. The page decides, never "is a session selected?",
         // because the client keeps a session selected behind every one of those
         // pages and moving it is exactly what the reader did not ask for.
-        if !self.page_shows_session() {
+        if matches!(self.runtime_picker_target, Some(ComposerTarget::Draft(_))) {
             self.new_session_runtime = Some(option.selection.clone());
+            self.completion = None;
             let message = format!(
                 "{}: {} · {}",
                 self.strings.runtime_next_session(),
@@ -2822,7 +2884,9 @@ impl App {
         // The authority owns the order when an arrangement is loaded; moving
         // the local copy instead would show the reader a list nobody else has.
         match self.sidebar_move(delta) {
-            Some(crate::app::SidebarMove::Remote(effect)) => return Outcome::effects(vec![effect]),
+            Some(crate::app::SidebarMove::Remote(effect)) => {
+                return Outcome::effects(vec![*effect]);
+            }
             Some(crate::app::SidebarMove::Blocked) => {
                 self.toast(Toast::warning(self.strings.sidebar_pinned_first()));
                 return Outcome::quiet();
@@ -3431,6 +3495,7 @@ mod tests {
         assert!(refused.effects.is_empty());
 
         // Choosing the available one asks for exactly that selection.
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
             selected: 0,
@@ -3542,6 +3607,7 @@ mod tests {
         } else {
             session_on(&mut app, desired);
         }
+        app.runtime_picker_target = Some(app.runtime_target());
         app
     }
 
@@ -3562,6 +3628,7 @@ mod tests {
         assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Choices), 2);
         assert_eq!(app.runtime_picker_row_count(RuntimePickerView::Options), 4);
 
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
             selected: 1,
@@ -3621,6 +3688,7 @@ mod tests {
         let desired = catalog.options[0].selection.clone();
         app.runtime_options = Some(catalog);
         session_on(&mut app, desired);
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
             selected: 0,
@@ -3653,6 +3721,7 @@ mod tests {
             .clone();
 
         // Thinking depth is the first row of the run-option view.
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 0,
@@ -3704,6 +3773,7 @@ mod tests {
         app.runtime_options = Some(catalog);
         session_on(&mut app, desired);
 
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 0,
@@ -3726,6 +3796,7 @@ mod tests {
         let mut app = app_with_run_options(Page::Agent);
 
         // Web search is the third run option.
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 2,
@@ -3763,6 +3834,7 @@ mod tests {
 
         // Notes is the fourth run option, and it has no value list: it asks for
         // one.
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 3,
@@ -3804,6 +3876,7 @@ mod tests {
     fn escape_from_a_value_list_returns_to_the_switcher_row() {
         let mut app = app_with_run_options(Page::Agent);
 
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 1,
@@ -3847,6 +3920,7 @@ mod tests {
         // Conversation mode is the second run option. The modes are listed in
         // the catalogue's own order — `Pair` before `Plan` — after the default
         // row.
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 1,
@@ -3960,6 +4034,7 @@ mod tests {
 
         // The page is on the entry the reader picked, and the picker says so.
         assert_eq!(app.current_runtime_option_index(), Some(1));
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Options,
             selected: 0,
@@ -4011,6 +4086,7 @@ mod tests {
         // the session it does not show.
         app.show_runtime_picker();
         assert_eq!(app.current_runtime_option_index(), Some(0));
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
             selected: 1,
@@ -4077,6 +4153,7 @@ mod tests {
         // The reader chooses the next session's Agent while looking at the list.
         app.show_runtime_picker();
         assert_eq!(app.current_runtime_option_index(), Some(0));
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
             selected: 2,
@@ -4093,12 +4170,11 @@ mod tests {
             .expect("the page named a runtime and created with none");
         assert_eq!(created.agent_id, picked.agent_id);
 
-        // And the session the reader came from is still the Agent it was.
+        // The new identity cannot inherit the old session's runtime state.
+        assert!(app.session_runtime_selection().is_none());
         assert_eq!(
-            app.session_runtime_selection()
-                .map(|selection| selection.agent_id.clone()),
-            Some(codex.agent_id),
-            "writing a new session moved the open one"
+            app.page_runtime_selection().unwrap().agent_id,
+            picked.agent_id
         );
     }
 
@@ -4166,7 +4242,7 @@ mod tests {
         app.set_selection(Scope::Sessions, cursor);
 
         let forked = app.perform(Intent::ForkSession);
-        let [Effect::ForkSession { session_id }] = forked.effects.as_slice() else {
+        let [Effect::ForkSession { session_id, .. }] = forked.effects.as_slice() else {
             panic!("expected one fork, got {forked:?}");
         };
         assert_eq!(
@@ -4212,6 +4288,7 @@ mod tests {
         let session_id = app.selected_session_id().cloned().expect("a session");
         app.navigate_to(Page::Agent);
 
+        app.show_runtime_picker();
         app.overlay = Some(Overlay::RuntimePicker {
             view: RuntimePickerView::Choices,
             selected: 1,
@@ -4268,7 +4345,7 @@ mod tests {
             "a session was created before an Agent could be named"
         );
         assert_eq!(app.composer.text(), "who answers this?");
-        assert!(app.pending_new_session.is_none());
+        assert!(app.pending_creations.is_empty());
 
         // A catalogue that publishes nothing is not going to answer: the page
         // says so rather than creating with a runtime the reader never chose.

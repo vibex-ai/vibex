@@ -71,6 +71,10 @@ a pin.
 
 ## 3. Threading and event model
 
+Draft, request, editor, and transcript ownership follow the
+[TUI Session State contract](../frontend/tui-session-state.md). A navigation
+change does not transfer an in-flight operation to the new page.
+
 One process, two execution domains:
 
 ```text

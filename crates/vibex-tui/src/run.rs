@@ -213,9 +213,12 @@ fn event_loop(
             // A released message is projected exactly like a typed one: it was
             // written for this session a while ago, and it should appear the
             // moment it goes out rather than a round trip later.
-            app.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
+            let send_id =
+                app.mark_send_dispatched(Some(&session_id), text.clone(), attachments.clone());
             worker.dispatch(crate::app::Effect::SendMessage {
                 session_id,
+                send_id,
+                correlation_id: app.pending_sends[&send_id].correlation_id.clone(),
                 text,
                 attachments,
             });
@@ -784,6 +787,16 @@ fn composer_takes_keys(app: &App) -> bool {
     app.focus == Focus::Composer && app.page.is_composing_page()
 }
 
+fn dispatch_completions(app: &mut App, worker: &Worker) {
+    if let Some((trigger, query)) = app.refresh_completion() {
+        worker.dispatch(crate::app::Effect::DiscoverCompletions {
+            ticket: app.composer_ticket(),
+            trigger,
+            query,
+        });
+    }
+}
+
 fn handle_composer_key(
     app: &mut App,
     worker: &Worker,
@@ -825,21 +838,19 @@ fn handle_composer_key(
         // would make `Alt+B` type a `b`.
         KeyCode::Char(character) if !ctrl && !alt => {
             app.composer.insert_char(character);
-            if let Some((trigger, query)) = app.refresh_completion() {
-                worker.dispatch(crate::app::Effect::DiscoverCompletions { trigger, query });
-            }
+            dispatch_completions(app, worker);
             return Ok(Some(false));
         }
         // `Alt`/`Ctrl` + Backspace is a word kill and belongs to the binding
         // table; a bare Backspace is one grapheme.
         KeyCode::Backspace if !ctrl && !alt => {
             app.composer.backspace();
-            app.refresh_completion();
+            dispatch_completions(app, worker);
             return Ok(Some(false));
         }
         KeyCode::Delete => {
             app.composer.delete();
-            app.refresh_completion();
+            dispatch_completions(app, worker);
             return Ok(Some(false));
         }
         // Shift turns a motion into a selection. These arms come first: a
@@ -1210,7 +1221,10 @@ fn mouse_cell_clamped(app: &mut App, column: u16, row: u16) -> Option<(usize, u1
 
 fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> BackendResult<()> {
     match message {
-        AppMessage::Pasted(content) => {
+        AppMessage::Pasted { ticket, content } => {
+            if !app.accepts_composer_ticket(&ticket) {
+                return Ok(());
+            }
             use crate::worker::ClipboardContent;
             match content {
                 ClipboardContent::Image { mime_type, bytes } => {
@@ -1228,25 +1242,30 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
         }
-        AppMessage::ClipboardImage(image) => match image {
-            Some((mime_type, bytes)) => match app.attach_image_bytes(mime_type, bytes) {
-                Ok(label) => {
-                    let message = format!("{} {label}", app.strings.image_attached());
-                    app.toast(Toast::success(message));
-                }
-                Err(error) => app.toast(Toast::warning(error)),
-            },
-            // No clipboard image: the reader can still name a file, and saying
-            // so is better than a key that appears to do nothing.
-            None => {
-                app.overlay = Some(crate::app::Overlay::Prompt {
-                    title: app.strings.image_path_title().to_string(),
-                    field: crate::app::PromptField::ImagePath,
-                    value: String::new(),
-                });
-                app.toast(Toast::info(app.strings.image_clipboard_empty().to_string()));
+        AppMessage::ClipboardImage { ticket, image } => {
+            if !app.accepts_composer_ticket(&ticket) {
+                return Ok(());
             }
-        },
+            match image {
+                Some((mime_type, bytes)) => match app.attach_image_bytes(mime_type, bytes) {
+                    Ok(label) => {
+                        let message = format!("{} {label}", app.strings.image_attached());
+                        app.toast(Toast::success(message));
+                    }
+                    Err(error) => app.toast(Toast::warning(error)),
+                },
+                // No clipboard image: the reader can still name a file, and saying
+                // so is better than a key that appears to do nothing.
+                None => {
+                    app.overlay = Some(crate::app::Overlay::Prompt {
+                        title: app.strings.image_path_title().to_string(),
+                        field: crate::app::PromptField::ImagePath,
+                        value: String::new(),
+                    });
+                    app.toast(Toast::info(app.strings.image_clipboard_empty().to_string()));
+                }
+            }
+        }
         AppMessage::Sessions(result) => {
             if let Err(error) = app.agent.apply_sessions(result) {
                 app.toast(Toast::danger(error.message));
@@ -1308,11 +1327,11 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // is what populates `selected_session_id` and the timeline model,
             // so live events stop being dropped as stale.
             if app.agent.apply_session_snapshot(&ticket, result) {
+                app.sync_transcript();
                 match failure {
                     Some(message) => app.toast(Toast::danger(message)),
                     None => {
                         app.sync_transcript();
-                        app.open_session(ticket.session_id.clone());
                         app.live = LiveState::Ready;
                     }
                 }
@@ -1334,11 +1353,26 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // The catalogue is read both on the way into a session (for the
             // composer's info line) and by the picker itself; only the second
             // one opens an overlay, which is what the pending flag records.
-            let picker_waiting = app.runtime_picker_pending;
+            let picker_waiting = app.runtime_picker_pending && app.runtime_picker_is_current();
             app.runtime_picker_pending = false;
             match result {
                 Ok(catalog) => {
-                    app.runtime_options = Some(catalog);
+                    let picker_open = matches!(
+                        app.overlay,
+                        Some(
+                            Overlay::RuntimePicker { .. }
+                                | Overlay::RunOptionValues { .. }
+                                | Overlay::Prompt {
+                                    field: PromptField::RunOptionValue,
+                                    ..
+                                }
+                        )
+                    );
+                    // Indices and run-option values refer to the catalogue the
+                    // reader opened. An unrelated prefetch cannot reorder it.
+                    if !picker_open {
+                        app.runtime_options = Some(catalog);
+                    }
                     if picker_waiting && app.overlay.is_none() {
                         app.show_runtime_picker();
                     }
@@ -1353,45 +1387,85 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             };
         }
-        AppMessage::SessionCreated(result) => match result {
-            Ok(session) => {
-                app.live = LiveState::Ready;
-                // The answer is the session's identity, not its runtime: open
-                // it the way the session list does, so the composer names the
-                // Agent it was created with instead of the catalogue's first
-                // entry, and the switcher offers to move the session it is on.
-                dispatch_all(worker, &app.open_session_effects(session.id.clone()));
-                // The message that asked for the session opens it: the reader
-                // wrote a prompt, not a request for an empty session.
-                match app.pending_send_effect(session.id) {
-                    Some(effect) => worker.dispatch(effect),
-                    None => app.toast(Toast::success(format!(
-                        "{}: {}",
-                        app.strings.session_new(),
-                        session.title
-                    ))),
+        AppMessage::SessionCreated { request_id, result } => {
+            if !app.pending_creations.contains_key(&request_id) {
+                return Ok(());
+            }
+            match result {
+                Ok(session) if session.id == request_id => {
+                    app.record_created_session(&session);
+                    // A reply owns its request, never navigation. Fetch only if
+                    // this identity remains selected, and leave the page alone.
+                    if app.selected_session_id() == Some(&request_id) {
+                        if let Ok(ticket) = app.agent.begin_session_load(request_id.clone()) {
+                            worker.dispatch(crate::app::Effect::OpenSession {
+                                session_id: request_id.clone(),
+                                ticket,
+                            });
+                        }
+                        app.sync_transcript();
+                    }
+                    if let Some(effect) = app.pending_send_effect(request_id) {
+                        worker.dispatch(effect);
+                    }
+                }
+                Ok(_) => {
+                    app.fail_creation(&request_id);
+                    app.toast(Toast::danger(
+                        "The backend returned a different session for this creation",
+                    ));
+                }
+                Err(error) => {
+                    app.fail_creation(&request_id);
+                    app.toast(Toast::danger(error.message));
                 }
             }
-            Err(error) => {
-                // The draft is kept rather than sent nowhere, and the reader is
-                // put back on the page that asked for the session: it is where
-                // the runtime (and the workspace) can be looked at before
-                // trying again.
-                app.abandon_pending_send();
-                app.restore_pending_new_session();
-                app.page = crate::app::Page::NewSession;
-                app.focus = crate::app::Focus::Composer;
-                app.sync_transcript();
-                app.toast(Toast::danger(error.message));
+        }
+        AppMessage::SessionForked { request_id, result } => {
+            let Some(navigation_serial) = app.pending_forks.remove(&request_id) else {
+                return Ok(());
+            };
+            match result {
+                Ok(session) => {
+                    app.record_created_session(&session);
+                    if navigation_serial == app.navigation_serial {
+                        dispatch_all(worker, &app.open_session_effects(session.id));
+                    }
+                }
+                Err(error) => app.toast(Toast::danger(error.message)),
             }
-        },
+        }
+        AppMessage::MessageSent {
+            session_id,
+            send_id,
+            result,
+        } => {
+            let correlation_id = app
+                .pending_sends
+                .get(&send_id)
+                .filter(|pending| pending.session_id.as_ref() == Some(&session_id))
+                .map(|pending| pending.correlation_id.clone());
+            app.finish_send(&session_id, send_id);
+            match result {
+                Ok(items) => {
+                    for item in items.iter().filter(|item| {
+                        item.session_id == session_id
+                            && correlation_id.is_some()
+                            && item.correlation_id == correlation_id
+                    }) {
+                        app.confirm_pending_item(item);
+                    }
+                    app.sync_transcript();
+                }
+                Err(error) => {
+                    app.abandon_send(&session_id, send_id);
+                    app.sync_transcript();
+                    app.toast(Toast::danger(error.message));
+                }
+            }
+        }
         AppMessage::Mutation { key, result } => {
             app.pending.remove(&key);
-            if key == "send_message" && result.is_err() {
-                // The projected row is a promise this client could not keep.
-                app.abandon_pending_send();
-                app.sync_transcript();
-            }
             match result {
                 Ok(()) => {
                     if key == "resolve_permission" {
@@ -1429,14 +1503,23 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         AppMessage::Workspaces(rows) => {
             app.workspace_rows = rows;
         }
-        AppMessage::WorkspaceOpened(result) => match result {
-            Ok(summary) => {
-                app.workspace_path = Some(summary.workspace.root_path.clone());
-                let outcome = app.perform(crate::action::Intent::NewSession);
-                dispatch_refresh(app, outcome);
+        AppMessage::WorkspaceOpened {
+            draft_id,
+            navigation_serial,
+            result,
+        } => {
+            if app.new_draft_id != draft_id || app.navigation_serial != navigation_serial {
+                return Ok(());
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
+            match result {
+                Ok(summary) => {
+                    app.workspace_path = Some(summary.workspace.root_path.clone());
+                    let outcome = app.perform(crate::action::Intent::NewSession);
+                    dispatch_refresh(app, outcome);
+                }
+                Err(error) => app.toast(Toast::danger(error.message)),
+            }
+        }
         AppMessage::DirectoryListing(result) => match result {
             Ok(listing) => {
                 app.set_selection(crate::keymap::Scope::Sessions, 0);
@@ -1704,37 +1787,44 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
-        AppMessage::Completions(result) => match result {
-            Ok(discovery) => {
-                if let Some(menu) = app.completion.as_mut() {
-                    // `/` shows the Agent's commands and Vibex Prompts in one
-                    // list; the menu keeps the provider's ordering, which is
-                    // already "most relevant first".
-                    let mut entries = discovery
-                        .response
-                        .entries
-                        .iter()
-                        .chain(discovery.quick_phrases.iter())
-                        .map(|entry| crate::composer::Completion {
-                            insert: entry.insertion_text.clone(),
-                            label: entry.label.clone(),
-                            detail: entry.description.clone().unwrap_or_default(),
-                            group: format!("{:?}", entry.source_kind),
-                        })
-                        .collect::<Vec<_>>();
-                    entries.dedup_by(|left, right| left.insert == right.insert);
-                    menu.items = entries;
-                    menu.loading = false;
-                    menu.selected = menu.selected.min(menu.items.len().saturating_sub(1));
+        AppMessage::Completions { ticket, result } => {
+            if !app.accepts_composer_ticket(&ticket)
+                || ticket.runtime.as_deref() != app.page_runtime_selection().as_ref()
+            {
+                return Ok(());
+            }
+            match result {
+                Ok(discovery) => {
+                    if let Some(menu) = app.completion.as_mut() {
+                        // `/` shows the Agent's commands and Vibex Prompts in one
+                        // list; the menu keeps the provider's ordering, which is
+                        // already "most relevant first".
+                        let mut entries = discovery
+                            .response
+                            .entries
+                            .iter()
+                            .chain(discovery.quick_phrases.iter())
+                            .map(|entry| crate::composer::Completion {
+                                insert: entry.insertion_text.clone(),
+                                label: entry.label.clone(),
+                                detail: entry.description.clone().unwrap_or_default(),
+                                group: format!("{:?}", entry.source_kind),
+                            })
+                            .collect::<Vec<_>>();
+                        entries.dedup_by(|left, right| left.insert == right.insert);
+                        menu.items = entries;
+                        menu.loading = false;
+                        menu.selected = menu.selected.min(menu.items.len().saturating_sub(1));
+                    }
+                }
+                Err(error) => {
+                    if let Some(menu) = app.completion.as_mut() {
+                        menu.loading = false;
+                    }
+                    app.toast(Toast::warning(error.message));
                 }
             }
-            Err(error) => {
-                if let Some(menu) = app.completion.as_mut() {
-                    menu.loading = false;
-                }
-                app.toast(Toast::warning(error.message));
-            }
-        },
+        }
         AppMessage::Hooks(result) => match result {
             Ok(hooks) => {
                 app.management_data.hooks = hooks;
@@ -1768,8 +1858,15 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 app.toast(Toast::warning(error.message));
             }
         }
-        AppMessage::EditorFinished(result) => match result {
-            Ok(Some(text)) => app.composer.set_text(text),
+        AppMessage::EditorFinished { ticket, result } => match result {
+            Ok(Some(text)) => {
+                if ticket
+                    .as_ref()
+                    .is_some_and(|ticket| app.accepts_composer_ticket(ticket))
+                {
+                    app.composer.set_text(text);
+                }
+            }
             Ok(None) => {}
             Err(error) => app.toast(Toast::danger(error.message)),
         },
@@ -1792,6 +1889,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             {
                 // Deliberately not `dirty`: the frame is repainted when the
                 // event itself is applied below.
+            }
+            if let vibex_backend::BackendEvent::Timeline(event) = &event
+                && event.session_id == event.item.session_id
+                && event.sequence == event.item.sequence
+            {
+                app.confirm_pending_item(&event.item);
             }
             let decision = app.agent.apply_event(event);
             match decision {
@@ -1980,5 +2083,637 @@ mod tests {
             Some((crate::keymap::Scope::Agent, 0))
         );
         assert_eq!(hover_target(&app, 40, 31), None, "a row below the band");
+    }
+    fn isolation_app() -> App {
+        let facade = vibex_backend::DisconnectedBackend::facade();
+        facade.replace_capabilities(vibex_backend::BackendCapabilitySnapshot::desktop_native_v1());
+        let mut app = App::new(
+            facade,
+            crate::app::AppOptions {
+                sidebar_path: None,
+                ..Default::default()
+            },
+        );
+        app.live = LiveState::Ready;
+        app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: vec![],
+            auth_sources: vec![],
+            options: ["codex", "deepseek-harness"]
+                .into_iter()
+                .map(|agent| vibex_core::SessionRuntimeOption {
+                    selection: vibex_core::SessionRuntimeSelection::provider(
+                        vibex_core::AgentId::parse(agent).unwrap(),
+                        vibex_core::ProviderProfileId::new(),
+                        "test-model",
+                    ),
+                    agent_label: agent.into(),
+                    auth_source_label: "test".into(),
+                    model_label: "test-model".into(),
+                    reasoning_efforts: vec![],
+                    modes: vec![],
+                    features: vec![],
+                    availability: vibex_core::RuntimeOptionAvailability::Available,
+                })
+                .collect(),
+        });
+        app
+    }
+
+    fn isolation_session(id: vibex_core::VibexSessionId, agent: &str) -> vibex_core::AgentSession {
+        vibex_core::AgentSession {
+            id,
+            title: agent.into(),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/test/project".into(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+            state: vibex_core::AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_message_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
+
+    fn isolation_create(app: &mut App, text: &str, agent: usize) -> vibex_core::VibexSessionId {
+        app.perform(crate::action::Intent::NewSession);
+        app.new_session_runtime = Some(
+            app.runtime_options.as_ref().unwrap().options[agent]
+                .selection
+                .clone(),
+        );
+        app.composer.set_text(text);
+        let outcome = app.perform(crate::action::Intent::SubmitComposer);
+        outcome
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                crate::app::Effect::CreateSession { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn isolation_worker() -> Worker {
+        Worker::start(vibex_backend::DisconnectedBackend::facade())
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn late_open_callback_cannot_leave_draft_or_retarget_picker() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let id = vibex_core::VibexSessionId::new();
+        let load = app.open_session_effects(id.clone());
+        let ticket = load
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                crate::app::Effect::OpenSession { ticket, .. } => Some(ticket),
+                _ => None,
+            })
+            .unwrap();
+        app.perform(Intent::NewSession);
+        app.show_runtime_picker();
+        app.perform(Intent::SelectNext);
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionOpened {
+                ticket,
+                result: Ok(vibex_ui::AgentSessionSnapshot {
+                    session: isolation_session(id.clone(), "codex"),
+                    timeline: vec![],
+                    runtime_selection: None,
+                    timeline_has_older: false,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.page, crate::app::Page::NewSession);
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            outcome.effects.is_empty(),
+            "a draft choice switched an existing runtime"
+        );
+        assert_eq!(
+            app.new_session_runtime.as_ref().unwrap().agent_id.as_str(),
+            "deepseek-harness"
+        );
+        assert_eq!(app.active_session().unwrap().agent_id.as_str(), "codex");
+        assert_eq!(app.selected_session_id(), Some(&id));
+    }
+
+    #[test]
+    fn session_snapshot_and_failure_callbacks_preserve_global_navigation() {
+        let worker = isolation_worker();
+        for fail in [false, true] {
+            let mut app = isolation_app();
+            let id = vibex_core::VibexSessionId::new();
+            let load = app.open_session_effects(id.clone());
+            let ticket = load
+                .effects
+                .into_iter()
+                .find_map(|effect| match effect {
+                    crate::app::Effect::OpenSession { ticket, .. } => Some(ticket),
+                    _ => None,
+                })
+                .unwrap();
+            app.perform(crate::action::Intent::GotoSessions);
+            let result = if fail {
+                Err(vibex_backend::BackendError::failed("test", "load failed"))
+            } else {
+                Ok(vibex_ui::AgentSessionSnapshot {
+                    session: isolation_session(id, "codex"),
+                    timeline: vec![],
+                    runtime_selection: None,
+                    timeline_has_older: false,
+                })
+            };
+            apply_message(
+                &mut app,
+                &worker,
+                AppMessage::SessionOpened { ticket, result },
+            )
+            .unwrap();
+            assert_eq!(app.page, crate::app::Page::Sessions);
+            assert!(app.transcript.blocks().is_empty());
+        }
+    }
+
+    #[test]
+    fn creation_callbacks_are_correlated_and_duplicates_do_nothing() {
+        let worker = isolation_worker();
+        for reverse in [false, true] {
+            let mut app = isolation_app();
+            let a = isolation_create(&mut app, "first prompt", 0);
+            let send_a = app.pending_creations[&a].send_id;
+            let b = isolation_create(&mut app, "second prompt", 1);
+            let send_b = app.pending_creations[&b].send_id;
+            let order = if reverse {
+                vec![b.clone(), a.clone()]
+            } else {
+                vec![a.clone(), b.clone()]
+            };
+            for request_id in order {
+                let agent = if request_id == a {
+                    "codex"
+                } else {
+                    "deepseek-harness"
+                };
+                let session = isolation_session(request_id.clone(), agent);
+                apply_message(
+                    &mut app,
+                    &worker,
+                    AppMessage::SessionCreated {
+                        request_id: request_id.clone(),
+                        result: Ok(session.clone()),
+                    },
+                )
+                .unwrap();
+                assert_eq!(app.selected_session_id(), Some(&b));
+                let serial = app.navigation_serial;
+                apply_message(
+                    &mut app,
+                    &worker,
+                    AppMessage::SessionCreated {
+                        request_id,
+                        result: Ok(session),
+                    },
+                )
+                .unwrap();
+                assert_eq!(app.navigation_serial, serial);
+            }
+            assert!(app.pending_creations.is_empty());
+            assert_eq!(app.pending_sends[&send_a].text, "first prompt");
+            assert_eq!(app.pending_sends[&send_a].session_id.as_ref(), Some(&a));
+            assert_eq!(app.pending_sends[&send_b].text, "second prompt");
+            assert_eq!(app.pending_sends[&send_b].session_id.as_ref(), Some(&b));
+            assert_eq!(app.history.entries().len(), 2);
+        }
+    }
+
+    #[test]
+    fn failed_creation_preserves_newer_draft_and_explicit_retry_gets_new_identity() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let a = isolation_create(&mut app, "recover me", 0);
+        app.perform(Intent::NewSession);
+        app.composer.set_text("newer draft");
+        app.new_session_runtime = Some(
+            app.runtime_options.as_ref().unwrap().options[1]
+                .selection
+                .clone(),
+        );
+        app.workspace_path = Some("/different/project".into());
+        let draft_b = app.new_draft_id.clone();
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionCreated {
+                request_id: a.clone(),
+                result: Err(vibex_backend::BackendError::failed(
+                    "test",
+                    "failed creation",
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "newer draft");
+        assert_eq!(app.new_draft_id, draft_b);
+        assert_eq!(app.workspace_path.as_deref(), Some("/different/project"));
+        assert_eq!(app.failed_creations.len(), 1);
+        let b = app.perform(Intent::SubmitComposer);
+        assert!(!b.effects.is_empty());
+        app.perform(Intent::NewSession);
+        assert_eq!(app.composer.text(), "recover me");
+        assert_eq!(
+            app.new_session_runtime.as_ref().unwrap().agent_id.as_str(),
+            "codex"
+        );
+        assert_ne!(app.new_draft_id, a);
+        let retry = app.new_draft_id.clone();
+        app.perform(Intent::SubmitComposer);
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionCreated {
+                request_id: a.clone(),
+                result: Ok(isolation_session(a, "codex")),
+            },
+        )
+        .unwrap();
+        assert!(app.pending_creations.contains_key(&retry));
+    }
+
+    #[test]
+    fn fork_reply_cannot_consume_prompt_or_navigate_after_another_creation() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let fork = vibex_core::VibexSessionId::new();
+        app.pending_forks
+            .insert(fork.clone(), app.navigation_serial);
+        let created = isolation_create(&mut app, "new prompt", 1);
+        let forked_session = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionForked {
+                request_id: fork,
+                result: Ok(forked_session),
+            },
+        )
+        .unwrap();
+        assert!(app.pending_creations.contains_key(&created));
+        assert_eq!(app.selected_session_id(), Some(&created));
+        assert_eq!(app.pending_send_for_active().unwrap().text, "new prompt");
+    }
+
+    #[test]
+    fn send_error_callback_only_removes_its_own_session_and_attempt() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let a = vibex_core::VibexSessionId::new();
+        let old_send = app.mark_send_dispatched(Some(&a), "old".into(), vec![]);
+        let new_send = app.mark_send_dispatched(Some(&a), "new".into(), vec![]);
+        let b = vibex_core::VibexSessionId::new();
+        app.open_session_effects(b.clone());
+        let other_send = app.mark_send_dispatched(Some(&b), "other session".into(), vec![]);
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::MessageSent {
+                session_id: a.clone(),
+                send_id: old_send,
+                result: Err(vibex_backend::BackendError::failed("test", "send failed")),
+            },
+        )
+        .unwrap();
+        assert!(!app.pending_sends.contains_key(&old_send));
+        assert!(app.pending_sends.contains_key(&new_send));
+        assert!(app.pending_sends.contains_key(&other_send));
+        assert_eq!(app.pending_send_for_active().unwrap().text, "other session");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::MessageSent {
+                session_id: a,
+                send_id: other_send,
+                result: Err(vibex_backend::BackendError::failed(
+                    "test",
+                    "mismatched callback",
+                )),
+            },
+        )
+        .unwrap();
+        assert!(app.pending_sends.contains_key(&other_send));
+    }
+
+    #[test]
+    fn wrong_created_identity_recovers_draft_without_sending() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let request_id = isolation_create(&mut app, "keep this", 1);
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionCreated {
+                request_id,
+                result: Ok(isolation_session(
+                    vibex_core::VibexSessionId::new(),
+                    "codex",
+                )),
+            },
+        )
+        .unwrap();
+        assert!(app.pending_creations.is_empty());
+        assert!(app.pending_sends.is_empty());
+        assert_eq!(app.composer.text(), "keep this");
+        assert_eq!(app.page, crate::app::Page::NewSession);
+    }
+
+    #[test]
+    fn deferred_catalogue_neither_reopens_cancelled_picker_nor_reorders_open_choices() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let mut catalog = app.runtime_options.take().unwrap();
+        app.perform(Intent::NewSession);
+        app.perform(Intent::SwitchAgentRuntime);
+        app.perform(Intent::GotoSessions);
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::RuntimeOptions(Ok(catalog.clone())),
+        )
+        .unwrap();
+        assert!(app.overlay.is_none());
+        app.perform(Intent::NewSession);
+        app.show_runtime_picker();
+        app.perform(Intent::SelectNext);
+        catalog.options.reverse();
+        apply_message(&mut app, &worker, AppMessage::RuntimeOptions(Ok(catalog))).unwrap();
+        app.perform(Intent::ConfirmOverlay);
+        assert_eq!(
+            app.new_session_runtime.as_ref().unwrap().agent_id.as_str(),
+            "deepseek-harness"
+        );
+    }
+    #[test]
+    fn late_composer_callbacks_cannot_edit_another_draft() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.perform(Intent::NewSession);
+        app.composer.set_text("first draft");
+        let ticket = app.composer_ticket();
+        isolation_create(&mut app, "submitted first", 0);
+        app.perform(Intent::NewSession);
+        app.composer.set_text("second draft");
+        let messages = [
+            AppMessage::Pasted {
+                ticket: ticket.clone(),
+                content: crate::worker::ClipboardContent::Text("stale paste".into()),
+            },
+            AppMessage::ClipboardImage {
+                ticket: ticket.clone(),
+                image: Some(("image/png".into(), vec![1, 2, 3])),
+            },
+            AppMessage::EditorFinished {
+                ticket: Some(ticket.clone()),
+                result: Ok(Some("stale external edit".into())),
+            },
+            AppMessage::Completions {
+                ticket,
+                result: Err(vibex_backend::BackendError::failed(
+                    "test",
+                    "stale completion",
+                )),
+            },
+        ];
+        app.toast = None;
+        for message in messages {
+            apply_message(&mut app, &worker, message).unwrap();
+        }
+        assert_eq!(app.composer.text(), "second draft");
+        assert_eq!(app.composer.image_count(), 0);
+        assert!(app.toast.is_none());
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn composer_callback_requires_unchanged_input_even_with_same_owner() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.perform(crate::action::Intent::NewSession);
+        app.composer.set_text("draft before edit");
+        let ticket = app.composer_ticket();
+        app.composer.set_text("draft after edit");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::EditorFinished {
+                ticket: Some(ticket),
+                result: Ok(Some("stale edited text".into())),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "draft after edit");
+        let ticket = app.composer_ticket();
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Pasted {
+                ticket,
+                content: crate::worker::ClipboardContent::Text(" accepted".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "draft after edit accepted");
+    }
+
+    #[test]
+    fn workspace_callback_cannot_move_a_newer_draft_or_page() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.perform(Intent::NewSession);
+        let draft_id = app.new_draft_id.clone();
+        let navigation_serial = app.navigation_serial;
+        app.perform(Intent::GotoSessions);
+        app.perform(Intent::NewSession);
+        app.workspace_path = Some("/newer/workspace".into());
+        app.composer.set_text("newer work");
+        let project_id = vibex_core::ProjectId::new();
+        let summary = vibex_backend::WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: project_id.clone(),
+                name: "old".into(),
+                root_path: "/old".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            workspace: vibex_core::WorkspaceRecord {
+                id: vibex_core::WorkspaceId::new(),
+                project_id,
+                root_path: "/old".into(),
+                mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            git_branch: None,
+        };
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::WorkspaceOpened {
+                draft_id,
+                navigation_serial,
+                result: Ok(summary),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.workspace_path.as_deref(), Some("/newer/workspace"));
+        assert_eq!(app.composer.text(), "newer work");
+    }
+
+    #[test]
+    fn slow_creation_and_send_expiry_never_release_followup_before_send_ack() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let id = isolation_create(&mut app, "first", 0);
+        let send_id = app.pending_creations[&id].send_id;
+        app.pending_sends.get_mut(&send_id).unwrap().submitted_at =
+            std::time::Instant::now() - Duration::from_secs(100);
+        app.enqueue(id.clone(), "followup".into(), vec![]);
+        assert!(!app.settle_pending_send());
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionCreated {
+                request_id: id.clone(),
+                result: Ok(isolation_session(id.clone(), "codex")),
+            },
+        )
+        .unwrap();
+        assert!(app.pending_sends[&send_id].submitted_at.elapsed() < Duration::from_secs(1));
+        assert!(app.drain_queue().is_empty());
+        app.pending_sends.get_mut(&send_id).unwrap().submitted_at =
+            std::time::Instant::now() - Duration::from_secs(100);
+        assert!(app.settle_pending_send());
+        assert!(app.pending_send_for_active().is_none());
+        assert!(
+            app.drain_queue().is_empty(),
+            "display timeout released a still-running RPC"
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::MessageSent {
+                session_id: id,
+                send_id,
+                result: Ok(vec![]),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.drain_queue().len(), 1);
+    }
+    #[test]
+    fn background_send_confirms_from_its_reply_or_event_without_opening_it() {
+        let worker = isolation_worker();
+        for via_event in [false, true] {
+            let mut app = isolation_app();
+            let background = vibex_core::VibexSessionId::new();
+            let visible = vibex_core::VibexSessionId::new();
+            app.open_session_effects(visible.clone());
+            let send_id = app.mark_send_dispatched(Some(&background), "same words".into(), vec![]);
+            let correlation_id = app.pending_sends[&send_id].correlation_id.clone();
+            app.enqueue(background.clone(), "next".into(), vec![]);
+            let item = vibex_core::TimelineItem {
+                id: vibex_core::TimelineItemId::new(),
+                session_id: background.clone(),
+                sequence: 8,
+                timestamp_ms: 1,
+                source: vibex_core::TimelineSource::User,
+                kind: vibex_core::TimelineItemKind::UserMessage,
+                correlation_id: Some(correlation_id),
+                provider_correlation_id: None,
+                redaction_state: vibex_core::TimelineRedactionState::None,
+                execution_attribution: None,
+                payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                    text: "same words".into(),
+                    ..Default::default()
+                }),
+            };
+            if via_event {
+                apply_message(
+                    &mut app,
+                    &worker,
+                    AppMessage::Event(vibex_backend::BackendEvent::Timeline(
+                        vibex_core::TimelineLiveEvent {
+                            session_id: background.clone(),
+                            sequence: 8,
+                            item: item.clone(),
+                        },
+                    )),
+                )
+                .unwrap();
+                assert!(!app.pending_sends.contains_key(&send_id));
+                assert!(
+                    app.drain_queue().is_empty(),
+                    "echo is not the RPC acknowledgement"
+                );
+            }
+            apply_message(
+                &mut app,
+                &worker,
+                AppMessage::MessageSent {
+                    session_id: background,
+                    send_id,
+                    result: Ok(vec![item]),
+                },
+            )
+            .unwrap();
+            assert!(!app.pending_sends.contains_key(&send_id));
+            assert_eq!(app.selected_session_id(), Some(&visible));
+            assert_eq!(app.drain_queue().len(), 1);
+        }
+    }
+
+    #[test]
+    fn completion_from_another_agent_cannot_finish_current_menu() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.perform(crate::action::Intent::NewSession);
+        app.composer.set_text("/a");
+        app.refresh_completion();
+        let ticket = app.composer_ticket();
+        app.new_session_runtime = Some(
+            app.runtime_options.as_ref().unwrap().options[1]
+                .selection
+                .clone(),
+        );
+        app.toast = None;
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Completions {
+                ticket,
+                result: Err(vibex_backend::BackendError::failed(
+                    "test",
+                    "old agent discovery",
+                )),
+            },
+        )
+        .unwrap();
+        assert!(app.toast.is_none());
+        assert!(app.completion.as_ref().unwrap().loading);
     }
 }

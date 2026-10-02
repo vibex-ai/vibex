@@ -526,7 +526,7 @@ pub struct ProjectionState {
 #[derive(Debug, Clone)]
 pub enum SidebarMove {
     /// Send this change to the authority, which owns the order.
-    Remote(Effect),
+    Remote(Box<Effect>),
     /// The move would cross the pinned band, which sorts above everything.
     Blocked,
     /// Already against the end of its band.
@@ -560,20 +560,20 @@ pub struct QueuedMessage {
 /// becomes shows up, and it counts as a running turn in the meantime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingSend {
-    /// The session it was sent to, absent while that session is still being
-    /// created: the reader pressed Enter on the page that *asks* for one, and
-    /// the message has to be on screen before the runtime has answered.
+    /// The destination, including a reserved ID while creation is pending.
+    /// An unbound projection is never shown in any session.
     pub session_id: Option<VibexSessionId>,
     /// Distinguishes this send's projected row from the next one's. The row has
     /// to keep one identity across frames — the transcript diffs by id, and the
     /// scroll anchor holds one — so it cannot be derived from the clock.
     pub serial: u64,
+    pub correlation_id: vibex_core::CorrelationId,
     pub text: String,
     /// The message as it went on the wire, labels stripped: the echo re-derives
     /// what the reader saw from these, exactly as the sent row will.
     pub attachments: Vec<vibex_core::MessageAttachment>,
-    /// The newest timeline sequence the client knew when the message was sent,
-    /// so only a *newer* row can be the one that confirms it.
+    /// The known timeline end positions the optimistic row. Confirmation uses
+    /// correlation identity, never a text/sequence guess.
     pub after_sequence: i64,
     pub submitted_at: std::time::Instant,
 }
@@ -627,14 +627,44 @@ impl PendingSend {
 
     /// Whether one timeline item is the echo of this send.
     fn is_confirmed_item(&self, item: &vibex_core::TimelineItem) -> bool {
-        item.sequence > self.after_sequence
-            && matches!(
-                &item.payload,
-                vibex_core::TimelinePayload::UserMessage(message)
-                    if message.text.trim() == self.text.trim()
-                        && message.attachments == self.attachments
-            )
+        self.session_id.as_ref() == Some(&item.session_id)
+            && item.correlation_id.as_ref() == Some(&self.correlation_id)
+            && matches!(item.payload, vibex_core::TimelinePayload::UserMessage(_))
     }
+}
+
+/// The owner of an editor buffer. Draft identities are reserved session IDs;
+/// submitting a draft promotes its identity without borrowing another session.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ComposerTarget {
+    Draft(VibexSessionId),
+    Session(VibexSessionId),
+}
+
+/// An asynchronous edit is valid only for the same owner and unchanged input.
+/// Navigation invalidates it even when the reader returns to the same editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerTicket {
+    pub target: Option<ComposerTarget>,
+    pub navigation_serial: u64,
+    pub runtime: Option<Box<vibex_core::SessionRuntimeSelection>>,
+    pub text: String,
+    pub cursor: usize,
+}
+
+/// Immutable input to one creation, retained until its own callback arrives.
+#[derive(Debug, Clone)]
+pub struct PendingCreation {
+    pub outgoing: crate::composer::Outgoing,
+    pub runtime: Option<vibex_core::SessionRuntimeSelection>,
+    pub workspace_root: String,
+    pub send_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedCreation {
+    pub draft_id: VibexSessionId,
+    pub creation: PendingCreation,
 }
 
 /// The whole application.
@@ -709,10 +739,16 @@ pub struct App {
     /// The workspace chosen in the workspace browser, consumed by the
     /// new-session prompt.
     pub workspace_path: Option<String>,
-    /// The message the composing page was holding when the session was asked
-    /// for. The send needs a session id, and the id only exists once the runtime
-    /// answers — so the message waits here for exactly one round trip.
-    pub pending_new_session: Option<crate::composer::Outgoing>,
+    /// Immutable first-message inputs keyed by the reserved session identity.
+    /// Each remains here until its own creation is acknowledged.
+    pub pending_creations: BTreeMap<VibexSessionId, PendingCreation>,
+    pub failed_creations: Vec<FailedCreation>,
+    pub new_draft_id: VibexSessionId,
+    pub composer_target: Option<ComposerTarget>,
+    pub composer_drafts: BTreeMap<ComposerTarget, ComposerBuffer>,
+    pub runtime_picker_target: Option<ComposerTarget>,
+    pub navigation_serial: u64,
+    pub pending_forks: BTreeMap<VibexSessionId, u64>,
     /// The Agent and model chosen on the composing page, before there is a
     /// session to move. It is the runtime the session is *created* with.
     pub new_session_runtime: Option<vibex_core::SessionRuntimeSelection>,
@@ -770,7 +806,9 @@ pub struct App {
     /// message arrives a round trip later. Until it does, the send is projected
     /// here — so the message is on screen the moment Enter is pressed, and the
     /// session reads as running rather than as having swallowed the message.
-    pub pending_send: Option<PendingSend>,
+    pub pending_sends: BTreeMap<u64, PendingSend>,
+    /// RPC lifetime is independent of the optimistic row's display timeout.
+    pub inflight_sends: BTreeMap<u64, VibexSessionId>,
     /// Bumped for every send, so each projected row keeps its own identity.
     pub pending_send_serial: u64,
     /// Sessions that finished a turn while the reader was looking elsewhere.
@@ -1135,7 +1173,14 @@ impl App {
             runtime_options: None,
             runtime_picker_pending: false,
             workspace_path: None,
-            pending_new_session: None,
+            pending_creations: BTreeMap::new(),
+            failed_creations: Vec::new(),
+            new_draft_id: VibexSessionId::new(),
+            composer_target: None,
+            composer_drafts: BTreeMap::new(),
+            runtime_picker_target: None,
+            navigation_serial: 0,
+            pending_forks: BTreeMap::new(),
             new_session_runtime: None,
             run_option_prompt: None,
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
@@ -1154,7 +1199,8 @@ impl App {
             last_click: None,
             queued_messages: Vec::new(),
             queue_selection: None,
-            pending_send: None,
+            pending_sends: BTreeMap::new(),
+            inflight_sends: BTreeMap::new(),
             pending_send_serial: 0,
             unread_sessions: std::collections::BTreeSet::new(),
             banner: None,
@@ -1248,9 +1294,8 @@ impl App {
     /// reader is leaving.
     ///
     /// The distinction is the *page*, not whether a session happens to be
-    /// selected: a send that is still creating its session has no session of
-    /// its own either, and the view that waits for it must still read as
-    /// working.
+    /// selected: a creation owns its reserved identity before the authority
+    /// has persisted the session, while an editable new draft owns no session.
     pub fn page_owns_session(&self) -> bool {
         self.page != Page::NewSession
     }
@@ -1288,17 +1333,14 @@ impl App {
     /// emptied of the session they came from, because what is about to appear
     /// there is a new one. The message itself is projected into it until the
     /// runtime's own copy arrives.
-    pub fn enter_creating_session(&mut self) {
-        if self.agent.state.selected_session_id.take().is_some() {
-            self.agent.state.active_session.clear();
-            self.agent.state.timeline = vibex_desktop_model::TimelineModel::default();
-            self.agent.state.timeline_has_older = false;
-        }
-        self.transcript.set_blocks(Vec::new());
-        self.scroll = ScrollState::default();
-        self.page = Page::Agent;
-        self.focus = Focus::Composer;
+    pub fn enter_creating_session(&mut self, session_id: VibexSessionId) {
+        self.open_session(session_id.clone());
+        self.composer_drafts
+            .remove(&ComposerTarget::Draft(session_id));
         self.workspace_path = None;
+        self.new_session_runtime = None;
+        self.new_draft_id = VibexSessionId::new();
+        self.sync_transcript();
     }
 
     /// The runtime selection the open session is on: its Agent, the account or
@@ -1401,6 +1443,12 @@ impl App {
     /// behind it is not what the page names or moves.
     pub fn page_runtime_selection(&self) -> Option<vibex_core::SessionRuntimeSelection> {
         if self.page_shows_session() {
+            if let Some(creation) = self
+                .selected_session_id()
+                .and_then(|id| self.pending_creations.get(id))
+            {
+                return creation.runtime.clone();
+            }
             return self.session_runtime_selection().cloned();
         }
         self.new_session_runtime
@@ -1939,10 +1987,12 @@ impl App {
                     },
                     project_id: Some(project_id),
                 };
-                return Some(SidebarMove::Remote(Effect::MutateSidebarOrganization {
-                    mutation,
-                    expected_revision: Some(view.revision),
-                }));
+                return Some(SidebarMove::Remote(Box::new(
+                    Effect::MutateSidebarOrganization {
+                        mutation,
+                        expected_revision: Some(view.revision),
+                    },
+                )));
             }
             cursor += delta;
         }
@@ -2742,7 +2792,92 @@ impl App {
         }
     }
 
+    pub fn composer_ticket(&self) -> ComposerTicket {
+        ComposerTicket {
+            target: self.composer_target.clone(),
+            navigation_serial: self.navigation_serial,
+            runtime: self.page_runtime_selection().map(Box::new),
+            text: self.composer.text().to_string(),
+            cursor: self.composer.cursor(),
+        }
+    }
+
+    pub fn accepts_composer_ticket(&self, ticket: &ComposerTicket) -> bool {
+        ticket.target == self.composer_target
+            && ticket.navigation_serial == self.navigation_serial
+            && ticket.text == self.composer.text()
+            && ticket.cursor == self.composer.cursor()
+    }
+
+    pub fn switch_composer(&mut self, target: ComposerTarget) {
+        if self.composer_target.as_ref() == Some(&target) {
+            return;
+        }
+        let buffer = std::mem::take(&mut self.composer);
+        if let Some(previous) = self.composer_target.replace(target.clone()) {
+            self.composer_drafts.insert(previous, buffer);
+        }
+        self.composer = self.composer_drafts.remove(&target).unwrap_or_default();
+        self.completion = None;
+        self.draft_selecting = false;
+        self.composer_mode = ComposerMode::Normal;
+    }
+
+    pub fn runtime_target(&self) -> ComposerTarget {
+        if self.page_shows_session() {
+            ComposerTarget::Session(self.selected_session_id().unwrap().clone())
+        } else {
+            ComposerTarget::Draft(self.new_draft_id.clone())
+        }
+    }
+
+    pub fn runtime_picker_is_current(&self) -> bool {
+        self.runtime_picker_target.as_ref() == Some(&self.runtime_target())
+            && !self
+                .selected_session_id()
+                .is_some_and(|id| self.page_shows_session() && self.session_is_uncreated(id))
+    }
+
+    pub fn session_is_uncreated(&self, session_id: &VibexSessionId) -> bool {
+        self.pending_creations.contains_key(session_id)
+            || self
+                .failed_creations
+                .iter()
+                .any(|failed| &failed.draft_id == session_id)
+            || &self.new_draft_id == session_id
+    }
+
+    pub fn cancel_runtime_picker(&mut self) {
+        self.runtime_picker_pending = false;
+        self.runtime_picker_target = None;
+        self.run_option_prompt = None;
+        if matches!(
+            self.overlay,
+            Some(
+                Overlay::RuntimePicker { .. }
+                    | Overlay::RunOptionValues { .. }
+                    | Overlay::Prompt {
+                        field: PromptField::RunOptionValue,
+                        ..
+                    }
+            )
+        ) {
+            self.overlay = None;
+        }
+    }
+
     pub fn navigate_to(&mut self, page: Page) {
+        if self.page != page {
+            self.navigation_serial = self.navigation_serial.wrapping_add(1);
+            self.cancel_runtime_picker();
+        }
+        if page == Page::NewSession {
+            self.switch_composer(ComposerTarget::Draft(self.new_draft_id.clone()));
+        } else if page.is_composing_page()
+            && let Some(session_id) = self.selected_session_id().cloned()
+        {
+            self.switch_composer(ComposerTarget::Session(session_id));
+        }
         self.page = page;
         self.filtering = false;
         self.focus = Focus::Main;
@@ -2782,6 +2917,9 @@ impl App {
     }
 
     pub fn open_session(&mut self, session_id: VibexSessionId) {
+        self.navigation_serial = self.navigation_serial.wrapping_add(1);
+        self.cancel_runtime_picker();
+        self.switch_composer(ComposerTarget::Session(session_id.clone()));
         self.unread_sessions.remove(session_id.as_str());
         self.navigation.enter_session(session_id.as_str());
         self.navigate_to(Page::Agent);
@@ -2791,32 +2929,92 @@ impl App {
         self.scroll = ScrollState::default();
     }
 
-    /// Put a held draft back in the composer after a failed creation.
-    pub fn restore_pending_new_session(&mut self) {
-        if let Some(outgoing) = self.pending_new_session.take() {
-            self.composer.set_draft(outgoing.text, outgoing.images);
+    pub fn record_created_session(&mut self, session: &AgentSession) {
+        let rows = self.agent.state.sessions.value.get_or_insert_with(Vec::new);
+        if !rows.iter().any(|row| row.id == session.id) {
+            rows.push(session.clone());
         }
     }
 
-    /// The effect that opens a freshly created session with the message that
-    /// asked for it.
-    ///
-    /// A draft that was only a request for a session — an empty one — is not
-    /// sent: the reader asked for a session, and an empty turn is not a message.
+    /// Consume exactly one acknowledged creation. Duplicate or unrelated
+    /// callbacks have no prompt to send.
     pub fn pending_send_effect(&mut self, session_id: VibexSessionId) -> Option<Effect> {
-        let outgoing = self.pending_new_session.take()?;
-        if outgoing.text.trim().is_empty() && outgoing.images.is_empty() {
-            return None;
-        }
-        let attachments = self.wire_attachments(&outgoing.images);
-        if let Some(pending) = self.pending_send.as_mut() {
-            pending.session_id = Some(session_id.clone());
-        }
+        let creation = self.pending_creations.remove(&session_id)?;
+        let pending = self.pending_sends.get_mut(&creation.send_id)?;
+        pending.submitted_at = std::time::Instant::now();
+        let correlation_id = pending.correlation_id.clone();
+        let attachments = self.wire_attachments(&creation.outgoing.images);
+        self.history.push(creation.outgoing.text.clone());
         Some(Effect::SendMessage {
             session_id,
-            text: outgoing.text,
+            send_id: creation.send_id,
+            correlation_id,
+            text: creation.outgoing.text,
             attachments,
         })
+    }
+
+    /// Restore only this creation's draft. Off-screen failures wait for an
+    /// empty new-session editor; they never replace newer text or navigate.
+    pub fn fail_creation(&mut self, request_id: &VibexSessionId) -> bool {
+        let Some(creation) = self.pending_creations.remove(request_id) else {
+            return false;
+        };
+        self.abandon_send(request_id, creation.send_id);
+        let on_failed_session =
+            self.page_shows_session() && self.selected_session_id() == Some(request_id);
+        self.failed_creations.push(FailedCreation {
+            draft_id: request_id.clone(),
+            creation,
+        });
+        if on_failed_session && self.composer.is_empty() && !self.new_draft_has_content_or_choices()
+        {
+            self.restore_failed_creation();
+            self.navigate_to(Page::NewSession);
+            self.focus = Focus::Composer;
+        }
+        self.sync_transcript();
+        true
+    }
+
+    pub fn new_draft_has_content_or_choices(&self) -> bool {
+        let target = ComposerTarget::Draft(self.new_draft_id.clone());
+        let buffer = if self.composer_target.as_ref() == Some(&target) {
+            Some(&self.composer)
+        } else {
+            self.composer_drafts.get(&target)
+        };
+        buffer.is_some_and(|buffer| !buffer.is_empty())
+            || self.new_session_runtime.is_some()
+            || self.workspace_path.is_some()
+    }
+
+    pub fn restore_failed_creation(&mut self) {
+        let Some(failed) = self.failed_creations.pop() else {
+            return;
+        };
+        self.new_draft_id = VibexSessionId::new();
+        // Follow-up text typed while creation was pending remains the new
+        // session's editor after an explicit retry; its first prompt is separate.
+        if let Some(buffer) = self
+            .composer_drafts
+            .remove(&ComposerTarget::Session(failed.draft_id.clone()))
+        {
+            self.composer_drafts
+                .insert(ComposerTarget::Session(self.new_draft_id.clone()), buffer);
+        }
+        for queued in &mut self.queued_messages {
+            if queued.session_id == failed.draft_id {
+                queued.session_id = self.new_draft_id.clone();
+            }
+        }
+        self.new_session_runtime = failed.creation.runtime;
+        self.workspace_path = Some(failed.creation.workspace_root);
+        self.switch_composer(ComposerTarget::Draft(self.new_draft_id.clone()));
+        self.composer.set_draft(
+            failed.creation.outgoing.text,
+            failed.creation.outgoing.images,
+        );
     }
 
     /// Take the keyboard into the composer, placing the caret when the click
@@ -3135,95 +3333,127 @@ impl App {
     /// that dropped the message. The composing page counts only the send it is
     /// holding — none, because sending leaves it for the session view.
     pub fn turn_reads_running(&self) -> bool {
-        self.session_running() || self.pending_send_for_active().is_some()
+        self.session_running()
+            || self.pending_send_for_active().is_some()
+            || (self.page_shows_session()
+                && self
+                    .selected_session_id()
+                    .is_some_and(|id| self.inflight_sends.values().any(|pending| pending == id)))
     }
 
     /// The unconfirmed send for the selected session, whichever page is up.
     fn pending_send_for_selected(&self) -> Option<&PendingSend> {
-        let pending = self.pending_send.as_ref()?;
-        match pending.session_id.as_ref() {
-            None => Some(pending),
-            Some(session_id) => (self.selected_session_id() == Some(session_id)).then_some(pending),
-        }
+        let selected = self.selected_session_id()?;
+        self.pending_sends
+            .values()
+            .rev()
+            .find(|pending| pending.session_id.as_ref() == Some(selected))
     }
 
-    /// The unconfirmed send for the page in front of the reader, if there is
-    /// one.
-    ///
-    /// A send whose session is still being created belongs to the reader as
-    /// well: they are looking at the page the session will open on, and the
-    /// message they just wrote is the only thing on it. A send that belongs to
-    /// the session behind the composing page does not: that page is writing a
-    /// new session, and the round trip of another one is not its state.
     pub fn pending_send_for_active(&self) -> Option<&PendingSend> {
-        if self.page_owns_session() {
-            self.pending_send_for_selected()
-        } else {
-            None
-        }
+        self.page_shows_session()
+            .then(|| self.pending_send_for_selected())
+            .flatten()
     }
 
-    /// Forget a send the runtime has echoed, or one that has waited too long.
-    ///
-    /// Called after the timeline changes and on every tick: the confirmation is
-    /// a property of the timeline, and the timeout is the only thing standing
-    /// between a dropped message and a row that never goes away.
+    pub fn confirm_pending_item(&mut self, item: &vibex_core::TimelineItem) -> bool {
+        let before = self.pending_sends.len();
+        self.pending_sends
+            .retain(|_, pending| !pending.is_confirmed_item(item));
+        before != self.pending_sends.len()
+    }
+
+    /// Confirmation and expiry are scoped to each send's session. Reconnect
+    /// only refetches authoritative history; nothing here resubmits a prompt.
     pub fn settle_pending_send(&mut self) -> bool {
-        let Some(pending) = self.pending_send.as_ref() else {
+        let timeline = &self.agent.state.timeline;
+        let before = self.pending_sends.len();
+        self.pending_sends.retain(|_, pending| {
+            let creating = pending
+                .session_id
+                .as_ref()
+                .is_some_and(|id| self.pending_creations.contains_key(id));
+            creating
+                || (pending.submitted_at.elapsed() <= PendingSend::TIMEOUT
+                    && !(pending.session_id.is_some()
+                        && pending.session_id == timeline.session_id
+                        && pending.is_confirmed_by(&timeline.items)))
+        });
+        before != self.pending_sends.len()
+    }
+
+    pub fn finish_send(&mut self, session_id: &VibexSessionId, send_id: u64) -> bool {
+        if self.inflight_sends.get(&send_id) != Some(session_id) {
+            return false;
+        }
+        self.inflight_sends.remove(&send_id);
+        true
+    }
+
+    pub fn abandon_send(&mut self, session_id: &VibexSessionId, send_id: u64) -> bool {
+        let finished = self.finish_send(session_id, send_id);
+        if self
+            .pending_sends
+            .get(&send_id)
+            .is_some_and(|pending| pending.session_id.as_ref() == Some(session_id))
+        {
+            self.pending_sends.remove(&send_id);
+            return true;
+        }
+        finished
+    }
+
+    /// Remove the selected session's most recent projection (local dismissal).
+    pub fn abandon_pending_send(&mut self) -> bool {
+        let Some(pending) = self.pending_send_for_selected() else {
             return false;
         };
-        if pending.submitted_at.elapsed() > PendingSend::TIMEOUT {
-            self.pending_send = None;
-            return true;
-        }
-        // A send is confirmed by the timeline on screen. A reader who has left
-        // the session keeps the projection until the timeout — it is not drawn
-        // anywhere else, and the timeline is refetched when they come back, so
-        // it settles then rather than showing a phantom row in another session.
-        // A send whose session does not exist yet has no timeline to appear in;
-        // the timeout is what settles it if the creation never answers.
-        if pending.session_id.is_none() {
-            return false;
-        }
-        let confirmed = pending.is_confirmed_by(&self.agent.state.timeline.items);
-        if confirmed {
-            self.pending_send = None;
-            return true;
-        }
-        false
+        let serial = pending.serial;
+        self.pending_sends.remove(&serial);
+        self.inflight_sends.remove(&serial);
+        self.turn_started = None;
+        true
     }
 
-    /// Drop a send the runtime refused, so no phantom row is left behind.
-    pub fn abandon_pending_send(&mut self) -> bool {
-        let had = self.pending_send.take().is_some();
-        if had {
-            self.turn_started = None;
-        }
-        had
-    }
-
-    /// Record a message that has been dispatched but not yet echoed.
     pub fn mark_send_dispatched(
         &mut self,
         session_id: Option<&VibexSessionId>,
         text: String,
         attachments: Vec<vibex_core::MessageAttachment>,
-    ) {
+    ) -> u64 {
         self.pending_send_serial = self.pending_send_serial.wrapping_add(1);
-        self.pending_send = Some(PendingSend {
-            session_id: session_id.cloned(),
-            serial: self.pending_send_serial,
-            text,
-            attachments,
-            after_sequence: self.transcript.newest_sequence(),
-            submitted_at: std::time::Instant::now(),
-        });
-        self.turn_started = Some(std::time::Instant::now());
-        self.scroll.follow = true;
-        // The projection is part of the transcript, so it is put there now
-        // rather than at the next event — waiting for one is the delay this
-        // exists to remove.
+        let serial = self.pending_send_serial;
+        let after_sequence = if session_id == self.agent.state.timeline.session_id.as_ref() {
+            self.agent
+                .state
+                .timeline
+                .items
+                .last()
+                .map_or(0, |item| item.sequence)
+        } else {
+            0
+        };
+        if let Some(session_id) = session_id {
+            self.inflight_sends.insert(serial, session_id.clone());
+        }
+        self.pending_sends.insert(
+            serial,
+            PendingSend {
+                session_id: session_id.cloned(),
+                serial,
+                correlation_id: vibex_core::CorrelationId::new(),
+                text,
+                attachments,
+                after_sequence,
+                submitted_at: std::time::Instant::now(),
+            },
+        );
+        if session_id.is_some() && session_id == self.selected_session_id() {
+            self.turn_started = Some(std::time::Instant::now());
+            self.scroll.follow = true;
+        }
         self.sync_transcript();
+        serial
     }
 
     /// Hold a message until the running turn ends, for the open session.
@@ -3525,14 +3755,21 @@ impl App {
     /// reader is *not* looking at, which is exactly the case a queue has to get
     /// right.
     fn session_is_running(&self, session_id: &VibexSessionId) -> bool {
+        if self.session_is_uncreated(session_id)
+            || self
+                .inflight_sends
+                .values()
+                .any(|pending| pending == session_id)
+        {
+            return true;
+        }
         // A send that is still in flight counts: the runtime has not reported
         // the turn yet, and releasing the next held message into that gap would
         // interleave two turns.
         if self
-            .pending_send
-            .as_ref()
-            .and_then(|pending| pending.session_id.as_ref())
-            .is_some_and(|pending| pending == session_id)
+            .pending_sends
+            .values()
+            .any(|pending| pending.session_id.as_ref() == Some(session_id))
         {
             return true;
         }
@@ -4238,6 +4475,7 @@ pub enum Effect {
     },
     ListRuntimeOptions,
     CreateSession {
+        request_id: VibexSessionId,
         workspace_root: String,
         title: Option<String>,
         /// The runtime the composing page names: the reader's choice, or the
@@ -4257,10 +4495,13 @@ pub enum Effect {
         session_id: VibexSessionId,
     },
     ForkSession {
+        request_id: VibexSessionId,
         session_id: VibexSessionId,
     },
     SendMessage {
         session_id: VibexSessionId,
+        send_id: u64,
+        correlation_id: vibex_core::CorrelationId,
         text: String,
         /// Images the prompt carries, in the order they were attached.
         attachments: Vec<vibex_core::MessageAttachment>,
@@ -4272,12 +4513,16 @@ pub enum Effect {
     ///
     /// An image is attached; text is pasted. Reading a clipboard is I/O and
     /// belongs to the worker, so the reducer only asks.
-    ReadClipboard,
+    ReadClipboard {
+        ticket: ComposerTicket,
+    },
     /// Ask the host for an image on the system clipboard.
     ///
     /// Reading a clipboard is I/O and belongs to the worker; the reducer asks
     /// and gets an [`crate::worker::AppMessage::ClipboardImage`] back.
-    ReadClipboardImage,
+    ReadClipboardImage {
+        ticket: ComposerTicket,
+    },
     Interrupt {
         session_id: VibexSessionId,
     },
@@ -4303,6 +4548,8 @@ pub enum Effect {
     },
     ListWorkspaces,
     OpenWorkspace {
+        draft_id: VibexSessionId,
+        navigation_serial: u64,
         root_path: String,
     },
     BrowseDirectories {
@@ -4380,6 +4627,7 @@ pub enum Effect {
         backup_id: String,
     },
     DiscoverCompletions {
+        ticket: ComposerTicket,
         trigger: crate::composer::CompletionTrigger,
         query: String,
     },
@@ -4444,6 +4692,7 @@ pub enum Effect {
     },
     /// Hand the terminal to `$EDITOR` and read the result back.
     EditExternally {
+        ticket: Option<ComposerTicket>,
         title: String,
         body: String,
     },
@@ -4488,8 +4737,8 @@ impl Effect {
             Effect::ArchiveSession { .. } => "archive_session",
             Effect::DeleteSession { .. } => "delete_session",
             Effect::ForkSession { .. } => "fork_session",
-            Effect::ReadClipboard => "read_clipboard",
-            Effect::ReadClipboardImage => "read_clipboard_image",
+            Effect::ReadClipboard { .. } => "read_clipboard",
+            Effect::ReadClipboardImage { .. } => "read_clipboard_image",
             Effect::SendMessage { .. } => "send_message",
             Effect::ContinueTurn { .. } => "continue_turn",
             Effect::Interrupt { .. } => "interrupt",
