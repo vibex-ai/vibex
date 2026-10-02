@@ -33,50 +33,24 @@ fn unavailable() -> BackendError {
 
 #[cfg(target_os = "android")]
 mod android {
-    use std::sync::{Mutex, OnceLock};
-
-    use android_activity::AndroidApp;
     use jni::{
-        EnvUnowned, JavaVM,
-        objects::{JClass, JObject, JString},
-        refs::Global,
+        EnvUnowned,
+        objects::{JClass, JString},
     };
 
-    use super::{BackendError, BackendResult, enqueue_pairing_link, unavailable};
-
-    fn android_app() -> &'static Mutex<Option<AndroidApp>> {
-        static APP: OnceLock<Mutex<Option<AndroidApp>>> = OnceLock::new();
-        APP.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn initialize(app: &AndroidApp) {
-        if let Ok(mut current) = android_app().lock() {
-            *current = Some(app.clone());
-        }
-    }
+    use super::{BackendError, BackendResult, enqueue_pairing_link};
 
     pub fn launch() -> BackendResult<()> {
-        let app = android_app()
-            .lock()
-            .ok()
-            .and_then(|app| app.clone())
-            .ok_or_else(unavailable)?;
-        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
-        vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-            let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
-            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-            let result = env.call_method(
+        crate::android_bridge::with_activity(|env, activity| {
+            env.call_method(
                 activity,
                 jni::jni_str!("launchPairingQrScanner"),
                 jni::jni_sig!(() -> ()),
                 &[],
-            );
-            if result.is_err() {
-                let _ = env.exception_clear();
-            }
-            result.map(|_| ())
+            )?;
+            Ok(())
         })
-        .map_err(|_| {
+        .ok_or_else(|| {
             BackendError::failed(
                 "mobile_pairing_scanner_launch_failed",
                 "The QR scanner could not be opened",
@@ -100,9 +74,6 @@ mod android {
             .resolve::<jni::errors::LogErrorAndDefault>()
     }
 }
-
-#[cfg(target_os = "android")]
-pub use android::initialize as initialize_android;
 
 #[cfg(target_os = "android")]
 pub use android::launch;

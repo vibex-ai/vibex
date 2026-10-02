@@ -10,12 +10,16 @@ Agent sessions as a GUI.
 - `gpui-pre` / `gpui-pre-platform` come from crates.io; the Android and iOS
   hosts are built on `gpui-pre-mobile`, pinned by git revision in
   `apps/mobile/Cargo.toml`.
-- `apps/mobile/src/platform.rs` is the single place that knows how to construct
-  the platform and read window insets or drive the software keyboard, because
-  `gpui-pre-mobile` reports those outside `PlatformWindow`.
-- Android's IME host is the vendored `dev.gpui.mobile.GpuiInputActivity`
-  (`apps/mobile/android/app/src/main/java/dev/gpui/mobile/`); the class name and
-  package are part of the JNI contract and must not change.
+- `apps/mobile/src/platform.rs` normalizes the window-level APIs
+  `gpui-pre-mobile` reports outside `PlatformWindow` — window insets and the
+  software keyboard — for both hosts.
+- Android enters through `gpui-pre-mobile`'s host-driven entry
+  (`gpui_mobile::android::host`) rather than `android-activity`'s `android_main`:
+  `GpuiHostActivity` is a plain Activity that hands its `SurfaceView`, input,
+  IME, insets and lifecycle to `apps/mobile/src/android_host.rs`, so the render
+  thread and the GPUI window outlive every Activity recreation. The
+  `android-activity` entry can only build its process-global platform once, so a
+  recreated Activity used to panic and close the app until the process died.
 - iOS runs from `apps/mobile/ios/Vibex/main.m`, which enters `UIApplicationMain`,
   registers the root view, and forwards the frame clock and app lifecycle to
   `gpui-pre-mobile`.

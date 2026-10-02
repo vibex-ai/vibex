@@ -120,38 +120,8 @@ fn notification_copy(kind: &AgentNotificationKind) -> (&'static str, &'static st
 
 #[cfg(target_os = "android")]
 mod platform {
-    use std::sync::{Mutex, OnceLock};
-
-    use android_activity::AndroidApp;
-    use jni::{JavaVM, objects::JObject, refs::Global};
-
-    fn android_app() -> &'static Mutex<Option<AndroidApp>> {
-        static APP: OnceLock<Mutex<Option<AndroidApp>>> = OnceLock::new();
-        APP.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn initialize(app: &AndroidApp) {
-        if let Ok(mut current) = android_app().lock() {
-            *current = Some(app.clone());
-        }
-    }
-
-    fn with_activity(
-        call: impl FnOnce(&mut jni::Env<'_>, &JObject<'_>) -> jni::errors::Result<()>,
-    ) {
-        let Some(app) = android_app().lock().ok().and_then(|app| app.clone()) else {
-            return;
-        };
-        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
-        let _ = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-            let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
-            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-            call(env, &activity)
-        });
-    }
-
     pub fn request_authorization() {
-        with_activity(|env, activity| {
+        let _ = crate::android_bridge::with_activity(|env, activity| {
             env.call_method(
                 activity,
                 jni::jni_str!("requestNotificationAuthorization"),
@@ -163,7 +133,7 @@ mod platform {
     }
 
     pub fn present(notification_id: &str, title: &str, body: &str, opaque_locator: &str) {
-        with_activity(|env, activity| {
+        let _ = crate::android_bridge::with_activity(|env, activity| {
             let notification_id = env.new_string(notification_id)?;
             let title = env.new_string(title)?;
             let body = env.new_string(body)?;
@@ -190,11 +160,8 @@ mod platform {
 }
 
 #[cfg(target_os = "android")]
-pub use platform::initialize as initialize_android;
-
-#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnNotificationActivated<
+pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnNotificationActivated<
     'caller,
 >(
     mut unowned_env: jni::EnvUnowned<'caller>,

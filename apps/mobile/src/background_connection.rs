@@ -358,47 +358,33 @@ fn state_unavailable() -> BackendError {
 
 #[cfg(target_os = "android")]
 mod platform {
-    use std::sync::{Mutex, OnceLock};
-
-    use android_activity::AndroidApp;
-    use jni::{JavaVM, objects::JObject, refs::Global};
-
-    fn android_app() -> &'static Mutex<Option<AndroidApp>> {
-        static APP: OnceLock<Mutex<Option<AndroidApp>>> = OnceLock::new();
-        APP.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn initialize(app: &AndroidApp) {
-        if let Ok(mut current) = android_app().lock() {
-            *current = Some(app.clone());
-        }
-    }
-
-    fn call_activity(method: &'static jni::strings::JNIStr) -> bool {
-        let Some(app) = android_app().lock().ok().and_then(|app| app.clone()) else {
-            return false;
-        };
-        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
-        vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-            let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
-            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-            env.call_method(activity, method, jni::jni_sig!(() -> ()), &[])?;
+    /// Starts the foreground service that keeps the connection runnable while
+    /// the Activity is backgrounded.
+    pub fn start_service() -> bool {
+        crate::android_bridge::with_activity(|env, activity| {
+            env.call_method(
+                activity,
+                jni::jni_str!("startRemoteConnectionService"),
+                jni::jni_sig!(() -> ()),
+                &[],
+            )?;
             Ok(())
         })
-        .is_ok()
-    }
-
-    pub fn start_service() -> bool {
-        call_activity(jni::jni_str!("startRemoteConnectionService"))
+        .is_some()
     }
 
     pub fn stop_service() {
-        let _ = call_activity(jni::jni_str!("stopRemoteConnectionService"));
+        let _ = crate::android_bridge::with_activity(|env, activity| {
+            env.call_method(
+                activity,
+                jni::jni_str!("stopRemoteConnectionService"),
+                jni::jni_sig!(() -> ()),
+                &[],
+            )?;
+            Ok(())
+        });
     }
 }
-
-#[cfg(target_os = "android")]
-pub use platform::initialize as initialize_android;
 
 #[cfg(not(target_os = "android"))]
 mod platform {
@@ -415,7 +401,7 @@ mod tests {
 
     const ANDROID_MANIFEST: &str = include_str!("../android/app/src/main/AndroidManifest.xml");
     const ANDROID_ACTIVITY: &str =
-        include_str!("../android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
+        include_str!("../android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java");
     const ANDROID_CONNECTION_SERVICE: &str =
         include_str!("../android/app/src/main/java/ai/vibex/mobile/RemoteConnectionService.java");
     const BACKGROUND_CONNECTION_SOURCE: &str = include_str!("background_connection.rs");

@@ -3,6 +3,10 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 #![cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
 
+#[cfg(target_os = "android")]
+mod android_bridge;
+#[cfg(target_os = "android")]
+mod android_host;
 mod app;
 mod assets;
 mod background_connection;
@@ -31,11 +35,12 @@ pub use pairing::{MobileCredentialBundle, MobileRemoteRouteBundle};
 
 /// Builds the shared state and opens the root window.
 ///
-/// Runs inside the application callback on both targets: on Android once the
-/// native surface exists, on iOS once UIKit has finished launching. Everything
-/// before the window — Tokio, the kit, the bundled fonts — has to happen here
-/// because the GPUI context only exists at this point.
-fn open_root_window(data_dir: PathBuf, cx: &mut App) {
+/// Runs inside the application callback on both targets: on Android on the
+/// host-driven render thread, once the first surface has arrived; on iOS once
+/// UIKit has finished launching. Everything before the window — Tokio, the kit,
+/// the bundled fonts — has to happen here because the GPUI context only exists
+/// at this point.
+pub(crate) fn open_root_window(data_dir: PathBuf, cx: &mut App) {
     let tokio_handle = background_connection::tokio_handle();
     gpui_tokio::init_from_handle(cx, tokio_handle.clone());
     // gpui-kit registers the global theme and the overlay state every
@@ -71,104 +76,12 @@ fn open_root_window(data_dir: PathBuf, cx: &mut App) {
         },
     )
     .expect("failed to open Vibex mobile window");
-}
 
-#[cfg(target_os = "android")]
-fn initialize_android_tls(android_app: &android_activity::AndroidApp) {
-    use jni::{JavaVM, objects::JObject, refs::Global, signature::RuntimeMethodSignature};
-
-    let vm = unsafe { JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
-    vm.attach_current_thread_for_scope(|env| -> jni::errors::Result<()> {
-        let raw_activity = android_app.activity_as_ptr() as jni::sys::jobject;
-        let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-        let signature = RuntimeMethodSignature::from_str("()Landroid/content/Context;")?;
-        let context = env
-            .call_method(
-                activity,
-                jni::jni_str!("getApplicationContext"),
-                signature.method_signature(),
-                &[],
-            )?
-            .l()?;
-
-        rustls_platform_verifier::android::init_with_env(env, context)
-    })
-    .expect("failed to initialize Android TLS certificate verifier");
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub fn android_main(android_app: android_activity::AndroidApp) {
-    let data_dir = android_app
-        .internal_data_path()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    // Logging and the panic hook come first so every later failure is visible
-    // in logcat instead of vanishing with the native thread.
-    platform::install_diagnostics();
-    gpui_mobile::android::jni::init_platform(&android_app);
-    initialize_android_tls(&android_app);
-    background_connection::initialize_android(&android_app);
-    discovery::initialize_android(&android_app);
-    notifications::initialize_android(&android_app);
-    power::initialize_android(&android_app);
-    platform::initialize_android(&android_app);
-    scanner::initialize_android(&android_app);
-
-    // `Application::run` blocks by driving the Android event loop, and defers
-    // the callback until the activity has a native surface.
-    let platform = platform::current_platform(false);
-    gpui::Application::with_platform(platform)
-        .with_assets(assets::MobileAssets)
-        .run(move |cx: &mut App| open_root_window(data_dir, cx));
-}
-
-/// Reports an application lifecycle transition from the Android host.
-///
-/// Called from `GpuiNativeActivity.onResume` / `onPause`, which are the only
-/// places that see Android's process lifecycle. `gpui-pre-mobile` implements no
-/// `Platform::on_app_lifecycle`, so this bridge is what feeds
-/// [`background_connection`]'s suspend/resume handling.
-///
-/// # Safety
-/// Must only be called from the JVM on a valid JNI thread.
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLifecycle(
-    _env: *mut std::ffi::c_void,
-    _class: *mut std::ffi::c_void,
-    foreground: jni::sys::jboolean,
-) {
-    let phase = if foreground {
-        gpui::AppLifecyclePhase::Active
-    } else {
-        gpui::AppLifecyclePhase::Background
-    };
-    platform::notify_lifecycle(phase);
-}
-
-/// Reports the software keyboard's visibility from the Android host.
-///
-/// `gpui-pre-mobile` drives the IME from focus changes alone, so nothing on the
-/// Rust side learns that the user dismissed the keyboard while an input kept
-/// GPUI focus. The vendored activity reports the real state so a tap on that
-/// input can ask for the keyboard again.
-///
-/// # Safety
-/// Must only be called from the JVM on a valid JNI thread.
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeKeyboardVisible<'caller>(
-    mut unowned_env: jni::EnvUnowned<'caller>,
-    _class: jni::objects::JClass<'caller>,
-    visible: jni::sys::jboolean,
-) {
-    unowned_env
-        .with_env(|_| -> jni::errors::Result<()> {
-            platform::set_keyboard_visible(visible);
-            Ok(())
-        })
-        .resolve::<jni::errors::LogErrorAndDefault>()
+    // The Android Activity reports its window insets from `onCreate`, before
+    // this window exists; apply whatever it already reported now that GPUI has
+    // a window to size.
+    #[cfg(target_os = "android")]
+    android_host::apply_pending_insets();
 }
 
 /// Registers the iOS root-view callback.

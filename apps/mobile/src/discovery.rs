@@ -321,59 +321,28 @@ fn invalid_discovery() -> BackendError {
 
 #[cfg(target_os = "android")]
 mod android {
-    use std::sync::{Mutex, OnceLock};
-
-    use android_activity::AndroidApp;
     use jni::{
-        EnvUnowned, JavaVM,
-        objects::{JClass, JObject, JString},
-        refs::Global,
+        EnvUnowned,
+        objects::{JClass, JString},
     };
     use vibex_backend::{BackendError, BackendResult};
 
     use super::enqueue_native_json;
 
-    fn android_app() -> &'static Mutex<Option<AndroidApp>> {
-        static APP: OnceLock<Mutex<Option<AndroidApp>>> = OnceLock::new();
-        APP.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn initialize(app: &AndroidApp) {
-        if let Ok(mut current) = android_app().lock() {
-            *current = Some(app.clone());
-        }
-    }
-
-    fn call_activity(method: &'static str) -> BackendResult<()> {
-        let app = android_app()
-            .lock()
-            .ok()
-            .and_then(|app| app.clone())
-            .ok_or_else(unavailable)?;
-        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
-        vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-            let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
-            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-            let result = env.call_method(
-                activity,
-                jni::strings::JNIString::new(method),
-                jni::jni_sig!(() -> ()),
-                &[],
-            );
-            if result.is_err() {
-                let _ = env.exception_clear();
-            }
-            result.map(|_| ())
+    fn call_activity(method: &'static jni::strings::JNIStr) -> BackendResult<()> {
+        crate::android_bridge::with_activity(|env, activity| {
+            env.call_method(activity, method, jni::jni_sig!(() -> ()), &[])?;
+            Ok(())
         })
-        .map_err(|_| unavailable())
+        .ok_or_else(unavailable)
     }
 
     pub fn start() -> BackendResult<()> {
-        call_activity("startLanPairingDiscovery")
+        call_activity(jni::jni_str!("startLanPairingDiscovery"))
     }
 
     pub fn stop() {
-        let _ = call_activity("stopLanPairingDiscovery");
+        let _ = call_activity(jni::jni_str!("stopLanPairingDiscovery"));
     }
 
     fn unavailable() -> BackendError {
@@ -384,7 +353,7 @@ mod android {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnLanDiscoveryEvent<
+    pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnLanDiscoveryEvent<
         'caller,
     >(
         mut unowned_env: EnvUnowned<'caller>,
@@ -401,7 +370,7 @@ mod android {
 }
 
 #[cfg(target_os = "android")]
-pub use android::{initialize as initialize_android, start, stop};
+pub use android::{start, stop};
 
 #[cfg(target_os = "ios")]
 unsafe extern "C" {

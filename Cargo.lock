@@ -10722,7 +10722,6 @@ dependencies = [
 name = "vibex-mobile"
 version = "0.1.0-rc.7"
 dependencies = [
- "android-activity",
  "base64",
  "chrono",
  "futures-channel",
@@ -10733,6 +10732,8 @@ dependencies = [
  "gpui-pre-mobile",
  "gpui-tokio",
  "jni",
+ "log",
+ "ndk",
  "rustls-platform-verifier",
  "serde",
  "serde_json",

@@ -60,7 +60,7 @@ import java.util.concurrent.Executors;
 public final class PairingQrScannerActivity extends AppCompatActivity {
     static {
         // This Activity may be restored directly after process death, without
-        // GpuiNativeActivity first associating the Rust library with its ClassLoader.
+        // GpuiHostActivity first associating the Rust library with its ClassLoader.
         System.loadLibrary("vibex_mobile");
     }
 

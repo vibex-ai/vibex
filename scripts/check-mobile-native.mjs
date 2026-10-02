@@ -29,7 +29,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
     "apps/mobile/android/settings.gradle",
     "apps/mobile/android/app/build.gradle",
-    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java",
     "apps/mobile/android/app/src/main/res/values/styles.xml",
     "apps/mobile/ios/project.yml",
@@ -37,9 +37,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/ios/Vibex/QRScanner.swift",
     "apps/mobile/ios/Headers/vibex_mobile.h",
     "apps/mobile/ios/Headers/module.modulemap",
+    "apps/mobile/src/android_bridge.rs",
+    "apps/mobile/src/android_host.rs",
     "apps/mobile/src/platform.rs",
-    "apps/mobile/src/scroll_capture.rs",
-    "apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java"
+    "apps/mobile/src/scroll_capture.rs"
   ]) {
     assert(exists(path), `native_mobile_file_missing:${path}`);
   }
@@ -57,10 +58,11 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const android = read("apps/mobile/android/app/src/main/AndroidManifest.xml");
   const androidSettings = read("apps/mobile/android/settings.gradle");
   const androidBuild = read("apps/mobile/android/app/build.gradle");
-  const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
+  const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java");
   const androidScanner = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java");
   const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
-  const gpuiMobileActivity = read("apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java");
+  const androidBridge = read("apps/mobile/src/android_bridge.rs");
+  const androidHost = read("apps/mobile/src/android_host.rs");
   const iosMain = read("apps/mobile/ios/Vibex/main.m");
   const iosProject = read("apps/mobile/ios/project.yml");
   const iosScanner = read("apps/mobile/ios/Vibex/QRScanner.swift");
@@ -97,23 +99,44 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     !remoteTransport.includes("danger_accept_invalid_certs"),
     "android_remote_tls_verification_disabled"
   );
+  // Android enters through gpui-pre-mobile's host-driven entry. The
+  // `android-activity` entry point (`android_main`) can only build its
+  // process-global platform once: a recreated Activity — which the foreground
+  // connection service makes routine, because the process outlives the
+  // Activity — tripped GPUI's main-thread assert and finished itself, so the
+  // app flashed closed until the process was killed. The host entry owns a
+  // process-lived render thread instead and must stay the only Android entry.
+  assert(androidHost.includes("gpui_mobile::android::host::start_with_assets"), "android_host_entry_missing");
+  assert(androidHost.includes("gpui_mobile::android::jni::set_host_activity"), "android_host_activity_bridge_missing");
   assert(
-    entry.includes("gpui_mobile::android::jni::init_platform(&android_app)"),
-    "android_gpui_platform_init_missing"
+    androidHost.includes("Java_ai_vibex_mobile_GpuiHostActivity_nativeStart"),
+    "android_host_start_export_missing"
   );
-  assert(platform.includes("gpui_mobile::android::init_logger()"), "android_gpui_logger_missing");
-  assert(entry.includes("rustls_platform_verifier::android::init_with_env"), "android_tls_platform_verifier_init_missing");
-  assert(entry.includes('"getApplicationContext"'), "android_tls_application_context_missing");
+  assert(androidHost.includes("nativeSurfaceCreated"), "android_host_surface_export_missing");
+  assert(androidHost.includes("nativeSurfaceDestroyed"), "android_host_surface_release_export_missing");
   assert(
-    entry.indexOf("initialize_android_tls(&android_app)") < entry.indexOf("Application::with_platform"),
+    androidBridge.includes("pub fn with_activity"),
+    "android_activity_jni_bridge_missing"
+  );
+  assert(
+    read("apps/mobile/src/background_connection.rs").includes("crate::android_bridge::with_activity"),
+    "android_connection_service_bridge_missing"
+  );
+  assert(
+    read("apps/mobile/src/discovery.rs").includes("crate::android_bridge::with_activity"),
+    "android_lan_discovery_bridge_missing"
+  );
+  assert(!entry.includes("android_main"), "android_activity_entry_present");
+  assert(!entry.includes("init_platform"), "android_process_platform_init_present");
+  assert(!manifest.includes("android.app.lib_name"), "android_native_activity_library_metadata_present");
+  assert(platform.includes("gpui_mobile::android::init_logger()"), "android_gpui_logger_missing");
+  assert(androidHost.includes("rustls_platform_verifier::android::init_with_env"), "android_tls_platform_verifier_init_missing");
+  assert(androidHost.includes('"getApplicationContext"'), "android_tls_application_context_missing");
+  assert(
+    androidHost.indexOf("initialize_android_tls(env, &activity)")
+      < androidHost.indexOf("host::start_with_assets"),
     "android_tls_platform_verifier_init_order_invalid"
   );
-  assert(entry.includes("scanner::initialize_android(&android_app)"), "android_qr_scanner_init_missing");
-  assert(
-    entry.includes("gpui::Application::with_platform(platform)"),
-    "native_gpui_application_missing"
-  );
-  assert(entry.includes("platform::current_platform(false)"), "native_mobile_platform_facade_missing");
   assert(entry.includes('target_os = "ios"'), "ios_rust_entry_missing");
   assert(entry.includes("assets::load_fonts(cx)"), "native_mobile_font_loading_missing");
   // Text entry used to be a hand-rolled field that focused itself and asked for
@@ -126,22 +149,42 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(platform.includes("gpui_mobile::show_keyboard()"), "native_text_input_keyboard_missing");
   assert(platform.includes("gpui_mobile::hide_keyboard()"), "native_text_input_keyboard_hide_missing");
 
-  assert(android.includes('android:name=".GpuiNativeActivity"'), "android_gpui_activity_missing");
-  assert(android.includes('android:value="vibex_mobile"'), "android_native_library_name_invalid");
+  assert(android.includes('android:name=".GpuiHostActivity"'), "android_gpui_activity_missing");
   assert(android.includes('android:windowSoftInputMode="adjustResize"'), "android_keyboard_resize_missing");
+  assert(
+    android.includes('android:enableOnBackInvokedCallback="false"'),
+    "android_back_navigation_legacy_callback_missing"
+  );
   assert(!android.includes('android:hasCode="false"'), "android_java_host_disabled");
   assert(!android.includes("WebView"), "android_webview_host_present");
+  assert(androidActivity.includes("extends Activity"), "android_gpui_host_activity_base_missing");
   assert(
-    androidActivity.includes("extends dev.gpui.mobile.GpuiInputActivity"),
-    "android_gpui_ime_activity_base_missing"
+    !androidActivity.includes("extends android.app.NativeActivity"),
+    "android_gpui_host_activity_native_activity_base_present"
   );
-  assert(androidActivity.includes('System.loadLibrary("vibex_mobile")'), "android_gpui_native_library_classloader_load_missing");
-  assert(gpuiMobileActivity.includes("extends EditText"), "android_ime_editor_missing");
-  assert(gpuiMobileActivity.includes("public void gpuiShowKeyboard"), "android_ime_show_bridge_missing");
-  assert(gpuiMobileActivity.includes("public void gpuiHideKeyboard"), "android_ime_hide_bridge_missing");
-  assert(gpuiMobileActivity.includes("gpuiResetComposition"), "android_ime_reset_bridge_missing");
-  assert(gpuiMobileActivity.includes("InputConnectionWrapper"), "android_ime_connection_bridge_missing");
-  assert(gpuiMobileActivity.includes("private static native void nativeIme"), "android_ime_jni_callback_missing");
+  assert(
+    androidActivity.includes('System.loadLibrary("vibex_mobile")'),
+    "android_gpui_native_library_classloader_load_missing"
+  );
+  // The host contract: a SurfaceView the app hands to GPUI, input forwarded by
+  // hand, window insets reported to native code, and the IME bridge kept
+  // working without a NativeActivity.
+  assert(androidActivity.includes("SurfaceHolder.Callback"), "android_host_surface_callback_missing");
+  assert(androidActivity.includes("surfaceCreated"), "android_host_surface_created_missing");
+  assert(androidActivity.includes("nativeSurfaceCreated"), "android_host_surface_bridge_missing");
+  assert(androidActivity.includes("nativeSurfaceDestroyed"), "android_host_surface_release_bridge_missing");
+  assert(androidActivity.includes("dispatchTouchEvent"), "android_host_touch_bridge_missing");
+  assert(androidActivity.includes("dispatchKeyEvent"), "android_host_key_bridge_missing");
+  assert(androidActivity.includes("setDecorFitsSystemWindows(getWindow(), false)"), "android_host_edge_to_edge_missing");
+  assert(androidActivity.includes("setOnApplyWindowInsetsListener"), "android_host_insets_bridge_missing");
+  assert(androidActivity.includes("nativeInsets"), "android_host_insets_export_missing");
+  assert(androidActivity.includes("nativeKeyboardState"), "android_host_keyboard_state_missing");
+  assert(androidActivity.includes("extends EditText"), "android_ime_editor_missing");
+  assert(androidActivity.includes("public void gpuiShowKeyboard"), "android_ime_show_bridge_missing");
+  assert(androidActivity.includes("public void gpuiHideKeyboard"), "android_ime_hide_bridge_missing");
+  assert(androidActivity.includes("gpuiResetComposition"), "android_ime_reset_bridge_missing");
+  assert(androidActivity.includes("InputConnectionWrapper"), "android_ime_connection_bridge_missing");
+  assert(androidActivity.includes("private static native void nativeIme"), "android_ime_jni_callback_missing");
   assert(androidActivity.includes("nativeOnAppLifecycle"), "android_lifecycle_bridge_missing");
   assert(androidActivity.includes("protected void onResume()"), "android_lifecycle_resume_missing");
   assert(androidActivity.includes("protected void onPause()"), "android_lifecycle_pause_missing");
@@ -169,7 +212,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     androidBuild.includes("implementation 'rustls:rustls-platform-verifier:latest.release'"),
     "android_tls_verifier_aar_dependency_missing"
   );
-  assert(entry.includes("Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLifecycle"), "android_lifecycle_jni_export_missing");
+  assert(
+    androidHost.includes("Java_ai_vibex_mobile_GpuiHostActivity_nativeOnAppLifecycle"),
+    "android_lifecycle_jni_export_missing"
+  );
 
   assert(iosMain.includes("vibex_mobile_register_app();"), "ios_rust_entry_call_missing");
   assert(iosMain.includes("    gpui_ios_run_demo();"), "ios_gpui_run_loop_missing");
@@ -260,6 +306,10 @@ function runSelfTest() {
     ["apps/mobile/src/pairing.rs", source("apps/mobile/src/pairing.rs")],
     ["apps/mobile/src/scanner.rs", source("apps/mobile/src/scanner.rs")],
     ["apps/mobile/src/storage.rs", source("apps/mobile/src/storage.rs")],
+    ["apps/mobile/src/background_connection.rs", source("apps/mobile/src/background_connection.rs")],
+    ["apps/mobile/src/discovery.rs", source("apps/mobile/src/discovery.rs")],
+    ["apps/mobile/src/android_bridge.rs", source("apps/mobile/src/android_bridge.rs")],
+    ["apps/mobile/src/android_host.rs", source("apps/mobile/src/android_host.rs")],
     ["crates/vibex-remote-client/Cargo.toml", source("crates/vibex-remote-client/Cargo.toml")],
     ["crates/vibex-remote-client/src/transport.rs", source("crates/vibex-remote-client/src/transport.rs")],
     ["apps/mobile/src/platform.rs", source("apps/mobile/src/platform.rs")],
@@ -269,7 +319,7 @@ function runSelfTest() {
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
     ["apps/mobile/android/settings.gradle", source("apps/mobile/android/settings.gradle")],
     ["apps/mobile/android/app/build.gradle", source("apps/mobile/android/app/build.gradle")],
-    ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java")],
+    ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java")],
     ["apps/mobile/android/app/src/main/res/values/styles.xml", source("apps/mobile/android/app/src/main/res/values/styles.xml")],
     ["apps/mobile/ios/project.yml", source("apps/mobile/ios/project.yml")],
@@ -278,8 +328,7 @@ function runSelfTest() {
     ["apps/mobile/ios/Vibex/Notifications.m", source("apps/mobile/ios/Vibex/Notifications.m")],
     ["apps/mobile/ios/Vibex/QRScanner.swift", source("apps/mobile/ios/Vibex/QRScanner.swift")],
     ["apps/mobile/ios/Headers/vibex_mobile.h", source("apps/mobile/ios/Headers/vibex_mobile.h")],
-    ["apps/mobile/ios/Headers/module.modulemap", source("apps/mobile/ios/Headers/module.modulemap")],
-    ["apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java", source("apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java")]
+    ["apps/mobile/ios/Headers/module.modulemap", source("apps/mobile/ios/Headers/module.modulemap")]
   ]);
 
   function expectRejected(path, from, to, code) {
@@ -298,7 +347,7 @@ function runSelfTest() {
 
   expectRejected(
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
-    'android:name=".GpuiNativeActivity"',
+    'android:name=".GpuiHostActivity"',
     'android:name="android.webkit.WebView"',
     "native_mobile_checker_self_test_accepted_webview_host"
   );
@@ -309,13 +358,13 @@ function runSelfTest() {
     "native_mobile_checker_self_test_accepted_exported_scanner"
   );
   expectRejected(
-    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
-    "extends dev.gpui.mobile.GpuiInputActivity",
-    "extends android.app.Activity",
-    "native_mobile_checker_self_test_accepted_non_native_activity_host"
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
+    "extends Activity",
+    "extends android.app.NativeActivity",
+    "native_mobile_checker_self_test_accepted_native_activity_host"
   );
   expectRejected(
-    "apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java",
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
     "private static native void nativeIme",
     "private static native void nativeMissing",
     "native_mobile_checker_self_test_accepted_missing_ime_bridge"
@@ -327,10 +376,22 @@ function runSelfTest() {
     "native_mobile_checker_self_test_accepted_missing_gpui_mobile_dependency"
   );
   expectRejected(
-    "apps/mobile/src/lib.rs",
-    "Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLifecycle",
-    "Java_ai_vibex_mobile_GpuiNativeActivity_nativeMissingLifecycle",
+    "apps/mobile/src/android_host.rs",
+    "Java_ai_vibex_mobile_GpuiHostActivity_nativeOnAppLifecycle",
+    "Java_ai_vibex_mobile_GpuiHostActivity_nativeMissingLifecycle",
     "native_mobile_checker_self_test_accepted_missing_android_lifecycle_bridge"
+  );
+  expectRejected(
+    "apps/mobile/src/lib.rs",
+    "pub(crate) fn open_root_window",
+    'pub extern "system" fn android_main() {}\npub(crate) fn open_root_window',
+    "native_mobile_checker_self_test_accepted_android_activity_entry"
+  );
+  expectRejected(
+    "apps/mobile/src/android_host.rs",
+    "gpui_mobile::android::host::start_with_assets",
+    "gpui_mobile::android::jni::init_platform",
+    "native_mobile_checker_self_test_accepted_android_process_platform_init"
   );
   expectRejected(
     "apps/mobile/ios/Vibex/main.m",
@@ -339,7 +400,7 @@ function runSelfTest() {
     "native_mobile_checker_self_test_accepted_missing_ios_run_loop"
   );
   expectRejected(
-    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
     'System.loadLibrary("vibex_mobile")',
     'System.loadLibrary("missing")',
     "native_mobile_checker_self_test_accepted_unloaded_gpui_jni"
@@ -357,13 +418,13 @@ function runSelfTest() {
     "native_mobile_checker_self_test_accepted_missing_tls_verifier_dependency"
   );
   expectRejected(
-    "apps/mobile/src/lib.rs",
+    "apps/mobile/src/android_host.rs",
     "rustls_platform_verifier::android::init_with_env",
     "rustls_platform_verifier::android::missing_init",
     "native_mobile_checker_self_test_accepted_missing_tls_verifier_init"
   );
   expectRejected(
-    "apps/mobile/src/lib.rs",
+    "apps/mobile/src/android_host.rs",
     '"getApplicationContext"',
     '"getBaseContext"',
     "native_mobile_checker_self_test_accepted_activity_tls_context"

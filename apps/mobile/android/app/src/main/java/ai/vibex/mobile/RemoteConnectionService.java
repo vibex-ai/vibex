@@ -41,7 +41,7 @@ public final class RemoteConnectionService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        Intent openApp = new Intent(this, GpuiNativeActivity.class)
+        Intent openApp = new Intent(this, GpuiHostActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent contentIntent = PendingIntent.getActivity(
                 this,

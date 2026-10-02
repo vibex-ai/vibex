@@ -37,8 +37,12 @@ vibex-ui = { path = "../../crates/vibex-ui" }
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245" }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-activity = { version = "0.6", features = ["native-activity"] }
 jni = "0.22"
+# The host entry reports through the `log` facade, which is what the platform
+# logger installed by `install_diagnostics` is wired to.
+log = "0.4"
+# The host entry hands GPUI the `ANativeWindow` behind each Android `Surface`.
+ndk = { version = "0.9", features = ["nativewindow"] }
 rustls-platform-verifier = "0.7"
 
 [dev-dependencies]

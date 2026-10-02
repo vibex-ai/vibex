@@ -2,9 +2,10 @@
 //!
 //! Both native clients run on `gpui-pre-mobile`, whose platform types are
 //! supplied per target (`gpui_mobile::android` / `::ios`) rather than by
-//! `gpui_platform`. This module is the single place that knows how to build the
-//! [`gpui::Platform`] for the host, so the rest of the app can keep calling
-//! window-level APIs.
+//! `gpui_platform`. The hosts own building the platform — the Android host
+//! entry does it on its process-lived render thread, the iOS one when UIKit
+//! launches — so this module only normalizes the window-level APIs the app
+//! calls.
 //!
 //! Three things differ from the desktop platform surface and are normalized
 //! here instead of at every call site:
@@ -22,10 +23,9 @@
 //!   on this platform; the host forwards iOS phases over FFI and Android phases
 //!   over JNI, both landing in [`notify_lifecycle`].
 
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{Edges, Pixels, Platform, Window, px};
+use gpui::{Edges, Pixels, Window, px};
 
 /// The insets obscuring a window: system UI plus the software keyboard.
 ///
@@ -49,28 +49,6 @@ impl WindowInsets {
             bottom: px(self.bottom),
             left: px(self.left),
         }
-    }
-}
-
-/// The platform for the current mobile target.
-///
-/// On Android the platform is a process-wide singleton created by
-/// `jni::init_platform`, which `android_main` must have called already; on iOS
-/// each call builds a fresh `IosPlatform`, matching the crate's own example.
-pub fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    #[cfg(target_os = "android")]
-    {
-        gpui_mobile::android::jni::shared_platform()
-            .expect("the Android platform must be initialized before the window opens")
-            .into_rc()
-    }
-    #[cfg(target_os = "ios")]
-    {
-        gpui_mobile::current_platform(false)
-    }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        unreachable!("the mobile client only runs on Android and iOS")
     }
 }
 
@@ -237,35 +215,13 @@ unsafe extern "C" {
 
 /// The Android half of [`open_app_settings`].
 ///
-/// Mirrors `scanner.rs`: the host activity is the only object that can start an
-/// intent, so the app handle is captured once at startup and the call is made
-/// through JNI by method name.
+/// The host activity is the only object that can start an intent, so the call
+/// goes through [`crate::android_bridge`], which always addresses the Activity
+/// the platform layer recorded last.
 #[cfg(target_os = "android")]
 mod android {
-    use std::sync::{Mutex, OnceLock};
-
-    use android_activity::AndroidApp;
-    use jni::{EnvUnowned, JavaVM, objects::JObject, refs::Global};
-
-    fn android_app() -> &'static Mutex<Option<AndroidApp>> {
-        static APP: OnceLock<Mutex<Option<AndroidApp>>> = OnceLock::new();
-        APP.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn initialize(app: &AndroidApp) {
-        if let Ok(mut current) = android_app().lock() {
-            *current = Some(app.clone());
-        }
-    }
-
     pub fn open_app_settings() -> bool {
-        let Some(app) = android_app().lock().ok().and_then(|app| app.clone()) else {
-            return false;
-        };
-        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
-        vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
-            let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
-            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+        crate::android_bridge::with_activity(|env, activity| {
             let result = env.call_method(
                 activity,
                 jni::jni_str!("openAppSettings"),
@@ -280,6 +236,3 @@ mod android {
         .unwrap_or(false)
     }
 }
-
-#[cfg(target_os = "android")]
-pub use android::initialize as initialize_android;
