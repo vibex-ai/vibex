@@ -25942,6 +25942,28 @@ impl VibexWorkbench {
         session_title_from_first_message(self.new_session_input.read(cx).value().as_ref())
     }
 
+    /// The text and attachments a new-session submission would actually carry.
+    ///
+    /// Attachment metadata outlives a deleted marker so an undo can bring the
+    /// overlay back, so emptiness has to be read through the same filter the
+    /// submission uses: a marker no longer in the text is not content.
+    fn new_session_draft_payload(&self, cx: &App) -> (String, Vec<MessageAttachment>) {
+        let raw_text = self.new_session_input.read(cx).value().to_string();
+        composer_submission_payload(&raw_text, &self.new_session_attachments)
+    }
+
+    /// Whether the new-session page holds anything to open a session with.
+    ///
+    /// A session is created *with* its first message here: the panel's arrow is
+    /// the same affordance as the session Composer's send button, which is
+    /// disabled on an empty draft. Reading the draft as empty is what keeps a
+    /// stray Enter — or a click on that arrow — from creating a session nobody
+    /// asked for.
+    fn new_session_draft_has_content(&self, cx: &App) -> bool {
+        let (text, attachments) = self.new_session_draft_payload(cx);
+        !text.trim().is_empty() || !attachments.is_empty()
+    }
+
     fn select_new_session_target(
         &mut self,
         target: NewSessionOpenTarget,
@@ -26327,6 +26349,12 @@ impl VibexWorkbench {
         {
             return;
         }
+        // Nothing typed and nothing attached means there is no first message to
+        // create the session with, so a stray Enter on the empty prompt must not
+        // open one. The create button reads the same answer and stays disabled.
+        if !self.new_session_draft_has_content(cx) {
+            return;
+        }
         if self.new_session_input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
         }) {
@@ -26413,8 +26441,7 @@ impl VibexWorkbench {
             attachments: self.new_session_attachments.clone(),
             command_entry: self.new_session_command_entry.clone(),
         };
-        let (text, attachments) =
-            composer_submission_payload(&raw_text, &self.new_session_attachments);
+        let (text, attachments) = self.new_session_draft_payload(cx);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
         // Manual slash expansion reads the authority's discovery capability.
         // A paired runtime resolves explicit command selections through the
@@ -42248,6 +42275,7 @@ impl VibexWorkbench {
             && has_agent_choices
             && self.new_session_runtime_selection.is_some()
             && worktree_form_valid
+            && self.new_session_draft_has_content(cx)
             && !self.agent_action_pending
             && !creation_pending;
         let new_session_slogan = strings.new_session_slogan;
@@ -80709,6 +80737,53 @@ mod tests {
         assert!(clear_draft.contains("input.set_value(\"\", window, cx)"));
         assert!(clear_draft.contains("self.new_session_attachments = attachments;"));
         assert!(clear_draft.contains("self.new_session_command_entry = command_entry;"));
+    }
+
+    #[test]
+    fn empty_new_session_draft_creates_nothing() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let refusal = submit
+            .find("if !self.new_session_draft_has_content(cx) {")
+            .expect("an empty draft must be refused before a session is created");
+        let optimistic_session = submit
+            .find("let optimistic_session_id = VibexSessionId::new();")
+            .expect("session creation should remain inspectable");
+        assert!(
+            refusal < optimistic_session,
+            "the empty-draft refusal must precede every creation step"
+        );
+        assert_eq!(
+            submit
+                .matches("if !self.new_session_draft_has_content(cx) {")
+                .count(),
+            1
+        );
+        assert!(submit.contains("let (text, attachments) = self.new_session_draft_payload(cx);"));
+
+        let draft_gate = source
+            .split_once("    fn new_session_draft_has_content(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn select_new_session_target("))
+            .map(|(body, _)| body)
+            .expect("the new-session draft gate should remain inspectable");
+        assert!(
+            draft_gate.contains("!text.trim().is_empty() || !attachments.is_empty()"),
+            "the gate must read the same payload the submission builds"
+        );
+
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        assert!(
+            panel.contains("&& self.new_session_draft_has_content(cx)"),
+            "the create button must stay disabled while the draft is empty"
+        );
     }
 
     #[test]
