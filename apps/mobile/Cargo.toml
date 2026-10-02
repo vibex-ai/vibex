@@ -37,6 +37,11 @@ vibex-ui = { path = "../../crates/vibex-ui" }
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245" }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# `gpui-pre-mobile` links `android-activity`'s NativeActivity glue into the
+# library, and that glue references `android_main`; this dependency carries the
+# `AndroidApp` type of the inert stub that keeps the symbol defined. The
+# `native-activity` feature itself stays enabled by `gpui-pre-mobile`.
+android-activity = "0.6"
 jni = "0.22"
 # The host entry reports through the `log` facade, which is what the platform
 # logger installed by `install_diagnostics` is wired to.

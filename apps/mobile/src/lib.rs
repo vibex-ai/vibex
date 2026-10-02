@@ -84,6 +84,23 @@ pub(crate) fn open_root_window(data_dir: PathBuf, cx: &mut App) {
     android_host::apply_pending_insets();
 }
 
+/// Keeps `android-activity`'s glue linkable. **Not** an entry point.
+///
+/// `gpui-pre-mobile` enables `android-activity`'s `native-activity` feature, so
+/// its glue — and the `ANativeActivity_onCreate` export that references
+/// `android_main` — is linked into this library even though Vibex enters
+/// through [`android_host`]. Android resolves every dynamic symbol when it
+/// loads a library, so dropping the symbol made `dlopen` fail with
+/// `cannot locate symbol "android_main"` and the app could not start at all.
+///
+/// Nothing can call this: the manifest declares no NativeActivity and no
+/// `android.app.lib_name`, so the system never invokes `ANativeActivity_onCreate`.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub fn android_main(_app: android_activity::AndroidApp) {
+    log::error!("android_main was called; Vibex starts through GpuiHostActivity");
+}
+
 /// Registers the iOS root-view callback.
 ///
 /// The UIKit host calls this from `application:didFinishLaunchingWithOptions:`

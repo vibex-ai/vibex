@@ -126,8 +126,13 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     read("apps/mobile/src/discovery.rs").includes("crate::android_bridge::with_activity"),
     "android_lan_discovery_bridge_missing"
   );
-  assert(!entry.includes("android_main"), "android_activity_entry_present");
+  // `gpui-pre-mobile` links android-activity's NativeActivity glue, and that
+  // glue references `android_main`: the symbol has to exist for Android to
+  // `dlopen` the library at all, but it must stay an inert stub, because the
+  // real entry is the host one.
+  assert(entry.includes("pub fn android_main("), "android_glue_entry_symbol_missing");
   assert(!entry.includes("init_platform"), "android_process_platform_init_present");
+  assert(!entry.includes("Application::with_platform"), "android_application_built_by_app_present");
   assert(!manifest.includes("android.app.lib_name"), "android_native_activity_library_metadata_present");
   assert(platform.includes("gpui_mobile::android::init_logger()"), "android_gpui_logger_missing");
   assert(androidHost.includes("rustls_platform_verifier::android::init_with_env"), "android_tls_platform_verifier_init_missing");
@@ -384,14 +389,20 @@ function runSelfTest() {
   expectRejected(
     "apps/mobile/src/lib.rs",
     "pub(crate) fn open_root_window",
-    'pub extern "system" fn android_main() {}\npub(crate) fn open_root_window',
-    "native_mobile_checker_self_test_accepted_android_activity_entry"
+    'fn android_main() { gpui_mobile::android::jni::init_platform(); }\npub(crate) fn open_root_window',
+    "native_mobile_checker_self_test_accepted_android_process_platform_init"
+  );
+  expectRejected(
+    "apps/mobile/src/lib.rs",
+    "pub fn android_main(_app: android_activity::AndroidApp) {",
+    "pub fn android_missing(_app: android_activity::AndroidApp) {",
+    "native_mobile_checker_self_test_accepted_missing_android_glue_symbol"
   );
   expectRejected(
     "apps/mobile/src/android_host.rs",
     "gpui_mobile::android::host::start_with_assets",
     "gpui_mobile::android::jni::init_platform",
-    "native_mobile_checker_self_test_accepted_android_process_platform_init"
+    "native_mobile_checker_self_test_accepted_android_host_process_platform_init"
   );
   expectRejected(
     "apps/mobile/ios/Vibex/main.m",
