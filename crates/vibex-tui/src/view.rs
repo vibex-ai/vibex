@@ -711,42 +711,29 @@ fn render_todo_band(
     area: Rect,
     app: &App,
     theme: &TuiTheme,
-    _strings: Strings,
+    strings: Strings,
 ) {
     let Some(progress) = app.todo_progress() else {
         return;
     };
-    let bar_width = usize::from(area.width).saturating_sub(16).clamp(4, 40);
-    let filled = (progress.done * bar_width)
-        .checked_div(progress.total)
-        .unwrap_or(0);
-    let mut spans = vec![Span::styled(
-        format!(
-            "{}{} {}/{}",
-            "█".repeat(filled),
-            "░".repeat(bar_width.saturating_sub(filled)),
-            progress.done,
-            progress.total
-        ),
-        Style::default().fg(theme.roles.accent_user),
-    )];
-    // The running step is what the reader wants from this band; the bar alone
-    // says how much is left without saying what is happening.
-    let label = progress
-        .running
-        .clone()
-        .unwrap_or_else(|| progress.title.clone());
-    if !label.is_empty() {
-        let used = bar_width + 8;
-        spans.push(Span::styled(
-            format!(
-                "  {}",
-                truncate_to_width(&label, usize::from(area.width).saturating_sub(used), "…")
+    let heading = format!(
+        "{} {}/{}",
+        strings.dock_plan(),
+        progress.done,
+        progress.total
+    );
+    let label = progress.running.as_deref().unwrap_or(&progress.title);
+    let available = usize::from(area.width).saturating_sub(display_width(&heading) + 3);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(heading, theme.muted()),
+            Span::styled(
+                format!(" · {}", truncate_to_width(label, available, "…")),
+                theme.muted(),
             ),
-            Style::default().fg(theme.roles.gray),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        ])),
+        area,
+    );
 }
 
 /// The transcript band: full width, no frame.
@@ -4424,7 +4411,14 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
             hints.push((Intent::FocusComposer, strings.composer_send()));
         }
         if app.turn_reads_running() {
-            hints.push((Intent::ContextualCancel, strings.session_stop()));
+            hints.push((
+                Intent::ContextualCancel,
+                if app.composer.is_empty() {
+                    strings.session_stop()
+                } else {
+                    strings.hint_clear()
+                },
+            ));
         }
         hints.push((Intent::SwitchAgentRuntime, strings.runtime_title()));
         hints.push((Intent::FocusNext, strings.transcript_browse()));

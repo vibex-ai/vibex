@@ -73,6 +73,13 @@ without fetching a record before creation has completed.
   each own a distinct, exclusively created scratch file and clean up only that
   file.
 - Reconnect and history reload do not replay creation or message mutations.
+- A missing timeline event range triggers `App::refresh_timeline`, which asks
+  `begin_session_load` for a generation-scoped snapshot. While
+  `timeline_status.phase == Loading`, subsequent events cannot launch another
+  load. Applying the reply preserves the current page and editor target.
+- Transcript expansion is local presentation state keyed by block ID. A live
+  update or final snapshot must preserve it. Group expansion opens every member;
+  toggling all reasoning chooses a target state once before walking groups.
 
 ## 4. Validation & Error Matrix
 

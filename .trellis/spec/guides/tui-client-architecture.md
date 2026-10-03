@@ -149,7 +149,7 @@ outer padding (1 row top/bottom, 2 columns each side)
   [gap] [banner]       transient messages
   [gap] [dock]         the running-work panel, while it is open
   prompt gap           1 row
-  prompt               borders + one blank row + the draft's wrapped rows
+  prompt               padded draft surface + separate runtime info line
   shortcut band        1 row, always last
 outer padding
 ```
@@ -261,9 +261,10 @@ Rules that follow:
   band and the dock own the plan, and the request row already shows the outcome.
   Every density decision is mirrored in `estimate_height`, because a renderer
   and an estimator that disagree about shape make scrolling jump.
-* A run of three or more collapsed rows *of the same kind* folds into its first
-  member (`MIN_GROUP_RUN`), which reports `+N` before its summary so truncation
-  cannot hide the count. An expanded or failed row breaks the run.
+* A run of three or more collapsed rows with the same kind, action title, turn
+  and runtime folds into its first member (`MIN_GROUP_RUN`), which reports `+N`
+  before its summary. Expanded and failed rows break the run. Opening the head
+  reveals every member; keyboard navigation skips members while folded.
 * The current block is marked with a pointer in the margin plus a lifted header.
   Never a full-width reversed row: it is the heaviest emphasis a terminal has.
 * Focus is expressed as a fade toward the canvas (`TuiTheme::fade`), not as a
@@ -315,10 +316,10 @@ Rules that follow:
 | Surface | Contract |
 | --- | --- |
 | Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. |
-| Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle has its own slower pulse so a connected session does not look busy. |
-| Composer | one blank row above the draft; the bottom border *is* the info line, using ` · `; the mode prefix says what the draft will do. |
+| Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle remains static so a connected session does not look busy. |
+| Composer | padded raised surface without a title or border; runtime and run options sit on a separate line below it. Repository state shares that line when enabled and space allows. |
 | Completion | a drawer above the composer: two full-width rules, no corners, count on the top rule, selection marker is the composer's own arrow. |
-| Shortcut band | `KEYS:LABEL` joined by a rule; keys bright, labels dim; leading hints survive a narrow terminal. |
+| Shortcut band | keys and localized labels separated by middots; prioritize send/newline or expand/details for the current focus, then runtime switching and navigation. Use the keymap for chords and click actions. |
 
 ## 6. Rendering
 
@@ -375,7 +376,9 @@ every emphasis, code and link on it. Content whose spacing *is* the layout —
 fenced code, diffs, table rows and rules — takes a preformatted path that
 hard-wraps by cell and never collapses runs of spaces, and a table is a closed
 box (`┌┬┐ ├┼┤ └┴┘`) whose columns are padded by display width, so a double-width
-cell cannot push the next `│` out of line.
+cell cannot push the next `│` out of line. Table cells wrap within their columns;
+column budgets include all padding and separators. When columns cannot fit,
+render records vertically rather than discard cell content.
 
 **A streamed answer is rendered once, and never from its first character
 again.** Re-parsing the whole document on every delta is quadratic in the length
@@ -557,16 +560,23 @@ is never a column count.
   the reader and the composing page's mark animate too; everything else holds
   still, and that is what keeps an idle session at zero frames (the PTY
   `an_idle_interface_writes_nothing` contract).
-* **Work is evidence: rows while it runs, detail on demand.** A streaming dense
-  row is still one row — its newest line (`live_row`: the tail for prose, the
-  action for a tool) — because a running session that prints whole reasoning
-  blocks and raw tool payloads buries the rows the reader is scanning for. A
-  tool payload is summarised by what it does (`tool_action`, JSON string fields
-  in the order that answers "what is it doing"), the runtime is named once per
-  run and again where it changes, and a run never folds across runtimes. The
-  estimate in `estimate_height` must agree with that shape, or scrolling jumps
-  as rows come into view; a block whose neighbour changed is therefore
-  re-measured (the gap and the attribution are decided by the neighbours).
+* **Work records have the same layout while running and after completion.**
+  `is_dense_row` always hides the body until explicit expansion. Reasoning
+  shows its label; a tool shows a recognized action, never raw JSON or XML as a
+  fallback. Complete input followed by output can still supply the action;
+  unknown or incomplete payloads remain available in details. Runtime attribution
+  also lives in details. Failure stays visible and breaks grouping. Keep height
+  estimates and cached neighbour gaps in sync with the rendered shape.
+* **Expansion belongs to the reader.** `Transcript::set_blocks` retains it by
+  stable block ID while content updates. Group changes invalidate measurements
+  and cached rows. The rendered group head supplies the mouse hit target;
+  clicking it and the expand key run the same intent.
+* **A stream must recover from missing events.** `App::refresh_timeline` starts
+  a generation-scoped session load from sequence zero when a timeline gap is
+  reported. An in-flight load prevents duplicate requests. Applying the snapshot
+  updates the projection without navigating, transferring a draft or resending
+  a message. Worker-result batches have a time budget so a burst cannot keep the
+  next frame waiting for the queue to empty.
 * **A send is projected until the runtime echoes it.** The client does not own
   the timeline: the reader's own message comes back a round trip later, so it is
   drawn locally as the row it will become (`PendingSend::row`) and the session

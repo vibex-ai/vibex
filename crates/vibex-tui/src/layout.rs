@@ -10,10 +10,10 @@
 //!   │  transcript — no border, its own left edge is the margin    │  fills
 //!   │                                                            │
 //!   │ ⠹ running · read src/net/upload.rs          12s ⇣1.2k      │  turn status
-//!   │ ╭─ title ────────────────────────────────────────╮         │
-//!   │ │ ❯ draft                                        │         │  prompt
-//!   │ ╰─ agent · model ────────────────────────────────╯         │
-//!   │ Ctrl+P Commands │ ? Help │ Ctrl+Q Quit                      │  shortcuts
+//!   │   ❯ draft                                                 │  prompt
+//!   │                                                            │
+//!   │   agent · model · run options                    branch    │  context
+//!   │ Enter Send · Shift+Enter Newline · Ctrl+G Runtime           │  shortcuts
 //!   └────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -58,7 +58,7 @@ pub struct BandRequest {
     pub banner: u16,
     /// The collapsible panel above the composer: what the session is running.
     pub dock: u16,
-    /// The composer's total height, borders included.
+    /// The composer's total height, padding and runtime info included.
     pub prompt: u16,
     /// Rows between the transcript and the composer.
     pub prompt_gap: u16,

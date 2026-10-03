@@ -2285,6 +2285,282 @@ mod tests {
             .0
     }
 
+    fn conversation_item(
+        session_id: &vibex_core::VibexSessionId,
+        sequence: i64,
+        payload: vibex_core::TimelinePayload,
+    ) -> vibex_core::TimelineItem {
+        vibex_core::TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source: vibex_core::TimelineSource::Agent,
+            kind: match payload {
+                vibex_core::TimelinePayload::UserMessage(_) => {
+                    vibex_core::TimelineItemKind::UserMessage
+                }
+                vibex_core::TimelinePayload::ToolCall(_) => vibex_core::TimelineItemKind::ToolCall,
+                _ => vibex_core::TimelineItemKind::AgentMessageDelta,
+            },
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        }
+    }
+
+    fn conversation_frame(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn live_callbacks_show_a_growing_answer_and_settle_without_reflow() {
+        use vibex_core::{AgentMessageDeltaPayload, TimelinePayload};
+        let worker = isolation_worker();
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut app = isolation_app();
+            app.resize(width, height);
+            app.navigate_to(Page::Agent);
+            let id = vibex_core::VibexSessionId::new();
+            let mut session = isolation_session(id.clone(), "codex");
+            session.state = vibex_core::AgentSessionState::Running;
+            app.agent.state.selected_session_id = Some(id.clone());
+            app.agent.state.active_session.resolve(session.clone());
+            app.agent
+                .state
+                .timeline
+                .replace_authoritative(id.clone(), vec![]);
+            for sequence in 1..=30 {
+                let item = conversation_item(
+                    &id,
+                    sequence,
+                    TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                        text_delta: format!(
+                            "Paragraph {sequence}: 中文流式内容 **keeps arriving**.\n\n"
+                        ),
+                        chunk_index: sequence as u32 - 1,
+                        phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+                    }),
+                );
+                apply_message(
+                    &mut app,
+                    &worker,
+                    AppMessage::Event(vibex_backend::BackendEvent::Timeline(
+                        vibex_core::TimelineLiveEvent {
+                            session_id: id.clone(),
+                            sequence,
+                            item,
+                        },
+                    )),
+                )
+                .unwrap();
+                let screen = conversation_frame(&mut app, width, height);
+                assert!(
+                    screen.contains(&format!("Paragraph {sequence}:")),
+                    "latest delta did not reach the screen: {screen}"
+                );
+                assert_eq!(app.transcript.len(), 1);
+            }
+            let before = app
+                .transcript
+                .visible_lines(app.scroll, 1000, &app.theme, app.strings);
+            session.state = vibex_core::AgentSessionState::Idle;
+            session.updated_at_ms += 1;
+            apply_message(
+                &mut app,
+                &worker,
+                AppMessage::Event(vibex_backend::BackendEvent::SessionUpdated(session)),
+            )
+            .unwrap();
+            let after = app
+                .transcript
+                .visible_lines(app.scroll, 1000, &app.theme, app.strings);
+            assert_eq!(
+                before, after,
+                "completing a turn changed its Markdown layout"
+            );
+            assert!(!app.transcript_animating());
+        }
+    }
+
+    #[test]
+    fn a_gap_starts_one_refetch_and_streaming_resumes_after_the_snapshot() {
+        use vibex_core::{AgentMessageDeltaPayload, TimelinePayload};
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let id = vibex_core::VibexSessionId::new();
+        let mut session = isolation_session(id.clone(), "codex");
+        session.state = vibex_core::AgentSessionState::Running;
+        app.agent.state.selected_session_id = Some(id.clone());
+        app.agent.state.active_session.resolve(session.clone());
+        let item = |sequence, text: &str| {
+            conversation_item(
+                &id,
+                sequence,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: text.into(),
+                    chunk_index: sequence as u32 - 1,
+                    phase: None,
+                }),
+            )
+        };
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(id.clone(), vec![item(1, "one ")]);
+        app.perform(crate::action::Intent::NewSession);
+        app.composer.set_text("keep this draft");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::Timeline(
+                vibex_core::TimelineLiveEvent {
+                    session_id: id.clone(),
+                    sequence: 3,
+                    item: item(3, "three "),
+                },
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            app.agent.state.timeline_status.phase,
+            vibex_ui::AsyncPhase::Loading
+        );
+        assert!(
+            app.refresh_timeline().is_none(),
+            "a refetch is already in flight"
+        );
+        let ticket = vibex_ui::AgentSessionLoadTicket {
+            generation: app.agent.state.generation,
+            session_id: id.clone(),
+            after_sequence: 0,
+        };
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionOpened {
+                ticket,
+                result: Ok(vibex_ui::AgentSessionSnapshot {
+                    session,
+                    timeline: vec![item(1, "one "), item(2, "two "), item(3, "three ")],
+                    runtime_selection: None,
+                    timeline_has_older: false,
+                }),
+            },
+        )
+        .unwrap();
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::Timeline(
+                vibex_core::TimelineLiveEvent {
+                    session_id: id.clone(),
+                    sequence: 4,
+                    item: item(4, "four"),
+                },
+            )),
+        )
+        .unwrap();
+        assert!(!app.agent.state.timeline.needs_authoritative_refetch);
+        assert!(
+            app.transcript
+                .block(0)
+                .unwrap()
+                .body
+                .contains("one two three four")
+        );
+        assert_eq!(app.page, Page::NewSession);
+        assert_eq!(app.composer.text(), "keep this draft");
+    }
+
+    #[test]
+    fn mouse_opens_a_group_and_keyboard_skips_its_folded_members() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(id.clone());
+        let mut items = (1..=3)
+            .map(|sequence| {
+                conversation_item(
+                    &id,
+                    sequence,
+                    vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                        tool_call_id: format!("tool-{sequence}"),
+                        tool_name: "read".into(),
+                        status: vibex_core::ToolCallStatus::Completed,
+                        summary: String::new(),
+                        input_summary: Some(format!("src/file-{sequence}.rs")),
+                        output_summary: Some(format!("contents of file {sequence}")),
+                        raw_extension: None,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push(conversation_item(
+            &id,
+            4,
+            vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                text_delta: "The result is ready.".into(),
+                chunk_index: 0,
+                phase: None,
+            }),
+        ));
+        app.agent.state.timeline.replace_authoritative(id, items);
+        app.sync_transcript();
+        conversation_frame(&mut app, 100, 30);
+        app.focus = Focus::Main;
+        app.set_selection(crate::keymap::Scope::Agent, 0);
+        app.perform(Intent::SelectNext);
+        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 3);
+        app.perform(Intent::SelectPrevious);
+        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 0);
+        conversation_frame(&mut app, 100, 30);
+        let area = app.regions.scrollback;
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 3,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        let opened = conversation_frame(&mut app, 100, 30);
+        assert!(opened.contains("contents of file 3"));
+        app.sync_transcript();
+        assert!(
+            app.transcript.blocks()[..3]
+                .iter()
+                .all(|block| block.expanded)
+        );
+        app.perform(Intent::ToggleAllBlocksExpanded);
+        app.focus = Focus::Composer;
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.focus, Focus::Main);
+        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 3);
+    }
+
     #[test]
     fn late_open_callback_cannot_leave_draft_or_retarget_picker() {
         use crate::action::Intent;

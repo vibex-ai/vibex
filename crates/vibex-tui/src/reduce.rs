@@ -560,11 +560,15 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::ToggleReasoningExpanded => {
-                // Reasoning blocks are the collapsible ones the desktop folds
-                // by default; toggling them all is the whole-body equivalent.
+                // Expanding a group opens its members too. Choose one target
+                // state before walking so later members are not toggled shut.
+                let expand = self.transcript.blocks().iter().any(|block| {
+                    block.kind == vibex_desktop_model::TimelineRowKind::Reasoning && !block.expanded
+                });
                 for index in 0..self.transcript.len() {
                     let is_reasoning = self.transcript.block(index).is_some_and(|block| {
                         block.kind == vibex_desktop_model::TimelineRowKind::Reasoning
+                            && block.expanded != expand
                     });
                     if is_reasoning {
                         self.transcript.toggle_block(index);

@@ -251,7 +251,7 @@ fn startup_paints_a_first_frame() {
         "the status band is missing:\n{screen}"
     );
     assert!(
-        screen.contains("Commands") || screen.contains("Help"),
+        screen.contains("Ctrl+P") && screen.contains("Ctrl+Q"),
         "the shortcut band is missing:\n{screen}"
     );
 }

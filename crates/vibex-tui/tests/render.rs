@@ -5451,3 +5451,44 @@ fn the_session_view_shows_the_continuation_countdown() {
         "the countdown is not beside the composer:\n{screen}"
     );
 }
+
+#[test]
+fn reasoning_toggle_opens_and_closes_every_member_of_a_group() {
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.navigate_to(Page::Agent);
+    let row = vibex_tui::transcript::Block {
+        id: "thought-0".into(),
+        kind: vibex_desktop_model::TimelineRowKind::Reasoning,
+        title: "Thinking".into(),
+        body: "Detailed reasoning".into(),
+        turn_id: Some("turn-1".into()),
+        sequence: 1,
+        expanded: false,
+        collapsible: true,
+        streaming: false,
+        failed: false,
+        pending_permission: false,
+        file_path: None,
+        runtime_attribution: None,
+        conclusion: false,
+        group: vibex_tui::transcript::GroupRole::Solo,
+    };
+    app.transcript.set_blocks(
+        (0..4)
+            .map(|index| {
+                let mut row = row.clone();
+                row.id = format!("thought-{index}");
+                row
+            })
+            .collect(),
+    );
+    app.perform(Intent::ToggleReasoningExpanded);
+    assert!(app.transcript.blocks().iter().all(|row| row.expanded));
+    app.perform(Intent::ToggleReasoningExpanded);
+    assert!(app.transcript.blocks().iter().all(|row| !row.expanded));
+    assert!(matches!(
+        app.transcript.blocks()[0].group,
+        vibex_tui::transcript::GroupRole::Head { hidden: 3 }
+    ));
+}

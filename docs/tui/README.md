@@ -70,8 +70,7 @@ One vertical stack of full-width bands — status, transcript, turn status,
 composer, shortcut bar. There are no permanently-boxed side panes: every border
 costs two columns or two rows that the content does not get, and on a fixed grid
 that is the whole budget. The transcript is what is being read, so it takes the
-full width, and the structure inside it — the per-block rail — does the work a
-frame would.
+full width, and message surfaces and expandable work rows give it structure.
 
 Navigation that would otherwise be a permanent column is a full-screen view
 (Sessions, Files, Changes) or an overlay, which is also the only way a session
@@ -89,33 +88,17 @@ line: a global page keeps its own chrome.
 
 ## Visual language
 
-Four ideas carry the interface.
+Your messages use a raised background and a prompt marker. Continuation lines
+align with the first line's text, and Markdown punctuation in your input remains
+literal. A message that scrolls out of view stays pinned above the transcript.
+Agent replies render Markdown as text arrives, including wrapped code and tables.
 
-**The rail.** Every transcript block owns a one-column colour bar down its whole
-height. It gives each block a visible left edge, so a long tool output stays one
-object instead of dissolving into the previous one, and it lets a session be
-scanned by colour before a word is read:
-
-| Rail | Block |
-| --- | --- |
-| accent | your message |
-| foreground | the Agent's reply |
-| violet | reasoning |
-| blue | tool call, command, file change, search |
-| grey | system notice, todo, git |
-| amber | approval, question, retry |
-| red | error |
-| green | resolution |
-
-The rail is a *filled cell* rather than a drawn line: it is exactly one column
-wide in every font and needs no box-drawing glyph. Because a filled cell is
-carried entirely by colour, a terminal without colour falls back to a drawn
-`│`, which keeps the structure and lets the colour go.
-
-Work items — tool calls, commands, reasoning — also carry a `⏺` bullet, and a
-run of three or more collapsed ones folds into its first member with a
-`╶╶ N more` summary. A session produces work items in bursts, and showing all of
-them at full height buries the sentences they are evidence for.
+Tool calls and reasoning use compact disclosure rows (`▸` / `▾`). Their layout
+stays the same while running and after completion. Click a row or press `e` to
+expand its details; raw payloads and reasoning paragraphs stay behind that fold.
+Three or more consecutive records of the same action can share one row with a
+`+N` count. Expanding the group reveals all members. Different actions, turns,
+runtimes and failures remain distinct, and updates preserve your expansion choices.
 
 **Layered surfaces.** Backgrounds step away from the canvas, so a tool body or a
 raised row reads as a distinct plane rather than as more text on the same
@@ -131,9 +114,9 @@ active one. A session with no turns draws nothing there — a scrollbar in the
 same columns would be counted as turns, which is the one thing the rail must not
 do.
 
-**Focus is a fade, not a switch.** Panes that do not have the keyboard keep
-their colour and drop in weight, and the composer's rail goes from the accent to
-dim grey. That makes "where will my keystrokes go" answerable at a glance.
+**Focus.** A pointer marks the selected transcript block. The prompt marker and
+terminal caret show where typing lands. `Tab` switches between the transcript
+and composer; `Up` in an empty composer enters the transcript at its last row.
 
 **One chrome, many modals.** Every popup — the command palette, the runtime
 picker, an approval card, a diff view, a confirmation — is drawn through one
@@ -182,19 +165,15 @@ The row above the composer is where the interface reports what is happening:
 ```
 
 It sits between the transcript and the composer because it must never scroll
-away. Idle has its own slower pulse, so a connected session does not look like a
-working one.
+away. Idle remains static. Running turns animate even while waiting for a tool or runtime startup.
 
 ### Composer
 
-```text
-╭─ <session title> ─────────────────────────────╮
-│ ❯ the draft so far                             │
-╰─ <agent> · <model> · <running>     multiline ▏╯
-```
-
-The bottom border is an info line rather than a rule: a terminal has no room for
-chrome that only carries status, and a divider that also informs is free.
+The draft sits on a padded background without a frame or repeated session title.
+Its height follows wrapped text, and long drafts scroll to keep the caret visible.
+Below it, one line names the Agent, model and run options. Repository information
+shares the available space when enabled. The shortcut row prioritizes the actions
+available at the current focus.
 
 A paste of four or more lines (or one over 10 KB) collapses into a chip —
 `[Pasted: 42 lines]` — instead of burying the draft. The chip is one object:
@@ -277,7 +256,7 @@ already has:
 | `Alt+D` | kill the word after the cursor |
 | `Ctrl+Y` | yank the last killed text back |
 | `Alt+B` / `Alt+F`, `Ctrl+←` / `Ctrl+→` | move by word |
-| `↑` / `↓` | recall sent messages |
+| `↑` / `↓` | move through draft lines; `↑` in an empty draft enters the timeline |
 
 There is one kill buffer rather than a ring: a ring is a second thing to learn
 for a case that a terminal rarely reaches. Undo coalesces consecutive typing
@@ -286,27 +265,15 @@ just typed rather than moving text out from under a cursor placed on purpose.
 
 ### Running work
 
-A session that is working is mostly *evidence*: reasoning, and the tool calls and
-commands the turn makes. It is drawn as rows rather than as sections, and the
-rule holds while it streams — the three things that made a running session
-unreadable were all of them about volume:
+Tools and reasoning keep the same compact rows while running and after completion.
+Tool rows show a recognized command, path or query; reasoning rows show a label.
+Click the header or press `e` to reveal the complete content. `Enter` opens the
+selected block's details. Expanded content stays open while new events arrive.
+Consecutive identical actions may group with a `+N` count; failed records always
+remain visible. Runtime attribution is available with expanded details.
 
-- **A work item stays one row while it arrives.** A reasoning block prints its
-  *newest* line, because the head of a thought still being written is not a
-  summary of it; a tool call prints its action. The full text is behind the fold
-  (`e`, or the block's detail view) and one keypress away.
-- **A tool row shows what it does, not what it was sent.** A call arrives as
-  JSON — `{"command":"cargo test -p vibex-tui"}` — and the row shows the
-  command; the file a file operation touches, or what a search looks for, when
-  that is the payload. The rest is payload, and payload is what the fold is for.
-- **A run names its runtime once.** Consecutive work items of one kind from one
-  runtime fold into their first row with a `+N` count. The runtime's name rides
-  that row, and appears again only where it *changes* — a run from another Agent
-  is a different run, so it does not fold in. The reader's own message is never
-  attributed: they wrote it.
-
-An answer still streams in full. It is the content rather than the evidence for
-it, and the reader is reading it as it lands.
+Agent replies stream in full. If events are missed, the client fetches authoritative
+history before resuming updates, without sending your message again.
 
 ### Markdown
 
@@ -332,15 +299,14 @@ text it labels.
 Styling survives line breaks: the wrapper stays the authority on where lines
 break, and each visual line is matched back onto the styled runs, so emphasis or
 code that lands across a wrap keeps its colour. Content whose spacing *is* the
-layout — code, diffs, tables — is never re-flowed.
+layout — code and diffs — keeps its spacing. Table cells wrap inside their
+columns; very narrow tables become vertical records so cell contents remain readable.
 
 ### Status bar
 
-Identity on the left, context in the centre, appearance on the right. Splitting
-it into zones is what stops the bar from becoming one left-aligned sentence
-whose tail is the first thing a narrow terminal eats. The centre is the
-context-window readout — `8.5K / 1.0M`, with the colour moving through the
-usage thresholds — so the answer is available without reading the number.
+The workspace appears on the left. Connection warnings, context usage and the
+current seat appear on the right. A ready connection does not label a running
+turn as complete; the turn status row reports whether work is active.
 
 ### Composer modes
 
@@ -361,10 +327,10 @@ selection marker so the highlighted row lines up with the text being typed.
 
 ### Shortcut band
 
-`KEYS:LABEL` joined by a rule; keys are drawn bright and labels dim, because the
-key is what the reader is looking for and the label only confirms it. The
-leading hints survive a narrow terminal, so shrinking the window degrades the
-band from the least important end.
+Keys and labels are separated by middots. The row prioritizes send and newline
+while composing, and expand, details and reply while browsing the transcript.
+Runtime switching remains available through `Ctrl+G`. Hints use the current
+keymap, and clicking a hint runs the same action as its key.
 
 ## Pages
 
@@ -620,11 +586,10 @@ of failing to start.
 
 ### Status line
 
-Optional, on by default, and switched off from Settings on a short terminal: a
-denser second row under the composer carrying the branch and change count, the
-plan's progress, the context budget and how many messages are queued. The top
-band answers "where am I and is it alive"; this one answers "what am I working
-on".
+The optional repository readout shares the runtime info line below the composer.
+It shows the branch and changed-file count when space allows. Settings can hide
+this readout; the Agent and model stay visible. Context usage remains in the
+header, and plan progress appears once as a compact step summary.
 
 ### First run
 
