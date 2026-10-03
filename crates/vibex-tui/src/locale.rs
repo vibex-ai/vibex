@@ -274,6 +274,11 @@ strings! {
         "傳送訊息…（/ 命令 · @ 檔案 · $ 技能）"
     },
     composer_send => { "Send", "发送", "傳送" },
+    composer_newline => { "Newline", "换行", "換行" },
+    transcript_browse => { "Timeline", "时间线", "時間線" },
+    transcript_details => { "Details", "详情", "詳情" },
+    transcript_expand => { "Expand / collapse", "展开 / 收起", "展開 / 收合" },
+    session_stop => { "Stop", "停止", "停止" },
     composer_nothing_to_undo => {
         "Nothing left to undo in the draft",
         "草稿没有可撤销的修改",

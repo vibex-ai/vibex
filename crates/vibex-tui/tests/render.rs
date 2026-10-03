@@ -215,13 +215,8 @@ fn the_prompt_sits_directly_above_the_shortcuts_band() {
         .iter()
         .position(|line| line.contains('❯'))
         .expect("the prompt is on screen");
-    // Below the prompt: its own bottom border, the status line, the shortcut
-    // band, then the outer padding. Nothing else may intrude.
-    assert!(
-        lines[prompt_row + 1].contains('╰'),
-        "the prompt has no bottom border: {:?}",
-        lines[prompt_row + 1]
-    );
+    // One padding row, then runtime context and the shortcuts.
+    assert!(lines[prompt_row + 1].trim().is_empty());
     let band_row = lines
         .iter()
         .position(|line| line.contains("Ctrl+P"))
@@ -239,20 +234,18 @@ fn the_prompt_sits_directly_above_the_shortcuts_band() {
 }
 
 #[test]
-fn the_prompt_border_carries_the_context_line() {
+fn the_prompt_has_a_padded_surface_and_separate_context_line() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
-    let lines = render(&mut app, 120, 40);
-    let bottom = lines
-        .iter()
-        .rev()
-        .find(|line| line.contains('╰'))
-        .expect("the prompt has a bottom border");
-    // The rule continues around the context rather than a bare line of dashes.
-    let inner = bottom.trim_matches(|c| c == ' ' || c == '╰' || c == '╯');
-    assert!(
-        inner.chars().any(|c| c.is_alphanumeric()),
-        "the prompt's bottom border carries no context: {bottom:?}"
+    let buffer = render_buffer(&mut app, 120, 40);
+    let band = app.regions.composer_band.unwrap();
+    let editor = app.regions.composer.unwrap();
+    assert_eq!(editor.y, band.y + 1);
+    assert_eq!(editor.bottom() + 2, band.bottom());
+    assert_eq!(buffer[(band.x, band.y)].bg, app.theme.roles.surface_raised);
+    assert_ne!(
+        buffer[(band.x, band.bottom() - 1)].bg,
+        app.theme.roles.surface_raised
     );
 }
 
@@ -375,15 +368,15 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
     let lines = render(&mut app, 120, 40);
     let screen = text(&lines);
     assert!(
-        lines.iter().any(|line| line.contains("bal/gpt-5")),
-        "the prompt does not name the provider and model:\n{screen}"
+        lines.iter().any(|line| line.contains("gpt-5")),
+        "the prompt does not name its model:\n{screen}"
     );
     assert!(
         lines.iter().any(|line| line.contains("Ctrl+G")),
         "the prompt does not advertise the runtime switch:\n{screen}"
     );
     assert!(
-        !screen.contains("bal/claude-sonnet"),
+        !screen.contains("claude-sonnet"),
         "the prompt named a catalogue entry the session is not on:\n{screen}"
     );
     // It rides the far end of the bottom border: the reader looks for the
@@ -391,7 +384,7 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
     // eye follows into the prompt.
     let info_row = lines
         .iter()
-        .find(|line| line.contains("bal/gpt-5"))
+        .find(|line| line.contains("gpt-5"))
         .expect("the info line is on screen");
     let start = info_row
         .char_indices()
@@ -399,11 +392,11 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
         .map(|(index, _)| index)
         .expect("the info line has content");
     assert!(
-        start > 60,
-        "the runtime is still on the left of the box: column {start}\n{screen}"
+        start < 8,
+        "the runtime is not aligned with the editor: column {start}\n{screen}"
     );
     assert!(
-        info_row[start..].starts_with("codex · bal/gpt-5"),
+        info_row[start..].starts_with("codex · gpt-5"),
         "the info line starts with something else: {:?}",
         &info_row[start..]
     );
@@ -678,10 +671,10 @@ fn the_prompt_names_the_run_options_the_session_is_on() {
     let screen = text(&lines);
     let info_row = lines
         .iter()
-        .find(|line| line.contains("Ctrl+G"))
+        .find(|line| line.contains("codex · gpt-5"))
         .expect("the info line is on screen");
     assert!(
-        info_row.contains("codex · bal/gpt-5 · High · Plan · Ctrl+G"),
+        info_row.contains("codex · gpt-5 · High · Plan"),
         "the info line does not name the run options in effect: {info_row:?}"
     );
     // A feature stays in the switcher: the line carries the shape of the
@@ -1562,7 +1555,7 @@ fn hiding_finished_dock_work_leaves_the_running_step() {
     seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.perform(Intent::ToggleDock);
     let before = text(&render(&mut app, 120, 40));
-    assert!(before.contains("1/3"), "{before}");
+    assert!(before.contains("read the design"), "{before}");
     app.perform(Intent::DockHideDone);
     let after = text(&render(&mut app, 120, 40));
     assert!(
@@ -1969,15 +1962,11 @@ fn a_wrapped_draft_keeps_every_row_on_screen() {
         .composer
         .expect("the composer published its rows");
     assert!(region.height >= 2, "the box did not grow: {region:?}");
-    // The box grew by exactly the rows it drew: the bottom border still sits on
-    // the row after the last text row.
+    let band = app.regions.composer_band.unwrap();
     assert_eq!(
-        usize::from(region.bottom()),
-        lines
-            .iter()
-            .position(|line| line.contains('╰'))
-            .expect("the composer has a bottom border"),
-        "the box and its rows disagree:\n{screen}"
+        region.bottom() + 2,
+        band.bottom(),
+        "editor padding and context overlap"
     );
 }
 
@@ -2212,15 +2201,31 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
 }
 
 #[test]
-fn the_bottom_status_line_can_be_turned_off() {
+fn the_status_line_setting_gates_the_repository_line() {
+    // The line the setting controls moved off its own band and onto the
+    // composer's context row, so the switch is asserted where it is drawn now.
     use vibex_tui::settings::SettingRow;
     let mut app = app(120, 44);
     app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_status01");
+    app.git_status = Some(vibex_core::GitStatusSummary {
+        workspace_id: vibex_core::WorkspaceId::new(),
+        repo_path: "/tmp/vibex-status".to_string(),
+        branch: Some("feature-timeline".into()),
+        short_commit: None,
+        detached: false,
+        dirty: true,
+        staged_count: 0,
+        unstaged_count: 1,
+        untracked_count: 0,
+        changes: Vec::new(),
+        captured_at_ms: 0,
+    });
     let with = text(&render(&mut app, 120, 44));
     app.settings.status_line = false;
     let without = text(&render(&mut app, 120, 44));
-    // The rows go back to the transcript, so the two frames differ.
-    assert_ne!(with, without);
+    assert!(with.contains("feature-timeline"));
+    assert!(!without.contains("feature-timeline"));
     // And the setting is a real row with a real value.
     assert_eq!(
         app.setting_value(SettingRow::StatusLine),
@@ -2961,8 +2966,10 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         screen.contains("Done: the test now uses the fake clock."),
         "{screen}"
     );
-    // Five tool calls read as one row that says how many it stands for.
-    assert!(screen.contains("read_file  +4"), "{screen}");
+    // Different actions remain distinct; grouping must not hide a write as a read.
+    assert!(screen.contains("read_file"), "{screen}");
+    assert!(screen.contains("write_file"), "{screen}");
+    assert!(screen.contains("grep"), "{screen}");
     assert!(
         !screen.contains("Tool read_file"),
         "the kind label doubles the title:\n{screen}"
@@ -4436,19 +4443,21 @@ fn a_running_session_reads_as_rows() {
     app.transcript.set_blocks(blocks);
     let screen = text(&render(&mut app, 110, 26));
 
-    // The reasoning row is its newest line, not the whole thought.
+    // The reasoning body stays behind its disclosure in both states.
     assert!(
-        screen.contains("one row tall while it streams"),
-        "the live line is missing:\n{screen}"
+        !screen.contains("one row tall while it streams"),
+        "a thought leaked into the collapsed row:\n{screen}"
     );
     assert!(
         !screen.contains("shows every reasoning paragraph in full"),
         "the whole reasoning block is on screen:\n{screen}"
     );
     // A tool row names its action; the payload stays behind the fold. The run's
-    // head is the row that carries it, and the rest are counted beside it.
+    // head is the row that carries it, and the rest are counted beside it. The
+    // command shares its row with the rest of the run, so what is asserted is
+    // the head of it; the tail belongs to the expanded body.
     assert!(
-        screen.contains("git diff -- crates/vibex-tui/src/app.rs"),
+        screen.contains("cd /home/peatboy/code/peatboy/vibex-dev/vibex && git diff"),
         "the tool's command is not on its row:\n{screen}"
     );
     assert!(
@@ -4461,7 +4470,7 @@ fn a_running_session_reads_as_rows() {
     // under the reader's own message, which no runtime wrote.
     assert_eq!(
         screen.matches("DeepSeek Harness").count(),
-        1,
+        0,
         "the attribution repeats:\n{screen}"
     );
     let user_row = screen

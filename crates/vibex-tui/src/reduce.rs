@@ -131,14 +131,30 @@ impl App {
             Intent::RequestQuit => self.confirm_quit(),
             Intent::Back => self.go_back(),
             Intent::FocusNext => {
-                self.focus = self.focus.next();
+                self.focus = if self.page.is_session_page() {
+                    if self.focus == Focus::Composer {
+                        Focus::Main
+                    } else {
+                        Focus::Composer
+                    }
+                } else {
+                    self.focus.next()
+                };
                 if self.focus == Focus::Composer && self.page != Page::NewSession {
                     self.navigate_to(Page::Agent);
                 }
                 Outcome::effects(vec![])
             }
             Intent::FocusPrevious => {
-                self.focus = self.focus.previous();
+                self.focus = if self.page.is_session_page() {
+                    if self.focus == Focus::Composer {
+                        Focus::Main
+                    } else {
+                        Focus::Composer
+                    }
+                } else {
+                    self.focus.previous()
+                };
                 Outcome::effects(vec![])
             }
             Intent::Refresh => self.refresh_current_page(),
@@ -1920,7 +1936,20 @@ impl App {
             return Outcome::quiet();
         }
         let current = self.selection_for(scope) as i64;
-        let next = (current + delta).clamp(0, count as i64 - 1) as usize;
+        let mut next = (current + delta).clamp(0, count as i64 - 1) as usize;
+        if scope == Scope::Agent {
+            while self
+                .transcript
+                .block(next)
+                .is_some_and(|block| block.group == crate::transcript::GroupRole::Member)
+            {
+                let candidate = next as i64 + delta.signum();
+                if candidate < 0 || candidate >= count as i64 {
+                    return Outcome::quiet();
+                }
+                next = candidate as usize;
+            }
+        }
         self.set_selection(scope, next);
         if scope == Scope::Agent {
             self.scroll.follow = false;
@@ -3140,7 +3169,7 @@ impl App {
     fn refresh_current_page(&mut self) -> Outcome {
         match self.page {
             Page::NewSession | Page::Sessions => Outcome::effects(self.session_page_effects()),
-            Page::Agent => Outcome::effects(vec![Effect::RefreshTimeline]),
+            Page::Agent => Outcome::effects(self.refresh_timeline().into_iter().collect()),
             Page::Devices => Outcome::effects(vec![Effect::ListDevices]),
             Page::Providers => Outcome::effects(vec![Effect::ListProfiles]),
             Page::Agents => Outcome::effects(vec![Effect::ListAgents]),

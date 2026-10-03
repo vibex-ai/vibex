@@ -328,7 +328,11 @@ impl Transcript {
         let mut reused_rendered: HashMap<usize, RenderedBlock> = HashMap::new();
         let mut reused_recency = Vec::new();
 
-        for (new_index, block) in blocks.into_iter().enumerate() {
+        for (new_index, mut block) in blocks.into_iter().enumerate() {
+            if let Some(&old_index) = existing.get(block.id.as_str()) {
+                block.expanded = self.blocks[old_index].expanded;
+                block.group = self.blocks[old_index].group;
+            }
             let key = block.content_key();
             match existing.get(block.id.as_str()) {
                 Some(&old_index) if self.keys.get(old_index) == Some(&key) => {
@@ -363,8 +367,7 @@ impl Transcript {
 
         // A live renderer belongs to a block that is still in the transcript;
         // one whose block has gone would otherwise sit in the map forever.
-        let present = self
-            .blocks
+        let present = next_blocks
             .iter()
             .map(|block| block.id.as_str())
             .collect::<std::collections::HashSet<_>>();
@@ -406,6 +409,11 @@ impl Transcript {
     /// member and reports the rest as a count, which is the density the reader
     /// wants by default and one keypress away from the detail.
     fn apply_grouping(&mut self) {
+        let previous = self
+            .blocks
+            .iter()
+            .map(|block| block.group)
+            .collect::<Vec<_>>();
         for block in &mut self.blocks {
             block.group = GroupRole::Solo;
         }
@@ -417,6 +425,8 @@ impl Transcript {
             }
             let start = index;
             let kind = self.blocks[start].kind;
+            let title = self.blocks[start].title.clone();
+            let turn = self.blocks[start].turn_id.clone();
             // A run is one kind of work *by one runtime*: folding a row that
             // came from somewhere else into this run would hide the only thing
             // the attribution is there to say.
@@ -424,6 +434,8 @@ impl Transcript {
             while index < self.blocks.len()
                 && eligible_for_group(&self.blocks[index])
                 && self.blocks[index].kind == kind
+                && self.blocks[index].title == title
+                && self.blocks[index].turn_id == turn
                 && self.blocks[index].runtime_attribution == attribution
             {
                 index += 1;
@@ -438,6 +450,15 @@ impl Transcript {
             self.blocks[start].group = GroupRole::Head { hidden };
             for member in &mut self.blocks[start + 1..index] {
                 member.group = GroupRole::Member;
+            }
+        }
+        for (index, old) in previous.into_iter().enumerate() {
+            if old != self.blocks[index].group {
+                self.keys[index] = self.blocks[index].content_key();
+                self.invalidate(index);
+                if index > 0 {
+                    self.invalidate(index - 1);
+                }
             }
         }
     }
@@ -568,8 +589,20 @@ impl Transcript {
         if !block.collapsible {
             return false;
         }
-        block.expanded = !block.expanded;
-        self.invalidate(index);
+        let expanded = !block.expanded;
+        let count = match block.group {
+            GroupRole::Head { hidden } => hidden + 1,
+            _ => 1,
+        };
+        for member in index..(index + count).min(self.blocks.len()) {
+            self.blocks[member].expanded = expanded;
+            self.keys[member] = self.blocks[member].content_key();
+            self.invalidate(member);
+        }
+        self.apply_grouping();
+        if index > 0 {
+            self.invalidate(index - 1);
+        }
         true
     }
 
@@ -581,9 +614,14 @@ impl Transcript {
             }
             if self.blocks[index].expanded != expanded {
                 self.blocks[index].expanded = expanded;
+                self.keys[index] = self.blocks[index].content_key();
                 self.invalidate(index);
+                if index > 0 {
+                    self.invalidate(index - 1);
+                }
             }
         }
+        self.apply_grouping();
     }
 
     /// Whether every collapsible block is currently open.
@@ -601,6 +639,13 @@ impl Transcript {
         self.rendered.remove(&index);
         self.recency.retain(|value| *value != index);
         self.layout_valid = false;
+    }
+
+    fn next_visible_block(&self, index: usize) -> Option<&Block> {
+        self.blocks
+            .iter()
+            .skip(index + 1)
+            .find(|block| block.group != GroupRole::Member)
     }
 
     fn ensure_layout(&mut self) {
@@ -640,7 +685,7 @@ impl Transcript {
         if matches!(block.group, GroupRole::Member) {
             return 0;
         }
-        let next = self.blocks.get(index + 1);
+        let next = self.next_visible_block(index);
         let gap = gap_after(block, next);
         let available = self.width.max(8);
         let dense = is_dense_row(block.kind);
@@ -656,12 +701,8 @@ impl Transcript {
             TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
         ) && !block.body.is_empty();
         let header = usize::from(!headerless);
-        let body_lines = if block.body.is_empty() || (dense && !open && !block.streaming) {
-            // A dense row's body is behind the fold, and a streaming one shows a
-            // single live line rather than the whole body.
+        let body_lines = if block.body.is_empty() || (dense && !open) {
             0
-        } else if dense && !open {
-            1
         } else if open || block.streaming {
             // Count newlines plus a wrap allowance per line.
             let explicit = block.body.matches('\n').count() + 1;
@@ -670,9 +711,9 @@ impl Transcript {
         } else {
             COLLAPSED_BODY_LINES.min(block.body.matches('\n').count() + 1)
         };
-        let status = usize::from(block.failed && block.kind != TimelineRowKind::Error)
+        let status = usize::from(block.failed && !dense && block.kind != TimelineRowKind::Error)
             + usize::from(block.pending_permission)
-            + usize::from(block.runtime_attribution.is_some() && !dense);
+            + usize::from(block.runtime_attribution.is_some() && block.expanded);
         (header + body_lines + status + gap).max(1)
     }
 
@@ -742,7 +783,7 @@ impl Transcript {
         };
         // The successor decides the separator, so a run of tool calls renders
         // as a list rather than as a stack of sections.
-        let next = self.blocks.get(index + 1).cloned();
+        let next = self.next_visible_block(index).cloned();
         let prose = if matches!(block.kind, TimelineRowKind::UserMessage) {
             theme.base()
         } else {
@@ -1436,7 +1477,6 @@ fn is_markdown(kind: TimelineRowKind) -> bool {
     matches!(
         kind,
         TimelineRowKind::AgentMessage
-            | TimelineRowKind::UserMessage
             | TimelineRowKind::Reasoning
             | TimelineRowKind::Plan
             | TimelineRowKind::Error
@@ -1515,22 +1555,22 @@ pub fn is_work_item(kind: TimelineRowKind) -> bool {
 }
 
 /// The leading mark a work item carries on its first line.
-fn bullet(
-    kind: TimelineRowKind,
-    theme: &TuiTheme,
-    collapsed: bool,
-) -> Option<(&'static str, Style)> {
-    if !is_work_item(kind) {
+fn bullet(block: &Block, theme: &TuiTheme) -> Option<(&'static str, Style)> {
+    if !is_work_item(block.kind) {
         return None;
     }
-    let unicode = theme.glyphs() == crate::theme::GlyphMode::Unicode;
-    let glyph = if unicode { "⏺" } else { "*" };
-    // A collapsed item recedes: it is context for the conversation, not part of
-    // it, so it drops a grey step rather than keeping full contrast.
-    let color = if collapsed {
-        theme.roles.gray
+    let tier = crate::glyphs::GlyphTier::of(theme);
+    let glyph = if block.failed {
+        crate::glyphs::ballot_x(tier)
     } else {
-        theme.roles.gray_bright
+        crate::glyphs::disclosure(block.expanded, tier)
+    };
+    let color = if block.failed {
+        theme.roles.danger
+    } else if block.streaming {
+        theme.roles.accent_running
+    } else {
+        theme.roles.gray
     };
     Some((glyph, Style::default().fg(color)))
 }
@@ -1598,6 +1638,12 @@ fn shows_kind_label(kind: TimelineRowKind, title: &str, label: &str) -> bool {
 /// printing the payload turns every row into a wall of JSON, so the *action* is
 /// what the row shows.
 fn dense_summary(block: &Block) -> Option<String> {
+    if block.kind == TimelineRowKind::Reasoning {
+        return None;
+    }
+    if let Some(path) = &block.file_path {
+        return Some(path.clone());
+    }
     let body = block.body.trim();
     if body.is_empty() {
         return None;
@@ -1640,7 +1686,7 @@ fn is_tool_item(kind: TimelineRowKind) -> bool {
 /// is not JSON (already-rendered output, a plain command) is its own summary.
 fn tool_action(body: &str) -> String {
     let trimmed = body.trim();
-    if !trimmed.starts_with('{') {
+    if !trimmed.starts_with(['{', '[', '<']) {
         return trimmed
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -1648,8 +1694,13 @@ fn tool_action(body: &str) -> String {
             .trim()
             .to_string();
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return trimmed.to_string();
+    // A call body can contain input followed by output. Decode just the first
+    // value; incomplete or unknown payloads stay in the expandable details.
+    let Some(Ok(value)) = serde_json::Deserializer::from_str(trimmed)
+        .into_iter::<serde_json::Value>()
+        .next()
+    else {
+        return String::new();
     };
     const FIELDS: [&str; 7] = [
         "command",
@@ -1678,40 +1729,7 @@ fn tool_action(body: &str) -> String {
             return text.to_string();
         }
     }
-    // Nothing recognisable: the payload as it came, on one line.
-    trimmed.lines().next().unwrap_or_default().to_string()
-}
-
-/// The newest line of a body that is still arriving.
-///
-/// Prose is read forwards, so the head of a thought still being written is not
-/// a summary of it — but the *tail* says what the model is doing right now,
-/// which is the only question a running row has to answer.
-fn live_tail(block: &Block) -> Option<String> {
-    let body = block.body.trim_end();
-    if body.is_empty() {
-        return None;
-    }
-    let last = body
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())?
-        .trim();
-    (!last.is_empty()).then(|| last.to_string())
-}
-
-/// The one line a dense row shows while its body is still arriving.
-///
-/// A dense row stays a row: a tool call that dumps its whole output, or a
-/// reasoning block that prints a paragraph at a time, is a wall of text that
-/// buries the rows around it — and the rows around it are what the reader is
-/// scanning for. The full text is one keypress away.
-fn live_row(block: &Block) -> Option<String> {
-    if is_tool_item(block.kind) {
-        dense_summary(block)
-    } else {
-        live_tail(block)
-    }
+    String::new()
 }
 
 /// The blank rows that follow a block.
@@ -1818,7 +1836,7 @@ pub fn render_block_with_attribution(
         _ => theme.base(),
     };
     let mut parts: Vec<(String, Style)> = Vec::new();
-    if let Some((glyph, style)) = bullet(block.kind, theme, !block.is_open()) {
+    if let Some((glyph, style)) = bullet(block, theme) {
         parts.push((format!("{glyph} "), style));
     }
     if shows_kind_label(block.kind, &block.title, label) {
@@ -1841,12 +1859,18 @@ pub fn render_block_with_attribution(
             style,
         )
     } else {
-        (block.title.clone(), title_style)
+        (
+            if block.kind == TimelineRowKind::Reasoning {
+                label.to_string()
+            } else {
+                block.title.clone()
+            },
+            title_style,
+        )
     };
     parts.push((heading, title_style));
     // The one detail that identifies a dense row, dimmed beside its title.
-    // A streaming block never carries one: its body *is* the answer, and the
-    // summary would be the first line of a sentence still being written.
+    // Its shape is independent of whether the work is still running.
     if let GroupRole::Head { hidden } = block.group
         && hidden > 0
     {
@@ -1856,11 +1880,19 @@ pub fn render_block_with_attribution(
     }
     if dense
         && !open
-        && !block.streaming
         && !matches!(block.kind, TimelineRowKind::SystemNotice)
         && let Some(summary) = dense_summary(block)
     {
-        parts.push((format!("  {summary}"), theme.dimmed(theme.roles.gray_dim)));
+        parts.push((
+            format!(
+                "  {}",
+                summary.split_whitespace().collect::<Vec<_>>().join(" ")
+            ),
+            theme.muted(),
+        ));
+    }
+    if dense && block.failed {
+        parts.push((format!("  {}", strings.failed()), theme.danger()));
     }
     if block.collapsible && !block.expanded && !dense {
         parts.push((
@@ -1903,47 +1935,38 @@ pub fn render_block_with_attribution(
     }
 
     // A dense row is one row: its body is what the fold is for, and the detail
-    // overlay can show all of it. A streaming dense row is still one row — its
-    // newest line, so the reader can see it working without the session turning
-    // into a wall of text. An answer arriving (not dense) is different: it *is*
-    // the content, so it renders as it is written.
+    // overlay can show all of it. Messages render every arriving line; work
+    // records keep the same shape until the reader expands them.
     let shows_body = !body.is_empty() && (!dense || open);
-    let live_line = (dense && !open && block.streaming)
-        .then(|| live_row(block))
-        .flatten();
-    if shows_body || live_line.is_some() {
-        // A lifted band behind a work body separates blocks that sit next to
-        // each other without spending a row on a separator.
+    if shows_body {
         let body_background = body_band(block, theme);
-        // A reader's own words stay at full brightness; an Agent's answer is
-        // set one step down so its headings, emphasis and code have somewhere
-        // to stand.
-        let prose = if matches!(block.kind, TimelineRowKind::UserMessage) {
+        let prose = if block.kind == TimelineRowKind::UserMessage {
             theme.base()
         } else {
             theme.prose()
         };
-        let mut rendered = if shows_body {
-            match streamed {
-                Some(rendered) => rendered.clone(),
-                None if is_markdown(block.kind) => {
-                    crate::markdown::render_markdown_with(body, theme, body_width, strings, prose)
-                }
-                None => render_plain(body, theme, body_width),
+        let mut rendered = match streamed {
+            Some(rendered) => rendered.clone(),
+            None if is_markdown(block.kind) => {
+                crate::markdown::render_markdown_with(body, theme, body_width, strings, prose)
             }
-        } else {
-            // The live line of a row that is still arriving: one row, so the
-            // transcript keeps its shape while the work happens.
-            match live_line {
-                Some(text) => crate::markdown::RenderedMarkdown {
-                    lines: vec![Line::from(Span::raw(text.clone()))],
-                    plain: vec![text],
-                },
-                None => crate::markdown::RenderedMarkdown {
-                    lines: Vec::new(),
-                    plain: Vec::new(),
-                },
+            None if block.kind == TimelineRowKind::UserMessage => {
+                let plain = crate::text::wrap_source_text(body, body_width)
+                    .into_iter()
+                    .map(|row| row.text)
+                    .collect::<Vec<_>>();
+                let lines = plain
+                    .iter()
+                    .map(|text| {
+                        Line::from(Span::styled(
+                            text.clone(),
+                            theme.base().bg(theme.roles.surface_raised),
+                        ))
+                    })
+                    .collect();
+                crate::markdown::RenderedMarkdown { lines, plain }
             }
+            None => render_plain(body, theme, body_width),
         };
         let style = body_style(block, theme);
         // Markdown separates paragraphs with a blank row, including the last
@@ -1959,7 +1982,7 @@ pub fn render_block_with_attribution(
         }
         // Fold before wrapping: a collapsed block must not pay for the lines it
         // is not going to show.
-        if !open && rendered.height() > COLLAPSED_BODY_LINES {
+        if !open && !block.streaming && rendered.height() > COLLAPSED_BODY_LINES {
             rendered.lines.truncate(COLLAPSED_BODY_LINES);
             rendered.plain.truncate(COLLAPSED_BODY_LINES);
         }
@@ -1971,6 +1994,7 @@ pub fn render_block_with_attribution(
             if let Some(background) = body_background {
                 styled = styled.style(background);
             }
+            let row_style = styled.style;
             let mut spans = styled.spans;
             let mut text = text;
             if index == 0
@@ -1984,12 +2008,16 @@ pub fn render_block_with_attribution(
                 spans = marked;
                 text = format!("{glyph} {text}");
             }
+            if index > 0 && prompt_mark.is_some() {
+                spans.insert(0, Span::raw("  "));
+                text = format!("  {text}");
+            }
             let marker = if index == 0 && selected {
                 pointer_glyph(theme)
             } else {
                 " "
             };
-            let mut row = row_line(marker, spans);
+            let mut row = row_line(marker, spans).style(row_style);
             if index == 0 && selected {
                 row = row.style(Style::default().bg(theme.roles.surface_highlight));
             }
@@ -2001,7 +2029,7 @@ pub fn render_block_with_attribution(
     let mut status = Vec::new();
     // An Error block already says it failed; repeating the word on its own row
     // adds a line without adding information.
-    if block.failed && block.kind != TimelineRowKind::Error {
+    if block.failed && !dense && block.kind != TimelineRowKind::Error {
         status.push((strings.failed().to_string(), theme.danger()));
     }
     if block.pending_permission {
@@ -2012,26 +2040,13 @@ pub fn render_block_with_attribution(
     }
     // The reader's own message has no runtime: they wrote it, and naming the
     // Agent under their words says the opposite of what happened.
-    let attributed = show_attribution && block.kind != TimelineRowKind::UserMessage;
+    let attributed =
+        show_attribution && block.kind != TimelineRowKind::UserMessage && block.expanded;
     if let Some(runtime) = block.runtime_attribution.as_ref().filter(|_| attributed) {
-        // Attribution rides the header of a dense row rather than spending a
-        // row of its own: it is a label, not a sentence.
-        if dense {
-            let text = format!(" [{runtime}]");
-            if let Some(last) = lines.last_mut() {
-                last.spans.push(Span::styled(
-                    text.clone(),
-                    theme.dimmed(theme.roles.gray_dim),
-                ));
-                if let Some(plain) = plain.last_mut() {
-                    plain.push_str(&text);
-                }
-            }
-        } else {
-            status.push((format!("[{runtime}]"), theme.dimmed(theme.roles.gray_dim)));
-        }
+        status.push((format!("[{runtime}]"), theme.muted()));
     }
     for (text, style) in status {
+        let text = truncate_to_width(&text, content_width, "…");
         lines.push(row_line(" ", vec![Span::styled(text.clone(), style)]));
         plain.push(text);
     }
@@ -2068,6 +2083,9 @@ fn row_line(marker: &str, spans: Vec<Span<'static>>) -> Line<'static> {
 /// Soften a rail colour for one frame of the running animation.
 /// The background band a block body sits on, when it benefits from one.
 fn body_band(block: &Block, theme: &TuiTheme) -> Option<Style> {
+    if block.kind == TimelineRowKind::UserMessage {
+        return Some(Style::default().bg(theme.roles.surface_raised));
+    }
     if !block.is_open() {
         return None;
     }
@@ -2096,7 +2114,7 @@ fn body_style(block: &Block, theme: &TuiTheme) -> Style {
             Style::default().fg(theme.roles.gray)
         }
         TimelineRowKind::UserMessage => theme.base(),
-        _ => theme.base(),
+        _ => Style::default(),
     }
 }
 
@@ -2126,7 +2144,11 @@ mod tests {
         Block {
             id: id.to_string(),
             kind,
-            title: format!("{id} title"),
+            title: if is_work_item(kind) {
+                "work".into()
+            } else {
+                format!("{id} title")
+            },
             body: body.to_string(),
             turn_id: Some("turn-1".into()),
             sequence: 1,
@@ -2575,9 +2597,12 @@ mod tests {
         let mut entry = block("a", TimelineRowKind::Command, "cargo test");
         entry.file_path = Some("src/lib.rs".into());
         entry.runtime_attribution = Some("codex".into());
+        // The copied text carries the block's own title, whatever the row's
+        // kind decides that title is.
+        let title = entry.title.clone();
         transcript.set_blocks(vec![entry]);
         let text = transcript.block_text(0).unwrap();
-        assert!(text.contains("a title"));
+        assert!(text.contains(&title), "{text}");
         assert!(text.contains("cargo test"));
         let metadata = transcript.block_metadata(0).unwrap();
         assert!(metadata.contains("kind=command"));
@@ -2650,10 +2675,10 @@ mod tests {
             entry.collapsible = false;
             render_block(&entry, &palette, 60, strings()).plain[0].clone()
         };
-        assert!(with_bullet(TimelineRowKind::ToolCall).starts_with('⏺'));
-        assert!(with_bullet(TimelineRowKind::Reasoning).starts_with('⏺'));
-        assert!(!with_bullet(TimelineRowKind::AgentMessage).starts_with('⏺'));
-        assert!(!with_bullet(TimelineRowKind::UserMessage).starts_with('⏺'));
+        assert!(with_bullet(TimelineRowKind::ToolCall).starts_with('▸'));
+        assert!(with_bullet(TimelineRowKind::Reasoning).starts_with('▸'));
+        assert!(!with_bullet(TimelineRowKind::AgentMessage).starts_with('▸'));
+        assert!(!with_bullet(TimelineRowKind::UserMessage).starts_with('▸'));
     }
 
     #[test]
@@ -2801,6 +2826,89 @@ mod density_tests {
         )
     }
 
+    #[test]
+    fn expanded_groups_survive_updates_and_collapse_back_to_one_row() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let rows = (0..4)
+            .map(|index| {
+                item(
+                    &format!("tool-{index}"),
+                    TimelineRowKind::ToolCall,
+                    &format!("cargo test package-{index}"),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        transcript.set_blocks(rows.clone());
+        let collapsed = transcript.visible_lines(ScrollState::default(), 40, &theme(), strings());
+        assert!(collapsed.iter().any(|line| line.to_string().contains("+3")));
+        assert!(transcript.toggle_block(0));
+        let mut updated = rows;
+        updated[2].body.push_str("\nall tests passed");
+        updated[2].streaming = false;
+        transcript.set_blocks(updated);
+        let expanded = transcript.visible_lines(ScrollState::default(), 40, &theme(), strings());
+        for index in 0..4 {
+            assert!(
+                expanded
+                    .iter()
+                    .any(|line| line.to_string().contains(&format!("package-{index}")))
+            );
+        }
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.to_string().contains("all tests passed"))
+        );
+        transcript.toggle_all(false);
+        let folded = transcript.visible_lines(ScrollState::default(), 40, &theme(), strings());
+        assert_eq!(folded.len(), collapsed.len());
+        assert_eq!(transcript.total_height(), folded.len());
+    }
+
+    #[test]
+    fn different_actions_turns_and_failures_cannot_hide_inside_a_group() {
+        let mut rows = (0..4)
+            .map(|index| {
+                item(
+                    &format!("t{index}"),
+                    TimelineRowKind::ToolCall,
+                    "detail",
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows[1].title = "edit".into();
+        rows[2].failed = true;
+        rows[3].turn_id = Some("next-turn".into());
+        let mut transcript = Transcript::new();
+        transcript.set_blocks(rows);
+        assert!(
+            transcript
+                .blocks()
+                .iter()
+                .all(|block| block.group == GroupRole::Solo)
+        );
+    }
+
+    #[test]
+    fn user_text_keeps_literal_syntax_spacing_and_hanging_indent() {
+        let row = item(
+            "user",
+            TimelineRowKind::UserMessage,
+            "# heading  **literal**\n第二行文字 abcdefghijklmnopqrstuvwxyz",
+            false,
+        );
+        let rendered = render_block(&row, &theme(), 30, strings());
+        assert!(rendered.plain[0].contains("# heading  **literal**"));
+        assert!(rendered.plain[1].starts_with("  第二行"));
+        for line in rendered.lines.iter().take(rendered.height - 1) {
+            assert_eq!(line.style.bg, Some(theme().roles.surface_raised));
+            assert!(line.width() <= 30);
+        }
+    }
+
     fn item(id: &str, kind: TimelineRowKind, body: &str, streaming: bool) -> Block {
         Block {
             id: id.to_string(),
@@ -2826,78 +2934,37 @@ mod density_tests {
     }
 
     #[test]
-    fn a_work_item_that_is_still_arriving_stays_one_row() {
-        // The reader is scanning the rows, not reading the work: a reasoning
-        // block that prints itself a paragraph at a time, or a tool call that
-        // dumps its whole output, is a wall of text with the conversation
-        // buried in it.
-        let long = "first thought\nsecond thought\nthird thought\nfourth thought";
-        let streaming = item("r1", TimelineRowKind::Reasoning, long, true);
-        let rendered = render_block(&streaming, &theme(), 60, strings());
-        // Header, one live line, and the gap that follows a block.
-        assert_eq!(
-            rendered.height, 3,
-            "header plus one live line: {rendered:?}"
-        );
-        assert!(
-            rendered.plain[1].contains("fourth thought"),
-            "the live line is not the newest one: {:?}",
-            rendered.plain
-        );
-        assert!(
-            !rendered
-                .plain
-                .iter()
-                .any(|line| line.contains("first thought")),
-            "the whole thought is on screen: {:?}",
-            rendered.plain
-        );
-
-        // A tool call shows its action, and its payload stays behind the fold.
-        let tool = item(
-            "t1",
-            TimelineRowKind::ToolCall,
-            r#"{"command":"cargo test -p vibex-tui","description":"Run the tests"}"#,
-            true,
-        );
-        let rendered = render_block(&tool, &theme(), 60, strings());
-        assert_eq!(rendered.height, 3);
-        assert!(
-            rendered.plain[1].contains("cargo test -p vibex-tui"),
-            "{:?}",
-            rendered.plain
-        );
-        assert!(
-            !rendered.plain[1].contains("description"),
-            "the payload leaked into the row: {:?}",
-            rendered.plain
-        );
-
-        // Once it has stopped, the row is its summary and nothing else.
-        let settled = item(
-            "t1",
-            TimelineRowKind::ToolCall,
-            r#"{"command":"ls"}"#,
-            false,
-        );
-        assert_eq!(
-            render_block(&settled, &theme(), 60, strings()).height,
-            2,
-            "a finished work item is its summary and nothing else"
-        );
-
-        // The whole of it is one keypress away.
-        let mut opened = streaming;
-        opened.expanded = true;
-        let rendered = render_block(&opened, &theme(), 60, strings());
-        assert!(
-            rendered
-                .plain
-                .iter()
-                .any(|line| line.contains("first thought")),
-            "expanding lost the body: {:?}",
-            rendered.plain
-        );
+    fn work_rows_keep_their_shape_when_the_turn_finishes() {
+        for (kind, body) in [
+            (
+                TimelineRowKind::Reasoning,
+                "first thought\nsecond thought\nlast thought",
+            ),
+            (
+                TimelineRowKind::ToolCall,
+                r#"{"command":"cargo test","description":"Run tests"}"#,
+            ),
+        ] {
+            let mut row = item("work", kind, body, true);
+            let running = render_block(&row, &theme(), 60, strings());
+            row.streaming = false;
+            let completed = render_block(&row, &theme(), 60, strings());
+            assert_eq!(running.plain, completed.plain);
+            assert_eq!(running.height, 2);
+            assert!(!running.text().contains("first thought"));
+            assert!(!running.text().contains("description"));
+            row.expanded = true;
+            let expanded = render_block(&row, &theme(), 60, strings());
+            assert!(
+                expanded
+                    .text()
+                    .contains(if kind == TimelineRowKind::Reasoning {
+                        "first thought"
+                    } else {
+                        "description"
+                    })
+            );
+        }
     }
 
     #[test]
@@ -2943,11 +3010,17 @@ mod density_tests {
         assert_eq!(action(r#"{"command":["git","diff"]}"#), "git diff");
         // Not JSON, or nothing recognisable: the first line as it came.
         assert_eq!(action("cargo test -p vibex-tui"), "cargo test -p vibex-tui");
-        assert_eq!(action(r#"{"unknown":"kept"}"#), r#"{"unknown":"kept"}"#);
+        assert_eq!(action(r#"{"unknown":"kept"}"#), "");
+        assert_eq!(action(r#"{"command":"partial"#), "");
+        assert_eq!(action("<path>/tmp/a.rs</path>"), "");
+        assert_eq!(
+            action("{\"command\":\"cargo test\"}\n42 tests passed"),
+            "cargo test"
+        );
     }
 
     #[test]
-    fn a_run_names_the_runtime_once() {
+    fn attribution_is_available_in_details_without_repeating_on_collapsed_rows() {
         // Three words repeated on every row of a session is noise; the row where
         // the runtime *changes* is the one that says something.
         let attribution = Some("DeepSeek Harness · bai · deepseek-v4.1-flash".to_string());
@@ -2970,7 +3043,14 @@ mod density_tests {
             .iter()
             .filter(|line| line.to_string().contains("DeepSeek Harness"))
             .count();
-        assert_eq!(named, 1, "the runtime is named on every row");
+        assert_eq!(named, 0, "collapsed rows repeat runtime metadata");
+        transcript.toggle_block(0);
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("DeepSeek Harness"))
+        );
 
         // A switch is worth a row: the name reappears where it changes.
         let mut blocks = transcript.blocks().to_vec();

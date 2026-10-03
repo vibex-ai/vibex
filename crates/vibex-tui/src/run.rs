@@ -153,7 +153,8 @@ fn event_loop(
 
         // ---- worker results ----------------------------------------------
         let mut handled = 0usize;
-        while handled < 64 {
+        let results_started = Instant::now();
+        while handled < 64 && results_started.elapsed() < INPUT_BATCH_BUDGET {
             match messages.try_recv() {
                 Ok(message) => {
                     handled += 1;
@@ -940,6 +941,21 @@ fn handle_composer_key(
             if app.completion.is_some() {
                 let outcome = app.perform(Intent::CompletionPrevious);
                 dispatch_all(worker, &outcome);
+            } else if app.composer.is_empty()
+                && app.page == Page::Agent
+                && !app.transcript.is_empty()
+            {
+                // An empty editor hands Up to the last visible transcript row.
+                app.focus = Focus::Main;
+                let index = app
+                    .transcript
+                    .blocks()
+                    .iter()
+                    .rposition(|block| block.group != crate::transcript::GroupRole::Member)
+                    .unwrap_or(0);
+                app.set_selection(crate::keymap::Scope::Agent, index);
+                app.scroll.follow = false;
+                app.scroll.offset = app.transcript.offset_of_block(index);
             } else {
                 app.composer.move_up();
                 app.refresh_completion();
@@ -1167,6 +1183,21 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             let Some((line, column)) = mouse_cell(app, mouse.column, mouse.row) else {
                 return false;
             };
+            if let Some(index) = app.transcript.block_at_line(line)
+                && app.transcript.line_of_block(index) == line
+                && app.transcript.block(index).is_some_and(|block| {
+                    block.collapsible && crate::transcript::is_dense_row(block.kind)
+                })
+            {
+                app.clear_text_selection();
+                app.focus = Focus::Main;
+                app.set_selection(crate::keymap::Scope::Agent, index);
+                app.scroll.follow = false;
+                app.scroll.offset = app.transcript.scroll_offset();
+                let outcome = app.perform(crate::action::Intent::ToggleBlockExpanded);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
             let now = Instant::now();
             let double_click = app.last_click.is_some_and(|(at, last_line, last_column)| {
                 now.duration_since(at) < DOUBLE_CLICK && last_line == line && last_column == column
@@ -1983,6 +2014,9 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     // continue applying deltas across the gap.
                     app.live = LiveState::Reconnecting;
                     app.toast(Toast::info(app.strings.reconnecting().to_string()));
+                    if let Some(effect) = app.refresh_timeline() {
+                        worker.dispatch(effect);
+                    }
                 }
                 vibex_ui::AgentEventDecision::Disconnected => {
                     app.live = LiveState::Offline;

@@ -586,9 +586,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if Bands::is_visible(bands.prompt) {
         render_prompt(frame, bands.prompt, app, &theme, strings);
     }
-    if Bands::is_visible(bands.status_line) {
-        render_status_line(frame, bands.status_line, app, &theme, strings);
-    }
     render_shortcuts(frame, bands.shortcuts, app, &theme);
 
     if let Some(overlay) = app.overlay.clone() {
@@ -658,9 +655,7 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         prompt: 0,
         prompt_gap: u16::from(app.page.is_session_page()),
         shortcuts: 1,
-        status_line: u16::from(
-            app.settings.status_line && app.page.is_session_page() && app.viewport.1 > 24,
-        ),
+        status_line: 0,
     }
 }
 
@@ -683,8 +678,7 @@ fn composer_height(app: &App, width: u16) -> u16 {
         .composer
         .display_row_count(text_width)
         .min(MAX_COMPOSER_DRAFT_ROWS);
-    // Borders (2) + one blank row above the draft + the draft itself. The info
-    // line rides on the bottom border rather than taking a row.
+    // One padding row on each side of the draft, followed by the context line.
     (rows as u16 + 3).max(4)
 }
 
@@ -2068,22 +2062,14 @@ fn render_status_band(
         right.push(span);
     };
 
-    let (live_text, live_color) = match app.live {
-        crate::app::LiveState::Ready => (strings.done(), theme.roles.accent_success),
-        crate::app::LiveState::Connecting => (strings.connecting(), theme.roles.gray),
-        crate::app::LiveState::Reconnecting => (strings.reconnecting(), theme.roles.warning),
-        crate::app::LiveState::Offline => (strings.disconnected(), theme.roles.danger),
+    let connection = match app.live {
+        crate::app::LiveState::Ready => None,
+        crate::app::LiveState::Connecting => Some((strings.connecting(), theme.roles.gray)),
+        crate::app::LiveState::Reconnecting => Some((strings.reconnecting(), theme.roles.warning)),
+        crate::app::LiveState::Offline => Some((strings.disconnected(), theme.roles.danger)),
     };
-    push_segment(
-        &mut right,
-        Span::styled(live_text, Style::default().fg(live_color)),
-    );
-
-    if app.focus == crate::app::Focus::Composer {
-        push_segment(
-            &mut right,
-            Span::styled("compose", Style::default().fg(theme.roles.accent_user)),
-        );
+    if let Some((label, color)) = connection {
+        push_segment(&mut right, Span::styled(label, Style::default().fg(color)));
     }
 
     let approvals = app.pending_permission_count();
@@ -2635,48 +2621,30 @@ fn render_composer(
     let focused = app.focus == crate::app::Focus::Composer;
     let running = app.turn_reads_running();
 
-    // Rail colour: the user's own accent when this is where typing lands, the
-    // dim grey otherwise.
     let rail_color = if focused {
         theme.roles.accent_user
     } else {
-        theme.roles.gray_dim
+        theme.roles.gray
     };
-    let border_color = if focused {
-        theme.roles.border_focused
-    } else {
-        theme.roles.gray_dim
+    // A quiet writing surface with padding; context lives below it, so neither
+    // the title nor runtime labels compete with the draft's caret.
+    let input = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
     };
-
-    let title = match app.page {
-        // The box is where a session is born, so it is titled with the page
-        // rather than with the session the reader is about to leave behind.
-        crate::app::Page::NewSession => strings.session_new().to_string(),
-        _ => app
-            .active_session()
-            .map(|session| session.title.clone())
-            .unwrap_or_else(|| strings.product_tagline().to_string()),
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(theme.roles.surface_raised)),
+        input,
+    );
+    let text_area = Rect {
+        x: input.x + 1,
+        y: input.y + 1,
+        width: input.width.saturating_sub(2),
+        height: input.height.saturating_sub(2),
     };
-
-    let block = bordered(theme)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(theme.roles.gray),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 {
+    if text_area.height == 0 {
         return;
     }
-
-    // One blank row above the draft. It is what makes the box read as a place
-    // to write rather than as a one-line field with a border.
-    let text_area = Rect {
-        y: inner.y.saturating_add(1),
-        height: inner.height.saturating_sub(1),
-        ..inner
-    };
 
     let prompt_width = crate::glyphs::PROMPT_ARROW_WIDTH;
     let width = usize::from(text_area.width).saturating_sub(prompt_width);
@@ -2717,7 +2685,7 @@ fn render_composer(
                 Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(
                     truncate_to_width(&placeholder, width, "…"),
-                    Style::default().fg(theme.roles.gray_dim),
+                    Style::default().fg(theme.roles.gray),
                 ),
             ])),
             text_area,
@@ -2744,13 +2712,7 @@ fn render_composer(
                 } else {
                     Span::raw(" ".repeat(prompt_width))
                 };
-                // The caret's row is drawn at full strength; the rest of a
-                // long draft recedes so the eye stays where typing happens.
-                let style = if index == usize::from(caret.0) {
-                    theme.base()
-                } else {
-                    theme.base().add_modifier(Modifier::DIM)
-                };
+                let style = theme.base().bg(theme.roles.surface_raised);
                 let mut spans = vec![gutter];
                 spans.extend(composer_line_spans(
                     &row.text,
@@ -2778,9 +2740,7 @@ fn render_composer(
         }
     }
 
-    // The info line is painted onto the bottom border. The rule continues
-    // around it, so the composer keeps a single clean outline while still
-    // carrying context -- a row of chrome that would otherwise be spent on `─`.
+    // Runtime context sits below the padded writing surface.
     if area.height >= 2 {
         let bottom = Rect {
             y: area.y + area.height - 1,
@@ -2788,7 +2748,7 @@ fn render_composer(
             width: area.width.saturating_sub(2),
             height: 1,
         };
-        render_composer_info(frame, bottom, app, theme, strings, focused, running);
+        render_composer_info(frame, bottom, app, theme, strings);
     }
 
     if let Some(menu) = app.completion.clone() {
@@ -2921,202 +2881,61 @@ fn render_composer_info(
     app: &App,
     theme: &TuiTheme,
     strings: Strings,
-    focused: bool,
-    running: bool,
 ) {
     if area.height == 0 {
         return;
     }
-    // A middot rather than a rule: the info line is prose about the session, not
-    // another set of columns, and a horizontal separator would read as chrome.
-    let sep = |theme: &TuiTheme| {
-        Span::styled(
-            " · ",
-            Style::default().fg(if focused {
-                theme.roles.gray_dim
-            } else {
-                theme.fade(theme.roles.gray_dim, 0.5)
-            }),
-        )
-    };
-    let flag = |theme: &TuiTheme| {
-        Style::default().fg(if focused {
-            theme.roles.gray
-        } else {
-            theme.fade(theme.roles.gray, 0.55)
-        })
-    };
-
-    let mut line = Vec::new();
-    // How the Agent runs, not only which one it is: the values the reader set
-    // on the switcher's run options ride beside the runtime they belong to, so
-    // "what will this message be sent through" is answered without opening it.
-    let run_options = app.composer_run_option_labels();
-    let push_run_options = |line: &mut Vec<Span<'static>>| {
-        for label in &run_options {
-            line.push(sep(theme));
-            line.push(Span::styled(label.clone(), flag(theme)));
-        }
-    };
-    // Model identity: the session's own, or — on the page where a session is
-    // being written — the one the new message would be sent through, because
-    // choosing it is what that page is for. The *page* decides, not whether a
-    // session happens to be selected: the composing page keeps the session it
-    // came from selected, and reporting that one here promises an Agent the
-    // message will not go through.
-    if app.page_is_composing() {
-        let (agent, model) = app.composer_runtime_labels();
-        line.push(Span::styled(
-            agent,
-            flag(theme).add_modifier(Modifier::BOLD),
-        ));
-        if !model.is_empty() {
-            line.push(sep(theme));
-            line.push(Span::styled(model, flag(theme)));
-        }
-        push_run_options(&mut line);
-        line.push(sep(theme));
-        line.push(Span::styled(
-            strings.runtime_switch_hint().to_string(),
-            flag(theme),
-        ));
-    } else if let Some(session) = app.active_session().or_else(|| {
-        // The row the list holds for the open session answers while the
-        // session's own copy is still on its way: naming the Agent it
-        // records is better than an empty line.
-        app.selected_session_id()
-            .and_then(|session_id| app.session_by_id(session_id))
-    }) {
-        // The Agent and model the draft will actually be sent through. The
-        // catalogue's first entry is *not* that: a session keeps its own
-        // runtime until the reader switches it, so naming the default here
-        // would misreport every session that is not on it.
-        let current = app.current_runtime_option_index().and_then(|index| {
-            app.runtime_options
-                .as_ref()
-                .and_then(|catalog| catalog.options.get(index))
-        });
-        match current {
-            Some(option) => {
-                line.push(Span::styled(
-                    option.agent_label.clone(),
-                    flag(theme).add_modifier(Modifier::BOLD),
-                ));
-                line.push(sep(theme));
-                line.push(Span::styled(
-                    format!("{}/{}", option.auth_source_label, option.model_label),
-                    flag(theme),
-                ));
-            }
-            // No catalogue entry to read labels from: the session's own
-            // selection still names the Agent and the model, so say what is
-            // known rather than guessing at the rest.
-            None => {
-                line.push(Span::styled(
-                    app.session_runtime_selection()
-                        .map(|selection| selection.agent_id.to_string())
-                        .unwrap_or_else(|| session.agent_id.to_string()),
-                    flag(theme).add_modifier(Modifier::BOLD),
-                ));
-                if let Some(model) = app
-                    .session_runtime_selection()
-                    .and_then(|selection| selection.model.model_id())
-                {
-                    line.push(sep(theme));
-                    line.push(Span::styled(model.to_string(), flag(theme)));
-                }
-            }
-        }
-        // The switch has to be legible from where the reader is looking: the
-        // line already names the runtime, so it also names the key that moves it.
-        // A backend that cannot honour the key explains itself with a toast
-        // rather than silently dropping the entry point.
-        push_run_options(&mut line);
-        line.push(sep(theme));
-        line.push(Span::styled(
-            strings.runtime_switch_hint().to_string(),
-            flag(theme),
-        ));
-    } else {
-        // No session yet: name the page, which is the only true context there is.
-        let page = match app.page {
-            Page::Agent => strings.nav_agent(),
-            Page::Files => strings.nav_files(),
-            Page::Changes => strings.nav_changes(),
-            Page::Terminal => strings.nav_terminal(),
-            Page::Sessions => strings.nav_sessions(),
-            Page::Management => strings.nav_management(),
-            Page::Usage => strings.nav_usage(),
-            Page::Settings => strings.nav_settings(),
-            Page::Help => strings.nav_help(),
-            _ => strings.nav_management(),
-        };
-        line.push(Span::styled(page.to_string(), flag(theme)));
+    let (agent, model) = app.composer_runtime_labels();
+    let mut left = vec![Span::styled(agent, theme.muted())];
+    if !model.is_empty() {
+        left.push(Span::styled(format!(" · {model}"), theme.base()));
     }
-    // A continuation counting down is drawn where the reader is looking when
-    // they are inside the session — the Desktop puts the same seconds on its
-    // composer — so a message that is about to be sent on its own never
-    // arrives unannounced. A page writing a new session has no session whose
-    // continuation it could be.
+    for option in app.composer_run_option_labels() {
+        left.push(Span::styled(format!(" · {option}"), theme.muted()));
+    }
     if let Some(seconds) = app
         .page_session_id()
-        .and_then(|session_id| app.auto_continue.countdown_seconds(session_id))
+        .and_then(|id| app.auto_continue.countdown_seconds(id))
     {
-        line.push(sep(theme));
-        line.push(Span::styled(
-            format!("↻{seconds}"),
-            Style::default().fg(theme.roles.accent_attention),
-        ));
+        left.push(Span::styled(format!(" · ↻{seconds}"), theme.warning()));
     }
-    if running {
-        line.push(sep(theme));
-        line.push(Span::styled(
-            strings.running().to_string(),
-            Style::default().fg(theme.roles.accent_running),
-        ));
-    }
-    // Attached images are invisible in the draft beyond their labels, so the
-    // info line is where the count becomes a number the reader can check.
     let images = app.composer.image_count();
     if images > 0 {
-        line.push(sep(theme));
-        line.push(Span::styled(
-            format!("🖼 {images} {}", strings.image_count()),
-            flag(theme),
+        left.push(Span::styled(
+            format!(" · {images} {}", strings.image_count()),
+            theme.muted(),
         ));
     }
-    let pending = app.page_approval_count();
-    if pending > 0 {
-        line.push(sep(theme));
-        line.push(Span::styled(
-            format!("⚠ {pending} {}", strings.approval_title()),
-            theme.warning().add_modifier(Modifier::BOLD),
-        ));
+    let mut right = Vec::new();
+    if app.settings.status_line
+        && app.page_owns_session()
+        && let Some(status) = &app.git_status
+    {
+        if let Some(branch) = &status.branch {
+            right.push(Span::styled(branch.clone(), theme.muted()));
+        }
+        if !status.changes.is_empty() {
+            right.push(Span::styled(
+                format!(" · {} {}", status.changes.len(), strings.nav_changes()),
+                theme.warning(),
+            ));
+        }
     }
-    // The mode hints trail the context: the reader who wants them already knows
-    // what the session is, and the reader who does not is not stopped by them.
-    if app.composer.line_count() > 1 {
-        line.push(sep(theme));
-        line.push(Span::styled(
-            strings.settings_keys().to_string(),
-            flag(theme),
-        ));
+    // Keep runtime identity before optional repository information on narrow screens.
+    if left
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum::<usize>()
+        + right
+            .iter()
+            .map(|span| display_width(&span.content))
+            .sum::<usize>()
+        + 3
+        > usize::from(area.width)
+    {
+        right.clear();
     }
-    if focused {
-        line.push(Span::styled(
-            "▏",
-            Style::default().fg(theme.roles.accent_user),
-        ));
-    }
-    line.push(Span::raw(" "));
-
-    // Right-aligned: when the line is wider than the box, ratatui clips the
-    // tail, so a narrow terminal loses the mode hints before it loses the
-    // runtime the message will be sent through.
-    frame.render_widget(
-        Paragraph::new(Line::from(line)).alignment(Alignment::Right),
-        area,
-    );
+    render_zoned_line(frame, area, left, None, right);
 }
 
 /// The completion popup, drawn directly above the composer.
@@ -4577,87 +4396,6 @@ fn category_label(category: crate::keymap::Category, strings: Strings) -> &'stat
     }
 }
 
-/// The bottom status line: a denser second row of context.
-///
-/// The top band answers "where am I and is it alive"; this one answers "what am
-/// I working on": the branch, the model, the context budget and how much is
-/// waiting. It is optional because a terminal that has just lost two rows to it
-/// is a terminal that lost two rows of transcript.
-fn render_status_line(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    let sep = Span::styled(" │ ", Style::default().fg(theme.roles.gray_dim));
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let push = |spans: &mut Vec<Span<'static>>, span: Span<'static>| {
-        if !spans.is_empty() {
-            spans.push(sep.clone());
-        }
-        spans.push(span);
-    };
-    if let Some(status) = app.git_status.as_ref() {
-        let branch = status
-            .branch
-            .clone()
-            .unwrap_or_else(|| "detached".to_string());
-        push(
-            &mut spans,
-            Span::styled(
-                format!(
-                    "{} {branch}",
-                    crate::glyphs::diamond_hollow(app.glyph_tier())
-                ),
-                Style::default().fg(theme.roles.path),
-            ),
-        );
-        if !status.changes.is_empty() {
-            push(
-                &mut spans,
-                Span::styled(
-                    format!("{} {}", status.changes.len(), strings.nav_changes()),
-                    Style::default().fg(theme.roles.accent_attention),
-                ),
-            );
-        }
-    }
-    if let Some(progress) = app.todo_progress() {
-        push(
-            &mut spans,
-            Span::styled(
-                format!("{}/{}", progress.done, progress.total),
-                Style::default().fg(theme.roles.accent_user),
-            ),
-        );
-    }
-    if let Some(context) = context_usage_spans(app, theme) {
-        push(&mut spans, Span::raw(""));
-        spans.pop();
-        if !spans.is_empty() {
-            spans.push(sep.clone());
-        }
-        spans.extend(context);
-    }
-    if !app.queued_messages.is_empty() {
-        push(
-            &mut spans,
-            Span::styled(
-                format!("{} {}", app.queued_messages.len(), strings.composer_queue()),
-                Style::default().fg(theme.roles.gray),
-            ),
-        );
-    }
-    if spans.is_empty() {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.roles.surface)),
-        area,
-    );
-}
-
 /// The key hint bar.
 ///
 /// Keys are drawn bold and bright, labels dim: the key is what the reader is
@@ -4666,56 +4404,70 @@ fn render_status_line(
 /// from the least important end rather than truncating it arbitrarily.
 fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     let scopes = app.documented_scopes();
-    let bindings = app.keymap.advertised(&scopes);
-    let key_style = Style::default()
-        .fg(theme.roles.gray_bright)
-        .add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(theme.roles.gray_dim);
-
+    let strings = app.strings;
+    let mut hints = Vec::new();
+    if app.page.is_session_page() && app.overlay.is_none() {
+        let composing = app.focus == crate::app::Focus::Composer || app.page_is_composing();
+        if composing {
+            hints.push((
+                Intent::SubmitComposer,
+                if app.turn_reads_running() {
+                    strings.composer_queue()
+                } else {
+                    strings.composer_send()
+                },
+            ));
+            hints.push((Intent::InsertNewline, strings.composer_newline()));
+        } else {
+            hints.push((Intent::ToggleBlockExpanded, strings.transcript_expand()));
+            hints.push((Intent::OpenBlockDetails, strings.transcript_details()));
+            hints.push((Intent::FocusComposer, strings.composer_send()));
+        }
+        if app.turn_reads_running() {
+            hints.push((Intent::ContextualCancel, strings.session_stop()));
+        }
+        hints.push((Intent::SwitchAgentRuntime, strings.runtime_title()));
+        hints.push((Intent::FocusNext, strings.transcript_browse()));
+    }
+    for binding in app.keymap.advertised(&scopes) {
+        if let Some(label) = binding.label
+            && !hints.iter().any(|(intent, _)| *intent == binding.intent)
+        {
+            hints.push((binding.intent, label));
+        }
+    }
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1usize;
-    let mut first = true;
-    let budget = usize::from(area.width);
-    for (index, binding) in bindings.iter().enumerate() {
-        let Some(label) = binding.label else { continue };
-        let text = format!("{}:{label}", binding.chord.display());
-        let width = display_width(&text) + 5;
-        // The first few hints are the ones a reader needs most; they are kept
-        // even when the rest would not fit.
-        let pinned = index < PINNED_HINTS;
-        if used + width > budget && !pinned {
-            break;
-        }
-        if used + width > budget {
+    for (intent, label) in hints {
+        let Some(chord) = app.keymap.chord_for(intent) else {
+            continue;
+        };
+        let key = chord.display();
+        let separator = if used == 1 { "" } else { "  ·  " };
+        let width = display_width(&key) + 1 + display_width(label);
+        if used + display_width(separator) + width > usize::from(area.width) {
             continue;
         }
-        used += width;
-        if !first {
-            spans.push(Span::styled(
-                "  │  ",
-                Style::default().fg(theme.roles.gray_dim),
-            ));
-        }
-        first = false;
-        // The band doubles as a menu: a hint is a button whose label is the key
-        // that would do exactly the same thing.
+        spans.push(Span::styled(separator, theme.dimmed(theme.roles.gray_dim)));
+        used += display_width(separator);
         app.regions.hints.push((
             Rect {
-                x: area.x + (used - width + 1) as u16,
+                x: area.x + used as u16,
                 y: area.y,
                 width: width as u16,
                 height: 1,
             },
-            binding.intent,
+            intent,
         ));
-        spans.push(Span::styled(binding.chord.display(), key_style));
-        spans.push(Span::styled(format!(":{label}"), label_style));
+        spans.push(Span::styled(key, theme.muted()));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            theme.dimmed(theme.roles.gray_dim),
+        ));
+        used += width;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
-
-/// How many leading hints survive a narrow terminal.
-const PINNED_HINTS: usize = 3;
 
 /// Compact a token count to at most four characters.
 ///

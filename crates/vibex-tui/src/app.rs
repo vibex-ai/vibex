@@ -3188,6 +3188,16 @@ impl App {
         self.refresh_search_matches();
     }
 
+    /// Repair missing events without navigating or resending a message.
+    pub fn refresh_timeline(&mut self) -> Option<Effect> {
+        if self.agent.state.timeline_status.phase == vibex_ui::AsyncPhase::Loading {
+            return None;
+        }
+        let session_id = self.selected_session_id()?.clone();
+        let ticket = self.agent.begin_session_load(session_id.clone()).ok()?;
+        Some(Effect::OpenSession { session_id, ticket })
+    }
+
     /// Ask for one more page of older history, if there is one to ask for.
     ///
     /// The controller refuses when nothing is selected, when the projection
@@ -4474,7 +4484,8 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
         expanded: false,
         // A dense row shows one line by shape, so it has to be openable to be
         // readable in full: the transcript is where its body lives.
-        collapsible: row.collapsible || crate::transcript::is_dense_row(row.kind),
+        collapsible: row.kind != vibex_desktop_model::TimelineRowKind::AgentMessage
+            && (row.collapsible || crate::transcript::is_dense_row(row.kind)),
         streaming: row.streaming,
         failed: row.failed,
         pending_permission: row.pending_permission || row.turn_pending_permission,
