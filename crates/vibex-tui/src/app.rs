@@ -2909,9 +2909,32 @@ impl App {
 
     pub fn runtime_picker_is_current(&self) -> bool {
         self.runtime_picker_target.as_ref() == Some(&self.runtime_target())
-            && !self
-                .selected_session_id()
-                .is_some_and(|id| self.page_shows_session() && self.session_is_uncreated(id))
+            && !self.page_shows_uncreated_session()
+    }
+
+    /// Whether the page in front of the reader shows a session that does not
+    /// exist yet.
+    ///
+    /// The reader sent the first message of a new session, and what the page
+    /// shows is the identity reserved for it: either the authority has not
+    /// answered with the session it belongs to, or the creation failed and the
+    /// page kept the draft. Nothing that addresses *the session itself* can be
+    /// honoured in that window — it has no runtime to move and no turn to
+    /// interrupt — so every such action has to say which state it is waiting
+    /// for rather than quietly doing nothing.
+    pub fn page_shows_uncreated_session(&self) -> bool {
+        self.selected_session_id()
+            .is_some_and(|id| self.page_shows_session() && self.session_is_uncreated(id))
+    }
+
+    /// Whether the page's reserved session is still being created.
+    ///
+    /// The other half of [`Self::page_shows_uncreated_session`]: a creation
+    /// that failed has stopped waiting for the authority and started waiting
+    /// for the reader.
+    pub fn page_session_is_being_created(&self) -> bool {
+        self.selected_session_id()
+            .is_some_and(|id| self.pending_creations.contains_key(id))
     }
 
     pub fn session_is_uncreated(&self, session_id: &VibexSessionId) -> bool {

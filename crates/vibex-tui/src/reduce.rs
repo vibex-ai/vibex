@@ -2439,10 +2439,18 @@ impl App {
         if let Some(outcome) = self.unavailable_outcome(BackendOperation::AgentSwitchRuntime) {
             return outcome;
         }
-        if self
-            .selected_session_id()
-            .is_some_and(|id| self.page_shows_session() && self.session_is_uncreated(id))
-        {
+        // A session the authority has not created yet has no runtime to move:
+        // the one its creation carries is already on its way. The key bar
+        // advertises `Ctrl+G` here all the same, so the reader who presses it
+        // in that window is told which state they are waiting for instead of
+        // watching the panel fail to appear.
+        if self.page_shows_uncreated_session() {
+            let message = if self.page_session_is_being_created() {
+                self.strings.runtime_session_creating()
+            } else {
+                self.strings.runtime_session_uncreated()
+            };
+            self.toast(Toast::warning(message.to_string()));
             return Outcome::quiet();
         }
         self.runtime_picker_target = Some(self.runtime_target());
@@ -4126,6 +4134,91 @@ mod tests {
             Effect::SwitchRuntime { selection, .. } => Some(selection),
             _ => None,
         })
+    }
+
+    #[test]
+    fn the_switcher_says_why_it_cannot_move_a_session_that_does_not_exist_yet() {
+        // The flow that made `Ctrl+G` look broken: `n`, write, Enter. The page
+        // moves into the new session at once, while the authority is still
+        // creating it — and the key bar advertises the switcher the whole time.
+        // There is no runtime to move yet, so the key has to say which state it
+        // is waiting for rather than opening nothing at all.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("a new thing");
+        let created = app.perform(Intent::SubmitComposer);
+        assert!(
+            created
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CreateSession { .. })),
+            "the creation was not asked for: {created:?}"
+        );
+        assert!(
+            app.page_shows_uncreated_session(),
+            "the page did not move into the creation"
+        );
+        assert!(app.page_session_is_being_created());
+
+        app.toast = None;
+        let refused = app.perform(Intent::SwitchAgentRuntime);
+        assert!(
+            refused.effects.is_empty(),
+            "a session that does not exist was moved: {refused:?}"
+        );
+        assert_eq!(
+            app.overlay, None,
+            "a picker opened for a session that does not exist yet"
+        );
+        let toast = app.toast.as_ref().expect("the refusal was silent");
+        assert_eq!(
+            toast.text,
+            app.strings.runtime_session_creating(),
+            "the refusal named another reason"
+        );
+
+        // The authority answered: the same key opens the switcher again.
+        app.pending_creations.clear();
+        assert!(!app.page_shows_uncreated_session());
+        app.toast = None;
+        app.perform(Intent::SwitchAgentRuntime);
+        assert!(
+            matches!(app.overlay, Some(Overlay::RuntimePicker { .. })),
+            "the switcher stayed closed after the session existed: {:?}",
+            app.overlay
+        );
+    }
+
+    #[test]
+    fn a_creation_that_failed_says_so_instead_of_swallowing_the_key() {
+        // The other half of the same window: the authority refused, and the
+        // page still shows the identity that never became a session.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("a new thing");
+        app.perform(Intent::SubmitComposer);
+        // A follow-up typed while the creation was in flight keeps the page on
+        // the identity that never became a session: there is nothing to
+        // restore it *to*, so it stays where the reader is looking.
+        app.composer.insert_str("and then some");
+        let request_id = app.selected_session_id().cloned().expect("an identity");
+        assert!(app.fail_creation(&request_id));
+        assert!(app.page_shows_uncreated_session());
+        assert!(!app.page_session_is_being_created());
+
+        app.toast = None;
+        let refused = app.perform(Intent::SwitchAgentRuntime);
+        assert!(refused.effects.is_empty(), "{refused:?}");
+        assert_eq!(app.overlay, None);
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some(app.strings.runtime_session_uncreated()),
+            "the refusal named another reason"
+        );
     }
 
     /// The catalogue row one entry is drawn on.

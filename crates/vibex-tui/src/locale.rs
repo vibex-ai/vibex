@@ -535,6 +535,19 @@ strings! {
         "运行时没有可用来新建会话的 Agent",
         "執行階段沒有可用來新增工作階段的 Agent"
     },
+    // The session on screen is one the authority has not created yet, so there
+    // is no runtime to move. Said instead of opening a picker whose Enter could
+    // only fail, and instead of swallowing the key.
+    runtime_session_creating => {
+        "The new session is still being created — its runtime can change once it exists",
+        "新会话还在创建中 — 创建完成后才能切换运行时",
+        "新工作階段仍在建立中 — 建立完成後才能切換執行階段"
+    },
+    runtime_session_uncreated => {
+        "The session could not be created — send the message again to switch its runtime",
+        "会话没有创建成功 — 请重新发送消息后再切换运行时",
+        "工作階段沒有建立成功 — 請重新傳送訊息後再切換執行階段"
+    },
     // The run options the chosen Agent publishes, one Tab away from the
     // catalogue rows.
     runtime_run_options => { "Run options", "运行选项", "執行選項" },
