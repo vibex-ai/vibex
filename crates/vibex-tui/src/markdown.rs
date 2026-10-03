@@ -869,24 +869,44 @@ impl<'a> Builder<'a> {
                 cells[row_index + offset][index] = plain_inlines(cell);
             }
         }
-        // Column widths share the available space, bounded so one wide cell
-        // cannot push the table past the viewport.
-        let separators = columns.saturating_sub(1) * 3 + 2;
-        let budget = self.width.saturating_sub(indent + separators).max(columns);
-        let mut widths = vec![0usize; columns];
+        // Each column owns its padding and a separator; count the closing edge
+        // too, otherwise a full-width table wraps every row's last border.
+        let separators = columns * 3 + 1;
+        let available = self.width.saturating_sub(indent);
+        if available < separators + columns * 3 {
+            // A narrow terminal reads a record vertically. No cell is discarded.
+            for row in cells.iter().skip(offset) {
+                for (index, cell) in row.iter().enumerate() {
+                    let mut logical = Logical::new();
+                    logical.indent = indent;
+                    if offset > 0 {
+                        logical.spans.push(Span::styled(
+                            format!("{}: ", cells[0][index]),
+                            self.theme.strong(),
+                        ));
+                    }
+                    logical.spans.push(Span::styled(cell.clone(), self.prose));
+                    self.push_logical(logical);
+                }
+                self.blank();
+            }
+            return;
+        }
+        let budget = available - separators;
+        let mut widths = vec![3usize; columns];
         for row in &cells {
             for (index, cell) in row.iter().enumerate() {
                 widths[index] = widths[index].max(display_width(cell).min(budget));
             }
         }
-        let total = widths.iter().sum::<usize>();
-        if total > budget {
-            let mut remaining = budget;
-            for width in widths.iter_mut() {
-                let share = (*width * budget / total).max(3);
-                *width = share.min(remaining.max(3));
-                remaining = remaining.saturating_sub(*width);
-            }
+        while widths.iter().sum::<usize>() > budget {
+            let index = widths
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, width)| **width)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            widths[index] -= 1;
         }
         let glyphs = self.theme.glyphs() == crate::theme::GlyphMode::Unicode;
         let (vertical, horizontal) = if glyphs { ("│", "─") } else { ("|", "-") };
@@ -916,28 +936,35 @@ impl<'a> Builder<'a> {
             None,
         );
         for (row_index, row) in cells.iter().enumerate() {
-            let mut spans = vec![Span::styled(format!("{vertical} "), border)];
-            for (index, width) in widths.iter().enumerate() {
-                let cell = row.get(index).map(String::as_str).unwrap_or_default();
-                // Padding is measured in cells: `{:<width$}` counts
-                // characters, which drags a CJK table's columns out of line.
-                let padded = pad_cell(cell, *width, alignments.get(index).copied());
-                let style = if row_index == 0 && header.is_some() {
-                    self.theme.strong()
-                } else {
-                    self.theme.base()
-                };
-                spans.push(Span::styled(padded, style));
-                // The closing edge carries no trailing space: a row must be
-                // exactly as wide as the rule that closes it.
-                let edge = if index + 1 == widths.len() {
-                    format!(" {vertical}")
-                } else {
-                    format!(" {vertical} ")
-                };
-                spans.push(Span::styled(edge, border));
+            let wrapped = row
+                .iter()
+                .zip(&widths)
+                .map(|(cell, width)| wrap_text(cell, *width))
+                .collect::<Vec<_>>();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for line_index in 0..height {
+                let mut spans = vec![Span::styled(format!("{vertical} "), border)];
+                for (index, width) in widths.iter().enumerate() {
+                    let cell = wrapped[index]
+                        .get(line_index)
+                        .map(|line| line.text.as_str())
+                        .unwrap_or_default();
+                    let padded = pad_cell(cell, *width, alignments.get(index).copied());
+                    let style = if row_index == 0 && header.is_some() {
+                        self.theme.strong()
+                    } else {
+                        self.prose
+                    };
+                    spans.push(Span::styled(padded, style));
+                    let edge = if index + 1 == widths.len() {
+                        format!(" {vertical}")
+                    } else {
+                        format!(" {vertical} ")
+                    };
+                    spans.push(Span::styled(edge, border));
+                }
+                self.push_preformatted(indent, spans, None);
             }
-            self.push_preformatted(indent, spans, None);
             if row_index == 0 && header.is_some() {
                 self.push_preformatted(
                     indent,
@@ -1563,6 +1590,28 @@ mod tests {
             text.contains('┌') && text.contains('├') && text.contains('└'),
             "{text}"
         );
+    }
+
+    #[test]
+    fn narrow_tables_wrap_every_cell_without_splitting_the_border() {
+        let palette = theme(ColorMode::TrueColor);
+        let strings = Strings::for_locale(Locale::En);
+        let source = "| Key | Value |\n| --- | --- |\n| 入口 | abcdefghijklmnopqrstuvwxyz |\n| 依赖 | 中文内容需要完整保留 |";
+        for width in [12, 24, 36, 80] {
+            let rendered = render_markdown(source, &palette, width, strings);
+            assert!(
+                rendered.lines.iter().all(|line| line.width() <= width),
+                "{}",
+                rendered.text()
+            );
+            let joined = rendered
+                .text()
+                .chars()
+                .filter(|c| !c.is_whitespace() && !"│─┌┬┐├┼┤└┴┘".contains(*c))
+                .collect::<String>();
+            assert!(joined.contains("abcdefghijklmnopqrstuvwxyz"), "{joined}");
+            assert!(joined.contains("中文内容需要完整保留"), "{joined}");
+        }
     }
 
     #[test]
