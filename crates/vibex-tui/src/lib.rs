@@ -15,6 +15,7 @@
 //! theme     design tokens → terminal colour with truecolor/256/16/none degradation
 //! text      grapheme-correct measurement, wrapping with joiners, bidi order
 //! locale    en / zh-CN / zh-TW product copy
+//! attachment an attachment's place in the message, drawn back as a placeholder
 //! keymap    one binding table per scope: dispatch + key bar + help
 //! layout    the screen as a vertical stack of full-width bands
 //! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
@@ -34,6 +35,7 @@
 
 pub mod action;
 pub mod app;
+pub mod attachment;
 pub mod auto_continue;
 pub mod composer;
 pub mod console;

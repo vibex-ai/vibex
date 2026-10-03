@@ -728,7 +728,12 @@ is never a column count.
   no file of ours is reachable and the runtime materialises the bytes itself.
   `outgoing()` computes the offsets from the chips in one walk, so an expanded
   paste in front of an image moves it, and the queue carries the pairs so a held
-  message does not lose them.
+  message does not lose them. **A projection row carries only text**, so every
+  surface puts the attachment back itself: the desktop as an inline chip beside
+  the words, the terminal as a bracketed placeholder at the offset
+  (`attachment::with_attachments`), which is what the reader's own message must
+  read as — the optimistic `PendingSend` row included, since it is built to be
+  the row the echo becomes.
 * **One paste route, whoever pasted.** The terminal's bracketed paste and the
   client's own clipboard reader both end in `App::insert_pasted_text`: a picture
   named as a path becomes an attachment — quoted, `file://`, `~`-relative and

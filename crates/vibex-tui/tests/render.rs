@@ -3523,6 +3523,79 @@ fn a_sent_image_keeps_its_place_in_the_message() {
 }
 
 #[test]
+fn a_sent_image_is_drawn_where_it_sat() {
+    // The composer's `[Image #1]` is a draft surface: it leaves the text on the
+    // way out, and `inline_text_offset` is the only thing that still says where
+    // the picture sat. A client that draws the wire text as it stands shows the
+    // reader their own message with a hole in it, and no hint that a picture is
+    // there at all.
+    use vibex_tui::action::Intent;
+    let mut app = app(100, 30);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let session = seeded_session("session_placeholder1", "image message");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session.clone());
+    app.composer.insert_str("before ");
+    let label = app
+        .attach_image_bytes("image/png", vec![0x89, b'P', b'N', b'G'])
+        .expect("the image attaches");
+    app.composer.insert_str(" after");
+    let (wire_text, attachments) = app
+        .perform(Intent::SubmitComposer)
+        .effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            vibex_tui::Effect::SendMessage {
+                text, attachments, ..
+            } => Some((text, attachments)),
+            _ => None,
+        })
+        .expect("the message was sent");
+    assert_eq!(
+        wire_text, "before  after",
+        "the label stays out of the wire text"
+    );
+    let expected = format!("before {label} after");
+
+    // The row projected from Enter, until the runtime echoes the message.
+    let screen = text(&render(&mut app, 100, 30));
+    let folded = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        folded.contains(&expected),
+        "the optimistic row lost the picture's place:\n{screen}"
+    );
+
+    // And the row the echo becomes: the timeline holds the attachments, the
+    // row itself does not, so the projection has to put them back.
+    let item = seeded_item(
+        &session.id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: wire_text,
+            attachments,
+            ..Default::default()
+        }),
+    );
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session.id.clone(), vec![item]);
+    app.abandon_pending_send();
+    app.sync_transcript();
+    let screen = text(&render(&mut app, 100, 30));
+    let folded = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        folded.contains(&expected),
+        "the echoed row lost the picture's place:\n{screen}"
+    );
+}
+
+#[test]
 fn starting_a_session_lands_on_a_page_with_the_prompt_in_it() {
     // `n` used to open a dialog asking what to call the session. A reader who
     // asked for a session asked to *write*, so the gesture now lands on a page

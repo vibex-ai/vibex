@@ -12,7 +12,7 @@
 //! the TUI cannot invent a second interpretation of sessions, approvals or
 //! capability gating.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use vibex_backend::DomainCapabilities;
 use vibex_backend::{BackendCapabilitySnapshot, BackendFacade, BackendOperation};
@@ -589,8 +589,11 @@ impl PendingSend {
     ///
     /// It is built to look exactly like the row the echo will become: same kind,
     /// same body, so the reader sees one message that stays put rather than one
-    /// that is replaced by a different-looking one a moment later.
-    fn row(&self) -> TimelineRow {
+    /// that is replaced by a different-looking one a moment later. The body is
+    /// the wire text — the composer's labels were dropped on the way out — so
+    /// its attachments are put back where they sat, exactly as the echoed row's
+    /// will be.
+    fn row(&self, strings: Strings) -> TimelineRow {
         TimelineRow {
             id: format!(
                 "pending-send:{}:{}",
@@ -610,7 +613,7 @@ impl PendingSend {
             first_sequence: self.after_sequence.saturating_add(1),
             last_sequence: self.after_sequence.saturating_add(1),
             title: "You".to_string(),
-            body: self.text.clone(),
+            body: crate::attachment::with_attachments(&self.text, &self.attachments, strings),
             streaming: false,
             collapsible: false,
             pending_permission: false,
@@ -3180,12 +3183,13 @@ impl App {
         // runtime has finished must stop claiming to stream, or the client
         // draws a spinner over a finished answer for the rest of the session.
         let mut rows = self.agent.state.transcript_rows();
+        self.restore_message_placeholders(&mut rows);
         // A send the runtime has not echoed yet is projected as the row it will
         // become. It goes last because that is where the echo will land, and it
         // is only drawn for the session it belongs to: another session's client
         // state is not this transcript.
         if let Some(pending) = self.pending_send_for_active() {
-            rows.push(pending.row());
+            rows.push(pending.row(self.strings));
         }
         self.projection.rows = rows.clone();
         let blocks: Vec<Block> = rows
@@ -3227,6 +3231,58 @@ impl App {
         // Streaming content can add or invalidate matches, so an open search
         // is re-run rather than left pointing at blocks that have changed.
         self.refresh_search_matches();
+    }
+
+    /// Put each user message's attachments back into the row it is drawn as.
+    ///
+    /// A row carries text and nothing else: the projection drops a message's
+    /// attachments, and with them the only record of where each picture sat —
+    /// the wire text has no labels, only `inline_text_offset`. The timeline
+    /// still holds them, and a row's `item_ids` are the index into it, so the
+    /// placeholder is put back here for everything that draws the row: the
+    /// transcript, its pinned header and its block detail.
+    fn restore_message_placeholders(&self, rows: &mut [TimelineRow]) {
+        if !rows
+            .iter()
+            .any(|row| row.kind == vibex_desktop_model::TimelineRowKind::UserMessage)
+        {
+            return;
+        }
+        // One pass over the timeline rather than a scan per row: a long session
+        // redraws on every streamed delta, and a lookup that walks the items
+        // once per message would make the transcript quadratic in its own
+        // history.
+        let by_item: HashMap<&str, &[vibex_core::MessageAttachment]> = self
+            .agent
+            .state
+            .timeline
+            .items
+            .iter()
+            .filter_map(|item| match &item.payload {
+                vibex_core::TimelinePayload::UserMessage(message)
+                    if !message.attachments.is_empty() =>
+                {
+                    Some((item.id.as_str(), message.attachments.as_slice()))
+                }
+                _ => None,
+            })
+            .collect();
+        if by_item.is_empty() {
+            return;
+        }
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.kind == vibex_desktop_model::TimelineRowKind::UserMessage)
+        {
+            let Some(attachments) = row
+                .item_ids
+                .iter()
+                .find_map(|id| by_item.get(id.as_str()).copied())
+            else {
+                continue;
+            };
+            row.body = crate::attachment::with_attachments(&row.body, attachments, self.strings);
+        }
     }
 
     /// Repair missing events without navigating or resending a message.
