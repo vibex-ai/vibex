@@ -244,9 +244,11 @@ fn startup_paints_a_first_frame() {
     let screen = session.wait_for(|screen| screen.contains("Vibex") && screen.contains("Sessions"));
     // The status band, the view and the shortcut bar are three different bands;
     // seeing all three proves the stack was assembled rather than half-painted.
+    // The band names the seat the frame is attached to — a healthy connection is
+    // the quiet case now, so there is no "Done" badge to look for.
     assert!(
-        screen.contains("Done") || screen.contains("Connecting"),
-        "{screen}"
+        screen.contains("Remote") || screen.contains("Authority"),
+        "the status band is missing:\n{screen}"
     );
     assert!(
         screen.contains("Commands") || screen.contains("Help"),
@@ -377,6 +379,27 @@ fn typing_echoes_into_the_frame() {
     // The wide characters must land in the frame too, which is what proves the
     // input path handles multi-byte characters rather than dropping them.
     assert!(screen.contains('中'), "{screen}");
+}
+
+#[test]
+fn the_workspace_key_opens_the_picker_on_the_new_session_page() {
+    // The page advertises `Ctrl+W` as the way to change where the session will
+    // work, and the composer binds the same chord to its word kill. Which one
+    // answers is decided in dispatch, by scope order — the layer no state test
+    // can see — so the reader who pressed the key the page named got nothing.
+    let mut session = Session::start(120, 40);
+    session.wait_for(|screen| screen.contains("Vibex"));
+    session.send(b"n");
+    session.wait_for(|screen| screen.contains("New session"));
+    // Ctrl+W, with the empty draft the page is in when it makes the promise.
+    session.send(b"\x17");
+    // The picker's own line: it is drawn where the rows would be, and nowhere
+    // else in the frame.
+    let screen = session.wait_for(|screen| screen.contains("No workspaces"));
+    assert!(
+        screen.contains("Workspace"),
+        "the picker did not name itself:\n{screen}"
+    );
 }
 
 #[test]

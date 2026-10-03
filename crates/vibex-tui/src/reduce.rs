@@ -817,7 +817,18 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::DeleteWordBefore => {
-                self.composer.delete_word_before();
+                // The page where a session is written names `Ctrl+W` as the way
+                // to change where it will work, and this binding — the shell's
+                // word kill — is what answers that key first. The kill keeps the
+                // key while there is a word to kill; with nothing to kill the
+                // key does what the page says, the same way an empty editor
+                // hands `Up` to the transcript instead of the history.
+                if !self.composer.delete_word_before()
+                    && self.page == Page::NewSession
+                    && self.focus == Focus::Composer
+                {
+                    return self.perform(Intent::SwitchWorkspace);
+                }
                 Outcome::effects(vec![])
             }
             Intent::DeleteWordAfter => {
@@ -4717,6 +4728,70 @@ mod tests {
             .expect("the page named a runtime and created with none");
         assert_eq!(created.agent_id, agent_id);
         assert_eq!(created.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn ctrl_w_on_the_new_session_page_changes_the_workspace() {
+        // The page names the key that changes where the session will work, so
+        // the key has to do that. It did not: the composer's own binding
+        // answered `Ctrl+W` first — the shell's word kill — and a reader who
+        // pressed the key the page advertised got nothing, or lost a word.
+        // Resolved the way the event loop resolves it, scopes included.
+        use crate::keymap::{Chord, Keymap};
+        let mut app = capable_app();
+        app.keymap = Keymap::built_in();
+        app.live = crate::app::LiveState::Ready;
+        app.perform(Intent::NewSession);
+        assert_eq!(
+            app.focus,
+            Focus::Composer,
+            "the page hands over the composer"
+        );
+
+        let chord = Chord::ctrl('w');
+        let intent = app
+            .keymap
+            .resolve(&app.active_scopes(), chord)
+            .expect("Ctrl+W is bound");
+        let outcome = app.perform(intent);
+        assert!(
+            matches!(app.overlay, Some(Overlay::WorkspacePicker { .. })),
+            "Ctrl+W did not open the workspace picker on the page that advertises it: {:?}",
+            app.overlay
+        );
+        assert!(
+            outcome
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::BrowseDirectories { .. })),
+            "the listing was not asked for: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_still_kills_a_word_while_the_new_session_draft_has_one() {
+        // The other half of the rule: the page's key only takes over where the
+        // kill would have done nothing. While the reader is writing, `Ctrl+W`
+        // is the shell's word kill it is everywhere else — whitespace-delimited,
+        // so a path goes in one press.
+        use crate::keymap::{Chord, Keymap};
+        let mut app = capable_app();
+        app.keymap = Keymap::built_in();
+        app.live = crate::app::LiveState::Ready;
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("look at src/net.rs");
+
+        let intent = app
+            .keymap
+            .resolve(&app.active_scopes(), Chord::ctrl('w'))
+            .expect("Ctrl+W is bound");
+        assert_eq!(intent, Intent::DeleteWordBefore);
+        app.perform(intent);
+        assert_eq!(app.composer.text(), "look at ");
+        assert_eq!(
+            app.overlay, None,
+            "a draft with text in it opened the picker instead of killing a word"
+        );
     }
 
     #[test]
