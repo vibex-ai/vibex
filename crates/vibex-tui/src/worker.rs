@@ -240,6 +240,94 @@ impl Worker {
     }
 }
 
+/// List one directory of *this* machine for the workspace picker.
+///
+/// The shape is the authority's answer, because the picker draws both the same
+/// way: directories only, hidden names skipped, case-insensitively sorted, and
+/// a parent the reader can walk up to — absent at the filesystem root, which is
+/// what makes `Up` there say there is nothing above rather than offering a
+/// directory that does not exist. There are no browse roots: those bound a
+/// *paired* client, and this branch only runs for a backend that is the
+/// authority itself.
+///
+/// `path` of `None` opens on the reader's home, which is where a directory
+/// starts being worth choosing from.
+fn local_directory_listing(
+    path: Option<String>,
+) -> BackendResult<vibex_core::RemoteWorkspaceDirectoryListing> {
+    let requested = match path {
+        Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+        _ => home_directory(),
+    };
+    let canonical = requested.canonicalize().map_err(|error| {
+        BackendError::failed(
+            "directory_unavailable",
+            "the requested directory does not exist on this machine",
+        )
+        .with_recovery_hint(format!(
+            "Choose a directory that exists, or walk up from the one you are in ({error})"
+        ))
+    })?;
+    // Blocking, and deliberately so: it is one short read on the worker's
+    // runtime, and the same call the desktop's own picker makes from its.
+    let read_dir = std::fs::read_dir(&canonical).map_err(|error| {
+        BackendError::failed(
+            "directory_list_failed",
+            format!("the requested directory could not be listed: {error}"),
+        )
+    })?;
+    let mut entries = Vec::new();
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // A symlinked directory is browsable; a broken link fails `metadata`
+        // and is skipped rather than failing the listing.
+        let is_dir = if file_type.is_symlink() {
+            entry
+                .path()
+                .metadata()
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        entries.push(vibex_core::RemoteWorkspaceDirectoryEntry {
+            name,
+            path: entry.path().to_string_lossy().into_owned(),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: Vec::new(),
+        path: canonical.to_string_lossy().into_owned(),
+        parent: canonical
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned()),
+        entries,
+    })
+}
+
+/// The directory a listing starts from when the reader named none.
+fn home_directory() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
 struct Dispatch {
     facade: BackendFacade,
     sender: UnboundedSender<AppMessage>,
@@ -597,11 +685,26 @@ impl Dispatch {
                 }
             }
             Effect::BrowseDirectories { path } => {
-                let result = self
+                // The listing belongs to the machine the Agent will run on. A
+                // paired authority owns that machine and answers over the wire;
+                // a native backend *is* that machine and browses locally — it
+                // deliberately does not report `WorkspaceBrowseDirectories`, so
+                // the capability is what says which of the two this is. Asking
+                // a native backend for the authority's directories is what made
+                // the picker open empty and say the backend could not browse.
+                let authority_owned = self
                     .facade
-                    .workspace()
-                    .browse_authority_directories(path)
-                    .await;
+                    .capabilities()
+                    .workspace
+                    .supports(vibex_backend::BackendOperation::WorkspaceBrowseDirectories);
+                let result = if authority_owned {
+                    self.facade
+                        .workspace()
+                        .browse_authority_directories(path)
+                        .await
+                } else {
+                    local_directory_listing(path)
+                };
                 self.send(AppMessage::DirectoryListing(result));
             }
             Effect::LoadFileTree { workspace_id } => {
@@ -1472,5 +1575,47 @@ mod tests {
         for effect in effects {
             assert!(!effect.key().is_empty());
         }
+    }
+
+    #[test]
+    fn a_local_listing_offers_directories_and_a_way_up() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let inside = root.path().join("clash-report");
+        std::fs::create_dir(&inside).expect("a directory");
+        std::fs::create_dir(root.path().join(".hidden")).expect("a hidden directory");
+        std::fs::write(root.path().join("notes.md"), "x").expect("a file");
+
+        let listing = local_directory_listing(Some(root.path().to_string_lossy().into_owned()))
+            .expect("the directory lists");
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["clash-report"],
+            "a file or a hidden name reached the picker: {names:?}"
+        );
+        assert_eq!(listing.path, inside.parent().unwrap().to_string_lossy());
+        assert_eq!(
+            listing.parent.as_deref(),
+            Some(root.path().parent().unwrap().to_string_lossy().as_ref()),
+            "the reader cannot walk out of the directory they opened"
+        );
+        assert!(listing.roots.is_empty(), "a local listing has no roots");
+
+        // The entry carries the path the picker will hand back, not just a name.
+        assert_eq!(
+            listing.entries[0].path,
+            inside.to_string_lossy(),
+            "the entry does not name the directory it stands for"
+        );
+    }
+
+    #[test]
+    fn a_local_listing_refuses_a_directory_that_is_not_one() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let file = root.path().join("notes.md");
+        std::fs::write(&file, "x").expect("a file");
+        let error = local_directory_listing(Some(file.to_string_lossy().into_owned()))
+            .expect_err("a file is not a directory to browse");
+        assert_eq!(error.code, "directory_list_failed");
     }
 }

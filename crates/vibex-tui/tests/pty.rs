@@ -51,6 +51,17 @@ impl Session {
     /// Start with extra environment variables, which is how a scenario makes
     /// the client behave like a process that hosts a runtime.
     fn start_with(columns: u16, rows: u16, environment: &[(&str, &str)]) -> Self {
+        Self::start_at(None, columns, rows, environment)
+    }
+
+    /// Start with the client's working directory set, so a scenario that reads
+    /// the filesystem browses a tree the test owns instead of the runner's.
+    fn start_at(
+        directory: Option<&std::path::Path>,
+        columns: u16,
+        rows: u16,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -61,6 +72,9 @@ impl Session {
             })
             .expect("a pseudo-terminal is available");
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_vibex-tui-harness"));
+        if let Some(directory) = directory {
+            command.cwd(directory);
+        }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         // Pin the locale: the assertions are on English copy, and inheriting a
@@ -387,18 +401,24 @@ fn the_workspace_key_opens_the_picker_on_the_new_session_page() {
     // work, and the composer binds the same chord to its word kill. Which one
     // answers is decided in dispatch, by scope order — the layer no state test
     // can see — so the reader who pressed the key the page named got nothing.
-    let mut session = Session::start(120, 40);
+    //
+    // The picker then has to *list* something: this seat is native, which
+    // browses the machine it runs on rather than reporting the capability a
+    // paired client uses, so the listing is the client's own filesystem.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir(directory.path().join("clash-report")).expect("a directory to choose");
+    let mut session = Session::start_at(Some(directory.path()), 120, 40, &[]);
     session.wait_for(|screen| screen.contains("Vibex"));
     session.send(b"n");
     session.wait_for(|screen| screen.contains("New session"));
     // Ctrl+W, with the empty draft the page is in when it makes the promise.
     session.send(b"\x17");
-    // The picker's own line: it is drawn where the rows would be, and nowhere
-    // else in the frame.
-    let screen = session.wait_for(|screen| screen.contains("No workspaces"));
+    let screen = session.wait_for(|screen| screen.contains("clash-report"));
+    // The picker's own hint row, which is what says the rows are a listing
+    // rather than a line of the page behind it.
     assert!(
-        screen.contains("Workspace"),
-        "the picker did not name itself:\n{screen}"
+        screen.contains("Workspace") && screen.contains("nav"),
+        "the picker did not open on the directory:\n{screen}"
     );
 }
 

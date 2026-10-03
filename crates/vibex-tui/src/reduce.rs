@@ -473,13 +473,17 @@ impl App {
                 // gesture with no result — and it moved the reader off the page
                 // they were writing on.
                 self.overlay = Some(Overlay::WorkspacePicker { selected: 0 });
-                Outcome::effects(vec![Effect::BrowseDirectories { path: None }])
+                Outcome::effects(vec![Effect::BrowseDirectories {
+                    path: self.workspace_picker_start(),
+                }])
             }
             Intent::OpenWorkspaceBrowser => {
                 self.overlay = Some(Overlay::WorkspacePicker { selected: 0 });
                 // The listing is what the picker draws, and the browse root is
                 // where a reader who has never been anywhere should start.
-                Outcome::effects(vec![Effect::BrowseDirectories { path: None }])
+                Outcome::effects(vec![Effect::BrowseDirectories {
+                    path: self.workspace_picker_start(),
+                }])
             }
             Intent::WorkspaceBrowseUp => {
                 let parent = self
@@ -3743,9 +3747,15 @@ mod tests {
     /// facade is not: the reducer must be able to issue an older-page request
     /// for the trigger under test.
     fn capable_app() -> App {
+        app_with_capabilities(vibex_backend::BackendCapabilitySnapshot::desktop_native_v1())
+    }
+
+    /// An app over one capability snapshot, which is what decides whether the
+    /// picker reads this machine or asks the authority.
+    fn app_with_capabilities(snapshot: vibex_backend::BackendCapabilitySnapshot) -> App {
         let backend = std::sync::Arc::new(vibex_backend::DisconnectedBackend);
         let facade = vibex_backend::BackendFacade::new(
-            vibex_backend::BackendCapabilitySnapshot::desktop_native_v1(),
+            snapshot,
             backend.clone(),
             backend.clone(),
             backend.clone(),
@@ -4795,6 +4805,54 @@ mod tests {
         assert_eq!(
             app.overlay, None,
             "a draft with text in it opened the picker instead of killing a word"
+        );
+    }
+
+    #[test]
+    fn the_workspace_picker_opens_where_the_page_is_when_it_reads_this_machine() {
+        // The native seat browses *this* machine — it does not report
+        // `WorkspaceBrowseDirectories` — so the reader opens the picker on the
+        // directory the page already names instead of walking down from home.
+        // A backend that can browse the authority names its own roots, and a
+        // path proposed from here could fall outside them.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut app = capable_app();
+        assert!(
+            !app.supports(vibex_backend::BackendOperation::WorkspaceBrowseDirectories),
+            "the native snapshot claims to browse the authority"
+        );
+        app.workspace_path = Some(directory.path().to_string_lossy().into_owned());
+        assert_eq!(
+            app.workspace_picker_start().as_deref(),
+            Some(directory.path().to_string_lossy().as_ref())
+        );
+        let opened = app.perform(Intent::SwitchWorkspace);
+        assert!(
+            opened.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::BrowseDirectories { path: Some(path) }
+                    if path == &directory.path().to_string_lossy()
+            )),
+            "the picker did not open on the page's own directory: {opened:?}"
+        );
+
+        // A directory that is not there is not proposed: the backend would
+        // answer with an error instead of a listing.
+        app.workspace_path = Some("/nonexistent/vibex-workspace".to_string());
+        assert_eq!(app.workspace_picker_start(), None);
+
+        // The authority's directories are the authority's to name.
+        let mut snapshot = vibex_backend::BackendCapabilitySnapshot::desktop_native_v1();
+        snapshot
+            .workspace
+            .operations
+            .insert(vibex_backend::BackendOperation::WorkspaceBrowseDirectories);
+        let mut remote = app_with_capabilities(snapshot);
+        remote.workspace_path = Some(directory.path().to_string_lossy().into_owned());
+        assert_eq!(
+            remote.workspace_picker_start(),
+            None,
+            "a paired authority was told where to start its own listing"
         );
     }
 

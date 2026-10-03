@@ -1771,6 +1771,24 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Where the directory picker opens.
+    ///
+    /// A backend that can browse the authority's filesystem answers a first
+    /// listing with its own root, so nothing is proposed here: which roots
+    /// exist is the authority's to say. A backend that browses *this* machine
+    /// — the native seat, which deliberately does not report
+    /// `WorkspaceBrowseDirectories` — opens on the directory the page already
+    /// names when that directory exists here. A reader choosing a root is
+    /// usually choosing a sibling of the project they are in, and walking down
+    /// from home is a different question.
+    pub fn workspace_picker_start(&self) -> Option<String> {
+        if self.supports(BackendOperation::WorkspaceBrowseDirectories) {
+            return None;
+        }
+        let path = self.new_session_workspace();
+        std::path::Path::new(&path).is_dir().then_some(path)
+    }
+
     /// Workspace the session pages read from.
     pub fn active_workspace_id(&self) -> Option<vibex_core::WorkspaceId> {
         self.active_session()
