@@ -1190,25 +1190,6 @@ fn the_selection_marker_follows_the_scope() {
 }
 
 #[test]
-fn a_tiny_terminal_shows_the_degradation_notice() {
-    let app = app(40, 10);
-    let message = vibex_tui::view::degradation_message(&app);
-    assert!(
-        message.is_some(),
-        "a 40x10 terminal must produce a degradation message"
-    );
-    let message = message.unwrap();
-    assert!(message.contains("60x16"), "{message}");
-    assert!(message.contains("40x10"), "{message}");
-}
-
-#[test]
-fn a_large_terminal_does_not_trigger_the_degradation_notice() {
-    let app = app(120, 40);
-    assert!(vibex_tui::view::degradation_message(&app).is_none());
-}
-
-#[test]
 fn the_locked_runtime_message_gives_three_ways_out() {
     let message = vibex_tui::view::locked_seat_help(Strings::for_locale(Locale::En));
     assert!(message.contains("Remote Access"));

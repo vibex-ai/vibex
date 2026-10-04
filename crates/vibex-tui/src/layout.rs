@@ -27,6 +27,11 @@
 //!
 //! The module is pure data: it computes rectangles and nothing else, so the
 //! composition can be asserted at any terminal size without rendering.
+//!
+//! There is no minimum terminal size. A terminal too short for the whole stack
+//! gives back the rows around the conversation before it gives up the
+//! transcript or the composer, and the last two shrink only when there is
+//! nothing else left.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 
@@ -107,31 +112,69 @@ pub const MIN_TRANSCRIPT_FOR_GUTTER: u16 = 52;
 /// Compute the frame.
 ///
 /// Optional bands are dropped in reverse order of usefulness as the terminal
-/// shortens: the banner first, then the tasks and todo rows. The transcript, the
-/// composer and the hint bar are never dropped.
+/// shortens: the banner first, then the dock, the tasks and the todo rows. The
+/// transcript and the composer are the last two bands standing.
+///
+/// Nothing here refuses to lay out a terminal for being small. When the rows
+/// asked for do not fit, the chrome around the conversation gives its rows back
+/// in [`Chrome::shed`] order — the transcript and the composer are the last two
+/// bands standing — so every size produces a whole frame rather than a notice.
 pub fn compute(area: Rect, request: BandRequest) -> Bands {
     let short = area.height <= SHORT_TERMINAL_ROWS;
-    let outer_vpad = if area.height == 0 { 0 } else { OUTER_VPAD };
-    let hpad = OUTER_HPAD.min(area.width / 4);
-
-    let content = Rect {
-        x: area.x.saturating_add(hpad),
-        y: area.y.saturating_add(outer_vpad),
-        width: area.width.saturating_sub(hpad.saturating_mul(2)),
-        height: area.height.saturating_sub(outer_vpad.saturating_mul(2)),
-    };
 
     // A short terminal gives up its optional rows before it gives up any of the
-    // transcript or the composer.
-    let banner = if short { 0 } else { request.banner };
-    // The dock is a convenience panel, so a short terminal gives its rows back
-    // to the transcript before anything essential is dropped.
-    let dock = if short { 0 } else { request.dock };
-    let tasks = if short { 0 } else { request.tasks };
-    let todo = if short { 0 } else { request.todo };
-    let turn_status = request.turn_status;
-    let queue = request.queue;
-    let shortcuts = request.shortcuts;
+    // transcript or the composer, whatever the frame would otherwise have had
+    // room for.
+    let optional = |height: u16| if short { 0 } else { height };
+
+    // What is still on the table, and the order it is given back in.
+    let mut chrome = Chrome {
+        vpad: if area.height == 0 { 0 } else { OUTER_VPAD },
+        banner: optional(request.banner),
+        dock: optional(request.dock),
+        tasks: optional(request.tasks),
+        todo: optional(request.todo),
+        status_line: optional(request.status_line),
+        status: 1,
+        transcript_gap: 1,
+        prompt_gap: request.prompt_gap,
+        queue: request.queue,
+        turn_status: request.turn_status,
+        shortcuts: request.shortcuts,
+        floor: SCROLLBACK_MIN_ROWS,
+        prompt: request.prompt,
+    };
+    while chrome.rows() > area.height && chrome.shed() {}
+    // On a terminal too short even for the bands that are left, the composer
+    // gives its rows back last and the transcript keeps a line of the
+    // conversation rather than the frame going blank.
+    let spoken_for = chrome.rows().saturating_sub(chrome.prompt);
+    chrome.prompt = chrome.prompt.min(area.height.saturating_sub(spoken_for));
+
+    let Chrome {
+        vpad,
+        banner,
+        dock,
+        tasks,
+        todo,
+        status_line,
+        status,
+        transcript_gap,
+        prompt_gap,
+        queue,
+        turn_status,
+        shortcuts,
+        floor,
+        prompt,
+    } = chrome;
+
+    let hpad = OUTER_HPAD.min(area.width / 4);
+    let content = Rect {
+        x: area.x.saturating_add(hpad),
+        y: area.y.saturating_add(vpad),
+        width: area.width.saturating_sub(hpad.saturating_mul(2)),
+        height: area.height.saturating_sub(vpad.saturating_mul(2)),
+    };
 
     // A blank row above each optional band, so bands read as separate.
     let gap = |height: u16| -> u16 {
@@ -142,26 +185,23 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
         }
     };
 
-    let mut constraints = vec![Constraint::Length(1)]; // status
+    let mut constraints = vec![Constraint::Length(status)]; // status
     for height in [tasks, todo] {
         if height > 0 {
             constraints.push(Constraint::Length(gap(height)));
             constraints.push(Constraint::Length(height));
         }
     }
-    constraints.push(Constraint::Length(gap(1)));
-    constraints.push(Constraint::Min(SCROLLBACK_MIN_ROWS));
+    constraints.push(Constraint::Length(transcript_gap));
+    constraints.push(Constraint::Min(floor));
     for height in [queue, turn_status, banner, dock] {
         if height > 0 {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(height));
         }
     }
-    if request.prompt_gap > 0 {
-        constraints.push(Constraint::Length(request.prompt_gap));
-    }
-    constraints.push(Constraint::Length(request.prompt));
-    let status_line = if short { 0 } else { request.status_line };
+    constraints.push(Constraint::Length(prompt_gap));
+    constraints.push(Constraint::Length(prompt));
     if status_line > 0 {
         constraints.push(Constraint::Length(status_line));
     }
@@ -171,7 +211,8 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
     let mut next = chunks.iter().copied();
     let mut take = || next.next().unwrap_or_default();
     // A constraint that was not pushed has no chunk, so the reader walks the
-    // same sequence the builder did.
+    // same sequence the builder did. A hidden band keeps its slot at zero
+    // height, so the sequence does not shift with the size of the terminal.
     let status = take();
     let tasks_rect = if tasks > 0 {
         take();
@@ -211,9 +252,7 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
     } else {
         Rect::default()
     };
-    if request.prompt_gap > 0 {
-        take();
-    }
+    take(); // the gap above the composer
     let prompt = take();
     let status_line_rect = if status_line > 0 {
         take()
@@ -255,6 +294,102 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
         prompt,
         status_line: status_line_rect,
         shortcuts: shortcuts_rect,
+    }
+}
+
+/// The rows a frame is still willing to spend, and the order it gives them up.
+///
+/// The transcript and the composer are deliberately absent from
+/// [`Chrome::shed`]: they are what the reader came for, so everything else
+/// releases its rows first. The composer is the last band to shrink, and only
+/// after the transcript has been reduced to a single line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Chrome {
+    /// Outer padding, in rows above and below the whole stack.
+    vpad: u16,
+    /// The transient message row.
+    banner: u16,
+    /// The running-work panel above the composer.
+    dock: u16,
+    /// The background-work row.
+    tasks: u16,
+    /// The session's open steps.
+    todo: u16,
+    /// The denser status row under the composer.
+    status_line: u16,
+    /// The status row above the transcript.
+    status: u16,
+    /// The blank row between the status row and the transcript.
+    transcript_gap: u16,
+    /// The blank row between the transcript and the composer.
+    prompt_gap: u16,
+    /// The held-message band.
+    queue: u16,
+    /// The running-turn band.
+    turn_status: u16,
+    /// The key hint bar.
+    shortcuts: u16,
+    /// The transcript's floor, never below one row.
+    floor: u16,
+    /// The composer's height.
+    prompt: u16,
+}
+
+impl Chrome {
+    /// The rows this frame would need, each optional band with the blank row
+    /// that separates it.
+    fn rows(&self) -> u16 {
+        let band = |height: u16| height.saturating_add(u16::from(height > 0));
+        self.vpad
+            .saturating_mul(2)
+            .saturating_add(band(self.banner))
+            .saturating_add(band(self.dock))
+            .saturating_add(band(self.tasks))
+            .saturating_add(band(self.todo))
+            .saturating_add(self.status_line)
+            .saturating_add(self.status)
+            .saturating_add(self.transcript_gap)
+            .saturating_add(self.prompt_gap)
+            .saturating_add(band(self.queue))
+            .saturating_add(band(self.turn_status))
+            .saturating_add(self.shortcuts)
+            .saturating_add(self.floor)
+            .saturating_add(self.prompt)
+    }
+
+    /// Give back the next least useful rows, returning `false` when the frame
+    /// is down to the transcript's last line and the composer.
+    fn shed(&mut self) -> bool {
+        if self.vpad > 0 {
+            self.vpad = 0;
+        } else if self.banner > 0 {
+            self.banner = 0;
+        } else if self.dock > 0 {
+            self.dock = 0;
+        } else if self.tasks > 0 {
+            self.tasks = 0;
+        } else if self.todo > 0 {
+            self.todo = 0;
+        } else if self.status_line > 0 {
+            self.status_line = 0;
+        } else if self.status > 0 {
+            self.status = 0;
+        } else if self.transcript_gap > 0 {
+            self.transcript_gap = 0;
+        } else if self.prompt_gap > 0 {
+            self.prompt_gap = 0;
+        } else if self.queue > 0 {
+            self.queue = 0;
+        } else if self.turn_status > 0 {
+            self.turn_status = 0;
+        } else if self.shortcuts > 0 {
+            self.shortcuts = 0;
+        } else if self.floor > 1 {
+            self.floor = 1;
+        } else {
+            return false;
+        }
+        true
     }
 }
 

@@ -249,27 +249,13 @@ fn event_loop(
 
         // ---- frame --------------------------------------------------------
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
-            if let Some(message) = crate::view::degradation_message(app) {
-                terminal
-                    .draw(|frame| {
-                        let theme = app.theme.clone();
-                        frame.render_widget(
-                            ratatui::widgets::Paragraph::new(message.clone())
-                                .style(theme.warning())
-                                .alignment(ratatui::layout::Alignment::Center),
-                            frame.area(),
-                        );
-                    })
-                    .map_err(|error| {
-                        BackendError::failed("tui_render_failed", error.to_string())
-                    })?;
-            } else {
-                terminal
-                    .draw(|frame| crate::view::render(frame, app))
-                    .map_err(|error| {
-                        BackendError::failed("tui_render_failed", error.to_string())
-                    })?;
-            }
+            // Every size draws the interface itself. There is no minimum: the
+            // layout gives back the bands around the transcript and the
+            // composer as the terminal shrinks, so a small one still paints a
+            // whole frame rather than a notice about being small.
+            terminal
+                .draw(|frame| crate::view::render(frame, app))
+                .map_err(|error| BackendError::failed("tui_render_failed", error.to_string()))?;
             last_frame = Instant::now();
             dirty = false;
         }

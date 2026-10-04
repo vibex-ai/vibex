@@ -88,6 +88,12 @@ before it touches the transcript or the composer. They belong to the session
 view, so the session list does not inherit the active session's plan or turn
 line: a global page keeps its own chrome.
 
+There is no minimum terminal size. Below the size that holds the whole stack,
+the outer padding, the status row and the blank rows between bands go too, then
+the running-turn and queue bands, and finally the transcript keeps one line
+while the composer shrinks to its own smallest form. Every size paints a whole
+frame of the interface; none of them paints a notice about being small.
+
 ## Visual language
 
 Your messages use a raised background and a prompt marker. Continuation lines
@@ -689,7 +695,7 @@ Every one of these has a defined behaviour rather than a broken screen:
 | Condition | Behaviour |
 | --- | --- |
 | stdout is not a TTY | no raw mode; a clear message and a non-zero exit |
-| terminal below 60×16 | a size notice, not a half-rendered frame |
+| terminal below 60×16 | the bands around the conversation are given back; the transcript and the composer stay, and the frame is never refused |
 | in-process diagnostics | diverted to a spill file, named on exit; never drawn into a frame |
 | `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal |
 | non-UTF-8 locale | ASCII borders and markers |
@@ -724,12 +730,13 @@ cargo run -p vibex-tui --example preview -- 120 34 --welcome
 cargo test -p vibex-tui
 ```
 
-Four layers:
+Five layers:
 
 | Layer | Command | What it proves |
 | --- | --- | --- |
 | Reducer | `cargo test -p vibex-tui --lib` | the intent → effect mapping is a pure function |
 | Render | `cargo test -p vibex-tui --test render` | layout degrades at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
+| Tiny terminal | `cargo test -p vibex-tui --test tiny_terminal` | every page draws a whole frame down to 1×1, and a small terminal keeps a line of transcript and a composer that shows the draft |
 | Contract | `cargo test -p vibex-tui --test contracts` | dependency boundary, key tables, locale coverage, no secret-shaped copy |
 | PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, keeps in-process diagnostics out of the terminal, restores the terminal on exit, and survives a resize storm |
 

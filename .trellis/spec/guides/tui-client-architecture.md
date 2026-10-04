@@ -138,18 +138,18 @@ The screen is **one vertical stack of full-width bands**, computed by
 `crate::layout::compute`:
 
 ```text
-outer padding (1 row top/bottom, 2 columns each side)
-  status band          1 row, always
+outer padding (1 row top/bottom, 2 columns each side) — given back first
+  status band          1 row while the terminal can hold it
   [gap] [tasks]        only when background work exists
   [gap] [todo]         only when the session has steps
   [gap]
-  transcript           fills; Min(5) rows, the only flexible band
+  transcript           fills; Min(5) rows, Min(1) when the terminal is shorter
   [gap] [queue]        only when messages are held
   [gap] turn status    while running, waiting, or reporting a live session
   [gap] [banner]       transient messages
   [gap] [dock]         the running-work panel, while it is open
-  prompt gap           1 row
-  prompt               padded draft surface + separate runtime info line
+  prompt gap           1 row while there is room for it
+  prompt               padded draft surface + separate runtime info line; shrinks last
   shortcut band        1 row, last — only where the page is navigated, not written on
 outer padding
 ```
@@ -165,6 +165,13 @@ Rules that make this work:
 * **Optional bands collapse to zero height**, never to a smaller size, and the
   frame skips their renderers entirely. `SHORT_TERMINAL_ROWS` drops the banner,
   tasks, todo and dock bands before it touches the transcript or the composer.
+* **There is no minimum terminal size.** `Chrome::shed` gives rows back as the
+  terminal shortens, least useful first: the outer padding, the status row, the
+  blank rows that separate the bands, the queue and turn-status bands, the
+  shortcut band, and only then the transcript's floor — down to a single line.
+  The composer is the last band to shrink, so every size paints the conversation
+  and the place to type; a size notice is not something the client has. The
+  render tests drive every page down to 1×1 and `run.rs` has no size branch.
 * **A band that duplicates another yields to it.** While the dock is open it
   lists the plan and the held queue, so `band_request` gives those two bands
   zero height rather than printing the same rows twice on one screen.
@@ -863,10 +870,11 @@ is never a column count.
 | --- | --- |
 | Reducer unit tests | the intent → effect mapping is a pure function; key sequences drive state |
 | `TestBackend` render tests | layout degrades correctly at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
+| Tiny-terminal render tests | every page paints a whole frame down to 1×1; a small terminal keeps a line of transcript and a composer that shows the draft |
 | Contract tests | dependency boundary, key tables, locale coverage, no secret-shaped copy, docs exist per page |
 | PTY end-to-end | the real binary enters raw mode, paints a first frame, writes zero bytes when idle, keeps in-process diagnostics out of the terminal, restores the terminal on exit, survives a resize storm |
 
-`cargo test -p vibex-tui` runs the first three. The PTY layer needs the harness
+`cargo test -p vibex-tui` runs the first four. The PTY layer needs the harness
 entry point, so it runs as
 `cargo test -p vibex-tui --features pty-harness --test pty`; `pnpm check:rust`
 covers both.
