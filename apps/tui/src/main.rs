@@ -4,7 +4,7 @@
 //! vibex                      attach to (or start) the runtime for this home
 //! vibex tui                  same as above
 //! vibex connect <link|code>  pair with a runtime and attach to it
-//! vibex status               report which seat this home would use
+//! vibex status               report which mode this home would use
 //! vibex computer <command>   drive the desktop through a running runtime
 //! vibex --help               usage
 //! vibex --version            version
@@ -207,14 +207,15 @@ fn usage() -> String {
          \x20   taken from the path, because the runtime refuses to start a channel\n\
          \x20   in a home that does not match it.\n\
          \x20   vibex connect <vibex://… | pairing-code>\n\
-         \x20   vibex status [--home <dir>]        report the seat without attaching\n\
+         \x20   vibex status [--home <dir>]        report the mode without attaching\n\
          \x20   vibex computer <command>           drive the desktop; needs the\n\
          \x20                                     environment a running runtime\n\
          \x20                                     gives an Agent session\n\
          \n\
-         SEATS:\n\
-         \x20   authority  this process starts and owns the runtime for the home\n\
-         \x20   remote     another runtime owns the home, or a link was given\n\
+         MODES:\n\
+         \x20   local mode   this process starts and owns the runtime for the home\n\
+         \x20   remote mode  another runtime owns the home, or a link was given\n\
+         \x20   `vibex status` prints the mode as seat=authority or seat=remote.\n\
          \n\
          ENVIRONMENT:\n\
          \x20   VIBEX_HOME        runtime home (default ~/.vibex/<channel>)\n\
@@ -242,7 +243,8 @@ mod tests {
             "vibex status",
             "vibex computer",
             "VIBEX_HOME",
-            "authority",
+            "local mode",
+            "remote mode",
         ] {
             assert!(text.contains(needle), "usage is missing {needle}");
         }

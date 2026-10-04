@@ -306,7 +306,7 @@ fn the_status_band_reports_liveness_and_seat_together() {
         "segments are not separated: {status:?}"
     );
     assert!(
-        status.contains("Remote") || status.contains("Authority"),
+        status.contains("Remote mode"),
         "the seat must be visible: {status:?}"
     );
     assert!(
@@ -1080,7 +1080,7 @@ fn color_less_mode_still_renders_every_label() {
     );
     app.resize(100, 30);
     let screen = text(&render(&mut app, 100, 30));
-    assert!(screen.contains("Authority") || screen.contains("Remote"));
+    assert!(screen.contains("Local mode"));
     // The ASCII glyph tier must not emit glyphs a legacy console lacks.
     for forbidden in ['╭', '╰', '╮', '╯'] {
         assert!(

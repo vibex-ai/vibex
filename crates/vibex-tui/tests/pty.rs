@@ -264,7 +264,7 @@ fn startup_paints_a_first_frame() {
     // healthy connection is the quiet case now, so there is no "Done" badge to
     // look for.
     assert!(
-        screen.contains("Remote") || screen.contains("Authority"),
+        screen.contains("Remote mode") || screen.contains("Local mode"),
         "the status band is missing:\n{screen}"
     );
     assert!(

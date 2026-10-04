@@ -701,8 +701,16 @@ strings! {
     settings_about => { "About", "关于", "關於" },
     settings_connection => { "Connection", "连接", "連線" },
     settings_backend => { "Backend", "后端", "後端" },
-    settings_authority_seat => { "Authority seat (in-process)", "权威座（进程内）", "權威座（行程內）" },
-    settings_remote_seat => { "Remote seat", "远程座", "遠端座" },
+    settings_authority_seat => {
+        "Local mode (in-process runtime)",
+        "本地模式（进程内运行时）",
+        "本機模式（行程內執行階段）"
+    },
+    settings_remote_seat => {
+        "Remote mode (runtime over a link)",
+        "远程模式（通过网络连接运行时）",
+        "遠端模式（透過網路連線執行階段）"
+    },
     settings_capabilities => { "Capabilities", "能力", "能力" },
     settings_version => { "Version", "版本", "版本" },
     settings_section_appearance => { "Appearance", "外观", "外觀" },
@@ -742,9 +750,9 @@ strings! {
         "目前客戶端連線的執行階段能力版本。"
     },
     settings_seat_hint => {
-        "Whether this process owns the runtime or reaches it over a link.",
-        "本进程拥有运行时，还是通过网络连接。",
-        "本行程擁有執行階段，還是透過網路連線。"
+        "Local mode starts the runtime in this app; remote mode connects to one.",
+        "本地模式由本程序启动运行时；远程模式通过网络连接运行时。",
+        "本機模式由本程式啟動執行階段；遠端模式透過網路連線執行階段。"
     },
     settings_version_hint => {
         "The client build; the runtime reports its own version separately.",
@@ -855,9 +863,11 @@ strings! {
         "Vibex 桌面端正在运行且未开放本机客户端。请在桌面端开启 设置 → 远程访问 → Direct，或退出桌面端后重试，或用 `vibex connect <链接>` 连接远程运行时。",
         "Vibex 桌面端正在執行且未開放本機用戶端。請在桌面端開啟 設定 → 遠端存取 → Direct，或結束桌面端後重試，或用 `vibex connect <連結>` 連線遠端執行階段。"
     },
-    seat_authority => { "Authority", "权威座", "權威座" },
-    seat_remote => { "Remote", "远程座", "遠端座" },
-    seat_local_loopback => { "Local runtime", "本机运行时", "本機執行階段" },
+    // How the client is attached, in the reader's words. "Seat" stays the
+    // internal name (`SeatKind`); the reader sees a mode, because a seat is
+    // not a word a terminal user knows.
+    seat_authority => { "Local mode", "本地模式", "本機模式" },
+    seat_remote => { "Remote mode", "远程模式", "遠端模式" },
 }
 
 impl Strings {

@@ -8,7 +8,7 @@ media stack itself.
 ```bash
 vibex                      # attach to (or start) the runtime for this home
 vibex connect vibex://…    # pair with a runtime and attach to it
-vibex status               # report which seat this home would use
+vibex status               # report which mode this home would use
 vibex status --home <dir>  # ... for another home, without attaching
 vibex --home <dir>         # run against another home
 vibex-server tui           # run the client from the server binary
@@ -16,7 +16,7 @@ vibex-desktop tui          # run the client from the desktop binary (Linux)
 ```
 
 `vibex status` never attaches, so it is the first thing to run when something
-is wrong — it prints the home, the flavour, the seat, the endpoint and the
+is wrong — it prints the home, the flavour, the mode, the endpoint and the
 reason, and exits zero even when the real run would fail.
 
 ### Homes and flavours
@@ -51,14 +51,15 @@ binary so a shell user never installs anything extra:
 | Windows | `vibex.exe` from the NSIS installer; the GUI binary uses the `windows` subsystem and cannot host a console |
 | Containers | `docker exec -it <container> vibex-server tui` |
 
-## Seats
+## Modes
 
-A client attaches in one of two ways, decided once before the interface starts:
+A client attaches in one of two modes, decided once before the interface starts.
+The status band names the mode, and *Settings → Connection* shows the same word:
 
-| Seat | When | Notes |
+| Mode | When | Notes |
 | --- | --- | --- |
-| **Authority** | nothing else owns the home | this process starts and owns the runtime; native steering is available |
-| **Remote** | another runtime owns the home, or a link was given | the client is a network peer; steering degrades to interrupt + resend |
+| **Local mode** | nothing else owns the home | this process starts and owns the runtime; native steering is available |
+| **Remote mode** | another runtime owns the home, or a link was given | the client is a network peer; steering degrades to interrupt + resend |
 
 If the home is locked and the runtime is not accepting local clients, the client
 prints three ways out: enable *Settings → Remote Access → Direct*, quit the
@@ -212,9 +213,9 @@ both the bytes and its place: `inline_text_offset` is where the chip sat in the
 text, in UTF-16 units, which is what puts the picture back between the words
 rather than at the end of the paragraph on every other client. A file the
 runtime can read is sent as an absolute `file://` URI, the form the desktop
-writes itself; a clipboard image on an authority seat is written beside the
+writes itself; a clipboard image in local mode is written beside the
 message and sent the same way, because a path is the only form the desktop can
-draw. On a remote seat, where no file of ours is reachable, the bytes travel as
+draw. In remote mode, where no file of ours is reachable, the bytes travel as
 a data URL that the runtime materialises on its own host. A message pulled back
 out of the queue puts its chips where they were, not stacked at the end.
 
@@ -307,7 +308,7 @@ columns; very narrow tables become vertical records so cell contents remain read
 ### Status bar
 
 The workspace appears on the left. Connection warnings, context usage and the
-current seat appear on the right. A ready connection does not label a running
+current mode appear on the right. A ready connection does not label a running
 turn as complete; the turn status row reports whether work is active.
 
 The location is chrome, not a status: it is drawn in the bright grey a secondary
@@ -669,7 +670,7 @@ and `Esc` closes it.
 ## Terminal ownership
 
 The client draws on the alternate screen, so it owns the terminal for as long as
-it runs — including `stderr`. An authority seat boots the runtime *in this
+it runs — including `stderr`. Local mode boots the runtime *in this
 process*, and the runtime reports startup stages from background tasks that
 finish after the first frame is painted. A line like that landing in a frame
 wraps at the last column and scrolls the grid, which is the log residue that
@@ -678,7 +679,7 @@ must never appear under the interface.
 So writes aimed at `stderr` are diverted into a spill file while the client owns
 the screen, and the terminal's own `stderr` is handed back on exit. Nothing is
 dropped silently: the client names the file when it exits, and the file is
-`VIBEX_TUI_LOG` when that is set. A remote seat writes nothing at all, so no
+`VIBEX_TUI_LOG` when that is set. Remote mode writes nothing at all, so no
 notice is printed and no file is named.
 
 ## Degradation
