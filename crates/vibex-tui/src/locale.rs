@@ -75,8 +75,6 @@ strings! {
     none => { "None", "无", "無" },
     yes => { "Yes", "是", "是" },
     no => { "No", "否", "否" },
-    enabled => { "Enabled", "已启用", "已啟用" },
-    disabled => { "Disabled", "已禁用", "已停用" },
     unknown => { "Unknown", "未知", "未知" },
     search => { "Search", "搜索", "搜尋" },
     filter => { "Filter", "过滤", "過濾" },
@@ -120,9 +118,6 @@ strings! {
     nav_settings => { "Settings", "设置", "設定" },
     nav_help => { "Help", "帮助", "說明" },
     nav_agent => { "Agent", "Agent", "Agent" },
-    nav_files => { "Files", "文件", "檔案" },
-    nav_changes => { "Changes", "变更", "變更" },
-    nav_terminal => { "Terminal", "终端", "終端機" },
     nav_git => { "Git", "Git", "Git" },
 
     // ---- sessions -------------------------------------------------------
@@ -376,24 +371,6 @@ strings! {
     transcript_tool => { "Tool", "工具", "工具" },
     transcript_command => { "Command", "命令", "命令" },
     transcript_file_change => { "File change", "文件变更", "檔案變更" },
-    transcript_diff => { "Diff", "差异", "差異" },
-    git_revert_title => { "Discard changes", "放弃更改", "捨棄變更" },
-    git_revert_warning => {
-        "This discards the working-tree changes at this path. It cannot be undone.",
-        "这将丢弃该路径的工作区更改，且无法撤销。",
-        "這將捨棄該路徑的工作區變更，且無法復原。"
-    },
-    git_history_title => { "Recent commits", "最近提交", "最近提交" },
-    git_branches_title => { "Branches", "分支", "分支" },
-    worktree_title => { "Worktrees", "工作树", "工作樹" },
-    worktree_create_title => { "New worktree branch", "新建工作树分支", "新增工作樹分支" },
-    worktree_preflight_title => {
-        "Worktree preflight",
-        "工作树预检",
-        "工作樹預檢"
-    },
-    worktree_preflight_allowed => { "Allowed", "允许", "允許" },
-    worktree_preflight_blocked => { "Blocked", "已阻止", "已封鎖" },
     transcript_error => { "Error", "错误", "錯誤" },
     transcript_notice => { "Notice", "提示", "提示" },
     transcript_plan => { "Plan", "计划", "計畫" },
@@ -610,7 +587,6 @@ strings! {
     management_prompts => { "Prompts", "提示词", "提示詞" },
     management_hooks => { "Hooks", "钩子", "鉤子" },
     management_devices => { "Devices", "设备", "裝置" },
-    management_recovery => { "Recovery", "恢复", "復原" },
     management_scheduled => { "Scheduled tasks", "定时任务", "定時任務" },
     management_automation => { "Automation", "自动化", "自動化" },
     management_health => { "Provider health", "Provider 健康", "Provider 健康" },
@@ -681,36 +657,12 @@ strings! {
         "Vibex 只記錄 token 數量；價格由 Provider 端決定。"
     },
 
-    // ---- recovery -------------------------------------------------------
-    recovery_title => { "Recovery", "恢复", "復原" },
-    recovery_diagnostics => { "Export diagnostics", "导出诊断", "匯出診斷" },
-    recovery_backup_create => { "Create backup", "创建备份", "建立備份" },
-    recovery_backup_inspect => { "Inspect backup", "检查备份", "檢查備份" },
-    recovery_backup_restore => { "Restore backup", "恢复备份", "還原備份" },
-    recovery_restore_warning => {
-        "Restoring replaces the current runtime data. Type the backup id to confirm.",
-        "恢复将替换当前运行时数据。请输入备份 ID 以确认。",
-        "還原將取代目前執行階段資料。請輸入備份 ID 以確認。"
-    },
-    recovery_authority_only => {
-        "Recovery runs on the authoritative runtime",
-        "恢复操作在权威运行时上执行",
-        "復原操作在權威執行階段上執行"
-    },
-    recovery_artifact_path => { "Written to", "写入位置", "寫入位置" },
-
     // ---- settings -------------------------------------------------------
     settings_theme => { "Theme", "主题", "主題" },
     settings_language => { "Language", "语言", "語言" },
     settings_icons => { "Icons", "图标", "圖示" },
     settings_color => { "Colour", "颜色", "顏色" },
     settings_keys => { "Key bindings", "键位", "鍵位" },
-    settings_status_line => { "Status line", "状态行", "狀態列" },
-    settings_status_line_hint => {
-        "A second, denser status row under the composer: branch, model and context",
-        "输入框下方的第二行状态：分支、模型与上下文用量",
-        "輸入框下方的第二行狀態：分支、模型與上下文用量"
-    },
     settings_keys_hint => {
         "Rebind in ~/.vibex/tui-keys.toml",
         "在 ~/.vibex/tui-keys.toml 中重映射",

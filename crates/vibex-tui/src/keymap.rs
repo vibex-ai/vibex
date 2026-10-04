@@ -279,9 +279,6 @@ pub enum Scope {
     Runtime,
     Sessions,
     Agent,
-    Files,
-    Changes,
-    Terminal,
     Management,
     Providers,
     Agents,
@@ -291,7 +288,6 @@ pub enum Scope {
     Hooks,
     Devices,
     Usage,
-    Recovery,
     Settings,
     Help,
 }
@@ -305,9 +301,6 @@ impl Scope {
         Scope::Runtime,
         Scope::Sessions,
         Scope::Agent,
-        Scope::Files,
-        Scope::Changes,
-        Scope::Terminal,
         Scope::Management,
         Scope::Providers,
         Scope::Agents,
@@ -317,7 +310,6 @@ impl Scope {
         Scope::Hooks,
         Scope::Devices,
         Scope::Usage,
-        Scope::Recovery,
         Scope::Settings,
         Scope::Help,
     ];
@@ -330,9 +322,6 @@ impl Scope {
             Scope::Runtime => "runtime",
             Scope::Sessions => "sessions",
             Scope::Agent => "agent",
-            Scope::Files => "files",
-            Scope::Changes => "changes",
-            Scope::Terminal => "terminal",
             Scope::Management => "management",
             Scope::Agents => "agents",
             Scope::Providers => "providers",
@@ -342,7 +331,6 @@ impl Scope {
             Scope::Hooks => "hooks",
             Scope::Devices => "devices",
             Scope::Usage => "usage",
-            Scope::Recovery => "recovery",
             Scope::Settings => "settings",
             Scope::Help => "help",
         }
@@ -355,9 +343,7 @@ impl Scope {
             Scope::Agent => Category::Transcript,
             Scope::Composer => Category::Composer,
             Scope::Overlay | Scope::Runtime => Category::Modals,
-            Scope::Sessions | Scope::Files | Scope::Changes | Scope::Terminal => {
-                Category::Workbench
-            }
+            Scope::Sessions => Category::Workbench,
             Scope::Management
             | Scope::Providers
             | Scope::Agents
@@ -365,9 +351,7 @@ impl Scope {
             | Scope::Skills
             | Scope::Prompts
             | Scope::Hooks => Category::Management,
-            Scope::Devices | Scope::Usage | Scope::Recovery | Scope::Settings | Scope::Help => {
-                Category::Panels
-            }
+            Scope::Devices | Scope::Usage | Scope::Settings | Scope::Help => Category::Panels,
         }
     }
 }
@@ -721,18 +705,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Agent,
-        Chord::plain(KeyCode::Left),
-        Intent::PreviousPanel,
-        "Previous panel",
-    ),
-    binding(
-        Scope::Agent,
-        Chord::plain(KeyCode::Right),
-        Intent::NextPanel,
-        "Next panel",
-    ),
-    binding(
-        Scope::Agent,
         Chord::plain(KeyCode::Char('/')),
         Intent::BeginTranscriptSearch,
         "Find",
@@ -788,18 +760,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Chord::plain(KeyCode::Char('p')),
         Intent::SearchPrevious,
         "Prev match",
-    ),
-    binding(
-        Scope::Agent,
-        Chord::plain(KeyCode::F(3)),
-        Intent::OpenChanges,
-        "Changes",
-    ),
-    binding(
-        Scope::Agent,
-        Chord::plain(KeyCode::F(4)),
-        Intent::OpenFiles,
-        "Files",
     ),
     binding(
         Scope::Agent,
@@ -1139,85 +1099,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     // ---- deviceless pages ------------------------------------------------
     binding(
-        Scope::Files,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Files,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Files,
-        Chord::plain(KeyCode::Enter),
-        Intent::OpenSelectedFile,
-        "Open file",
-    ),
-    binding(
-        Scope::Files,
-        Chord::plain(KeyCode::Char('e')),
-        Intent::EditSelectedFile,
-        "Edit in $EDITOR",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('a')),
-        Intent::GitStageSelected,
-        "Stage",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('u')),
-        Intent::GitUnstageSelected,
-        "Unstage",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('c')),
-        Intent::GitCommit,
-        "Commit",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('d')),
-        Intent::ShowDiff,
-        "Diff",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('w')),
-        Intent::WorktreeMenu,
-        "Worktrees",
-    ),
-    binding(
-        Scope::Terminal,
-        Chord::plain(KeyCode::Char('n')),
-        Intent::NewTerminal,
-        "New terminal",
-    ),
-    binding(
-        Scope::Terminal,
-        Chord::plain(KeyCode::Char('x')),
-        Intent::CloseTerminal,
-        "Close terminal",
-    ),
-    // ---- management ------------------------------------------------------
-    binding(
         Scope::Management,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
@@ -1429,50 +1310,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::Refresh,
         "Refresh",
     ),
-    // ---- recovery --------------------------------------------------------
-    binding(
-        Scope::Recovery,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Recovery,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Recovery,
-        Chord::plain(KeyCode::Enter),
-        Intent::ActivateRecoveryAction,
-        "Run",
-    ),
-    binding(
-        Scope::Recovery,
-        Chord::plain(KeyCode::Char('d')),
-        Intent::ExportDiagnostics,
-        "Export diagnostics",
-    ),
-    binding(
-        Scope::Recovery,
-        Chord::plain(KeyCode::Char('b')),
-        Intent::CreateBackup,
-        "Create backup",
-    ),
-    binding(
-        Scope::Recovery,
-        Chord::plain(KeyCode::Char('i')),
-        Intent::InspectBackup,
-        "Inspect backup",
-    ),
-    binding(
-        Scope::Recovery,
-        Chord::ctrl('r'),
-        Intent::RestoreBackup,
-        "Restore backup",
-    ),
-    // ---- settings --------------------------------------------------------
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Up),
@@ -1686,48 +1523,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     // ---- files / changes extras ------------------------------------------
     binding(
-        Scope::Files,
-        Chord::plain(KeyCode::Char(' ')),
-        Intent::ToggleFileTreeExpanded,
-        "Expand dir",
-    ),
-    binding(
-        Scope::Files,
-        Chord::plain(KeyCode::Char('/')),
-        Intent::FileSearch,
-        "Search files",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::ctrl('x'),
-        Intent::GitRevert,
-        "Revert",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('l')),
-        Intent::GitHistory,
-        "History",
-    ),
-    binding(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('b')),
-        Intent::GitBranches,
-        "Branches",
-    ),
-    alias(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('p')),
-        Intent::WorktreePreflight,
-    ),
-    binding(
-        Scope::Terminal,
-        Chord::plain(KeyCode::Char('f')),
-        Intent::TerminalToggleFollow,
-        "Follow output",
-    ),
-    // ---- management extras -----------------------------------------------
-    binding(
         Scope::Management,
         Chord::ctrl('x'),
         Intent::UninstallAgent,
@@ -1754,11 +1549,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Providers,
         Chord::plain(KeyCode::Char('h')),
         Intent::ProviderHealth,
-    ),
-    alias(
-        Scope::Changes,
-        Chord::plain(KeyCode::Char('n')),
-        Intent::WorktreeCreate,
     ),
     alias(
         Scope::Usage,

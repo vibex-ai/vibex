@@ -42,9 +42,6 @@ pub enum Page {
     /// reader who presses `n` wants to write, so the page they land on is a
     /// prompt, with the runtime it will be sent through named beside it.
     NewSession,
-    Files,
-    Changes,
-    Terminal,
     Management,
     Providers,
     Agents,
@@ -54,7 +51,6 @@ pub enum Page {
     Hooks,
     Devices,
     Usage,
-    Recovery,
     Settings,
     Help,
 }
@@ -64,9 +60,6 @@ impl Page {
         match self {
             Page::Sessions => Scope::Sessions,
             Page::Agent | Page::NewSession => Scope::Agent,
-            Page::Files => Scope::Files,
-            Page::Changes => Scope::Changes,
-            Page::Terminal => Scope::Terminal,
             Page::Management | Page::Agents => Scope::Management,
             Page::Providers => Scope::Providers,
             Page::Mcp => Scope::Mcp,
@@ -75,17 +68,13 @@ impl Page {
             Page::Hooks => Scope::Hooks,
             Page::Devices => Scope::Devices,
             Page::Usage => Scope::Usage,
-            Page::Recovery => Scope::Recovery,
             Page::Settings => Scope::Settings,
             Page::Help => Scope::Help,
         }
     }
 
     pub const fn is_session_page(self) -> bool {
-        matches!(
-            self,
-            Page::Agent | Page::NewSession | Page::Files | Page::Changes | Page::Terminal
-        )
+        matches!(self, Page::Agent | Page::NewSession)
     }
 
     /// Whether the page exists to write a message: the composer owns the
@@ -213,7 +202,6 @@ pub enum Overlay {
 pub enum PromptField {
     RenameSession,
     WorkspacePath,
-    CommitMessage,
     ProviderSecret,
     ProviderEndpoint,
     McpServerName,
@@ -221,8 +209,6 @@ pub enum PromptField {
     PromptName,
     HookName,
     DeviceRevokeReason,
-    RestoreBackupId,
-    WorktreeBranch,
     ImagePath,
     /// A run option the Agent publishes as free text rather than as a list.
     RunOptionValue,
@@ -419,11 +405,10 @@ pub enum ManagementRow {
     Prompts,
     Hooks,
     Devices,
-    Recovery,
 }
 
 impl ManagementRow {
-    pub const ALL: [ManagementRow; 8] = [
+    pub const ALL: [ManagementRow; 7] = [
         ManagementRow::Agents,
         ManagementRow::Providers,
         ManagementRow::Mcp,
@@ -431,7 +416,6 @@ impl ManagementRow {
         ManagementRow::Prompts,
         ManagementRow::Hooks,
         ManagementRow::Devices,
-        ManagementRow::Recovery,
     ];
 
     pub const fn page(self) -> Page {
@@ -443,7 +427,6 @@ impl ManagementRow {
             ManagementRow::Prompts => Page::Prompts,
             ManagementRow::Hooks => Page::Hooks,
             ManagementRow::Devices => Page::Devices,
-            ManagementRow::Recovery => Page::Recovery,
         }
     }
 }
@@ -713,12 +696,6 @@ pub struct App {
     pub should_quit: bool,
     pub workspace_rows: Vec<vibex_backend::WorkspaceSummary>,
     pub workspace_browse: Option<vibex_core::RemoteWorkspaceDirectoryListing>,
-    pub file_rows: Vec<vibex_core::FileTreeEntry>,
-    pub git_status: Option<vibex_core::GitStatusSummary>,
-    pub git_history: Vec<vibex_core::GitCommitSummary>,
-    pub git_branches: Vec<vibex_core::GitBranchSummary>,
-    pub worktrees: Option<Box<vibex_core::GitWorktreeLifecycleSnapshot>>,
-    pub diff_text: Option<String>,
     pub text_view: Option<(String, String)>,
     /// The crossterm-reported terminal size, used by renderers that need to
     /// make a layout decision before the frame buffer exists.
@@ -1192,7 +1169,6 @@ impl App {
                 selected: 0,
                 view: SettingsMode::Browse,
                 filter: String::new(),
-                status_line: true,
             },
             management_data: ManagementData::default(),
             selection: BTreeMap::new(),
@@ -1206,12 +1182,6 @@ impl App {
             should_quit: false,
             workspace_rows: Vec::new(),
             workspace_browse: None,
-            file_rows: Vec::new(),
-            git_status: None,
-            git_history: Vec::new(),
-            git_branches: Vec::new(),
-            worktrees: None,
-            diff_text: None,
             text_view: None,
             viewport: (120, 40),
             transcript_band_rows: 20,
@@ -2214,12 +2184,9 @@ impl App {
             Page::Skills => self.management_data.skills.len(),
             Page::Prompts => self.management_data.prompts.len(),
             Page::Hooks => self.management_data.hooks.len(),
-            Page::Recovery => RecoveryAction::ALL.len(),
             Page::Settings => self.visible_settings().len(),
             Page::Agent => self.transcript.len(),
-            Page::Changes => self.file_rows.len(),
-            Page::Files => self.file_rows.len(),
-            Page::Usage | Page::Help | Page::Terminal => 0,
+            Page::Usage | Page::Help => 0,
         }
     }
 
@@ -2717,9 +2684,6 @@ impl App {
             Page::Sessions => strings.nav_sessions(),
             Page::Agent => strings.nav_agent(),
             Page::NewSession => strings.session_new(),
-            Page::Files => strings.nav_files(),
-            Page::Changes => strings.nav_changes(),
-            Page::Terminal => strings.nav_terminal(),
             Page::Management | Page::Agents => strings.nav_management(),
             Page::Providers => strings.management_providers(),
             Page::Mcp => strings.management_mcp(),
@@ -2728,7 +2692,6 @@ impl App {
             Page::Hooks => strings.management_hooks(),
             Page::Devices => strings.devices_title(),
             Page::Usage => strings.nav_usage(),
-            Page::Recovery => strings.recovery_title(),
             Page::Settings => strings.nav_settings(),
             Page::Help => strings.nav_help(),
         }
@@ -3028,15 +2991,14 @@ impl App {
         self.navigate_to(page);
     }
 
-    pub fn select_session_destination(&mut self, destination: SessionDestination) {
-        let page = match destination {
-            SessionDestination::Agent => Page::Agent,
-            SessionDestination::Files => Page::Files,
-            SessionDestination::Changes => Page::Changes,
-            SessionDestination::Terminal => Page::Terminal,
-        };
-        self.navigation.select_session(destination);
-        self.navigate_to(page);
+    /// Move into the session's own page.
+    ///
+    /// The session shell's navigation still names a destination, and `Agent`
+    /// is the only one this client has: the workbench pages that used to sit
+    /// beside it (files, changes, terminal) are not part of the TUI.
+    pub fn select_session_destination(&mut self) {
+        self.navigation.select_session(SessionDestination::Agent);
+        self.navigate_to(Page::Agent);
     }
 
     pub fn open_session(&mut self, session_id: VibexSessionId) {
@@ -4615,24 +4577,6 @@ pub enum ManagementEntryEdit {
     },
 }
 
-/// Actions on the recovery page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryAction {
-    Diagnostics,
-    BackupCreate,
-    BackupInspect,
-    BackupRestore,
-}
-
-impl RecoveryAction {
-    pub const ALL: [RecoveryAction; 4] = [
-        RecoveryAction::Diagnostics,
-        RecoveryAction::BackupCreate,
-        RecoveryAction::BackupInspect,
-        RecoveryAction::BackupRestore,
-    ];
-}
-
 /// Asynchronous work the reducer asks the worker to perform.
 ///
 /// The variants carry only data; the worker owns the tokio runtime and the
@@ -4749,16 +4693,6 @@ pub enum Effect {
     BrowseDirectories {
         path: Option<String>,
     },
-    LoadFileTree {
-        workspace_id: vibex_core::WorkspaceId,
-    },
-    LoadGitStatus {
-        workspace_id: vibex_core::WorkspaceId,
-    },
-    LoadGitDiff {
-        workspace_id: vibex_core::WorkspaceId,
-        path: String,
-    },
     ListDevices,
     CreatePairingOffer,
     RevokeDevice {
@@ -4814,12 +4748,6 @@ pub enum Effect {
         enabled: bool,
     },
     LoadUsage,
-    ExportDiagnostics,
-    CreateBackup,
-    InspectBackup,
-    RestoreBackup {
-        backup_id: String,
-    },
     DiscoverCompletions {
         ticket: ComposerTicket,
         trigger: crate::composer::CompletionTrigger,
@@ -4830,52 +4758,9 @@ pub enum Effect {
     ProbeAgentRuntime {
         request: vibex_core::AgentRuntimeOptionProbeRequest,
     },
-    /// Stage or unstage one path.
-    GitStage {
-        workspace_id: vibex_core::WorkspaceId,
-        path: String,
-        stage: bool,
-    },
-    /// Commit the staged changes with an already-collected message.
-    GitCommit {
-        workspace_id: vibex_core::WorkspaceId,
-        message: String,
-    },
-    /// Recent commits on the workspace's branch.
-    LoadGitHistory {
-        workspace_id: vibex_core::WorkspaceId,
-    },
-    /// Local and remote branches.
-    LoadGitBranches {
-        workspace_id: vibex_core::WorkspaceId,
-    },
-    /// Discard the changes at one path.
-    GitRevert {
-        workspace_id: vibex_core::WorkspaceId,
-        path: String,
-    },
-    /// Read the worktree lifecycle snapshot for a workspace.
-    LoadWorktrees {
-        workspace_id: vibex_core::WorkspaceId,
-    },
-    /// Run the destructive preflight a worktree action requires.
-    WorktreePreflight {
-        workspace_id: vibex_core::WorkspaceId,
-        path: String,
-    },
-    /// Create a worktree from a branch name.
-    WorktreeCreate {
-        workspace_id: vibex_core::WorkspaceId,
-        branch_name: String,
-    },
     /// Edit one management entry by id.
     UpdateEntry {
         entry: ManagementEntryEdit,
-    },
-    /// Read a file for the read-only viewer.
-    ReadFile {
-        workspace_id: vibex_core::WorkspaceId,
-        path: String,
     },
     /// Provider health summaries.
     ListHealth,
@@ -4943,9 +4828,6 @@ impl Effect {
             Effect::ListWorkspaces => "workspaces",
             Effect::OpenWorkspace { .. } => "open_workspace",
             Effect::BrowseDirectories { .. } => "browse",
-            Effect::LoadFileTree { .. } => "file_tree",
-            Effect::LoadGitStatus { .. } => "git_status",
-            Effect::LoadGitDiff { .. } => "git_diff",
             Effect::ListDevices => "devices",
             Effect::CreatePairingOffer => "pairing_offer",
             Effect::RevokeDevice { .. } => "revoke_device",
@@ -4969,22 +4851,9 @@ impl Effect {
             | Effect::TogglePrompt { .. }
             | Effect::ToggleHook { .. } => "toggle_entry",
             Effect::LoadUsage => "usage",
-            Effect::ExportDiagnostics => "diagnostics",
-            Effect::CreateBackup => "backup_create",
-            Effect::InspectBackup => "backup_inspect",
-            Effect::RestoreBackup { .. } => "backup_restore",
             Effect::DiscoverCompletions { .. } => "completions",
             Effect::CheckDrift => "drift",
             Effect::ProbeAgentRuntime { .. } => "runtime_probe",
-            Effect::GitStage { .. } => "git_stage",
-            Effect::GitCommit { .. } => "git_commit",
-            Effect::ReadFile { .. } => "read_file",
-            Effect::LoadGitHistory { .. } => "git_history",
-            Effect::LoadGitBranches { .. } => "git_branches",
-            Effect::GitRevert { .. } => "git_revert",
-            Effect::LoadWorktrees { .. } => "worktrees",
-            Effect::WorktreePreflight { .. } => "worktree_preflight",
-            Effect::WorktreeCreate { .. } => "worktree_create",
             Effect::UpdateEntry { .. } => "update_entry",
             Effect::ListHealth => "provider_health",
             Effect::RenameProfile { .. } => "rename_profile",
@@ -5243,9 +5112,8 @@ mod tests {
     fn management_rows_cover_every_management_page() {
         let pages = ManagementRow::ALL.map(ManagementRow::page);
         assert!(pages.contains(&Page::Devices));
-        assert!(pages.contains(&Page::Recovery));
         assert!(pages.contains(&Page::Providers));
-        assert_eq!(pages.len(), 8);
+        assert_eq!(pages.len(), 7);
     }
 
     #[test]
@@ -5281,12 +5149,6 @@ mod tests {
                 "{section:?} has no setting"
             );
         }
-    }
-
-    #[test]
-    fn recovery_actions_cover_every_destructive_and_read_only_action() {
-        assert_eq!(RecoveryAction::ALL.len(), 4);
-        assert!(RecoveryAction::ALL.contains(&RecoveryAction::BackupRestore));
     }
 
     #[test]

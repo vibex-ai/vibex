@@ -105,10 +105,6 @@ intents! {
     CopyBlockBody => { scope: Agent, id: "block_copy", label: "Copy", help: "Copy the selected block's body to the clipboard." },
     CopyBlockMetadata => { scope: Agent, id: "block_copy_meta", label: "Copy meta", help: "Copy the command, path or id attached to the block." },
     OpenBlockDetails => { scope: Agent, id: "block_details", label: "Details", help: "Open the diff, terminal output or full text for the block." },
-    PreviousPanel => { scope: Agent, id: "panel_previous", label: "Prev panel", help: "Move to the previous workbench panel." },
-    NextPanel => { scope: Agent, id: "panel_next", label: "Next panel", help: "Move to the next workbench panel." },
-    OpenChanges => { scope: Agent, id: "open_changes", label: "Changes", help: "Open the Git workbench for this session." },
-    OpenFiles => { scope: Agent, id: "open_files", label: "Files", help: "Open the file tree for this session." },
     SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: "Runtime", help: "Choose the Agent, its model and the run options it publishes." },
     ProbeAgentRuntime => { scope: Agent, id: "runtime_probe", label: "Probe", help: "Ask the runtime to re-discover available Agents." },
     BeginTranscriptSearch => { scope: Agent, id: "transcript_search", label: "Find", help: "Search the transcript with a regular expression." },
@@ -184,28 +180,8 @@ intents! {
     ElicitationFieldNext => { scope: Overlay, id: "elicitation_next", label: "Next field", help: "Move to the next question." },
     ElicitationFieldPrevious => { scope: Overlay, id: "elicitation_prev", label: "Prev field", help: "Move to the previous question." },
 
-    // ---- files ----------------------------------------------------------
-    OpenSelectedFile => { scope: Files, id: "file_open", label: "Open", help: "Show the file's contents read-only." },
-    EditSelectedFile => { scope: Files, id: "file_edit", label: "$EDITOR", help: "Hand the file to your editor." },
-    ToggleFileTreeExpanded => { scope: Files, id: "file_toggle", label: "Expand", help: "Expand or collapse the highlighted directory." },
-    FileSearch => { scope: Files, id: "file_search", label: "Search", help: "Search file names in the workspace." },
 
-    // ---- changes / git --------------------------------------------------
-    GitStageSelected => { scope: Changes, id: "git_stage", label: "Stage", help: "Stage the highlighted path." },
-    GitUnstageSelected => { scope: Changes, id: "git_unstage", label: "Unstage", help: "Unstage the highlighted path." },
-    GitCommit => { scope: Changes, id: "git_commit", label: "Commit", help: "Commit the staged changes; the message opens in $EDITOR." },
-    GitRevert => { scope: Changes, id: "git_revert", label: "Revert", help: "Discard the highlighted change after confirmation." },
-    ShowDiff => { scope: Changes, id: "git_diff", label: "Diff", help: "Show the diff for the highlighted path." },
-    GitHistory => { scope: Changes, id: "git_history", label: "History", help: "Browse recent commits." },
-    GitBranches => { scope: Changes, id: "git_branches", label: "Branches", help: "List and switch branches." },
-    WorktreeMenu => { scope: Changes, id: "worktree_menu", label: "Worktrees", help: "Create, archive, restore or discard a worktree." },
-    WorktreeCreate => { scope: Changes, id: "worktree_create", label: "Create", help: "Create a worktree for the selected branch." },
-    WorktreePreflight => { scope: Changes, id: "worktree_preflight", label: "Preflight", help: "Run the preflight check a worktree action requires." },
 
-    // ---- terminal -------------------------------------------------------
-    NewTerminal => { scope: Terminal, id: "terminal_new", label: "New", help: "Open a runtime terminal in this session." },
-    CloseTerminal => { scope: Terminal, id: "terminal_close", label: "Close", help: "Close the current runtime terminal." },
-    TerminalToggleFollow => { scope: Terminal, id: "terminal_follow", label: "Follow", help: "Follow or pause terminal output." },
 
     // ---- management -----------------------------------------------------
     OpenManagementSection => { scope: Management, id: "management_open", label: "Open", help: "Open the highlighted management section." },
@@ -235,12 +211,6 @@ intents! {
     // ---- usage ----------------------------------------------------------
     UsageSessionScope => { scope: Usage, id: "usage_scope", label: "Scope", help: "Switch between this session and the aggregate." },
 
-    // ---- recovery -------------------------------------------------------
-    ActivateRecoveryAction => { scope: Recovery, id: "recovery_run", label: "Run", help: "Run the highlighted recovery action." },
-    ExportDiagnostics => { scope: Recovery, id: "recovery_diagnostics", label: "Diagnostics", help: "Export a diagnostics bundle on the authority host." },
-    CreateBackup => { scope: Recovery, id: "recovery_backup", label: "Back up", help: "Create a database backup on the authority host." },
-    InspectBackup => { scope: Recovery, id: "recovery_inspect", label: "Inspect", help: "Read a backup's manifest without restoring it." },
-    RestoreBackup => { scope: Recovery, id: "recovery_restore", label: "Restore", help: "Restore a backup. Destructive, and doubly confirmed." },
 
     // ---- settings -------------------------------------------------------
     ActivateSetting => { scope: Settings, id: "setting_activate", label: "Change", help: "Change the highlighted setting." },
@@ -276,15 +246,8 @@ impl Intent {
                 | Intent::ForkSession
                 | Intent::ArchiveSession
                 | Intent::DeleteSession
-                | Intent::GitStageSelected
-                | Intent::GitUnstageSelected
-                | Intent::GitCommit
-                | Intent::GitRevert
                 | Intent::CreatePairingCode
                 | Intent::RevokeSelectedDevice
-                | Intent::CreateBackup
-                | Intent::RestoreBackup
-                | Intent::ExportDiagnostics
                 | Intent::InstallOrUpdateAgent
                 | Intent::UninstallAgent
                 | Intent::AgentLogout
@@ -293,11 +256,8 @@ impl Intent {
                 | Intent::EditProviderProjection
                 | Intent::ToggleSelectedEntry
                 | Intent::EditSelectedEntry
-                | Intent::WorktreeCreate
                 | Intent::SteerRunningTurn
                 | Intent::BackgroundRunningCommand
-                | Intent::NewTerminal
-                | Intent::CloseTerminal
                 | Intent::SwitchAgentRuntime
         )
     }
@@ -341,8 +301,6 @@ impl Intent {
                 | Intent::CopyBlockBody
                 | Intent::CopyBlockMetadata
                 | Intent::OpenBlockDetails
-                | Intent::PreviousPanel
-                | Intent::NextPanel
                 | Intent::ToggleSidebar
                 | Intent::ReloadKeymap
                 | Intent::CloseOverlay

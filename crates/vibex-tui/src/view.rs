@@ -20,8 +20,7 @@ use vibex_ui::shell::ShellKind;
 
 use crate::action::Intent;
 use crate::app::{
-    App, Availability, BannerTone, ComposerMode, ManagementRow, Overlay, Page, RecoveryAction,
-    ToastTone,
+    App, Availability, BannerTone, ComposerMode, ManagementRow, Overlay, Page, ToastTone,
 };
 use crate::keymap::Scope;
 use crate::layout::Bands;
@@ -210,16 +209,6 @@ pub const PALETTE: &[PaletteEntry] = &[
         intent: Intent::ProbeAgentRuntime,
     },
     PaletteEntry {
-        label: "Files",
-        hint: "Open the workspace file tree",
-        intent: Intent::OpenFiles,
-    },
-    PaletteEntry {
-        label: "Changes",
-        hint: "Open the Git workbench",
-        intent: Intent::OpenChanges,
-    },
-    PaletteEntry {
         label: "Devices",
         hint: "Pair and revoke devices",
         intent: Intent::OpenManagementSection,
@@ -283,9 +272,7 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::SwitchWorkspace
         | Intent::OpenSelectedSession
         | Intent::EnterSession => PaletteGroup::Session,
-        Intent::OpenFiles
-        | Intent::OpenChanges
-        | Intent::OpenBlockDetails
+        Intent::OpenBlockDetails
         | Intent::CopyBlockBody
         | Intent::CopyBlockMetadata
         | Intent::ToggleBlockExpanded
@@ -297,10 +284,6 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::ToggleSelectedEntry
         | Intent::EditSelectedEntry
         | Intent::ReloadManagement
-        | Intent::ExportDiagnostics
-        | Intent::CreateBackup
-        | Intent::InspectBackup
-        | Intent::RestoreBackup
         | Intent::ProviderHealth => PaletteGroup::Management,
         Intent::CreatePairingCode | Intent::RevokeSelectedDevice | Intent::OpenDeviceAudit => {
             PaletteGroup::Device
@@ -533,9 +516,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         Page::Agent => render_scrollback(frame, bands.scrollback, app, &theme, strings),
         Page::NewSession => render_new_session(frame, bands.scrollback, app, &theme, strings),
         Page::Sessions => render_session_view(frame, bands.scrollback, app, &theme, strings),
-        Page::Files | Page::Changes => {
-            render_file_view(frame, bands.scrollback, app, &theme, strings)
-        }
         Page::Management
         | Page::Providers
         | Page::Agents
@@ -545,19 +525,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         | Page::Hooks
         | Page::Devices
         | Page::Usage
-        | Page::Recovery
         | Page::Settings
         | Page::Help => render_management_view(frame, bands.scrollback, app, &theme, strings),
-        Page::Terminal => {
-            let inner = page_frame(
-                frame,
-                bands.scrollback,
-                &theme,
-                strings.nav_terminal(),
-                true,
-            );
-            empty_state(frame, inner, &theme, strings.toast_action_unavailable());
-        }
     }
 
     // The rail maps the transcript, so it belongs to the pages that show one.
@@ -1471,22 +1440,6 @@ pub fn session_card_text(app: &App, session: &vibex_core::AgentSession) -> Strin
         .join("\n")
 }
 
-fn render_file_view(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    let title = if app.page == Page::Changes {
-        strings.nav_changes()
-    } else {
-        strings.nav_files()
-    };
-    render_file_list(frame, area, app, theme, strings, title);
-}
-
-/// The management, device, usage, recovery and settings views.
 fn render_management_view(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1501,7 +1454,6 @@ fn render_management_view(
         }
         Page::Devices => render_devices(frame, area, app, theme, strings),
         Page::Usage => render_usage(frame, area, app, theme, strings),
-        Page::Recovery => render_recovery(frame, area, app, theme, strings),
         Page::Settings => render_settings(frame, area, app, theme, strings),
         Page::Help => render_help(frame, area, app, theme, strings),
         _ => {}
@@ -2897,36 +2849,7 @@ fn render_composer_info(
             theme.muted(),
         ));
     }
-    let mut right = Vec::new();
-    if app.settings.status_line
-        && app.page_owns_session()
-        && let Some(status) = &app.git_status
-    {
-        if let Some(branch) = &status.branch {
-            right.push(Span::styled(branch.clone(), theme.muted()));
-        }
-        if !status.changes.is_empty() {
-            right.push(Span::styled(
-                format!(" · {} {}", status.changes.len(), strings.nav_changes()),
-                theme.warning(),
-            ));
-        }
-    }
-    // Keep runtime identity before optional repository information on narrow screens.
-    if left
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum::<usize>()
-        + right
-            .iter()
-            .map(|span| display_width(&span.content))
-            .sum::<usize>()
-        + 3
-        > usize::from(area.width)
-    {
-        right.clear();
-    }
-    render_zoned_line(frame, area, left, None, right);
+    render_zoned_line(frame, area, left, None, Vec::new());
 }
 
 /// The completion popup, drawn directly above the composer.
@@ -3089,84 +3012,6 @@ fn strings_of(_app: &App) -> Strings {
     Strings::for_locale(crate::locale::Locale::En)
 }
 
-fn render_file_list(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-    title: &str,
-) {
-    let inner = page_frame(frame, area, theme, title, true);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
-        .split(inner);
-
-    let entries: Vec<(String, String)> = if app.page == Page::Changes {
-        app.git_status
-            .as_ref()
-            .map(|status| {
-                status
-                    .changes
-                    .iter()
-                    .map(|entry| {
-                        (
-                            format!("{:?} {}", entry.kind, entry.path),
-                            entry.path.clone(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        app.file_rows
-            .iter()
-            .map(|entry| {
-                let marker = match entry.kind {
-                    vibex_core::FileEntryKind::Directory => "▸ ",
-                    vibex_core::FileEntryKind::File => "  ",
-                    _ => "? ",
-                };
-                (format!("{marker}{}", entry.name), entry.path.clone())
-            })
-            .collect()
-    };
-
-    if entries.is_empty() {
-        empty_state(frame, rows[0], theme, strings.nothing_here());
-    } else {
-        let selected = app.selection_for(app.page.scope());
-        let items = entries
-            .iter()
-            .enumerate()
-            .map(|(index, (label, _))| {
-                let style = if index == selected {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
-                ListItem::new(Line::from(Span::styled(label.clone(), style)))
-            })
-            .collect::<Vec<_>>();
-        let mut state = ratatui::widgets::ListState::default();
-        state.select(Some(selected.min(entries.len() - 1)));
-        frame.render_stateful_widget(List::new(items), rows[0], &mut state);
-    }
-
-    if let Some(diff) = &app.diff_text {
-        frame.render_widget(
-            Paragraph::new(truncate_to_width(
-                diff.lines().next().unwrap_or(""),
-                usize::from(rows[1].width),
-                "…",
-            ))
-            .style(theme.muted()),
-            rows[1],
-        );
-    }
-}
-
 fn render_management(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3184,7 +3029,6 @@ fn render_management(
         strings.management_prompts(),
         strings.management_hooks(),
         strings.management_devices(),
-        strings.management_recovery(),
     ];
     let counts = [
         app.management_data.agents.len(),
@@ -3194,7 +3038,6 @@ fn render_management(
         app.management_data.prompts.len(),
         app.management_data.hooks.len(),
         app.management_data.devices.len(),
-        app.management_data.backups.len(),
     ];
     let selected = app.selection_for(Scope::Management);
     let items = rows
@@ -3205,9 +3048,6 @@ fn render_management(
             let availability = match row {
                 ManagementRow::Devices => {
                     app.availability(vibex_backend::BackendOperation::DeviceList)
-                }
-                ManagementRow::Recovery => {
-                    app.availability(vibex_backend::BackendOperation::RecoveryDiagnosticsExport)
                 }
                 _ => Availability::Available,
             };
@@ -3534,81 +3374,6 @@ fn render_usage(
         Paragraph::new(strings.usage_no_cost_hint())
             .style(theme.muted())
             .wrap(Wrap { trim: true }),
-        rows[1],
-    );
-}
-
-fn render_recovery(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    let inner = page_frame(frame, area, theme, strings.recovery_title(), true);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
-        .split(inner);
-    let actions = [
-        (RecoveryAction::Diagnostics, strings.recovery_diagnostics()),
-        (
-            RecoveryAction::BackupCreate,
-            strings.recovery_backup_create(),
-        ),
-        (
-            RecoveryAction::BackupInspect,
-            strings.recovery_backup_inspect(),
-        ),
-        (
-            RecoveryAction::BackupRestore,
-            strings.recovery_backup_restore(),
-        ),
-    ];
-    let selected = app.selection_for(Scope::Recovery);
-    let items = actions
-        .iter()
-        .enumerate()
-        .map(|(index, (action, label))| {
-            let availability = match action {
-                RecoveryAction::Diagnostics => {
-                    app.availability(vibex_backend::BackendOperation::RecoveryDiagnosticsExport)
-                }
-                RecoveryAction::BackupCreate => {
-                    app.availability(vibex_backend::BackendOperation::RecoveryBackupCreate)
-                }
-                RecoveryAction::BackupInspect => {
-                    app.availability(vibex_backend::BackendOperation::RecoveryBackupInspect)
-                }
-                RecoveryAction::BackupRestore => {
-                    app.availability(vibex_backend::BackendOperation::RecoveryBackupRestore)
-                }
-            };
-            let style = if index == selected {
-                theme.selected()
-            } else if availability.is_available() {
-                theme.base()
-            } else {
-                theme.muted()
-            };
-            let suffix = match availability {
-                Availability::Available => String::new(),
-                Availability::RequiresPermission => {
-                    format!("  [{}]", strings.permission_required_for())
-                }
-                _ => format!("  [{}]", strings.toast_action_unavailable()),
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<24}", label), style),
-                Span::styled(suffix, theme.muted()),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(actions.len() - 1)));
-    frame.render_stateful_widget(List::new(items), rows[0], &mut state);
-    frame.render_widget(
-        Paragraph::new(strings.recovery_authority_only()).style(theme.muted()),
         rows[1],
     );
 }

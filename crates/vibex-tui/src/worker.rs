@@ -104,14 +104,6 @@ pub enum AppMessage {
         result: BackendResult<vibex_backend::WorkspaceSummary>,
     },
     DirectoryListing(BackendResult<vibex_core::RemoteWorkspaceDirectoryListing>),
-    FileTree(BackendResult<Vec<vibex_core::FileTreeEntry>>),
-    FileContents(BackendResult<vibex_core::FileReadResponse>),
-    GitStatus(BackendResult<vibex_core::GitStatusSummary>),
-    GitDiff(BackendResult<vibex_core::GitDiffResponse>),
-    GitHistory(BackendResult<vibex_core::GitHistoryResponse>),
-    GitBranches(BackendResult<vibex_core::GitBranchListResponse>),
-    Worktrees(BackendResult<Box<vibex_core::GitWorktreeLifecycleSnapshot>>),
-    WorktreePreflight(BackendResult<vibex_core::GitWorktreeDestructivePreflight>),
     Devices(BackendResult<Vec<vibex_core::RemoteDeviceDetail>>),
     PairingOffer(BackendResult<Box<vibex_core::RemoteCreatePairingOfferResponse>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
@@ -130,8 +122,6 @@ pub enum AppMessage {
         result: BackendResult<Box<vibex_core::AgentCommandDiscovery>>,
     },
     Usage(BackendResult<Box<UsageReport>>),
-    Recovery(BackendResult<String>),
-    BackupList(BackendResult<Vec<vibex_core::BackupCreateOutcome>>),
     Clipboard(BackendResult<()>),
     EditorFinished {
         ticket: Option<crate::app::ComposerTicket>,
@@ -707,147 +697,11 @@ impl Dispatch {
                 };
                 self.send(AppMessage::DirectoryListing(result));
             }
-            Effect::LoadFileTree { workspace_id } => {
-                let request = vibex_core::FileTreeRequest {
-                    workspace_id,
-                    path: None,
-                    max_depth: Some(3),
-                    include_hidden: false,
-                };
-                let result = self.facade.file().file_tree(request).await;
-                self.send(AppMessage::FileTree(result));
-            }
-            Effect::ReadFile { workspace_id, path } => {
-                let request = vibex_core::FileReadRequest {
-                    workspace_id,
-                    path,
-                    max_bytes: Some(512 * 1024),
-                };
-                let result = self.facade.file().read_file(request).await;
-                self.send(AppMessage::FileContents(result));
-            }
-            Effect::LoadGitStatus { workspace_id } => {
-                let result = self.facade.git().git_status(workspace_id).await;
-                self.send(AppMessage::GitStatus(result));
-            }
-            Effect::LoadGitDiff { workspace_id, path } => {
-                let request = vibex_core::GitDiffRequest {
-                    workspace_id,
-                    path,
-                    staged: false,
-                };
-                let result = self.facade.git().git_diff(request).await;
-                self.send(AppMessage::GitDiff(result));
-            }
-            Effect::GitStage {
-                workspace_id,
-                path,
-                stage,
-            } => {
-                let request = MutationRequest::new(vibex_core::GitStageRequest {
-                    workspace_id,
-                    paths: vec![path],
-                });
-                let result = if stage {
-                    self.facade.git().stage(request).await.map(|_| ())
-                } else {
-                    self.facade.git().unstage(request).await.map(|_| ())
-                };
-                match result {
-                    Ok(()) => self.ok("git_stage"),
-                    Err(error) => self.failure("git_stage", error),
-                }
-            }
-            Effect::LoadGitHistory { workspace_id } => {
-                let request = vibex_core::GitHistoryRequest {
-                    workspace_id,
-                    limit: Some(200),
-                    before_commit: None,
-                    ref_name: None,
-                    author: None,
-                    query: None,
-                    authored_after_ms: None,
-                    authored_before_ms: None,
-                };
-                let result = self.facade.git().git_history(request).await;
-                self.send(AppMessage::GitHistory(result));
-            }
-            Effect::LoadGitBranches { workspace_id } => {
-                let result = self.facade.git().git_branch_list(workspace_id).await;
-                self.send(AppMessage::GitBranches(result));
-            }
-            Effect::GitRevert { workspace_id, path } => {
-                let request = MutationRequest::new(vibex_core::GitStageRequest {
-                    workspace_id,
-                    paths: vec![path],
-                });
-                match self.facade.git().git_revert(request).await {
-                    Ok(status) => {
-                        self.send(AppMessage::GitStatus(Ok(status)));
-                        self.ok("git_revert");
-                    }
-                    Err(error) => self.failure("git_revert", error),
-                }
-            }
-            Effect::LoadWorktrees { workspace_id } => {
-                let result = self.facade.git().git_worktree_snapshot(workspace_id).await;
-                self.send(AppMessage::Worktrees(result.map(Box::new)));
-            }
-            Effect::WorktreePreflight { workspace_id, path } => {
-                // Preflight is mandatory: it is what tells the user whether a
-                // destructive worktree action would lose work.
-                let request = vibex_core::GitWorktreeArchiveRequest {
-                    workspace_id,
-                    worktree_path: path,
-                    expected_head: None,
-                    preflight_revision: None,
-                };
-                let result = self
-                    .facade
-                    .git()
-                    .git_worktree_archive_preflight(request)
-                    .await;
-                self.send(AppMessage::WorktreePreflight(result));
-            }
-            Effect::WorktreeCreate {
-                workspace_id,
-                branch_name,
-            } => {
-                let request = MutationRequest::new(vibex_core::GitWorktreeCreateRequest {
-                    workspace_id,
-                    branch_name,
-                    base_ref: None,
-                    name: None,
-                    worktree_path: None,
-                    target_workspace_id: None,
-                    target_branch: None,
-                });
-                match self.facade.git().git_worktree_create(request).await {
-                    Ok(_) => self.ok("worktree_create"),
-                    Err(error) => self.failure("worktree_create", error),
-                }
-            }
             Effect::UpdateEntry { entry } => {
                 let result = self.update_entry(entry).await;
                 match result {
                     Ok(()) => self.ok("update_entry"),
                     Err(error) => self.failure("update_entry", error),
-                }
-            }
-            Effect::GitCommit {
-                workspace_id,
-                message,
-            } => {
-                let request = MutationRequest::new(vibex_core::GitCommitRequest {
-                    workspace_id,
-                    message,
-                    paths: Vec::new(),
-                    amend: false,
-                    push_after: false,
-                });
-                match self.facade.git().commit(request).await {
-                    Ok(_) => self.ok("git_commit"),
-                    Err(error) => self.failure("git_commit", error),
                 }
             }
             Effect::ListDevices => {
@@ -1159,43 +1013,6 @@ impl Dispatch {
                     aggregate: aggregate.ok(),
                 };
                 self.send(AppMessage::Usage(Ok(Box::new(report))));
-            }
-            Effect::ExportDiagnostics => {
-                let request = MutationRequest::new(vibex_core::DiagnosticExportPayload::default());
-                match self.facade.management().export_diagnostics(request).await {
-                    Ok(outcome) => self.send(AppMessage::Recovery(Ok(outcome.destination))),
-                    Err(error) => self.send(AppMessage::Recovery(Err(error))),
-                }
-            }
-            Effect::CreateBackup => {
-                let request = MutationRequest::new(vibex_core::BackupCreatePayload::default());
-                match self.facade.management().backup_create(request).await {
-                    Ok(outcome) => self.send(AppMessage::Recovery(Ok(outcome.backup_dir))),
-                    Err(error) => self.send(AppMessage::Recovery(Err(error))),
-                }
-            }
-            Effect::InspectBackup => {
-                let request = vibex_core::BackupInspectPayload::default();
-                match self.facade.management().backup_inspect(request).await {
-                    Ok(outcome) => self.send(AppMessage::Recovery(Ok(format!(
-                        "{}: {:?}",
-                        outcome.backup_dir, outcome.migration_compatibility
-                    )))),
-                    Err(error) => self.send(AppMessage::Recovery(Err(error))),
-                }
-            }
-            Effect::RestoreBackup { backup_id } => {
-                let request = MutationRequest::new(vibex_core::BackupRestorePayload {
-                    backup_dir: Some(backup_id),
-                    ..Default::default()
-                });
-                match self.facade.management().backup_restore(request).await {
-                    Ok(outcome) => self.send(AppMessage::Recovery(Ok(format!(
-                        "{:?} {}",
-                        outcome.status, outcome.target_db_path
-                    )))),
-                    Err(error) => self.send(AppMessage::Recovery(Err(error))),
-                }
             }
             Effect::DiscoverCompletions {
                 ticket,

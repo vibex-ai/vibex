@@ -775,14 +775,7 @@ fn the_management_index_lists_every_section() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::GotoManagement);
     let screen = text(&render(&mut app, 120, 40));
-    for needle in [
-        "Agents",
-        "Providers",
-        "MCP servers",
-        "Skills",
-        "Devices",
-        "Recovery",
-    ] {
+    for needle in ["Agents", "Providers", "MCP servers", "Skills", "Devices"] {
         assert!(
             screen.contains(needle),
             "management lost {needle}:\n{screen}"
@@ -795,11 +788,15 @@ fn unavailable_capabilities_are_visible_not_hidden() {
     // A disconnected backend supports nothing, so every gated row must say so
     // rather than silently disappearing.
     let mut app = app(120, 40);
-    app.navigate_to(Page::Recovery);
+    // A connected client whose backend does not offer device management: the
+    // index's gated row has to say so rather than pretending it is there.
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.capabilities.device = vibex_backend::DomainCapabilities::unavailable();
+    app.perform(vibex_tui::action::Intent::GotoManagement);
     let screen = text(&render(&mut app, 120, 40));
     assert!(
         screen.contains("cannot") || screen.contains("unavailable"),
-        "gated recovery actions must explain themselves:\n{screen}"
+        "gated rows must explain themselves:\n{screen}"
     );
 }
 
@@ -2198,41 +2195,6 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
     app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     assert_eq!(app.settings.theme_id, "vibex-dark");
     assert!(app.overlay.is_none());
-}
-
-#[test]
-fn the_status_line_setting_gates_the_repository_line() {
-    // The line the setting controls moved off its own band and onto the
-    // composer's context row, so the switch is asserted where it is drawn now.
-    use vibex_tui::settings::SettingRow;
-    let mut app = app(120, 44);
-    app.navigate_to(Page::Agent);
-    enter_session(&mut app, "session_status01");
-    app.git_status = Some(vibex_core::GitStatusSummary {
-        workspace_id: vibex_core::WorkspaceId::new(),
-        repo_path: "/tmp/vibex-status".to_string(),
-        branch: Some("feature-timeline".into()),
-        short_commit: None,
-        detached: false,
-        dirty: true,
-        staged_count: 0,
-        unstaged_count: 1,
-        untracked_count: 0,
-        changes: Vec::new(),
-        captured_at_ms: 0,
-    });
-    let with = text(&render(&mut app, 120, 44));
-    app.settings.status_line = false;
-    let without = text(&render(&mut app, 120, 44));
-    assert!(with.contains("feature-timeline"));
-    assert!(!without.contains("feature-timeline"));
-    // And the setting is a real row with a real value.
-    assert_eq!(
-        app.setting_value(SettingRow::StatusLine),
-        vibex_tui::Strings::for_locale(Locale::En).disabled()
-    );
-    assert!(app.apply_setting_value(SettingRow::StatusLine, "on"));
-    assert!(app.settings.status_line);
 }
 
 #[test]

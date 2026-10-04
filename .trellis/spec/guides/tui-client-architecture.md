@@ -317,7 +317,7 @@ Rules that follow:
 | --- | --- |
 | Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. |
 | Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle remains static so a connected session does not look busy. |
-| Composer | padded raised surface without a title or border; runtime and run options sit on a separate line below it. Repository state shares that line when enabled and space allows. |
+| Composer | padded raised surface without a title or border; runtime and run options sit on a separate line below it. |
 | Completion | a drawer above the composer: two full-width rules, no corners, count on the top rule, selection marker is the composer's own arrow. |
 | Shortcut band | keys and localized labels separated by middots; prioritize send/newline or expand/details for the current focus, then runtime switching and navigation. Use the keymap for chords and click actions. |
 

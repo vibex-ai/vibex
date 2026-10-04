@@ -1567,7 +1567,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         let message = app.strings.approval_resolved().to_string();
                         app.toast(Toast::success(message));
                     }
-                    if key == "update_entry" || key == "git_revert" || key == "worktree_create" {
+                    if key == "update_entry" {
                         let message = app.strings.management_saved().to_string();
                         app.toast(Toast::success(message));
                     }
@@ -1619,144 +1619,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Ok(listing) => {
                 app.set_selection(crate::keymap::Scope::Sessions, 0);
                 app.workspace_browse = Some(listing);
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::FileTree(result) => match result {
-            Ok(rows) => {
-                app.file_rows = rows;
-                app.live = LiveState::Ready;
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::FileContents(result) => match result {
-            Ok(response) => {
-                app.overlay = Some(Overlay::TextView {
-                    title: response.path.clone(),
-                    body: response.content.clone().unwrap_or_default(),
-                    scroll: 0,
-                });
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::GitStatus(result) => match result {
-            Ok(status) => {
-                app.git_status = Some(status);
-                app.live = LiveState::Ready;
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::GitHistory(result) => match result {
-            Ok(history) => {
-                let body = history
-                    .commits
-                    .iter()
-                    .map(|commit| {
-                        format!(
-                            "{}  {}  {}",
-                            commit.short_hash, commit.author_name, commit.subject
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                app.git_history = history.commits;
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.git_history_title().to_string(),
-                    body,
-                    scroll: 0,
-                });
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::GitBranches(result) => match result {
-            Ok(branches) => {
-                let body = branches
-                    .branches
-                    .iter()
-                    .map(|branch| {
-                        format!(
-                            "{} {}{}",
-                            if branch.current { "*" } else { " " },
-                            branch.name,
-                            branch
-                                .upstream
-                                .as_ref()
-                                .map(|upstream| format!(
-                                    "  {upstream} (+{}/-{})",
-                                    branch.ahead, branch.behind
-                                ))
-                                .unwrap_or_default()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                app.git_branches = branches.branches;
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.git_branches_title().to_string(),
-                    body,
-                    scroll: 0,
-                });
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::Worktrees(result) => match result {
-            Ok(snapshot) => {
-                let body = if snapshot.managed_worktrees.is_empty() {
-                    app.strings.nothing_here().to_string()
-                } else {
-                    snapshot
-                        .managed_worktrees
-                        .iter()
-                        .map(|worktree| {
-                            format!(
-                                "{}  {}  {:?}",
-                                worktree.branch.clone().unwrap_or_else(|| "-".to_string()),
-                                worktree.worktree_path,
-                                worktree.status
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                app.worktrees = Some(snapshot);
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.worktree_title().to_string(),
-                    body,
-                    scroll: 0,
-                });
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::WorktreePreflight(result) => match result {
-            Ok(preflight) => {
-                // The preflight verdict is shown before anything is touched.
-                let verdict = if preflight.allowed {
-                    app.strings.worktree_preflight_allowed()
-                } else {
-                    app.strings.worktree_preflight_blocked()
-                };
-                let risks = preflight
-                    .risks
-                    .iter()
-                    .map(|risk| format!("{risk:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.worktree_preflight_title().to_string(),
-                    body: format!("{verdict}\n\n{risks}"),
-                    scroll: 0,
-                });
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::GitDiff(result) => match result {
-            Ok(diff) => {
-                app.diff_text = Some(diff.diff.clone());
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.transcript_diff().to_string(),
-                    body: diff.diff,
-                    scroll: 0,
-                });
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
@@ -1945,19 +1807,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 app.management_data.usage_session = report.session;
                 app.live = LiveState::Ready;
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::Recovery(result) => match result {
-            Ok(detail) => {
-                app.toast(Toast::success(format!(
-                    "{}: {detail}",
-                    app.strings.recovery_artifact_path()
-                )));
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::BackupList(result) => match result {
-            Ok(list) => app.management_data.backups = list,
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::Clipboard(result) => {

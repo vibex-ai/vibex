@@ -73,7 +73,7 @@ that is the whole budget. The transcript is what is being read, so it takes the
 full width, and message surfaces and expandable work rows give it structure.
 
 Navigation that would otherwise be a permanent column is a full-screen view
-(Sessions, Files, Changes) or an overlay, which is also the only way a session
+(Sessions, Management) or an overlay, which is also the only way a session
 row can show a title, workspace, state and age without truncating all four.
 
 The transcript wraps to the band it is drawn in — the renderer states that
@@ -171,9 +171,8 @@ away. Idle remains static. Running turns animate even while waiting for a tool o
 
 The draft sits on a padded background without a frame or repeated session title.
 Its height follows wrapped text, and long drafts scroll to keep the caret visible.
-Below it, one line names the Agent, model and run options. Repository information
-shares the available space when enabled. The shortcut row prioritizes the actions
-available at the current focus.
+Below it, one line names the Agent, model and run options. The shortcut row
+prioritizes the actions available at the current focus.
 
 A paste of four or more lines (or one over 10 KB) collapses into a chip —
 `[Pasted: 42 lines]` — instead of burying the draft. The chip is one object:
@@ -519,21 +518,9 @@ Pending approvals appear as a card: `a` allows, `d` denies, `Ctrl+A` allows for
 the rest of the session, and a digit answers with that specific advertised
 option. Elicitation forms are filled field by field and submitted with `s`.
 
-### Files
-
-A read-only view of the workspace tree. `Enter` opens a file, `e` hands it to
-`$EDITOR`. The TUI is not an editor: `Ctrl+O` and `e` are the only write paths,
-and both go through a program you chose.
-
-### Changes
-
-Git status, diffs, staging (`a`), unstaging (`u`), committing (`c`) and the
-worktree menu (`w`). Worktree lifecycle actions run their preflight first and
-show the result before touching anything.
-
 ### Management
 
-Agents, Providers, MCP servers, Skills, Prompts, Hooks, Devices and Recovery.
+Agents, Providers, MCP servers, Skills, Prompts, Hooks and Devices.
 Every row shows its availability: an operation the authority does not offer, or
 that this device's grant does not permit, is visible and explains itself rather
 than disappearing.
@@ -552,18 +539,11 @@ remote-protocol audit trail is readable here.
 Per-session and aggregate token counts. Vibex records tokens only — there is no
 cost, price or currency in the data model, so the page does not invent one.
 
-### Recovery
-
-Diagnostics export and database backup create / inspect / restore. All of these
-run on the authoritative runtime; restoring is destructive and requires typing
-the backup id. The capability gate marks them as needing full control on a
-paired device.
-
 ### Settings
 
 Theme and its dark/light mode (20 shipped themes), language (`en`, `zh-CN`,
-`zh-TW`), icon set, the bottom status line, the default workspace for new
-sessions, and the key-binding file. The page is one surface with four modes rather than four screens:
+`zh-TW`), icon set, the default workspace for new sessions, and the
+key-binding file. The page is one surface with four modes rather than four screens:
 
 | Mode | Entered by | What it does |
 | --- | --- | --- |
@@ -583,13 +563,6 @@ table, so accepting it would silently disable the other action. Rows moved off
 their default carry a marker, and the title shows whether there are unsaved
 changes. The interface reports which lines of the file it could not use instead
 of failing to start.
-
-### Status line
-
-The optional repository readout shares the runtime info line below the composer.
-It shows the branch and changed-file count when space allows. Settings can hide
-this readout; the Agent and model stay visible. Context usage remains in the
-header, and plan progress appears once as a compact step summary.
 
 ### First run
 

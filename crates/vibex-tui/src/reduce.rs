@@ -17,8 +17,7 @@ use vibex_core::{
 use crate::action::Intent;
 use crate::app::{
     App, Availability, ComposerTarget, Effect, Focus, ManagementRow, Overlay, Page,
-    PendingCreation, PromptField, RecoveryAction, RunOption, RunOptionKey, RunOptionKind,
-    RuntimePickerView, Toast,
+    PendingCreation, PromptField, RunOption, RunOptionKey, RunOptionKind, RuntimePickerView, Toast,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
@@ -301,7 +300,7 @@ impl App {
                     // Landing on the session view is a request to work in it, so
                     // the caret goes back into the composer: navigating set the
                     // focus to the page itself.
-                    self.select_session_destination(vibex_ui::shell::SessionDestination::Agent);
+                    self.select_session_destination();
                     self.focus = Focus::Composer;
                 }
                 outcome
@@ -624,22 +623,6 @@ impl App {
                     }
                     None => Outcome::quiet(),
                 }
-            }
-            Intent::PreviousPanel => {
-                self.cycle_session_destination(false);
-                Outcome::effects(vec![])
-            }
-            Intent::NextPanel => {
-                self.cycle_session_destination(true);
-                Outcome::effects(vec![])
-            }
-            Intent::OpenChanges => {
-                self.select_session_destination(vibex_ui::shell::SessionDestination::Changes);
-                self.load_changes()
-            }
-            Intent::OpenFiles => {
-                self.select_session_destination(vibex_ui::shell::SessionDestination::Files);
-                self.load_files()
             }
             Intent::SwitchAgentRuntime => self.open_runtime_picker(),
             Intent::ProbeAgentRuntime => match self.active_session() {
@@ -1004,162 +987,10 @@ impl App {
             Intent::RevokeSelectedDevice => self.begin_revoke_device(),
             Intent::OpenDeviceAudit => Outcome::effects(vec![Effect::ListAudit]),
 
-            // ---- files / changes -------------------------------------------
-            Intent::OpenSelectedFile => {
-                let index = self.selection_for(Scope::Files);
-                match self.file_rows.get(index).cloned() {
-                    Some(entry) if entry.kind == vibex_core::FileEntryKind::File => {
-                        let workspace_id = self.active_workspace_id();
-                        match workspace_id {
-                            Some(workspace_id) => Outcome::effects(vec![Effect::ReadFile {
-                                workspace_id,
-                                path: entry.path,
-                            }]),
-                            None => Outcome::quiet(),
-                        }
-                    }
-                    _ => Outcome::quiet(),
-                }
-            }
-            Intent::EditSelectedFile => {
-                let index = self.selection_for(Scope::Files);
-                match self.file_rows.get(index).cloned() {
-                    Some(entry) if entry.kind == vibex_core::FileEntryKind::File => {
-                        Outcome::effects(vec![Effect::EditExternally {
-                            ticket: None,
-                            title: entry.name.clone(),
-                            body: entry.path.clone(),
-                        }])
-                    }
-                    _ => Outcome::quiet(),
-                }
-            }
-            Intent::ToggleFileTreeExpanded => Outcome::effects(vec![]),
-            Intent::FileSearch => {
-                self.filtering = true;
-                Outcome::effects(vec![])
-            }
-            Intent::ShowDiff => {
-                let index = self.selection_for(Scope::Changes);
-                let (Some(status), Some(workspace_id)) =
-                    (self.git_status.as_ref(), self.active_workspace_id())
-                else {
-                    return Outcome::quiet();
-                };
-                let Some(entry) = status.changes.get(index) else {
-                    return Outcome::quiet();
-                };
-                let path = entry.path.clone();
-                Outcome::effects(vec![Effect::LoadGitDiff { workspace_id, path }])
-            }
-            Intent::GitStageSelected => self.git_stage(true),
-            Intent::GitUnstageSelected => self.git_stage(false),
-            Intent::GitCommit => {
-                self.overlay = Some(Overlay::Prompt {
-                    title: self.strings.transcript_git().to_string(),
-                    field: PromptField::CommitMessage,
-                    value: String::new(),
-                });
-                Outcome::effects(vec![])
-            }
-            Intent::GitRevert => {
-                let index = self.selection_for(Scope::Changes);
-                let Some(status) = self.git_status.as_ref() else {
-                    return Outcome::quiet();
-                };
-                let Some(entry) = status.changes.get(index) else {
-                    return Outcome::quiet();
-                };
-                let path = entry.path.clone();
-                self.overlay = Some(Overlay::Confirm {
-                    title: self.strings.git_revert_title().to_string(),
-                    body: format!("{path}\n\n{}", self.strings.git_revert_warning()),
-                    confirm: Intent::GitRevert,
-                });
-                Outcome::effects(vec![])
-            }
-            Intent::GitHistory => match self.active_workspace_id() {
-                Some(workspace_id) => {
-                    Outcome::effects(vec![Effect::LoadGitHistory { workspace_id }])
-                }
-                None => Outcome::quiet(),
-            },
-            Intent::GitBranches => match self.active_workspace_id() {
-                Some(workspace_id) => {
-                    Outcome::effects(vec![Effect::LoadGitBranches { workspace_id }])
-                }
-                None => Outcome::quiet(),
-            },
-            Intent::WorktreeMenu => match self.active_workspace_id() {
-                Some(workspace_id) => {
-                    Outcome::effects(vec![Effect::LoadWorktrees { workspace_id }])
-                }
-                None => Outcome::quiet(),
-            },
-            Intent::WorktreePreflight => {
-                let Some(workspace_id) = self.active_workspace_id() else {
-                    return Outcome::quiet();
-                };
-                let Some(path) = self.selected_worktree_path() else {
-                    self.toast(Toast::warning(self.strings.nothing_here().to_string()));
-                    return Outcome::quiet();
-                };
-                Outcome::effects(vec![Effect::WorktreePreflight { workspace_id, path }])
-            }
-            Intent::WorktreeCreate => {
-                self.overlay = Some(Overlay::Prompt {
-                    title: self.strings.worktree_create_title().to_string(),
-                    field: PromptField::WorktreeBranch,
-                    value: String::new(),
-                });
-                Outcome::effects(vec![])
-            }
-
-            // ---- terminal ---------------------------------------------------
-            Intent::NewTerminal | Intent::CloseTerminal | Intent::TerminalToggleFollow => {
-                // The embedded terminal pane is an M4 feature; the terminal
-                // page explains that rather than pretending to work.
-                self.toast(Toast::info(
-                    self.strings.toast_action_unavailable().to_string(),
-                ));
-                Outcome::quiet()
-            }
-
             // ---- usage -------------------------------------------------------
             Intent::UsageSessionScope => {
                 self.usage_scope_session = !self.usage_scope_session;
                 Outcome::effects(vec![Effect::LoadUsage])
-            }
-
-            // ---- recovery ----------------------------------------------------
-            Intent::ActivateRecoveryAction => {
-                let index = self.selection_for(Scope::Recovery);
-                match RecoveryAction::ALL.get(index) {
-                    Some(RecoveryAction::Diagnostics) => self.perform(Intent::ExportDiagnostics),
-                    Some(RecoveryAction::BackupCreate) => self.perform(Intent::CreateBackup),
-                    Some(RecoveryAction::BackupInspect) => self.perform(Intent::InspectBackup),
-                    Some(RecoveryAction::BackupRestore) => self.perform(Intent::RestoreBackup),
-                    None => Outcome::quiet(),
-                }
-            }
-            Intent::ExportDiagnostics => self.guard(
-                BackendOperation::RecoveryDiagnosticsExport,
-                Effect::ExportDiagnostics,
-            ),
-            Intent::CreateBackup => {
-                self.guard(BackendOperation::RecoveryBackupCreate, Effect::CreateBackup)
-            }
-            Intent::InspectBackup => self.guard(
-                BackendOperation::RecoveryBackupInspect,
-                Effect::InspectBackup,
-            ),
-            Intent::RestoreBackup => {
-                self.overlay = Some(Overlay::Prompt {
-                    title: self.strings.recovery_backup_restore().to_string(),
-                    field: PromptField::RestoreBackupId,
-                    value: String::new(),
-                });
-                Outcome::effects(vec![])
             }
 
             // ---- settings ----------------------------------------------------
@@ -1628,22 +1459,6 @@ impl App {
                     reason: None,
                 }])
             }
-            Intent::GitRevert => {
-                let index = self.selection_for(Scope::Changes);
-                let (Some(status), Some(workspace_id)) =
-                    (self.git_status.as_ref(), self.active_workspace_id())
-                else {
-                    return Outcome::quiet();
-                };
-                let Some(entry) = status.changes.get(index) else {
-                    return Outcome::quiet();
-                };
-                let path = entry.path.clone();
-                self.guard(
-                    BackendOperation::GitRevert,
-                    Effect::GitRevert { workspace_id, path },
-                )
-            }
             Intent::RequestQuit => {
                 self.should_quit = true;
                 Outcome::effects(vec![])
@@ -1686,15 +1501,6 @@ impl App {
                     Err(error) => self.toast(Toast::warning(error)),
                 }
                 Outcome::effects(vec![])
-            }
-            PromptField::CommitMessage => {
-                let Some(workspace_id) = self.active_workspace_id() else {
-                    return Outcome::quiet();
-                };
-                Outcome::effects(vec![Effect::GitCommit {
-                    workspace_id,
-                    message: trimmed,
-                }])
             }
             PromptField::ProviderSecret => {
                 let index = self.selection_for(Scope::Providers);
@@ -1763,18 +1569,6 @@ impl App {
                     None => Outcome::quiet(),
                 }
             }
-            PromptField::WorktreeBranch => {
-                if trimmed.is_empty() {
-                    return Outcome::quiet();
-                }
-                match self.active_workspace_id() {
-                    Some(workspace_id) => Outcome::effects(vec![Effect::WorktreeCreate {
-                        workspace_id,
-                        branch_name: trimmed,
-                    }]),
-                    None => Outcome::quiet(),
-                }
-            }
             PromptField::DeviceRevokeReason => {
                 let index = self.selection_for(Scope::Devices);
                 let Some(device) = self.management_data.devices.get(index) else {
@@ -1785,15 +1579,6 @@ impl App {
                     device_id,
                     reason: (!trimmed.is_empty()).then_some(trimmed),
                 }])
-            }
-            PromptField::RestoreBackupId => {
-                if trimmed.is_empty() {
-                    return Outcome::quiet();
-                }
-                self.guard(
-                    BackendOperation::RecoveryBackupRestore,
-                    Effect::RestoreBackup { backup_id: trimmed },
-                )
             }
             PromptField::RunOptionValue => {
                 // The key rode along with the prompt; taking it here is what
@@ -1881,10 +1666,6 @@ impl App {
         // is what walks the panes, and the draft is left where it was.
         if self.focus == Focus::Composer && !self.page.is_session_page() {
             self.focus = Focus::Main;
-            return Outcome::effects(vec![]);
-        }
-        if self.page.is_session_page() && self.page != Page::Agent {
-            self.select_session_destination(vibex_ui::shell::SessionDestination::Agent);
             return Outcome::effects(vec![]);
         }
         if self.page != Page::Sessions {
@@ -2010,36 +1791,6 @@ impl App {
             }),
             other => other,
         };
-    }
-
-    fn cycle_session_destination(&mut self, forward: bool) {
-        use vibex_ui::shell::SessionDestination;
-        let order = [
-            SessionDestination::Agent,
-            SessionDestination::Files,
-            SessionDestination::Changes,
-            SessionDestination::Terminal,
-        ];
-        let current = order
-            .iter()
-            .position(|candidate| *candidate == self.navigation.session)
-            .unwrap_or(0);
-        let next = if forward {
-            (current + 1) % order.len()
-        } else {
-            (current + order.len() - 1) % order.len()
-        };
-        self.select_session_destination(order[next]);
-    }
-
-    /// Path of the highlighted managed worktree, when the page has one.
-    pub fn selected_worktree_path(&self) -> Option<String> {
-        let snapshot = self.worktrees.as_ref()?;
-        let index = self.selection_for(Scope::Changes);
-        snapshot
-            .managed_worktrees
-            .get(index)
-            .map(|worktree| worktree.worktree_path.clone())
     }
 
     /// The effects that open a session: the snapshot, which carries the
@@ -3205,25 +2956,7 @@ impl App {
             Page::Prompts => Outcome::effects(vec![Effect::ListPrompts]),
             Page::Hooks => Outcome::effects(vec![Effect::ListHooks]),
             Page::Usage => Outcome::effects(vec![Effect::LoadUsage]),
-            Page::Files => self.load_files(),
-            Page::Changes => self.load_changes(),
-            Page::Management | Page::Recovery | Page::Settings | Page::Help | Page::Terminal => {
-                Outcome::effects(vec![])
-            }
-        }
-    }
-
-    fn load_files(&mut self) -> Outcome {
-        match self.active_workspace_id() {
-            Some(workspace_id) => Outcome::effects(vec![Effect::LoadFileTree { workspace_id }]),
-            None => Outcome::quiet(),
-        }
-    }
-
-    fn load_changes(&mut self) -> Outcome {
-        match self.active_workspace_id() {
-            Some(workspace_id) => Outcome::effects(vec![Effect::LoadGitStatus { workspace_id }]),
-            None => Outcome::quiet(),
+            Page::Management | Page::Settings | Page::Help => Outcome::effects(vec![]),
         }
     }
 
@@ -3353,33 +3086,6 @@ impl App {
         self.guard(
             BackendOperation::ManagementProviderModelFetch,
             Effect::FetchProviderModels { profile_id },
-        )
-    }
-
-    fn git_stage(&mut self, stage: bool) -> Outcome {
-        let index = self.selection_for(Scope::Changes);
-        let Some(workspace_id) = self.active_workspace_id() else {
-            return Outcome::quiet();
-        };
-        let Some(status) = self.git_status.as_ref() else {
-            return Outcome::quiet();
-        };
-        let Some(entry) = status.changes.get(index) else {
-            return Outcome::quiet();
-        };
-        let path = entry.path.clone();
-        let operation = if stage {
-            BackendOperation::GitStage
-        } else {
-            BackendOperation::GitUnstage
-        };
-        self.guard(
-            operation,
-            Effect::GitStage {
-                workspace_id,
-                path,
-                stage,
-            },
         )
     }
 
@@ -5454,35 +5160,35 @@ mod tests {
     fn mutating_effects_are_distinguishable_by_key() {
         // The pending map is keyed by this string, so two different mutations
         // sharing a key would clear each other's spinner.
-        let workspace_id = vibex_core::WorkspaceId::new();
+        let session_id = VibexSessionId::new();
         let keys = [
-            Effect::GitStage {
-                workspace_id: workspace_id.clone(),
-                path: "a".into(),
-                stage: true,
+            Effect::RenameSession {
+                session_id: session_id.clone(),
+                title: "t".into(),
             }
             .key(),
-            Effect::GitCommit {
-                workspace_id: workspace_id.clone(),
-                message: "m".into(),
+            Effect::ArchiveSession {
+                session_id: session_id.clone(),
             }
             .key(),
-            Effect::GitRevert {
-                workspace_id: workspace_id.clone(),
-                path: "a".into(),
+            Effect::DeleteSession {
+                session_id: session_id.clone(),
             }
             .key(),
-            Effect::WorktreeCreate {
-                workspace_id: workspace_id.clone(),
-                branch_name: "b".into(),
+            Effect::ForkSession {
+                request_id: VibexSessionId::new(),
+                session_id: session_id.clone(),
             }
             .key(),
-            Effect::WorktreePreflight {
-                workspace_id: workspace_id.clone(),
-                path: "a".into(),
+            Effect::ContinueTurn {
+                session_id: session_id.clone(),
             }
             .key(),
-            Effect::LoadGitHistory { workspace_id }.key(),
+            Effect::Interrupt {
+                session_id: session_id.clone(),
+            }
+            .key(),
+            Effect::LoadUsage.key(),
         ];
         let unique = keys.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), keys.len(), "{keys:?}");

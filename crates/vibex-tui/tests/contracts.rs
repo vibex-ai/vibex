@@ -252,13 +252,12 @@ fn every_locale_key_is_translated_in_all_three_languages() {
     // the accessors are macro-generated from one declaration, a missing
     // translation is a compile error; this asserts the copy is real.
     type Copy = (fn(&vibex_tui::Strings) -> &'static str, &'static str);
-    let pairs: [Copy; 6] = [
+    let pairs: [Copy; 5] = [
         (|s| s.nav_sessions(), "sessions"),
         (|s| s.approval_title(), "approval"),
         (|s| s.elicitation_title(), "elicitation"),
         (|s| s.devices_title(), "devices"),
         (|s| s.usage_title(), "usage"),
-        (|s| s.recovery_title(), "recovery"),
     ];
     for (accessor, label) in pairs {
         assert!(!accessor(&en).is_empty(), "{label} missing in en");
@@ -327,12 +326,9 @@ fn the_documentation_exists_for_every_page() {
     for page in [
         "Sessions",
         "Agent",
-        "Files",
-        "Changes",
         "Management",
         "Devices",
         "Usage",
-        "Recovery",
         "Settings",
         "Help",
     ] {
