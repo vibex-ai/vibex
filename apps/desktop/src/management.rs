@@ -1338,6 +1338,19 @@ impl ManagementCenter {
                     }
                 },
             ),
+            // The Skill market answers Enter the same way the MCP market does:
+            // both toolbars are the same control, so the keystroke cannot work
+            // in one and be missing in the other.
+            cx.subscribe_in(
+                &skill_market_query,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.search_skill_market(window, cx);
+                        cx.stop_propagation();
+                    }
+                },
+            ),
             cx.subscribe(&mcp_name_draft, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_command_draft, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_args_draft, |_, _, _: &InputEvent, cx| cx.notify()),
@@ -24595,6 +24608,32 @@ mod tests {
         assert_eq!(market_page(9, short.len()), 2);
         assert_eq!(market_page(0, short.len()), 1);
         assert_eq!(market_page(2, 0), 1);
+    }
+
+    #[test]
+    fn market_toolbars_answer_enter_with_search() {
+        let source = include_str!("management.rs");
+        // Both markets draw the same toolbar, so both query fields have to
+        // answer Enter: a keystroke that works in one registry and is missing
+        // in the other reads as a broken field, not as a different catalog.
+        for (query_field, search_call) in [
+            (
+                "                &mcp_market_query,",
+                "this.search_mcp_market(",
+            ),
+            (
+                "                &skill_market_query,",
+                "this.search_skill_market(",
+            ),
+        ] {
+            let subscription = source
+                .split_once(query_field)
+                .and_then(|(_, tail)| tail.split_once("            cx.subscribe(&mcp_name_draft,"))
+                .map(|(body, _)| body)
+                .expect("Market query subscription should remain inspectable");
+            assert!(subscription.contains("InputEvent::PressEnter"));
+            assert!(subscription.contains(search_call));
+        }
     }
 
     fn market_entry_for_display() -> vibex_core::McpMarketEntry {
