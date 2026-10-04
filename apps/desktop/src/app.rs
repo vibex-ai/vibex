@@ -2708,6 +2708,60 @@ fn docked_right_rail_content_width(total_width: f32) -> f32 {
     (total_width - RIGHT_ACTIVITY_BAR_WIDTH).max(0.0)
 }
 
+/// The narrowest a docked preview panel may be drawn.
+///
+/// The shell reserves `preview_min_width` for the panel, and a Medium window
+/// reserves less than the panel's own floor. Taking the smaller of the two puts
+/// the seam's lower bound on the width the panel is actually drawn at, instead
+/// of advertising a minimum the panel ignores.
+fn preview_panel_min_width(preview_min_width: f32) -> f32 {
+    PREVIEW_PANEL_MIN_WIDTH.min(preview_min_width)
+}
+
+/// The width range the preview panel's left seam may drag within.
+///
+/// The panel's ceiling is what the session page leaves it, not a share of the
+/// viewport: every drag keeps the conversation at least
+/// `WORKBENCH_PREVIEW_MIN_CENTER_WIDTH` wide, so pulling the seam across the
+/// window can never starve the timeline the panel sits next to.
+fn preview_panel_width_limits(
+    viewport_width: f32,
+    preview_min_width: f32,
+    sidebar_width: f32,
+    right_edge_width: f32,
+) -> (f32, f32) {
+    let minimum = preview_panel_min_width(preview_min_width);
+    let available_width =
+        (viewport_width - sidebar_width - right_edge_width - WORKBENCH_PREVIEW_MIN_CENTER_WIDTH)
+            .floor()
+            .max(minimum);
+    let viewport_max =
+        (viewport_width * PREVIEW_PANEL_VIEWPORT_RATIO).clamp(minimum, PREVIEW_PANEL_MAX_WIDTH);
+    (
+        minimum,
+        PREVIEW_PANEL_MAX_WIDTH
+            .min(available_width)
+            .min(viewport_max),
+    )
+}
+
+/// The width a docked preview panel renders at for a stored preference.
+fn resolved_preview_panel_width(
+    stored_width: f32,
+    viewport_width: f32,
+    preview_min_width: f32,
+    sidebar_width: f32,
+    right_edge_width: f32,
+) -> f32 {
+    let (minimum, maximum) = preview_panel_width_limits(
+        viewport_width,
+        preview_min_width,
+        sidebar_width,
+        right_edge_width,
+    );
+    stored_width.clamp(minimum, maximum)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SidebarAnimationState {
     from_value: f32,
@@ -30280,32 +30334,43 @@ impl VibexWorkbench {
         )
     }
 
+    /// The width the sidebar takes away from the preview panel.
+    fn preview_sidebar_reservation(&self, visibility: WorkbenchVisibility) -> f32 {
+        if visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible {
+            self.sidebar_panel_width(visibility)
+        } else {
+            0.0
+        }
+    }
+
+    /// The width the window's right edge takes away from the preview panel.
+    fn preview_right_edge_reservation(&self, visibility: WorkbenchVisibility) -> f32 {
+        if visibility.right_rail_docked && self.ui_state.workbench.right_rail_visible {
+            self.right_rail_panel_width(visibility)
+        } else {
+            RIGHT_ACTIVITY_BAR_WIDTH
+        }
+    }
+
+    /// The width the docked preview panel is drawn at.
+    ///
+    /// The stored width is the reader's own choice, made with the panel's left
+    /// seam, so every docked shell honours it. A Medium window used to pin the
+    /// panel to the shell's own minimum instead: the seam then moved a number
+    /// nothing painted, while the session page beside it kept every pixel the
+    /// pinned panel did not use and could not be dragged any narrower. Compact
+    /// still follows the shell, because the panel is a sheet there and draws no
+    /// seam of its own.
     fn preview_panel_width(&self, visibility: WorkbenchVisibility) -> f32 {
         match visibility.layout.kind {
-            ShellKind::Wide => {
-                let sidebar_width =
-                    if visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible {
-                        self.sidebar_panel_width(visibility)
-                    } else {
-                        0.0
-                    };
-                let right_edge_width =
-                    if visibility.right_rail_docked && self.ui_state.workbench.right_rail_visible {
-                        self.right_rail_panel_width(visibility)
-                    } else {
-                        RIGHT_ACTIVITY_BAR_WIDTH
-                    };
-                let available_width =
-                    visibility.layout.viewport_width as f32 - sidebar_width - right_edge_width;
-                let maximum = PREVIEW_PANEL_MAX_WIDTH
-                    .min(visibility.layout.viewport_width as f32 * PREVIEW_PANEL_VIEWPORT_RATIO)
-                    .min(available_width.max(PREVIEW_PANEL_MIN_WIDTH));
-                self.ui_state
-                    .workbench
-                    .preview_width
-                    .clamp(PREVIEW_PANEL_MIN_WIDTH, maximum)
-            }
-            ShellKind::Medium | ShellKind::Compact => visibility.layout.preview_min_width,
+            ShellKind::Wide | ShellKind::Medium => resolved_preview_panel_width(
+                self.ui_state.workbench.preview_width,
+                visibility.layout.viewport_width as f32,
+                visibility.layout.preview_min_width,
+                self.preview_sidebar_reservation(visibility),
+                self.preview_right_edge_reservation(visibility),
+            ),
+            ShellKind::Compact => visibility.layout.preview_min_width,
         }
     }
 
@@ -30482,33 +30547,12 @@ impl VibexWorkbench {
             return None;
         }
         match panel {
-            RightPanelKind::Preview => {
-                let sidebar_width =
-                    if visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible {
-                        self.sidebar_panel_width(visibility)
-                    } else {
-                        0.0
-                    };
-                let right_edge_width =
-                    if visibility.right_rail_docked && self.ui_state.workbench.right_rail_visible {
-                        self.right_rail_panel_width(visibility)
-                    } else {
-                        RIGHT_ACTIVITY_BAR_WIDTH
-                    };
-                let available_width =
-                    (visibility.layout.viewport_width as f32 - sidebar_width - right_edge_width)
-                        .floor()
-                        .max(PREVIEW_PANEL_MIN_WIDTH);
-                let viewport_max = (visibility.layout.viewport_width as f32
-                    * PREVIEW_PANEL_VIEWPORT_RATIO)
-                    .clamp(PREVIEW_PANEL_MIN_WIDTH, PREVIEW_PANEL_MAX_WIDTH);
-                Some((
-                    PREVIEW_PANEL_MIN_WIDTH,
-                    PREVIEW_PANEL_MAX_WIDTH
-                        .min(available_width)
-                        .min(viewport_max),
-                ))
-            }
+            RightPanelKind::Preview => Some(preview_panel_width_limits(
+                visibility.layout.viewport_width as f32,
+                visibility.layout.preview_min_width,
+                self.preview_sidebar_reservation(visibility),
+                self.preview_right_edge_reservation(visibility),
+            )),
             RightPanelKind::RightRail => Some((
                 RIGHT_RAIL_PANEL_MIN_WIDTH,
                 right_rail_panel_max_width(visibility.layout.viewport_width),
@@ -76435,6 +76479,61 @@ mod tests {
         assert_eq!(
             calculate_workbench_auto_collapse(976, true, true, false, 320.0, 336.0),
             WorkbenchAutoCollapseState { sidebar: false }
+        );
+    }
+
+    #[test]
+    fn the_preview_seam_moves_the_width_every_docked_shell_draws() {
+        let medium = vibex_ui::ShellLayout::resolve(954, 875);
+        assert_eq!(medium.kind, ShellKind::Medium);
+        assert_eq!(medium.preview_min_width, 300.0);
+        let (minimum, maximum) = preview_panel_width_limits(
+            954.0,
+            medium.preview_min_width,
+            0.0,
+            RIGHT_ACTIVITY_BAR_WIDTH,
+        );
+        // The seam's floor is the width the panel is actually drawn at, so the
+        // handle cannot advertise a bound the shell then ignores.
+        assert_eq!(minimum, medium.preview_min_width);
+        assert!(maximum > minimum);
+        assert_eq!(
+            resolved_preview_panel_width(
+                520.0,
+                954.0,
+                medium.preview_min_width,
+                0.0,
+                RIGHT_ACTIVITY_BAR_WIDTH,
+            ),
+            520.0
+        );
+        // A stored width wider than the window allows lands on the ceiling
+        // instead of on the pinned minimum the Medium shell used to impose.
+        assert_eq!(
+            resolved_preview_panel_width(
+                PREVIEW_PANEL_MAX_WIDTH,
+                954.0,
+                medium.preview_min_width,
+                0.0,
+                RIGHT_ACTIVITY_BAR_WIDTH,
+            ),
+            maximum
+        );
+    }
+
+    #[test]
+    fn a_preview_drag_stops_before_the_session_page_loses_its_minimum() {
+        let wide = vibex_ui::ShellLayout::resolve(1_440, 900);
+        assert_eq!(wide.kind, ShellKind::Wide);
+        let (_, maximum) =
+            preview_panel_width_limits(1_440.0, wide.preview_min_width, 260.0, 320.0);
+        // Sidebar (260) + session page (240) + right rail (320) leave the panel
+        // its ceiling; the 62% viewport share and the panel's own maximum are
+        // both wider than that here.
+        assert_eq!(maximum, 620.0);
+        assert_eq!(
+            1_440.0 - 260.0 - 320.0 - maximum,
+            WORKBENCH_PREVIEW_MIN_CENTER_WIDTH
         );
     }
 
