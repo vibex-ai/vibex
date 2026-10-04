@@ -39,6 +39,14 @@ fn app(columns: u16, rows: u16) -> App {
     app
 }
 
+/// Something only the composing page draws.
+///
+/// The page stopped naming itself — it is the prompt, and a reader who typed the
+/// client's name to get here knows which page the cursor is in — so the tests
+/// that ask "is the composing page on screen" have to ask for the one row that
+/// is nobody else's: the runtime the message would be sent through.
+const COMPOSING_PAGE: &str = "Runtime";
+
 /// Draw one frame and return the terminal buffer, for checks that need cells
 /// rather than the text a person would read.
 fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
@@ -119,10 +127,11 @@ fn every_supported_size_produces_a_full_frame() {
         let lines = render(&mut app, width, height);
         assert_eq!(lines.len(), usize::from(height));
         let screen = text(&lines);
-        // The product chrome is always present.
+        // The chrome that says which build this is: the page does not name
+        // itself, so the version line is the product's own mark on it.
         assert!(
-            screen.contains("Vibex"),
-            "{width}x{height} lost the top bar"
+            screen.contains(env!("CARGO_PKG_VERSION")),
+            "{width}x{height} lost the version line"
         );
         assert!(
             screen.contains("Sessions"),
@@ -164,7 +173,7 @@ fn the_client_opens_on_the_page_a_session_is_written_on() {
     );
 
     let screen = text(&render(&mut app, 120, 40));
-    assert!(screen.contains("New session"), "{screen}");
+    assert!(screen.contains(COMPOSING_PAGE), "{screen}");
     assert!(
         screen.contains("Workspace") && screen.contains(&cwd.display().to_string()),
         "the page does not name where the session would work:\n{screen}"
@@ -3758,8 +3767,8 @@ fn starting_a_session_lands_on_a_page_with_the_prompt_in_it() {
     let screen = text(&render(&mut app, 100, 30));
     assert!(screen.contains("██"), "the mark is missing:\n{screen}");
     assert!(
-        screen.contains("New session"),
-        "the page does not name itself:\n{screen}"
+        screen.contains(COMPOSING_PAGE),
+        "the composing page is not on screen:\n{screen}"
     );
     // The empty composer is where the draft's vocabulary is spelled out, and it
     // is the only place: the page itself used to repeat the same three words.
@@ -4129,7 +4138,7 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
 
     let page_screen = text(&render(&mut app, 120, 40));
     assert!(
-        page_screen.contains("New session"),
+        page_screen.contains(COMPOSING_PAGE),
         "the composing page is not on screen:\n{page_screen}"
     );
     assert!(
@@ -4932,7 +4941,7 @@ fn sending_from_the_new_session_page_lands_in_the_session() {
         "the old session's view is still on screen:\n{screen}"
     );
     assert!(
-        !screen.contains("New session") && !screen.contains("新建会话"),
+        !screen.contains(COMPOSING_PAGE),
         "the composing page is still on screen:\n{screen}"
     );
     // The runtime answers: the session opens, the message is sent into it, and
@@ -4991,7 +5000,7 @@ fn a_new_session_that_could_not_be_created_goes_back_to_its_page() {
     assert!(app.pending_sends.is_empty());
     assert!(!app.turn_reads_running());
     let screen = text(&render(&mut app, 110, 30));
-    assert!(screen.contains("New session"), "{screen}");
+    assert!(screen.contains(COMPOSING_PAGE), "{screen}");
 }
 
 #[test]

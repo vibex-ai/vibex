@@ -2301,7 +2301,7 @@ fn render_new_session(
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Room for the mark, a blank row and the lines under it, or the mark is
     // dropped and the words speak for themselves.
-    let mark_fits = !mark.is_empty() && area.height as usize >= mark.len() + 8;
+    let mark_fits = !mark.is_empty() && area.height as usize >= mark.len() + 7;
     if mark_fits {
         lines.push(Line::from(""));
         let indent = usize::from(area.width)
@@ -2314,17 +2314,13 @@ fn render_new_session(
         }));
     }
     lines.push(Line::from(""));
-    let heading = vec![Span::styled(
-        strings.session_new().to_string(),
-        Style::default()
-            .fg(theme.roles.foreground)
-            .add_modifier(Modifier::BOLD),
-    )];
-    lines.push(centred(area.width, heading));
+    // The page does not name itself. It is the prompt, and a reader who typed
+    // the client's name to get here does not need telling which page the cursor
+    // is in; the version is the one thing here that is not already obvious.
     lines.push(centred(
         area.width,
         vec![Span::styled(
-            format!("{} {}", strings.app_name(), env!("CARGO_PKG_VERSION")),
+            env!("CARGO_PKG_VERSION").to_string(),
             theme.dimmed(theme.roles.gray_dim),
         )],
     ));
