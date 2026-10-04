@@ -29,6 +29,8 @@ fn app(columns: u16, rows: u16) -> App {
             locale: Locale::En,
             sidebar_path: None,
             runtime_path: None,
+            preferences_path: None,
+            ..Default::default()
         },
     );
     app.keymap = vibex_tui::keymap::Keymap::built_in();

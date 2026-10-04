@@ -733,6 +733,13 @@ pub struct App {
     /// The workspace chosen in the workspace browser, consumed by the
     /// new-session prompt.
     pub workspace_path: Option<String>,
+    /// The workspace the reader named as the default for new sessions.
+    ///
+    /// Apart from `workspace_path`, which is the choice for the session being
+    /// composed and may have come from the directory this client was started
+    /// in: only the settings row writes this standing answer down, so picking a
+    /// directory for one session leaves the next run's default alone.
+    pub preferred_workspace: Option<String>,
     /// Immutable first-message inputs keyed by the reserved session identity.
     /// Each remains here until its own creation is acknowledged.
     pub pending_creations: BTreeMap<VibexSessionId, PendingCreation>,
@@ -787,6 +794,9 @@ pub struct App {
     pub dock_hide_done: bool,
     /// Where the arrangement is written; `None` keeps it in memory only.
     pub sidebar_path: Option<std::path::PathBuf>,
+    /// Where the interface's own settings are written; `None` keeps them in
+    /// memory only, which is what a preview or a test wants.
+    pub preferences_path: Option<std::path::PathBuf>,
     /// The last left click, so two clicks in the same cell can be told apart
     /// from two clicks in different ones.
     pub last_click: Option<(std::time::Instant, usize, u16)>,
@@ -1116,7 +1126,18 @@ impl App {
     pub fn new(facade: BackendFacade, options: AppOptions) -> Self {
         let capabilities = facade.capabilities();
         let capability = options.capability;
-        let theme = TuiTheme::resolve(options.theme_id.as_deref(), options.mode, capability);
+        // The reader's choice per appearance comes from the file; a theme the
+        // composition root named for this run (`--theme`, `VIBEX_THEME`) seeds
+        // the slot for the appearance on screen without erasing the other one.
+        let mut themes = options.remembered.themes.clone();
+        if let Some(theme_id) = options.theme_id.as_deref() {
+            crate::settings::select_theme(&mut themes, options.mode, theme_id);
+        }
+        let theme = TuiTheme::resolve(
+            crate::settings::theme_slot(&themes, options.mode),
+            options.mode,
+            capability,
+        );
         let strings = Strings::with_locale(options.locale);
         let agent =
             AgentWorkflowController::new(facade.agent().clone(), capabilities.agent.clone());
@@ -1153,6 +1174,7 @@ impl App {
             },
             sidebar_grouped: arrangement.grouped,
             sidebar_path: options.sidebar_path,
+            preferences_path: options.preferences_path,
             transcript: Transcript::new(),
             scroll: ScrollState::default(),
             composer: ComposerBuffer::default(),
@@ -1164,7 +1186,7 @@ impl App {
             toast: None,
             quit_armed: 0,
             settings: SettingsState {
-                theme_id: theme.id.to_string(),
+                themes,
                 mode: options.mode,
                 locale: options.locale,
                 glyphs: capability.glyphs,
@@ -1197,6 +1219,7 @@ impl App {
             runtime_picker: crate::runtime_picker::RuntimePickerState::default(),
             pending_agent_focus: None,
             workspace_path: None,
+            preferred_workspace: options.remembered.workspace.clone(),
             pending_creations: BTreeMap::new(),
             failed_creations: Vec::new(),
             new_draft_id: VibexSessionId::new(),
@@ -1213,7 +1236,7 @@ impl App {
             search: None,
             hover: None,
             history_selection: 0,
-            recent_commands: Vec::new(),
+            recent_commands: options.remembered.recent_commands.clone(),
             text_selection: None,
             draft_selecting: false,
             dock_open: false,
@@ -1239,8 +1262,13 @@ impl App {
         // directory wants to write a message there, and the list is one key
         // away when they want to reopen something instead. The directory the
         // client was started in is the workspace that first session gets, so
-        // the page names it rather than asking which directory was meant.
-        app.workspace_path = Self::starting_workspace();
+        // the page names it rather than asking which directory was meant — and
+        // a reader who named a standing default in the settings gets that
+        // instead, because they already answered the question there.
+        app.workspace_path = app
+            .preferred_workspace
+            .clone()
+            .or_else(Self::starting_workspace);
         app.navigate_to(Page::NewSession);
         app.focus = Focus::Composer;
         app
@@ -1859,6 +1887,20 @@ impl App {
         Some(Self::interface_home()?.join("tui-runtime.json"))
     }
 
+    /// Where the interface's own settings are written.
+    ///
+    /// Beside the arrangement and the switcher's memory, for the same reason.
+    /// This is the file the settings surface keeps: the look, the language, the
+    /// standing workspace and the palette's recents.
+    pub fn interface_preferences_path() -> Option<std::path::PathBuf> {
+        if let Ok(explicit) = std::env::var("VIBEX_TUI_INTERFACE")
+            && !explicit.trim().is_empty()
+        {
+            return Some(std::path::PathBuf::from(explicit));
+        }
+        Some(Self::interface_home()?.join("tui-interface.json"))
+    }
+
     /// The directory the interface's own files live in.
     fn interface_home() -> Option<std::path::PathBuf> {
         if let Ok(explicit) = std::env::var("VIBEX_TUI_HOME")
@@ -1897,6 +1939,45 @@ impl App {
         if let Ok(body) = serde_json::to_string_pretty(&arrangement) {
             let _ = std::fs::write(path, body);
         }
+    }
+
+    /// The interface settings this run would write down.
+    ///
+    /// Read from the live surface rather than tracked beside it, so the file
+    /// cannot describe a value the reader is not looking at. The workspace is
+    /// the standing default alone: the directory a session is composed in is a
+    /// per-session answer, not a setting.
+    pub fn interface_preferences(&self) -> crate::interface_prefs::InterfacePreferences {
+        crate::interface_prefs::InterfacePreferences {
+            themes: self.settings.themes.clone(),
+            mode: Some(
+                match self.settings.mode {
+                    vibex_ui::GpuiThemeMode::Dark => "dark",
+                    vibex_ui::GpuiThemeMode::Light => "light",
+                }
+                .to_string(),
+            ),
+            icons: Some(
+                match self.settings.glyphs {
+                    crate::theme::GlyphMode::Unicode => "unicode",
+                    crate::theme::GlyphMode::Ascii => "ascii",
+                }
+                .to_string(),
+            ),
+            locale: Some(self.settings.locale.tag().to_string()),
+            workspace: self.preferred_workspace.clone(),
+            recent_commands: self.recent_commands.clone(),
+        }
+    }
+
+    /// Persist the interface's own settings. A failure is silent: losing a
+    /// preference is not worth interrupting the reader, and the next change
+    /// tries again.
+    pub fn save_interface_preferences(&self) {
+        let Some(path) = self.preferences_path.as_deref() else {
+            return;
+        };
+        self.interface_preferences().save(Some(path));
     }
 
     /// Fold the loaded session ids into the arrangement, keeping the reader's
@@ -3462,6 +3543,9 @@ impl App {
         self.recent_commands.retain(|candidate| candidate != &id);
         self.recent_commands.insert(0, id);
         self.recent_commands.truncate(MAX_RECENT_COMMANDS);
+        // The palette leads with these next time, so they are written down
+        // where the next run reads them.
+        self.save_interface_preferences();
     }
 
     /// Whether this click is the second of a double click.
@@ -4532,9 +4616,19 @@ impl Availability {
 pub struct AppOptions {
     pub seat: SeatKind,
     pub capability: ColorCapability,
+    /// The theme this run was started with, when the composition root named
+    /// one (`--theme`, `VIBEX_THEME`). It seeds the slot for `mode`; the other
+    /// appearance's slot still comes from `remembered`.
     pub theme_id: Option<String>,
     pub mode: vibex_ui::GpuiThemeMode,
     pub locale: Locale,
+    /// What the interface itself remembered last time: the theme per
+    /// appearance, the standing workspace and the palette's recents.
+    ///
+    /// The composition root loads this, the way it decides the seat, so a test
+    /// or a preview starts from a shape it names rather than from a home
+    /// directory it did not choose.
+    pub remembered: crate::interface_prefs::InterfacePreferences,
     /// Where the reader's session-list arrangement is kept.
     ///
     /// The composition root decides this, the way it decides the seat: a test
@@ -4547,6 +4641,12 @@ pub struct AppOptions {
     /// is separate from the key file: one file per concern, and a reader who
     /// wants the switcher to forget everything deletes one of them.
     pub runtime_path: Option<std::path::PathBuf>,
+    /// Where the interface's own settings are kept.
+    ///
+    /// Separate again: this is the file the settings surface writes, and a
+    /// reader who wants the interface back at its shipped defaults deletes it
+    /// without losing the arrangement or the switcher's memory.
+    pub preferences_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AppOptions {
@@ -4564,8 +4664,10 @@ impl AppOptions {
             theme_id: None,
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
+            remembered: crate::interface_prefs::InterfacePreferences::default(),
             sidebar_path: App::sidebar_arrangement_path(),
             runtime_path: App::runtime_preferences_path(),
+            preferences_path: App::interface_preferences_path(),
         }
     }
 }
@@ -4958,9 +5060,137 @@ mod tests {
             AppOptions {
                 sidebar_path: Some(path.to_path_buf()),
                 runtime_path: None,
+                preferences_path: None,
                 ..AppOptions::default()
             },
         )
+    }
+
+    /// An app whose interface settings live in `path` and nowhere else.
+    fn settings_app(path: &std::path::Path) -> App {
+        App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            AppOptions {
+                sidebar_path: None,
+                runtime_path: None,
+                preferences_path: Some(path.to_path_buf()),
+                ..AppOptions::default()
+            },
+        )
+    }
+
+    /// A shipped theme for `mode` that is not its catalog default, so applying
+    /// it is a visible change even from an empty slot.
+    fn non_default_theme(mode: vibex_ui::GpuiThemeMode) -> &'static str {
+        let default = vibex_ui::theme_catalog::default_theme_id(mode);
+        vibex_ui::theme_catalog::themes_for(mode)
+            .map(|theme| theme.id)
+            .find(|id| *id != default)
+            .expect("more than one theme ships per appearance")
+    }
+
+    #[test]
+    fn the_interface_settings_round_trip_through_their_file() {
+        use crate::settings::{SettingRow, theme_slot};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tui-interface.json");
+        let light = non_default_theme(vibex_ui::GpuiThemeMode::Light);
+
+        let mut app = settings_app(&path);
+        assert!(app.apply_setting_value(SettingRow::Mode, "light"));
+        assert!(app.apply_setting_value(SettingRow::Theme, light));
+        assert!(app.apply_setting_value(SettingRow::Icons, "ascii"));
+        assert!(app.apply_setting_value(SettingRow::Language, "zh-TW"));
+        assert!(app.apply_setting_value(SettingRow::Workspace, "/tmp/vibex-default-ws"));
+
+        // A later run reads the same answers back, including the light-theme
+        // slot the dark run did not touch.
+        let remembered = crate::interface_prefs::InterfacePreferences::load(Some(&path));
+        assert_eq!(remembered.mode(), Some(vibex_ui::GpuiThemeMode::Light));
+        assert_eq!(remembered.glyphs(), Some(crate::theme::GlyphMode::Ascii));
+        assert_eq!(remembered.locale(), Some(Locale::ZhTw));
+        assert_eq!(
+            theme_slot(&remembered.themes, vibex_ui::GpuiThemeMode::Light),
+            Some(light)
+        );
+        assert_eq!(
+            theme_slot(&remembered.themes, vibex_ui::GpuiThemeMode::Dark),
+            None
+        );
+        assert_eq!(
+            remembered.workspace.as_deref(),
+            Some("/tmp/vibex-default-ws")
+        );
+
+        let reloaded = App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            AppOptions {
+                mode: remembered.mode().unwrap(),
+                locale: remembered.locale().unwrap(),
+                remembered,
+                sidebar_path: None,
+                runtime_path: None,
+                preferences_path: None,
+                ..AppOptions::default()
+            },
+        );
+        assert_eq!(reloaded.settings.locale, Locale::ZhTw);
+        assert_eq!(reloaded.theme.id, light);
+        assert_eq!(
+            reloaded.workspace_path.as_deref(),
+            Some("/tmp/vibex-default-ws")
+        );
+        assert_eq!(
+            reloaded.preferred_workspace.as_deref(),
+            Some("/tmp/vibex-default-ws")
+        );
+    }
+
+    #[test]
+    fn each_appearance_keeps_its_own_theme_choice() {
+        use crate::settings::{SettingRow, theme_slot};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = settings_app(&directory.path().join("tui-interface.json"));
+        let dark = non_default_theme(vibex_ui::GpuiThemeMode::Dark);
+        let light = non_default_theme(vibex_ui::GpuiThemeMode::Light);
+
+        assert!(app.apply_setting_value(SettingRow::Theme, dark));
+        assert!(app.apply_setting_value(SettingRow::Mode, "light"));
+        assert!(app.apply_setting_value(SettingRow::Theme, light));
+        assert!(app.apply_setting_value(SettingRow::Mode, "dark"));
+        assert_eq!(app.theme.id, dark, "the dark slot survived the light one");
+        assert!(app.apply_setting_value(SettingRow::Mode, "light"));
+        assert_eq!(
+            app.theme.id, light,
+            "and the light slot survived the dark one"
+        );
+        assert_eq!(
+            theme_slot(&app.settings.themes, vibex_ui::GpuiThemeMode::Dark),
+            Some(dark)
+        );
+        assert_eq!(
+            theme_slot(&app.settings.themes, vibex_ui::GpuiThemeMode::Light),
+            Some(light)
+        );
+    }
+
+    #[test]
+    fn remembering_a_palette_command_writes_it_for_the_next_run() {
+        use crate::interface_prefs::InterfacePreferences;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tui-interface.json");
+        let mut app = settings_app(&path);
+        app.remember_command(Intent::OpenSettings);
+        app.remember_command(Intent::GotoSessions);
+
+        let remembered = InterfacePreferences::load(Some(&path));
+        assert_eq!(
+            remembered.recent_commands,
+            vec!["goto_sessions".to_string(), "open_settings".to_string()]
+        );
     }
 
     #[test]

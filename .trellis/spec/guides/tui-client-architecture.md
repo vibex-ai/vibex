@@ -810,6 +810,23 @@ is never a column count.
   reconciled against the *visible* rows, and pinned rows always sort first, so a
   manual move across that boundary is refused with a message instead of
   appearing to do nothing.
+* **What the settings surface changes is persisted, per appearance where the
+  choice is.** The look, the language, the standing workspace and the palette's
+  recents live in `InterfacePreferences` and are written to
+  `~/.vibex/tui-interface.json` (the path an `AppOptions` field, like the
+  arrangement's, so a test writes nothing into a home). `apply_setting_value` is
+  the only writer and the only saver, so a preview that `Esc` reverts also
+  reverts what was written. The theme is two slots — light and dark — because a
+  palette is authored for one appearance: switching appearances reads the other
+  slot instead of overwriting it, and the row shows the *resolved* id rather
+  than a stored one that may belong to the other appearance. Every stored value
+  is an optional string, and a value this build does not know loads as no
+  choice, so a newer build's file is not an error in an older one. Resolution
+  order is the composition root's option, then the environment (`VIBEX_THEME`,
+  `VIBEX_TUI_ICONS`), then the file, then detection: a value named for one run
+  outranks the standing one and is not written back over it, while the reader's
+  remembered language outranks `LANG`, which is a guess about the terminal
+  rather than a demand.
 * **A draft's mode is derived from its text, not tracked beside it.**
   `sync_composer_mode` reads the first character (`? ` = history search), so an
   undo, a recalled history entry or a paste cannot leave the prefix describing a

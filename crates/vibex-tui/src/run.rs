@@ -1947,6 +1947,8 @@ mod tests {
                 locale: crate::locale::Locale::En,
                 sidebar_path: None,
                 runtime_path: None,
+                preferences_path: None,
+                ..Default::default()
             },
         );
         app.resize(columns, rows);
@@ -2034,6 +2036,7 @@ mod tests {
             crate::app::AppOptions {
                 sidebar_path: None,
                 runtime_path: None,
+                preferences_path: None,
                 ..Default::default()
             },
         );

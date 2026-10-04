@@ -588,6 +588,20 @@ key-binding file. The page is one surface with four modes rather than four scree
 
 A reset asks first and then restores the shipped default.
 
+Every value the page changes is remembered for the next run: the appearance,
+the theme, the icon set, the language and the default workspace are written to
+`~/.vibex/tui-interface.json`, beside the arrangement and the key file. The
+theme is kept per appearance — a light palette and a dark one are two choices,
+so switching to light and back finds the dark one where it was. The command
+palette's **Recent** section is the same file: the commands the reader reached
+for last lead the list next time. A client with nowhere to write keeps the
+values for the run.
+
+Precedence is deliberate: a value named for this run — `--theme`, `VIBEX_THEME`
+or `VIBEX_TUI_ICONS` — wins over the remembered one and does not rewrite it,
+the reader's remembered choice wins over what the process locale or the
+terminal suggests, and the shipped default answers last.
+
 `Enter` on the Key bindings row opens the editor: every binding, grouped by
 scope, with the same `/` filter. `Enter` on a row captures the next chord,
 `d` puts that row back on its shipped chord and `s` writes
@@ -666,10 +680,11 @@ and `Esc` closes it.
 | --- | --- |
 | `VIBEX_HOME` | runtime home (default `~/.vibex/<channel>`) |
 | `VIBEX_CHANNEL` | `stable`, `rc`, or `preview` |
-| `VIBEX_THEME` | theme id |
+| `VIBEX_THEME` | theme id, for this run (outranks the remembered choice) |
 | `VIBEX_TUI_COLOR` | `truecolor`, `ansi256`, `16`, `none` |
 | `VIBEX_TUI_ICONS` | `auto`, `emoji`, `ascii` |
 | `VIBEX_TUI_KEYS` | key-remap file (default `<home>/tui-keys.toml`) |
+| `VIBEX_TUI_INTERFACE` | interface-settings file (default `<home>/tui-interface.json`) |
 | `VIBEX_TUI_LOG` | spill file for process diagnostics (default `$TMPDIR/vibex-tui-<pid>.log`) |
 | `NO_COLOR` | disable colour entirely |
 
