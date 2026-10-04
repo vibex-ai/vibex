@@ -3414,11 +3414,22 @@ fn a_finished_turn_stops_claiming_to_stream() {
         !settled.transcript_animating(),
         "a settled turn still animates"
     );
-    let screen = text(&render(&mut settled, 120, 30));
-    assert!(
-        !screen.contains("运行中") && !screen.contains("Running"),
-        "a settled session is drawn as running:\\n{screen}"
-    );
+    let settled_screen = text(&render(&mut settled, 120, 30));
+    // The turn line names the phase the turn is in, so a settled session must
+    // not be wearing any of the words a live one does.
+    for running_word in [
+        settled.strings.running(),
+        settled.strings.phase_preparing(),
+        settled.strings.phase_thinking(),
+        settled.strings.phase_calling_tool(),
+        settled.strings.phase_generating(),
+        settled.strings.phase_waiting_approval(),
+    ] {
+        assert!(
+            !settled_screen.contains(running_word),
+            "a settled session is drawn as running ({running_word}):\n{settled_screen}"
+        );
+    }
 
     // While the runtime says it is running, the same rows do stream.
     let mut running = build(vibex_core::AgentSessionState::Running);
@@ -3426,10 +3437,116 @@ fn a_finished_turn_stops_claiming_to_stream() {
         running.transcript_animating(),
         "a running turn stopped streaming"
     );
-    let screen = text(&render(&mut running, 120, 30));
+    let running_screen = text(&render(&mut running, 120, 30));
     assert!(
-        screen.contains("运行中") || screen.contains("Running"),
-        "a running session is not drawn as running:\\n{screen}"
+        running_screen.contains(running.strings.phase_generating()),
+        "the running turn's phase is not on its own turn line:\n{running_screen}"
+    );
+}
+
+#[test]
+fn the_turn_line_reports_what_the_running_turn_has_done() {
+    // The desktop draws a session's live reading above its composer: the phase,
+    // the clock, the tools it has called and the pace it is writing at. The TUI
+    // draws the same line above its prompt, and this is that line with
+    // everything it can say.
+    let session_id = vibex_core::VibexSessionId::new();
+    let correlation = vibex_core::CorrelationId::new();
+    let mut user = seeded_item(
+        &session_id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "question".into(),
+            attachments: Vec::new(),
+            ..Default::default()
+        }),
+    );
+    user.correlation_id = Some(correlation.clone());
+    let mut call = seeded_item(
+        &session_id,
+        2,
+        vibex_core::TimelineItemKind::ToolCall,
+        vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+            tool_call_id: "call-1".into(),
+            tool_name: "read_file".into(),
+            status: vibex_core::ToolCallStatus::Completed,
+            summary: String::new(),
+            input_summary: Some("crates/vibex-tui/src/view.rs".into()),
+            output_summary: Some("42 lines".into()),
+            raw_extension: None,
+        }),
+    );
+    call.correlation_id = Some(correlation.clone());
+    let mut delta = seeded_item(
+        &session_id,
+        3,
+        vibex_core::TimelineItemKind::AgentMessage,
+        vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+            text_delta: "the answer".into(),
+            chunk_index: 0,
+            phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+        }),
+    );
+    delta.correlation_id = Some(correlation.clone());
+
+    let mut app = app(120, 30);
+    app.navigate_to(Page::Agent);
+    let mut session = seeded_session("session_turnline01", "the line above the prompt");
+    session.id = session_id.clone();
+    session.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.active_session.resolve(session);
+    let mut timeline = vec![user, call, delta.clone()];
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id.clone(), timeline.clone());
+    // The clock is the session's: the turn has been running for a while.
+    app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(189));
+    app.sync_transcript();
+
+    // The pace is a difference between two readings, so the answer has to grow
+    // before there is one to report.
+    let mut grown = delta;
+    grown.sequence = 4;
+    grown.payload =
+        vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+            text_delta: " and more of it".into(),
+            chunk_index: 1,
+            phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+        });
+    timeline.push(grown);
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id.clone(), timeline);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.sync_transcript();
+
+    let screen = text(&render(&mut app, 120, 30));
+    let line = screen
+        .lines()
+        .find(|line| line.contains(app.strings.phase_generating()))
+        .unwrap_or_else(|| panic!("no turn line on the session page:\n{screen}"));
+    assert!(
+        line.contains("3m09s"),
+        "the turn's clock is not on the line: {line:?}"
+    );
+    assert!(
+        line.contains(&format!("1 {}", app.strings.tool_calls())),
+        "the tool count is not on the line: {line:?}"
+    );
+    assert!(
+        line.contains("t/s"),
+        "the pace is not on the line: {line:?}"
+    );
+    assert!(
+        !line.contains(app.strings.idle()),
+        "the running turn reads as idle: {line:?}"
     );
 }
 
@@ -4170,8 +4287,12 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
     assert!(app.is_animating(), "the running session is not animating");
     assert!(app.turn_elapsed().is_some());
     let session_screen = text(&render(&mut app, 120, 40));
+    // The turn line answers with the phase the turn is in — a session that has
+    // not produced anything yet says so rather than claiming a phase it has
+    // not reached — so either word is the page reading as running.
     assert!(
-        session_screen.contains("Running") || session_screen.contains("运行中"),
+        session_screen.contains(app.strings.phase_preparing())
+            || session_screen.contains(app.strings.running()),
         "the session's own page does not read as running:\n{session_screen}"
     );
 

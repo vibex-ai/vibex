@@ -834,6 +834,13 @@ pub struct App {
     pub turn_started: Option<std::time::Instant>,
     /// Tokens spent by the running turn, for the readout beside the timer.
     pub turn_tokens: Option<u64>,
+    /// The running turn as the line above the composer reads it: its phase, how
+    /// many tools it has called, and how fast it is producing output.
+    ///
+    /// The phase and the count are re-read from the projection on every event;
+    /// the rate is a difference between two of those readings, so it is held
+    /// rather than derived at draw time.
+    pub turn_readout: crate::turn::TurnReadout,
     /// What the Agent is doing right now, when the runtime says.
     pub activity: Option<String>,
     /// Monotonic clock driving every animation.
@@ -1286,6 +1293,7 @@ impl App {
             banner: None,
             turn_started: None,
             turn_tokens: None,
+            turn_readout: crate::turn::TurnReadout::default(),
             activity: None,
             animation_phase: 0,
             composer_mode: ComposerMode::Normal,
@@ -2863,6 +2871,17 @@ impl App {
             .flatten()
     }
 
+    /// The reading of the running turn, for the line above the composer.
+    ///
+    /// `None` when nothing is running or the page has no session of its own:
+    /// there is no live turn to describe, and the last one's phase would be a
+    /// claim about a turn that has ended. A send the runtime has not answered
+    /// yet has a reading with no phase in it — the line says the turn is
+    /// running, because that is all that is known.
+    pub fn turn_readout(&self) -> Option<&crate::turn::TurnReadout> {
+        (self.page_owns_session() && self.turn_reads_running()).then_some(&self.turn_readout)
+    }
+
     /// A short label for the current page, used when there is no session.
     pub fn page_label(&self, strings: Strings) -> &'static str {
         match self.page {
@@ -3005,10 +3024,49 @@ impl App {
             (false, true) => {
                 self.turn_started = None;
                 self.turn_tokens = None;
+                self.turn_readout.forget();
                 true
             }
             _ => false,
         }
+    }
+
+    /// Read the running turn into [`Self::turn_readout`].
+    ///
+    /// Called when the timeline moves rather than on a timer. The phase and the
+    /// tool count are read straight from the projection, but the rate is a
+    /// difference between two observations of the output, so an observation
+    /// taken before anything arrived has no difference to report.
+    ///
+    /// Answers whether the line above the composer would change.
+    pub fn sync_turn_readout(&mut self) -> bool {
+        if !self.turn_reads_running() {
+            return self.turn_readout.forget();
+        }
+        let Some(turn) = self.live_turn() else {
+            // A send the runtime has not answered yet reads as running before
+            // there is a turn to read: the line says so, and there is nothing
+            // else it could say.
+            return self.turn_readout.forget();
+        };
+        self.turn_readout.observe(&turn, std::time::Instant::now())
+    }
+
+    /// The turn the open session is still running, when it has one.
+    ///
+    /// The last turn the runtime has not closed is the live one: a completed
+    /// turn is history, and a superseded one was replaced by the queued message
+    /// that interrupted it.
+    fn live_turn(&self) -> Option<vibex_desktop_model::TimelineConversationTurn> {
+        if !self.page_owns_session() {
+            return None;
+        }
+        self.agent
+            .state
+            .conversation_turns()
+            .into_iter()
+            .rev()
+            .find(|turn| !(turn.complete || turn.superseded))
     }
 
     /// Whether anything on screen is moving without the reader's input.
@@ -3421,6 +3479,9 @@ impl App {
         // Streaming content can add or invalidate matches, so an open search
         // is re-run rather than left pointing at blocks that have changed.
         self.refresh_search_matches();
+        // The transcript is the turn's own output, so it is also where the line
+        // above the composer learns that the turn moved.
+        self.sync_turn_readout();
     }
 
     /// Put each user message's attachments back into the row it is drawn as.

@@ -24,6 +24,7 @@
 //! composer  the edit buffer, completion triggers and history
 //! search    transcript search: regex with smart case
 //! transcript block cache, incremental layout, viewport-only rendering
+//! turn      the running turn's phase, tool count and pace, read from the projection
 //! view      page shells, overlays, the key bar
 //! app       navigation and overlay state
 //! interface_prefs what the settings surface remembers between runs
@@ -60,6 +61,7 @@ pub mod terminal;
 pub mod text;
 pub mod theme;
 pub mod transcript;
+pub mod turn;
 pub mod view;
 pub mod worker;
 

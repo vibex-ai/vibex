@@ -88,6 +88,16 @@ strings! {
     pending => { "Pending", "等待中", "等待中" },
     running => { "Running", "运行中", "執行中" },
     idle => { "Idle", "空闲", "閒置" },
+    // The four things a running turn can be doing, named the way the desktop
+    // names them so the two surfaces read alike, and the tally of the tools it
+    // has called. The count comes first because both languages put it there:
+    // the label is the unit, not the sentence.
+    phase_preparing => { "Preparing", "准备中", "準備中" },
+    phase_thinking => { "Thinking", "思考中", "思考中" },
+    phase_calling_tool => { "Calling tool", "调用工具", "呼叫工具" },
+    phase_generating => { "Generating", "生成中", "生成中" },
+    phase_waiting_approval => { "Waiting for approval", "等待确认", "等待確認" },
+    tool_calls => { "tool calls", "次工具调用", "次工具呼叫" },
     archived => { "Archived", "已归档", "已封存" },
     copied => { "Copied", "已复制", "已複製" },
     nothing_here => { "Nothing here yet", "这里还没有内容", "這裡還沒有內容" },

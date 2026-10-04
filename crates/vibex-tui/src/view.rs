@@ -1899,10 +1899,11 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
 /// The turn-status row: what the Agent is doing, right now.
 ///
 /// This is the band that makes the interface feel alive. It is not part of the
-/// transcript because it must never scroll away, and it says three things: what
-/// is happening, how long it has been happening, and how much it has cost in
-/// tokens. An idle-but-connected session says so, rather than showing nothing
-/// and leaving the reader unsure whether the client is still there.
+/// transcript because it must never scroll away, and it says the same things
+/// the desktop's line above its composer says: what is happening, how long it
+/// has been happening, how many tools it has called, and how fast it is going.
+/// An idle-but-connected session says so, rather than showing nothing and
+/// leaving the reader unsure whether the client is still there.
 fn render_turn_status(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1919,6 +1920,10 @@ fn render_turn_status(
     let running = app.turn_reads_running();
     let approvals = app.page_approval_count();
     let questions = app.page_elicitation_count();
+    // A turn that is still streaming into the transcript reads as running even
+    // after the runtime has stopped calling the session running: the last line
+    // of an answer arriving is the turn, and the band must not go idle under it.
+    let live = running || app.transcript_animating();
 
     let (icon, label, color) = if approvals + questions > 0 {
         (
@@ -1930,15 +1935,14 @@ fn render_turn_status(
             ),
             theme.roles.accent_attention,
         )
-    } else if running || app.transcript_animating() {
+    } else if live {
         (
             crate::glyphs::frame_at(
                 crate::glyphs::spinner_frames(tier),
                 phase,
                 crate::glyphs::SPINNER_TICKS_PER_FRAME,
             ),
-            app.current_activity()
-                .unwrap_or_else(|| strings.running().to_string()),
+            turn_label(app, strings),
             theme.roles.accent_running,
         )
     } else {
@@ -1955,44 +1959,102 @@ fn render_turn_status(
         )
     };
 
-    // Right-aligned: elapsed time and tokens, so the left side is the sentence
-    // and the right side is the measurement.
-    let mut right: Vec<Span<'static>> = Vec::new();
-    if let Some(elapsed) = app.turn_elapsed() {
-        right.push(Span::styled(
-            format_turn_timer(elapsed),
-            Style::default().fg(theme.roles.gray_dim),
-        ));
-    }
-    if let Some(tokens) = app.turn_tokens() {
-        if !right.is_empty() {
-            right.push(Span::styled(" ", Style::default().fg(theme.roles.gray_dim)));
-        }
-        right.push(Span::styled(
-            format!(
-                "{}{}",
-                crate::glyphs::token_arrow(tier),
-                compact_tokens(tokens)
-            ),
-            Style::default().fg(theme.roles.gray_dim),
-        ));
-    }
-
-    let available = usize::from(area.width).saturating_sub(
-        right
-            .iter()
-            .map(|span| display_width(span.content.as_ref()))
-            .sum::<usize>()
-            + 4,
-    );
-    let left = vec![
+    // One sentence, in the desktop's order: what the Agent is doing, how long
+    // it has taken, how many tools it has called, what it has spent and how
+    // fast it is writing. A band that is not about a running turn — idle, or
+    // waiting on the reader — says only what it is; the measurements belong to
+    // work that is actually happening.
+    let mut line = vec![
         Span::styled(format!("{icon} "), Style::default().fg(color)),
-        Span::styled(
-            truncate_to_width(&label, available, "…"),
-            Style::default().fg(theme.roles.gray),
-        ),
+        Span::styled(label, Style::default().fg(theme.roles.gray)),
     ];
-    render_zoned_line(frame, area, left, None, right);
+    let measure = Style::default().fg(theme.roles.gray_dim);
+    let measure_part = |line: &mut Vec<Span<'static>>, text: String| {
+        line.push(Span::styled(" · ", measure));
+        line.push(Span::styled(text, measure));
+    };
+    if live {
+        if let Some(elapsed) = app.turn_elapsed() {
+            measure_part(&mut line, format_turn_timer(elapsed));
+        }
+        let readout = app.turn_readout();
+        if let Some(tool_calls) = readout
+            .map(crate::turn::TurnReadout::tool_calls)
+            .filter(|count| *count > 0)
+        {
+            measure_part(&mut line, format!("{tool_calls} {}", strings.tool_calls()));
+        }
+        if let Some(tokens) = app.turn_tokens() {
+            measure_part(
+                &mut line,
+                format!(
+                    "{}{}",
+                    crate::glyphs::token_arrow(tier),
+                    compact_tokens(tokens)
+                ),
+            );
+        }
+        if let Some(rate) = readout.and_then(crate::turn::TurnReadout::tokens_per_second) {
+            measure_part(&mut line, format!("{rate:.1} t/s"));
+        }
+    }
+    // A narrow terminal keeps what the Agent is doing and drops the measurement
+    // rather than wrapping a band that is one row tall.
+    truncate_spans(&mut line, usize::from(area.width));
+    frame.render_widget(Paragraph::new(Line::from(line)), area);
+}
+
+/// What the turn line calls the running turn.
+///
+/// The runtime's own activity line names the specific work when it has one —
+/// `read src/net/upload.rs` is more use than `Calling tool` — and the phase is
+/// what is left when it does not: the desktop's own vocabulary, so a reader who
+/// uses both surfaces reads the same words. A send the runtime has not answered
+/// yet has neither, and "Running" is the honest answer for it.
+fn turn_label(app: &App, strings: Strings) -> String {
+    if let Some(activity) = app.current_activity() {
+        return activity;
+    }
+    match app.turn_readout().and_then(crate::turn::TurnReadout::phase) {
+        Some(phase) => phase_label(phase, strings).to_string(),
+        None => strings.running().to_string(),
+    }
+}
+
+/// The word the interface uses for a turn's phase.
+fn phase_label(phase: crate::turn::TurnPhase, strings: Strings) -> &'static str {
+    match phase {
+        crate::turn::TurnPhase::Preparing => strings.phase_preparing(),
+        crate::turn::TurnPhase::Thinking => strings.phase_thinking(),
+        crate::turn::TurnPhase::CallingTool => strings.phase_calling_tool(),
+        crate::turn::TurnPhase::Generating => strings.phase_generating(),
+        crate::turn::TurnPhase::WaitingForApproval => strings.phase_waiting_approval(),
+    }
+}
+
+/// Trim a styled line to `width` columns, ellipsising where it is cut.
+///
+/// The turn line is a sentence with its measurements on the end, and they are
+/// what a narrow terminal can do without: what the Agent is doing is worth more
+/// than how fast it is doing it. The cut is made here rather than by the
+/// paragraph widget so the last span keeps its own colour instead of the whole
+/// line being re-styled or wrapped onto a row the band does not have.
+fn truncate_spans(spans: &mut Vec<Span<'static>>, width: usize) {
+    let mut used = 0usize;
+    for (index, span) in spans.iter().enumerate() {
+        let span_width = display_width(span.content.as_ref());
+        if used + span_width <= width {
+            used += span_width;
+            continue;
+        }
+        let trimmed = truncate_to_width(span.content.as_ref(), width - used, "…");
+        let style = span.style;
+        spans.truncate(index);
+        if !trimmed.is_empty() {
+            spans.push(Span::styled(trimmed, style));
+        }
+        return;
+    }
 }
 
 /// Format an elapsed duration the way a person reads it.
