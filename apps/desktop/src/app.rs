@@ -2453,31 +2453,22 @@ enum RightRailActivity {
     Editor,
     Files,
     Git,
-    Terminal,
-    /// Opens the embedded-browser tool panel. The browser is a tool panel of
-    /// the same rank as the terminal, not an application shell.
-    Browser,
     ChildAgents,
 }
 
 impl RightRailActivity {
     /// Every button, in the order a fresh install shows them.
-    const ALL: [Self; 6] = [
-        Self::Editor,
-        Self::Files,
-        Self::Git,
-        Self::Terminal,
-        Self::Browser,
-        Self::ChildAgents,
-    ];
+    ///
+    /// The rail carries panel toggles only. The terminal and the embedded
+    /// browser are preview surfaces, not rail panels, so they open from the
+    /// editor panel's own tool menus instead of from here.
+    const ALL: [Self; 4] = [Self::Editor, Self::Files, Self::Git, Self::ChildAgents];
 
     fn id(self) -> &'static str {
         match self {
             Self::Editor => "rail_activity_editor",
             Self::Files => right_rail_activity_id(RightRailMode::Files),
             Self::Git => right_rail_activity_id(RightRailMode::Git),
-            Self::Terminal => "rail_activity_terminal",
-            Self::Browser => "rail_activity_browser",
             Self::ChildAgents => "rail_activity_child_agents",
         }
     }
@@ -2487,8 +2478,6 @@ impl RightRailActivity {
             Self::Editor => Icon::default().path("icons/vibex/sidebar-right.svg"),
             Self::Files => right_rail_mode_icon(RightRailMode::Files),
             Self::Git => right_rail_mode_icon(RightRailMode::Git),
-            Self::Terminal => Icon::new(IconName::SquareTerminal),
-            Self::Browser => Icon::new(IconName::Globe),
             Self::ChildAgents => Icon::new(IconName::Bot),
         }
     }
@@ -31408,7 +31397,6 @@ impl VibexWorkbench {
         for activity in self.right_rail_activity_order() {
             let available = match activity {
                 RightRailActivity::Git => git_available,
-                RightRailActivity::Browser => true,
                 RightRailActivity::ChildAgents => child_agents_available,
                 _ => true,
             };
@@ -31453,41 +31441,6 @@ impl VibexWorkbench {
                         .when(show_git_badge, |this| {
                             this.child(git_activity_badge(pending_commit_count, cx))
                         })
-                        .into_any_element()
-                }
-                RightRailActivity::Terminal => right_rail_activity_button(
-                    "activity-terminal",
-                    Icon::new(IconName::SquareTerminal),
-                )
-                .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    let terminal_preview_open = this.code_preview_visible
-                        && this.code_workbench.read(cx).active_preview_is_terminal();
-                    if terminal_preview_open {
-                        this.toggle_preview(cx);
-                    } else {
-                        this.create_preview_terminal(window.window_handle(), None, None, cx);
-                    }
-                }))
-                .into_any_element(),
-                RightRailActivity::Browser => {
-                    right_rail_activity_button("activity-browser", Icon::new(IconName::Globe))
-                        .tooltip(locale::text("Embedded browser", "内嵌浏览器", "內嵌瀏覽器"))
-                        .selected(
-                            preview_open
-                                && self.code_workbench.read(cx).active_preview_is_browser(),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let browser_preview_open = this.code_preview_visible
-                                && this.code_workbench.read(cx).active_preview_is_browser();
-                            if browser_preview_open {
-                                this.toggle_preview(cx);
-                            } else {
-                                this.code_workbench.update(cx, |workbench, cx| {
-                                    workbench.open_browser(None, window, cx)
-                                });
-                            }
-                        }))
                         .into_any_element()
                 }
                 RightRailActivity::ChildAgents => {
@@ -74384,7 +74337,6 @@ mod tests {
 
         assert!(renderer.contains("activity-files"));
         assert!(renderer.contains("activity-git"));
-        assert!(renderer.contains("activity-terminal"));
         assert!(renderer.contains("activity-preview"));
         assert!(renderer.contains("self.preview_panel_open()"));
         assert!(renderer.contains("this.toggle_preview(cx)"));
@@ -74392,6 +74344,32 @@ mod tests {
             renderer.contains("self.right_rail_activity_order()"),
             "the bar draws its buttons in the reader's order"
         );
+    }
+
+    /// The rail carries panel toggles only: the terminal and the embedded
+    /// browser are preview surfaces that stay reachable from the editor
+    /// panel's own tool menus, not from the activity bar.
+    #[test]
+    fn the_right_rail_activity_bar_offers_no_terminal_or_browser_entry() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_right_rail_activity_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_management("))
+            .map(|(renderer, _)| renderer)
+            .expect("right rail activity renderer should remain inspectable");
+
+        assert!(!renderer.contains("activity-terminal"));
+        assert!(!renderer.contains("activity-browser"));
+        assert!(!renderer.contains("create_preview_terminal"));
+        assert!(!renderer.contains("open_browser"));
+
+        let activities = source
+            .split_once("enum RightRailActivity {")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
+            .map(|(activities, _)| activities)
+            .expect("the activity list should remain inspectable");
+        assert!(!activities.contains("Terminal"));
+        assert!(!activities.contains("Browser"));
     }
 
     /// The editor button carries the right-hand panel glyph rather than the
@@ -74425,28 +74403,32 @@ mod tests {
     }
 
     /// The bar keeps the order the reader dragged it into, and a button the
-    /// persisted order does not name keeps its built-in place.
+    /// persisted order does not name keeps its built-in place. Ids retired from
+    /// the bar — the terminal and browser buttons — are simply dropped.
     #[test]
     fn the_activity_order_follows_the_drag_and_keeps_unknown_buttons() {
         assert_eq!(
             resolved_right_rail_activity_order(&[]),
-            RightRailActivity::ALL.to_vec()
+            vec![
+                RightRailActivity::Editor,
+                RightRailActivity::Files,
+                RightRailActivity::Git,
+                RightRailActivity::ChildAgents,
+            ]
         );
 
         let persisted = vec![
-            "rail_activity_terminal".to_string(),
+            "rail_activity_browser".to_string(),
             "rail_plugin_system_git".to_string(),
-            "rail_activity_terminal".to_string(),
+            "rail_plugin_system_git".to_string(),
             "rail_activity_missing".to_string(),
         ];
         assert_eq!(
             resolved_right_rail_activity_order(&persisted),
             vec![
-                RightRailActivity::Terminal,
                 RightRailActivity::Git,
                 RightRailActivity::Editor,
                 RightRailActivity::Files,
-                RightRailActivity::Browser,
                 RightRailActivity::ChildAgents,
             ]
         );
@@ -74460,15 +74442,13 @@ mod tests {
             reordered_right_rail_activities(
                 &order,
                 RightRailActivity::Editor,
-                RightRailActivity::Terminal,
+                RightRailActivity::Git,
                 RightRailActivityDropPosition::After,
             ),
             vec![
                 RightRailActivity::Files,
                 RightRailActivity::Git,
-                RightRailActivity::Terminal,
                 RightRailActivity::Editor,
-                RightRailActivity::Browser,
                 RightRailActivity::ChildAgents,
             ]
         );
@@ -74484,8 +74464,6 @@ mod tests {
                 RightRailActivity::ChildAgents,
                 RightRailActivity::Files,
                 RightRailActivity::Git,
-                RightRailActivity::Terminal,
-                RightRailActivity::Browser,
             ]
         );
         assert_eq!(

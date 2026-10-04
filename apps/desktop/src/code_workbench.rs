@@ -5429,24 +5429,6 @@ impl CodeWorkbench {
         self.open_terminal_in_pane(terminal_id, None, window, cx);
     }
 
-    /// True when the focused preview tab is the embedded browser.
-    ///
-    /// The right-rail button uses this to decide between "show it" and "hide
-    /// it", exactly like the terminal activity does.
-    pub(crate) fn active_preview_is_browser(&self) -> bool {
-        self.preview
-            .active_tab_id(&self.preview.focused_pane_id)
-            .and_then(|tab_id| self.preview.tabs.get(tab_id))
-            .is_some_and(|tab| matches!(&tab.target, PreviewTarget::Browser { .. }))
-    }
-
-    pub(crate) fn active_preview_is_terminal(&self) -> bool {
-        self.preview
-            .active_tab_id(&self.preview.focused_pane_id)
-            .and_then(|tab_id| self.preview.tabs.get(tab_id))
-            .is_some_and(|tab| matches!(&tab.target, PreviewTarget::Terminal { .. }))
-    }
-
     pub fn open_terminal_in_pane(
         &mut self,
         terminal_id: TerminalId,
