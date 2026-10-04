@@ -976,8 +976,11 @@ fn search_query_window(query: &str, width: usize) -> (String, bool) {
 /// The full-screen session list.
 ///
 /// Sessions are a navigation level, not a permanent column. As a view they get
-/// the whole screen: a title, the workspace, the state and an age per row,
-/// which a 26-column sidebar could never show.
+/// the whole screen, and the screen is spent the way a reader scans a list of
+/// work: where they are and what the sessions are doing on the first line, the
+/// key that starts another on the second, then a heading per group and, under
+/// it, a row carrying the mark, the title, who is answering, when it last spoke
+/// and — on its own dim line — what it last said.
 fn render_session_view(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -986,71 +989,274 @@ fn render_session_view(
     strings: Strings,
 ) {
     let inner = page_frame(frame, area, theme, strings.sessions_title(), true);
-    // The filter is a line of the list, not a separate overlay, so the reader
-    // can see what is being typed and what it matched at the same time.
-    let list_area = if app.filtering || !app.filter.is_empty() {
-        let filter_area = Rect { height: 1, ..inner };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("/ ", Style::default().fg(theme.roles.accent_user)),
-                Span::styled(
-                    app.filter.clone(),
-                    Style::default().fg(theme.roles.foreground),
-                ),
-                Span::styled(
-                    if app.filtering { "▏" } else { "" },
-                    Style::default().fg(theme.roles.accent_user),
-                ),
-            ])),
-            filter_area,
-        );
+    let list = app.sidebar_view();
+    // A terminal too short for two rows of chrome keeps the rows instead: on
+    // four lines of screen, a heading the reader can act on is worth more than
+    // a summary of it.
+    if inner.height < 4 {
+        render_session_rows(frame, inner, &list, app, theme, strings);
+        return;
+    }
+    let list_area = Rect {
+        y: inner.y + 2,
+        height: inner.height - 2,
+        ..inner
+    };
+    render_session_header(
+        frame,
+        Rect { height: 1, ..inner },
+        &list.states,
+        app,
+        theme,
+        strings,
+    );
+    render_session_actions(
+        frame,
         Rect {
             y: inner.y + 1,
-            height: inner.height.saturating_sub(1),
+            height: 1,
             ..inner
+        },
+        app,
+        theme,
+        strings,
+    );
+    render_session_rows(frame, list_area, &list, app, theme, strings);
+}
+
+/// The list's first line: where the reader is, and how much work there is.
+///
+/// The filter takes the line over while it is being typed. It is what the list
+/// is answering, and the workspace behind it has not moved — so the two share
+/// one row rather than pushing the list down a line the moment a reader
+/// searches.
+fn render_session_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    states: &[(vibex_core::AgentSessionState, usize)],
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let chips = session_chip_spans(states, app, theme, strings);
+    let chip_width = spans_width(&chips);
+    // The chips describe the list, so they keep their columns and the location
+    // gives way to them: a path the reader already knows is worth less than a
+    // count they do not.
+    let left_budget = usize::from(area.width)
+        .saturating_sub(chip_width)
+        .saturating_sub(2);
+    let left = if app.filtering || !app.filter.is_empty() {
+        let mut spans = vec![
+            Span::styled("/ ", Style::default().fg(theme.roles.accent_user)),
+            Span::styled(
+                app.filter.clone(),
+                Style::default().fg(theme.roles.foreground),
+            ),
+        ];
+        if app.filtering {
+            spans.push(Span::styled(
+                "▏",
+                Style::default().fg(theme.roles.accent_user),
+            ));
         }
+        spans
     } else {
-        inner
+        session_location_spans(app, theme, strings, left_budget)
     };
-    let rows = app.sidebar_rows();
+    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    if chips.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(trim_spans(chips, usize::from(area.width))))
+            .alignment(Alignment::Right),
+        area,
+    );
+}
+
+/// The path the reader is working in, and the key that moves it.
+fn session_location_spans(
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+    budget: usize,
+) -> Vec<Span<'static>> {
+    let Some(path) = app.workspace_path.as_deref() else {
+        return Vec::new();
+    };
+    // A location folded down to one character is not a location: the chips
+    // take the line rather than leaving a stray slash in front of them.
+    if budget < 8 {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::styled(
+        compact_path(path, budget),
+        Style::default().fg(theme.roles.path),
+    )];
+    // The hint is drawn only when it fits whole: half a key is worse than no
+    // key, because the reader cannot tell which half is missing. The key is a
+    // global binding, so the chord is looked up by intent rather than by the
+    // scope this page owns.
+    if let Some(chord) = app.keymap.chord_for(Intent::SwitchWorkspace) {
+        let hint = format!(
+            "[{} {}]",
+            strings.session_workspace_label(),
+            chord.display()
+        );
+        if spans_width(&spans) + 1 + display_width(&hint) <= budget {
+            spans.push(Span::styled(
+                format!(" {hint}"),
+                theme.dimmed(theme.roles.gray_dim),
+            ));
+        }
+    }
+    spans
+}
+
+/// The list's second line: the one action a session list needs, and the mode
+/// the list is in with the key that changes it.
+fn render_session_actions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let new_session = format!("+ {}", strings.session_new());
+    let new_session = truncate_to_width(&new_session, usize::from(area.width), "…");
+    let label_width = display_width(&new_session);
+    // The button is a button: a click runs the same intent the key does.
+    app.regions.hints.push((
+        Rect {
+            width: label_width as u16,
+            height: 1,
+            ..area
+        },
+        Intent::NewSession,
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            new_session,
+            Style::default().fg(theme.roles.text_secondary),
+        ))),
+        area,
+    );
+    // The right-hand item names the mode the list is *in*: a reader looking at
+    // flat rows wants to know whether the list is grouped before pressing the
+    // key that changes it.
+    let Some(chord) = app.keymap.chord_for(Intent::ToggleSidebarGrouping) else {
+        return;
+    };
+    let mode = if app.sidebar_grouped {
+        strings.sidebar_grouped()
+    } else {
+        strings.sidebar_flat()
+    };
+    let hint = format!("{mode}  {}", chord.display());
+    // Strictly dropped rather than truncated, and only when the two sides
+    // cannot touch: half a hint is a key the reader cannot use.
+    if label_width + 2 + display_width(&hint) > usize::from(area.width) {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            theme.dimmed(theme.roles.gray),
+        )))
+        .alignment(Alignment::Right),
+        area,
+    );
+}
+
+/// What the header says about the list: how many sessions are waiting on the
+/// reader, still working, stopped badly and quiet.
+///
+/// The order is the order they have to be acted on, and a family with nothing
+/// in it is left out rather than drawn as a zero the reader has to read past.
+fn session_chip_spans(
+    states: &[(vibex_core::AgentSessionState, usize)],
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Vec<Span<'static>> {
+    let tier = app.glyph_tier();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (state, count) in states {
+        let (mark, colour, label) = session_chip(*state, tier, theme, strings);
+        if !spans.is_empty() {
+            spans.push(Span::styled(
+                "  ",
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+        spans.push(Span::styled(mark, Style::default().fg(colour)));
+        spans.push(Span::styled(
+            format!(" {count} {label}"),
+            Style::default().fg(theme.roles.gray),
+        ));
+    }
+    spans
+}
+
+/// The mark, colour and word of one summary chip.
+fn session_chip(
+    state: vibex_core::AgentSessionState,
+    tier: crate::glyphs::GlyphTier,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> (&'static str, ratatui::style::Color, &'static str) {
+    match state {
+        vibex_core::AgentSessionState::NeedsInput => (
+            crate::glyphs::state_marker("waiting", tier),
+            theme.roles.accent_attention,
+            strings.session_chip_waiting(),
+        ),
+        vibex_core::AgentSessionState::Running => (
+            crate::glyphs::state_marker("running", tier),
+            theme.roles.accent_running,
+            strings.session_chip_running(),
+        ),
+        vibex_core::AgentSessionState::Error => (
+            crate::glyphs::state_marker("failed", tier),
+            theme.roles.danger,
+            strings.session_chip_failed(),
+        ),
+        _ => (
+            crate::glyphs::diamond_hollow(tier),
+            theme.roles.gray_dim,
+            strings.session_chip_idle(),
+        ),
+    }
+}
+
+/// The list itself: a heading per group, and under each a row per session.
+fn render_session_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    list: &crate::sessions::SessionListRows,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let rows = &list.rows;
     if rows.is_empty() {
-        render_welcome(frame, list_area, app, theme, strings);
+        render_welcome(frame, area, app, theme, strings);
         return;
     }
     let selected = app.selection_for(Scope::Sessions);
     let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
-    // State is one mark, not a word: the shapes are the vocabulary the reader
-    // learns once (`▶` running, `✗` failed, `·` idle, `◆` waiting, `▤`
-    // archived), and spelling them out cost the title a third of the row for
-    // information the mark already carried.
-    let state_width = if rows.iter().any(|row| row.state.is_some()) {
-        2
-    } else {
-        0
-    };
-    // Auto-continue is a mark of its own before the state: `↻` when the session
-    // will continue itself, `↻3` while it counts down, so the reader can see
-    // what is about to happen and stop it.
-    let auto_labels = rows
-        .iter()
-        .map(|row| {
-            row.session_id
-                .as_ref()
-                .and_then(|session_id| auto_continue_label(app, session_id))
-        })
-        .collect::<Vec<_>>();
-    let auto_column = auto_labels
-        .iter()
-        .flatten()
-        .map(|label| display_width(label))
-        .max()
-        .unwrap_or(0);
-    let auto_width = if auto_column > 0 { auto_column + 1 } else { 0 };
+    let now_ms = vibex_core::unix_timestamp_ms();
     // When the session last said anything, right-aligned: the reader scanning
     // the list is looking for what changed, and a wall of identical rows says
     // nothing about that. The column is measured from what will be drawn, so a
     // list of sessions from today spends no width on days.
-    let now_ms = vibex_core::unix_timestamp_ms();
     let time_labels = rows
         .iter()
         .map(|row| {
@@ -1071,185 +1277,388 @@ fn render_session_view(
         .map(|label| display_width(label))
         .max()
         .unwrap_or(0)
-        .min(usize::from(list_area.width) / 4);
-    let time_width = if time_column > 0 { time_column + 1 } else { 0 };
-    let items = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let active = row
-                .session_id
-                .as_ref()
-                .is_some_and(|session_id| app.selected_session_id() == Some(session_id));
-            let hovered = app.hover == Some((Scope::Sessions, index));
-            let style = if index == selected {
-                Style::default()
-                    .fg(theme.roles.background)
-                    .bg(theme.roles.accent_user)
-                    .add_modifier(Modifier::BOLD)
-            } else if hovered {
-                Style::default()
-                    .fg(theme.roles.foreground)
-                    .bg(theme.roles.surface_highlight)
-            } else if active {
-                Style::default()
-                    .fg(theme.roles.accent_user)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.roles.foreground)
-            };
-            let marker = match row.kind {
-                vibex_desktop_model::AgentSidebarRowKind::Folder
-                | vibex_desktop_model::AgentSidebarRowKind::Project => {
-                    crate::glyphs::disclosure(!row.collapsed, app.glyph_tier())
-                }
-                // A pinned session keeps its place above the rest, and the list
-                // says so where the disclosure would otherwise be blank.
-                vibex_desktop_model::AgentSidebarRowKind::Session if row.pinned => {
-                    crate::glyphs::pin_marker(app.glyph_tier())
-                }
-                vibex_desktop_model::AgentSidebarRowKind::Session => " ",
-            };
-            // A folder is the reader's own container around whatever they put
-            // in it, so its heading is drawn as one: brighter than the body,
-            // and independent of the colour a selected row carries.
-            let heading_style = if index == selected || hovered {
-                style
-            } else {
-                Style::default()
-                    .fg(theme.roles.gray_bright)
-                    .add_modifier(Modifier::BOLD)
-            };
-            let label_style = if row.kind == vibex_desktop_model::AgentSidebarRowKind::Folder {
-                heading_style
-            } else {
-                style
-            };
-            // The session's Agent, marked the way the desktop's sidebar marks
-            // it: one cell that says *who* is answering, before the title.
-            let session = row
-                .session_id
-                .as_ref()
-                .and_then(|session_id| sessions.iter().find(|session| &session.id == session_id));
-            let agent_mark = session.map(|session| {
-                let label = app.session_agent_label(session);
-                let initial = label
-                    .trim()
-                    .chars()
-                    .next()
-                    .map(|character| character.to_uppercase().to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                (initial, agent_mark_style(&label, theme))
-            });
-            let unread = session.is_some_and(|session| app.session_is_unread(&session.id));
-            let indent = " ".repeat(usize::from(row.depth) * 2);
-            // The marker plus its space, then the title, then the state column.
-            // Padding is counted in cells, not characters: a CJK title occupies
-            // two cells per character and a `{:<width$}` pad would push the
-            // state off the row.
-            let name_width = usize::from(list_area.width)
-                .saturating_sub(
-                    usize::from(row.depth) * 2 + 2 + auto_width + state_width + time_width + 2,
-                )
-                .max(8);
-            let label = truncate_to_width(&row.label, name_width, "…");
-            let padding = name_width.saturating_sub(display_width(&label));
-            let mut spans = vec![Span::styled(
-                format!("{indent}{marker} "),
-                if row.kind == vibex_desktop_model::AgentSidebarRowKind::Folder {
-                    heading_style
-                } else {
-                    style
-                },
-            )];
-            if let Some((initial, mark_style)) = agent_mark.clone() {
-                spans.push(Span::styled(
-                    format!("{initial} "),
-                    if index == selected { style } else { mark_style },
-                ));
-            }
-            if unread {
-                spans.push(Span::styled(
-                    format!("{} ", crate::glyphs::unread_marker(app.glyph_tier())),
-                    if index == selected {
-                        style
-                    } else {
-                        Style::default().fg(theme.roles.accent_attention)
-                    },
-                ));
-            }
-            // The unread mark and the Agent mark take cells the title budget
-            // was computed without, so the pad absorbs the difference.
-            let taken = usize::from(agent_mark.is_some()) * 2 + usize::from(unread) * 2;
-            let padding = padding.saturating_sub(taken);
-            spans.push(Span::styled(
-                format!("{label}{}", " ".repeat(padding)),
-                label_style,
-            ));
-            if let Some(Some(label)) = auto_labels.get(index) {
-                let padding = auto_column.saturating_sub(display_width(label));
-                // Counting down is the one part of this the reader must not
-                // miss, so it is drawn in the attention colour rather than
-                // dimmed like the rest of the row's furniture.
-                let counting = row.session_id.as_ref().is_some_and(|session_id| {
-                    app.auto_continue.countdown_seconds(session_id).is_some()
-                });
-                spans.push(Span::styled(
-                    format!("{label}{} ", " ".repeat(padding)),
-                    if index == selected || hovered {
-                        style
-                    } else if counting {
-                        Style::default().fg(theme.roles.accent_attention)
-                    } else {
-                        Style::default().fg(theme.roles.accent_success)
-                    },
-                ));
-            } else if auto_width > 0 {
-                spans.push(Span::styled(" ".repeat(auto_width), style));
-            }
-            if let Some(state) = row.state {
-                let mark = crate::glyphs::state_marker(state_marker_key(state), app.glyph_tier());
-                spans.push(Span::styled(
-                    format!("{mark} "),
-                    if index == selected || hovered {
-                        style
-                    } else {
-                        Style::default().fg(state_marker_colour(state, theme))
-                    },
-                ));
-            }
-            if let Some(Some(time)) = time_labels.get(index) {
-                let padding = time_column.saturating_sub(display_width(time));
-                spans.push(Span::styled(
-                    format!(" {}{time}", " ".repeat(padding)),
-                    if index == selected || hovered {
-                        style
-                    } else {
-                        Style::default().fg(theme.roles.gray_dim)
-                    },
-                ));
-            }
-            let mut lines = vec![Line::from(spans)];
-            // An expanded session shows its detail card under its row, inside
-            // the same list item so the selection band covers the whole card.
-            if let Some(session_id) = row.session_id.as_ref()
-                && app.session_card_expanded(session_id.as_str())
-                && let Some(session) = sessions.iter().find(|session| &session.id == session_id)
-            {
-                lines.extend(session_card_lines(app, session, strings, theme, list_area));
-            }
-            ListItem::new(Text::from(lines))
-        })
-        .collect::<Vec<_>>();
+        .min(usize::from(area.width) / 4);
+    let mut items = Vec::with_capacity(rows.len());
+    let mut heights = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let lines = session_list_item(
+            row,
+            list.counts.get(index).copied().unwrap_or(0),
+            index == selected,
+            app.hover == Some((Scope::Sessions, index)),
+            time_labels.get(index).and_then(Option::as_ref),
+            time_column,
+            usize::from(area.width),
+            &sessions,
+            app,
+            theme,
+            strings,
+        );
+        heights.push(lines.len().min(usize::from(u16::MAX)) as u16);
+        items.push(ListItem::new(Text::from(lines)));
+    }
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected.min(rows.len().saturating_sub(1))));
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+    // The rows are not all one line tall, so the mouse needs to know which row
+    // the drawn window starts on and how tall each row in it is.
+    let first_row = state.offset().min(rows.len());
+    let mut drawn = 0usize;
+    let mut visible = Vec::new();
+    for height in heights.iter().skip(first_row) {
+        if drawn >= usize::from(area.height) {
+            break;
+        }
+        let height = usize::from((*height).max(1));
+        visible.push(height as u16);
+        drawn += height;
+    }
     app.regions.list = Some(crate::app::ListRegion {
-        rect: list_area,
+        rect: area,
         scope: Scope::Sessions,
         rows: rows.len(),
         first_line: 0,
+        first_row,
+        heights: visible,
     });
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(rows.len().saturating_sub(1))));
-    frame.render_stateful_widget(List::new(items), list_area, &mut state);
+}
+
+/// One row of the list: its heading, its title line, its second line and any
+/// detail card the reader has opened under it.
+#[allow(clippy::too_many_arguments)]
+fn session_list_item(
+    row: &vibex_desktop_model::AgentSidebarRow,
+    count: usize,
+    selected: bool,
+    hovered: bool,
+    time: Option<&String>,
+    time_column: usize,
+    width: usize,
+    sessions: &[vibex_core::AgentSession],
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Vec<Line<'static>> {
+    let session = row
+        .session_id
+        .as_ref()
+        .and_then(|session_id| sessions.iter().find(|session| &session.id == session_id));
+    if row.kind != vibex_desktop_model::AgentSidebarRowKind::Session {
+        return vec![session_heading_line(
+            row, count, selected, hovered, width, app, theme,
+        )];
+    }
+    let mut lines = session_row_lines(
+        row,
+        session,
+        selected,
+        hovered,
+        time,
+        time_column,
+        width,
+        app,
+        theme,
+        strings,
+    );
+    if let Some(session) = session
+        && app.session_card_expanded(session.id.as_str())
+    {
+        lines.extend(session_card_lines(app, session, strings, theme, width));
+    }
+    lines
+}
+
+/// A group's heading: what it is called, how much it holds, and a rule to the
+/// edge of the list.
+///
+/// The rule is what turns a stack of rows into sections: without it a project
+/// name is one more line of text, and the reader has to read it to find the
+/// next one.
+fn session_heading_line(
+    row: &vibex_desktop_model::AgentSidebarRow,
+    count: usize,
+    selected: bool,
+    hovered: bool,
+    width: usize,
+    app: &App,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    let tier = app.glyph_tier();
+    let disclosure = crate::glyphs::disclosure(!row.collapsed, tier);
+    let label_style = if selected {
+        Style::default().fg(theme.roles.accent_user)
+    } else if hovered {
+        Style::default().fg(theme.roles.foreground)
+    } else {
+        Style::default().fg(theme.roles.gray_bright)
+    }
+    .add_modifier(Modifier::BOLD);
+    let count_style = Style::default().fg(theme.roles.gray_dim);
+    let indent = usize::from(row.depth) * 2;
+    let count_label = if count > 0 {
+        format!(" {count}")
+    } else {
+        String::new()
+    };
+    // The name gives way before the shape of the heading does: a heading whose
+    // rule ran out is still a heading, but a heading without its name is not.
+    let label_width = width
+        .saturating_sub(indent)
+        .saturating_sub(2)
+        .saturating_sub(display_width(&count_label))
+        .saturating_sub(3)
+        .max(1);
+    let label = truncate_to_width(&row.label, label_width, "…");
+    let used = indent + 2 + display_width(&label) + display_width(&count_label);
+    let mut spans = vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(format!("{disclosure} "), label_style),
+        Span::styled(label, label_style),
+    ];
+    if !count_label.is_empty() {
+        spans.push(Span::styled(count_label, count_style));
+    }
+    // One column of air between the count and the rule, then the rule to the
+    // edge of the list, so the eye follows it to the next heading.
+    let rule_width = width.saturating_sub(used + 1);
+    if rule_width > 0 {
+        spans.push(Span::styled(" ", count_style));
+        spans.push(Span::styled(
+            HORIZONTAL_RULE.to_string().repeat(rule_width),
+            Style::default().fg(theme.roles.border),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The one glyph a heading's rule is drawn with.
+const HORIZONTAL_RULE: char = '─';
+
+/// A session's row: the title line and, under it, what the session last did.
+#[allow(clippy::too_many_arguments)]
+fn session_row_lines(
+    row: &vibex_desktop_model::AgentSidebarRow,
+    session: Option<&vibex_core::AgentSession>,
+    selected: bool,
+    hovered: bool,
+    time: Option<&String>,
+    time_column: usize,
+    width: usize,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Vec<Line<'static>> {
+    let tier = app.glyph_tier();
+    // A selected or hovered row is a band rather than a coloured sentence: the
+    // band covers the second line too, so the row reads as one object.
+    let band = (selected || hovered).then_some(theme.roles.surface_highlight);
+    let paint = |colour: ratatui::style::Color| match band {
+        Some(band) => Style::default().fg(colour).bg(band),
+        None => Style::default().fg(colour),
+    };
+    let title_style = paint(theme.roles.foreground);
+    let dim_style = paint(if selected {
+        theme.roles.text_secondary
+    } else {
+        theme.roles.gray_dim
+    });
+    let blank_style = match band {
+        Some(band) => Style::default().bg(band),
+        None => Style::default(),
+    };
+    let bar_style = Style::default()
+        .fg(theme.roles.accent_user)
+        .add_modifier(Modifier::BOLD);
+    let bar_style = match band {
+        Some(band) => bar_style.bg(band),
+        None => bar_style,
+    };
+    let bar = if selected {
+        crate::glyphs::accent_bar(tier)
+    } else {
+        " "
+    };
+    let state_mark = session.map(|session| {
+        (
+            session_state_mark(session.state, tier),
+            state_marker_colour(session.state, theme),
+        )
+    });
+    let icon_style = match (band, state_mark) {
+        (Some(band), Some((_, colour))) => Style::default().fg(colour).bg(band),
+        (None, Some((_, colour))) => Style::default().fg(colour),
+        _ => title_style,
+    };
+    let icon = state_mark.map(|(mark, _)| mark).unwrap_or(" ");
+    let badges = session_row_badges(row, session, selected, app, theme);
+    let badge_width = spans_width(&badges);
+    let badge_block = if badges.is_empty() {
+        0
+    } else {
+        badge_width + 2
+    };
+    // The age column ends one cell short of the edge, so the numbers are not
+    // glued to the frame.
+    let meta_width = if time_column > 0 { time_column + 2 } else { 0 };
+    let text_width = width
+        .saturating_sub(4)
+        .saturating_sub(meta_width)
+        .saturating_sub(badge_block);
+    let mut spans = vec![
+        Span::styled(format!("{bar} "), bar_style),
+        Span::styled(format!("{icon} "), icon_style),
+    ];
+    let title = truncate_to_width(&row.label, text_width, "…");
+    let mut text_used = display_width(&title);
+    spans.push(Span::styled(title, title_style));
+    // Who is answering, when the title has left room for it: which Agent a
+    // session runs on is how a reader tells two similarly named rows apart.
+    let subtitle = session
+        .map(|session| app.session_agent_label(session))
+        .unwrap_or_default();
+    if !subtitle.is_empty() && text_used + 3 + display_width(&subtitle) <= text_width {
+        spans.push(Span::styled(" · ", dim_style));
+        let subtitle = truncate_to_width(&subtitle, text_width - text_used - 3, "…");
+        text_used += 3 + display_width(&subtitle);
+        spans.push(Span::styled(subtitle, dim_style));
+    }
+    spans.push(Span::styled(
+        " ".repeat(text_width.saturating_sub(text_used)),
+        blank_style,
+    ));
+    if !badges.is_empty() {
+        spans.push(Span::styled("  ", blank_style));
+        spans.extend(badges);
+    }
+    if let Some(time) = time.filter(|_| time_column > 0) {
+        let padding = time_column.saturating_sub(display_width(time));
+        spans.push(Span::styled(
+            format!(" {}{time}", " ".repeat(padding)),
+            dim_style,
+        ));
+    }
+    let mut lines = vec![Line::from(spans)];
+    // The second line: what the session last did, or where it works when this
+    // client has not seen it do anything yet. A session waiting on the reader
+    // says so first — it is the one thing on the row that has to be acted on.
+    if let Some(session) = session {
+        let pending = session.state == vibex_core::AgentSessionState::NeedsInput;
+        let prefix = if pending {
+            format!("{}: ", strings.pending())
+        } else {
+            String::new()
+        };
+        let budget = width
+            .saturating_sub(4)
+            .saturating_sub(display_width(&prefix));
+        let mut spans = vec![Span::styled(format!("{bar}   "), bar_style)];
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, paint(theme.roles.warning)));
+        }
+        let secondary = match app.session_echo(&session.id) {
+            Some(echo) => truncate_to_width(echo, budget, "…"),
+            None => {
+                let root = compact_path(&session.workspace_root, budget);
+                truncate_to_width(&root, budget, "…")
+            }
+        };
+        spans.push(Span::styled(secondary, dim_style));
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// The marks a session row carries: pinned, unread, and whether the session is
+/// going to continue itself.
+fn session_row_badges(
+    row: &vibex_desktop_model::AgentSidebarRow,
+    session: Option<&vibex_core::AgentSession>,
+    selected: bool,
+    app: &App,
+    theme: &TuiTheme,
+) -> Vec<Span<'static>> {
+    let tier = app.glyph_tier();
+    let resting = |colour: ratatui::style::Color| Style::default().fg(colour);
+    let mut spans = Vec::new();
+    if row.pinned {
+        spans.push(Span::styled(
+            format!("{} ", crate::glyphs::pin_marker(tier)),
+            resting(theme.roles.gray_bright),
+        ));
+    }
+    if session.is_some_and(|session| app.session_is_unread(&session.id)) {
+        spans.push(Span::styled(
+            format!("{} ", crate::glyphs::unread_marker(tier)),
+            resting(if selected {
+                theme.roles.text_secondary
+            } else {
+                theme.roles.accent_attention
+            }),
+        ));
+    }
+    if let Some(session) = session
+        && let Some(label) = auto_continue_label(app, &session.id)
+    {
+        let counting = app.auto_continue.countdown_seconds(&session.id).is_some();
+        spans.push(Span::styled(
+            format!("{label} "),
+            resting(if selected {
+                theme.roles.text_secondary
+            } else if counting {
+                theme.roles.accent_attention
+            } else {
+                theme.roles.accent_success
+            }),
+        ));
+    }
+    spans
+}
+
+/// The mark beside a session in the list: a shape per state family, so a
+/// monochrome terminal can tell a failed session from a running one.
+fn session_state_mark(
+    state: vibex_core::AgentSessionState,
+    tier: crate::glyphs::GlyphTier,
+) -> &'static str {
+    match state {
+        vibex_core::AgentSessionState::Running => crate::glyphs::state_marker("running", tier),
+        vibex_core::AgentSessionState::NeedsInput => crate::glyphs::state_marker("waiting", tier),
+        vibex_core::AgentSessionState::Error => crate::glyphs::state_marker("failed", tier),
+        vibex_core::AgentSessionState::Archived => crate::glyphs::state_marker("archived", tier),
+        vibex_core::AgentSessionState::Initializing => crate::glyphs::diamond_dotted(tier),
+        _ => crate::glyphs::diamond_hollow(tier),
+    }
+}
+
+/// The width in cells of a run of spans.
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| display_width(&span.content)).sum()
+}
+
+/// Cut a run of spans to `budget` columns, dropping what does not fit.
+///
+/// The span that runs out of room is truncated rather than dropped, so a long
+/// path keeps its head and says it was cut; anything after it is gone.
+fn trim_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
+    let mut used = 0usize;
+    let mut kept = Vec::new();
+    for span in spans {
+        let width = display_width(&span.content);
+        if used + width <= budget {
+            used += width;
+            kept.push(span);
+            continue;
+        }
+        let room = budget.saturating_sub(used);
+        if room > 1 {
+            kept.push(Span::styled(
+                truncate_to_width(&span.content, room, "…"),
+                span.style,
+            ));
+        }
+        break;
+    }
+    kept
 }
 
 /// The auto-continue mark for one row: `↻` when the session will continue
@@ -1263,20 +1672,6 @@ fn auto_continue_label(app: &App, session_id: &vibex_core::VibexSessionId) -> Op
         .then(|| "↻".to_string())
 }
 
-/// A human-readable session state, rather than the variant name.
-/// The state's mark key, which is the state family rather than its word.
-///
-/// The word is localized and long; the family is what a mark can carry.
-fn state_marker_key(state: vibex_core::AgentSessionState) -> &'static str {
-    match state {
-        vibex_core::AgentSessionState::Running => "running",
-        vibex_core::AgentSessionState::Error => "failed",
-        vibex_core::AgentSessionState::NeedsInput => "waiting",
-        vibex_core::AgentSessionState::Archived => "archived",
-        _ => "idle",
-    }
-}
-
 /// The colour of a state's mark.
 fn state_marker_colour(
     state: vibex_core::AgentSessionState,
@@ -1288,27 +1683,6 @@ fn state_marker_colour(
         vibex_core::AgentSessionState::NeedsInput => theme.roles.accent_attention,
         _ => theme.roles.gray_dim,
     }
-}
-
-/// The colour of a session's Agent mark.
-///
-/// The Agent is identified by a letter, and the colour says the same thing a
-/// second time for a reader who is scanning rather than reading. It is derived
-/// from the label, so the same Agent keeps its colour across sessions and
-/// machines without anything having to agree on a table.
-fn agent_mark_style(label: &str, theme: &TuiTheme) -> Style {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    label.hash(&mut hasher);
-    let palette = [
-        theme.roles.accent_user,
-        theme.roles.accent,
-        theme.roles.command,
-        theme.roles.success,
-        theme.roles.accent_attention,
-    ];
-    let index = (hasher.finish() as usize) % palette.len();
-    Style::default().fg(palette[index])
 }
 
 /// How long ago a session last said anything, the way a list of them reads.
@@ -1403,13 +1777,11 @@ fn session_card_lines(
     session: &vibex_core::AgentSession,
     strings: Strings,
     theme: &TuiTheme,
-    area: Rect,
+    width: usize,
 ) -> Vec<Line<'static>> {
-    let indent = usize::from(area.width).min(120) / 12 + 4;
+    let indent = width.min(120) / 12 + 4;
     let label_width = 12usize;
-    let value_width = usize::from(area.width)
-        .saturating_sub(indent + label_width + 2)
-        .max(8);
+    let value_width = width.saturating_sub(indent + label_width + 2).max(8);
     let label_style = Style::default().fg(theme.roles.gray_dim);
     let value_style = Style::default().fg(theme.roles.gray);
     let bar_style = Style::default().fg(theme.roles.accent_user);
@@ -3212,6 +3584,8 @@ fn render_management(
         scope: Scope::Management,
         rows: rows.len(),
         first_line: 0,
+        first_row: 0,
+        heights: Vec::new(),
     });
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected.min(rows.len() - 1)));
@@ -3332,6 +3706,8 @@ fn render_entry_list(
         scope: app.page.scope(),
         rows: entries.len(),
         first_line: 0,
+        first_row: 0,
+        heights: Vec::new(),
     });
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected.min(entries.len() - 1)));

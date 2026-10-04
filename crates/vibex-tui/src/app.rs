@@ -810,6 +810,14 @@ pub struct App {
     /// The client's own notion, not the runtime's: it is what "unread" means in
     /// a list of sessions, and it is cleared by opening the session.
     pub unread_sessions: std::collections::BTreeSet<String>,
+    /// What each session last did, one line, for the list's second line.
+    ///
+    /// The runtime publishes a session's *state* but not its last words, and a
+    /// list of titles alone cannot say which of five idle sessions is the one
+    /// that answered. The line is the client's own reading of the events it
+    /// already receives, pruned to the sessions the list still holds, so it
+    /// costs the runtime nothing.
+    pub session_echoes: BTreeMap<String, String>,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -994,7 +1002,7 @@ impl FrameRegions {
 }
 
 /// A clickable list drawn by a page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRegion {
     pub rect: ratatui::layout::Rect,
     pub scope: crate::keymap::Scope,
@@ -1003,6 +1011,18 @@ pub struct ListRegion {
     pub rows: usize,
     /// Lines between the top of the rect and the first selectable row.
     pub first_line: usize,
+    /// The index of the row drawn at the top of the rect.
+    ///
+    /// A list scrolls by row, so a click has to know which row the first drawn
+    /// line belongs to before it can count downwards.
+    pub first_row: usize,
+    /// How many lines each drawn row occupies, top to bottom. Empty means every
+    /// row is one line, which is what a list of single-line rows publishes.
+    ///
+    /// Rows are not all the same height — a session with something to say
+    /// spends a second line on it — and a click that assumed one line per row
+    /// would land on the row below the one under the pointer.
+    pub heights: Vec<u16>,
 }
 
 /// Where the runtime switcher drew its rows.
@@ -1039,8 +1059,20 @@ pub fn list_row_at(region: &ListRegion, column: u16, row: u16) -> Option<usize> 
     {
         return None;
     }
-    let index = usize::from(row - region.rect.y).checked_sub(region.first_line)?;
-    (index < region.rows).then_some(index)
+    let line = usize::from(row - region.rect.y).checked_sub(region.first_line)?;
+    if region.heights.is_empty() {
+        return (line < region.rows).then_some(line);
+    }
+    let mut top = 0usize;
+    for (index, height) in region.heights.iter().enumerate() {
+        let height = usize::from((*height).max(1));
+        if line < top + height {
+            let index = region.first_row + index;
+            return (index < region.rows).then_some(index);
+        }
+        top += height;
+    }
+    None
 }
 
 /// A free-text selection over the transcript, in display coordinates.
@@ -1227,6 +1259,7 @@ impl App {
             inflight_sends: BTreeMap::new(),
             pending_send_serial: 0,
             unread_sessions: std::collections::BTreeSet::new(),
+            session_echoes: BTreeMap::new(),
             banner: None,
             turn_started: None,
             turn_tokens: None,
@@ -1793,7 +1826,18 @@ impl App {
 
     /// Sidebar rows for the current filter, with the reader's grouping applied.
     pub fn sidebar_rows(&self) -> Vec<vibex_desktop_model::AgentSidebarRow> {
-        let mut rows = match self.projection.sidebar_organization.as_ref() {
+        self.sidebar_view().rows
+    }
+
+    /// The session list as the page draws it: the rows, the size of each
+    /// heading's subtree, and the state tally the header's chips read.
+    ///
+    /// The three are computed together because they are three readings of one
+    /// projection: a chip counted from a different session set than the rows
+    /// were built from is how a header ends up describing a list nobody is
+    /// looking at.
+    pub fn sidebar_view(&self) -> crate::sessions::SessionListRows {
+        let mut list = match self.projection.sidebar_organization.as_ref() {
             Some(view) => {
                 let sessions = self
                     .agent
@@ -1814,22 +1858,39 @@ impl App {
             // sessions themselves, which is all a client without a desktop
             // can honestly say about the order.
             None => {
-                self.agent
+                let sessions = self
+                    .agent
                     .state
                     .view(&self.projection.sidebar, &self.filter, self.shell)
+                    .sessions;
+                let loaded = self
+                    .agent
+                    .state
                     .sessions
+                    .value
+                    .as_deref()
+                    .unwrap_or_default();
+                let states = crate::sessions::session_state_tally(loaded, &self.filter);
+                let counts = crate::sessions::heading_counts(&sessions, loaded, &self.filter);
+                crate::sessions::SessionListRows {
+                    counts,
+                    rows: sessions,
+                    states,
+                }
             }
         };
         if !self.sidebar_grouped {
             // Flat mode keeps the order the tree computed -- pinned first, then
             // the arrangement's positions -- and drops the headings: nothing
             // nests, so nothing is indented under a row that is not there.
-            rows.retain(|row| row.kind == vibex_desktop_model::AgentSidebarRowKind::Session);
-            for row in &mut rows {
+            list.rows
+                .retain(|row| row.kind == vibex_desktop_model::AgentSidebarRowKind::Session);
+            list.counts = vec![0; list.rows.len()];
+            for row in &mut list.rows {
                 row.depth = 0;
             }
         }
-        rows
+        list
     }
 
     /// The row the session cursor is on.
@@ -3923,6 +3984,48 @@ impl App {
             && self
                 .unread_sessions
                 .insert(event.session_id.as_str().to_string())
+    }
+
+    /// Note what a session last did, for the list's second line.
+    ///
+    /// Every event the client already receives passes through here, so the
+    /// list can say what a session was doing without asking the runtime a
+    /// second question about it. An item with nothing to say — a message still
+    /// arriving, the reader's own words, the Agent's private reasoning — leaves
+    /// the previous line standing rather than blanking it.
+    pub fn note_session_echo(&mut self, item: &vibex_core::TimelineItem) {
+        let Some(echo) = crate::sessions::session_echo(item) else {
+            return;
+        };
+        self.session_echoes
+            .insert(item.session_id.as_str().to_string(), echo);
+    }
+
+    /// What a session last did, when this client saw it.
+    pub fn session_echo(&self, session_id: &VibexSessionId) -> Option<&str> {
+        self.session_echoes
+            .get(session_id.as_str())
+            .map(String::as_str)
+    }
+
+    /// Drop the echoes of sessions the list no longer holds.
+    ///
+    /// The map is fed by every event and would otherwise keep a line for every
+    /// session this process has ever seen, including the ones that were
+    /// deleted while it was running.
+    pub fn retain_session_echoes(&mut self) {
+        let live = self
+            .agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|session| session.id.as_str().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.session_echoes
+            .retain(|session_id, _| live.contains(session_id));
     }
 
     /// The Agent a session runs on, named for the session list.

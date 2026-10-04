@@ -350,30 +350,58 @@ current keymap, and clicking a hint runs the same action as its key.
 
 ### Sessions
 
-Each row carries what the desktop's sidebar row carries, in terminal terms: the
-Agent's mark, an unread dot, the title, the state as a single mark, whether the
-session continues itself, and how long ago it last said anything. The marks and
-the time are aligned on their right edge in columns measured in terminal cells,
-so neither a double-width title nor a longer value pushes a column out of line.
+The list is a page of sections. Its first two lines are the page's own: where the
+reader is — the workspace path and the chord that moves it — with one chip per
+state the list holds on the right (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`), and,
+below it, the one action a session list needs: `+ New session` on the left, and
+the mode the list is in with the key that changes it (`Grouped by workspace  g`)
+on the right. The chips are counted through the filter and through folded
+headings, so a collapsed group still says how much work it holds; neither hint is
+truncated, because half a key is a key the reader cannot use.
 
-- **The Agent's mark** is its label's first letter, coloured from the label, so
-  the same Agent keeps its colour across sessions and machines without a table
-  to maintain. It leads the row because "who is answering" is the first thing a
-  reader scanning several sessions wants.
+Under them come the sections the reader arranged — the desktop's folders,
+projects and order — each with a heading: `▾ vibex 3 ────`. The heading carries
+the disclosure, the name, the count of sessions beneath it and a rule to the edge
+of the list, so a stack of rows reads as groups rather than as one run. `g` folds
+the headings away for one flat run, `/` filters (a search opens closed folders
+rather than hiding what it matched), and `Enter` on a heading folds it.
+
+Each session is two lines. The first carries the mark, the title, the Agent
+answering it after a middot, the marks it has earned and a coarse right-aligned
+age:
+
+```
+▶ fix the flaky test · Claude Code                                          3m
+  Ran cargo test --workspace and it passed
+```
+
+The second line says what the session last did, in the dim step; a session
+blocked on the reader puts `Pending:` in front of it in the attention colour,
+because that is the one thing on the row to act on. The line is the client's own
+reading of the events it already receives — the Agent's messages, tool calls,
+commands, file operations and errors, never a message still arriving and never
+the reader's own words, which are usually the title anyway — and it falls back to
+the session's workspace root when this client has not seen the session do
+anything. Rows are not all one line tall, so the frame publishes how many lines
+each drawn row takes and the mouse maps a click through that rather than through
+the line number.
+
+- **The Agent's name** follows the title: "who is answering" is the first thing a
+  reader scanning several sessions wants, and a name is one word where a coloured
+  initial was a guess.
 - **The unread dot** (`●`) appears on a session whose answer finished while the
-  reader was looking elsewhere — the client's own notion, cleared by opening
-  it. The dot and the pin are different shapes, not only different colours:
-  they share the leading column, and a monochrome terminal has to tell them
-  apart.
+  reader was looking elsewhere — the client's own notion, cleared by opening it.
+  The dot and the pin are different shapes, not only different colours: a
+  monochrome terminal has to tell them apart.
 - **The pin** (`★`, or `*` on a terminal without box drawing) marks a session
-  the authority has hoisted above the rest. It leads the row because a pinned
-  session is the one the reader asked to keep in view.
-- **State** is one mark, not a word: `▶` running, `✗` failed, `·` idle, `◆`
+  the authority has hoisted above the rest. It sits beside the age rather than
+  leading the row: the leading columns belong to the state and the title.
+- **State** is one mark, not a word: `▶` running, `✗` failed, `◇` idle, `◆`
   waiting on the reader, `▤` archived. The shapes are a small vocabulary the
   reader learns once, and spelling them out cost the title a third of the row
   for information the mark already carried. The shape carries the meaning on
-  its own; the colour says it a second time.
-- **Auto-continue** is a mark of its own before the state: `↻` when the session
+  its own; the colour says it a second time, and the header's chips count them.
+- **Auto-continue** is a mark of its own beside the age: `↻` when the session
   will continue itself, `↻3` while it counts down. `t` works it: it stops a
   countdown, resumes a suspended session, or switches auto-continue on or off —
   each of those is a control the desktop has.
@@ -384,10 +412,7 @@ so neither a double-width title nor a longer value pushes a column out of line.
 Order and folders are the desktop's, because they are the desktop's to own: the
 list draws the arrangement the authority publishes — its folders (nested, with
 whatever is folded), the order of projects and sessions, the pinned band, and
-the unread marks the desktop has already cleared. A session inside a folder is
-indented under it; the folder itself is drawn as a heading, brighter than the
-body. `g` folds the headings away for one flat run. `/` filters — a search opens
-closed folders rather than hiding what it matched. `Enter` opens, `n` starts a
+the unread marks the desktop has already cleared. `Enter` opens, `n` starts a
 new one, `r` renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A`
 includes archived sessions.
 

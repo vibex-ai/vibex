@@ -130,6 +130,13 @@ strings! {
     session_new => { "New session", "新建会话", "新增工作階段" },
     session_runtime_label => { "Runtime", "运行时", "執行環境" },
     session_workspace_label => { "Workspace", "工作区", "工作區" },
+    // The list's summary chips count sessions by state. Lower case because a
+    // chip is a count first and a word second: `◇ 5 idle` reads as a tally,
+    // while `◇ 5 Idle` reads as a sentence someone started.
+    session_chip_waiting => { "waiting", "待处理", "待處理" },
+    session_chip_running => { "running", "运行中", "執行中" },
+    session_chip_idle => { "idle", "空闲", "閒置" },
+    session_chip_failed => { "failed", "失败", "失敗" },
     queue_released => { "Held message sent", "排队消息已发出", "排隊訊息已發出" },
     time_just_now => { "now", "刚刚", "剛剛" },
     time_minutes => { "m", "分钟", "分鐘" },

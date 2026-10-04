@@ -1111,7 +1111,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 return true;
             }
             // A list row selects; a second click on the same row activates it.
-            if let Some(region) = app.regions.list
+            if let Some(region) = app.regions.list.clone()
                 && let Some(index) = crate::app::list_row_at(&region, mouse.column, mouse.row)
             {
                 let repeat = app.double_click_at(mouse.column, mouse.row);
@@ -1367,6 +1367,9 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             if let Err(error) = app.agent.apply_sessions(result) {
                 app.toast(Toast::danger(error.message));
             }
+            // A session the runtime no longer lists is a session the list can
+            // no longer draw, so its last words are not worth keeping.
+            app.retain_session_echoes();
             // Fold the loaded ids into the reader's arrangement: their pins and
             // manual order survive a refresh, and new sessions are appended
             // rather than dropped from the order.
@@ -1834,13 +1837,16 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             ) {
                 worker.dispatch(crate::app::Effect::LoadSidebarOrganization);
             }
-            // The unread mark is the client's own: the event says what arrived,
-            // and the list says where the reader was when it did.
-            if let vibex_backend::BackendEvent::Timeline(item) = &event
-                && app.note_activity(item)
-            {
-                // Deliberately not `dirty`: the frame is repainted when the
-                // event itself is applied below.
+            // The unread mark and the last thing a session did are both the
+            // client's own readings of the events it already receives: the
+            // event says what arrived, the list says where the reader was when
+            // it did, and what the session was last seen saying.
+            if let vibex_backend::BackendEvent::Timeline(item) = &event {
+                app.note_session_echo(&item.item);
+                if app.note_activity(item) {
+                    // Deliberately not `dirty`: the frame is repainted when the
+                    // event itself is applied below.
+                }
             }
             if let vibex_backend::BackendEvent::Timeline(event) = &event
                 && event.session_id == event.item.session_id

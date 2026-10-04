@@ -1352,11 +1352,21 @@ fn grouping_can_be_folded_away_without_losing_the_sessions() {
     app.agent.apply_sessions(Ok(session_pair())).expect("apply");
     app.perform(Intent::GotoSessions);
     let grouped = text(&render(&mut app, 120, 40));
-    assert!(grouped.contains("vibex-card-workspace"), "{grouped}");
+    assert!(
+        grouped.contains("vibex-card-workspace"),
+        "the heading is missing:\n{grouped}"
+    );
+    // A heading is the row that opens with a disclosure: the page frame is
+    // ruled too, so the rule alone cannot tell a heading from the border.
+    let is_heading = |line: &str| line.trim_start_matches(['│', ' ']).starts_with(['▾', '▸']);
+    assert!(
+        grouped.lines().any(is_heading),
+        "no heading was drawn:\n{grouped}"
+    );
     app.perform(Intent::ToggleSidebarGrouping);
     let flat = text(&render(&mut app, 120, 40));
     assert!(
-        !flat.contains("vibex-card-workspace"),
+        !flat.lines().any(is_heading),
         "the heading survived the toggle:\n{flat}"
     );
     assert!(flat.contains("alpha session"), "{flat}");
@@ -2065,7 +2075,7 @@ fn the_session_state_column_lines_up_on_every_row() {
                 .iter()
                 .any(|title| text.contains(title))
         })
-        .filter_map(|row| column_of(&buffer, row, "·"))
+        .filter_map(|row| column_of(&buffer, row, "◇"))
         .collect::<Vec<_>>();
     assert!(
         columns.len() >= 3,
@@ -2486,7 +2496,11 @@ fn the_frame_publishes_the_regions_the_mouse_needs() {
         .expect("sessions apply");
     app.perform(vibex_tui::action::Intent::GotoSessions);
     let _ = render(&mut app, 120, 40);
-    let list = app.regions.list.expect("the session list is clickable");
+    let list = app
+        .regions
+        .list
+        .clone()
+        .expect("the session list is clickable");
     assert_eq!(list.scope, Scope::Sessions);
     assert!(list.rows > 0 && list.rect.height > 0);
     // A click on the first row maps to row 0; one above the list maps to none.
@@ -5432,8 +5446,12 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     app.unread_sessions.insert(idle.id.as_str().to_string());
     let screen = text(&render(&mut app, 110, 24));
 
-    // The Agent's mark leads the row, and the time it last spoke trails it.
-    assert!(screen.contains("C fix the flaky test"), "{screen}");
+    // The Agent's name follows the title, and the time it last spoke trails
+    // the row.
+    assert!(
+        screen.contains("fix the flaky test · Claude Code"),
+        "the row does not name the Agent answering it:\n{screen}"
+    );
     assert!(screen.contains("3m"), "no relative time:\n{screen}");
     assert!(screen.contains("5h"), "{screen}");
     assert!(screen.contains("now"), "{screen}");
@@ -5454,8 +5472,9 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     );
     // States are told apart by shape as well as by colour — and by shape
     // *only*: the word is gone from the row, which is what gives the titles
-    // their width back.
-    for mark in ['▶', '✗', '·'] {
+    // their width back. An idle session is a hollow diamond: alive, and not
+    // working.
+    for mark in ['▶', '✗', '◇'] {
         assert!(
             screen.contains(mark),
             "missing the {mark:?} mark:\n{screen}"
@@ -5499,28 +5518,31 @@ fn the_session_list_columns_line_up() {
         line.find(needle)
             .map(|at| vibex_tui::text::display_width(&line[..at]))
     };
-    let mark_column = |needle: &str| {
+    let row_of = |needle: &str| {
         screen
             .lines()
             .find(|line| line.contains(needle))
-            .and_then(|line| column_of(line, needle))
+            .unwrap_or_else(|| panic!("no row for {needle:?}:\n{screen}"))
     };
-    let running_at = mark_column("▶").expect("the running row");
-    let failed_at = mark_column("✗").expect("the failed row");
+    // The mark, the title and the age are columns: two rows of different title
+    // lengths put each of them at the same place.
     assert_eq!(
-        running_at, failed_at,
+        column_of(row_of("short"), "▶"),
+        column_of(row_of("a much longer title"), "✗"),
         "the state column drifts with the length of a title:\n{screen}"
     );
-    let time_edge = |needle: &str| {
-        screen
-            .lines()
-            .find(|line| line.contains(needle))
-            .and_then(|line| column_of(line, needle).map(|at| at + needle.chars().count()))
+    assert_eq!(
+        column_of(row_of("short"), "short"),
+        column_of(row_of("a much longer title"), "a much longer"),
+        "the title column follows the group depth:\n{screen}"
+    );
+    let time_edge = |line: &str, needle: &str| {
+        column_of(line, needle).map(|at| at + vibex_tui::text::display_width(needle))
     };
     assert_eq!(
-        time_edge("3m"),
-        time_edge("5h"),
-        "the time column drifts:\n{screen}"
+        time_edge(row_of("short"), "3m"),
+        time_edge(row_of("a much longer title"), "5h"),
+        "the age is not right-aligned:\n{screen}"
     );
 }
 
@@ -5799,6 +5821,221 @@ fn the_session_list_marks_state_and_auto_continue_without_words() {
     assert!(
         !row.contains('↻'),
         "a session without it was marked: {row:?}"
+    );
+}
+
+/// The page says what the sessions are doing before the reader reads a single
+/// row, and keeps the one action a session list needs on the line below it.
+#[test]
+fn the_session_list_summarises_itself_and_offers_a_new_session() {
+    let mut waiting = seeded_session("session_head0001", "blocked on you");
+    waiting.state = vibex_core::AgentSessionState::NeedsInput;
+    let mut working = seeded_session("session_head0002", "still working");
+    working.state = vibex_core::AgentSessionState::Running;
+    let mut failed = seeded_session("session_head0003", "the one that failed");
+    failed.state = vibex_core::AgentSessionState::Error;
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![waiting, working, failed]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    let header = screen
+        .lines()
+        .find(|line| line.contains("waiting"))
+        .unwrap_or_else(|| panic!("no summary line:\n{screen}"));
+    // One chip per state the list holds, counted, and none for a state it does
+    // not: the chips are the list's tally, not a legend.
+    for chip in ["◆ 1 waiting", "▶ 1 running", "✗ 1 failed"] {
+        assert!(header.contains(chip), "missing {chip:?}: {header:?}");
+    }
+    assert!(
+        !header.contains("idle"),
+        "a state nothing is in was counted: {header:?}"
+    );
+    // The workspace is where the reader is, and the key that moves it sits
+    // beside it.
+    assert!(
+        header.contains("vibex-tui"),
+        "the header does not say where the reader is: {header:?}"
+    );
+    assert!(
+        header.contains("[Workspace"),
+        "the header does not name the key that moves the workspace: {header:?}"
+    );
+    let actions = screen
+        .lines()
+        .find(|line| line.contains("+ New session"))
+        .unwrap_or_else(|| panic!("no actions line:\n{screen}"));
+    assert!(
+        actions.contains("Grouped by workspace"),
+        "the actions line does not say how the list is grouped: {actions:?}"
+    );
+    // The button is a button: it publishes the rect a click would land on.
+    let button = app
+        .regions
+        .hints
+        .iter()
+        .find(|(_, intent)| *intent == vibex_tui::action::Intent::NewSession)
+        .map(|(rect, _)| *rect)
+        .expect("the new-session button is not clickable");
+    assert!(button.width > 0 && button.y == app.regions.list.unwrap().rect.y - 1);
+}
+
+/// A heading says what it holds and rules off the section, so a stack of rows
+/// reads as groups rather than as one long list.
+#[test]
+fn a_group_heading_counts_its_sessions_and_rules_the_section() {
+    let mut first = seeded_session("session_group0001", "first");
+    first.last_message_at_ms = vibex_core::unix_timestamp_ms();
+    let mut second = seeded_session("session_group0002", "second");
+    second.project_id = first.project_id.clone();
+    second.workspace_id = first.workspace_id.clone();
+    second.workspace_root = first.workspace_root.clone();
+    second.last_message_at_ms = first.last_message_at_ms;
+
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![first, second]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    let heading = screen
+        .lines()
+        .find(|line| line.trim_start_matches(['│', ' ']).starts_with('▾'))
+        .unwrap_or_else(|| panic!("no heading:\n{screen}"));
+    assert!(
+        heading.contains("vibex-card-workspace 2"),
+        "the heading does not say how much it holds: {heading:?}"
+    );
+    assert!(
+        heading.contains('─'),
+        "the heading does not rule off its section: {heading:?}"
+    );
+    // A session row is not a heading: it carries the mark and the age instead.
+    let row = screen
+        .lines()
+        .find(|line| line.contains("first"))
+        .unwrap_or_else(|| panic!("no session row:\n{screen}"));
+    assert!(
+        !row.contains('─'),
+        "a session row was drawn as a heading: {row:?}"
+    );
+}
+
+/// Under its title, a row says what the session last did. A session waiting on
+/// the reader says that first: it is the one thing on the row to act on.
+#[test]
+fn a_session_row_carries_what_it_last_did_under_its_title() {
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    let mut session = seeded_session("session_echo0001", "fix the flaky test");
+    session.last_message_at_ms = vibex_core::unix_timestamp_ms();
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.note_session_echo(&vibex_core::TimelineItem {
+        id: vibex_core::TimelineItemId::new(),
+        session_id: session.id.clone(),
+        sequence: 4,
+        timestamp_ms: vibex_core::unix_timestamp_ms(),
+        source: vibex_core::TimelineSource::Agent,
+        kind: vibex_core::TimelineItemKind::AgentMessage,
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: vibex_core::TimelineRedactionState::None,
+        execution_attribution: None,
+        payload: vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+            text: "Ran cargo test and it passed".to_string(),
+            is_final: true,
+        }),
+    });
+    let screen = text(&render(&mut app, 110, 24));
+    let lines = screen.lines().collect::<Vec<_>>();
+    let title_at = lines
+        .iter()
+        .position(|line| line.contains("fix the flaky test"))
+        .unwrap_or_else(|| panic!("no title row:\n{screen}"));
+    let secondary = lines
+        .get(title_at + 1)
+        .copied()
+        .unwrap_or_else(|| panic!("the row has no second line:\n{screen}"));
+    assert!(
+        secondary.contains("Ran cargo test and it passed"),
+        "the second line does not say what the session did: {secondary:?}"
+    );
+    // It starts under the title, not under the mark. `.find` counts bytes and
+    // the row's chrome is not ASCII, so the offsets are measured in cells.
+    let column_of = |line: &str, needle: &str| {
+        line.find(needle)
+            .map(|at| vibex_tui::text::display_width(&line[..at]))
+    };
+    assert_eq!(
+        column_of(lines[title_at], "fix the flaky test"),
+        column_of(secondary, "Ran cargo test"),
+        "the second line does not line up under the title:\n{screen}"
+    );
+
+    // A session blocked on the reader says so on the same line.
+    let mut blocked = seeded_session("session_echo0002", "waiting on you");
+    blocked.state = vibex_core::AgentSessionState::NeedsInput;
+    app.agent
+        .apply_sessions(Ok(vec![blocked]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    let line = screen
+        .lines()
+        .find(|line| line.contains("Pending:"))
+        .unwrap_or_else(|| panic!("a waiting session does not say so:\n{screen}"));
+    assert!(line.contains("waiting on you") || screen.contains("waiting on you"));
+    assert!(
+        !screen.contains("Running") && !screen.contains("Idle"),
+        "the state words are back on the rows:\n{screen}"
+    );
+}
+
+/// Rows are one line or two, so a click has to be measured against the row it
+/// landed in rather than against the line number it landed on.
+#[test]
+fn a_click_on_a_session_rows_second_line_selects_that_row() {
+    let mut first = seeded_session("session_click0001", "first row");
+    first.last_message_at_ms = vibex_core::unix_timestamp_ms();
+    let mut second = seeded_session("session_click0002", "second row");
+    second.project_id = first.project_id.clone();
+    second.workspace_id = first.workspace_id.clone();
+    second.workspace_root = first.workspace_root.clone();
+    second.last_message_at_ms = first.last_message_at_ms;
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![first, second]))
+        .expect("sessions apply");
+    let _ = render(&mut app, 110, 24);
+    let region = app
+        .regions
+        .list
+        .clone()
+        .expect("the list is a clickable region");
+    // Row 0 is the heading, row 1 the first session, row 2 the second: a click
+    // on the second line of row 1 has to answer row 1.
+    let line_of_row = |row: usize| {
+        region
+            .heights
+            .iter()
+            .take(row)
+            .map(|height| usize::from(*height))
+            .sum::<usize>()
+    };
+    let second_line = region.rect.y + (line_of_row(1) + 1) as u16;
+    assert_eq!(
+        vibex_tui::app::list_row_at(&region, region.rect.x + 1, second_line),
+        Some(1),
+        "a click on a row's second line landed on another row"
+    );
+    let third_line = region.rect.y + (line_of_row(2)) as u16;
+    assert_eq!(
+        vibex_tui::app::list_row_at(&region, region.rect.x + 1, third_line),
+        Some(2),
     );
 }
 

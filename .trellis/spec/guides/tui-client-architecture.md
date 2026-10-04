@@ -533,20 +533,43 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
+* **The session list is a page of sections, and it says what it holds before
+  the reader reads a row.** The view gets the whole screen, and spends its first
+  two lines on the page: the location with the chord that moves it, one chip per
+  state family the list holds (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`) right
+  aligned, then `+ New session` as a click target with the grouping mode and its
+  key on the right. Chips are counted through the filter *and* through folded
+  headings — a heading that hides its sessions still holds them — and a family
+  with nothing in it is not drawn as a zero. Neither hint row is truncated: the
+  location gives way to the chips, and a right-hand hint that does not fit whole
+  is dropped, because half a key is a key the reader cannot use.
 * **A list row carries the same facts as the desktop's.** The session list
-  renders the shared projection's rows (order, pins, folders) and adds what the
-  desktop's sidebar row has: the Agent's mark (its label's initial, coloured
-  from the label so no table is needed), an unread dot, a state mark *and* word,
-  and a coarse relative time. Unread is the client's own notion — a final
-  `AgentMessage` for a session the reader was not looking at (`note_activity`),
-  cleared by `open_session` — because the runtime does not track "read"; the
-  authority's own unread set is folded in beside it. Marks are one column at
-  every glyph tier and their shape carries the meaning, or a reader who cannot
-  tell the colours apart loses the state: `★` pinned (ASCII `*`), `●` unread,
-  the state's own `▶`/`✗`/`·`/`◆`/`▤`, and `↻`/`↻N` for auto-continue. The
-  state is *only* a mark: the words were removed once the shapes were learned,
-  because they cost the title a third of the row and said nothing the mark did
-  not.
+  renders the shared projection's rows (order, pins, folders) under a heading
+  per group — disclosure, name, the count of sessions in its subtree, and a rule
+  to the edge — and adds what the desktop's sidebar row has. A session row is
+  two lines: the state mark, the title, the Agent's name after a middot, the
+  unread dot, pin and auto-continue marks, and a coarse right-aligned age on the
+  first; what the session last did on the second, in the dim step, with
+  `Pending:` in the attention colour for a session waiting on the reader. The
+  echo is the client's own reading of events it already receives
+  (`note_session_echo`: the Agent's messages, tool calls, commands, file
+  operations and errors — never a delta, never the reader's own message),
+  pruned to the sessions the runtime still lists, falling back to the workspace
+  root. Unread is likewise the client's own notion — a final `AgentMessage` for
+  a session the reader was not looking at (`note_activity`), cleared by
+  `open_session` — because the runtime does not track "read"; the authority's
+  own unread set is folded in beside it. Marks are one column at every glyph
+  tier and their shape carries the meaning, or a reader who cannot tell the
+  colours apart loses the state: `★` pinned (ASCII `*`), `●` unread, the state's
+  own `▶`/`✗`/`◇`/`◆`/`▤`, and `↻`/`↻N` for auto-continue. The state is *only* a
+  mark: the words were removed once the shapes were learned, because they cost
+  the title a third of the row and said nothing the mark did not.
+* **Rows are not all one line tall, so a click is measured against the row it
+  landed in.** The frame publishes each drawn row's height and the index of the
+  row at the top of the list in its `ListRegion`, and `list_row_at` walks those
+  heights; a click on a session's second line selects that session rather than
+  the one below it. The list still scrolls by row (ratatui's `ListState`), so
+  the two never disagree about which row is where.
 * **Auto-continue is the desktop's rule, not a second one.** A session the
   reader switched on continues itself when a turn stops without an answer, and
   "without an answer" is read the way the desktop reads it: the shared

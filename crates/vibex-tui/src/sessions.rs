@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use vibex_core::AgentSession;
+use vibex_core::{AgentSession, AgentSessionState, TimelineItem, TimelinePayload};
 use vibex_desktop_model::{
     AgentSidebarRow, AgentSidebarRowKind, SidebarOrganizationItem, SidebarOrganizationView,
     sidebar_project_items_for_workspace, sidebar_root_items, sort_sidebar_sessions,
@@ -45,8 +45,86 @@ pub struct SessionListInput<'a> {
     pub query: &'a str,
 }
 
+/// The list as the page draws it.
+///
+/// The rows are the tree; the counts beside them are what a heading needs to
+/// say *how much* it holds, which the drawn rows cannot answer once a group is
+/// folded shut. The tally is what the page's header summarises: the reader
+/// scanning for work wants to know how much of it there is before reading a
+/// single row.
+pub struct SessionListRows {
+    pub rows: Vec<AgentSidebarRow>,
+    /// Sessions under each row's heading, parallel to `rows`. A session row is
+    /// nobody's heading, so it carries zero; a folded heading still carries the
+    /// size of what it hides.
+    pub counts: Vec<usize>,
+    /// Sessions the list holds, by the state family the header counts. Only
+    /// families with something in them are worth a chip, so zero-count
+    /// families are left out.
+    pub states: Vec<(AgentSessionState, usize)>,
+}
+
+/// The state families the header counts, in the order its chips read them.
+///
+/// The order is by what the reader has to act on: a session waiting on them,
+/// then one still working, then the ones that stopped badly, then the quiet
+/// rest. `Initializing` counts as running — the Agent has been asked and has
+/// not answered — and a closed or archived session is not news.
+pub const SESSION_STATE_CHIPS: [AgentSessionState; 4] = [
+    AgentSessionState::NeedsInput,
+    AgentSessionState::Running,
+    AgentSessionState::Error,
+    AgentSessionState::Idle,
+];
+
+/// Which chip family a session belongs to, when it belongs to one.
+pub fn session_state_chip(state: AgentSessionState) -> Option<AgentSessionState> {
+    match state {
+        AgentSessionState::NeedsInput => Some(AgentSessionState::NeedsInput),
+        AgentSessionState::Running | AgentSessionState::Initializing => {
+            Some(AgentSessionState::Running)
+        }
+        AgentSessionState::Error => Some(AgentSessionState::Error),
+        AgentSessionState::Idle => Some(AgentSessionState::Idle),
+        AgentSessionState::Closed | AgentSessionState::Archived => None,
+    }
+}
+
+/// How many sessions the header counts in each state family.
+///
+/// Counted from the sessions the list is *about* rather than from the rows it
+/// drew: a folded heading still holds its sessions, and a header that forgot
+/// them would say the reader has less waiting than they do. A filter narrows
+/// the count the same way it narrows the list.
+pub fn session_state_tally(
+    sessions: &[AgentSession],
+    query: &str,
+) -> Vec<(AgentSessionState, usize)> {
+    let mut states = SESSION_STATE_CHIPS
+        .iter()
+        .map(|state| (*state, 0usize))
+        .collect::<Vec<_>>();
+    for session in sessions
+        .iter()
+        .filter(|session| session.deleted_at_ms.is_none() && session_matches(session, query))
+    {
+        let Some(chip) = session_state_chip(session.state) else {
+            continue;
+        };
+        if let Some(count) = states
+            .iter_mut()
+            .find(|(state, _)| *state == chip)
+            .map(|(_, count)| count)
+        {
+            *count += 1;
+        }
+    }
+    states.retain(|(_, count)| *count > 0);
+    states
+}
+
 /// The tree the reader arranged, flattened into rows.
-pub fn session_list_rows(input: &SessionListInput<'_>) -> Vec<AgentSidebarRow> {
+pub fn session_list_rows(input: &SessionListInput<'_>) -> SessionListRows {
     let query = input.query.trim().to_lowercase();
     let searching = !query.is_empty();
 
@@ -61,6 +139,8 @@ pub fn session_list_rows(input: &SessionListInput<'_>) -> Vec<AgentSidebarRow> {
             .or_default()
             .push(session.clone());
     }
+
+    let states = session_state_tally(input.sessions, &query);
 
     let mut projects = input.projects.to_vec();
     // A session can outlive the workspace listing this client last fetched.
@@ -93,8 +173,10 @@ pub fn session_list_rows(input: &SessionListInput<'_>) -> Vec<AgentSidebarRow> {
     let project_ids = ordered_project_ids(&projects, &input.view.project_order);
 
     let mut rows = Vec::new();
+    let mut counts = Vec::new();
     push_root_children(
         &mut rows,
+        &mut counts,
         input,
         &sessions_by_project,
         &entries,
@@ -104,7 +186,11 @@ pub fn session_list_rows(input: &SessionListInput<'_>) -> Vec<AgentSidebarRow> {
         None,
         0,
     );
-    rows
+    SessionListRows {
+        rows,
+        counts,
+        states,
+    }
 }
 
 /// Projects in the order the sidebar shows them: the reader's arrangement
@@ -138,6 +224,7 @@ fn ordered_project_ids(projects: &[ProjectEntry], project_order: &[String]) -> V
 #[allow(clippy::too_many_arguments)]
 fn push_root_children(
     rows: &mut Vec<AgentSidebarRow>,
+    counts: &mut Vec<usize>,
     input: &SessionListInput<'_>,
     sessions_by_project: &BTreeMap<String, Vec<AgentSession>>,
     entries: &BTreeMap<String, ProjectEntry>,
@@ -153,6 +240,7 @@ fn push_root_children(
             SidebarOrganizationItem::Project(project_id) => {
                 push_project(
                     rows,
+                    counts,
                     input,
                     sessions_by_project,
                     entries,
@@ -170,19 +258,22 @@ fn push_root_children(
                 let matches_name = folder.name.to_lowercase().contains(query);
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
                 let mut children = Vec::new();
-                if !collapsed || searching {
-                    push_root_children(
-                        &mut children,
-                        input,
-                        sessions_by_project,
-                        entries,
-                        project_ids,
-                        query,
-                        searching,
-                        Some(&folder_id),
-                        depth + 1,
-                    );
-                }
+                let mut child_counts = Vec::new();
+                // The folder's children are built even while it is folded shut:
+                // the heading says how much it holds either way, and a folded
+                // heading that could not count would be a heading that lies.
+                push_root_children(
+                    &mut children,
+                    &mut child_counts,
+                    input,
+                    sessions_by_project,
+                    entries,
+                    project_ids,
+                    query,
+                    searching,
+                    Some(&folder_id),
+                    depth + 1,
+                );
                 if searching && !matches_name && children.is_empty() {
                     continue;
                 }
@@ -200,7 +291,11 @@ fn push_root_children(
                     state: None,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
-                rows.extend(children);
+                counts.push(subtree_sessions(&children, &child_counts));
+                if !collapsed || searching {
+                    rows.extend(children);
+                    counts.extend(child_counts);
+                }
             }
             SidebarOrganizationItem::Session(_) | SidebarOrganizationItem::Group(_) => {}
         }
@@ -211,6 +306,7 @@ fn push_root_children(
 #[allow(clippy::too_many_arguments)]
 fn push_project(
     rows: &mut Vec<AgentSidebarRow>,
+    counts: &mut Vec<usize>,
     input: &SessionListInput<'_>,
     sessions_by_project: &BTreeMap<String, Vec<AgentSession>>,
     entries: &BTreeMap<String, ProjectEntry>,
@@ -240,8 +336,10 @@ fn push_project(
         .map(|session| session.id.as_str().to_string())
         .collect::<Vec<_>>();
     let mut children = Vec::new();
+    let mut child_counts = Vec::new();
     push_project_children(
         &mut children,
+        &mut child_counts,
         input,
         project_id,
         &project_sessions,
@@ -275,8 +373,10 @@ fn push_project(
         state: None,
         parent_id: parent_folder_id.map(ToString::to_string),
     });
+    counts.push(subtree_sessions(&children, &child_counts));
     if !collapsed || searching {
         rows.extend(children);
+        counts.extend(child_counts);
     }
 }
 
@@ -284,6 +384,7 @@ fn push_project(
 #[allow(clippy::too_many_arguments)]
 fn push_project_children(
     rows: &mut Vec<AgentSidebarRow>,
+    counts: &mut Vec<usize>,
     input: &SessionListInput<'_>,
     project_id: &str,
     project_sessions: &[AgentSession],
@@ -328,6 +429,7 @@ fn push_project_children(
                     state: Some(session.state),
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
+                counts.push(0);
             }
             SidebarOrganizationItem::Folder(folder_id) => {
                 let Some(folder) = organization.folder(&folder_id) else {
@@ -336,19 +438,21 @@ fn push_project_children(
                 let matches_name = folder.name.to_lowercase().contains(query);
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
                 let mut children = Vec::new();
-                if !collapsed || searching {
-                    push_project_children(
-                        &mut children,
-                        input,
-                        project_id,
-                        project_sessions,
-                        session_ids,
-                        query,
-                        searching,
-                        Some(&folder_id),
-                        depth + 1,
-                    );
-                }
+                let mut child_counts = Vec::new();
+                // Built whether or not the folder is open, for the same reason
+                // the root-level folder is: the count on the heading.
+                push_project_children(
+                    &mut children,
+                    &mut child_counts,
+                    input,
+                    project_id,
+                    project_sessions,
+                    session_ids,
+                    query,
+                    searching,
+                    Some(&folder_id),
+                    depth + 1,
+                );
                 if searching && !matches_name && children.is_empty() {
                     continue;
                 }
@@ -366,7 +470,11 @@ fn push_project_children(
                     state: None,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
-                rows.extend(children);
+                counts.push(subtree_sessions(&children, &child_counts));
+                if !collapsed || searching {
+                    rows.extend(children);
+                    counts.extend(child_counts);
+                }
             }
             // A group row is a leaf this client does not draw yet; its members
             // are listed as ordinary sessions by the caller passing no groups,
@@ -376,10 +484,121 @@ fn push_project_children(
     }
 }
 
-fn session_matches(session: &AgentSession, query: &str) -> bool {
+/// How many sessions a heading holds: every session in its subtree, folded or
+/// not.
+///
+/// Counted through the children's own counts rather than by looking at the
+/// drawn rows, because a folded heading keeps its sessions out of the row list
+/// while still holding them.
+fn subtree_sessions(children: &[AgentSidebarRow], counts: &[usize]) -> usize {
+    children
+        .iter()
+        .zip(counts)
+        .map(|(row, count)| {
+            if row.kind == AgentSidebarRowKind::Session {
+                1
+            } else {
+                *count
+            }
+        })
+        .sum()
+}
+
+/// How many characters of a session's last words the list keeps.
+///
+/// The renderer truncates to the column it has; this is the bound that keeps a
+/// pasted document from living in memory for the rest of the process.
+const ECHO_CHARACTERS: usize = 200;
+
+/// What a session last did, one line, for the list's second line.
+///
+/// Only what the Agent said or did. A *delta* is a message still arriving and
+/// would rewrite the line on every chunk, and the reader's own message is
+/// already the title of half these rows. The text comes from the Agent, so it
+/// is flattened onto one line and stripped of control characters before any
+/// surface draws it.
+pub fn session_echo(item: &TimelineItem) -> Option<String> {
+    let text = match &item.payload {
+        TimelinePayload::AgentMessage(message) => message.text.as_str(),
+        TimelinePayload::ToolCall(call) => {
+            if call.summary.trim().is_empty() {
+                call.tool_name.as_str()
+            } else {
+                call.summary.as_str()
+            }
+        }
+        TimelinePayload::Command(command) => command.command.as_str(),
+        TimelinePayload::FileOperation(operation) => {
+            if operation.summary.trim().is_empty() {
+                operation.path.as_str()
+            } else {
+                operation.summary.as_str()
+            }
+        }
+        TimelinePayload::Error(error) => error.message.as_str(),
+        _ => return None,
+    };
+    one_line(text)
+}
+
+/// One line of a session's own words, or nothing when there is nothing to say.
+fn one_line(text: &str) -> Option<String> {
+    // A control character is not a line break: it is a cursor move, a bell or
+    // the start of an escape sequence, and drawing it would let the Agent
+    // rewrite the list around itself. Whitespace keeps its meaning as a
+    // separator, so it becomes a space like the rest.
+    let flattened = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let flattened = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.is_empty() {
+        return None;
+    }
+    Some(flattened.chars().take(ECHO_CHARACTERS).collect())
+}
+
+/// Whether a session is one the list is about, for a given filter.
+pub(crate) fn session_matches(session: &AgentSession, query: &str) -> bool {
     query.is_empty()
         || session.title.to_lowercase().contains(query)
         || session.workspace_root.to_lowercase().contains(query)
+}
+
+/// Heading counts for a projection that draws its own rows.
+///
+/// The arranged tree counts a heading while it builds it, because only it knows
+/// which sessions it decided to keep. A projection built elsewhere does not, so
+/// the headings are counted here from the sessions the rows name: the same
+/// question, asked of the rows rather than of the tree.
+pub fn heading_counts(
+    rows: &[AgentSidebarRow],
+    sessions: &[AgentSession],
+    query: &str,
+) -> Vec<usize> {
+    rows.iter()
+        .map(|row| {
+            if row.kind == AgentSidebarRowKind::Session {
+                return 0;
+            }
+            sessions
+                .iter()
+                .filter(|session| {
+                    session.deleted_at_ms.is_none()
+                        && session_matches(session, query)
+                        && session.project_id.as_str() == row.project_id
+                        && (row.workspace_id.is_empty()
+                            || session.workspace_id.as_str() == row.workspace_id)
+                })
+                .count()
+        })
+        .collect()
 }
 
 /// The last path segment of a workspace root, which is the name a project row
@@ -530,7 +749,7 @@ mod tests {
         }
     }
 
-    fn rows_for(view: &SidebarOrganizationView, query: &str) -> Vec<AgentSidebarRow> {
+    fn list_for(view: &SidebarOrganizationView, query: &str) -> SessionListRows {
         let sessions = vec![
             session("session_older001", "vibex", "older", 3),
             session("session_recent01", "vibex", "recent", 2),
@@ -561,8 +780,181 @@ mod tests {
         })
     }
 
+    fn rows_for(view: &SidebarOrganizationView, query: &str) -> Vec<AgentSidebarRow> {
+        list_for(view, query).rows
+    }
+
     fn labels(rows: &[AgentSidebarRow]) -> Vec<String> {
         rows.iter().map(|row| row.label.clone()).collect()
+    }
+
+    #[test]
+    fn a_heading_counts_what_it_holds_even_when_it_is_folded_shut() {
+        let view = arranged_view();
+        let list = list_for(&view, "");
+        let (index, _) = list
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.label == "archive")
+            .expect("the folded folder's heading");
+        // The folder hides its one session, and still says it holds one.
+        assert_eq!(
+            list.counts[index], 1,
+            "a folded heading stopped counting: {:#?}",
+            list.rows
+        );
+        assert!(!list.rows.iter().any(|row| row.label == "archived away"));
+        // A session row is nobody's heading.
+        let (session_index, _) = list
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.label == "kept")
+            .expect("a session row");
+        assert_eq!(list.counts[session_index], 0);
+        // The project heading counts its whole subtree, the folded folder's
+        // session included.
+        let (project_index, _) = list
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.label == "vibex")
+            .expect("the project heading");
+        assert_eq!(list.counts[project_index], 4);
+    }
+
+    #[test]
+    fn the_header_tally_counts_the_sessions_the_list_is_about() {
+        let view = arranged_view();
+        let mut sessions = vec![
+            session("session_older001", "vibex", "older", 3),
+            session("session_recent01", "vibex", "recent", 2),
+        ];
+        sessions[0].state = AgentSessionState::Running;
+        sessions[1].state = AgentSessionState::NeedsInput;
+        let mut quiet = session("session_quiet001", "vibex", "quiet", 1);
+        quiet.state = AgentSessionState::Idle;
+        // A session nobody can act on, and one that was deleted: neither is
+        // news the header should carry.
+        let mut closed = session("session_closed001", "vibex", "closed", 1);
+        closed.state = AgentSessionState::Closed;
+        let mut deleted = session("session_gone0001", "vibex", "gone", 1);
+        deleted.deleted_at_ms = Some(30);
+        sessions.extend([quiet, closed, deleted]);
+        let projects = vec![ProjectEntry {
+            id: "project_vibex".to_string(),
+            label: "vibex".to_string(),
+            created_at_ms: 6,
+            has_workspace: true,
+        }];
+        let list = session_list_rows(&SessionListInput {
+            view: &view,
+            sessions: &sessions,
+            projects: &projects,
+            unread_session_ids: &BTreeSet::new(),
+            query: "",
+        });
+        assert_eq!(
+            list.states,
+            vec![
+                (AgentSessionState::NeedsInput, 1),
+                (AgentSessionState::Running, 1),
+                (AgentSessionState::Idle, 1),
+            ],
+            "the tally is not what the list holds"
+        );
+
+        // A filter narrows the tally the same way it narrows the list.
+        let list = session_list_rows(&SessionListInput {
+            view: &view,
+            sessions: &sessions,
+            projects: &projects,
+            unread_session_ids: &BTreeSet::new(),
+            query: "quiet",
+        });
+        assert_eq!(
+            list.states,
+            vec![(AgentSessionState::Idle, 1)],
+            "a filter left the header counting hidden sessions"
+        );
+    }
+
+    fn echo_item(payload: TimelinePayload) -> TimelineItem {
+        let session_id = VibexSessionId::new();
+        TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence: 1,
+            timestamp_ms: 1,
+            source: vibex_core::TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_session_echo_is_one_clean_line_of_what_the_agent_did() {
+        assert_eq!(
+            session_echo(&echo_item(TimelinePayload::AgentMessage(
+                vibex_core::AgentMessagePayload {
+                    text: "done\x1b[2J\n\n  with it ".to_string(),
+                    is_final: true,
+                }
+            ))),
+            Some("done [2J with it".to_string()),
+            "a control character was allowed through, or the line was not flattened"
+        );
+        assert_eq!(
+            session_echo(&echo_item(TimelinePayload::ToolCall(
+                vibex_core::ToolCallPayload {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "read_file".to_string(),
+                    status: vibex_core::ToolCallStatus::Completed,
+                    summary: "Read src/main.rs".to_string(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }
+            ))),
+            Some("Read src/main.rs".to_string())
+        );
+        assert_eq!(
+            session_echo(&echo_item(TimelinePayload::AgentMessageDelta(
+                vibex_core::AgentMessageDeltaPayload {
+                    text_delta: "half a thought".to_string(),
+                    chunk_index: 0,
+                    phase: None,
+                }
+            ))),
+            None,
+            "a message still arriving is not what the session last said"
+        );
+        assert_eq!(
+            session_echo(&echo_item(TimelinePayload::UserMessage(
+                vibex_core::UserMessagePayload {
+                    text: "do the thing".to_string(),
+                    attachments: Vec::new(),
+                    delivery: Default::default(),
+                }
+            ))),
+            None,
+            "the reader's own message is the title of half these rows"
+        );
+        assert_eq!(
+            session_echo(&echo_item(TimelinePayload::Reasoning(
+                vibex_core::ReasoningPayload {
+                    text: "thinking about it".to_string(),
+                    is_final: true,
+                }
+            ))),
+            None,
+            "the Agent's private reasoning is not what it did"
+        );
     }
 
     #[test]
@@ -645,7 +1037,8 @@ mod tests {
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
             query: "",
-        });
+        })
+        .rows;
         assert!(
             !rows.iter().any(|row| row.label == "gone"),
             "an empty project kept a row: {rows:#?}"
@@ -665,7 +1058,8 @@ mod tests {
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
             query: "",
-        });
+        })
+        .rows;
         assert_eq!(labels(&rows), vec!["gone"], "{rows:#?}");
     }
 
@@ -679,7 +1073,8 @@ mod tests {
             projects: &[],
             unread_session_ids: &BTreeSet::new(),
             query: "",
-        });
+        })
+        .rows;
         // The project names the session's own root, so the session is not lost
         // behind a listing that has not caught up.
         assert_eq!(labels(&rows), vec!["project-gone", "orphan"], "{rows:#?}");
