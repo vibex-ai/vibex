@@ -1968,11 +1968,13 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Tu
 /// The location sits on the left and the status segments are right-aligned as a
 /// group, so the left column is stable while the group grows and shrinks. A
 /// left-aligned list of everything would push the state off the edge exactly
-/// when a narrow terminal makes it most worth reading.
+/// when a narrow terminal makes it most worth reading. The prompt's corner
+/// holds the band's one control: the way to the sessions that already exist,
+/// drawn last so it stays where the reader learned to find it.
 fn render_status_band(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
@@ -2065,6 +2067,63 @@ fn render_status_band(
             Style::default().fg(theme.roles.gray_dim),
         ),
     );
+
+    // ---- the corner: the way to the sessions that already exist ----------
+    // The page a session is written on is where the client starts, and the
+    // list is the other half of that home. It is drawn last so it holds the
+    // corner, and it is the only chrome here that is a control: the reader who
+    // wants to reopen something rather than write something should not have to
+    // know a key the draft has taken.
+    let mut entry: Option<(u16, u16)> = None;
+    if app.page == Page::NewSession {
+        let label = strings.nav_sessions();
+        // The chord that answers *here*: the composer owns the plain digits
+        // the global binding uses, so while it has the keyboard the page names
+        // its own chord rather than one that would type a digit.
+        let chord = match app.focus {
+            crate::app::Focus::Composer => app
+                .keymap
+                .chord_for_in(Scope::Composer, Intent::GotoSessions),
+            _ => None,
+        }
+        .or_else(|| app.keymap.chord_for(Intent::GotoSessions));
+        if !right.is_empty() {
+            right.push(sep.clone());
+        }
+        let offset = right.iter().map(Span::width).sum::<usize>() as u16;
+        right.push(Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let mut width = display_width(label) as u16;
+        if let Some(chord) = chord {
+            let chord = format!(" {}", chord.display());
+            width += display_width(&chord) as u16;
+            right.push(Span::styled(chord, theme.dimmed(theme.roles.gray_dim)));
+        }
+        entry = Some((offset, width));
+    }
+
+    // The entry is a button: a click runs the same intent the chord would.
+    // Its rect is the tail of the right-aligned group, so it is only published
+    // when the group was drawn at all — `render_zoned_line` drops the group
+    // rather than let it collide with the location on a narrow terminal.
+    let right_width = right.iter().map(Span::width).sum::<usize>() as u16;
+    if let Some((offset, width)) = entry
+        && right_width + 1 < area.width
+    {
+        app.regions.hints.push((
+            Rect {
+                x: area.x + area.width - right_width + offset,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            Intent::GotoSessions,
+        ));
+    }
 
     render_zoned_line(frame, area, left, None, right);
 }
@@ -2263,7 +2322,7 @@ fn render_new_session(
     lines.push(centred(
         area.width,
         vec![Span::styled(
-            format!("vibex {}", env!("CARGO_PKG_VERSION")),
+            format!("{} {}", strings.app_name(), env!("CARGO_PKG_VERSION")),
             theme.dimmed(theme.roles.gray_dim),
         )],
     ));

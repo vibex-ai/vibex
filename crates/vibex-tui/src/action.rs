@@ -241,7 +241,6 @@ impl Intent {
                 | Intent::ApprovalDeny
                 | Intent::ApprovalAlways
                 | Intent::ElicitationSubmit
-                | Intent::NewSession
                 | Intent::BeginRenameSession
                 | Intent::ForkSession
                 | Intent::ArchiveSession
@@ -263,6 +262,12 @@ impl Intent {
     }
 
     /// Whether the intent is meaningful while the connection is down.
+    ///
+    /// `NewSession` is here rather than in [`Self::mutates`] because it only
+    /// moves to the composing page and asks for reads: the page is the one the
+    /// client opens on, so it has to be reachable in the first moments of a run
+    /// when the seat is still connecting. Sending from it is what needs the
+    /// runtime, and `SubmitComposer` says so.
     pub const fn works_offline(self) -> bool {
         matches!(
             self,
@@ -272,6 +277,7 @@ impl Intent {
                 | Intent::Back
                 | Intent::FocusNext
                 | Intent::FocusPrevious
+                | Intent::NewSession
                 | Intent::GotoSessions
                 | Intent::GotoManagement
                 | Intent::GotoUsage

@@ -40,7 +40,9 @@ pub enum Page {
     ///
     /// A session is created by sending, not by answering a prompt about it: the
     /// reader who presses `n` wants to write, so the page they land on is a
-    /// prompt, with the runtime it will be sent through named beside it.
+    /// prompt, with the runtime it will be sent through named beside it. It is
+    /// also the page the client *opens* on, because the reader who typed
+    /// `vibex` in a directory came to write in it.
     NewSession,
     Management,
     Providers,
@@ -1124,7 +1126,7 @@ impl App {
         let arrangement = SidebarArrangement::load(options.sidebar_path.as_deref());
         let mut navigation = CompactNavigation::default();
         navigation.select_global(GlobalDestination::Sessions);
-        Self {
+        let mut app = Self {
             facade,
             capabilities,
             seat: options.seat,
@@ -1224,7 +1226,31 @@ impl App {
             activity: None,
             animation_phase: 0,
             composer_mode: ComposerMode::Normal,
-        }
+        };
+        // The client opens where a session is written, not on the list of
+        // sessions that already exist: the reader who typed `vibex` in a
+        // directory wants to write a message there, and the list is one key
+        // away when they want to reopen something instead. The directory the
+        // client was started in is the workspace that first session gets, so
+        // the page names it rather than asking which directory was meant.
+        app.workspace_path = Self::starting_workspace();
+        app.navigate_to(Page::NewSession);
+        app.focus = Focus::Composer;
+        app
+    }
+
+    /// The directory this client was started in, when it is one.
+    ///
+    /// A reader opens the client *in* the project they mean to work on, so
+    /// that directory is the workspace the first session gets: it is the one
+    /// answer they already gave by choosing where to run the command. A
+    /// directory that cannot be read, or that is not one, proposes nothing and
+    /// lets the page fall back to what the runtime reports.
+    fn starting_workspace() -> Option<String> {
+        std::env::current_dir()
+            .ok()
+            .filter(|path| path.is_dir())
+            .map(|path| path.display().to_string())
     }
 
     // ---- derived state -------------------------------------------------
@@ -1714,7 +1740,8 @@ impl App {
     /// The workspace a session created from the composing page will open in.
     ///
     /// The same answer [`Self::create_session_from_draft`] sends: the directory
-    /// the reader chose, else the one the open session already runs in.
+    /// the reader chose — which is the one the client was started in until they
+    /// choose another — else the one the open session already runs in.
     pub fn new_session_workspace(&self) -> String {
         self.workspace_path
             .clone()
@@ -1729,11 +1756,7 @@ impl App {
             })
             // Nothing has told us where the runtime works yet; this client's own
             // directory is the honest guess while the list is on its way.
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|path| path.display().to_string())
-            })
+            .or_else(Self::starting_workspace)
             .unwrap_or_default()
     }
 
@@ -2729,12 +2752,25 @@ impl App {
         self.page_owns_session() && self.transcript.is_animating()
     }
 
+    /// Whether the landing mark is still sweeping.
+    ///
+    /// The sweep is a greeting — the client saying it is alive while the reader
+    /// arrives on the prompt — and a greeting that never ends is a repaint
+    /// every animation tick for as long as the page is left open. One pass is
+    /// long enough to be seen and short enough that an untouched client returns
+    /// to zero frames; the phase it stops on is a whole number of passes, so
+    /// the mark comes to rest unlit rather than frozen halfway through a sweep.
+    fn landing_mark_sweeps(&self) -> bool {
+        self.composing_page_shines() && self.animation_phase < LANDING_SWEEP_FRAMES
+    }
+
     /// Whether anything on screen is moving without the reader's input.
     ///
-    /// The composing page's mark shines; a turn's spinner turns. Everything
-    /// else holds still, which is what keeps an idle session at zero frames.
+    /// The landing mark shines for its greeting; a turn's spinner turns.
+    /// Everything else holds still, which is what keeps an idle session — and
+    /// the prompt the client opens on — at zero frames.
     pub fn chrome_animating(&self) -> bool {
-        self.transcript_animating() || self.composing_page_shines()
+        self.transcript_animating() || self.landing_mark_sweeps()
     }
 
     /// Step the running indicator. Returns whether a repaint is due.
@@ -2792,7 +2828,7 @@ impl App {
             || self.turn_reads_running()
             || self.page_approval_count() > 0
             || self.page_elicitation_count() > 0
-            || self.composing_page_shines()
+            || self.landing_mark_sweeps()
     }
 
     /// The approvals the page in front of the reader is waiting on.
@@ -4388,6 +4424,12 @@ impl App {
 /// How many history entries the composer's drawer will show.
 pub const MAX_HISTORY_MATCHES: usize = 100;
 
+/// How many frames the landing mark sweeps before it holds still.
+///
+/// One whole sweep (the logo's cycle is sixty frames), so the mark rests unlit
+/// instead of frozen halfway through one. See [`App::chrome_animating`].
+pub const LANDING_SWEEP_FRAMES: u32 = 60;
+
 /// How many palette commands are remembered.
 pub const MAX_RECENT_COMMANDS: usize = 8;
 
@@ -5030,6 +5072,11 @@ mod tests {
     #[test]
     fn a_queued_message_keeps_its_images_when_it_is_pulled_back() {
         let mut app = arrangement_app(&tempfile::tempdir().unwrap().path().join("unused.json"));
+        // The reader is in a session; that is where a held message belongs, and
+        // the queue answers for the session the page shows.
+        let session_id = VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.navigate_to(Page::Agent);
         app.composer.insert_str("see this ");
         app.composer
             .insert_image(
@@ -5037,9 +5084,6 @@ mod tests {
                 crate::composer::ImageSource::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
             )
             .expect("the image attaches");
-        // The reader is in a session; that is where a held message belongs.
-        let session_id = VibexSessionId::new();
-        app.agent.state.selected_session_id = Some(session_id.clone());
         let outgoing = app.composer.take_outgoing();
         app.enqueue(session_id.clone(), outgoing.text, outgoing.images);
         assert_eq!(app.queued_messages.len(), 1);

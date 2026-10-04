@@ -321,7 +321,7 @@ Rules that follow:
 
 | Surface | Contract |
 | --- | --- |
-| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. The location is a secondary label, never a status hue, and a path that does not fit folds its ancestors to initials (`/h/p/c/p/c/node_modules`) before the head is dropped, keeping the component that names the directory whole. |
+| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. The location is a secondary label, never a status hue, and a path that does not fit folds its ancestors to initials (`/h/p/c/p/c/node_modules`) before the head is dropped, keeping the component that names the directory whole. On the prompt the band's last segment is a control: the session list's label and the chord that answers there, published as a click region so the mouse runs the same intent the key does. |
 | Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle remains static so a connected session does not look busy. |
 | Composer | padded raised surface without a title or border; an empty box names the draft's vocabulary (`/ commands @ files $ skills`) in the reader's language, and runtime and run options sit on a separate line below it. |
 | Completion | a drawer above the composer: two full-width rules, no corners, count on the top rule, selection marker is the composer's own arrow. |
@@ -703,15 +703,22 @@ is never a column count.
   cursor cannot move while an overlay is up — so a key can never change a
   session nobody selected. `Enter` already worked this way; a heading row owns no
   session and the action is inert there.
-* **A new session is a page, not a dialog.** The reader who asks for one asked
-  to write, so the gesture lands on a page that hands them the composer and
-  names what the message will be sent through — Agent, model, workspace — with
-  the keys that change them, and never the session behind it. The session is
-  created by *sending*: the title comes from the message, and a runtime chosen on
-  the page travels into `Effect::CreateSession` rather than needing a session to
-  exist first. The page is a session page for the *composer*
-  (`is_composing_page`), so the composer owns the keyboard; `Esc` returns to the
-  session list with the draft intact.
+* **A new session is a page, not a dialog — and it is the page the client opens
+  on.** The reader who asks for one asked to write, so the gesture lands on a
+  page that hands them the composer and names what the message will be sent
+  through — Agent, model, workspace — with the keys that change them, and never
+  the session behind it. The session is created by *sending*: the title comes
+  from the message, and a runtime chosen on the page travels into
+  `Effect::CreateSession` rather than needing a session to exist first. The page
+  is a session page for the *composer* (`is_composing_page`), so the composer
+  owns the keyboard. It is also where `App::new` starts: a reader who types
+  `vibex` in a directory came to write in it, so the page names that directory
+  as the workspace (`App::starting_workspace`) and offers the sessions that
+  already exist from a clickable corner entry in the status band. The entry
+  names the chord that answers where it is drawn — `Ctrl+L` while the composer
+  holds the keyboard, the global `1` otherwise — because the plain digits are
+  characters in a draft. `Esc` steps between the prompt and the list; from a
+  session it is still session → list → prompt.
 * **The page's choices belong to the page until a creation consumes them.**
   Entering the composing page keeps the Agent and the directory already chosen
   for it: `Ctrl+G` and `Ctrl+W` are global, so a reader who picked either from
@@ -722,11 +729,16 @@ is never a column count.
   it names — so the page a reader comes back to afterwards names the directory of
   the session they are in rather than one chosen for a session that already
   exists. The page *shows* what it holds (the hero's runtime and workspace rows),
-  so a kept choice is never a silent one.
-* **The waiting mark is the only chrome that animates by itself.**
+  so a kept choice is never a silent one. The page also reads the session list
+  on the way in even though it draws none of it: the countdown, the unread mark
+  and "is this session's turn running" are derived from that state, and none of
+  it may be wrong because the reader started on the prompt.
+* **The waiting mark is the only chrome that animates by itself.** The landing
+  mark's sweep is a greeting rather than a heartbeat:
   `chrome_animating` gates both the tick period and
-  `advance_transcript_animation`, so a session that is merely open still costs
-  zero frames — and a terminal that
+  `advance_transcript_animation`, and the greeting ends after one whole pass
+  (`LANDING_SWEEP_FRAMES`), so a session that is merely open — and a prompt left
+  waiting — costs zero frames. A terminal that
   cannot blend colours gets the mark at full strength rather than a sweep it
   cannot show.
 * **A paste over the threshold collapses into a chip.** `PASTE_CHIP_LINES` /
@@ -861,4 +873,5 @@ covers both.
 
 The idle assertion is load-bearing: it is the measured form of "no animation and
 no events means no frames". A startup notice legitimately repaints while it is
-visible, so the test settles first and only then measures.
+visible, and the landing mark sweeps one pass as a greeting, so the test settles
+until the process has been quiet and only then measures.

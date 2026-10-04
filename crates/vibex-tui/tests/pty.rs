@@ -255,18 +255,21 @@ impl Drop for Session {
 #[test]
 fn startup_paints_a_first_frame() {
     let mut session = Session::start(120, 40);
-    let screen = session.wait_for(|screen| screen.contains("Vibex") && screen.contains("Sessions"));
-    // The status band, the view and the shortcut bar are three different bands;
-    // seeing all three proves the stack was assembled rather than half-painted.
-    // The band names the seat the frame is attached to — a healthy connection is
-    // the quiet case now, so there is no "Done" badge to look for.
+    let screen = session.wait_for(|screen| {
+        screen.contains("Vibex") && screen.contains("New session") && screen.contains("Sessions")
+    });
+    // The status band, the prompt and the corner entry are three different
+    // bands; seeing all three proves the stack was assembled rather than
+    // half-painted. The band names the seat the frame is attached to — a
+    // healthy connection is the quiet case now, so there is no "Done" badge to
+    // look for.
     assert!(
         screen.contains("Remote") || screen.contains("Authority"),
         "the status band is missing:\n{screen}"
     );
     assert!(
-        screen.contains("Ctrl+P") && screen.contains("Ctrl+Q"),
-        "the shortcut band is missing:\n{screen}"
+        screen.contains("Runtime") && screen.contains("Workspace"),
+        "the prompt does not name what the message goes through:\n{screen}"
     );
 }
 
@@ -310,9 +313,11 @@ fn quitting_restores_the_terminal() {
 fn an_idle_interface_writes_nothing() {
     let mut session = Session::start(120, 40);
     session.wait_for(|screen| screen.contains("Vibex"));
-    // A startup notice is real content and repaints while it is visible; the
-    // contract under test is that nothing repaints once it is gone.
-    session.settle(Duration::from_millis(800), Duration::from_secs(20));
+    // The landing mark's greeting is real content and repaints while it runs,
+    // as a startup notice would; the contract under test is that nothing
+    // repaints once the greeting is over, so this waits it out rather than
+    // pretending the first quiet millisecond is steady state.
+    session.settle(Duration::from_millis(800), Duration::from_secs(30));
 
     let mark = session.captured.len();
     session.pump(IDLE_WINDOW);
@@ -379,14 +384,10 @@ fn in_process_diagnostics_never_reach_the_terminal() {
 
 #[test]
 fn typing_echoes_into_the_frame() {
-    // Without an open session the composer is not reachable, so this exercises
-    // the filter, which is the typing surface a fresh client always has.
+    // The client opens with the prompt in front of the reader, so a fresh
+    // client can be typed into without opening anything first.
     let mut session = Session::start(120, 40);
     session.wait_for(|screen| screen.contains("Vibex"));
-    // `/` opens the list filter, which is the typing surface a client with no
-    // session has.
-    session.send(b"/");
-    session.pump(Duration::from_millis(300));
     session.send("中文 abc".as_bytes());
     let screen = session.wait_for(|screen| screen.contains("abc"));
     assert!(screen.contains("abc"), "{screen}");
@@ -404,12 +405,12 @@ fn the_workspace_key_opens_the_picker_on_the_new_session_page() {
     //
     // The picker then has to *list* something: this seat is native, which
     // browses the machine it runs on rather than reporting the capability a
-    // paired client uses, so the listing is the client's own filesystem.
+    // paired client uses, so the listing is the client's own filesystem — the
+    // directory this client was started in, which is the page's own answer.
     let directory = tempfile::tempdir().expect("a temporary directory");
     std::fs::create_dir(directory.path().join("clash-report")).expect("a directory to choose");
     let mut session = Session::start_at(Some(directory.path()), 120, 40, &[]);
-    session.wait_for(|screen| screen.contains("Vibex"));
-    session.send(b"n");
+    // The prompt is the first screen, so there is nothing to open first.
     session.wait_for(|screen| screen.contains("New session"));
     // Ctrl+W, with the empty draft the page is in when it makes the promise.
     session.send(b"\x17");
@@ -439,18 +440,34 @@ fn a_resize_storm_does_not_lose_the_frame() {
 #[test]
 fn a_non_utf8_locale_still_renders_the_frame() {
     // The harness inherits the test process environment, so the assertion is
-    // that the ASCII border set is selected rather than assumed.
+    // that the ASCII border set is selected rather than assumed. The prompt is
+    // a bare writing surface, so the check steps to the list — with the chord
+    // the prompt's corner names — which is a framed page.
     let mut session = Session::start(100, 30);
     let screen = session.wait_for(|screen| screen.contains("Vibex"));
     assert!(!screen.is_empty());
-    // Whatever the glyph mode, the framed view's right border must reach the
-    // last column. The frame sits below the status band and its blank row.
+    session.send(b"\x0c"); // Ctrl+L: the session list, from the prompt.
+    // The frame has to be complete, not only started: the prompt's corner
+    // already says "Sessions", and a frame caught mid-paint has corners but no
+    // far edge yet. Whatever the glyph mode, the right border must reach the
+    // last column; the frame sits below the status band and its blank row.
+    let screen = session.wait_for(|screen| {
+        screen.lines().any(|line| {
+            let line = line.trim();
+            (line.starts_with('╭') && line.ends_with('╮'))
+                || (line.starts_with('+') && line.ends_with('+'))
+        })
+    });
     let framed = screen
         .lines()
-        .find(|line| line.contains('╭') || line.contains('+'))
+        .find(|line| {
+            let line = line.trim();
+            (line.starts_with('╭') && line.ends_with('╮'))
+                || (line.starts_with('+') && line.ends_with('+'))
+        })
         .unwrap_or_default();
     assert!(
-        framed.trim_end().ends_with('╮') || framed.trim_end().ends_with('+'),
-        "the frame's right border is missing: {framed:?}"
+        !framed.is_empty(),
+        "the framed page never assembled:\n{screen}"
     );
 }

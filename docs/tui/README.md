@@ -442,6 +442,16 @@ chosen, and one who opened it from the list stays on the list.
 
 ### New session
 
+The page the client *opens* on: running `vibex` in a directory puts that
+directory's prompt in front of the reader, because that is what they came to do.
+The workspace is the directory the client was started in — the answer they
+already gave by choosing where to run the command — and the runtime is the one
+last used here, so both are named and ready before a key is pressed. The
+sessions that already exist are one gesture away: the status band's top-right
+corner holds a clickable **Sessions** entry naming the chord that answers where
+the reader is (`Ctrl+L` while the composer holds the keyboard, the global `1`
+otherwise). `n` opens the same page from the list.
+
 `n` does not ask a question: it opens a page. The reader who asked for a session
 asked to *write*, so the page hands them the composer with the mark above it and
 the runtime the message will go through named under that — the Agent and model,
@@ -476,8 +486,10 @@ creates with — the catalogue's first available entry.
 
 The mark is drawn from characters — block glyphs where the terminal has them,
 two rows of ASCII where it does not — and a light sweeps across it while the
-page waits. It is the client's only animation that is not a turn's spinner, and
-it stops the moment the reader leaves.
+page waits. It is the client's only animation that is not a turn's spinner, it
+is a greeting rather than a heartbeat — one pass, then the mark rests — and it
+stops the moment the reader leaves. A prompt left open therefore costs no
+frames, which is the idle contract the PTY layer measures.
 
 `Enter` puts the message in the transcript immediately. The runtime owns the
 timeline, so its own copy of the reader's message is a round trip away — and a
@@ -581,12 +593,14 @@ of failing to start.
 
 ### First run
 
-With an empty session list the landing surface is a short ordered guide:
-connect to the runtime, choose where the Agent works, start a session, write the
-first message. Each step's state is derived from what the client already knows,
-so nothing is persisted and nothing has to be dismissed — the guide retires by
-itself once all four are done, and comes back into an empty home where it is
-useful again.
+With an empty session list the surface is a short ordered guide: connect to the
+runtime, choose where the Agent works, start a session, write the first message.
+The workspace step is already answered when the client was started in a
+directory — that directory is the workspace — so the guide opens on the session
+step and the earlier ones are shown as done. Each step's state is derived from
+what the client already knows, so nothing is persisted and nothing has to be
+dismissed — the guide retires by itself once all four are done, and comes back
+into an empty home where it is useful again.
 
 ### Help
 

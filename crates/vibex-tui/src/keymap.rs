@@ -958,6 +958,17 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::CopyDraftSelection,
         "Copy draft",
     ),
+    // The global navigation keys are single characters, so a page whose
+    // composer owns the keyboard cannot reach the session list with them —
+    // typing `1` is the digit the reader meant. This is the same destination
+    // on a chord the composer can afford to give up, and it is what the
+    // composing page's top-right entry names.
+    binding(
+        Scope::Composer,
+        Chord::ctrl('l'),
+        Intent::GotoSessions,
+        "Sessions",
+    ),
     // ---- overlays -------------------------------------------------------
     // Climbing out of a directory is part of browsing it, so the picker keeps
     // the key the workspace list uses rather than inventing a second one.
@@ -1698,6 +1709,19 @@ impl Keymap {
             .map(|binding| binding.chord)
     }
 
+    /// Chord to show for an intent in one scope, if that scope binds it.
+    ///
+    /// A single intent can be bound more than once — the session list is one
+    /// key in the global table and another while the composer owns the
+    /// keyboard — and a surface that names the chord has to name the one that
+    /// will answer *there*, not the first one in the table.
+    pub fn chord_for_in(&self, scope: Scope, intent: Intent) -> Option<Chord> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.scope == scope && binding.intent == intent)
+            .map(|binding| binding.chord)
+    }
+
     /// Whether the user has moved this intent off its default chord.
     pub fn is_overridden(&self, intent: Intent) -> bool {
         self.overrides.contains_key(&intent)
@@ -1925,6 +1949,27 @@ mod tests {
         assert_eq!(
             keymap.resolve(&[Scope::Agent, Scope::Global], Chord::ctrl('c')),
             Some(Intent::ContextualCancel)
+        );
+    }
+
+    #[test]
+    fn a_chord_is_named_for_the_scope_that_answers_it() {
+        let keymap = Keymap::built_in();
+        // The session list is `1` in the global table and `Ctrl+L` while the
+        // composer owns the keyboard, so a surface that names the chord has to
+        // say which of the two answers where it is drawn.
+        assert_eq!(
+            keymap.chord_for(Intent::GotoSessions),
+            Some(Chord::plain(KeyCode::Char('1')))
+        );
+        assert_eq!(
+            keymap.chord_for_in(Scope::Composer, Intent::GotoSessions),
+            Some(Chord::ctrl('l'))
+        );
+        assert_eq!(
+            keymap.chord_for_in(Scope::Sessions, Intent::GotoSessions),
+            None,
+            "the list's own scope does not rebind a global key"
         );
     }
 

@@ -99,7 +99,8 @@ fn main() {
     app.navigate_to(Page::Agent);
     app.live = vibex_tui::app::LiveState::Ready;
     if welcome {
-        // The empty-state surface, which is what a new session shows.
+        // The empty session list, which is what the prompt's corner entry
+        // opens; the prompt itself is the state the app is built in.
         app.navigate_to(vibex_tui::app::Page::Sessions);
     }
     if settings {

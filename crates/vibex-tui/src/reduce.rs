@@ -1660,9 +1660,17 @@ impl App {
             self.focus = Focus::Main;
             return Outcome::effects(vec![]);
         }
-        if self.page != Page::Sessions {
-            self.select_global(vibex_ui::shell::GlobalDestination::Sessions);
+        // The list and the page a session is written on are the two halves of
+        // where the client starts, so `Esc` steps between them: the reader who
+        // walks in from the prompt lands back on it rather than on a page that
+        // ignores the key. A session's own page still leaves to the list first,
+        // which makes the way out two steps: session, list, prompt.
+        if self.page == Page::Sessions {
+            self.navigate_to(Page::NewSession);
+            self.focus = Focus::Composer;
+            return Outcome::effects(vec![]);
         }
+        self.select_global(vibex_ui::shell::GlobalDestination::Sessions);
         Outcome::effects(vec![])
     }
 
@@ -1844,6 +1852,17 @@ impl App {
         if self.runtime_options.is_none() && self.runtime_catalog_available() {
             effects.push(Effect::ListRuntimeOptions);
         }
+        // The list of existing sessions is read once on the way in even though
+        // this page draws none of it: the client's own background work — an
+        // auto-continue countdown, an unread mark, whether a session's turn is
+        // still running — is derived from it, and none of that may be wrong
+        // because the reader happened to start on the prompt. Once it is read
+        // the state is kept, so `n` from the list does not read it again.
+        if self.agent.state.sessions.value.is_none() {
+            effects.push(Effect::ListSessions {
+                include_archived: self.show_archived,
+            });
+        }
         Outcome::effects(effects)
     }
 
@@ -1887,19 +1906,10 @@ impl App {
         }
         let outgoing = self.composer.take_outgoing();
         self.completion = None;
-        let workspace_root = self
-            .workspace_path
-            .clone()
-            .or_else(|| {
-                self.active_session()
-                    .map(|session| session.workspace_root.clone())
-            })
-            .or_else(|| {
-                self.workspace_rows
-                    .first()
-                    .map(|workspace| workspace.workspace.root_path.clone())
-            })
-            .unwrap_or_default();
+        // Read through the page's own answer (`new_session_workspace`), so what
+        // the page names is what the creation carries — including the directory
+        // the client was started in when nothing has chosen one.
+        let workspace_root = self.new_session_workspace();
         let request_id = self.new_draft_id.clone();
         // Select the reserved identity synchronously. There is no fetch until
         // the authority acknowledges creation, and no old timeline survives.
@@ -4696,6 +4706,45 @@ mod tests {
         assert!(
             app.workspace_path.is_none(),
             "the page kept a directory the session took"
+        );
+    }
+
+    #[test]
+    fn the_landing_page_reads_the_sessions_it_does_not_draw() {
+        // The prompt draws no list, but the client's background work — an
+        // auto-continue countdown, an unread mark, whether a session's turn is
+        // still running — is derived from one. It is read on the way in, and
+        // only once: `n` from the list must not read it a second time.
+        let mut app = capable_app();
+        let landing = app.perform(Intent::NewSession);
+        assert!(
+            landing
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListSessions { .. })),
+            "the landing page did not read the sessions: {:?}",
+            landing.effects
+        );
+        assert!(
+            landing
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListWorkspaces)),
+            "the landing page did not read the workspaces: {:?}",
+            landing.effects
+        );
+
+        app.agent
+            .apply_sessions(Ok(vec![openable_session("session_landing01")]))
+            .expect("sessions apply");
+        let again = app.perform(Intent::NewSession);
+        assert!(
+            !again
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListSessions { .. })),
+            "the list was read again with the state already in hand: {:?}",
+            again.effects
         );
     }
 

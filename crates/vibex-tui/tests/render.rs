@@ -147,6 +147,130 @@ fn the_welcome_state_tells_the_user_what_to_do() {
 }
 
 #[test]
+fn the_client_opens_on_the_page_a_session_is_written_on() {
+    use vibex_tui::app::Focus;
+    // The reader who typed `vibex` in a directory wants to write there, so the
+    // prompt is the first screen and the list is one gesture away. The
+    // directory the client was started in is the workspace that message is
+    // sent for: it is the answer the reader already gave.
+    let cwd = std::env::current_dir().expect("a working directory");
+    let mut app = app(120, 40);
+    assert_eq!(app.page, Page::NewSession);
+    assert_eq!(app.focus, Focus::Composer);
+    assert_eq!(
+        app.new_session_workspace(),
+        cwd.display().to_string(),
+        "the page did not name the directory the client was started in"
+    );
+
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("New session"), "{screen}");
+    assert!(
+        screen.contains("Workspace") && screen.contains(&cwd.display().to_string()),
+        "the page does not name where the session would work:\n{screen}"
+    );
+}
+
+#[test]
+fn the_prompt_offers_the_session_list_in_its_corner() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    let buffer = render_buffer(&mut app, 120, 40);
+    let status = display_row(&buffer, 1, 120);
+    assert!(
+        status.contains("Sessions") && status.contains("Ctrl+L"),
+        "the corner entry is missing from the status band: {status:?}"
+    );
+    // The entry is a control, not a label: its rect is on the status row, at
+    // the right end of it, and clicking it runs the same move as the chord.
+    let (rect, intent) = app
+        .regions
+        .hints
+        .iter()
+        .find(|(_, intent)| *intent == Intent::GotoSessions)
+        .copied()
+        .expect("the corner entry is not clickable");
+    assert_eq!(rect.y, 1, "the entry is not on the status row");
+    assert_eq!(intent, Intent::GotoSessions);
+    assert_eq!(
+        rect.x + rect.width,
+        120 - 2,
+        "the entry does not end at the right padding"
+    );
+    let entry = (rect.x..rect.x + rect.width)
+        .map(|column| buffer.cell((column, 1)).expect("cell").symbol())
+        .collect::<String>();
+    assert!(
+        entry.contains("Sessions"),
+        "the clickable rect is not over the entry: {entry:?}"
+    );
+}
+
+#[test]
+fn escape_walks_between_the_prompt_and_the_list() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::app::Focus;
+    // The two halves of where the client starts are a pair, so leaving the
+    // list lands back on the prompt rather than on a page that ignores the key.
+    let mut app = app(120, 40);
+    app.perform(Intent::Back);
+    assert_eq!(app.page, Page::Sessions);
+    app.perform(Intent::Back);
+    assert_eq!(app.page, Page::NewSession);
+    assert_eq!(app.focus, Focus::Composer);
+}
+
+#[test]
+fn the_composer_reaches_the_session_list_without_giving_up_the_draft() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::keymap::{Chord, Keymap};
+    let mut app = app(120, 40);
+    // A developer's key file must not decide this: the built-in table is what
+    // the page names in its corner.
+    app.keymap = Keymap::built_in();
+    app.composer.insert_str("half a thought");
+
+    let intent = app
+        .keymap
+        .resolve(&app.active_scopes(), Chord::ctrl('l'))
+        .expect("Ctrl+L is bound while the composer owns the keyboard");
+    assert_eq!(intent, Intent::GotoSessions);
+    app.perform(intent);
+    assert_eq!(app.page, Page::Sessions);
+    assert_eq!(
+        app.composer.text(),
+        "half a thought",
+        "reaching the list threw the draft away"
+    );
+
+    // The digits the global table uses are still digits: a reader writing `1`
+    // means the character.
+    for character in ['1', '2'] {
+        app.composer.insert_char(character);
+    }
+    assert_eq!(app.composer.text(), "half a thought12");
+}
+
+#[test]
+fn the_landing_mark_greets_and_then_holds_still() {
+    // The sweep says the client is alive while the reader arrives. It is a
+    // greeting, not a heartbeat: an untouched prompt returns to zero frames,
+    // which is the idle contract the whole client is measured against.
+    let mut app = app(120, 40);
+    assert!(app.chrome_animating(), "the landing mark does not sweep");
+    for _ in 0..vibex_tui::app::LANDING_SWEEP_FRAMES {
+        assert!(app.advance_transcript_animation());
+    }
+    assert!(!app.chrome_animating(), "the greeting never ends");
+    assert!(!app.advance_transcript_animation());
+    assert_eq!(
+        app.animation_phase() % 60,
+        0,
+        "the mark came to rest halfway through a sweep"
+    );
+}
+
+#[test]
 fn the_transcript_gets_the_full_width_at_every_size() {
     // The screen is a stack of full-width bands, so no permanent side pane
     // steals columns from the thing being read.
@@ -193,7 +317,10 @@ fn the_status_band_reports_liveness_and_seat_together() {
 
 #[test]
 fn the_shortcuts_band_is_the_last_row() {
+    // A page that is navigated rather than written on keeps the bar: the page
+    // a session is written on spends its last row on the prompt instead.
     let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::GotoSessions);
     let lines = render(&mut app, 120, 40);
     // The last row is the outer bottom padding; the band sits above it.
     let band = &lines[lines.len() - 2];
@@ -1429,7 +1556,8 @@ fn queued_texts(app: &App) -> Vec<String> {
 }
 
 /// Open a session: a message can only be held for one, so the queue's own
-/// tests have to be inside one.
+/// tests have to be inside one — which is the session's page, not the prompt
+/// the client opens on.
 fn enter_session(app: &mut App, id: &str) {
     let session = seeded_session(id, "queue fixture");
     app.agent
@@ -1437,6 +1565,7 @@ fn enter_session(app: &mut App, id: &str) {
         .expect("sessions apply");
     app.agent.state.selected_session_id = Some(session.id.clone());
     app.agent.state.active_session.resolve(session);
+    app.navigate_to(Page::Agent);
 }
 
 fn settings_app(width: u16, height: u16) -> App {
@@ -1725,17 +1854,21 @@ fn markdown_styling_reaches_the_screen() {
     );
 
     // A literal is coloured by what it is, so the version and the path in one
-    // sentence are findable at a glance rather than by reading the line.
+    // sentence are findable at a glance rather than by reading the line. The
+    // search is anchored to that sentence: the status band names the directory
+    // the client was started in, which can spell the crate's own name too.
+    let literal_row = rows
+        .iter()
+        .position(|row| row.contains("升级"))
+        .expect("the sentence holding the literals is on screen");
     let span_colour = |needle: &str| {
-        let row = rows
-            .iter()
-            .position(|row| row.contains(needle))
-            .unwrap_or_else(|| panic!("{needle} is on screen:\n{screen}"));
         // Column, not byte offset: the row is full of double-width glyphs.
-        let byte = rows[row].find(needle).expect("the needle is in the row");
-        let column = vibex_tui::text::display_width(&rows[row][..byte]).min(119) as u16;
+        let byte = rows[literal_row]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is on screen:\n{screen}"));
+        let column = vibex_tui::text::display_width(&rows[literal_row][..byte]).min(119) as u16;
         (column..120)
-            .filter_map(|column| buffer.cell((column, row as u16)))
+            .filter_map(|column| buffer.cell((column, literal_row as u16)))
             .find(|cell| cell.symbol().chars().any(char::is_alphanumeric))
             .and_then(|cell| cell.style().fg)
     };
@@ -2690,8 +2823,10 @@ fn the_welcome_screen_orders_the_first_run_steps() {
         positions.windows(2).all(|pair| pair[0] < pair[1]),
         "the steps are out of order:\n{screen}"
     );
-    // The first incomplete step is the one that explains itself.
-    assert!(screen.contains("Browse directories"), "{screen}");
+    // The first incomplete step is the one that explains itself. The workspace
+    // step is already answered — the client opens in the directory it was
+    // started in — so the guide starts at the session.
+    assert!(screen.contains("One session per task"), "{screen}");
 }
 
 #[test]
@@ -3636,10 +3771,15 @@ fn the_first_message_creates_the_session_it_is_written_in() {
     let mut app = app(100, 30);
     app.live = vibex_tui::app::LiveState::Ready;
     app.perform(Intent::NewSession);
-    // The page starts with no directory of its own: one chosen for a previous
-    // session is not silently reused. The reader picks one, or the open
-    // session's directory answers.
-    assert_ne!(app.new_session_workspace(), "/tmp/vibex-new-session");
+    // The page names the directory the client was started in, and a directory
+    // chosen for a previous session is not silently reused in its place.
+    assert_eq!(
+        app.new_session_workspace(),
+        std::env::current_dir()
+            .expect("a working directory")
+            .display()
+            .to_string()
+    );
     app.workspace_path = Some("/tmp/vibex-new-session".to_string());
     assert_eq!(app.new_session_workspace(), "/tmp/vibex-new-session");
     app.composer.insert_str("fix the flaky test");
@@ -3730,8 +3870,10 @@ fn the_mark_moves_only_where_it_is_drawn() {
         text_of(&vibex_tui::logo::rows(&theme, 40, false))
     );
 
-    // A page that waits animates; every other page still holds still.
+    // A page that waits animates; every other page still holds still. The
+    // client opens on the page that waits, so the list is the still one.
     let mut app = app(100, 30);
+    app.perform(Intent::GotoSessions);
     assert!(!app.chrome_animating());
     app.live = vibex_tui::app::LiveState::Ready;
     app.perform(Intent::NewSession);
@@ -4162,6 +4304,7 @@ fn a_message_held_for_one_session_waits_for_that_session() {
     // Session A is running, so the message is held for it.
     app.agent.state.selected_session_id = Some(running.id.clone());
     app.agent.state.active_session.resolve(running.clone());
+    app.navigate_to(Page::Agent);
     app.enqueue_message("for the first session".to_string());
     assert_eq!(
         queued_texts(&app),
@@ -4218,6 +4361,7 @@ fn a_held_message_is_released_while_the_reader_is_elsewhere() {
         .expect("sessions apply");
     app.agent.state.selected_session_id = Some(running.id.clone());
     app.agent.state.active_session.resolve(running.clone());
+    app.navigate_to(Page::Agent);
     app.enqueue_message("release me".to_string());
 
     // The reader is on the other session when the first one's turn ends.

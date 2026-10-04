@@ -83,8 +83,11 @@ fn event_loop(
     let mut last_tick = Instant::now();
     let mut reason = ExitReason::UserQuit;
 
-    // First frame: paint the skeleton before any I/O result arrives.
-    let initial = app.perform(crate::action::Intent::GotoSessions);
+    // First frame: paint the skeleton before any I/O result arrives. The
+    // client opens on the page a session is written on, so what the first
+    // frame reads is what that page names — the workspace, the runtime
+    // catalogue — plus the session list its background work is derived from.
+    let initial = app.perform(crate::action::Intent::NewSession);
     dispatch_all(worker, &initial);
     app.sync_transcript();
 
