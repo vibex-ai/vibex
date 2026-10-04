@@ -693,9 +693,17 @@ Every one of these has a defined behaviour rather than a broken screen:
 | in-process diagnostics | diverted to a spill file, named on exit; never drawn into a frame |
 | `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal |
 | non-UTF-8 locale | ASCII borders and markers |
+| sixteen colours only | the page keeps the terminal's own background; the palette carries ink, accents and rules, and no plane is painted |
 | disconnected | a banner, mutations disabled, the last known state marked stale |
 | read-only device | actions are visible, disabled, and say which permission they need |
 | very long conversation | the transcript is capped and the oldest blocks are dropped |
+
+The colour tier is chosen once, at startup: `NO_COLOR` first, then an explicit
+`VIBEX_TUI_COLOR`, then `COLORTERM`, then `TERM`. A `TERM` that names a 24-bit
+terminal — `xterm-kitty`, `xterm-ghostty`, `wezterm`, `foot`, `contour`,
+`alacritty`, or a `-direct` entry — is believed on its own, because `COLORTERM`
+is not always there to be read: `sshd` forwards only the names it is configured
+to accept, so the terminal's own name is what survives a link.
 
 ## Previewing
 
