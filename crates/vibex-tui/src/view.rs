@@ -2292,19 +2292,15 @@ fn render_new_session(
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    // Sixteen columns is the page's floor: below it even the wordmark and a
-    // version number do not fit on a line, so there is no page to draw.
-    if area.height < 4 || area.width < 16 {
+    if area.height < 4 || area.width < 24 {
         empty_state(frame, area, theme, strings.session_new());
         return;
     }
     let lit = app.composing_page_shines();
     let mark = crate::logo::rows(theme, app.animation_phase(), area.width, lit);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Room for the mark, the wordmark under it, a blank row and the lines below
-    // those, or the mark is dropped and the words speak for themselves. The
-    // wordmark took the row the version number used to have, so the budget is
-    // the one it always was: thirteen rows.
+    // Room for the mark, a blank row and the lines under it, or the mark is
+    // dropped and the words speak for themselves.
     let mark_fits = !mark.is_empty() && area.height as usize >= mark.len() + 8;
     if mark_fits {
         lines.push(Line::from(""));
@@ -2316,25 +2312,6 @@ fn render_new_session(
             spans.extend(line.spans);
             Line::from(spans)
         }));
-        // The mark is the `V`; this is the rest of the name. Together they read
-        // as the product, which is why the word is not translated and why the
-        // version rides here rather than under the heading, where it used to
-        // repeat the name the mark had already given.
-        lines.push(centred(
-            area.width,
-            vec![
-                Span::styled(
-                    crate::logo::WORD.to_string(),
-                    Style::default()
-                        .fg(theme.roles.foreground)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", env!("CARGO_PKG_VERSION")),
-                    theme.dimmed(theme.roles.gray_dim),
-                ),
-            ],
-        ));
     }
     lines.push(Line::from(""));
     let heading = vec![Span::styled(
@@ -2344,6 +2321,13 @@ fn render_new_session(
             .add_modifier(Modifier::BOLD),
     )];
     lines.push(centred(area.width, heading));
+    lines.push(centred(
+        area.width,
+        vec![Span::styled(
+            format!("{} {}", strings.app_name(), env!("CARGO_PKG_VERSION")),
+            theme.dimmed(theme.roles.gray_dim),
+        )],
+    ));
     lines.push(Line::from(""));
 
     // What the message will be sent through, and where. Both are answers the

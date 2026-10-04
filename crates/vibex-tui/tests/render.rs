@@ -119,11 +119,10 @@ fn every_supported_size_produces_a_full_frame() {
         let lines = render(&mut app, width, height);
         assert_eq!(lines.len(), usize::from(height));
         let screen = text(&lines);
-        // The product's name is on screen, spelled the way the brand spells it:
-        // the mark's `V`, and the rest of the word underneath.
+        // The product chrome is always present.
         assert!(
-            screen.contains("ibex"),
-            "{width}x{height} lost the product's name"
+            screen.contains("Vibex"),
+            "{width}x{height} lost the top bar"
         );
         assert!(
             screen.contains("Sessions"),
@@ -3741,17 +3740,8 @@ fn starting_a_session_lands_on_a_page_with_the_prompt_in_it() {
     );
     assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
 
-    // The mark draws itself, so the frame that holds it whole is the one after
-    // the pass — the frame an untouched client sits on.
-    while app.chrome_animating() {
-        assert!(app.advance_transcript_animation());
-    }
     let screen = text(&render(&mut app, 100, 30));
     assert!(screen.contains("██"), "the mark is missing:\n{screen}");
-    assert!(
-        screen.contains("ibex"),
-        "the page does not spell the product's name:\n{screen}"
-    );
     assert!(
         screen.contains("New session"),
         "the page does not name itself:\n{screen}"
@@ -3870,13 +3860,26 @@ fn the_mark_moves_only_where_it_is_drawn() {
             glyphs: vibex_tui::GlyphMode::Unicode,
         },
     );
-    // The light draws the mark, so two phases of the pass cannot agree.
+    // The lights cross the word, so two phases of the pass cannot agree.
     let first = vibex_tui::logo::rows(&theme, 0, 80, true);
     let later = vibex_tui::logo::rows(&theme, 20, 80, true);
-    assert_ne!(text_of(&first), text_of(&later), "the mark does not move");
-    // Once the pass is over the mark holds still, and it holds as the whole
-    // mark rather than as a frozen slice of the animation. This is the frame an
-    // untouched client sits on, so it is the one that has to be complete.
+    assert_ne!(text_of(&first), text_of(&later), "the light does not move");
+    // The letters are the same in every frame: a pass that redrew them would
+    // make a page that is waiting look like a page that is loading.
+    let waxing = vibex_tui::logo::rows(&theme, 3, 80, true);
+    assert_eq!(
+        waxing
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>(),
+        later
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>(),
+        "the light redrew the mark"
+    );
+    // Once the pass is over the mark holds still, and it holds the same mark
+    // an untouched client sits on for the rest of the session.
     let resting = text_of(&vibex_tui::logo::rows(
         &theme,
         vibex_tui::app::LANDING_SWEEP_FRAMES,

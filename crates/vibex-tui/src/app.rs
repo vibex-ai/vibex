@@ -4424,13 +4424,13 @@ impl App {
 /// How many history entries the composer's drawer will show.
 pub const MAX_HISTORY_MATCHES: usize = 100;
 
-/// How many frames the landing mark lights the page for before it holds still.
+/// How many frames the landing mark is lit for before it holds still.
 ///
 /// Taken from the mark's own timeline rather than written down twice: the
-/// client has to stop repainting on the frame the light finishes, or it either
-/// cuts the closing glint off or keeps a page that has gone still repainting.
-/// See [`App::chrome_animating`].
-pub const LANDING_SWEEP_FRAMES: u32 = crate::logo::SWEEP_FRAMES;
+/// client has to stop repainting on the frame the last light finishes, or it
+/// either cuts the closing glint off or keeps a page that has gone still
+/// repainting. See [`App::chrome_animating`].
+pub const LANDING_SWEEP_FRAMES: u32 = crate::logo::PASS_FRAMES;
 
 /// How many palette commands are remembered.
 pub const MAX_RECENT_COMMANDS: usize = 8;
