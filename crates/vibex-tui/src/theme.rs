@@ -80,6 +80,19 @@ impl ColorMode {
         }
     }
 
+    /// Whether a blended ramp survives this palette.
+    ///
+    /// True colour is the only mode whose resolved colours carry their own
+    /// channels: an indexed palette hands back an index, and this module has no
+    /// table to read one back with. Sixteen colours would also collapse the
+    /// ramp into two or three steps, which reads as a flicker rather than as a
+    /// fade. Callers that need a gradient in either mode are expected to step
+    /// down the theme's own greys and to reach for weight — `BOLD` and `DIM` —
+    /// instead of for a blend.
+    pub const fn blends(self) -> bool {
+        matches!(self, Self::TrueColor)
+    }
+
     /// Resolve a colour, or `None` when the mode forbids colour entirely.
     pub fn color(self, rgb: u32) -> Option<Color> {
         match self {
@@ -806,6 +819,33 @@ impl TuiTheme {
         self.capability
             .color(mix_rgb(from, background, 1.0 - weight))
             .unwrap_or(color)
+    }
+
+    /// Blend one colour toward another. `weight` is 1.0 for `to`, 0.0 for `from`.
+    ///
+    /// [`Self::fade`] walks a colour toward the canvas, which is what *dimming*
+    /// means. A light does the opposite: it has to put something *onto* the
+    /// surface it crosses, and the something is a hue rather than an absence of
+    /// one, so it needs a second colour to walk toward.
+    ///
+    /// The guard is [`ColorMode::blends`], the same one `fade` applies, and for
+    /// the same reason: a colour that cannot be taken apart cannot be mixed.
+    /// Callers that need this to degrade well should give the shallow modes
+    /// their own path rather than leaning on the fallback, which is simply the
+    /// colour they passed in.
+    pub fn blend(&self, from: Color, to: Color, weight: f32) -> Color {
+        if weight >= 1.0 {
+            return to;
+        }
+        if weight <= 0.0 || !self.capability.mode.blends() {
+            return from;
+        }
+        let (Some(from_rgb), Some(to_rgb)) = (color_rgb(from), color_rgb(to)) else {
+            return from;
+        };
+        self.capability
+            .color(mix_rgb(from_rgb, to_rgb, weight))
+            .unwrap_or(from)
     }
 
     /// The style for chrome that belongs to an unfocused pane.

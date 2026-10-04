@@ -119,10 +119,11 @@ fn every_supported_size_produces_a_full_frame() {
         let lines = render(&mut app, width, height);
         assert_eq!(lines.len(), usize::from(height));
         let screen = text(&lines);
-        // The product chrome is always present.
+        // The product's name is on screen, spelled the way the brand spells it:
+        // the mark's `V`, and the rest of the word underneath.
         assert!(
-            screen.contains("Vibex"),
-            "{width}x{height} lost the top bar"
+            screen.contains("ibex"),
+            "{width}x{height} lost the product's name"
         );
         assert!(
             screen.contains("Sessions"),
@@ -3740,8 +3741,17 @@ fn starting_a_session_lands_on_a_page_with_the_prompt_in_it() {
     );
     assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
 
+    // The mark draws itself, so the frame that holds it whole is the one after
+    // the pass — the frame an untouched client sits on.
+    while app.chrome_animating() {
+        assert!(app.advance_transcript_animation());
+    }
     let screen = text(&render(&mut app, 100, 30));
     assert!(screen.contains("██"), "the mark is missing:\n{screen}");
+    assert!(
+        screen.contains("ibex"),
+        "the page does not spell the product's name:\n{screen}"
+    );
     assert!(
         screen.contains("New session"),
         "the page does not name itself:\n{screen}"
@@ -3860,14 +3870,28 @@ fn the_mark_moves_only_where_it_is_drawn() {
             glyphs: vibex_tui::GlyphMode::Unicode,
         },
     );
-    // The sweep is a lit band, so two phases cannot draw the same mark.
-    let first = vibex_tui::logo::rows(&theme, 0, true);
-    let later = vibex_tui::logo::rows(&theme, 20, true);
+    // The light draws the mark, so two phases of the pass cannot agree.
+    let first = vibex_tui::logo::rows(&theme, 0, 80, true);
+    let later = vibex_tui::logo::rows(&theme, 20, 80, true);
     assert_ne!(text_of(&first), text_of(&later), "the mark does not move");
-    // The letters never change, only the light on them.
+    // Once the pass is over the mark holds still, and it holds as the whole
+    // mark rather than as a frozen slice of the animation. This is the frame an
+    // untouched client sits on, so it is the one that has to be complete.
+    let resting = text_of(&vibex_tui::logo::rows(
+        &theme,
+        vibex_tui::app::LANDING_SWEEP_FRAMES,
+        80,
+        true,
+    ));
     assert_eq!(
-        text_of(&vibex_tui::logo::rows(&theme, 0, false)),
-        text_of(&vibex_tui::logo::rows(&theme, 40, false))
+        resting,
+        text_of(&vibex_tui::logo::rows(&theme, 997, 80, true))
+    );
+    // A page that is not waiting draws that same resting mark, and never a
+    // frame of the animation.
+    assert_eq!(
+        resting,
+        text_of(&vibex_tui::logo::rows(&theme, 0, 80, false))
     );
 
     // A page that waits animates; every other page still holds still. The
@@ -3887,7 +3911,7 @@ fn the_mark_moves_only_where_it_is_drawn() {
     assert!(!app.advance_transcript_animation());
 }
 
-/// The mark with its styling: the sweep changes the light, not the letters.
+/// The mark with its styling: the light changes, and so does the mark it draws.
 fn text_of(lines: &[ratatui::text::Line<'static>]) -> String {
     lines
         .iter()
