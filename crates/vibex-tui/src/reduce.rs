@@ -1525,10 +1525,7 @@ impl App {
                     name: trimmed,
                 }])
             }
-            PromptField::McpServerName
-            | PromptField::SkillName
-            | PromptField::PromptName
-            | PromptField::HookName => {
+            PromptField::McpServerName | PromptField::SkillName | PromptField::PromptName => {
                 if trimmed.is_empty() {
                     return Outcome::quiet();
                 }
@@ -1556,12 +1553,7 @@ impl App {
                             }
                         })
                     }
-                    _ => self.management_data.hooks.get(index).map(|hook| {
-                        crate::app::ManagementEntryEdit::Hook {
-                            hook_id: hook.id.clone(),
-                            display_name: trimmed,
-                        }
-                    }),
+                    _ => None,
                 };
                 let _ = title;
                 match entry {
@@ -2954,7 +2946,6 @@ impl App {
             Page::Mcp => Outcome::effects(vec![Effect::ListMcp]),
             Page::Skills => Outcome::effects(vec![Effect::ListSkills]),
             Page::Prompts => Outcome::effects(vec![Effect::ListPrompts]),
-            Page::Hooks => Outcome::effects(vec![Effect::ListHooks]),
             Page::Usage => Outcome::effects(vec![Effect::LoadUsage]),
             Page::Management | Page::Settings | Page::Help => Outcome::effects(vec![]),
         }
@@ -2984,13 +2975,6 @@ impl App {
                 }]),
                 None => Outcome::quiet(),
             },
-            Page::Hooks => match self.management_data.hooks.get(index) {
-                Some(hook) => Outcome::effects(vec![Effect::ToggleHook {
-                    hook_id: hook.id.clone(),
-                    enabled: hook.status != vibex_core::HookStatus::Enabled,
-                }]),
-                None => Outcome::quiet(),
-            },
             _ => Outcome::quiet(),
         }
     }
@@ -3000,7 +2984,6 @@ impl App {
             Page::Mcp => PromptField::McpServerName,
             Page::Skills => PromptField::SkillName,
             Page::Prompts => PromptField::PromptName,
-            Page::Hooks => PromptField::HookName,
             _ => return Outcome::quiet(),
         };
         self.overlay = Some(Overlay::Prompt {
@@ -5142,10 +5125,6 @@ mod tests {
             crate::app::ManagementEntryEdit::Prompt {
                 prompt_id: vibex_core::PromptId::new(),
                 display_name: "c".into(),
-            },
-            crate::app::ManagementEntryEdit::Hook {
-                hook_id: vibex_core::HookId::new(),
-                display_name: "d".into(),
             },
         ];
         for edit in edits {

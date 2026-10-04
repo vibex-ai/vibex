@@ -522,7 +522,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         | Page::Mcp
         | Page::Skills
         | Page::Prompts
-        | Page::Hooks
         | Page::Devices
         | Page::Usage
         | Page::Settings
@@ -1449,7 +1448,7 @@ fn render_management_view(
 ) {
     match app.page {
         Page::Management => render_management(frame, area, app, theme, strings),
-        Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts | Page::Hooks => {
+        Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts => {
             render_entry_list(frame, area, app, theme, strings)
         }
         Page::Devices => render_devices(frame, area, app, theme, strings),
@@ -3027,7 +3026,6 @@ fn render_management(
         strings.management_mcp(),
         strings.management_skills(),
         strings.management_prompts(),
-        strings.management_hooks(),
         strings.management_devices(),
     ];
     let counts = [
@@ -3036,7 +3034,6 @@ fn render_management(
         app.management_data.mcp.len(),
         app.management_data.skills.len(),
         app.management_data.prompts.len(),
-        app.management_data.hooks.len(),
         app.management_data.devices.len(),
     ];
     let selected = app.selection_for(Scope::Management);
@@ -3095,7 +3092,6 @@ fn render_entry_list(
         Page::Mcp => strings.management_mcp(),
         Page::Skills => strings.management_skills(),
         Page::Prompts => strings.management_prompts(),
-        Page::Hooks => strings.management_hooks(),
         _ => strings.management_providers(),
     };
     let inner = page_frame(frame, area, theme, title, true);
@@ -3161,18 +3157,6 @@ fn render_entry_list(
                     prompt.display_name.clone(),
                     prompt.description.clone().unwrap_or_default(),
                     prompt.status == vibex_core::PromptStatus::Enabled,
-                )
-            })
-            .collect(),
-        Page::Hooks => app
-            .management_data
-            .hooks
-            .iter()
-            .map(|hook| {
-                (
-                    hook.display_name.clone(),
-                    format!("{:?}", hook.event_kind),
-                    hook.status == vibex_core::HookStatus::Enabled,
                 )
             })
             .collect(),

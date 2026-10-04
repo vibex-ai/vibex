@@ -285,7 +285,6 @@ pub enum Scope {
     Mcp,
     Skills,
     Prompts,
-    Hooks,
     Devices,
     Usage,
     Settings,
@@ -307,7 +306,6 @@ impl Scope {
         Scope::Mcp,
         Scope::Skills,
         Scope::Prompts,
-        Scope::Hooks,
         Scope::Devices,
         Scope::Usage,
         Scope::Settings,
@@ -328,7 +326,6 @@ impl Scope {
             Scope::Mcp => "mcp",
             Scope::Skills => "skills",
             Scope::Prompts => "prompts",
-            Scope::Hooks => "hooks",
             Scope::Devices => "devices",
             Scope::Usage => "usage",
             Scope::Settings => "settings",
@@ -349,8 +346,7 @@ impl Scope {
             | Scope::Agents
             | Scope::Mcp
             | Scope::Skills
-            | Scope::Prompts
-            | Scope::Hooks => Category::Management,
+            | Scope::Prompts => Category::Management,
             Scope::Devices | Scope::Usage | Scope::Settings | Scope::Help => Category::Panels,
         }
     }
@@ -1232,30 +1228,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Prompts,
-        Chord::plain(KeyCode::Char('e')),
-        Intent::EditSelectedEntry,
-        "Edit",
-    ),
-    binding(
-        Scope::Hooks,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Hooks,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Hooks,
-        Chord::plain(KeyCode::Char(' ')),
-        Intent::ToggleSelectedEntry,
-        "Enable / disable",
-    ),
-    binding(
-        Scope::Hooks,
         Chord::plain(KeyCode::Char('e')),
         Intent::EditSelectedEntry,
         "Edit",

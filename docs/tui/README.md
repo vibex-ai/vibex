@@ -520,7 +520,7 @@ option. Elicitation forms are filled field by field and submitted with `s`.
 
 ### Management
 
-Agents, Providers, MCP servers, Skills, Prompts, Hooks and Devices.
+Agents, Providers, MCP servers, Skills, Prompts and Devices.
 Every row shows its availability: an operation the authority does not offer, or
 that this device's grant does not permit, is visible and explains itself rather
 than disappearing.

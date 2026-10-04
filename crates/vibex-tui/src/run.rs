@@ -1794,13 +1794,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
         }
-        AppMessage::Hooks(result) => match result {
-            Ok(hooks) => {
-                app.management_data.hooks = hooks;
-                app.live = LiveState::Ready;
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
         AppMessage::Usage(result) => match result {
             Ok(report) => {
                 app.management_data.usage = report.aggregate;

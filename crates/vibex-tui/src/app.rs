@@ -48,7 +48,6 @@ pub enum Page {
     Mcp,
     Skills,
     Prompts,
-    Hooks,
     Devices,
     Usage,
     Settings,
@@ -65,7 +64,6 @@ impl Page {
             Page::Mcp => Scope::Mcp,
             Page::Skills => Scope::Skills,
             Page::Prompts => Scope::Prompts,
-            Page::Hooks => Scope::Hooks,
             Page::Devices => Scope::Devices,
             Page::Usage => Scope::Usage,
             Page::Settings => Scope::Settings,
@@ -207,7 +205,6 @@ pub enum PromptField {
     McpServerName,
     SkillName,
     PromptName,
-    HookName,
     DeviceRevokeReason,
     ImagePath,
     /// A run option the Agent publishes as free text rather than as a list.
@@ -403,18 +400,16 @@ pub enum ManagementRow {
     Mcp,
     Skills,
     Prompts,
-    Hooks,
     Devices,
 }
 
 impl ManagementRow {
-    pub const ALL: [ManagementRow; 7] = [
+    pub const ALL: [ManagementRow; 6] = [
         ManagementRow::Agents,
         ManagementRow::Providers,
         ManagementRow::Mcp,
         ManagementRow::Skills,
         ManagementRow::Prompts,
-        ManagementRow::Hooks,
         ManagementRow::Devices,
     ];
 
@@ -425,7 +420,6 @@ impl ManagementRow {
             ManagementRow::Mcp => Page::Mcp,
             ManagementRow::Skills => Page::Skills,
             ManagementRow::Prompts => Page::Prompts,
-            ManagementRow::Hooks => Page::Hooks,
             ManagementRow::Devices => Page::Devices,
         }
     }
@@ -450,7 +444,6 @@ pub struct ManagementData {
     pub mcp: Vec<vibex_core::McpServer>,
     pub skills: Vec<vibex_core::Skill>,
     pub prompts: Vec<vibex_core::Prompt>,
-    pub hooks: Vec<vibex_core::Hook>,
     pub backups: Vec<vibex_core::BackupCreateOutcome>,
     pub usage: Option<vibex_core::AgentUsageStatistics>,
     pub usage_session: Option<vibex_core::AgentTokenUsage>,
@@ -2183,7 +2176,6 @@ impl App {
             Page::Mcp => self.management_data.mcp.len(),
             Page::Skills => self.management_data.skills.len(),
             Page::Prompts => self.management_data.prompts.len(),
-            Page::Hooks => self.management_data.hooks.len(),
             Page::Settings => self.visible_settings().len(),
             Page::Agent => self.transcript.len(),
             Page::Usage | Page::Help => 0,
@@ -2689,7 +2681,6 @@ impl App {
             Page::Mcp => strings.management_mcp(),
             Page::Skills => strings.management_skills(),
             Page::Prompts => strings.management_prompts(),
-            Page::Hooks => strings.management_hooks(),
             Page::Devices => strings.devices_title(),
             Page::Usage => strings.nav_usage(),
             Page::Settings => strings.nav_settings(),
@@ -4571,10 +4562,6 @@ pub enum ManagementEntryEdit {
         prompt_id: vibex_core::PromptId,
         display_name: String,
     },
-    Hook {
-        hook_id: vibex_core::HookId,
-        display_name: String,
-    },
 }
 
 /// Asynchronous work the reducer asks the worker to perform.
@@ -4730,7 +4717,6 @@ pub enum Effect {
     ListMcp,
     ListSkills,
     ListPrompts,
-    ListHooks,
     ToggleMcp {
         server_id: vibex_core::McpServerId,
         enabled: bool,
@@ -4741,10 +4727,6 @@ pub enum Effect {
     },
     TogglePrompt {
         prompt_id: vibex_core::PromptId,
-        enabled: bool,
-    },
-    ToggleHook {
-        hook_id: vibex_core::HookId,
         enabled: bool,
     },
     LoadUsage,
@@ -4845,11 +4827,9 @@ impl Effect {
             Effect::ListMcp => "mcp",
             Effect::ListSkills => "skills",
             Effect::ListPrompts => "prompts",
-            Effect::ListHooks => "hooks",
-            Effect::ToggleMcp { .. }
-            | Effect::ToggleSkill { .. }
-            | Effect::TogglePrompt { .. }
-            | Effect::ToggleHook { .. } => "toggle_entry",
+            Effect::ToggleMcp { .. } | Effect::ToggleSkill { .. } | Effect::TogglePrompt { .. } => {
+                "toggle_entry"
+            }
             Effect::LoadUsage => "usage",
             Effect::DiscoverCompletions { .. } => "completions",
             Effect::CheckDrift => "drift",
@@ -5113,7 +5093,7 @@ mod tests {
         let pages = ManagementRow::ALL.map(ManagementRow::page);
         assert!(pages.contains(&Page::Devices));
         assert!(pages.contains(&Page::Providers));
-        assert_eq!(pages.len(), 7);
+        assert_eq!(pages.len(), 6);
     }
 
     #[test]

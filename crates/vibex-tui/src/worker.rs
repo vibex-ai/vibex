@@ -116,7 +116,6 @@ pub enum AppMessage {
     Mcp(BackendResult<Vec<vibex_core::McpServer>>),
     Skills(BackendResult<Vec<vibex_core::Skill>>),
     Prompts(BackendResult<Vec<vibex_core::Prompt>>),
-    Hooks(BackendResult<Vec<vibex_core::Hook>>),
     Completions {
         ticket: crate::app::ComposerTicket,
         result: BackendResult<Box<vibex_core::AgentCommandDiscovery>>,
@@ -907,10 +906,6 @@ impl Dispatch {
                 let result = self.facade.management().prompts().await;
                 self.send(AppMessage::Prompts(result));
             }
-            Effect::ListHooks => {
-                let result = self.facade.management().hooks().await;
-                self.send(AppMessage::Hooks(result));
-            }
             Effect::ToggleMcp { server_id, enabled } => {
                 let request = MutationRequest::new(vibex_core::McpServerUpdateRequest {
                     mcp_server_id: server_id,
@@ -979,27 +974,6 @@ impl Dispatch {
                     tags: None,
                 });
                 match self.facade.management().update_prompt(request).await {
-                    Ok(_) => self.ok("toggle_entry"),
-                    Err(error) => self.failure("toggle_entry", error),
-                }
-            }
-            Effect::ToggleHook { hook_id, enabled } => {
-                let request = MutationRequest::new(vibex_core::HookUpdateRequest {
-                    hook_id,
-                    display_name: None,
-                    provider_kind: None,
-                    event_kind: None,
-                    status: Some(if enabled {
-                        vibex_core::HookStatus::Enabled
-                    } else {
-                        vibex_core::HookStatus::Disabled
-                    }),
-                    install_state: None,
-                    command_preview: None,
-                    managed_marker: None,
-                    description: None,
-                });
-                match self.facade.management().update_hook(request).await {
                     Ok(_) => self.ok("toggle_entry"),
                     Err(error) => self.failure("toggle_entry", error),
                 }
@@ -1304,25 +1278,6 @@ impl Dispatch {
                     body: None,
                     description: None,
                     tags: None,
-                }))
-                .await
-                .map(|_| ()),
-            ManagementEntryEdit::Hook {
-                hook_id,
-                display_name,
-            } => self
-                .facade
-                .management()
-                .update_hook(MutationRequest::new(vibex_core::HookUpdateRequest {
-                    hook_id,
-                    display_name: Some(display_name),
-                    provider_kind: None,
-                    event_kind: None,
-                    status: None,
-                    install_state: None,
-                    command_preview: None,
-                    managed_marker: None,
-                    description: None,
                 }))
                 .await
                 .map(|_| ()),

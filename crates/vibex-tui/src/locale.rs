@@ -585,7 +585,6 @@ strings! {
     management_mcp => { "MCP servers", "MCP 服务", "MCP 服務" },
     management_skills => { "Skills", "技能", "技能" },
     management_prompts => { "Prompts", "提示词", "提示詞" },
-    management_hooks => { "Hooks", "钩子", "鉤子" },
     management_devices => { "Devices", "设备", "裝置" },
     management_scheduled => { "Scheduled tasks", "定时任务", "定時任務" },
     management_automation => { "Automation", "自动化", "自動化" },
