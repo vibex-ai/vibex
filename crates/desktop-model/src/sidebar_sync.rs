@@ -1220,6 +1220,49 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_session_filed_into_a_folder_projects_inside_it() {
+        let mut view = view_with_folder();
+        let sessions = [
+            "session-a".to_string(),
+            "session-b".to_string(),
+            "session-fresh".to_string(),
+        ];
+        let mut session_projects = session_projects();
+        session_projects.insert("session-fresh".to_string(), "project-1".to_string());
+
+        // The new-session flow hands the tree a session with no placement of its
+        // own, and files it into the folder the user started it from.
+        assert!(view.organization.place_into_folder(
+            &SidebarOrganizationItem::Session("session-fresh".into()),
+            "folder-1",
+            &session_projects,
+        ));
+
+        let root = sidebar_project_items(
+            &view.organization,
+            "project-1",
+            &sessions,
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(
+            !root.contains(&SidebarOrganizationItem::Session("session-fresh".into())),
+            "a filed session must not also be offered at the project root"
+        );
+        let children = sidebar_project_items(
+            &view.organization,
+            "project-1",
+            &sessions,
+            &BTreeSet::new(),
+            Some("folder-1"),
+        );
+        assert_eq!(
+            children,
+            [SidebarOrganizationItem::Session("session-fresh".into())]
+        );
+    }
+
+    #[test]
     fn workspace_folder_projection_isolated_from_sibling_worktrees() {
         let mut view = SidebarOrganizationView::default();
         assert!(view.organization.create_folder_with_workspace(

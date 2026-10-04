@@ -7016,6 +7016,10 @@ pub struct VibexWorkbench {
     pending_new_session: Option<PendingNewSession>,
     pending_new_session_titles: HashMap<String, String>,
     pending_initial_turn_interrupts: BTreeMap<String, watch::Sender<bool>>,
+    /// The sidebar folder the open new-session draft was started from, when the
+    /// user asked for it with a folder row's new-chat action. The session the
+    /// draft creates is filed under that folder instead of the project root.
+    new_session_folder_id: Option<String>,
     new_session_open: bool,
     new_session_draft_initialized: bool,
     new_session_project_menu_open: bool,
@@ -7996,6 +8000,7 @@ impl VibexWorkbench {
             pending_new_session: None,
             pending_new_session_titles: HashMap::new(),
             pending_initial_turn_interrupts: BTreeMap::new(),
+            new_session_folder_id: None,
             new_session_open: false,
             new_session_draft_initialized: false,
             new_session_project_menu_open: false,
@@ -25714,6 +25719,9 @@ impl VibexWorkbench {
         }
         let initialize_draft = !self.new_session_draft_initialized;
         self.new_session_open = true;
+        // A draft that is re-opened starts unowned again; only a folder row's
+        // new-chat action re-aims it, and it does so after this call.
+        self.new_session_folder_id = None;
         self.sync_agent_streaming_surface_visibility();
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
@@ -25776,6 +25784,7 @@ impl VibexWorkbench {
     fn clear_submitted_new_session_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_new_session_message_draft(window, cx);
         self.new_session_draft_initialized = false;
+        self.new_session_folder_id = None;
         self.new_session_workspace.reset_after_success();
     }
 
@@ -25815,6 +25824,7 @@ impl VibexWorkbench {
             previous_session_id: self.selected_session_id.clone(),
         });
         self.upsert_session_snapshot(session);
+        self.file_new_session_in_folder(&session_id);
         self.reconcile_sidebar_state();
         self.publish_sidebar_invalidation();
         self.optimistic_runtime_selections
@@ -26068,6 +26078,143 @@ impl VibexWorkbench {
         self.probe_new_session_eligibility(ticket, window, cx);
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
         cx.notify();
+    }
+
+    /// Opens the new-session page on the project or Worktree `folder_id`
+    /// belongs to, and remembers the folder so the session the page creates is
+    /// filed under it.
+    ///
+    /// A folder no project owns only groups root items, and the organization
+    /// tree refuses to file a session into it, so such a folder starts nothing.
+    /// A folder that names a Worktree resolves to that Worktree while it is
+    /// still known and falls back to its project when it is not, the same way
+    /// the row itself still renders.
+    fn open_new_session_in_folder(
+        &mut self,
+        folder_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.new_session_target_for_folder(&folder_id) else {
+            return;
+        };
+        // Opening the page clears the folder, so the folder that owns this
+        // draft is recorded after it, and only once it is known to be startable.
+        self.open_new_session(Some(target), window, cx);
+        self.new_session_folder_id = Some(folder_id.clone());
+        self.reveal_sidebar_folder(&folder_id);
+        cx.notify();
+    }
+
+    /// The project or Worktree a folder row's new-chat action starts a session
+    /// in.
+    fn new_session_target_for_folder(&self, folder_id: &str) -> Option<NewSessionOpenTarget> {
+        let folder = self.ui_state.sidebar.organization.folder(folder_id)?;
+        let project_id = folder.project_id.as_deref()?;
+        if !self
+            .workspaces
+            .iter()
+            .any(|(project, _)| project.id.as_str() == project_id)
+        {
+            return None;
+        }
+        folder
+            .workspace_id
+            .as_deref()
+            .and_then(|workspace_id| vibex_core::WorkspaceId::parse(workspace_id).ok())
+            .filter(|workspace_id| {
+                self.workspaces
+                    .iter()
+                    .any(|(_, workspace)| workspace.id == *workspace_id)
+            })
+            .map(NewSessionOpenTarget::Workspace)
+            .or_else(|| {
+                ProjectId::parse(project_id)
+                    .ok()
+                    .map(NewSessionOpenTarget::Project)
+            })
+    }
+
+    /// Opens the sidebar down to `folder_id`, the way folder creation reveals
+    /// the folder it just made. A session started from a folder row has to be
+    /// visible in that folder once it exists.
+    fn reveal_sidebar_folder(&mut self, folder_id: &str) {
+        let Some(folder) = self
+            .ui_state
+            .sidebar
+            .organization
+            .folder(folder_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.ui_state
+            .sidebar
+            .organization
+            .collapsed_folder_ids
+            .remove(folder_id);
+        self.reveal_sidebar_organization_ancestors(SidebarOrganizationItem::Folder(
+            folder_id.to_string(),
+        ));
+        if let Some(project_id) = folder.project_id.as_ref() {
+            self.sidebar_state.collapsed_ids.remove(project_id);
+        }
+        if let Some(workspace_id) = folder.workspace_id.as_ref() {
+            self.ui_state
+                .sidebar
+                .collapsed_workspace_ids
+                .remove(workspace_id);
+        }
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+    }
+
+    /// Files a session created from a folder row's new-chat action under that
+    /// folder. The placement is written before the sidebar reconciles, so the
+    /// session never spends a frame at the project root.
+    fn file_new_session_in_folder(&mut self, session_id: &VibexSessionId) {
+        let Some(folder_id) = self.new_session_folder_id.clone() else {
+            return;
+        };
+        let Some(session_workspace_id) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == *session_id)
+            .map(|session| session.workspace_id.as_str().to_string())
+        else {
+            return;
+        };
+        // A folder scoped to one Worktree only lists that Worktree's sessions,
+        // so a draft that moved to another Worktree is left at the project root
+        // instead of being filed where the sidebar would never show it.
+        let folder_lists_the_session = self
+            .ui_state
+            .sidebar
+            .organization
+            .folder(&folder_id)
+            .is_some_and(|folder| {
+                folder
+                    .workspace_id
+                    .as_deref()
+                    .is_none_or(|workspace_id| workspace_id == session_workspace_id)
+            });
+        if !folder_lists_the_session {
+            return;
+        }
+        let session_projects = self.sidebar_session_projects();
+        if !self.ui_state.sidebar.organization.place_into_folder(
+            &SidebarOrganizationItem::Session(session_id.as_str().to_string()),
+            &folder_id,
+            &session_projects,
+        ) {
+            return;
+        }
+        self.ui_state
+            .sidebar
+            .organization
+            .collapsed_folder_ids
+            .remove(&folder_id);
+        self.queue_ui_state();
     }
 
     fn probe_new_session_eligibility(
@@ -36988,6 +37135,15 @@ impl VibexWorkbench {
         let menu_project_id = project_id;
         let menu_workspace_id = context_workspace_id.clone();
         let menu_entity = cx.weak_entity();
+        // Only a folder some project owns can hold a session, so only such a
+        // folder offers to start one.
+        let folder_starts_sessions = self
+            .ui_state
+            .sidebar
+            .organization
+            .folder(&folder_id)
+            .is_some_and(|folder| folder.project_id.is_some());
+        let new_session_folder_id = folder_id.clone();
         let rename_error = renaming
             .then(|| self.sidebar_rename_error.clone())
             .flatten();
@@ -37295,7 +37451,9 @@ impl VibexWorkbench {
                                     div()
                                         .id(format!("sidebar-folder-actions-{folder_id}"))
                                         .flex_none()
-                                        .size(px(24.0))
+                                        .h(px(24.0))
+                                        .items_center()
+                                        .gap(px(2.0))
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation()
                                         })
@@ -37329,6 +37487,36 @@ impl VibexWorkbench {
                                                 })
                                                 .anchor(gpui::Anchor::TopRight),
                                         )
+                                        .when(folder_starts_sessions, |this| {
+                                            let new_session_label =
+                                                sidebar_new_session_for_folder_label(
+                                                    self.resolved_locale(),
+                                                    &folder_name,
+                                                );
+                                            this.child(
+                                                Button::new(format!(
+                                                    "sidebar-folder-new-{folder_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(IconName::Plus)
+                                                .accessibility_label(new_session_label.clone())
+                                                .tooltip(new_session_label)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_new_session_in_folder(
+                                                            new_session_folder_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                            )
+                                        })
                                         .invisible()
                                         .group_hover(&hover_group, |style| style.visible()),
                                 )
@@ -59765,6 +59953,17 @@ fn sidebar_new_session_for_project_label(
     }
 }
 
+fn sidebar_new_session_for_folder_label(
+    locale: locale::ResolvedLocale,
+    folder_name: &str,
+) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("New chat in folder {folder_name}"),
+        locale::ResolvedLocale::ZhCn => format!("在「{folder_name}」文件夹中新建会话"),
+        locale::ResolvedLocale::ZhTw => format!("在「{folder_name}」資料夾中建立會話"),
+    }
+}
+
 fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &str) -> String {
     match locale {
         locale::ResolvedLocale::En => {
@@ -77434,6 +77633,83 @@ mod tests {
         assert!(source.contains("finish_sidebar_rename_on_blur"));
         assert!(creation.contains("self.sidebar_state.collapsed_ids.remove(&project_id)"));
         assert!(creation.contains("self.queue_agent_ui_state()"));
+    }
+
+    #[test]
+    fn sidebar_folder_rows_start_a_session_that_lands_in_the_folder() {
+        let source = include_str!("app.rs");
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        assert!(folder.contains("let folder_starts_sessions = self"));
+        assert!(folder.contains("is_some_and(|folder| folder.project_id.is_some())"));
+        assert!(folder.contains(".when(folder_starts_sessions, |this| {"));
+        assert!(folder.contains("sidebar-folder-new-{folder_id}"));
+        assert!(folder.contains("IconName::Plus"));
+        assert!(folder.contains("this.open_new_session_in_folder("));
+        assert!(folder.contains("sidebar_new_session_for_folder_label("));
+        // The glyph is the whole control, so it carries the tooltip text as its
+        // accessible name too.
+        assert!(folder.contains(".accessibility_label(new_session_label.clone())"));
+        assert!(folder.contains(".tooltip(new_session_label)"));
+        assert!(source.contains("fn sidebar_new_session_for_folder_label("));
+
+        let opening = source
+            .split_once("    fn open_new_session_in_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn new_session_target_for_folder("))
+            .map(|(body, _)| body)
+            .expect("folder-started drafts should remain inspectable");
+        assert!(
+            opening.contains(
+                "let Some(target) = self.new_session_target_for_folder(&folder_id) else {"
+            )
+        );
+        assert!(opening.contains("self.open_new_session(Some(target), window, cx);"));
+        assert!(opening.contains("self.new_session_folder_id = Some(folder_id.clone());"));
+        assert!(opening.contains("self.reveal_sidebar_folder(&folder_id);"));
+
+        let resolution = source
+            .split_once("    fn new_session_target_for_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reveal_sidebar_folder("))
+            .map(|(body, _)| body)
+            .expect("folder targeting should remain inspectable");
+        assert!(resolution.contains("let project_id = folder.project_id.as_deref()?;"));
+        assert!(resolution.contains("project.id.as_str() == project_id"));
+        assert!(resolution.contains(".map(NewSessionOpenTarget::Workspace)"));
+        assert!(resolution.contains(".map(NewSessionOpenTarget::Project)"));
+
+        // The session has to be filed before the sidebar reconciles, or the row
+        // spends a frame at the project root before moving into the folder.
+        let registration = source
+            .split_once("    fn open_pending_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
+            .map(|(body, _)| body)
+            .expect("pending new-session registration should remain inspectable");
+        let upsert = registration
+            .find("self.upsert_session_snapshot(session);")
+            .expect("the optimistic row should be published first");
+        let file = registration
+            .find("self.file_new_session_in_folder(&session_id);")
+            .expect("a folder-owned draft should file its session");
+        let reconcile = registration
+            .find("self.reconcile_sidebar_state();")
+            .expect("the sidebar should reconcile after the row exists");
+        assert!(upsert < file && file < reconcile);
+
+        let filing = source
+            .split_once("    fn file_new_session_in_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_new_session_eligibility("))
+            .map(|(body, _)| body)
+            .expect("folder filing should remain inspectable");
+        assert!(filing.contains("organization.place_into_folder("));
+        assert!(
+            filing.contains("SidebarOrganizationItem::Session(session_id.as_str().to_string())")
+        );
+        assert!(filing.contains("is_none_or(|workspace_id| workspace_id == session_workspace_id)"));
+        assert!(filing.contains("collapsed_folder_ids"));
+        assert!(source.contains("self.new_session_folder_id = None;\n        self.new_session_workspace.reset_after_success();"));
     }
 
     #[test]
