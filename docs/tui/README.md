@@ -67,10 +67,11 @@ desktop app, or connect to another runtime with `vibex connect`.
 ## Screen composition
 
 One vertical stack of full-width bands — status, transcript, turn status,
-composer, shortcut bar. There are no permanently-boxed side panes: every border
-costs two columns or two rows that the content does not get, and on a fixed grid
-that is the whole budget. The transcript is what is being read, so it takes the
-full width, and message surfaces and expandable work rows give it structure.
+composer, and a shortcut bar on the pages that are navigated rather than written
+on. There are no permanently-boxed side panes: every border costs two columns or
+two rows that the content does not get, and on a fixed grid that is the whole
+budget. The transcript is what is being read, so it takes the full width, and
+message surfaces and expandable work rows give it structure.
 
 Navigation that would otherwise be a permanent column is a full-screen view
 (Sessions, Management) or an overlay, which is also the only way a session
@@ -171,8 +172,10 @@ away. Idle remains static. Running turns animate even while waiting for a tool o
 
 The draft sits on a padded background without a frame or repeated session title.
 Its height follows wrapped text, and long drafts scroll to keep the caret visible.
-Below it, one line names the Agent, model and run options. The shortcut row
-prioritizes the actions available at the current focus.
+An empty box names the draft's own vocabulary — `/ commands @ files $ skills`,
+in the reader's language — because that is the one place a reader looks when
+there is nothing to read. Below the box, one line names the Agent, model and run
+options.
 
 A paste of four or more lines (or one over 10 KB) collapses into a chip —
 `[Pasted: 42 lines]` — instead of burying the draft. The chip is one object:
@@ -307,6 +310,13 @@ The workspace appears on the left. Connection warnings, context usage and the
 current seat appear on the right. A ready connection does not label a running
 turn as complete; the turn status row reports whether work is active.
 
+The location is chrome, not a status: it is drawn in the bright grey a secondary
+label gets, so colour on that row means something happened rather than where the
+reader is. A path too long for its third of the row folds its folders to their
+initials first — `/h/p/c/p/c/node_modules` — and only drops the head behind an
+ellipsis when even that will not fit, because the tail is the part that names
+the directory.
+
 ### Composer modes
 
 The prefix says what the draft will do, in the place the reader is already
@@ -326,10 +336,14 @@ selection marker so the highlighted row lines up with the text being typed.
 
 ### Shortcut band
 
-Keys and labels are separated by middots. The row prioritizes send and newline
-while composing, and expand, details and reply while browsing the transcript.
-Runtime switching remains available through `Ctrl+G`. Hints use the current
-keymap, and clicking a hint runs the same action as its key.
+Keys and labels are separated by middots. The row belongs to the pages that are
+navigated — the session list and the management pages — and is not drawn on the
+pages a message is written on: a session page spends that row on the draft
+instead, and everything the band would advertise is a `?` away. Where it is
+drawn it prioritizes the actions available at the current focus: send and
+newline while composing, expand, details and reply while browsing the
+transcript. Runtime switching remains available through `Ctrl+G`. Hints use the
+current keymap, and clicking a hint runs the same action as its key.
 
 ## Pages
 
@@ -432,8 +446,9 @@ chosen, and one who opened it from the list stays on the list.
 asked to *write*, so the page hands them the composer with the mark above it and
 the runtime the message will go through named under that — the Agent and model,
 the workspace, and the keys that change both (`Ctrl+G` for the runtime, `Ctrl+W`
-for the directory). The draft's own vocabulary is spelled out there too, because
-this is the one screen where a reader has nothing else to read.
+for the directory). The draft's vocabulary is not repeated on the page: the
+empty composer under it spells out `/ commands @ files $ skills` itself, and the
+box is read every time it is written in where the hero is read once.
 
 The session is created by *sending*, not by answering a dialog: the title comes
 from the message, which is where a title comes from anyway. Sending leaves the

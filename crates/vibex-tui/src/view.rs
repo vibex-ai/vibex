@@ -622,7 +622,11 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         // measured by [`composer_height`] once the band's width is known.
         prompt: 0,
         prompt_gap: u16::from(app.page.is_session_page()),
-        shortcuts: 1,
+        // The pages a reader writes on spend their last row on the draft rather
+        // than on a legend: the composer's own line already names the runtime,
+        // and every key the bar would advertise is one `?` away. The pages that
+        // are navigated rather than written on keep it.
+        shortcuts: u16::from(!app.page.is_session_page()),
         status_line: 0,
     }
 }
@@ -2065,16 +2069,70 @@ fn render_status_band(
     render_zoned_line(frame, area, left, None, right);
 }
 
-/// Shorten a path from the left so the last components stay readable.
+/// Shorten a path so the last components stay readable.
 ///
 /// The tail of a path is what identifies it; `/home/dev/…/net/upload.rs` is
-/// more useful than `/home/dev/code/peatboy/vibex-dev/vib…`.
+/// more useful than `/home/dev/code/peatboy/vibex-dev/vib…`. Before the head is
+/// dropped, its folders fold to their initials — `/h/d/c/v/c/vibex-tui` still
+/// says how deep the path is and which branch of it the reader is on, and the
+/// final name is never touched.
 pub fn compact_path(path: &str, budget: usize) -> String {
     if display_width(path) <= budget || budget < 8 {
         return path.to_string();
     }
+    let abbreviated = abbreviate_components(path);
+    if display_width(&abbreviated) <= budget {
+        return abbreviated;
+    }
     let suffix = take_width_from_end(path, budget.saturating_sub(2));
     format!("…/{suffix}")
+}
+
+/// Fold every component but the last to its first character.
+///
+/// `/home/dev/code/vibex/crates/vibex-tui` becomes `/h/d/c/v/c/vibex-tui`: the
+/// ancestors still read as the path they are, and the component that names the
+/// place — the directory a session works in — keeps its whole name, because a
+/// row of initials alone would not say where the reader is.
+fn abbreviate_components(path: &str) -> String {
+    // A path with no separator at all (`C:`) has no ancestor to fold and is
+    // left as it is rather than mangled.
+    let Some(cut) = path.rfind(is_path_separator) else {
+        return path.to_string();
+    };
+    let (head, tail) = path.split_at(cut + 1);
+    let mut out = String::with_capacity(path.len());
+    let mut start = 0usize;
+    for (index, character) in head.char_indices() {
+        if !is_path_separator(character) {
+            continue;
+        }
+        out.push_str(fold_component(&head[start..index]));
+        out.push(character);
+        start = index + character.len_utf8();
+    }
+    out.push_str(tail);
+    out
+}
+
+/// One ancestor, shortened to its initial.
+///
+/// A volume is not a folder name: `C:` stays whole, because `C` alone would
+/// stop saying which drive the reader is on.
+fn fold_component(component: &str) -> &str {
+    if component.ends_with(':') {
+        return component;
+    }
+    match component.char_indices().nth(1) {
+        Some((index, _)) => &component[..index],
+        None => component,
+    }
+}
+
+/// Both separators, because the runtime's working directory may be a Windows
+/// path and the status band must not print it whole just because of a `\`.
+fn is_path_separator(character: char) -> bool {
+    character == '/' || character == '\\'
 }
 
 /// The last `budget` columns of a path, starting at a component boundary.
@@ -2091,7 +2149,7 @@ fn take_width_from_end(path: &str, budget: usize) -> String {
     }
     // Start at the next component boundary so a truncated name does not appear
     // as a fragment of its parent.
-    match path[start..].find('/') {
+    match path[start..].find(is_path_separator) {
         Some(offset) if offset + 1 < path.len() - start => path[start + offset + 1..].to_string(),
         _ => path[start..].to_string(),
     }
@@ -2182,9 +2240,9 @@ fn render_new_session(
     let lit = app.composing_page_shines();
     let mark = crate::logo::rows(theme, app.animation_phase(), lit);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Room for the mark, a blank row, the lines under it and the hint, or the
-    // mark is dropped and the words speak for themselves.
-    let mark_fits = area.height as usize >= mark.len() + 9;
+    // Room for the mark, a blank row and the lines under it, or the mark is
+    // dropped and the words speak for themselves.
+    let mark_fits = area.height as usize >= mark.len() + 8;
     if mark_fits {
         lines.push(Line::from(""));
         let indent = usize::from(area.width).saturating_sub(crate::logo::width(theme.glyphs())) / 2;
@@ -2227,7 +2285,8 @@ fn render_new_session(
         Some(strings.runtime_switch_hint()),
     ));
     // A path is longer than any terminal: the tail is the part that says where
-    // the session will work, so that is the part kept.
+    // the session will work, so that is the part kept whole while the folders
+    // above it fold to their initials.
     lines.push(setting_row(
         area.width,
         strings.session_workspace_label(),
@@ -2235,30 +2294,10 @@ fn render_new_session(
         theme,
         Some(strings.workspace_switch_hint()),
     ));
-    lines.push(Line::from(""));
 
-    // The draft's own vocabulary, spelled out: the page is the one place a
-    // first-time reader has nothing else to read.
-    let hints = [
-        ("/", strings.composer_command_menu()),
-        ("@", strings.composer_file_menu()),
-        ("$", strings.composer_skill_menu()),
-    ];
-    let mut spans = vec![Span::raw("  ")];
-    for (index, (key, label)) in hints.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled("  ", theme.dimmed(theme.roles.gray_dim)));
-        }
-        spans.push(Span::styled(
-            format!("{key} "),
-            Style::default().fg(theme.roles.accent_user),
-        ));
-        spans.push(Span::styled(
-            label.to_string(),
-            theme.dimmed(theme.roles.gray),
-        ));
-    }
-    lines.push(Line::from(spans));
+    // The draft's vocabulary is not repeated here: the empty composer under
+    // this page spells out `/ commands @ files $ skills` itself, and the page
+    // is read once while the box is read every time it is written in.
 
     // Centred as a block, the way the desktop's page is: the mark sits over the
     // prompt it belongs to rather than hanging at the top of a tall band.
@@ -2294,7 +2333,7 @@ fn setting_row(
         .saturating_sub(padded.chars().count() + hint.chars().count() + 2)
         .max(8);
     // A path keeps its tail — the directory the session works in is the end of
-    // it — and anything else keeps its head.
+    // it — and folds its ancestors to initials rather than losing them.
     let value = compact_path(value, budget);
     let used = padded.chars().count() + value.chars().count() + hint.chars().count() + 2;
     let indent = usize::from(width).saturating_sub(used) / 2;
@@ -2537,6 +2576,20 @@ fn empty_state(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, message: &st
     );
 }
 
+/// The empty composer's hint: one sigil per completion drawer, named in the
+/// reader's own language.
+///
+/// The words come from the same copy the drawers title themselves with, so the
+/// hint cannot describe a menu under a name the menu does not use.
+fn composer_vocabulary(strings: Strings) -> String {
+    format!(
+        "/ {} @ {} $ {}",
+        strings.composer_command_menu(),
+        strings.composer_file_menu(),
+        strings.composer_skill_menu()
+    )
+}
+
 /// Draw the composer.
 ///
 /// The composer is the one place the user types, so it gets the interface's
@@ -2613,14 +2666,16 @@ fn render_composer(
     app.regions.composer_scroll = 0;
     if app.composer.text().is_empty() {
         // The placeholder explains the mode rather than the product: the mode is
-        // the thing the reader cannot guess from an empty box.
+        // the thing the reader cannot guess from an empty box. In the ordinary
+        // mode the box is also where the draft's vocabulary is spelled out —
+        // the one place a reader looks when it is empty.
         let placeholder = match app.composer_mode {
             ComposerMode::Shell => strings.mode_shell().to_string(),
             ComposerMode::HistorySearch => strings.composer_history().to_string(),
             ComposerMode::Normal if running => {
                 format!("{} · Ctrl+S", strings.composer_steer())
             }
-            ComposerMode::Normal => strings.composer_placeholder().to_string(),
+            ComposerMode::Normal => composer_vocabulary(strings),
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -5748,6 +5803,41 @@ mod tests {
     fn transcript_width_leaves_room_for_the_frame() {
         let width = transcript_width(ShellKind::Wide, 160);
         assert!(width > 40 && width < 160);
+    }
+
+    #[test]
+    fn a_long_path_folds_its_folders_to_initials_before_dropping_its_head() {
+        // The tail — the directory the session works in — is the part that
+        // identifies the path, so it stays whole while its ancestors fold to one
+        // letter each. `/h/d/c/v/c/vibex-tui` still says how deep the reader is.
+        assert_eq!(
+            compact_path("/home/dev/code/vibex/crates/vibex-tui", 24),
+            "/h/d/c/v/c/vibex-tui"
+        );
+        // A path that already fits is never touched.
+        assert_eq!(compact_path("/tmp/work", 24), "/tmp/work");
+        // Cheap to compute even when it does not help: the caller's budget is
+        // what decides, not the path's shape.
+        assert_eq!(compact_path("vibex-tui", 4), "vibex-tui");
+    }
+
+    #[test]
+    fn a_path_too_long_even_for_initials_falls_back_to_its_tail() {
+        let compact = compact_path("/home/dev/code/vibex/crates/vibex-tui", 12);
+        assert!(display_width(&compact) <= 12, "{compact}");
+        assert!(compact.starts_with('…'), "{compact}");
+        assert!(compact.ends_with("vibex-tui"), "{compact}");
+    }
+
+    #[test]
+    fn a_windows_path_folds_on_its_own_separator() {
+        // The runtime's working directory may be a Windows path, and the status
+        // band must not print it whole just because the separator is a `\`. The
+        // volume is not a folder, so its colon survives the fold.
+        assert_eq!(
+            compact_path(r"C:\Users\dev\code\vibex\crates\vibex-tui", 24),
+            r"C:\U\d\c\v\c\vibex-tui"
+        );
     }
 
     #[test]

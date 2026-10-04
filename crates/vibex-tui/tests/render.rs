@@ -205,7 +205,7 @@ fn the_shortcuts_band_is_the_last_row() {
 }
 
 #[test]
-fn the_prompt_sits_directly_above_the_shortcuts_band() {
+fn the_prompt_is_the_last_band_on_a_session_page() {
     let mut app = app(120, 40);
     // The composer belongs to a session view.
     app.navigate_to(Page::Agent);
@@ -215,20 +215,47 @@ fn the_prompt_sits_directly_above_the_shortcuts_band() {
         .iter()
         .position(|line| line.contains('❯'))
         .expect("the prompt is on screen");
-    // One padding row, then runtime context and the shortcuts.
+    // One padding row, then the info line, then the outer padding: nothing is
+    // drawn between the prompt and the bottom of the screen.
     assert!(lines[prompt_row + 1].trim().is_empty());
-    let band_row = lines
-        .iter()
-        .position(|line| line.contains("Ctrl+P"))
-        .expect("the shortcut band is on screen");
     assert!(
-        band_row > prompt_row + 1,
-        "the shortcut band is above the prompt:\n{}",
+        !lines[prompt_row + 2].trim().is_empty(),
+        "the prompt's info line is missing:\n{}",
+        lines.join("\n")
+    );
+    assert_eq!(
+        prompt_row + 2,
+        lines.len() - 2,
+        "something is drawn under the prompt:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn a_session_page_draws_no_shortcut_band() {
+    // The pages a reader writes on spend their last row on the draft: the
+    // composer's own line names the runtime, and every key the band would
+    // advertise is a `?` away.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    let lines = render(&mut app, 120, 40);
+    assert!(
+        !lines.iter().any(|line| line.contains("Ctrl+P")),
+        "the session page still draws the key bar:\n{}",
         lines.join("\n")
     );
     assert!(
-        band_row >= lines.len() - 3,
-        "the shortcut band is not at the bottom:\n{}",
+        !lines.iter().any(|line| line.contains("Ctrl+Q")),
+        "the session page still draws the key bar:\n{}",
+        lines.join("\n")
+    );
+
+    // The list page keeps it: that page is navigated rather than written on.
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    let lines = render(&mut app, 120, 40);
+    assert!(
+        lines.iter().any(|line| line.contains("Ctrl+P")),
+        "the list page lost the key bar:\n{}",
         lines.join("\n")
     );
 }
@@ -371,10 +398,9 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
         lines.iter().any(|line| line.contains("gpt-5")),
         "the prompt does not name its model:\n{screen}"
     );
-    assert!(
-        lines.iter().any(|line| line.contains("Ctrl+G")),
-        "the prompt does not advertise the runtime switch:\n{screen}"
-    );
+    // The switcher's key is not advertised on a session page — the key legend
+    // lives behind `?` there — so what the prompt owes the reader is the
+    // runtime it is actually on, never a catalogue entry it is not.
     assert!(
         !screen.contains("claude-sonnet"),
         "the prompt named a catalogue entry the session is not on:\n{screen}"
@@ -3346,15 +3372,19 @@ fn the_frames_click_regions_do_not_accumulate() {
     // layout that no longer exists, and a list that only ever grows both leaks
     // and lets a click land on a row that has moved.
     let mut app = app(120, 40);
-    app.navigate_to(Page::Agent);
+    // The key legend belongs to the list page, so that is where the hint rects
+    // are published and where the leak would show.
     let _ = render(&mut app, 120, 40);
     let hints = app.regions.hints.len();
-    let turns = app.regions.turns.len();
+    assert!(hints > 0, "the frame published no hints");
     for _ in 0..3 {
         let _ = render(&mut app, 120, 40);
     }
-    assert!(hints > 0, "the frame published no hints");
     assert_eq!(app.regions.hints.len(), hints, "the hint list grew");
+
+    app.navigate_to(Page::Agent);
+    let _ = render(&mut app, 120, 40);
+    let turns = app.regions.turns.len();
     assert_eq!(app.regions.turns.len(), turns, "the turn list grew");
 
     // A session with turns publishes one rect per visible tick, and no more.
@@ -3581,19 +3611,22 @@ fn starting_a_session_lands_on_a_page_with_the_prompt_in_it() {
         screen.contains("New session"),
         "the page does not name itself:\n{screen}"
     );
+    // The empty composer is where the draft's vocabulary is spelled out, and it
+    // is the only place: the page itself used to repeat the same three words.
+    assert_eq!(
+        screen.matches("/ Commands").count(),
+        1,
+        "the prompt's vocabulary is not in the composer exactly once:\n{screen}"
+    );
     assert!(
-        screen.contains("Send a message"),
-        "the prompt is not on the page:\n{screen}"
+        screen.contains("@ Files") && screen.contains("$ Skills"),
+        "the prompt's vocabulary is incomplete:\n{screen}"
     );
     // The runtime the message will go through is named on the page *and* on the
     // composer's own line, because choosing it is what the page is for.
     assert!(
         screen.contains("Ctrl+G"),
         "the runtime switch is not offered:\n{screen}"
-    );
-    assert!(
-        screen.contains("Commands") && screen.contains("Files"),
-        "the draft's vocabulary is not spelled out:\n{screen}"
     );
 }
 
@@ -3934,7 +3967,7 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
         "the page offers to steer a turn it does not have:\n{page_screen}"
     );
     assert!(
-        page_screen.contains("Send a message"),
+        page_screen.contains("/ Commands"),
         "the empty page does not offer its own prompt:\n{page_screen}"
     );
 }

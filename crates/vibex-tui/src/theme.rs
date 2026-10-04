@@ -299,7 +299,10 @@ impl Default for ColorCapability {
 ///   how a reader tells a tool call from a thought without reading the label;
 /// * **grey** — three steps, because "dim punctuation", "muted body" and
 ///   "secondary label" are three different jobs;
-/// * **semantic** — a command is not an error is not a path.
+/// * **semantic** — a command is not an error. `path` is the exception that
+///   proves the rule: a location is where the reader already is, so it takes the
+///   secondary grey rather than a hue, and colour on a status row keeps meaning
+///   "something happened".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeRole {
     // ---- surfaces -------------------------------------------------------
@@ -348,6 +351,8 @@ pub struct ThemeRole {
     pub warning: Color,
     pub danger: Color,
     pub command: Color,
+    /// Where the reader is. Deliberately not a hue: a path is chrome, and on the
+    /// status row colour has to keep meaning a state rather than a location.
     pub path: Color,
     /// A hyperlink's label. Its own colour rather than `accent`, which several
     /// themes resolve to the foreground and would leave a link looking like
@@ -525,6 +530,14 @@ impl TuiTheme {
         };
         let background_rgb = token("background", default_bg);
         let foreground_rgb = token("foreground", default_fg);
+        // The bright step of the grey scale, named once: the status band's
+        // location is a secondary label rather than a status of its own, so it
+        // wears the same grey.
+        let bright_rgb = mix_rgb(
+            token("muted-foreground", foreground_rgb),
+            foreground_rgb,
+            0.35,
+        );
         let color = |rgb: u32| {
             capability
                 .color(rgb)
@@ -548,11 +561,7 @@ impl TuiTheme {
             // Three greys derived from the one the catalogue ships: the bright
             // step leans toward the foreground, the dim step away from it. A
             // single muted token cannot carry three jobs.
-            gray_bright: color(mix_rgb(
-                token("muted-foreground", foreground_rgb),
-                foreground_rgb,
-                0.35,
-            )),
+            gray_bright: color(bright_rgb),
             gray: color(token("muted-foreground", foreground_rgb)),
             gray_dim: color(mix_rgb(
                 token("muted-foreground", foreground_rgb),
@@ -584,7 +593,11 @@ impl TuiTheme {
             warning: color(token("warning", 0xd8a123)),
             danger: color(token("destructive", 0xd6453f)),
             command: color(token("chart-category-4", 0xd8a94a)),
-            path: color(token("chart-category-6", 0xd88a5a)),
+            // Where the reader already is, not a status to notice: the chart
+            // series' orange made the location read as a warning — the same
+            // family of hue as `danger` — so it wears the bright grey a
+            // secondary label gets and lets colour mean "something happened".
+            path: color(bright_rgb),
             link: color(token("chart-category-2", 0x5aa6d8)),
 
             diff_insert: color(token("right-rail-status-added", 0x3fae6a)),

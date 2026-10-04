@@ -150,7 +150,7 @@ outer padding (1 row top/bottom, 2 columns each side)
   [gap] [dock]         the running-work panel, while it is open
   prompt gap           1 row
   prompt               padded draft surface + separate runtime info line
-  shortcut band        1 row, always last
+  shortcut band        1 row, last — only where the page is navigated, not written on
 outer padding
 ```
 
@@ -193,6 +193,12 @@ Rules that make this work:
   scrolls under the caret and republishes the rows it scrolled as
   `FrameRegions::composer_scroll`, which is what a click adds back to map a
   visible row onto the row the draft wrapped to.
+* **The key legend belongs to the pages that are navigated, not written on.**
+  `band_request` gives the shortcut band zero height on a session page
+  (`is_session_page`: the session view and the composing page), so those pages
+  spend their last row on the draft; everything the band would advertise is a
+  `?` away, and the composer's own info line names the runtime the band used to
+  caption. The session list and the management pages keep it.
 * **A list column is measured in cells, never in characters.** Padding a row
   with `{:<width$}` counts characters, so a double-width title overflows its
   column and drags everything after it out of alignment; the session list
@@ -315,11 +321,11 @@ Rules that follow:
 
 | Surface | Contract |
 | --- | --- |
-| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. |
+| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. The location is a secondary label, never a status hue, and a path that does not fit folds its ancestors to initials (`/h/p/c/p/c/node_modules`) before the head is dropped, keeping the component that names the directory whole. |
 | Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle remains static so a connected session does not look busy. |
-| Composer | padded raised surface without a title or border; runtime and run options sit on a separate line below it. |
+| Composer | padded raised surface without a title or border; an empty box names the draft's vocabulary (`/ commands @ files $ skills`) in the reader's language, and runtime and run options sit on a separate line below it. |
 | Completion | a drawer above the composer: two full-width rules, no corners, count on the top rule, selection marker is the composer's own arrow. |
-| Shortcut band | keys and localized labels separated by middots; prioritize send/newline or expand/details for the current focus, then runtime switching and navigation. Use the keymap for chords and click actions. |
+| Shortcut band | drawn only on the pages that are navigated rather than written on (the session list and management); keys and localized labels separated by middots; prioritize send/newline or expand/details for the current focus, then runtime switching and navigation. Use the keymap for chords and click actions. |
 
 ## 6. Rendering
 

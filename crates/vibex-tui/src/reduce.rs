@@ -783,7 +783,7 @@ impl App {
                 let body = self.composer.text().to_string();
                 Outcome::effects(vec![Effect::EditExternally {
                     ticket: Some(self.composer_ticket()),
-                    title: self.strings.composer_placeholder().to_string(),
+                    title: self.strings.composer_editor_title().to_string(),
                     body,
                 }])
             }

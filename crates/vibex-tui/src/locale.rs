@@ -263,11 +263,10 @@ strings! {
     onboarding_done => { "Ready", "已就绪", "已就緒" },
 
     // ---- composer -------------------------------------------------------
-    composer_placeholder => {
-        "Send a message…  (/ commands · @ files · $ skills)",
-        "发送消息…（/ 命令 · @ 文件 · $ 技能）",
-        "傳送訊息…（/ 命令 · @ 檔案 · $ 技能）"
-    },
+    // The name the external editor's scratch file is created under. It says
+    // what the file holds rather than repeating product copy: the path is shown
+    // to the reader by their editor's own status line.
+    composer_editor_title => { "Vibex draft", "Vibex 草稿", "Vibex 草稿" },
     composer_send => { "Send", "发送", "傳送" },
     composer_newline => { "Newline", "换行", "換行" },
     transcript_browse => { "Timeline", "时间线", "時間線" },
