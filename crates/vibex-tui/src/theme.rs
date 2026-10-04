@@ -65,6 +65,9 @@ impl ColorMode {
         if term.contains("256color") {
             return Self::Ansi256;
         }
+        if term_draws_truecolor(&term) {
+            return Self::TrueColor;
+        }
         Self::Ansi16
     }
 
@@ -90,6 +93,50 @@ impl ColorMode {
             Self::Ansi16 => Some(rgb_to_ansi16(rgb)),
         }
     }
+}
+
+/// Terminal families whose entries draw 24-bit colour by construction.
+///
+/// `COLORTERM` is the usual hint, but it is an environment variable, and the
+/// environments that matter do not all carry it: an SSH session inherits only
+/// the names `sshd` is configured to accept, so a client that reports
+/// `COLORTERM=truecolor` in a local shell arrives as `TERM` alone. A `TERM`
+/// name is a statement about the terminal itself rather than about the shell
+/// around it, so it survives the hop — and without it the same client drops to
+/// the sixteen-colour tier, where the page loses its own background (see
+/// [`ThemeRole::canvas`]).
+const TRUECOLOR_TERMINALS: [&str; 8] = [
+    "kitty",
+    "ghostty",
+    "wezterm",
+    "foot",
+    "contour",
+    "alacritty",
+    "rio",
+    "hyper",
+];
+
+/// Whether a terminfo name promises 24-bit colour.
+///
+/// Matched as a family, so `xterm-kitty`, `foot-extra` and `tmux-ghostty` all
+/// answer yes, while an unrelated name that merely contains the letters does
+/// not.
+fn term_draws_truecolor(term: &str) -> bool {
+    // `xterm-direct` and `tmux-direct` are terminfo's own names for 24-bit
+    // colour; a name that spells the capability out is taken at its word.
+    if term.contains("direct") || term.contains("truecolor") || term.contains("24bit") {
+        return true;
+    }
+    TRUECOLOR_TERMINALS.iter().any(|family| {
+        let family = *family;
+        term == family
+            || term
+                .strip_prefix(family)
+                .is_some_and(|rest| rest.starts_with('-'))
+            || term
+                .strip_suffix(family)
+                .is_some_and(|rest| rest.ends_with('-'))
+    })
 }
 
 /// The 16 ANSI colours as sRGB triplets, used as the nearest-neighbour target
@@ -306,6 +353,19 @@ impl Default for ColorCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeRole {
     // ---- surfaces -------------------------------------------------------
+    /// The page the whole frame is painted on.
+    ///
+    /// A role of its own rather than an alias of `background`, because the
+    /// sixteen-colour tier cannot paint a canvas the theme chose. `black` is a
+    /// palette slot, not a promise of darkness: Catppuccin draws it as a mid
+    /// blue-grey and Solarized and Nord as a lifted one, so a page filled with
+    /// it reads as a washed-out sheet — and every surface that degrades to the
+    /// same slot disappears into it. The canvas therefore falls back to the
+    /// terminal's own background, which is by definition the colour its reader
+    /// chose to read on. `background` keeps its palette colour, because the
+    /// cells that use it as *ink* — text on an accent chip, a selection — sit on
+    /// a fill the palette owns.
+    pub canvas: Color,
     pub background: Color,
     /// Slightly lifted from `background`; used for inline panels.
     pub surface: Color,
@@ -550,6 +610,17 @@ impl TuiTheme {
             // Surfaces step away from the canvas so a plane change is visible
             // without a border. The light themes step *toward* grey instead,
             // which is why these are tokens rather than arithmetic.
+            //
+            // Sixteen colours are the one tier that cannot paint the plane the
+            // theme asked for: `black` is whatever the reader's palette says it
+            // is, so the page is left to the terminal — the only colour on
+            // screen that is guaranteed to be a background — while the palette
+            // goes on supplying every colour used as ink.
+            canvas: if matches!(capability.mode, ColorMode::Ansi16) {
+                Color::Reset
+            } else {
+                color(background_rgb)
+            },
             background: color(background_rgb),
             surface: color(token("card", background_rgb)),
             surface_raised: color(token("popover", background_rgb)),
@@ -676,7 +747,7 @@ impl TuiTheme {
     pub fn base(&self) -> Style {
         Style::default()
             .fg(self.roles.foreground)
-            .bg(self.roles.background)
+            .bg(self.roles.canvas)
     }
 
     pub fn muted(&self) -> Style {
@@ -728,7 +799,7 @@ impl TuiTheme {
         {
             return color;
         }
-        let (Some(from), Some(background)) = (color_rgb(color), color_rgb(self.roles.background))
+        let (Some(from), Some(background)) = (color_rgb(color), color_rgb(self.roles.canvas))
         else {
             return color;
         };
@@ -822,6 +893,117 @@ mod tests {
             ColorMode::detect_from(env_map(&[("TERM", "dumb")])),
             ColorMode::None
         );
+    }
+
+    #[test]
+    fn a_modern_terminal_keeps_its_colour_without_colorterm() {
+        // The environment that matters is the one reached over a link:
+        // `COLORTERM` is not forwarded unless `sshd` is configured to accept
+        // it, so a client that draws 24-bit colour locally arrives as `TERM`
+        // alone. Degrading it to sixteen colours there is what paints the page
+        // in the palette's `black` — a mid grey on Catppuccin, Solarized and
+        // Nord — and turns the whole interface into a washed-out sheet.
+        for term in [
+            "xterm-kitty",
+            "xterm-ghostty",
+            "wezterm",
+            "foot",
+            "foot-extra",
+            "contour",
+            "alacritty",
+            "rio",
+            "xterm-direct",
+            "tmux-direct",
+            "xterm-truecolor",
+        ] {
+            assert_eq!(
+                ColorMode::detect_from(env_map(&[("TERM", term)])),
+                ColorMode::TrueColor,
+                "{term} was degraded despite drawing 24-bit colour"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_names_a_limited_palette_is_taken_at_its_word() {
+        // The other half of the contract: a name that says eight or sixteen
+        // colours must not be promoted by a hint nobody sent.
+        for term in [
+            "xterm", "screen", "tmux", "linux", "vt100", "ansi", "cons25",
+        ] {
+            assert_eq!(
+                ColorMode::detect_from(env_map(&[("TERM", term)])),
+                ColorMode::Ansi16,
+                "{term} was promoted past its palette"
+            );
+        }
+        // A family match is a family match, not a substring: a name that only
+        // contains the letters is still just a name.
+        assert_eq!(
+            ColorMode::detect_from(env_map(&[("TERM", "kittyfoot")])),
+            ColorMode::Ansi16
+        );
+    }
+
+    #[test]
+    fn the_sixteen_colour_tier_leaves_the_page_to_the_terminal() {
+        // Sixteen colours is the tier that cannot paint the canvas the theme
+        // chose: `black` is a palette slot, and on the schemes named above it
+        // is a mid grey, so the page and every surface collapse onto one
+        // washed-out colour. The page therefore belongs to the terminal, while
+        // the roles used as ink keep a palette colour of their own — including
+        // `background`, which is the ink on an accent chip and would make a
+        // selection invisible if it went back to the terminal's default.
+        let capability = ColorCapability {
+            mode: ColorMode::Ansi16,
+            glyphs: GlyphMode::Unicode,
+        };
+        for mode in GpuiThemeMode::ALL {
+            for definition in theme_catalog::themes_for(mode) {
+                let theme = TuiTheme::from_definition(definition, capability);
+                assert_eq!(
+                    theme.roles.canvas,
+                    Color::Reset,
+                    "{} painted its own page in sixteen colours",
+                    definition.id
+                );
+                assert_eq!(theme.base().bg, Some(Color::Reset));
+                assert_ne!(
+                    theme.roles.background,
+                    Color::Reset,
+                    "{} left the ink on its accent chips to the terminal",
+                    definition.id
+                );
+                assert_ne!(
+                    theme.roles.foreground, theme.roles.background,
+                    "{} lost the contrast of an inverted chip",
+                    definition.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_faithful_palette_still_paints_the_theme_canvas() {
+        // The fallback is scoped to the tier that needs it: with a channel per
+        // colour the canvas is the theme's own background again.
+        for mode in [ColorMode::TrueColor, ColorMode::Ansi256] {
+            let capability = ColorCapability {
+                mode,
+                glyphs: GlyphMode::Unicode,
+            };
+            for theme_mode in GpuiThemeMode::ALL {
+                for definition in theme_catalog::themes_for(theme_mode) {
+                    let theme = TuiTheme::from_definition(definition, capability);
+                    assert_eq!(
+                        theme.roles.canvas, theme.roles.background,
+                        "{} lost its canvas in {mode:?}",
+                        definition.id
+                    );
+                    assert_eq!(theme.base().bg, Some(theme.roles.background));
+                }
+            }
+        }
     }
 
     #[test]
