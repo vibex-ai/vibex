@@ -4466,29 +4466,92 @@ fn a_running_session_reads_as_rows() {
             }),
         )
     };
+    let user_item = seeded_item(
+        &session_id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "optimise the timeline".to_string(),
+            attachments: Vec::new(),
+            ..Default::default()
+        }),
+    );
+    let thought = seeded_item(
+        &session_id,
+        2,
+        vibex_core::TimelineItemKind::Reasoning,
+        vibex_core::TimelinePayload::Reasoning(vibex_core::ReasoningPayload {
+            text: "FIRST-SENTINEL the timeline shows every reasoning paragraph in full.\n\n\
+                   The block cache measures each block once, so a body that grew\n\
+                   without a bound would push the session off the screen.\n\n\
+                   The fix is a window on the tail of the thought.\n\n\
+                   The newest rows stay and the oldest leave the top.\n\n\
+                   A fold marker says that older rows are above.\n\n\
+                   The rail says how tall the window is.\n\n\
+                   LAST-SENTINEL keep a dense row one row tall while it streams."
+                .to_string(),
+            is_final: false,
+        }),
+    );
+    // The projection stamps every row with the runtime that produced it; the
+    // client would otherwise show it as the reader's own.
+    let with_attribution = |app: &mut App| {
+        let mut blocks = app.transcript.blocks().to_vec();
+        for block in &mut blocks {
+            block.runtime_attribution = attribution.clone();
+        }
+        app.transcript.set_blocks(blocks);
+    };
     app.agent.state.selected_session_id = Some(session_id.clone());
+    // While the Agent is thinking, the thought is the last thing it produced:
+    // that is the row the window belongs to.
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id.clone(), vec![user_item.clone(), thought.clone()]);
+    app.sync_transcript();
+    with_attribution(&mut app);
+    let screen = text(&render(&mut app, 110, 26));
+
+    // A running thought is the one dense row whose body is drawn without being
+    // opened. It is drawn in a fixed window on its tail: the newest rows are
+    // there, the oldest have left the top, and the rail marks the window's
+    // height — one cell per row, the header included.
+    assert!(
+        screen.contains("LAST-SENTINEL"),
+        "the newest rows of the thought are not on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("FIRST-SENTINEL"),
+        "the window grew to the whole thought:\n{screen}"
+    );
+    assert!(
+        screen.contains("┃ …"),
+        "the fold marker is missing from the window:\n{screen}"
+    );
+    let thinking = screen
+        .lines()
+        .position(|line| line.contains("Thinking…"))
+        .expect("the running thought's header");
+    let railed = screen
+        .lines()
+        .skip(thinking)
+        .take_while(|line| line.starts_with("  ┃"))
+        .count();
+    assert!(railed >= 2, "the live window is not drawn:\n{screen}");
+    assert!(
+        railed <= 1 + vibex_tui::transcript::STREAMING_WINDOW_LINES,
+        "the window grew past its bound: {railed} rows:\n{screen}"
+    );
+
+    // The Agent moves on to a tool call. The runtime does not close a reasoning
+    // stream, so the row still says it is streaming — but it is no longer the
+    // tail, and the window folds to the one row a finished thought keeps.
     app.agent.state.timeline.replace_authoritative(
         session_id.clone(),
         vec![
-            seeded_item(
-                &session_id,
-                1,
-                vibex_core::TimelineItemKind::UserMessage,
-                vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
-                    text: "optimise the timeline".to_string(),
-                    attachments: Vec::new(),
-                    ..Default::default()
-                }),
-            ),
-            seeded_item(
-                &session_id,
-                2,
-                vibex_core::TimelineItemKind::Reasoning,
-                vibex_core::TimelinePayload::Reasoning(vibex_core::ReasoningPayload {
-                    text: "The timeline shows every reasoning paragraph in full. \n Each tool call prints its whole JSON payload. \n The fix is to keep a dense row one row tall while it streams.".to_string(),
-                    is_final: false,
-                }),
-            ),
+            user_item,
+            thought,
             tool(
                 3,
                 "cd /home/peatboy/code/peatboy/vibex-dev/vibex && git diff -- crates/vibex-tui/src/app.rs",
@@ -4507,23 +4570,16 @@ fn a_running_session_reads_as_rows() {
         ],
     );
     app.sync_transcript();
-    // Every row of a real session carries the runtime that produced it; the
-    // projection fills this in from the item's execution attribution.
-    let mut blocks = app.transcript.blocks().to_vec();
-    for block in &mut blocks {
-        block.runtime_attribution = attribution.clone();
-    }
-    app.transcript.set_blocks(blocks);
+    with_attribution(&mut app);
     let screen = text(&render(&mut app, 110, 26));
 
-    // The reasoning body stays behind its disclosure in both states.
     assert!(
-        !screen.contains("one row tall while it streams"),
-        "a thought leaked into the collapsed row:\n{screen}"
+        !screen.contains("LAST-SENTINEL"),
+        "a thought the Agent has left behind kept its window open:\n{screen}"
     );
     assert!(
-        !screen.contains("shows every reasoning paragraph in full"),
-        "the whole reasoning block is on screen:\n{screen}"
+        screen.contains("▸ Thinking"),
+        "the finished thought is not one row:\n{screen}"
     );
     // A tool row names its action; the payload stays behind the fold. The run's
     // head is the row that carries it, and the rest are counted beside it. The

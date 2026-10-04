@@ -10,7 +10,11 @@
 //! cargo run -p vibex-tui --example preview -- 100 30 --light
 //! cargo run -p vibex-tui --example preview -- 140 44 --no-color
 //! cargo run -p vibex-tui --example preview -- 120 34 --settings
+//! cargo run -p vibex-tui --example preview -- 100 30 --thinking --phase 4
 //! ```
+//!
+//! `--thinking` adds a thought that is still arriving, so the live window and
+//! its rail can be reviewed at a chosen `--phase` of the animation clock.
 //!
 //! `--ansi` emits real SGR codes instead of plain text, which is the only way
 //! to review the rails and background bands from a pipeline.
@@ -34,8 +38,11 @@ fn main() {
     let mut ansi = false;
     let mut welcome = false;
     let mut settings = false;
+    let mut thinking = false;
+    let mut phase = 0u32;
     let mut numbers = Vec::new();
-    for argument in &arguments {
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--light" => light = true,
             "--no-color" => mode = ColorMode::None,
@@ -43,6 +50,14 @@ fn main() {
             "--ansi" => ansi = true,
             "--welcome" => welcome = true,
             "--settings" => settings = true,
+            // A running thought, to review the live window and its rail.
+            "--thinking" => thinking = true,
+            "--phase" => {
+                phase = arguments
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+            }
             other => {
                 if let Ok(value) = other.parse::<u16>() {
                     numbers.push(value);
@@ -93,7 +108,16 @@ fn main() {
     }
     let blocks = sample_session();
     if !welcome {
+        let mut blocks = blocks;
+        if thinking {
+            blocks.push(live_thought());
+        }
         app.transcript.set_blocks(blocks);
+    }
+    if thinking {
+        // The view hands the transcript the app's own clock, so a frozen frame
+        // is a matter of stopping the clock rather than setting it twice.
+        app.animation_phase = phase;
     }
     // A live turn, so the rail and the turn line render rather than the idle
     // and single-turn fallbacks.
@@ -116,8 +140,11 @@ fn main() {
             if ansi {
                 let sgr = sgr_for(cell.fg, cell.bg, cell.modifier);
                 if open.as_deref() != Some(sgr.as_str()) {
-                    line.push_str("\u{1b}[0m");
+                    // A reset then the new parameters as one sequence: written
+                    // as two pieces the parameters would be printed as text.
+                    line.push_str("\u{1b}[0m\u{1b}[");
                     line.push_str(&sgr);
+                    line.push('m');
                     open = Some(sgr);
                 }
             }
@@ -141,6 +168,26 @@ fn main() {
         selected: 0,
         collapsed: std::collections::BTreeSet::new(),
     };
+}
+
+/// A thought that is still arriving, long enough to overflow its window.
+fn live_thought() -> Block {
+    let mut block = entry(
+        "live-thought",
+        TimelineRowKind::Reasoning,
+        "Thinking",
+        "I should check how the timeline renders a long thought before I change it.\n\
+         The block cache measures each block once, so a body that grows without a\n\
+         bound would push everything above it off the screen while the reader is\n\
+         still reading. The fix is a fixed window on the tail, with the newest rows\n\
+         arriving at the bottom and the oldest leaving the top.\n\
+         \n\
+         The window needs a left rail so the reader can see how tall it is, and the\n\
+         rail should move while the thought is still arriving.",
+        false,
+    );
+    block.streaming = true;
+    block
 }
 
 /// The SGR sequence for one cell's style.

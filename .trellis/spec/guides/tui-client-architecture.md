@@ -404,6 +404,31 @@ whatever is current. Deltas are drained in batches and frames are capped at one
 per `FRAME_INTERVAL`, so a burst of tokens costs one repaint rather than one per
 token, and an unchanged frame writes nothing.
 
+**A running thought is the one body drawn without being opened, and it is drawn
+in a fixed window on its tail.** Reasoning is a dense row, so its body normally
+sits behind the fold; while the Agent is still on it, the row shows up to
+`STREAMING_WINDOW_LINES` rows of the newest content instead, with a `…` row once
+older rows have left the top — the newest line pushes the oldest off rather than
+growing the block. The window's marker column carries an animated rail, one cell
+per row and the header included, so the bar is exactly as tall as the range it
+stands for; its crest travels down on the chrome animation clock, so the window
+is dropped from the render cache when the phase moves and re-drawn without a
+re-measure. A terminal that cannot blend colours draws the rail flat — the bar
+still marks the window. `set_animation_phase` is told the clock by the one
+function that draws the transcript, and a transcript with nothing streaming
+never advances it.
+
+The runtime does not close a reasoning stream: a row that once streamed keeps
+that flag for the rest of the turn. The window is therefore opened only on the
+block at the **end** of the transcript — the thought the Agent is on now — and
+folds to one row the moment any other row follows it, which is also what makes a
+tool call end the window without the provider saying so. That block is not
+eligible for a dense run either, because folding it away would hide the window
+the reader is watching. `estimate_height` bounds a live window by its own cap:
+markdown reflows the body, so the estimate is an upper bound rather than an
+equality, and an unmeasured window must never be estimated shorter than it
+draws.
+
 **The composer wraps its draft so byte offsets survive.** `wrap_text` produces
 *rendered* lines: a run of whitespace collapses to one space and a broken token
 is re-joined with a space of the wrapper's own, so a line is no longer the slice

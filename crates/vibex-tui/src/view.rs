@@ -759,6 +759,10 @@ fn render_scrollback(
     // place that knows how wide that is. Configuring it from a pane layout
     // instead is what left a wide terminal's right half empty.
     app.transcript.configure(usize::from(area.width), theme);
+    // The live thought window's rail is a frame of the chrome animation, so the
+    // clock is handed over here — the only place that draws the transcript, and
+    // therefore the only place that knows a frame is being drawn at all.
+    app.transcript.set_animation_phase(app.animation_phase());
     if app.transcript.is_empty() {
         render_welcome(frame, area, app, theme, strings);
         return;

@@ -52,12 +52,72 @@ const UNMEASURED: u32 = u32::MAX;
 /// The shortest run of collapsed work items worth folding.
 pub const MIN_GROUP_RUN: usize = 3;
 
+/// The most body rows a live thought shows before it folds.
+///
+/// A thought arrives a token at a time, and a block that grew with every token
+/// would push the rest of the session off the screen while the reader is
+/// reading it. The window is the compromise: a fixed number of rows at the
+/// tail, so the newest lines push the oldest off the top instead of adding
+/// height. One of the rows is the fold marker once the thought outgrows the
+/// window, so the block is never taller than this plus its header.
+pub const STREAMING_WINDOW_LINES: usize = 6;
+
+/// The mark that says older rows of a live thought are above the window.
+///
+/// A character rather than a chevron: the window's oldest row is *content*, and
+/// a glyph that pointed at a fold would read as a control the reader can press.
+const FOLD_MARKER: &str = "…";
+
+/// How far the rail's wave travels per animation tick, in radians.
+///
+/// The wave is `sin²`, so a full cycle is `π / RAIL_SPEED` ticks — around two
+/// seconds on the animation clock: slow enough to read as flow, fast enough to
+/// say the thought is still arriving.
+const RAIL_SPEED: f32 = 0.42;
+
+/// The wavelength of the rail's wave, in rows.
+///
+/// Longer than the tallest window, so the reader sees one crest travelling down
+/// rather than a row of them pulsing at once — and a fixed length rather than a
+/// fraction of the bar, so the motion looks the same as the window fills.
+const RAIL_WAVE_ROWS: f32 = 8.0;
+
+/// Whether a block has the shape of a thought that is still arriving.
+///
+/// The shape alone is not enough to open a window with: the runtime does not
+/// close a reasoning stream, so a row that once streamed keeps that flag for the
+/// rest of the turn. See [`is_live_thinking_window`].
+fn is_running_thought(block: &Block) -> bool {
+    block.kind == TimelineRowKind::Reasoning && block.streaming && !block.expanded
+}
+
+/// Whether a block opens the live window onto a thought's tail.
+///
+/// `trailing` says that nothing the reader can read follows the block. A
+/// thought that has been left behind by a tool call or an answer is finished
+/// whatever its row still claims: the window is for the thought the Agent is on
+/// *now*, which is why it folds to a single row the moment the next row
+/// arrives.
+///
+/// Such a block is *not* a one-row work item while it is live: it shows a
+/// bounded window onto the tail of its body, and everything the window does —
+/// the animation, the fold marker, the bound on its height — is gated on this
+/// one predicate.
+pub fn is_live_thinking_window(block: &Block, trailing: bool) -> bool {
+    trailing && is_running_thought(block)
+}
+
 /// Whether a block can be folded into a dense run.
 ///
 /// Only collapsed work items qualify: an expanded block is one the reader asked
-/// to see, and a message is never chrome.
-fn eligible_for_group(block: &Block) -> bool {
-    is_work_item(block.kind) && block.collapsible && !block.expanded && !block.failed
+/// to see, and a message is never chrome. A live thought does not qualify
+/// either: folding it into a run would hide the window the reader is watching.
+fn eligible_for_group(block: &Block, trailing: bool) -> bool {
+    !is_live_thinking_window(block, trailing)
+        && is_work_item(block.kind)
+        && block.collapsible
+        && !block.expanded
+        && !block.failed
 }
 
 /// Whether `incoming` starts with older blocks than the transcript holds.
@@ -202,6 +262,12 @@ pub struct Transcript {
     recency: Vec<usize>,
     width: usize,
     theme_id: String,
+    /// The chrome animation clock as of the last frame.
+    ///
+    /// Only a live thought's rail moves with it, so the clock is kept here
+    /// rather than in the cache key: a phase change drops the window's rows and
+    /// leaves every other block's rendering alone.
+    phase: u32,
     /// The block drawn as current last frame, so a change invalidates it.
     last_selected: Option<usize>,
     /// Display line the viewport started at in the last frame.
@@ -243,6 +309,7 @@ impl Transcript {
             recency: Vec::new(),
             width: 0,
             theme_id: String::new(),
+            phase: 0,
             last_selected: None,
             scroll_offset: 0,
             stats: TranscriptStats::default(),
@@ -419,7 +486,10 @@ impl Transcript {
         }
         let mut index = 0usize;
         while index < self.blocks.len() {
-            if !eligible_for_group(&self.blocks[index]) {
+            // Only the final row can be a live window: nothing follows it, so
+            // it is the thought the Agent is on rather than one it has left.
+            let trailing = index + 1 == self.blocks.len();
+            if !eligible_for_group(&self.blocks[index], trailing) {
                 index += 1;
                 continue;
             }
@@ -432,7 +502,7 @@ impl Transcript {
             // the attribution is there to say.
             let attribution = self.blocks[start].runtime_attribution.clone();
             while index < self.blocks.len()
-                && eligible_for_group(&self.blocks[index])
+                && eligible_for_group(&self.blocks[index], index + 1 == self.blocks.len())
                 && self.blocks[index].kind == kind
                 && self.blocks[index].title == title
                 && self.blocks[index].turn_id == turn
@@ -554,6 +624,38 @@ impl Transcript {
             self.invalidate_all();
         }
         self.set_theme(theme);
+    }
+
+    /// Tell the transcript how far the chrome animation clock has moved.
+    ///
+    /// The live thought window is the one block whose *rows* depend on the
+    /// clock: its rail is a frame of the running animation. A phase change
+    /// therefore drops those rows and no measurements — the window is the same
+    /// height, only lit differently — so the next frame redraws the wave
+    /// without a relayout.
+    pub fn set_animation_phase(&mut self, phase: u32) {
+        if self.phase == phase {
+            return;
+        }
+        self.phase = phase;
+        // There is at most one live window — it is the last row there is — so
+        // the clock's cost is a lookup, not a walk over the session.
+        if let Some(last) = self.last_visible_block()
+            && is_live_thinking_window(&self.blocks[last], true)
+        {
+            self.rendered.remove(&last);
+            self.recency.retain(|value| *value != last);
+        }
+    }
+
+    /// The last block that draws any rows.
+    ///
+    /// A folded member is not one: the run's head stands for it, so the head is
+    /// what "the end of the session" means.
+    fn last_visible_block(&self) -> Option<usize> {
+        self.blocks
+            .iter()
+            .rposition(|block| block.group != GroupRole::Member)
     }
 
     /// Drop every measurement and rendered row.
@@ -701,7 +803,18 @@ impl Transcript {
             TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
         ) && !block.body.is_empty();
         let header = usize::from(!headerless);
-        let body_lines = if block.body.is_empty() || (dense && !open) {
+        let body_lines = if block.body.is_empty() {
+            0
+        } else if is_live_thinking_window(block, next.is_none()) {
+            // The window is capped, which is the whole point: the rows it shows
+            // are the newest ones, and how many of them a thought fills is
+            // markdown's business. A count of the source lines is an upper
+            // bound — markdown joins soft-wrapped lines, it does not split them
+            // — and an unmeasured row must never be estimated *shorter* than it
+            // draws, or the tail would sit over the rows it should be showing.
+            let explicit = block.body.matches('\n').count() + 1;
+            (explicit + block.body.len() / available.max(1) / 2).min(STREAMING_WINDOW_LINES)
+        } else if dense && !open {
             0
         } else if open || block.streaming {
             // Count newlines plus a wrap allowance per line.
@@ -793,7 +906,13 @@ impl Transcript {
         // Only a body that will be drawn is worth parsing as it arrives: a
         // dense row shows one live line, and re-rendering the whole thought to
         // keep a renderer it never reads is work the session does not need.
-        let body_shown = !block.body.is_empty() && (!is_dense_row(block.kind) || block.expanded);
+        // A live window always draws, so its renderer is always advanced —
+        // which is what keeps a running thought's cost proportional to what is
+        // on screen rather than to what has been thought.
+        let body_shown = !block.body.is_empty()
+            && (!is_dense_row(block.kind)
+                || block.expanded
+                || is_live_thinking_window(&block, next.is_none()));
         if body_shown {
             self.refresh_stream(&block, theme, strings, body_width, prose);
         } else {
@@ -823,6 +942,7 @@ impl Transcript {
             strings,
             self.last_selected == Some(index),
             show_attribution,
+            self.phase,
         )
     }
 
@@ -1555,7 +1675,10 @@ pub fn is_work_item(kind: TimelineRowKind) -> bool {
 }
 
 /// The leading mark a work item carries on its first line.
-fn bullet(block: &Block, theme: &TuiTheme) -> Option<(&'static str, Style)> {
+///
+/// `live` says the block is drawing a window under the header, so the
+/// disclosure points at the rows it has rather than away from them.
+fn bullet(block: &Block, live: bool, theme: &TuiTheme) -> Option<(&'static str, Style)> {
     if !is_work_item(block.kind) {
         return None;
     }
@@ -1563,7 +1686,7 @@ fn bullet(block: &Block, theme: &TuiTheme) -> Option<(&'static str, Style)> {
     let glyph = if block.failed {
         crate::glyphs::ballot_x(tier)
     } else {
-        crate::glyphs::disclosure(block.expanded, tier)
+        crate::glyphs::disclosure(block.expanded || live, tier)
     };
     let color = if block.failed {
         theme.roles.danger
@@ -1597,7 +1720,21 @@ pub fn render_block(
     width: usize,
     strings: Strings,
 ) -> RenderedBlock {
-    render_block_styled(block, theme, width, strings, false)
+    render_block_at_phase(block, theme, width, strings, 0)
+}
+
+/// As [`render_block`], with the chrome animation clock.
+///
+/// Only a live thought window reads the clock: its rail is a wave whose crest
+/// travels down the window, and the phase is where the crest is.
+pub fn render_block_at_phase(
+    block: &Block,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    phase: u32,
+) -> RenderedBlock {
+    render_block_styled(block, theme, width, strings, false, phase)
 }
 
 /// Whether a block reads as one dense row rather than a titled section.
@@ -1736,7 +1873,9 @@ fn tool_action(body: &str) -> String {
 ///
 /// Two dense rows are a list, not two sections, and a blank row between every
 /// pair of them is most of a session's height. Everything else keeps the gap
-/// that separates blocks into objects.
+/// that separates blocks into objects. A live window needs no rule of its own:
+/// it is the last block there is, and the tail of a transcript always keeps its
+/// gap.
 pub fn gap_after(block: &Block, next: Option<&Block>) -> usize {
     let dense_run = is_dense_row(block.kind)
         && !block.expanded
@@ -1756,8 +1895,9 @@ pub fn render_block_styled(
     width: usize,
     strings: Strings,
     selected: bool,
+    phase: u32,
 ) -> RenderedBlock {
-    render_block_in_run(block, None, theme, width, strings, selected)
+    render_block_in_run(block, None, theme, width, strings, selected, phase)
 }
 
 /// As [`render_block_styled`], told what follows the block.
@@ -1772,8 +1912,9 @@ pub fn render_block_in_run(
     width: usize,
     strings: Strings,
     selected: bool,
+    phase: u32,
 ) -> RenderedBlock {
-    render_block_in_run_with_body(block, next, None, theme, width, strings, selected)
+    render_block_in_run_with_body(block, next, None, theme, width, strings, selected, phase)
 }
 
 /// As [`render_block_in_run`], with a body the caller has already rendered.
@@ -1790,8 +1931,11 @@ pub fn render_block_in_run_with_body(
     width: usize,
     strings: Strings,
     selected: bool,
+    phase: u32,
 ) -> RenderedBlock {
-    render_block_with_attribution(block, next, streamed, theme, width, strings, selected, true)
+    render_block_with_attribution(
+        block, next, streamed, theme, width, strings, selected, true, phase,
+    )
 }
 
 /// As [`render_block_in_run_with_body`], told whether this row carries the
@@ -1810,6 +1954,7 @@ pub fn render_block_with_attribution(
     strings: Strings,
     selected: bool,
     show_attribution: bool,
+    phase: u32,
 ) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
@@ -1823,6 +1968,10 @@ pub fn render_block_with_attribution(
     let content_width = chrome::content_width(width).max(8);
     let label = kind_label(block.kind, strings);
     let dense = is_dense_row(block.kind);
+    // A running thought the reader has not opened, at the end of the session:
+    // the one block whose body is drawn without an explicit expansion, inside a
+    // window on its tail.
+    let live = is_live_thinking_window(block, next.is_none());
     // `Block::is_open` means "not collapsible" as well as "the reader opened
     // it"; a dense row is showing one line because that is its shape, so only
     // an explicit expansion reveals its body.
@@ -1836,7 +1985,7 @@ pub fn render_block_with_attribution(
         _ => theme.base(),
     };
     let mut parts: Vec<(String, Style)> = Vec::new();
-    if let Some((glyph, style)) = bullet(block, theme) {
+    if let Some((glyph, style)) = bullet(block, live, theme) {
         parts.push((format!("{glyph} "), style));
     }
     if shows_kind_label(block.kind, &block.title, label) {
@@ -1861,7 +2010,13 @@ pub fn render_block_with_attribution(
     } else {
         (
             if block.kind == TimelineRowKind::Reasoning {
-                label.to_string()
+                if live {
+                    // The ellipsis is the running state: the row it sits on is
+                    // the head of a window, not a finished thought.
+                    format!("{label}…")
+                } else {
+                    label.to_string()
+                }
             } else {
                 block.title.clone()
             },
@@ -1919,27 +2074,15 @@ pub fn render_block_with_attribution(
         .saturating_sub(prompt_mark.map_or(0, |_| 2))
         .max(8);
 
-    if !headerless {
-        let header = truncate_parts(parts, content_width);
-        let header_plain = header
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let marker = if selected { pointer_glyph(theme) } else { " " };
-        let mut header_line = row_line(marker, header);
-        if selected {
-            header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
-        }
-        lines.push(header_line);
-        plain.push(header_plain);
-    }
-
     // A dense row is one row: its body is what the fold is for, and the detail
     // overlay can show all of it. Messages render every arriving line; work
-    // records keep the same shape until the reader expands them.
-    let shows_body = !body.is_empty() && (!dense || open);
-    if shows_body {
-        let body_background = body_band(block, theme);
+    // records keep the same shape until the reader expands them — except a
+    // running thought, whose whole reason to be on screen is that the reader
+    // watches it arrive.
+    let shows_body = !body.is_empty() && (!dense || open || live);
+    // Built before the header: a live window's rail is one cell per row of the
+    // window, and the header row carries its first cell.
+    let mut rendered = shows_body.then(|| {
         let prose = if block.kind == TimelineRowKind::UserMessage {
             theme.base()
         } else {
@@ -1968,7 +2111,6 @@ pub fn render_block_with_attribution(
             }
             None => render_plain(body, theme, body_width),
         };
-        let style = body_style(block, theme);
         // Markdown separates paragraphs with a blank row, including the last
         // one; the block gap is the separator between blocks, and two of them
         // is one row of a session spent on nothing.
@@ -1986,6 +2128,36 @@ pub fn render_block_with_attribution(
             rendered.lines.truncate(COLLAPSED_BODY_LINES);
             rendered.plain.truncate(COLLAPSED_BODY_LINES);
         }
+        rendered
+    });
+    // A running thought is held to a fixed window on its tail: the newest rows
+    // are the ones being read, and once the window is full the oldest leaves
+    // the top instead of the block growing without bound. The rail is then one
+    // cell per row of the window, its header included, so the bar the reader
+    // sees is exactly as tall as the range it stands for.
+    if let Some(rendered) = rendered.as_mut()
+        && live
+    {
+        fold_live_window(rendered, theme);
+    }
+
+    if !headerless {
+        let header = truncate_parts(parts, content_width);
+        let header_plain = header
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let mut header_line = row_line(row_marker(0, live, selected, phase, theme), header);
+        if selected {
+            header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
+        }
+        lines.push(header_line);
+        plain.push(header_plain);
+    }
+
+    if let Some(rendered) = rendered {
+        let body_background = body_band(block, theme);
+        let style = body_style(block, theme);
         for (index, (line, text)) in rendered.lines.into_iter().zip(rendered.plain).enumerate() {
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
@@ -2012,12 +2184,12 @@ pub fn render_block_with_attribution(
                 spans.insert(0, Span::raw("  "));
                 text = format!("  {text}");
             }
-            let marker = if index == 0 && selected {
-                pointer_glyph(theme)
-            } else {
-                " "
-            };
-            let mut row = row_line(marker, spans).style(row_style);
+            // The pointer is the first body row's marker only where there is no
+            // rail to give it up: a live window's rail runs unbroken, and the
+            // header above already carries the cursor.
+            let pointer = selected && index == 0 && !live;
+            let mut row = row_line(row_marker(index + 1, live, pointer, phase, theme), spans)
+                .style(row_style);
             if index == 0 && selected {
                 row = row.style(Style::default().bg(theme.roles.surface_highlight));
             }
@@ -2047,13 +2219,16 @@ pub fn render_block_with_attribution(
     }
     for (text, style) in status {
         let text = truncate_to_width(&text, content_width, "…");
-        lines.push(row_line(" ", vec![Span::styled(text.clone(), style)]));
+        lines.push(row_line(
+            Span::raw(" "),
+            vec![Span::styled(text.clone(), style)],
+        ));
         plain.push(text);
     }
 
     // Trailing gap so blocks are separated without a rule.
     for _ in 0..gap_after(block, next) {
-        lines.push(row_line(" ", Vec::new()));
+        lines.push(row_line(Span::raw(" "), Vec::new()));
         plain.push(String::new());
     }
 
@@ -2066,21 +2241,86 @@ pub fn render_block_with_attribution(
 
 /// Build one rendered row: the marker column, the pad, then the content.
 ///
-/// The marker is the block's selection pointer, or a space. It takes the first
-/// of the margin columns rather than a column of its own, so a marked block's
-/// text stays on the same column as every other block's — a row that shifted by
-/// one would break the left edge the reader scans down.
-fn row_line(marker: &str, spans: Vec<Span<'static>>) -> Line<'static> {
-    debug_assert!(marker.chars().count() <= chrome::PAD_LEFT);
-    let pad = chrome::PAD_LEFT.saturating_sub(marker.chars().count());
+/// The marker is the block's selection pointer, a cell of a live window's rail,
+/// or a space. It takes the first of the margin columns rather than a column of
+/// its own, so a marked block's text stays on the same column as every other
+/// block's — a row that shifted by one would break the left edge the reader
+/// scans down.
+fn row_line(marker: Span<'static>, spans: Vec<Span<'static>>) -> Line<'static> {
+    let marker_width = display_width(marker.content.as_ref());
+    debug_assert!(marker_width <= chrome::PAD_LEFT);
+    let pad = chrome::PAD_LEFT.saturating_sub(marker_width);
     let mut out = Vec::with_capacity(spans.len() + 2);
-    out.push(Span::raw(marker.to_string()));
+    out.push(marker);
     out.push(Span::raw(" ".repeat(pad)));
     out.extend(spans);
     Line::from(out)
 }
 
-/// Soften a rail colour for one frame of the running animation.
+/// The marker cell of one row of a block, `row` counting from the header.
+///
+/// When the block is a live thought window the cell is one step of the rail that
+/// marks the window's extent, lit by [`rail_weight`] so a crest travels down it
+/// while the thought arrives. A terminal that cannot blend colours draws the
+/// rail flat: the bar still marks the window, it simply holds still.
+fn row_marker(
+    row: usize,
+    live: bool,
+    pointer: bool,
+    phase: u32,
+    theme: &TuiTheme,
+) -> Span<'static> {
+    if !live {
+        return Span::raw(if pointer { pointer_glyph(theme) } else { " " }.to_string());
+    }
+    let colour = theme.fade(theme.roles.accent_thinking, rail_weight(row, phase));
+    let glyph = if pointer {
+        pointer_glyph(theme)
+    } else {
+        crate::glyphs::accent_bar(crate::glyphs::GlyphTier::of(theme))
+    };
+    Span::styled(glyph.to_string(), Style::default().fg(colour))
+}
+
+/// How brightly one cell of a live window's rail burns.
+///
+/// A sine squared travelling down the bar: one crest of full colour with a long
+/// dim tail, which the eye reads as a single highlight moving rather than as a
+/// bar blinking on and off.
+fn rail_weight(row: usize, phase: u32) -> f32 {
+    use std::f32::consts::PI;
+    // The phase grows, the row term is subtracted, so the crest travels *down*
+    // the window — the direction the thought itself is moving.
+    let angle = phase as f32 * RAIL_SPEED - (row as f32 / RAIL_WAVE_ROWS) * 2.0 * PI;
+    let wave = angle.sin();
+    // Never fully dark: the rail's job is to mark the window's extent even at
+    // the trough of the wave, and a bar that vanished there would read as a
+    // rendering fault rather than as motion.
+    0.3 + 0.7 * wave * wave
+}
+
+/// Hold a live thought to its window.
+///
+/// The newest rows are kept and the oldest leave the top, which is what makes
+/// the window fixed: a thought a hundred lines long costs the same rows on
+/// screen as a thought ten lines long. Once rows have left, the top row says so
+/// — without it the reader would take the first visible line for the beginning
+/// of the thought.
+fn fold_live_window(rendered: &mut crate::markdown::RenderedMarkdown, theme: &TuiTheme) {
+    let window = STREAMING_WINDOW_LINES.max(2);
+    if rendered.lines.len() > window {
+        let keep = window - 1;
+        let cut = rendered.lines.len() - keep;
+        rendered.lines.drain(..cut);
+        rendered.plain.drain(..cut);
+        rendered.lines.insert(
+            0,
+            Line::from(Span::styled(FOLD_MARKER, theme.dimmed(theme.roles.gray))),
+        );
+        rendered.plain.insert(0, FOLD_MARKER.to_string());
+    }
+}
+
 /// The background band a block body sits on, when it benefits from one.
 fn body_band(block: &Block, theme: &TuiTheme) -> Option<Style> {
     if block.kind == TimelineRowKind::UserMessage {
@@ -2646,7 +2886,7 @@ mod tests {
         let mut entry = block("a", TimelineRowKind::AgentMessage, "body");
         entry.collapsible = false;
         let plain = render_block(&entry, &theme(), 60, strings());
-        let marked = render_block_styled(&entry, &theme(), 60, strings(), true);
+        let marked = render_block_styled(&entry, &theme(), 60, strings(), true, 0);
         // The marker takes the first margin column, and only on the header, so
         // the text of a marked block stays on the column of every other block.
         assert_eq!(plain.lines[0].spans[0].content.as_ref(), " ");
@@ -2665,6 +2905,163 @@ mod tests {
         // The rows under it are not lifted, so only the header reads as current.
         assert_eq!(marked.lines[1].style.bg, None);
         assert_eq!(plain.lines[0].style.bg, None);
+    }
+
+    /// A thought long enough to overflow its window.
+    fn running_thought() -> Block {
+        let mut entry = block(
+            "thought",
+            TimelineRowKind::Reasoning,
+            "- read the cache path\n- check how a delta invalidates it\n- decide where the window lives\n- keep the newest rows\n- drop the oldest\n- mark the fold\n- draw the rail\n- animate the rail",
+        );
+        entry.streaming = true;
+        entry
+    }
+
+    #[test]
+    fn a_running_thought_opens_a_window_on_the_tail_of_its_body() {
+        let entry = running_thought();
+        let rendered = render_block(&entry, &theme(), 60, strings());
+        let text = rendered.plain.join("\n");
+        // The header says the thought is still arriving, and the bullet points
+        // at the rows below it rather than away from them.
+        assert!(
+            rendered.plain[0].contains("Thinking…"),
+            "{}",
+            rendered.plain[0]
+        );
+        assert!(rendered.plain[0].contains('▾'), "{}", rendered.plain[0]);
+        // The newest rows are the ones shown, the oldest have left the top, and
+        // the row above them says so.
+        assert!(text.contains("animate the rail"), "{text}");
+        assert!(text.contains(FOLD_MARKER), "{text}");
+        assert!(!text.contains("read the cache path"), "{text}");
+        // The window is bounded: header, window rows, gap.
+        assert!(
+            rendered.height <= 1 + STREAMING_WINDOW_LINES + chrome::GAP,
+            "the window grew past its bound: {} rows",
+            rendered.height
+        );
+        assert!(
+            rendered.plain[1] == FOLD_MARKER,
+            "the fold marker is not the first row of the window: {:?}",
+            rendered.plain[1]
+        );
+    }
+
+    #[test]
+    fn a_thought_that_has_landed_folds_to_one_row() {
+        let mut entry = running_thought();
+        entry.streaming = false;
+        let rendered = render_block(&entry, &theme(), 60, strings());
+        assert_eq!(rendered.height, 1 + chrome::GAP);
+        assert!(
+            rendered.plain[0].contains("Thinking"),
+            "{:?}",
+            rendered.plain
+        );
+        assert!(!rendered.plain[0].contains('…'), "{:?}", rendered.plain);
+        assert!(rendered.plain[0].contains('▸'), "{:?}", rendered.plain);
+    }
+
+    #[test]
+    fn the_window_rail_spans_the_window_and_moves_with_the_clock() {
+        let entry = running_thought();
+        let palette = theme();
+        let at = |phase| render_block_at_phase(&entry, &palette, 60, strings(), phase);
+        let early = at(0);
+        let later = at(4);
+        let bar = crate::glyphs::accent_bar(crate::glyphs::GlyphTier::Full);
+        // One cell per row of the window, the header included, so the bar the
+        // reader sees is exactly as tall as the range it stands for.
+        for (row, line) in early
+            .lines
+            .iter()
+            .take(1 + STREAMING_WINDOW_LINES)
+            .enumerate()
+        {
+            assert_eq!(line.spans[0].content.as_ref(), bar, "row {row}");
+            assert!(line.spans[0].style.fg.is_some(), "row {row} is unlit");
+        }
+        assert_eq!(
+            early.lines[1 + STREAMING_WINDOW_LINES].spans[0]
+                .content
+                .as_ref(),
+            " ",
+            "the gap row carries rail"
+        );
+        // A cell is lit differently a few ticks later, and two cells of one
+        // frame differ from each other: the highlight travels rather than the
+        // whole bar flashing.
+        assert_ne!(
+            early.lines[0].spans[0].style.fg,
+            later.lines[0].spans[0].style.fg
+        );
+        assert_ne!(
+            early.lines[0].spans[0].style.fg,
+            early.lines[1].spans[0].style.fg
+        );
+        // The cursor takes the header's cell and lights it like the rail cell it
+        // replaced; the bar itself carries on below, so the window's height is
+        // still what the reader sees.
+        let marked = render_block_styled(&entry, &palette, 60, strings(), true, 0);
+        assert_eq!(marked.lines[0].spans[0].content.as_ref(), "▌");
+        assert_eq!(
+            marked.lines[0].spans[0].style.fg,
+            early.lines[0].spans[0].style.fg
+        );
+        assert_eq!(marked.lines[1].spans[0].content.as_ref(), bar);
+    }
+
+    #[test]
+    fn a_running_thought_is_never_folded_into_a_work_run() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let mut thought = block("live", TimelineRowKind::Reasoning, "weighing the options");
+        thought.streaming = true;
+        // Three work items in a row would fold into a run. The live thought
+        // must not: its window is the thing the reader is watching.
+        transcript.set_blocks(vec![
+            block("t0", TimelineRowKind::ToolCall, "ran"),
+            block("t1", TimelineRowKind::ToolCall, "ran"),
+            thought,
+        ]);
+        assert_eq!(transcript.blocks()[2].group, GroupRole::Solo);
+        let text = transcript
+            .visible_lines(ScrollState::default(), 20, &theme(), strings())
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("weighing the options"), "{text}");
+    }
+
+    #[test]
+    fn the_clock_redraws_the_window_without_laying_it_out_again() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let palette = theme();
+        transcript.set_blocks(vec![running_thought()]);
+        let _ = transcript.visible_lines(ScrollState::default(), 30, &palette, strings());
+        let first = transcript.stats.blocks_rendered;
+        // The same frame twice: the window is resident, so nothing re-renders.
+        let _ = transcript.visible_lines(ScrollState::default(), 30, &palette, strings());
+        assert_eq!(
+            transcript.stats.blocks_rendered, first,
+            "an unchanged frame re-rendered the window"
+        );
+        // A moved clock drops the window's rows — the rail is a frame of the
+        // animation — and the height stays measured, so nothing reflows.
+        transcript.set_animation_phase(3);
+        let _ = transcript.visible_lines(ScrollState::default(), 30, &palette, strings());
+        assert!(
+            transcript.stats.blocks_rendered > first,
+            "the moved clock did not redraw the window"
+        );
+        assert_eq!(
+            transcript.stats.blocks_measured, 1,
+            "the clock forced a re-measure"
+        );
     }
 
     #[test]
@@ -2935,36 +3332,58 @@ mod density_tests {
 
     #[test]
     fn work_rows_keep_their_shape_when_the_turn_finishes() {
-        for (kind, body) in [
-            (
-                TimelineRowKind::Reasoning,
-                "first thought\nsecond thought\nlast thought",
-            ),
-            (
-                TimelineRowKind::ToolCall,
-                r#"{"command":"cargo test","description":"Run tests"}"#,
-            ),
-        ] {
-            let mut row = item("work", kind, body, true);
-            let running = render_block(&row, &theme(), 60, strings());
-            row.streaming = false;
-            let completed = render_block(&row, &theme(), 60, strings());
-            assert_eq!(running.plain, completed.plain);
-            assert_eq!(running.height, 2);
-            assert!(!running.text().contains("first thought"));
-            assert!(!running.text().contains("description"));
-            row.expanded = true;
-            let expanded = render_block(&row, &theme(), 60, strings());
-            assert!(
-                expanded
-                    .text()
-                    .contains(if kind == TimelineRowKind::Reasoning {
-                        "first thought"
-                    } else {
-                        "description"
-                    })
-            );
-        }
+        // A tool row is one row whether or not it is still running: its payload
+        // is a wall of JSON, and the fold is what keeps it out of the timeline.
+        let mut row = item(
+            "work",
+            TimelineRowKind::ToolCall,
+            r#"{"command":"cargo test","description":"Run tests"}"#,
+            true,
+        );
+        let running = render_block(&row, &theme(), 60, strings());
+        row.streaming = false;
+        let completed = render_block(&row, &theme(), 60, strings());
+        assert_eq!(running.plain, completed.plain);
+        assert_eq!(running.height, 2);
+        assert!(!running.text().contains("description"));
+        row.expanded = true;
+        let expanded = render_block(&row, &theme(), 60, strings());
+        assert!(expanded.text().contains("description"));
+    }
+
+    #[test]
+    fn a_thought_opens_while_it_runs_and_folds_when_it_lands() {
+        let mut row = item(
+            "thought",
+            TimelineRowKind::Reasoning,
+            "first thought\nsecond thought\nlast thought",
+            true,
+        );
+        let running = render_block(&row, &theme(), 60, strings());
+        // Running: a window on the thought, under a header that says so.
+        assert!(
+            running.plain[0].contains("Thinking…"),
+            "{:?}",
+            running.plain
+        );
+        assert!(
+            running.text().contains("last thought"),
+            "{}",
+            running.text()
+        );
+        assert_eq!(running.lines[0].spans[0].content.as_ref(), "┃");
+        // Landed: one row, and the whole thought behind the fold.
+        row.streaming = false;
+        let completed = render_block(&row, &theme(), 60, strings());
+        assert_eq!(completed.height, 2);
+        assert_eq!(
+            completed.plain,
+            vec!["▸ Thinking".to_string(), String::new()]
+        );
+        assert!(!completed.text().contains("first thought"));
+        row.expanded = true;
+        let expanded = render_block(&row, &theme(), 60, strings());
+        assert!(expanded.text().contains("first thought"));
     }
 
     #[test]
@@ -2975,13 +3394,14 @@ mod density_tests {
         let mut transcript = Transcript::new();
         transcript.configure(60, &theme());
         transcript.set_blocks(vec![
+            item("t1", TimelineRowKind::ToolCall, "output\nmore\nmore", true),
+            // Last, so it is the thought the window belongs to.
             item(
                 "r1",
                 TimelineRowKind::Reasoning,
                 "one\ntwo\nthree\nfour",
                 true,
             ),
-            item("t1", TimelineRowKind::ToolCall, "output\nmore\nmore", true),
         ]);
         let count = transcript.blocks().len();
         let measured = (0..count)
@@ -2993,7 +3413,56 @@ mod density_tests {
         let estimated = (0..count)
             .map(|index| transcript.estimate_height(index))
             .collect::<Vec<_>>();
-        assert_eq!(measured, estimated, "estimate and render disagree");
+        // A tool row's shape is one row, so there the estimate is exact.
+        assert_eq!(measured[0], estimated[0], "estimate and render disagree");
+        // A thought's window reflows its body through markdown, which no count
+        // of source lines can predict. The estimate is an upper bound instead:
+        // an unmeasured window that drew taller than it was estimated would sit
+        // over the rows the reader is following.
+        assert!(
+            estimated[1] >= measured[1],
+            "the estimate understates the live window: {estimated:?} vs {measured:?}"
+        );
+        assert!(
+            estimated[1] <= 1 + STREAMING_WINDOW_LINES + chrome::GAP,
+            "the estimate exceeds the window's own bound: {estimated:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_thought_at_the_end_of_the_session_is_live() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        // The runtime never closes a reasoning stream, so both rows still say
+        // they are running; only the one the Agent is on now may open a window.
+        transcript.set_blocks(vec![
+            item(
+                "stale",
+                TimelineRowKind::Reasoning,
+                "- a thought the agent has finished with",
+                true,
+            ),
+            item("tool", TimelineRowKind::ToolCall, "ran", false),
+            item(
+                "live",
+                TimelineRowKind::Reasoning,
+                "- read the cache path\n- keep the newest rows\n- animate the rail",
+                true,
+            ),
+        ]);
+        let screen = transcript
+            .visible_lines(ScrollState::default(), 30, &theme(), strings())
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("animate the rail"), "{screen}");
+        assert!(
+            !screen.contains("a thought the agent has finished with"),
+            "a thought the Agent has left behind kept its window:\n{screen}"
+        );
+        assert_eq!(screen.matches("Thinking…").count(), 1, "{screen}");
+        assert!(screen.contains("▸ Thinking"), "{screen}");
     }
 
     #[test]
