@@ -677,6 +677,12 @@ pub struct App {
     pub focus: Focus,
     pub overlay: Option<Overlay>,
     pub toast: Option<Toast>,
+    /// Frames the reader's first `Ctrl+C` is still waiting for a second one.
+    ///
+    /// The hint on the status band is drawn from this rather than stored beside
+    /// it, so the two can never disagree about whether a second press would
+    /// quit. Zero is "not armed".
+    quit_armed: u8,
 
     pub settings: SettingsState,
     pub management_data: ManagementData,
@@ -1156,6 +1162,7 @@ impl App {
             focus: Focus::Main,
             overlay: None,
             toast: None,
+            quit_armed: 0,
             settings: SettingsState {
                 theme_id: theme.id.to_string(),
                 mode: options.mode,
@@ -2257,6 +2264,27 @@ impl App {
         self.toast = Some(toast);
     }
 
+    /// Whether a second `Ctrl+C` would quit, and the hint is on screen.
+    pub fn quit_armed(&self) -> bool {
+        self.quit_armed > 0
+    }
+
+    /// Take the reader's first `Ctrl+C`, and start the window a second one has
+    /// to land in.
+    pub fn arm_quit(&mut self) {
+        self.quit_armed = QUIT_ARM_FRAMES;
+    }
+
+    /// Spend the arming, returning whether there was one to spend.
+    ///
+    /// Every `Ctrl+C` spends it, including the presses that go on to do
+    /// something else: an arming that survived a press which cleared a draft or
+    /// stopped a turn would leave the *next* press quitting on a reader who had
+    /// long since stopped asking to leave.
+    pub fn spend_quit(&mut self) -> bool {
+        std::mem::take(&mut self.quit_armed) > 0
+    }
+
     /// Advance transient state by one frame.
     /// Collapse or expand the whole sidebar.
     pub fn toggle_sidebar_collapsed(&mut self) {
@@ -2882,8 +2910,9 @@ impl App {
 
     pub fn tick(&mut self) -> crate::reduce::Outcome {
         // A visible toast keeps the frames coming: it is transient content, and
-        // the tick is what takes it away.
-        let mut dirty = self.toast.is_some();
+        // the tick is what takes it away. So does an armed quit, whose hint is
+        // the same kind of thing.
+        let mut dirty = self.toast.is_some() || self.quit_armed();
         if let Some(toast) = self.toast.as_mut() {
             toast.ttl = toast.ttl.saturating_sub(1);
             if toast.ttl == 0 {
@@ -2891,6 +2920,9 @@ impl App {
                 dirty = true;
             }
         }
+        // The window a second `Ctrl+C` has to land in runs on the same clock the
+        // hint does, so the moment the hint goes the arming goes with it.
+        self.quit_armed = self.quit_armed.saturating_sub(1);
         // The countdown to a continuation is the one thing on the session list
         // that changes without an event: it is what the reader watches to
         // decide whether to stop it.
@@ -4453,6 +4485,16 @@ pub const MAX_HISTORY_MATCHES: usize = 100;
 
 /// How many palette commands are remembered.
 pub const MAX_RECENT_COMMANDS: usize = 8;
+
+/// Frames a first `Ctrl+C` waits for its second before forgetting.
+///
+/// The hint on the status band counts down on the same number, so the reader
+/// always has as long to answer as they had to read it. The tick is 120 ms
+/// while something is animating and 200 ms while nothing is, which makes the
+/// window about two and a half seconds on the page a reader opens on and four
+/// on an idle one — long enough to be a question, short enough that a stray
+/// press stops meaning anything.
+pub const QUIT_ARM_FRAMES: u8 = 20;
 
 /// Column thresholds for the three shell layouts, re-calibrated from the
 /// desktop's pixel breakpoints for a character grid.

@@ -2001,6 +2001,33 @@ fn render_status_band(
         Style::default().fg(theme.roles.path),
     ));
 
+    // ---- right: the question, while there is one -------------------------
+    // The reader's first `Ctrl+C` takes the band rather than joining the end of
+    // it. A question the reader cannot see is not a question, and the segments
+    // would have to fit beside it to be worth anything: `render_zoned_line`
+    // drops a right-hand group that does not fit whole, so a hint appended to
+    // the mode, the connection and the way to the list would vanish on exactly
+    // the narrow terminals where the reader has least room to guess. What it
+    // displaces is all one key away, and a reader being asked whether to leave
+    // is not on their way to any of it. A toast still wins: it is about
+    // something that happened, and this is only about what a second press
+    // would do.
+    if app.quit_armed() && app.toast.is_none() {
+        render_zoned_line(
+            frame,
+            area,
+            left,
+            None,
+            vec![Span::styled(
+                strings.quit_hint().to_string(),
+                Style::default()
+                    .fg(theme.roles.warning)
+                    .add_modifier(Modifier::BOLD),
+            )],
+        );
+        return;
+    }
+
     // ---- right: the status segments --------------------------------------
     let mut right: Vec<Span<'static>> = Vec::new();
     let push_segment = |right: &mut Vec<Span<'static>>, span: Span<'static>| {

@@ -1675,6 +1675,11 @@ impl App {
     }
 
     fn contextual_cancel(&mut self) -> Outcome {
+        // Every `Ctrl+C` spends the arming first, whatever it goes on to do.
+        // The second press has to be a press that had nothing else to cancel,
+        // or a reader who cleared a draft and then pressed again would quit
+        // without ever having been asked.
+        let armed = self.spend_quit();
         if self.overlay.is_some() {
             self.cancel_runtime_picker();
             self.overlay = None;
@@ -1698,7 +1703,17 @@ impl App {
             self.auto_continue.pause(&session_id, now_ms);
             return Outcome::effects(vec![Effect::Interrupt { session_id }]);
         }
-        self.confirm_quit()
+        // Nothing left to cancel, so the reader is asking to leave. Twice: a
+        // single press lands here by accident often enough — a `Ctrl+C` aimed
+        // at a turn that had just finished — that quitting on it would be the
+        // client taking a misfire for an instruction. The first press answers
+        // with the hint on the status band and the second one leaves.
+        if armed {
+            self.should_quit = true;
+            return Outcome::effects(vec![]);
+        }
+        self.arm_quit();
+        Outcome::effects(vec![])
     }
 
     fn is_turn_running(&self) -> bool {

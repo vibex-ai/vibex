@@ -927,6 +927,70 @@ fn a_confirm_overlay_offers_both_answers() {
 }
 
 #[test]
+fn a_ctrl_c_with_nothing_left_to_cancel_asks_before_it_leaves() {
+    // The reader pressed `Ctrl+C` at a prompt with nothing to cancel. That is a
+    // common misfire — a press aimed at a turn that had just finished — so the
+    // client asks instead of leaving, and asks on the page it is already on.
+    let hint = Strings::for_locale(Locale::En).quit_hint();
+    let mut app = app(120, 40);
+    assert!(!app.quit_armed());
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(!app.should_quit, "one press was taken for an instruction");
+    assert!(app.quit_armed(), "the page did not ask anything");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains(hint),
+        "the page did not say how to answer:\n{screen}"
+    );
+
+    // The second press is the answer.
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(app.should_quit, "the second press did not leave");
+}
+
+#[test]
+fn a_question_about_quitting_expires_with_its_hint() {
+    // The hint and the arming are one piece of state, so the answer is live
+    // exactly as long as the question is on screen.
+    let hint = Strings::for_locale(Locale::En).quit_hint();
+    let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(app.quit_armed());
+    for _ in 0..vibex_tui::app::QUIT_ARM_FRAMES {
+        app.tick();
+    }
+    assert!(!app.quit_armed(), "the question never went away");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        !screen.contains(hint),
+        "the hint outlived the arming:\n{screen}"
+    );
+    // A press after that is a new question, not a stale answer.
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(!app.should_quit, "a stale press was taken for an answer");
+    assert!(app.quit_armed(), "the new question was not asked");
+}
+
+#[test]
+fn a_ctrl_c_that_cancels_something_else_answers_nothing() {
+    // The draft case: the first press asked about quitting, the reader went
+    // back to writing, and the second press is for the draft. Letting it answer
+    // the old question would quit on a reader who had moved on.
+    let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(app.quit_armed());
+    app.composer.insert_str("a thought");
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(!app.should_quit, "clearing a draft quit the client");
+    assert_eq!(app.composer.text(), "");
+    assert!(!app.quit_armed(), "the old question outlived its press");
+    // And the press after that asks again rather than leaving.
+    app.perform(vibex_tui::action::Intent::ContextualCancel);
+    assert!(!app.should_quit, "the spent question was answered");
+    assert!(app.quit_armed(), "the next question was not asked");
+}
+
+#[test]
 fn a_secret_prompt_never_echoes_the_secret() {
     let mut app = app(120, 40);
     app.overlay = Some(vibex_tui::app::Overlay::Prompt {

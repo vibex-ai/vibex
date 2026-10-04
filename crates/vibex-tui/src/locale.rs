@@ -354,6 +354,11 @@ strings! {
         "在 ? 後輸入以搜尋已傳送訊息；Enter 取回"
     },
     composer_draft_cleared => { "Draft cleared", "草稿已清空", "草稿已清空" },
+    quit_hint => {
+        "Press Ctrl+C again to quit",
+        "再按一次 Ctrl+C 退出",
+        "再按一次 Ctrl+C 離開"
+    },
     composer_attachments => { "Attachments", "附件", "附件" },
     composer_attach_hint => {
         "Type a path to attach it",
