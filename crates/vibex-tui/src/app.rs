@@ -2752,37 +2752,63 @@ impl App {
         self.page_owns_session() && self.transcript.is_animating()
     }
 
-    /// Whether the landing mark is still sweeping.
+    /// Whether the landing mark has a light crossing it right now.
     ///
-    /// The sweep is a greeting — the client saying it is alive while the reader
-    /// arrives on the prompt — and a greeting that never ends is a repaint
-    /// every animation tick for as long as the page is left open. One pass is
-    /// long enough to be seen and short enough that an untouched client returns
-    /// to zero frames; the phase it stops on is a whole number of passes, so
-    /// the mark comes to rest unlit rather than frozen halfway through a sweep.
-    fn landing_mark_sweeps(&self) -> bool {
-        self.composing_page_shines() && self.animation_phase < LANDING_SWEEP_FRAMES
+    /// The light comes round again for as long as the page waits, so this is
+    /// true for one pass of the loop and false between passes. It is the
+    /// question the tick period asks: there is nothing to draw quickly while
+    /// the mark sits between lights.
+    fn landing_mark_moves(&self) -> bool {
+        self.landing_mark_loops() && crate::logo::moving(self.animation_phase)
+    }
+
+    /// Whether the landing mark is looping at all.
+    ///
+    /// The page waits for the reader, so its light will come round again: the
+    /// clock has to keep running even in the quiet stretch between passes, or
+    /// there would be no next pass.
+    fn landing_mark_loops(&self) -> bool {
+        self.composing_page_shines()
+    }
+
+    /// Whether the landing mark is between passes, with nothing else moving.
+    ///
+    /// The mark keeps a clock through the quiet stretch — that is what brings
+    /// the light round again — but a frame that draws what is already on screen
+    /// is not a reason to repaint, and a light that came round at the price of
+    /// a repaint every animation tick for as long as the page is left open
+    /// would be a greeting charged to the reader's battery. So the clock runs
+    /// on the slow tick between passes and the client holds still.
+    fn landing_mark_waits(&self) -> bool {
+        self.landing_mark_loops()
+            && !self.landing_mark_moves()
+            && !self.transcript_animating()
+            && !self.turn_reads_running()
+            && self.page_approval_count() == 0
+            && self.page_elicitation_count() == 0
     }
 
     /// Whether anything on screen is moving without the reader's input.
     ///
-    /// The landing mark shines for its greeting; a turn's spinner turns.
+    /// The landing mark's light crosses the page; a turn's spinner turns.
     /// Everything else holds still, which is what keeps an idle session — and
-    /// the prompt the client opens on — at zero frames.
+    /// the prompt the client opens on, between passes — at zero frames.
     pub fn chrome_animating(&self) -> bool {
-        self.transcript_animating() || self.landing_mark_sweeps()
+        self.transcript_animating() || self.landing_mark_moves()
     }
 
     /// Step the running indicator. Returns whether a repaint is due.
     ///
     /// Streaming text does not need one: a delta marks the app dirty by itself,
-    /// so a transcript with no other animation stays at zero frames.
+    /// so a transcript with no other animation stays at zero frames. Neither
+    /// does the landing mark's clock between passes, which is stepping a phase
+    /// whose frame is already on screen.
     pub fn advance_transcript_animation(&mut self) -> bool {
         if !self.is_animating() {
             return false;
         }
         self.animation_phase = self.animation_phase.wrapping_add(1);
-        true
+        !self.landing_mark_waits()
     }
 
     /// Keep the turn clock in step with what the session actually is.
@@ -2820,15 +2846,16 @@ impl App {
     /// The turn line's spinner turns the whole time a turn is running — the
     /// quiet parts of a turn included, which is when it matters most: a spinner
     /// held on one frame while the runtime starts up reads as a frozen client.
-    /// The composing page's mark shines while it waits, and a question waiting
-    /// on the reader pulses. Everything else holds still, which is what keeps an
-    /// idle session at zero frames.
+    /// The composing page's mark loops while it waits, quiet stretch included,
+    /// because the clock between passes is what brings the light round again;
+    /// a question waiting on the reader pulses. Everything else holds still,
+    /// which is what keeps an idle session at zero frames.
     pub fn is_animating(&self) -> bool {
         self.transcript_animating()
             || self.turn_reads_running()
             || self.page_approval_count() > 0
             || self.page_elicitation_count() > 0
-            || self.landing_mark_sweeps()
+            || self.landing_mark_loops()
     }
 
     /// The approvals the page in front of the reader is waiting on.
@@ -4423,14 +4450,6 @@ impl App {
 
 /// How many history entries the composer's drawer will show.
 pub const MAX_HISTORY_MATCHES: usize = 100;
-
-/// How many frames the landing mark is lit for before it holds still.
-///
-/// Taken from the mark's own timeline rather than written down twice: the
-/// client has to stop repainting on the frame the last light finishes, or it
-/// either cuts the closing glint off or keeps a page that has gone still
-/// repainting. See [`App::chrome_animating`].
-pub const LANDING_SWEEP_FRAMES: u32 = crate::logo::PASS_FRAMES;
 
 /// How many palette commands are remembered.
 pub const MAX_RECENT_COMMANDS: usize = 8;

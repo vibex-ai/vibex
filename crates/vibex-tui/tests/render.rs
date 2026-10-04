@@ -252,22 +252,37 @@ fn the_composer_reaches_the_session_list_without_giving_up_the_draft() {
 }
 
 #[test]
-fn the_landing_mark_greets_and_then_holds_still() {
-    // The sweep says the client is alive while the reader arrives. It is a
-    // greeting, not a heartbeat: an untouched prompt returns to zero frames,
-    // which is the idle contract the whole client is measured against.
+fn the_landing_mark_loops_without_repainting_between_passes() {
+    // The light comes round for as long as the page waits, but the stretch
+    // between passes draws what is already on screen: the clock runs, the
+    // repaint does not. That is what keeps a looping mark from being a repaint
+    // every animation tick for the life of the page.
     let mut app = app(120, 40);
-    assert!(app.chrome_animating(), "the landing mark does not sweep");
-    for _ in 0..vibex_tui::app::LANDING_SWEEP_FRAMES {
-        assert!(app.advance_transcript_animation());
+    assert!(app.chrome_animating(), "the landing mark does not light up");
+    let mut drew = 0usize;
+    let mut quiet = 0usize;
+    // One whole loop. Every tick moves the clock, and asks for a repaint
+    // exactly when the frame it lands on is one that differs from rest.
+    for _ in 0..vibex_tui::logo::LOOP_FRAMES {
+        let lands_on = (app.animation_phase() + 1) % vibex_tui::logo::LOOP_FRAMES;
+        assert!(app.is_animating(), "the loop's clock stopped");
+        assert_eq!(
+            app.advance_transcript_animation(),
+            vibex_tui::logo::moving(lands_on),
+            "the tick landing on phase {lands_on} asked for the wrong thing"
+        );
+        if vibex_tui::logo::moving(lands_on) {
+            drew += 1;
+        } else {
+            quiet += 1;
+        }
     }
-    assert!(!app.chrome_animating(), "the greeting never ends");
-    assert!(!app.advance_transcript_animation());
-    assert_eq!(
-        app.animation_phase() % 60,
-        0,
-        "the mark came to rest halfway through a sweep"
-    );
+    // Most of a loop is the quiet stretch, which is the point of it.
+    assert_eq!(drew, vibex_tui::logo::SWEEP_FRAMES as usize);
+    assert!(quiet > drew, "the light is on more often than it is off");
+    // And the clock has come round exactly.
+    assert_eq!(app.animation_phase() % vibex_tui::logo::LOOP_FRAMES, 0);
+    assert!(app.chrome_animating(), "the light did not come round again");
 }
 
 #[test]
@@ -3878,11 +3893,11 @@ fn the_mark_moves_only_where_it_is_drawn() {
             .collect::<Vec<_>>(),
         "the light redrew the mark"
     );
-    // Once the pass is over the mark holds still, and it holds the same mark
-    // an untouched client sits on for the rest of the session.
+    // Between passes the mark holds still, and it holds the same mark an
+    // untouched client sits on for the rest of the session.
     let resting = text_of(&vibex_tui::logo::rows(
         &theme,
-        vibex_tui::app::LANDING_SWEEP_FRAMES,
+        vibex_tui::logo::SWEEP_FRAMES,
         80,
         true,
     ));

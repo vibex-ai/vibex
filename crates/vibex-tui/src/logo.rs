@@ -10,11 +10,9 @@
 //!
 //! # The light
 //!
-//! Two lights cross the word, and the word never changes while they do. The
-//! first is a wide, soft wash that opens the page; the second, a full pause
-//! later, is a narrow glint with a bright core. Both are one pass of
-//! [`PASS_FRAMES`], which is the number the client counts to before it stops
-//! repainting ([`crate::app::LANDING_SWEEP_FRAMES`]).
+//! One soft band of silver-white crosses the word, pauses, and comes round
+//! again. The word never changes while it does: a pass that drew the letters as
+//! it went would make a page that is waiting look like a page that is loading.
 //!
 //! Three things about the light are deliberate and easy to get wrong:
 //!
@@ -23,14 +21,16 @@
 //!   keep headroom for the light to spend. A mark that rests at full strength
 //!   has nowhere left to light up, and a band that mixes the mark toward the
 //!   background — which is what this used to do — draws a shadow crossing the
-//!   word rather than a light;
-//! * **the light has a hue before it has a core.** A cell walks from its
-//!   resting grey to the theme's cyan and only then to the foreground, so the
-//!   middle of the pass is a coloured band rather than a lighter smudge;
-//! * **the mark at rest is a gradient, not a flat block.** It is brightest at
-//!   the top and steps down toward the bottom, which is both the headroom the
-//!   closing glint spends and what keeps the page from looking like a wall of
-//!   one colour once the animation is over.
+//!   word rather than a light over it;
+//! * **the light is the canvas's opposite, not a hue.** Silver-white on a dark
+//!   page and ink on a light one, which is the same statement twice: the
+//!   strongest thing that can be drawn where it falls;
+//! * **the loop has no seam, and no wasted frame.** The light starts and ends
+//!   two widths off the word, so the first and last frames of a pass are the
+//!   resting mark; and [`moving`] names exactly the frames that draw something
+//!   other than rest, which is what lets the client run the loop's clock
+//!   between passes without repainting for it
+//!   ([`crate::app::App::advance_transcript_animation`]).
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -61,52 +61,44 @@ const WORDMARK_ASCII: [&str; 2] = ["V  V  i  b  e  x", " VV   vibex.dev"];
 // The light
 // ---------------------------------------------------------------------------
 
-/// Frames the opening wash takes to cross the word.
-const WASH_FRAMES: u32 = 20;
+/// Frames one light takes to cross the word.
+pub const SWEEP_FRAMES: u32 = 20;
 
-/// Columns either side of the wash's centre that it reaches across.
+/// Frames one whole loop takes: the crossing, and the quiet stretch after it.
+///
+/// The quiet stretch is most of the loop on purpose. A light that came round
+/// again the moment it left would stop being something that happens to the page
+/// and start being a flicker on it. At the tick the client runs while a light
+/// is moving, and the slower one it runs between lights, a loop is about ten
+/// seconds with the light itself taking a quarter of that.
+pub const LOOP_FRAMES: u32 = 60;
+
+/// Columns either side of the light's centre that it reaches across.
 const WASH_WIDTH: f32 = 5.0;
-
-/// How much light the wash carries at its centre.
-///
-/// Half of the ramp, which is exactly the hue: a wash is a colour passing over
-/// the word, and the white core belongs to the glint alone.
-const WASH_PEAK: f32 = 0.5;
-
-/// The frame the closing glint enters on.
-const GLINT_START: u32 = 38;
-
-/// Frames the closing glint takes to cross the word and leave it.
-const GLINT_FRAMES: u32 = 22;
-
-/// Columns either side of the glint's centre that it reaches across.
-const GLINT_WIDTH: f32 = 1.7;
-
-/// Frames one whole landing animation takes: washed, settled, crossed.
-///
-/// The number the client repaints for and then stops at.
-pub const PASS_FRAMES: u32 = GLINT_START + GLINT_FRAMES;
 
 /// How far down the mark's own grey scale the resting bottom row sits.
 ///
 /// The top row rests at `REST_HEAD` of the way there rather than at the
-/// foreground, which is the headroom the lights spend.
+/// foreground, which is the headroom the light spends.
 const REST_HEAD: f32 = 0.25;
 
 /// Above this much light a cell is drawn bold in a palette that cannot blend.
-///
-/// Below the wash's peak on purpose: a threshold above it would mean the
-/// opening wash is never marked at all in a palette that has only weight to
-/// spend, and the page would open on a still mark.
 const LIT: f32 = 0.45;
 
-/// The light's colour.
+/// The colour a light crossing the mark takes.
 ///
-/// Cyan rather than the running rail's blue. Both mean "alive", but the landing
-/// page is doing nothing at all, and the blue that means *a turn is running*
-/// would say the wrong thing on it.
-fn light_hue(theme: &TuiTheme) -> Color {
-    theme.roles.accent_tool
+/// The catalogue has no token named for a light, and the one it carries for the
+/// job is `border`: authored as the canvas's opposite in every shipped theme —
+/// `#ffffff` in all ten dark ones, `#000000` in all ten light ones — which is
+/// what light is, and what makes a specular read as a specular rather than as a
+/// slightly lighter grey. On a light page that inverts to ink, which is the
+/// same statement: the strongest thing that can be drawn on the canvas it falls
+/// on. The token is named for hairlines because that is what it was authored
+/// for; its value is what a light needs, and minting a second white here would
+/// put a colour outside the catalogue that every theme would then have to be
+/// checked against.
+fn silver(theme: &TuiTheme) -> Color {
+    theme.roles.border
 }
 
 /// Whether this terminal can be shown a light at all.
@@ -117,6 +109,19 @@ fn light_hue(theme: &TuiTheme) -> Color {
 /// movement is dropped.
 fn lights_up(theme: &TuiTheme) -> bool {
     !matches!(theme.capability.mode, ColorMode::None)
+}
+
+/// Whether the mark at `phase` draws anything other than its resting self.
+///
+/// Every frame outside a pass is the resting mark exactly, and every frame
+/// inside one differs from it. That is the contract the client's clock between
+/// passes relies on: it can keep the loop turning without repainting for it.
+/// The frames at either end of a pass differ from rest by a level or two of one
+/// channel, because the band starts and ends two widths off the word rather
+/// than on its edge — the difference is what a seam would be made of, and it is
+/// why there is none to see.
+pub const fn moving(phase: u32) -> bool {
+    phase % LOOP_FRAMES < SWEEP_FRAMES
 }
 
 /// The art a terminal of `available` columns is drawn with, if it fits.
@@ -145,19 +150,18 @@ pub fn width(glyphs: GlyphMode, available: u16) -> usize {
 
 /// Rows of the mark, lit as if a light were crossing it.
 ///
-/// `phase` advances a frame at a time and is not wrapped: past [`PASS_FRAMES`]
-/// the mark is simply at rest, which is what keeps an idle client at zero
-/// frames. `bright` is whether the page the mark sits on is waiting for input
-/// at all; a mark on a page that is not is drawn at rest and never animated.
+/// `phase` advances a frame at a time and is read through [`LOOP_FRAMES`], so
+/// the light comes round again for as long as the page waits. `bright` is
+/// whether the page the mark sits on is waiting for input at all; a mark on a
+/// page that is not is drawn at rest and never animated.
 pub fn rows(theme: &TuiTheme, phase: u32, available: u16, bright: bool) -> Vec<Line<'static>> {
     let Some(art) = art(theme.glyphs(), available) else {
         return Vec::new();
     };
     let width = width_of(art);
     let height = art.len();
-    let animating = bright && lights_up(theme) && phase < PASS_FRAMES;
+    let animating = bright && lights_up(theme);
     let wash = wash_position(phase, width);
-    let glint = glint_position(phase, width);
 
     art.iter()
         .enumerate()
@@ -171,7 +175,7 @@ pub fn rows(theme: &TuiTheme, phase: u32, available: u16, bright: bool) -> Vec<L
                     spans.push(Span::raw(" "));
                 } else {
                     let light = if animating {
-                        light_at(column, wash, glint)
+                        light_at(column, wash)
                     } else {
                         0.0
                     };
@@ -191,38 +195,28 @@ pub fn rows(theme: &TuiTheme, phase: u32, available: u16, bright: bool) -> Vec<L
         .collect()
 }
 
-/// Where the opening wash's centre is, in columns, or nowhere once it has left.
+/// Where the light's centre is, in columns, or nowhere between passes.
 fn wash_position(phase: u32, width: usize) -> f32 {
-    if phase >= WASH_FRAMES {
+    let swept = phase % LOOP_FRAMES;
+    if swept >= SWEEP_FRAMES {
         return f32::NEG_INFINITY;
     }
-    let crossed = phase as f32 / WASH_FRAMES as f32;
-    // Enters from off the left edge and leaves past the right one, so the
-    // frame the wash ends on is indistinguishable from rest.
-    crossed * (width as f32 + 2.0 * WASH_WIDTH) - WASH_WIDTH
+    let crossed = swept as f32 / SWEEP_FRAMES as f32;
+    // Two widths off the left edge and two past the right one, so the band is
+    // already dark where the word begins and dark again where it ends: the
+    // first and last frames of a pass are the resting mark, and the loop has no
+    // seam to see.
+    crossed * (width as f32 + 4.0 * WASH_WIDTH) - 2.0 * WASH_WIDTH
 }
 
-/// Where the closing glint's centre is, in columns, or nowhere before it starts.
-fn glint_position(phase: u32, width: usize) -> f32 {
-    if !(GLINT_START..PASS_FRAMES).contains(&phase) {
-        return f32::NEG_INFINITY;
-    }
-    let crossed = (phase - GLINT_START) as f32 / GLINT_FRAMES as f32;
-    crossed * (width as f32 + 8.0) - 4.0
-}
-
-/// How much light a cell carries: 0.0 at rest, 1.0 at the core of the glint.
-fn light_at(column: usize, wash: f32, glint: f32) -> f32 {
-    let column = column as f32;
-    let washed = WASH_PEAK * (-((column - wash) / WASH_WIDTH).powi(2)).exp();
-    let flashed = (-((column - glint) / GLINT_WIDTH).powi(2)).exp();
-    washed.max(flashed)
+/// How much light a cell carries: 0.0 at rest, 1.0 under the centre of a band.
+fn light_at(column: usize, wash: f32) -> f32 {
+    (-((column as f32 - wash) / WASH_WIDTH).powi(2)).exp()
 }
 
 /// The style one cell of the mark is drawn in.
 ///
-/// A cell's colour is its resting weight walked toward the light and then
-/// toward the foreground, so the glint has a core and a tinted fringe.
+/// A cell's colour is its resting weight walked toward the light.
 /// [`ColorMode::blends`] decides whether that ramp can be drawn at all; where
 /// it cannot, the resting weight becomes a step between two theme greys and the
 /// light becomes weight, which is the only brightness a shallow palette has.
@@ -253,18 +247,7 @@ fn style_for(theme: &TuiTheme, row: usize, height: usize, light: f32) -> Style {
         REST_HEAD + (1.0 - REST_HEAD) * (row as f32 / (height - 1) as f32)
     };
     let rest = theme.blend(theme.roles.foreground, theme.roles.gray_dim, depth);
-    let colour = if light <= 0.0 {
-        rest
-    } else if light < 0.5 {
-        theme.blend(rest, light_hue(theme), light * 2.0)
-    } else {
-        theme.blend(
-            light_hue(theme),
-            theme.roles.foreground,
-            (light - 0.5) * 2.0,
-        )
-    };
-    Style::default().fg(colour)
+    Style::default().fg(theme.blend(rest, silver(theme), light))
 }
 
 #[cfg(test)]
@@ -281,8 +264,23 @@ mod tests {
         )
     }
 
+    fn light_theme() -> TuiTheme {
+        TuiTheme::resolve(
+            Some("vibex-light"),
+            GpuiThemeMode::Light,
+            ColorCapability {
+                mode: ColorMode::TrueColor,
+                glyphs: GlyphMode::Unicode,
+            },
+        )
+    }
+
     fn text_of(lines: &[Line<'static>]) -> Vec<String> {
         lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    fn painted(lines: &[Line<'static>]) -> String {
+        format!("{lines:?}")
     }
 
     fn first_colour(line: &Line<'static>) -> Color {
@@ -292,9 +290,9 @@ mod tests {
             .expect("no drawn cell on this row")
     }
 
-    fn brightness(colour: Color) -> u32 {
+    fn brightness(colour: Color) -> i32 {
         match colour {
-            Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+            Color::Rgb(r, g, b) => i32::from(r) + i32::from(g) + i32::from(b),
             other => panic!("true colour produced {other:?}"),
         }
     }
@@ -302,7 +300,7 @@ mod tests {
     #[test]
     fn the_mark_fits_the_terminal_it_is_drawn_in() {
         let unicode = theme(ColorMode::TrueColor, GlyphMode::Unicode);
-        let wide = rows(&unicode, PASS_FRAMES, 80, true);
+        let wide = rows(&unicode, 0, 80, true);
         assert_eq!(wide.len(), WORDMARK.len());
         assert_eq!(width(GlyphMode::Unicode, 80), WORDMARK[0].chars().count());
         assert!(
@@ -313,13 +311,13 @@ mod tests {
 
         // A pane too narrow for the word gets the lines under it and nothing
         // else, rather than half a wordmark.
-        assert!(rows(&unicode, PASS_FRAMES, 30, true).is_empty());
+        assert!(rows(&unicode, 0, 30, true).is_empty());
         assert_eq!(width(GlyphMode::Unicode, 30), 0);
 
         // A console font has no block glyphs: the mark falls back to words
         // rather than to six rows of substitution characters.
         let ascii = theme(ColorMode::TrueColor, GlyphMode::Ascii);
-        let art = rows(&ascii, PASS_FRAMES, 80, true);
+        let art = rows(&ascii, 0, 80, true);
         assert_eq!(art.len(), WORDMARK_ASCII.len());
         assert!(
             art.iter().all(|line| line.to_string().is_ascii()),
@@ -331,80 +329,99 @@ mod tests {
     fn the_light_crosses_the_letters_and_never_redraws_them() {
         let unicode = theme(ColorMode::TrueColor, GlyphMode::Unicode);
         let letters = |phase: u32| text_of(&rows(&unicode, phase, 80, true));
-        let resting = letters(PASS_FRAMES);
-        // Every frame spells the same word: a pass that revealed the letters
-        // would make a page that is waiting look like a page that is loading.
-        for phase in 0..=PASS_FRAMES {
+        let resting = letters(LOOP_FRAMES);
+        // Every frame of two whole loops spells the same word.
+        for phase in 0..(2 * LOOP_FRAMES) {
             assert_eq!(letters(phase), resting, "phase {phase} redrew the mark");
         }
-        // The lights move, whatever else is true.
-        let lit = |phase: u32| format!("{:?}", rows(&unicode, phase, 80, true));
-        assert_ne!(lit(0), lit(WASH_FRAMES - 1), "the wash did not move");
+        // The light moves, whatever else is true.
+        let lit = |phase: u32| painted(&rows(&unicode, phase, 80, true));
+        assert_ne!(lit(0), lit(SWEEP_FRAMES / 2), "the light did not move");
         assert_ne!(
-            lit(WASH_FRAMES),
-            lit(GLINT_START + GLINT_FRAMES / 2),
-            "the glint did not move"
+            lit(SWEEP_FRAMES / 2),
+            lit(SWEEP_FRAMES - 1),
+            "the light stopped halfway"
         );
     }
 
     #[test]
-    fn the_mark_comes_to_rest_every_time() {
+    fn the_loop_has_no_seam_and_no_wasted_frame() {
         let unicode = theme(ColorMode::TrueColor, GlyphMode::Unicode);
-        let art = text_of(&rows(&unicode, PASS_FRAMES, 80, true));
-        // Past the pass the mark is still: this is the state an untouched
-        // client sits in for the rest of the session, so no frame after the
-        // pass may differ from it, in colour or in letters.
-        for phase in [PASS_FRAMES, PASS_FRAMES + 1, PASS_FRAMES + 997] {
+        // The resting mark is read from the frame the light has just left on,
+        // which is the first frame of the quiet stretch. A whole loop on from
+        // the start of a pass is the start of the *next* pass, not rest.
+        let resting = painted(&rows(&unicode, SWEEP_FRAMES, 80, true));
+        for phase in SWEEP_FRAMES..LOOP_FRAMES {
             assert_eq!(
-                format!("{:?}", rows(&unicode, phase, 80, true)),
-                format!("{:?}", rows(&unicode, PASS_FRAMES, 80, true)),
-                "phase {phase}"
+                painted(&rows(&unicode, phase, 80, true)),
+                resting,
+                "phase {phase} of the quiet stretch does not rest"
             );
         }
-        // A page that is not waiting gets the resting mark, never a frozen
-        // frame of the animation.
-        assert_eq!(text_of(&rows(&unicode, 3, 80, false)), art);
-        assert_eq!(text_of(&rows(&unicode, 0, 80, false)), art);
+        // The loop comes round exactly: what the client draws at a phase and at
+        // that phase plus a loop is the same picture.
+        for phase in 0..LOOP_FRAMES {
+            assert_eq!(
+                painted(&rows(&unicode, phase, 80, true)),
+                painted(&rows(&unicode, phase + LOOP_FRAMES, 80, true)),
+                "phase {phase} does not repeat"
+            );
+        }
+        // `moving` names the frames that differ from rest, in both directions:
+        // a quiet frame that drew something would be a repaint the client asked
+        // for and did not get, and a moving frame that drew the resting mark
+        // would be a repaint it paid for and did not need.
+        for phase in 0..(2 * LOOP_FRAMES) {
+            let frame = painted(&rows(&unicode, phase, 80, true));
+            if moving(phase) {
+                assert_ne!(frame, resting, "phase {phase} moves but draws rest");
+            } else {
+                assert_eq!(frame, resting, "phase {phase} is quiet but draws");
+            }
+        }
     }
 
     #[test]
-    fn the_light_spends_the_headroom_the_rest_state_keeps() {
-        let unicode = theme(ColorMode::TrueColor, GlyphMode::Unicode);
-        // At rest the mark is a gradient, not a flat block: the top is a
-        // different colour from the bottom.
-        let resting = rows(&unicode, PASS_FRAMES, 80, true);
-        let rest_top = first_colour(&resting[0]);
-        let rest_bottom = first_colour(&resting[WORDMARK.len() - 1]);
-        assert_ne!(rest_top, rest_bottom, "the mark rests flat");
+    fn the_light_is_the_canvas_s_opposite() {
+        // Halfway through a pass the band's centre is on column twenty, so that
+        // cell carries the light at full strength: the colour to read the light
+        // off.
+        let lit_cell = |theme: &TuiTheme| {
+            rows(theme, SWEEP_FRAMES / 2, 80, true)[0].spans[20]
+                .style
+                .fg
+                .expect("the cell is drawn")
+        };
+        let rest_top = |theme: &TuiTheme| first_colour(&rows(theme, SWEEP_FRAMES, 80, true)[0]);
 
-        // Across the pass some cell gets brighter than the mark ever rests,
-        // which it can only do because the rest state kept the headroom ...
-        let mut brightest = brightness(rest_top);
-        let mut tinted = false;
-        for phase in 0..PASS_FRAMES {
-            for line in rows(&unicode, phase, 80, true) {
-                for span in line.spans {
-                    let Some(colour) = span.style.fg else {
-                        continue;
-                    };
-                    if span.content.trim().is_empty() {
-                        continue;
-                    }
-                    let Color::Rgb(r, g, b) = colour else {
-                        panic!("true colour produced {colour:?}")
-                    };
-                    // ... and does it in a colour rather than in a lighter
-                    // grey, which is what stops the pass reading as a smudge.
-                    tinted |= r != g || g != b;
-                    brightest = brightest.max(brightness(colour));
-                }
-            }
-        }
-        assert!(
-            brightest > brightness(rest_top),
-            "the light never rose above the resting mark"
+        let dark = theme(ColorMode::TrueColor, GlyphMode::Unicode);
+        assert_eq!(
+            lit_cell(&dark),
+            dark.roles.border,
+            "the light is not the colour the catalogue keeps for it"
         );
-        assert!(tinted, "the light never took a hue");
+        assert!(
+            brightness(lit_cell(&dark)) > brightness(rest_top(&dark)),
+            "the light does not rise above the resting mark"
+        );
+        // The mark rests as a gradient rather than a flat block, which is the
+        // headroom that light is spending.
+        let resting = rows(&dark, SWEEP_FRAMES, 80, true);
+        assert_ne!(
+            first_colour(&resting[0]),
+            first_colour(&resting[WORDMARK.len() - 1]),
+            "the mark rests flat"
+        );
+
+        // On a light page the same ramp is ink: a light cannot be brighter than
+        // the paper it falls on, so the strongest thing that can be drawn there
+        // is the darkest.
+        let light = light_theme();
+        assert_eq!(lit_cell(&light), light.roles.border);
+        assert!(
+            brightness(lit_cell(&light)) < brightness(rest_top(&light)),
+            "the light on a light page does not darken the mark"
+        );
     }
 
     #[test]
@@ -415,17 +432,17 @@ mod tests {
         // flicker.
         for mode in [ColorMode::Ansi16, ColorMode::Ansi256] {
             let theme = theme(mode, GlyphMode::Unicode);
-            let lit = rows(&theme, WASH_FRAMES / 2, 80, true);
+            let lit = rows(&theme, SWEEP_FRAMES / 2, 80, true);
             assert!(
                 lit.iter().any(|line| line
                     .spans
                     .iter()
                     .any(|span| span.style.add_modifier.contains(Modifier::BOLD))),
-                "{mode:?} did not mark the wash"
+                "{mode:?} did not mark the light"
             );
             // The resting mark still steps down its own greys, so the page is
             // not left with the flat block a gradient-less palette would give.
-            let resting = rows(&theme, PASS_FRAMES, 80, true);
+            let resting = rows(&theme, LOOP_FRAMES, 80, true);
             assert_ne!(
                 first_colour(&resting[0]),
                 first_colour(&resting[WORDMARK.len() - 1]),
@@ -437,10 +454,10 @@ mod tests {
         // and still, because a light with neither colour nor weight to spend
         // would only flicker between two identical frames.
         let plain = theme(ColorMode::None, GlyphMode::Unicode);
-        let resting = format!("{:?}", rows(&plain, PASS_FRAMES, 80, true));
-        for phase in [0, WASH_FRAMES / 2, GLINT_START + 4] {
+        let resting = painted(&rows(&plain, LOOP_FRAMES, 80, true));
+        for phase in [0, SWEEP_FRAMES / 2, SWEEP_FRAMES + 3] {
             assert_eq!(
-                format!("{:?}", rows(&plain, phase, 80, true)),
+                painted(&rows(&plain, phase, 80, true)),
                 resting,
                 "a colourless terminal animated the mark at phase {phase}"
             );
