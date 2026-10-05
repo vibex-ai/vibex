@@ -313,8 +313,8 @@ fn handle_key(
     let key = normalized_key(key);
     // The transcript search bar is a text field, so it takes printable keys
     // before the binding table sees them — the same rule the list filter uses.
-    // Control chords still fall through, so `Ctrl+Q`, `Ctrl+P` and `Ctrl+C`
-    // keep working while a field has focus.
+    // Control chords still fall through, so `Ctrl+P` and `Ctrl+C` keep working
+    // while a field has focus.
     if app.search_composing() && !key.modifiers.contains(KeyModifiers::CONTROL) {
         handle_search_key(app, key);
         return Ok(false);
@@ -650,8 +650,9 @@ fn handle_key(
                     });
                     return Ok(false);
                 }
-                // Anything else — `Ctrl+Q`, the function keys — falls through
-                // to the binding table, so the editor does not trap the reader.
+                // Anything else — the control chords, the function keys —
+                // falls through to the binding table, so the editor does not
+                // trap the reader.
                 _ => {}
             }
         }

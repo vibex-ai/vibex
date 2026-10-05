@@ -499,11 +499,6 @@ fn a_session_page_draws_no_shortcut_band() {
         "the session page still draws the key bar:\n{}",
         lines.join("\n")
     );
-    assert!(
-        !lines.iter().any(|line| line.contains("Ctrl+Q")),
-        "the session page still draws the key bar:\n{}",
-        lines.join("\n")
-    );
 
     // The list page keeps it: that page is navigated rather than written on.
     app.perform(vibex_tui::action::Intent::GotoSessions);
@@ -1023,11 +1018,25 @@ fn the_command_palette_shows_matches_and_a_query_line() {
 
 #[test]
 fn a_confirm_overlay_offers_both_answers() {
-    let mut app = app(120, 40);
-    app.perform(vibex_tui::action::Intent::RequestQuit);
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    select_setting(&mut app, SettingRow::Theme);
+    app.perform(vibex_tui::action::Intent::ResetSetting);
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("Confirm"), "{screen}");
     assert!(screen.contains("Cancel"), "{screen}");
+}
+
+#[test]
+fn the_quit_command_leaves_without_a_second_question() {
+    // `Ctrl+Q` used to raise a modal asking whether the reader meant it. The
+    // chord is gone, and so is the modal: the palette's Quit is a command the
+    // reader picked out by name, and `Ctrl+C` still owns the two-press version
+    // for the key that can be hit by accident.
+    let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::RequestQuit);
+    assert!(app.overlay.is_none(), "quitting asked a second question");
+    assert!(app.should_quit, "the quit command did not leave");
 }
 
 #[test]

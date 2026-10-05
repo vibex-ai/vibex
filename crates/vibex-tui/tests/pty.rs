@@ -288,10 +288,9 @@ fn startup_paints_a_first_frame() {
 fn quitting_restores_the_terminal() {
     let mut session = Session::start(100, 30);
     session.wait_for_first_frame();
-    session.send(b"\x11"); // Ctrl+Q
+    session.send(b"\x03"); // Ctrl+C: nothing to cancel, so the band asks
     session.pump(Duration::from_millis(300));
-    // Accept the confirmation.
-    session.send(b"\r");
+    session.send(b"\x03"); // the second press leaves
     session.pump(Duration::from_millis(500));
 
     let deadline = Instant::now() + SETTLE_TIMEOUT;
@@ -300,7 +299,7 @@ fn quitting_restores_the_terminal() {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("the client did not exit after the quit confirmation");
+            panic!("the client did not exit after the second Ctrl+C");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -369,13 +368,13 @@ fn in_process_diagnostics_never_reach_the_terminal() {
     );
 
     // Quit so the client restores the terminal and names the spill file.
-    session.send(b"\x11");
+    session.send(b"\x03");
     session.pump(Duration::from_millis(300));
-    session.send(b"\r");
+    session.send(b"\x03");
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     while session.child.try_wait().ok().flatten().is_none() {
         if Instant::now() >= deadline {
-            panic!("the client did not exit after the quit confirmation");
+            panic!("the client did not exit after the second Ctrl+C");
         }
         session.pump(Duration::from_millis(50));
     }
@@ -516,14 +515,17 @@ fn row_of(screen: &str, needle: &str) -> Option<usize> {
 }
 
 /// Quit a running client and wait for it to exit.
+///
+/// `Ctrl+C` is the only key that leaves, and it asks once: the first press
+/// arms the quit and puts the hint on the status band, the second one goes.
 fn quit(session: &mut Session) {
-    session.send(b"\x11"); // Ctrl+Q
+    session.send(b"\x03"); // Ctrl+C: nothing to cancel, so the band asks
     session.pump(Duration::from_millis(300));
-    session.send(b"\r"); // accept the confirmation
+    session.send(b"\x03"); // the second press leaves
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     while session.child.try_wait().ok().flatten().is_none() {
         if Instant::now() >= deadline {
-            panic!("the client did not exit after the quit confirmation");
+            panic!("the client did not exit after the second Ctrl+C");
         }
         session.pump(Duration::from_millis(50));
     }
