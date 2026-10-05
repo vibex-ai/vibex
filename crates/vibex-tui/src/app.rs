@@ -84,6 +84,23 @@ impl Page {
     }
 }
 
+/// How many pages the walk back remembers.
+///
+/// A page costs two small enums; the cap exists so a client left running for
+/// days cannot grow the history without bound, and it is deeper than any path a
+/// reader walks in one sitting.
+const PAGE_HISTORY_LIMIT: usize = 64;
+
+/// A page the reader left, and the pane that owned the keyboard on it.
+///
+/// `Esc` returns here: the focus comes back with the page, so a reader who
+/// opened a panel from a draft lands back in the composer that draft is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageVisit {
+    pub page: Page,
+    pub focus: Focus,
+}
+
 /// Which pane owns the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -674,6 +691,9 @@ pub struct App {
 
     pub page: Page,
     pub focus: Focus,
+    /// The pages the reader came from, newest last, which is what `Esc` walks
+    /// back through: the order pages were opened in, not a fixed hierarchy.
+    pub page_history: Vec<PageVisit>,
     pub overlay: Option<Overlay>,
     pub toast: Option<Toast>,
     /// Frames the reader's first `Ctrl+C` is still waiting for a second one.
@@ -1268,6 +1288,7 @@ impl App {
             completion: None,
             page: Page::Sessions,
             focus: Focus::Main,
+            page_history: Vec::new(),
             overlay: None,
             toast: None,
             quit_armed: 0,
@@ -3314,7 +3335,55 @@ impl App {
         }
     }
 
+    /// Open the page the reader asked for.
+    ///
+    /// The page being left is remembered, because `Esc` walks back through the
+    /// pages the reader actually opened rather than through a fixed hierarchy:
+    /// a reader who opened Usage from the composing page lands back on the
+    /// composing page, not on a session list they never opened. Showing the
+    /// page already on screen is not a step, so it is not remembered either.
     pub fn navigate_to(&mut self, page: Page) {
+        if page != self.page {
+            self.remember_page();
+        }
+        self.enter_page(page);
+    }
+
+    /// Note where the reader is, for the walk back.
+    fn remember_page(&mut self) {
+        self.page_history.push(PageVisit {
+            page: self.page,
+            focus: self.focus,
+        });
+        if self.page_history.len() > PAGE_HISTORY_LIMIT {
+            self.page_history.remove(0);
+        }
+    }
+
+    /// Walk back to the page this one was opened from, if there is one.
+    ///
+    /// Walking back is not opening a page: what the reader returns to is a page
+    /// they already had, so the step never grows the history it walks. The focus
+    /// the page was left with comes back with it — a keyboard that was in the
+    /// composer lands there again — and an entry that names the page already on
+    /// screen is skipped rather than spending the press on no movement. Answers
+    /// whether there was anywhere to go.
+    pub fn navigate_back(&mut self) -> bool {
+        while let Some(visit) = self.page_history.pop() {
+            if visit.page == self.page {
+                continue;
+            }
+            self.enter_page(visit.page);
+            if visit.focus == Focus::Composer && visit.page.is_composing_page() {
+                self.focus = Focus::Composer;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Show a page, with the state a page change resets.
+    fn enter_page(&mut self, page: Page) {
         if self.page != page {
             self.navigation_serial = self.navigation_serial.wrapping_add(1);
             self.cancel_runtime_picker();

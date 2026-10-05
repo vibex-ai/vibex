@@ -499,13 +499,24 @@ is never a column count.
   where the protocol answers, and `Ctrl+J` — a line feed, a byte of its own in
   every terminal — everywhere else. Help lists both; the send key stays `Enter`.
 * `Esc` only walks back one level; it never cancels a running turn. `Ctrl+C`
-  owns clear-draft / interrupt / quit-confirm.
-* **The composer is not a room without a door.** `Esc` in the composer returns
-  to the session list in a single press — `go_back` skips its focus hop on a
-  session page — and leaves the draft where it was, so stepping out costs
-  nothing and stepping back in resumes typing. A selection highlight and an open
-  completion drawer are dismissed first; clearing the draft is `Ctrl+C`, never a
-  second `Esc`.
+  owns clear-draft / interrupt / quit-confirm. **The pages a reader opened are a
+  history, not a hierarchy.** `navigate_to` remembers the page it leaves — and
+  the pane that owned the keyboard on it — in `App::page_history`, and `go_back`
+  returns there, so a reader who opens Usage (`3`) from the composing page comes
+  back to that draft rather than to a session list they never opened. Walking
+  back is not an open: it never pushes, an entry naming the page already shown is
+  skipped rather than spending a press on no movement, and the history is capped
+  at `PAGE_HISTORY_LIMIT`. With nothing to walk back to, the two halves of where
+  the client starts still step between each other — the list and the prompt — and
+  every other page falls back to the list.
+* **The composer is not a room without a door.** `Esc` in the composer returns,
+  in a single press, to the page the session was opened from — the session list
+  when the reader came from it — because `go_back` skips its focus hop on a
+  session page, and leaves the draft where it was, so stepping out costs nothing
+  and stepping back in resumes typing. The focus a page was left with comes back
+  with it, so a panel opened from a draft lands in that draft's composer. A
+  selection highlight and an open completion drawer are dismissed first; clearing
+  the draft is `Ctrl+C`, never a second `Esc`.
 * **A chord a text field does not use stays global.** The composer scope wins
   over `Scope::Global`, so binding a completion key to `Ctrl+P` silently killed
   the command palette inside every session. Completion navigation lives on
@@ -848,8 +859,9 @@ is never a column count.
   drawn last so it holds the corner; it names the chord that answers where the
   keyboard is: `Ctrl+L` while the composer holds it, the global `1` once the
   reader has moved to the transcript, because the plain digits are characters in
-  a draft. `Esc` steps between the prompt and the list; from a
-  session it is still session → list → prompt.
+  a draft. `Esc` returns to the page this one was opened from — a session opened
+  from the list comes back to the list — while the prompt and the list still step
+  between each other when nothing was opened before them.
 * **The page's choices belong to the page until a creation consumes them.**
   Entering the composing page keeps the Agent and the directory already chosen
   for it: `Ctrl+G` and `Ctrl+W` are global, so a reader who picked either from

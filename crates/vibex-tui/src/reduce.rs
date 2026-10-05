@@ -1661,33 +1661,36 @@ impl App {
             self.filter.clear();
             return Outcome::effects(vec![]);
         }
-        // Leaving the composing page abandons the session that was never
-        // created, not the draft: the words stay in the composer, so `n` again
-        // finds them.
-        if self.page == Page::NewSession {
-            self.navigate_to(Page::Sessions);
-            self.focus = Focus::Main;
-            return Outcome::effects(vec![]);
-        }
         // The composer is where the keyboard lands when a session is opened, so
-        // it must not be a room with no door: `Esc` from a session returns to
-        // the session list rather than only moving focus off the draft. `Tab`
-        // is what walks the panes, and the draft is left where it was.
+        // it must not be a room with no door: `Esc` from the composer moves the
+        // keyboard off the draft rather than only being swallowed by it. `Tab`
+        // is what walks the panes, and the draft is left where it was. A
+        // session's own page skips this hop, so leaving one costs one press.
         if self.focus == Focus::Composer && !self.page.is_session_page() {
             self.focus = Focus::Main;
             return Outcome::effects(vec![]);
         }
-        // The list and the page a session is written on are the two halves of
-        // where the client starts, so `Esc` steps between them: the reader who
-        // walks in from the prompt lands back on it rather than on a page that
-        // ignores the key. A session's own page still leaves to the list first,
-        // which makes the way out two steps: session, list, prompt.
-        if self.page == Page::Sessions {
-            self.navigate_to(Page::NewSession);
-            self.focus = Focus::Composer;
+        // Pages are a history, not a hierarchy: `Esc` returns to the page this
+        // one was opened from, in the order the reader opened them. A reader who
+        // opened Usage while writing a new session lands back in that draft —
+        // never on a session list they never opened.
+        if self.navigate_back() {
             return Outcome::effects(vec![]);
         }
-        self.select_global(vibex_ui::shell::GlobalDestination::Sessions);
+        // Nothing was opened before this page, so the two halves of where the
+        // client starts still step between each other; any other page falls back
+        // to the list, which is the page every session is opened from.
+        match self.page {
+            Page::Sessions => {
+                self.navigate_to(Page::NewSession);
+                self.focus = Focus::Composer;
+            }
+            Page::NewSession => {
+                self.navigate_to(Page::Sessions);
+                self.focus = Focus::Main;
+            }
+            _ => self.select_global(vibex_ui::shell::GlobalDestination::Sessions),
+        }
         Outcome::effects(vec![])
     }
 
@@ -3678,8 +3681,11 @@ mod tests {
     fn escape_from_a_session_returns_to_the_list_with_the_draft_kept() {
         // The composer is where the keyboard lands when a session opens, so
         // `Esc` has to be able to leave the page from it: a reader who could
-        // not get back to the session list was stuck in the session.
+        // not get back to the session list was stuck in the session. The list
+        // is the page the session was opened from, which is what `Esc` returns
+        // to, so the reader walks in the way they really do.
         let mut app = capable_app();
+        app.navigate_to(Page::Sessions);
         app.navigate_to(Page::Agent);
         app.focus = crate::app::Focus::Composer;
         app.composer.set_text("an unsent draft");
@@ -3692,6 +3698,49 @@ mod tests {
             "an unsent draft",
             "leaving the session threw the draft away"
         );
+    }
+
+    #[test]
+    fn escape_walks_back_through_the_pages_that_were_opened() {
+        // The pages a reader opened are a history, not a hierarchy: a reader
+        // writing a new session who opens the Usage page comes back to the
+        // draft, with the keyboard where they left it — not to a session list
+        // they never opened, which is where a fixed hierarchy sent them.
+        let mut app = capable_app();
+        assert_eq!(app.page, Page::NewSession);
+        app.composer.insert_str("a first thought");
+
+        app.perform(Intent::GotoUsage);
+        assert_eq!(app.page, Page::Usage);
+
+        let outcome = app.perform(Intent::Back);
+        assert!(outcome.effects.is_empty());
+        assert_eq!(
+            app.page,
+            Page::NewSession,
+            "Esc left the page the Usage page was opened from"
+        );
+        assert_eq!(app.focus, crate::app::Focus::Composer);
+        assert_eq!(app.composer.text(), "a first thought");
+
+        // The step after that is the page the draft page itself came from, and
+        // the opening page's pair still steps between the two of them.
+        app.perform(Intent::Back);
+        assert_eq!(app.page, Page::Sessions);
+    }
+
+    #[test]
+    fn a_panel_returns_to_the_page_that_opened_it() {
+        // The management sections are pages of their own, so the way back from
+        // one is the page that listed it rather than the session list.
+        let mut app = capable_app();
+        app.navigate_to(Page::Management);
+        app.navigate_to(Page::Providers);
+
+        app.perform(Intent::Back);
+        assert_eq!(app.page, Page::Management);
+        app.perform(Intent::Back);
+        assert_eq!(app.page, Page::NewSession);
     }
 
     /// A runtime catalogue with two Agents, the second one unavailable.
