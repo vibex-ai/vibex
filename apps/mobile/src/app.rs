@@ -6335,14 +6335,21 @@ impl MobileApp {
     ///
     /// The saved runtimes lead because most visits are a return to a runtime
     /// rather than a new pairing, and a tap on one of those cards is the whole
-    /// way back. The three entries at the bottom are not peers: scanning is the
-    /// only one that reaches both a desktop and a headless cloud runtime,
-    /// because both publish a `vibex://` link; the other two cover the cases
-    /// where scanning is not possible, and each opens the panel that explains
-    /// it above the row, so the buttons never move under the user's finger.
+    /// way back. The three entries are not peers: scanning is the only one that
+    /// reaches both a desktop and a headless cloud runtime, because both
+    /// publish a `vibex://` link; the other two cover the cases where scanning
+    /// is not possible, and each opens the panel that explains it above the
+    /// entries, so they never move under the user's finger.
+    ///
+    /// A phone that has never paired anything has no runtimes to show, so the
+    /// three entries stack in the middle of the page where the eye already is
+    /// instead of hanging off the bottom edge; the first pairing turns them
+    /// back into the row above the thumb.
     fn render_pairing(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let scan_busy = self.pairing_action == Some(PairingAction::Scan);
         let scan_enabled = !self.pairing_busy;
+        let saved_runtimes = !self.known_hosts.is_empty();
+        let panel_open = self.pairing_panel != PairingPanel::None;
         let error_here = (self.pairing_panel != PairingPanel::Manual)
             .then(|| self.pairing_error_line())
             .flatten();
@@ -6375,16 +6382,33 @@ impl MobileApp {
                             .child(
                                 div()
                                     .id("pairing-panel-scroll")
+                                    .debug_selector(|| "pairing-panel-scroll".to_string())
                                     .w_full()
                                     .flex_1()
                                     .min_h_0()
+                                    .flex()
+                                    .flex_col()
                                     .track_scroll(&self.pairing_scroll)
                                     .overflow_y_scroll()
                                     .restrict_scroll_to_axis()
+                                    // The stacked entries are the only content
+                                    // on a page with nothing paired, so they
+                                    // take the middle; an open panel owns the
+                                    // region from its own first line instead.
+                                    .when(!saved_runtimes && !panel_open, |region| {
+                                        region.justify_center()
+                                    })
                                     .when_some(error_here, |region, line| {
                                         region.child(div().mb(px(theme::SPACING_MD)).child(line))
                                     })
                                     .child(self.render_pairing_panel(cx))
+                                    .when(!saved_runtimes, |region| {
+                                        region.child(self.render_pairing_stack(
+                                            scan_busy,
+                                            scan_enabled,
+                                            cx,
+                                        ))
+                                    })
                                     .when(self.pairing_from_hosts, |region| {
                                         region.child(
                                             div()
@@ -6408,7 +6432,9 @@ impl MobileApp {
                             ),
                     ),
             )
-            .child(self.render_pairing_actions(scan_busy, scan_enabled, cx))
+            .when(saved_runtimes, |page| {
+                page.child(self.render_pairing_actions(scan_busy, scan_enabled, cx))
+            })
     }
 
     /// The product wordmark. The brand mark supplies the capital "V" and the
@@ -6423,6 +6449,7 @@ impl MobileApp {
         div()
             .flex()
             .items_center()
+            .justify_center()
             .gap(px(1.0))
             .mb(px(theme::SPACING_XL))
             .text_size(px(PAIRING_WORDMARK_FONT))
@@ -6455,15 +6482,12 @@ impl MobileApp {
     /// A tap is the whole interaction: it installs that runtime's credential
     /// and connects. The strip scrolls sideways rather than wrapping, so the
     /// page keeps a single row of history however many runtimes are saved.
+    ///
+    /// A phone that has saved none renders nothing here: the entries below say
+    /// what to do about that already.
     fn render_pairing_runtimes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.known_hosts.is_empty() {
-            return div()
-                .w_full()
-                .mb(px(theme::SPACING_MD))
-                .text_size(px(theme::FONT_CAPTION))
-                .text_color(theme::text_muted())
-                .child(locale::common("No runtimes yet"))
-                .into_any_element();
+            return div().into_any_element();
         }
         div()
             .id("pairing-runtimes")
@@ -6611,7 +6635,6 @@ impl MobileApp {
         scan_enabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let panel_open = |panel: PairingPanel| self.pairing_panel == panel;
         div()
             .w_full()
             .debug_selector(|| "pairing-actions".to_string())
@@ -6620,39 +6643,95 @@ impl MobileApp {
             .gap(px(theme::SPACING_SM))
             .py(px(theme::SPACING_MD))
             .child(self.render_pairing_scan_action(scan_busy, scan_enabled, cx))
+            .child(self.render_pairing_panel_toggle(
+                PairingPanel::Nearby,
+                "pairing-nearby-toggle",
+                "icons/wifi-outlined.svg",
+                locale::text("Find", "查找", "尋找"),
+                cx,
+            ))
+            .child(self.render_pairing_panel_toggle(
+                PairingPanel::Manual,
+                "pairing-manual-toggle",
+                "icons/clipboard-paste.svg",
+                locale::text("Link", "链接", "連結"),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// The same three ways on a page with nothing paired: three rows in the
+    /// middle of the page, where the thumb and the eye already are, instead of
+    /// a row hanging off the bottom edge under an empty page.
+    fn render_pairing_stack(
+        &self,
+        scan_busy: bool,
+        scan_enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .debug_selector(|| "pairing-actions-stack".to_string())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACING_SM))
+            // The shared button grows along its container's main axis; in a
+            // column that would stretch the entries, so the rows keep their
+            // touch-target height.
             .child(
-                pairing_action_button(
-                    "pairing-nearby-toggle",
-                    Some("icons/wifi-outlined.svg"),
-                    locale::text("Find", "查找", "尋找"),
-                    false,
-                    panel_open(PairingPanel::Nearby),
-                )
-                .when(self.pairing_busy, |button| button.opacity(0.4))
-                .when(!self.pairing_busy, |button| {
-                    button
-                        .cursor_pointer()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_nearby_pairing))
-                }),
+                self.render_pairing_scan_action(scan_busy, scan_enabled, cx)
+                    .flex_none(),
             )
             .child(
-                pairing_action_button(
-                    "pairing-manual-toggle",
-                    Some("icons/clipboard-paste.svg"),
-                    locale::text("Link", "链接", "連結"),
-                    false,
-                    panel_open(PairingPanel::Manual),
+                self.render_pairing_panel_toggle(
+                    PairingPanel::Nearby,
+                    "pairing-nearby-toggle",
+                    "icons/wifi-outlined.svg",
+                    locale::text("Find", "查找", "尋找"),
+                    cx,
                 )
-                .when(self.pairing_busy, |button| button.opacity(0.4))
-                .when(!self.pairing_busy, |button| {
-                    button
-                        .cursor_pointer()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_manual_pairing))
-                }),
+                .flex_none(),
+            )
+            .child(
+                self.render_pairing_panel_toggle(
+                    PairingPanel::Manual,
+                    "pairing-manual-toggle",
+                    "icons/clipboard-paste.svg",
+                    locale::text("Link", "链接", "連結"),
+                    cx,
+                )
+                .flex_none(),
             )
             .into_any_element()
+    }
+
+    /// One of the two fallbacks, as the entry that opens its panel. Both layouts
+    /// place the same entries, so they share one builder.
+    fn render_pairing_panel_toggle(
+        &self,
+        panel: PairingPanel,
+        id: &'static str,
+        icon: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        pairing_action_button(id, Some(icon), label, false, self.pairing_panel == panel)
+            .when(self.pairing_busy, |button| button.opacity(0.4))
+            .when(!self.pairing_busy, |button| {
+                button
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, window, cx| {
+                            if panel == PairingPanel::Nearby {
+                                this.toggle_nearby_pairing(event, window, cx);
+                            } else {
+                                this.toggle_manual_pairing(event, window, cx);
+                            }
+                        }),
+                    )
+            })
     }
 
     /// The one action that covers both kinds of runtime.
@@ -6665,7 +6744,7 @@ impl MobileApp {
         busy: bool,
         enabled: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::Stateful<gpui::Div> {
         pairing_action_button(
             "scan-pairing-qr",
             (!busy).then_some("icons/scan-line.svg"),
@@ -19165,7 +19244,8 @@ mod tests {
         );
 
         // The same page with the runtime list empty is what a fresh install
-        // paints, and it has to keep the same three ways to add one.
+        // paints: no strip, no empty-state copy, and the three entries stacked
+        // in the middle of the page instead of hanging off the bottom edge.
         app.update(cx, |app, cx| {
             app.known_hosts.clear();
             app.active_host_id = None;
@@ -19174,6 +19254,31 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        assert!(
+            cx.debug_bounds("pairing-runtimes").is_none(),
+            "an empty runtime list should render no strip"
+        );
+        assert!(
+            cx.debug_bounds("pairing-actions").is_none(),
+            "the bottom row belongs to the page that has runtimes to show"
+        );
+        let region = cx
+            .debug_bounds("pairing-panel-scroll")
+            .expect("the content region should be laid out");
+        let stack = cx
+            .debug_bounds("pairing-actions-stack")
+            .expect("the stacked entries should be laid out");
+        assert!(
+            stack.size.height >= px(3.0 * theme::TOUCH_TARGET),
+            "the three entries should stack into three rows: {:?}",
+            stack.size
+        );
+        let above = stack.origin.y - region.origin.y;
+        let below = region.origin.y + region.size.height - (stack.origin.y + stack.size.height);
+        assert!(
+            above - below < px(1.0) && below - above < px(1.0),
+            "the stacked entries should sit in the middle: above={above:?} below={below:?}"
+        );
     }
 
     /// One renderer out of `app.rs`, from its signature to the item after it,
@@ -19200,15 +19305,22 @@ mod tests {
             "self.render_pairing_brand()",
             "self.render_pairing_runtimes(cx)",
             "self.render_pairing_actions(scan_busy, scan_enabled, cx)",
+            "self.render_pairing_stack(",
         ] {
             assert!(page.contains(call), "the page should still render {call}");
         }
-        assert!(!page.contains("Add a device"));
+        // The row is for a page that has runtimes; the stack replaces it when
+        // there are none, and the empty page carries no copy about it.
+        assert!(page.contains(".when(saved_runtimes, |page|"));
+        assert!(!page.contains("No runtimes yet") && !page.contains("Add a device"));
 
-        // The mark supplies the capital "V" and the label completes the name.
+        // The mark supplies the capital "V" and the label completes the name,
+        // and the lockup sits in the middle of the page rather than at its
+        // left edge.
         let brand = renderer_source(source, "render_pairing_brand");
         assert!(brand.contains("icons/vibex-mark.svg"));
         assert!(brand.contains("\"ibex\""));
+        assert!(brand.contains(".justify_center()"));
         assert!(!brand.contains("brand/logo.svg"));
 
         // Every saved runtime is reachable, and the row scrolls sideways once
@@ -19217,14 +19329,21 @@ mod tests {
         assert!(strip.contains("self.known_hosts"));
         assert!(strip.contains(".overflow_x_scroll()"));
 
-        let actions = renderer_source(source, "render_pairing_actions");
-        assert!(actions.contains("self.render_pairing_scan_action("));
-        for entry in ["pairing-nearby-toggle", "pairing-manual-toggle"] {
-            assert!(
-                actions.contains(entry),
-                "the bottom row should keep {entry}"
-            );
+        // Both layouts offer the same three entries, and the stack keeps them
+        // at their touch-target height instead of flexing them tall.
+        for layout in ["render_pairing_actions", "render_pairing_stack"] {
+            let source = renderer_source(source, layout);
+            assert!(source.contains("self.render_pairing_scan_action("));
+            for entry in ["pairing-nearby-toggle", "pairing-manual-toggle"] {
+                assert!(source.contains(entry), "{layout} should keep {entry}");
+            }
         }
+        assert!(
+            renderer_source(source, "render_pairing_stack")
+                .matches(".flex_none()")
+                .count()
+                >= 3
+        );
         assert!(renderer_source(source, "render_pairing_scan_action").contains("scan-pairing-qr"));
     }
 
