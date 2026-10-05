@@ -4767,10 +4767,16 @@ impl ManagementCenter {
     }
 
     /// Checks or unchecks one picker row against the draft.
+    ///
+    /// Checking answers whether the Provider offers the Model, not which Model
+    /// the settings pane is showing. When that Model is the one on screen
+    /// either way, though, the pane follows the draft: its fields are the only
+    /// copy of the declaration the checkbox just created or released.
     fn select_profile_candidate(
         &mut self,
         row: &ProfileCandidateRow,
         selected: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let changed = if selected {
@@ -4787,6 +4793,9 @@ impl ManagementCenter {
         };
         if changed {
             self.navigation.mark_dirty(ManagementSection::Agents, true);
+            if self.profile_model_selection.as_deref() == Some(row.id.as_str()) {
+                self.sync_profile_model_editor(window, cx);
+            }
         }
         cx.notify();
     }
@@ -4919,19 +4928,7 @@ impl ManagementCenter {
         // holds, so deleting the open one closes it.
         if self.profile_model_selection.as_deref() == Some(model_id.as_str()) {
             self.profile_model_selection = None;
-            self.profile_model_edit_wire_api = None;
-            self.profile_model_edit_reasoning_disabled = false;
-            self.profile_model_edit_error = None;
-            self.profile_model_advanced_open = false;
-            for input in [
-                &self.profile_model_edit_id,
-                &self.profile_model_edit_name,
-                &self.profile_model_edit_efforts,
-                &self.profile_model_edit_context_tokens,
-                &self.profile_model_edit_output_tokens,
-            ] {
-                input.update(cx, |state, cx| state.set_value("", window, cx));
-            }
+            self.clear_profile_model_editor(window, cx);
         }
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
@@ -4954,7 +4951,9 @@ impl ManagementCenter {
     /// Points the settings pane at one picker row.
     ///
     /// A row the Provider does not configure yet has no settings to show, so
-    /// the pane presents the command that adds it instead of an editor.
+    /// the pane presents the command that adds it instead of an editor. The
+    /// fields are emptied with it: the previous Model's values would otherwise
+    /// be presented as this row's settings the moment it is checked.
     fn select_profile_model(
         &mut self,
         model_id: String,
@@ -4969,12 +4968,39 @@ impl ManagementCenter {
         {
             Some(index) => self.load_profile_model_editor(index, window, cx),
             None => {
-                self.profile_model_edit_wire_api = None;
-                self.profile_model_edit_reasoning_disabled = false;
-                self.profile_model_edit_error = None;
-                self.profile_model_advanced_open = false;
+                self.clear_profile_model_editor(window, cx);
                 cx.notify();
             }
+        }
+    }
+
+    /// Points the settings pane's fields at the Model the pane is showing.
+    ///
+    /// A row can become the selection before the draft holds it — the pane
+    /// offers to add it — and a checkbox can put it in the draft afterwards.
+    /// Loading and emptying therefore travel together, so the fields always
+    /// describe the Model named by the pane's header.
+    fn sync_profile_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_profile_model_index() {
+            Some(index) => self.load_profile_model_editor(index, window, cx),
+            None => self.clear_profile_model_editor(window, cx),
+        }
+    }
+
+    /// Empties the settings pane, for a selection the draft no longer holds.
+    fn clear_profile_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_model_edit_wire_api = None;
+        self.profile_model_edit_reasoning_disabled = false;
+        self.profile_model_edit_error = None;
+        self.profile_model_advanced_open = false;
+        for input in [
+            &self.profile_model_edit_id,
+            &self.profile_model_edit_name,
+            &self.profile_model_edit_efforts,
+            &self.profile_model_edit_context_tokens,
+            &self.profile_model_edit_output_tokens,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
         }
     }
 
@@ -12533,8 +12559,8 @@ impl ManagementCenter {
                             .text_color(cx.theme().muted_foreground)
                             .child(management_locale_text("Select all", "全选", "全選")),
                     )
-                    .on_click(cx.listener(move |this, checked, _, cx| {
-                        this.set_visible_profile_candidates_selected(*checked, cx);
+                    .on_click(cx.listener(move |this, checked, window, cx| {
+                        this.set_visible_profile_candidates_selected(*checked, window, cx);
                     })),
             );
         }
@@ -12798,8 +12824,8 @@ impl ManagementCenter {
                             .checked(configured)
                             .accessibility_label(SharedString::from(title.clone()))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, checked, _, cx| {
-                                this.select_profile_candidate(&toggled, *checked, cx);
+                            .on_click(cx.listener(move |this, checked, window, cx| {
+                                this.select_profile_candidate(&toggled, *checked, window, cx);
                             })),
                     ),
             )
@@ -13375,7 +13401,12 @@ impl ManagementCenter {
     /// "All" means the rows on screen: a filtered select-all leaves hidden
     /// matches alone, and a filtered clear does not release Models the filter
     /// is hiding.
-    fn set_visible_profile_candidates_selected(&mut self, selected: bool, cx: &mut Context<Self>) {
+    fn set_visible_profile_candidates_selected(
+        &mut self,
+        selected: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let filter = self
             .profile_model_search
             .read(cx)
@@ -13387,6 +13418,12 @@ impl ManagementCenter {
             .into_iter()
             .filter(|row| profile_candidate_matches(row, &filter))
             .collect::<Vec<_>>();
+        // A bulk answer can move the Model the settings pane is showing in or
+        // out of the draft, and the pane's fields are that Model's settings.
+        let selection_affected = self
+            .profile_model_selection
+            .as_deref()
+            .is_some_and(|selection| rows.iter().any(|row| row.id == selection));
         let mut changed = false;
         for row in rows {
             changed |= if selected {
@@ -13404,6 +13441,9 @@ impl ManagementCenter {
         }
         if changed {
             self.navigation.mark_dirty(ManagementSection::Agents, true);
+            if selection_affected {
+                self.sync_profile_model_editor(window, cx);
+            }
             cx.notify();
         }
     }
@@ -25819,31 +25859,91 @@ mod tests {
     ) {
         cx.update(gpui_component::init);
         let (center, cx) = cx.add_window_view(ManagementCenter::new);
-        center.update(cx, |center, cx| {
-            center.profile_available_models = vec![test_provider_model("gpt-5", Some("GPT-5"))];
-            let mut configured = test_provider_model("gpt-5", None);
-            configured.capabilities.context_tokens = Some(128_000);
-            center.profile_configured_models = vec![configured];
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_available_models = vec![test_provider_model("gpt-5", Some("GPT-5"))];
+                let mut configured = test_provider_model("gpt-5", None);
+                configured.capabilities.context_tokens = Some(128_000);
+                center.profile_configured_models = vec![configured];
 
-            let rows = center.profile_candidate_rows();
-            center.select_profile_candidate(&rows[0], false, cx);
-            assert!(center.profile_configured_models.is_empty());
-            assert_eq!(center.profile_detached_models.len(), 1);
-            let rows = center.profile_candidate_rows();
-            assert!(!rows[0].is_configured());
-            // The row stays on screen while its declaration waits for a
-            // re-check, and the trash beside it is what drops the declaration.
-            assert!(rows[0].is_declared());
+                let rows = center.profile_candidate_rows();
+                center.select_profile_candidate(&rows[0], false, window, cx);
+                assert!(center.profile_configured_models.is_empty());
+                assert_eq!(center.profile_detached_models.len(), 1);
+                let rows = center.profile_candidate_rows();
+                assert!(!rows[0].is_configured());
+                // The row stays on screen while its declaration waits for a
+                // re-check, and the trash beside it is what drops the declaration.
+                assert!(rows[0].is_declared());
 
-            center.select_profile_candidate(&rows[0], true, cx);
-            assert_eq!(center.profile_configured_models.len(), 1);
-            assert_eq!(
-                center.profile_configured_models[0]
-                    .capabilities
-                    .context_tokens,
-                Some(128_000),
-                "re-checking a row must restore what the Model declared"
-            );
+                center.select_profile_candidate(&rows[0], true, window, cx);
+                assert_eq!(center.profile_configured_models.len(), 1);
+                assert_eq!(
+                    center.profile_configured_models[0]
+                        .capabilities
+                        .context_tokens,
+                    Some(128_000),
+                    "re-checking a row must restore what the Model declared"
+                );
+            });
+        });
+    }
+
+    /// The settings pane edits the Model its header names. Opening a row can
+    /// name a Model the draft does not hold yet — the pane offers to add it —
+    /// and the checkbox can put it into the draft afterwards, so the fields must
+    /// be emptied on the first and filled on the second instead of keeping the
+    /// previous Model's values.
+    #[gpui::test]
+    fn checking_the_model_the_pane_shows_fills_its_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_available_models = vec![
+                    test_provider_model("gemini-3.8-flash", None),
+                    test_provider_model("glm-5.1", None),
+                ];
+                center.profile_configured_models =
+                    vec![test_provider_model("gemini-3.8-flash", None)];
+
+                // Opening a configured Model loads its settings.
+                center.select_profile_model("gemini-3.8-flash".to_string(), window, cx);
+                assert_eq!(
+                    center.profile_model_edit_id.read(cx).value(),
+                    "gemini-3.8-flash"
+                );
+
+                // Opening a row the draft does not hold shows the command that
+                // adds it, never the previous Model's id under the new header.
+                center.select_profile_model("glm-5.1".to_string(), window, cx);
+                assert!(center.selected_profile_model_index().is_none());
+                assert!(center.profile_model_edit_id.read(cx).value().is_empty());
+
+                // Checking the row the pane is showing opens its settings, with
+                // the id that row names.
+                let rows = center.profile_candidate_rows();
+                let glm = rows
+                    .iter()
+                    .find(|row| row.id == "glm-5.1")
+                    .expect("the catalogue row must be listed")
+                    .clone();
+                center.select_profile_candidate(&glm, true, window, cx);
+                assert_eq!(center.profile_model_edit_id.read(cx).value(), "glm-5.1");
+                assert_eq!(center.profile_model_selection.as_deref(), Some("glm-5.1"));
+
+                // Releasing it leaves the pane with nothing to edit, so no field
+                // may keep claiming to be this Model's settings.
+                let rows = center.profile_candidate_rows();
+                let glm = rows
+                    .iter()
+                    .find(|row| row.id == "glm-5.1")
+                    .expect("the released row must stay listed")
+                    .clone();
+                center.select_profile_candidate(&glm, false, window, cx);
+                assert!(center.selected_profile_model_index().is_none());
+                assert!(center.profile_model_edit_id.read(cx).value().is_empty());
+            });
         });
     }
 
@@ -25851,23 +25951,25 @@ mod tests {
     fn releasing_a_hand_typed_model_keeps_its_row(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (center, cx) = cx.add_window_view(ManagementCenter::new);
-        center.update(cx, |center, cx| {
-            center.profile_configured_models = vec![test_provider_model("hand-typed", None)];
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_configured_models = vec![test_provider_model("hand-typed", None)];
 
-            let rows = center.profile_candidate_rows();
-            center.select_profile_candidate(&rows[0], false, cx);
-            assert!(center.profile_configured_models.is_empty());
+                let rows = center.profile_candidate_rows();
+                center.select_profile_candidate(&rows[0], false, window, cx);
+                assert!(center.profile_configured_models.is_empty());
 
-            // The catalogue never advertised it, so the released declaration is
-            // the only thing keeping the row in the list.
-            let rows = center.profile_candidate_rows();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].id, "hand-typed");
-            assert!(!rows[0].is_configured());
-            assert!(rows[0].is_declared());
+                // The catalogue never advertised it, so the released declaration is
+                // the only thing keeping the row in the list.
+                let rows = center.profile_candidate_rows();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "hand-typed");
+                assert!(!rows[0].is_configured());
+                assert!(rows[0].is_declared());
 
-            center.select_profile_candidate(&rows[0], true, cx);
-            assert_eq!(center.profile_configured_models.len(), 1);
+                center.select_profile_candidate(&rows[0], true, window, cx);
+                assert_eq!(center.profile_configured_models.len(), 1);
+            });
         });
     }
 
@@ -25920,7 +26022,7 @@ mod tests {
                 center.profile_configured_models = vec![configured];
 
                 let rows = center.profile_candidate_rows();
-                center.select_profile_candidate(&rows[0], false, cx);
+                center.select_profile_candidate(&rows[0], false, window, cx);
                 assert_eq!(center.profile_detached_models.len(), 1);
 
                 center.delete_profile_model("gpt-5".to_string(), window, cx);
@@ -25930,7 +26032,7 @@ mod tests {
                 assert!(!rows[0].is_declared());
 
                 let rows = center.profile_candidate_rows();
-                center.select_profile_candidate(&rows[0], true, cx);
+                center.select_profile_candidate(&rows[0], true, window, cx);
                 assert_eq!(
                     center.profile_configured_models[0]
                         .capabilities
