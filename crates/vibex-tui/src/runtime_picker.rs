@@ -235,26 +235,24 @@ impl App {
             .collect();
     }
 
-    /// What one selection overrides, in the words the run-option view uses.
+    /// What one selection overrides, as the values themselves.
     ///
-    /// `None` when the entry is on everything the Agent published: a remembered
-    /// row that carries no overrides has nothing to say beyond its own name, and
-    /// "Default" on every row of the list would be noise rather than
-    /// information.
-    pub fn run_option_overrides(&self, selection: &SessionRuntimeSelection) -> Option<String> {
-        let labels = self
+    /// Only the values: the line under the list is read as "how will this run",
+    /// and the row above it has already said what the entry is. Naming each
+    /// option as well ("Thinking depth High · Conversation mode Plan") doubles
+    /// the line's length to repeat a vocabulary the run-option view owns, and the
+    /// order is that view's order, which is stable and the reader's own.
+    ///
+    /// `None` when the entry is on everything the Agent published: nothing set is
+    /// not a value to show.
+    pub fn run_option_values(&self, selection: &SessionRuntimeSelection) -> Option<String> {
+        let values = self
             .run_options_for(selection)
             .into_iter()
             .filter(|option| option.is_explicit())
-            .map(|option| {
-                format!(
-                    "{} {}",
-                    option.label,
-                    option.resolved_label(self.strings.runtime_default())
-                )
-            })
+            .map(|option| option.resolved_label(self.strings.runtime_default()))
             .collect::<Vec<_>>();
-        (!labels.is_empty()).then(|| labels.join(" · "))
+        (!values.is_empty()).then(|| values.join(" · "))
     }
 
     /// How many rows one view of the switcher lists.

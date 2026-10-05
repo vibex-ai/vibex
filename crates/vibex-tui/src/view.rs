@@ -6222,24 +6222,13 @@ fn runtime_picker_entry_line(
     };
     let indent = if in_group { 4 } else { 2 };
     // A pinned row names an entry out of its group, so it has to carry what the
-    // heading above it would otherwise say — the Agent it belongs to — and, as
-    // the rows a reader comes back to, how that entry ran last time. An entry
-    // under its own heading needs neither: the heading is right above it, and a
-    // whole group of repeated run options would be a wall rather than a list.
-    let overrides = if in_group {
-        None
-    } else {
-        app.run_option_overrides(&app.runtime_prefs.with_remembered_options(option))
-    };
+    // heading above it would otherwise say: the Agent it belongs to. Its run
+    // options are not drawn here — three names and a settings summary do not fit
+    // one row, and the reader who wants them is one `Tab` from the line under
+    // the list, which the highlighted row already fills in.
     let status_width = status.as_deref().map(display_width).unwrap_or_default();
     let status_gap = if status_width > 0 { 2 } else { 0 };
-    let summary_width = overrides
-        .as_deref()
-        .map(|summary| pinned_summary_width(display_width(summary), width))
-        .unwrap_or_default();
-    let summary_gap = if summary_width > 0 { 2 } else { 0 };
-    let available =
-        width.saturating_sub(indent + 2 + status_width + status_gap + summary_width + summary_gap);
+    let available = width.saturating_sub(indent + 2 + status_width + status_gap);
     // The model is what a reader scans for, so it takes the larger share and the
     // account truncates first: "Default CLI account/…" names the provenance, but
     // two rows of the same model on two accounts are still two rows.
@@ -6274,14 +6263,6 @@ fn runtime_picker_entry_line(
             if current { theme.base() } else { theme.muted() },
         ),
     ];
-    if let Some(summary) = overrides {
-        let summary = truncate_to_width(&summary, summary_width, "…");
-        spans.push(Span::styled(" ".repeat(summary_gap), theme.base()));
-        spans.push(Span::styled(
-            pad_to_width(&summary, summary_width),
-            theme.dimmed(theme.roles.gray),
-        ));
-    }
     if let Some(status) = status {
         spans.push(Span::styled(" ".repeat(status_gap), theme.base()));
         spans.push(Span::styled(
@@ -6319,7 +6300,7 @@ fn runtime_picker_preview(
         return Line::from("");
     }
     let body = app
-        .run_option_overrides(&selection)
+        .run_option_values(&selection)
         .unwrap_or_else(|| strings.runtime_default().to_string());
     let text = format!(
         "{}: {body} · {}",
@@ -6443,19 +6424,6 @@ fn pinned_columns(available: usize) -> (usize, usize, usize) {
     let rest = body - model;
     let agent = (rest * 3 / 5).max(4).min(rest);
     (agent, rest - agent, model)
-}
-
-/// How much of a pinned row the remembered run options may take.
-///
-/// Enough to read "Thinking depth High · Conversation mode Plan", and never so
-/// much that the entry's own names are squeezed out of the row: the summary is
-/// what the reader set on the entry, and the entry is what they are looking for.
-fn pinned_summary_width(summary: usize, width: usize) -> usize {
-    const NAMES_MINIMUM: usize = 20;
-    if width <= NAMES_MINIMUM + 6 {
-        return 0;
-    }
-    summary.min(width - NAMES_MINIMUM - 2)
 }
 
 /// Split the width left for "account · model" between the two names.

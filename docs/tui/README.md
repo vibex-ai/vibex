@@ -543,7 +543,9 @@ order the Desktop arranges them in (its sort strategy, its manual drag and the
 usage it counts), so `↑↓` walk the Agents, the pinned recent rows and — once a
 group is opened with `→` or `Enter` — the accounts and models under them. The
 row in effect is marked, and the pinned rows carry what a heading would have
-said, the Agent they belong to, plus the run options last set on them.
+said: the Agent they belong to. How the row under the cursor would run is the
+line beneath the list, which names the values themselves without repeating the
+run-option view's labels.
 `Enter` on a row chooses it *and* moves to its run options, so picking an Agent
 and saying how it runs are one visit rather than two; `Tab` opens the run
 options of the row under the cursor without choosing it. Either way the run

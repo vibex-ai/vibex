@@ -785,10 +785,11 @@ fn pick_entry(app: &mut App, index: usize) {
 #[test]
 fn a_pinned_row_names_the_agent_and_how_it_ran() {
     // A pinned row stands outside every Agent group, so it has to carry what the
-    // heading above it would otherwise say — the Agent — and, as the row the
-    // reader comes back to, how that entry ran last time. An entry under its own
-    // heading leaves both to the heading: the group is right above it, and a
-    // whole list of repeated run options would be a wall rather than a list.
+    // heading above it would otherwise say: the Agent the entry belongs to. It
+    // does *not* carry the run options — three names and a settings summary do
+    // not fit one row, and squeezing them in hides the names the reader needs to
+    // tell two entries apart. The highlighted row gets the line under the list
+    // instead, which says how it would run.
     let mut app = app(140, 40);
     app.navigate_to(Page::Agent);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -810,7 +811,7 @@ fn a_pinned_row_names_the_agent_and_how_it_ran() {
     );
     let row = screen
         .lines()
-        .find(|line| line.contains("Thinking depth High"))
+        .find(|line| line.contains("· bal · gpt-5"))
         .unwrap_or_else(|| panic!("the recent row is not on screen:\n{screen}"));
     for expected in ["codex", "bal", "gpt-5"] {
         assert!(
@@ -819,18 +820,23 @@ fn a_pinned_row_names_the_agent_and_how_it_ran() {
         );
     }
     assert!(
-        row.contains("Thinking depth High"),
-        "the recent row does not say how it ran: {row:?}"
+        !row.contains("High"),
+        "the recent row spent its room on how the entry ran: {row:?}"
     );
-    // The Agent's own entries say none of that twice: the heading above them is
-    // the Agent, and the run options belong to the pinned row.
-    let entry = screen
+    // The line under the list answers for the row the cursor is on, with the
+    // values themselves: the option's name is the run-option view's vocabulary,
+    // and repeating it here doubles the line to say "High" twice over.
+    let preview = screen
         .lines()
-        .find(|line| line.contains("● bal · gpt-5"))
-        .unwrap_or_else(|| panic!("the entry in use is not on screen:\n{screen}"));
+        .find(|line| line.contains("Run options:"))
+        .unwrap_or_else(|| panic!("the preview line is not on screen:\n{screen}"));
     assert!(
-        !entry.contains("Thinking depth"),
-        "an entry under its heading repeats the run options: {entry:?}"
+        preview.contains("Run options: High"),
+        "the preview does not name the value in effect: {preview:?}"
+    );
+    assert!(
+        !preview.contains("Thinking depth"),
+        "the preview repeats the option's name: {preview:?}"
     );
 }
 
