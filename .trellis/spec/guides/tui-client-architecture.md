@@ -224,14 +224,16 @@ Rules that make this work:
   columns go back to the prose.
 * **The frame publishes what the mouse needs, nothing more.** `FrameRegions`
   carries the transcript rect, a `ListRegion` (rect, scope, row count, first
-  line), the composer's text rows, the queue band, the dock, the turn rail's
-  ticks, the shortcut band's hints with their intents, the banner and a modal's
-  close control. Every one of them is written by the renderer that drew it,
-  because only that code knows where the band landed, and every one of them is
-  dropped by `FrameRegions::begin_frame` with the frame that drew it, so a closed
-  panel or a modal that has left cannot keep a stale hit rect; `run.rs` does
-  nothing but hit-test. A click on a hint runs the intent its key would run, so
-  the mouse cannot grow a second, divergent command set.
+  line), the controls a list row draws for itself (`RowActionRegion`: rect, the
+  row it acts on, its intent), the composer's text rows, the queue band, the
+  dock, the turn rail's ticks, the shortcut band's hints with their intents, the
+  banner and a modal's close control. Every one of them is written by the
+  renderer that drew it, because only that code knows where the band landed, and
+  every one of them is dropped by `FrameRegions::begin_frame` with the frame
+  that drew it, so a closed panel, a modal that has left or a row that has
+  scrolled away cannot keep a stale hit rect; `run.rs` does nothing but
+  hit-test. A click on a hint runs the intent its key would run, so the mouse
+  cannot grow a second, divergent command set.
 * **The banner row has one owner.** `BannerPriority` orders the claimants
   (transient < tip < mode < warning); `App::set_banner` refuses to displace a
   higher-priority message, and `refresh_banner` re-derives the row from the
@@ -613,6 +615,25 @@ is never a column count.
   own `▶`/`✗`/`◇`/`◆`/`▤`, and `↻`/`↻N` for auto-continue. The state is *only* a
   mark: the words were removed once the shapes were learned, because they cost
   the title a third of the row and said nothing the mark did not.
+* **A row's own controls act on their row, not on the cursor.** Rename and
+  delete are drawn at the right end of a session row while the reader is on it —
+  the selected row, or the row under the pointer — just inside the age column,
+  so the age keeps the edge and its column on every row whether one is being
+  acted on or not. Every other row gives those six columns back to its title,
+  which is what keeps the list from becoming a field of buttons. The pair is one
+  column each plus a column of padding (`✎`/`✕`, `e`/`d` at the legacy tier,
+  from `glyphs::rename_icon`/`delete_icon`), and the pointer resting on one
+  lights that one alone — the delete in `danger`, the rename in the accent — for
+  the width of its target, glyph and padding together. Each is
+  published as a `RowActionRegion` carrying its rect *and the row it belongs
+  to*: the pointer is what chose the target, so the click moves the cursor to
+  that row before running the intent — an intent that resolves its session
+  through `App::list_session_target()` would otherwise rename or delete the row
+  the cursor happened to be on. The keyboard is still the primary path and the
+  same two actions: `r` and `Ctrl+X`, both in the binding table and the palette.
+  A control nobody can see is not published — a row the window has scrolled past
+  and a pair a narrow terminal has pushed out of the band are dropped rather
+  than left as rects a click could land on.
 * **The list is a window over lines, not a selection over rows.** A workspace can
   hold hundreds of sessions and a row can carry a detail card, so the page lays
   every row out, measures them in lines, and draws the window it is scrolled to

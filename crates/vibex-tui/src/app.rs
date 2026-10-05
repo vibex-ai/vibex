@@ -786,6 +786,13 @@ pub struct App {
     /// The click target the pointer is over, so a control can show it can be
     /// pressed before the reader presses it.
     pub hovered_hint: Option<crate::action::Intent>,
+    /// The control inside a list row the pointer is over: the row it belongs to
+    /// and the intent it would run.
+    ///
+    /// A row's controls act on *their* row rather than on the cursor's, so the
+    /// hover state names the row as well as the control: lighting a button on a
+    /// row the reader is not pointing at would promise the wrong target.
+    pub hovered_row_action: Option<(usize, crate::action::Intent)>,
     /// Which sent message the composer's history drawer points at.
     pub history_selection: usize,
     /// Commands run from the palette, most recent first.
@@ -1015,6 +1022,10 @@ pub struct FrameRegions {
     pub turns: Vec<(ratatui::layout::Rect, usize)>,
     /// The shortcut band's hints, so a click runs the same intent as the key.
     pub hints: Vec<(ratatui::layout::Rect, crate::action::Intent)>,
+    /// The controls a list row draws for itself, each with the row it belongs
+    /// to. A button acts on its own row, which is not always the cursor's — the
+    /// pointer is what chose it — so the row index rides with the rect.
+    pub row_actions: Vec<RowActionRegion>,
 }
 
 impl FrameRegions {
@@ -1026,6 +1037,7 @@ impl FrameRegions {
     pub fn begin_frame(&mut self) {
         self.turns.clear();
         self.hints.clear();
+        self.row_actions.clear();
         self.runtime_picker = None;
         // A list, a banner row, a composer's box and a modal's close affordance
         // each belong to the frame that drew them: left standing, the session
@@ -1063,6 +1075,19 @@ pub struct ListRegion {
     /// spends a second line on it — and a click that assumed one line per row
     /// would land on the row below the one under the pointer.
     pub heights: Vec<u16>,
+}
+
+/// A control a list row draws at its own right edge — the session row's rename
+/// and delete buttons.
+///
+/// The rect is in screen coordinates and belongs to the frame that drew it; the
+/// row index is what the control acts on, because the reader who pressed it
+/// pointed at that row rather than at the one the cursor is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowActionRegion {
+    pub rect: ratatui::layout::Rect,
+    pub row: usize,
+    pub intent: crate::action::Intent,
 }
 
 /// Where the runtime switcher drew its rows.
@@ -1300,6 +1325,7 @@ impl App {
             search: None,
             hover: None,
             hovered_hint: None,
+            hovered_row_action: None,
             history_selection: 0,
             recent_commands: options.remembered.recent_commands.clone(),
             text_selection: None,

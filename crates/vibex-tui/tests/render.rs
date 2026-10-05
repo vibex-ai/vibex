@@ -5798,6 +5798,139 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     }
 }
 
+/// A session row carries the two controls that act on it — rename and delete —
+/// while the reader is on it: the row the cursor is on, and the row under the
+/// pointer. Every other row gives their columns back to its title, and each
+/// control publishes the rect a click would land on, against its own row.
+#[test]
+fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
+    use vibex_tui::action::Intent;
+    let now = vibex_core::unix_timestamp_ms();
+    let mut first = seeded_session("session_ruler0001", "fix the flaky test");
+    first.last_message_at_ms = now;
+    let mut second = seeded_session("session_ruler0002", "the other one");
+    // One workspace, so the two sessions are rows under one heading.
+    second.project_id = first.project_id.clone();
+    second.workspace_id = first.workspace_id.clone();
+    second.workspace_root = first.workspace_root.clone();
+    second.last_message_at_ms = now;
+
+    let mut app = app(100, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![first, second]))
+        .expect("sessions apply");
+    // Row 0 is the workspace heading; rows 1 and 2 are the sessions.
+    app.set_selection(Scope::Sessions, 1);
+    let screen = text(&render(&mut app, 100, 24));
+    let row_of = |needle: &str| {
+        screen
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle:?}:\n{screen}"))
+    };
+    let selected = screen.lines().nth(row_of("fix the flaky test")).unwrap();
+    assert!(
+        selected.contains('✎') && selected.contains('✕'),
+        "the row the cursor is on carries no controls: {selected:?}"
+    );
+    let other = screen.lines().nth(row_of("the other one")).unwrap();
+    assert!(
+        !other.contains('✎') && !other.contains('✕'),
+        "a row nobody is on was given controls: {other:?}"
+    );
+
+    // The pair is a click target, and each half names the row it belongs to.
+    let controls = app.regions.row_actions.clone();
+    assert_eq!(
+        controls.len(),
+        2,
+        "the selected row's controls: {controls:?}"
+    );
+    assert!(controls.iter().all(|control| control.row == 1));
+    for control in &controls {
+        assert_eq!(
+            control.rect.y,
+            row_of("fix the flaky test") as u16,
+            "a control was published on another line: {control:?}"
+        );
+    }
+    let rename = controls
+        .iter()
+        .find(|control| control.intent == Intent::BeginRenameSession)
+        .expect("the rename control is not clickable");
+    let delete = controls
+        .iter()
+        .find(|control| control.intent == Intent::DeleteSession)
+        .expect("the delete control is not clickable");
+    assert!(
+        rename.rect.right() <= delete.rect.x && delete.rect.right() <= 100,
+        "the pair does not fit the row: {rename:?} {delete:?}"
+    );
+    // The age keeps the right edge on every row: the controls sit inside it
+    // rather than pushing it off.
+    assert!(
+        delete.rect.right() < 100,
+        "the controls have taken the column the age ends at: {delete:?}"
+    );
+
+    // The pointer's row answers the same way, without moving the cursor: the
+    // reader points at a row to act on it, and the selected row is not it.
+    app.hover = Some((Scope::Sessions, 2));
+    let screen = text(&render(&mut app, 100, 24));
+    let hovered = screen.lines().nth(row_of("the other one")).unwrap();
+    assert!(
+        hovered.contains('✎') && hovered.contains('✕'),
+        "the row under the pointer carries no controls: {hovered:?}"
+    );
+    assert!(
+        app.regions
+            .row_actions
+            .iter()
+            .any(|control| control.row == 2),
+        "the hovered row's controls are not clickable: {:?}",
+        app.regions.row_actions
+    );
+    assert_eq!(
+        app.selection_for(Scope::Sessions),
+        1,
+        "the pointer moved the cursor"
+    );
+
+    // A control answers the pointer before the click does: the one under it
+    // lights, and the one beside it does not.
+    let resting = render_buffer(&mut app, 100, 24);
+    app.hovered_row_action = Some((2, Intent::DeleteSession));
+    let lit = render_buffer(&mut app, 100, 24);
+    let control = |app: &App, intent: Intent| {
+        app.regions
+            .row_actions
+            .iter()
+            .find(|control| control.row == 2 && control.intent == intent)
+            .map(|control| control.rect)
+            .unwrap_or_else(|| panic!("row 2 published no {intent:?} control"))
+    };
+    let changed = |rect: ratatui::layout::Rect| {
+        (rect.x..rect.right())
+            .filter(|column| {
+                resting.cell((*column, rect.y)).map(|cell| cell.style())
+                    != lit.cell((*column, rect.y)).map(|cell| cell.style())
+            })
+            .count()
+    };
+    let delete = control(&app, Intent::DeleteSession);
+    assert_eq!(
+        changed(delete),
+        usize::from(delete.width),
+        "the control under the pointer did not light"
+    );
+    assert_eq!(
+        changed(control(&app, Intent::BeginRenameSession)),
+        0,
+        "the hover spilled onto the control beside it"
+    );
+}
+
 /// The columns of the list line up, measured in cells rather than bytes: the
 /// rows carry box drawing and geometric glyphs, and the eye scans columns.
 #[test]
@@ -5937,6 +6070,9 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
         .apply_sessions(Ok(vec![failed, running.clone()]))
         .expect("sessions apply");
     app.unread_sessions.insert(running.id.as_str().to_string());
+    // The cursor is on a session, so the row's controls are drawn and have to
+    // survive the same console font the marks do.
+    app.set_selection(Scope::Sessions, 1);
     let screen = text(&render(&mut app, 110, 24));
     for mark in ['x', '>', 'o'] {
         assert!(
@@ -5950,6 +6086,28 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
             .filter(|line| line.contains("Failed") || line.contains("Running"))
             .all(|line| line.is_ascii()),
         "a legacy console was handed a glyph it cannot draw:\n{screen}"
+    );
+    let buffer = render_buffer(&mut app, 110, 24);
+    let drawn = app
+        .regions
+        .row_actions
+        .iter()
+        .map(|control| {
+            (
+                control.intent,
+                buffer
+                    .cell((control.rect.x, control.rect.y))
+                    .map(|cell| cell.symbol().to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        drawn.contains(&(
+            vibex_tui::action::Intent::BeginRenameSession,
+            "e".to_string()
+        )) && drawn.contains(&(vibex_tui::action::Intent::DeleteSession, "d".to_string())),
+        "the controls do not degrade to the legacy tier: {drawn:?}"
     );
 }
 

@@ -183,6 +183,30 @@ pub fn state_marker(state: &str, tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The control that renames the row it sits on. One column.
+///
+/// A pencil is the shape every list uses for "edit this name", and the legacy
+/// tier gets the initial of the action rather than a box-drawing substitute: a
+/// console font has no pencil, and a mark it cannot draw is not a control.
+pub fn rename_icon(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "✎",
+        GlyphTier::Legacy => "e",
+    }
+}
+
+/// The control that deletes the row it sits on. One column.
+///
+/// A cross rather than the failed session's `✗`: the state mark already owns
+/// that shape on the same row, and two spellings of "bad" in one line read as
+/// one fact. At the legacy tier the letter is the action's own initial.
+pub fn delete_icon(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "✕",
+        GlyphTier::Legacy => "d",
+    }
+}
+
 /// The rule a section heading trails to the edge of its list. One column.
 ///
 /// It is a box-drawing character, so a legacy console gets the hyphen rather
@@ -326,6 +350,8 @@ mod tests {
                 timeline_tick(tier),
                 timeline_tick_active(tier),
                 heading_rule(tier),
+                rename_icon(tier),
+                delete_icon(tier),
             ] {
                 assert_eq!(
                     crate::text::display_width(glyph),
@@ -375,6 +401,8 @@ mod tests {
             timeline_tick(tier),
             timeline_tick_active(tier),
             heading_rule(tier),
+            rename_icon(tier),
+            delete_icon(tier),
         ];
         drawn.extend_from_slice(spinner_frames(tier));
         drawn.extend_from_slice(idle_pulse_frames(tier));

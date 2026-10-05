@@ -1262,6 +1262,36 @@ fn session_chip(
     }
 }
 
+/// The two controls a session row keeps for itself, and where they are.
+///
+/// The row does not know where it will land: the page lays every row out and
+/// then draws a window of them, so a control is placed relative to the row —
+/// its line and its column — and `render_session_rows` moves it onto the screen
+/// once the window is known.
+struct SessionRowControl {
+    /// The line of the row the control sits on, counting from its first.
+    line: usize,
+    /// The control's first column, from the row's left edge.
+    column: u16,
+    /// How many cells the control's target covers.
+    width: u16,
+    intent: Intent,
+}
+
+/// How many columns a session row's two controls take when they are drawn: two
+/// of air, then a cell of icon and a cell of padding each.
+///
+/// A control's target is its glyph *and* the column after it, so a pointer does
+/// not have to land on the character itself. The width is given back to the
+/// title on every row that is not being acted on.
+const SESSION_ROW_CONTROL_AIR: usize = 2;
+const SESSION_ROW_CONTROL_WIDTH: usize = 2;
+const SESSION_ROW_CONTROLS_WIDTH: usize = SESSION_ROW_CONTROL_AIR + SESSION_ROW_CONTROL_WIDTH * 2;
+
+/// The columns a session row spends before its title: the selection bar and the
+/// state mark, each with the column of air that keeps it off what follows.
+const SESSION_ROW_LEAD: usize = 4;
+
 /// The list itself: a heading per group, and under each a row per session.
 fn render_session_rows(
     frame: &mut Frame<'_>,
@@ -1277,6 +1307,7 @@ fn render_session_rows(
         return;
     }
     let selected = app.selection_for(Scope::Sessions);
+    let hovered_action = app.hovered_row_action;
     let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
     let now_ms = vibex_core::unix_timestamp_ms();
     // When the session last said anything, right-aligned: the reader scanning
@@ -1312,13 +1343,22 @@ fn render_session_rows(
     let mut all = Vec::new();
     let mut heights = Vec::with_capacity(rows.len());
     let mut starts = Vec::with_capacity(rows.len());
+    // A row's own controls, in the coordinates of the laid-out list: the line
+    // each landed on, the row it belongs to, and where it sits inside that row.
+    // They are moved onto the screen once the window is known, so a button on a
+    // row the reader has scrolled past is never published as a click target.
+    let mut controls: Vec<(usize, usize, SessionRowControl)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         starts.push(all.len());
+        let mut row_controls = Vec::new();
         let row_lines = session_list_item(
             row,
             list.counts.get(index).copied().unwrap_or(0),
             index == selected,
             app.hover == Some((Scope::Sessions, index)),
+            hovered_action
+                .filter(|(hovered_row, _)| *hovered_row == index)
+                .map(|(_, intent)| intent),
             time_labels.get(index).and_then(Option::as_ref),
             time_column,
             usize::from(area.width),
@@ -1326,7 +1366,11 @@ fn render_session_rows(
             app,
             theme,
             strings,
+            &mut row_controls,
         );
+        for control in row_controls {
+            controls.push((starts[index] + control.line, index, control));
+        }
         heights.push(row_lines.len().max(1));
         all.extend(row_lines);
     }
@@ -1356,6 +1400,30 @@ fn render_session_rows(
         .copied()
         .unwrap_or(0);
     app.session_scroll = offset;
+    // The controls land where the rows they belong to were drawn. One on a line
+    // the window has scrolled past — or one a terminal too narrow to hold the
+    // pair has pushed out of the band — is not published at all: a click there
+    // would otherwise act on a control nobody can see.
+    for (line, row, control) in controls {
+        let fits =
+            usize::from(control.column) + usize::from(control.width) <= usize::from(area.width);
+        let drawn = line
+            .checked_sub(offset)
+            .is_some_and(|screen_line| screen_line < window);
+        if !fits || !drawn {
+            continue;
+        }
+        app.regions.row_actions.push(crate::app::RowActionRegion {
+            rect: Rect {
+                x: area.x.saturating_add(control.column),
+                y: area.y.saturating_add((line - offset) as u16),
+                width: control.width,
+                height: 1,
+            },
+            row,
+            intent: control.intent,
+        });
+    }
     let visible = all
         .into_iter()
         .skip(offset)
@@ -1396,6 +1464,7 @@ fn session_list_item(
     count: usize,
     selected: bool,
     hovered: bool,
+    hovered_control: Option<Intent>,
     time: Option<&String>,
     time_column: usize,
     width: usize,
@@ -1403,6 +1472,7 @@ fn session_list_item(
     app: &App,
     theme: &TuiTheme,
     strings: Strings,
+    controls: &mut Vec<SessionRowControl>,
 ) -> Vec<Line<'static>> {
     let session = row
         .session_id
@@ -1419,12 +1489,14 @@ fn session_list_item(
         session,
         selected,
         hovered,
+        hovered_control,
         time,
         time_column,
         width,
         app,
         theme,
         strings,
+        controls,
     );
     if let Some(session) = session
         && app.session_card_expanded(session.id.as_str())
@@ -1509,18 +1581,24 @@ fn session_heading_line(
 }
 
 /// A session's row: the title line and, under it, what the session last did.
+///
+/// The title line spends its right end on the row's two controls while the
+/// reader is on the row: the cursor's row and the row under the pointer both
+/// carry them, and every other row gives their columns back to its title.
 #[allow(clippy::too_many_arguments)]
 fn session_row_lines(
     row: &vibex_desktop_model::AgentSidebarRow,
     session: Option<&vibex_core::AgentSession>,
     selected: bool,
     hovered: bool,
+    hovered_control: Option<Intent>,
     time: Option<&String>,
     time_column: usize,
     width: usize,
     app: &App,
     theme: &TuiTheme,
     strings: Strings,
+    controls: &mut Vec<SessionRowControl>,
 ) -> Vec<Line<'static>> {
     let tier = app.glyph_tier();
     // A selected or hovered row is a band rather than a coloured sentence: the
@@ -1574,10 +1652,20 @@ fn session_row_lines(
     // The age column ends one cell short of the edge, so the numbers are not
     // glued to the frame.
     let meta_width = if time_column > 0 { time_column + 2 } else { 0 };
+    // The row's own controls are drawn only while the row is the reader's: the
+    // selected row, or the one the pointer is on. Their width comes off the
+    // title, which is the only thing that can pay for them.
+    let active = selected || hovered;
+    let control_block = if active {
+        SESSION_ROW_CONTROLS_WIDTH
+    } else {
+        0
+    };
     let text_width = width
-        .saturating_sub(4)
+        .saturating_sub(SESSION_ROW_LEAD)
         .saturating_sub(meta_width)
-        .saturating_sub(badge_block);
+        .saturating_sub(badge_block)
+        .saturating_sub(control_block);
     let mut spans = vec![
         Span::styled(format!("{bar} "), bar_style),
         Span::styled(format!("{icon} "), icon_style),
@@ -1603,6 +1691,56 @@ fn session_row_lines(
     if !badges.is_empty() {
         spans.push(Span::styled("  ", blank_style));
         spans.extend(badges);
+    }
+    if active {
+        // The pair sits just inside the age column, so the age keeps the edge
+        // on every row whether a row is being acted on or not. Each control is
+        // its glyph plus the column after it: the target is the pair of cells,
+        // and the pointer resting on one lights that one alone.
+        let control_start = SESSION_ROW_LEAD + text_width + badge_block;
+        let resting = || paint(theme.roles.gray_bright);
+        let lit = |accent: ratatui::style::Color| {
+            Style::default()
+                .fg(theme.roles.background)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        let rename_style = if hovered_control == Some(Intent::BeginRenameSession) {
+            lit(theme.roles.accent_user)
+        } else {
+            resting()
+        };
+        let delete_style = if hovered_control == Some(Intent::DeleteSession) {
+            lit(theme.roles.danger)
+        } else {
+            resting()
+        };
+        // Each control is one span of glyph and padding, so the whole target
+        // lights when the pointer is on it rather than only the character.
+        spans.push(Span::styled(
+            " ".repeat(SESSION_ROW_CONTROL_AIR),
+            blank_style,
+        ));
+        spans.push(Span::styled(
+            format!("{} ", crate::glyphs::rename_icon(tier)),
+            rename_style,
+        ));
+        spans.push(Span::styled(
+            format!("{} ", crate::glyphs::delete_icon(tier)),
+            delete_style,
+        ));
+        controls.push(SessionRowControl {
+            line: 0,
+            column: (control_start + SESSION_ROW_CONTROL_AIR) as u16,
+            width: SESSION_ROW_CONTROL_WIDTH as u16,
+            intent: Intent::BeginRenameSession,
+        });
+        controls.push(SessionRowControl {
+            line: 0,
+            column: (control_start + SESSION_ROW_CONTROL_AIR + SESSION_ROW_CONTROL_WIDTH) as u16,
+            width: SESSION_ROW_CONTROL_WIDTH as u16,
+            intent: Intent::DeleteSession,
+        });
     }
     if let Some(time) = time.filter(|_| time_column > 0) {
         let padding = time_column.saturating_sub(display_width(time));

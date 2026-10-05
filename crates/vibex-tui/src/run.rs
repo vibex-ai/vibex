@@ -1124,6 +1124,22 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.overlay.is_some() {
                 return false;
             }
+            // A row's own control acts on the row it was drawn for, not on the
+            // row the cursor happens to be on: the pointer chose the target,
+            // and a delete button that removed a different session than the one
+            // under it is the one mistake this row cannot make.
+            if let Some(action) = app
+                .regions
+                .row_actions
+                .iter()
+                .find(|action| rect_contains(action.rect, mouse.column, mouse.row))
+                .copied()
+            {
+                app.set_selection(crate::keymap::Scope::Sessions, action.row);
+                let outcome = app.perform(action.intent);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
             // A hint in the shortcut band is a button: clicking it runs the
             // intent the key would have run.
             if let Some((_, intent)) = app
@@ -1257,9 +1273,21 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 .iter()
                 .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
                 .map(|(_, intent)| *intent);
-            if app.hover != hover || app.hovered_hint != hint {
+            // A control inside a list row answers the same way, and carries the
+            // row it belongs to so the right one lights up.
+            let row_action = app
+                .regions
+                .row_actions
+                .iter()
+                .find(|action| rect_contains(action.rect, mouse.column, mouse.row))
+                .map(|action| (action.row, action.intent));
+            if app.hover != hover
+                || app.hovered_hint != hint
+                || app.hovered_row_action != row_action
+            {
                 app.hover = hover;
                 app.hovered_hint = hint;
+                app.hovered_row_action = row_action;
                 return true;
             }
             false
@@ -2593,6 +2621,172 @@ mod tests {
         );
         let opened = conversation_frame(&mut app, 100, 30);
         assert!(opened.contains("clickable 1"), "{opened}");
+    }
+
+    /// A session row's own controls act on the row they were drawn for rather
+    /// than on the row the cursor happens to be on. The pointer chose the
+    /// target, and a delete button that removed a different session than the
+    /// one under it is the one mistake this pair cannot make.
+    #[test]
+    fn a_session_rows_controls_act_on_the_row_under_the_pointer() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.live = crate::app::LiveState::Ready;
+        let project = vibex_core::ProjectId::new();
+        let workspace = vibex_core::WorkspaceId::new();
+        let sessions = (1..=2)
+            .map(|index| vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse(format!("session_action{index:04}"))
+                    .expect("valid session id"),
+                title: format!("actionable {index}"),
+                // One workspace, so the two are rows 1 and 2 under one heading.
+                project_id: project.clone(),
+                workspace_id: workspace.clone(),
+                workspace_root: "/tmp/vibex-action-workspace".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: index,
+                updated_at_ms: index,
+                last_message_at_ms: index,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+        app.agent.apply_sessions(Ok(sessions)).expect("apply");
+        app.navigate_to(Page::Sessions);
+        // The cursor stays on the first session; the pointer is on the second.
+        app.set_selection(crate::keymap::Scope::Sessions, 1);
+        app.hover = Some((crate::keymap::Scope::Sessions, 2));
+        conversation_frame(&mut app, 100, 30);
+
+        let control = |app: &App, row: usize, intent: Intent| {
+            app.regions
+                .row_actions
+                .iter()
+                .find(|control| control.row == row && control.intent == intent)
+                .map(|control| control.rect)
+                .unwrap_or_else(|| panic!("row {row} published no {intent:?} control"))
+        };
+        // What the row under the pointer is called, read from the list itself:
+        // the order the sessions are drawn in is the arrangement's, not this
+        // test's.
+        let pointed = app.sidebar_rows()[2].label.clone();
+        let rename = control(&app, 2, Intent::BeginRenameSession);
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rename.x,
+                row: rename.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.selection_for(crate::keymap::Scope::Sessions),
+            2,
+            "the control did not move the cursor to the row it was drawn for"
+        );
+        match app.overlay.clone() {
+            Some(Overlay::Prompt {
+                field: crate::app::PromptField::RenameSession,
+                value,
+                ..
+            }) => assert_eq!(value, pointed, "the prompt names another session"),
+            other => panic!("the rename control opened {other:?}"),
+        }
+
+        // The delete button raises the same guard its chord does, against the
+        // row it was drawn for.
+        app.perform(Intent::Back);
+        conversation_frame(&mut app, 100, 30);
+        let delete = control(&app, 2, Intent::DeleteSession);
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: delete.right() - 1,
+                row: delete.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        match app.overlay.clone() {
+            Some(Overlay::Confirm { confirm, .. }) => {
+                assert_eq!(confirm, Intent::DeleteSession)
+            }
+            other => panic!("the delete control opened {other:?}"),
+        }
+    }
+
+    /// A row's controls describe the frame that drew them: a click after the
+    /// list has left the screen lands on nothing, not on the button that used
+    /// to be there.
+    #[test]
+    fn a_row_control_rect_does_not_outlive_the_frame_that_drew_it() {
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.agent
+            .apply_sessions(Ok(vec![vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse("session_action0001")
+                    .expect("valid session id"),
+                title: "actionable".to_string(),
+                project_id: vibex_core::ProjectId::new(),
+                workspace_id: vibex_core::WorkspaceId::new(),
+                workspace_root: "/tmp/vibex-action-workspace".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_message_at_ms: 1,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            }]))
+            .expect("apply");
+        app.navigate_to(Page::Sessions);
+        // Row 0 is the workspace heading; the session is under it.
+        app.set_selection(crate::keymap::Scope::Sessions, 1);
+        conversation_frame(&mut app, 100, 30);
+        let control = app
+            .regions
+            .row_actions
+            .first()
+            .copied()
+            .expect("the selected row published no controls");
+
+        app.navigate_to(Page::Agent);
+        conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.regions.row_actions.is_empty(),
+            "a control outlived the frame that drew it"
+        );
+        let before = (
+            app.selection_for(crate::keymap::Scope::Sessions),
+            app.overlay.clone(),
+        );
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: control.rect.x,
+                row: control.rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            (
+                app.selection_for(crate::keymap::Scope::Sessions),
+                app.overlay.clone()
+            ),
+            before,
+            "a click on a control nobody can see still ran"
+        );
     }
 
     /// A list rect describes the frame that drew it, so it must not outlive
