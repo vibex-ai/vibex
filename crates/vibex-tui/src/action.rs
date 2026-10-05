@@ -51,7 +51,7 @@ intents! {
     OpenCommandPalette => { scope: Global, id: "command_palette", label: "Commands", help: "Fuzzy-search every page and action." },
     ToggleHelp => { scope: Global, id: "help", label: "Help", help: "Show the keys and concepts for whatever has focus right now." },
     OpenSettings => { scope: Global, id: "open_settings", label: "Settings", help: "Theme, language, icons, colour and key bindings." },
-    RequestQuit => { scope: Global, id: "quit", label: "Quit", help: "Leave the TUI after a confirmation." },
+    RequestQuit => { scope: Global, id: "quit", label: "Quit", help: "Leave the TUI and restore the terminal. The palette is the only way to ask for it by name." },
     Back => { scope: Global, id: "back", label: "Back", help: "Close the overlay, then the panel, then the page. Never quits." },
     FocusNext => { scope: Global, id: "focus_next", label: "Next pane", help: "Move focus between sidebar, main area, details and composer." },
     FocusPrevious => { scope: Global, id: "focus_previous", label: "Previous pane", help: "Move focus backwards." },

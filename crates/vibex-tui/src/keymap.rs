@@ -392,6 +392,9 @@ pub use crate::action::Intent;
 ///   everyone and `hjkl` works for people who want it.
 /// * Keys that raise or lower privilege (`a`/`d`/`A`) are single characters and
 ///   therefore always go through an explicit confirmation or a scoped surface.
+/// * `Ctrl+C` is the one key that leaves: it interrupts, and with nothing left
+///   to cancel its second press is the exit. No second chord quits, so the
+///   answer to "how do I get out" is never a choice between two keys.
 pub static DEFAULT_BINDINGS: &[Binding] = &[
     // ---- global ---------------------------------------------------------
     binding(
@@ -418,7 +421,11 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         "Settings",
     ),
     alias(Scope::Global, Chord::ctrl(','), Intent::OpenSettings),
-    binding(Scope::Global, Chord::ctrl('q'), Intent::RequestQuit, "Quit"),
+    // `Quit` has no chord on purpose. `Ctrl+C` already owns leaving — the first
+    // press interrupts, and with nothing left to cancel it asks on the status
+    // band — so a second key for the same exit was only a way to reach it
+    // without the question. The command palette still lists it, and
+    // `tui-keys.toml` can still give it a chord back.
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Esc),
@@ -1878,15 +1885,18 @@ mod tests {
     }
 
     #[test]
-    fn every_intent_has_a_binding_and_an_id() {
+    fn every_intent_has_a_way_in_and_an_id() {
+        // A chord or a palette command: the two producers a reader drives. An
+        // intent with neither is one nobody can reach, which is how an action
+        // ends up implemented and never run.
         for intent in Intent::ALL {
-            assert!(
-                DEFAULT_BINDINGS
-                    .iter()
-                    .any(|binding| binding.intent == *intent),
-                "{} has no default binding",
-                intent.id()
-            );
+            let bound = DEFAULT_BINDINGS
+                .iter()
+                .any(|binding| binding.intent == *intent);
+            let listed = crate::view::PALETTE
+                .iter()
+                .any(|entry| entry.intent == *intent);
+            assert!(bound || listed, "{} has no way in", intent.id());
             assert_eq!(Intent::from_id(intent.id()), Some(*intent));
         }
     }

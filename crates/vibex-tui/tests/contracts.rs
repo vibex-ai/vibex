@@ -121,12 +121,17 @@ fn every_advertised_binding_resolves_to_an_intent() {
 }
 
 #[test]
-fn every_intent_is_reachable_from_some_scope() {
+fn every_intent_is_reachable_from_a_chord_or_the_palette() {
     let keymap = vibex_tui::keymap::Keymap::built_in();
     for intent in vibex_tui::action::Intent::ALL {
+        // `Quit` is the one intent with no chord. `Ctrl+C` is the key that
+        // leaves, and the palette is where the command is still offered.
+        let listed = vibex_tui::view::PALETTE
+            .iter()
+            .any(|entry| entry.intent == *intent);
         assert!(
-            keymap.chord_for(*intent).is_some(),
-            "{} has no reachable key",
+            keymap.chord_for(*intent).is_some() || listed,
+            "{} has neither a reachable key nor a palette entry",
             intent.id()
         );
     }
@@ -187,9 +192,10 @@ fn escape_never_cancels_a_running_turn() {
 #[test]
 fn the_session_view_keeps_the_global_escape_hatches() {
     // The composer owns the keyboard inside a session, and a composer-scope
-    // binding wins over the global one. Two chords must never be taken by it,
-    // because they are the ways *out*: the command palette and quitting. A
-    // reader who could type but not leave reported both as dead keys.
+    // binding wins over the global one. `Ctrl+P` must never be taken by it: a
+    // reader who could type but not open the palette out of a session reported
+    // it as a dead key. `Ctrl+C` is the other way out, and `Ctrl+Q` is now
+    // nothing at all — it was the same exit under a second name.
     let keymap = vibex_tui::keymap::Keymap::built_in();
     use vibex_tui::keymap::Scope;
     let scopes = [Scope::Composer, Scope::Agent, Scope::Global];
@@ -200,8 +206,13 @@ fn the_session_view_keeps_the_global_escape_hatches() {
     );
     assert_eq!(
         keymap.resolve(&scopes, vibex_tui::keymap::Chord::ctrl('q')),
-        Some(vibex_tui::action::Intent::RequestQuit),
-        "Ctrl+Q no longer asks to quit inside a session"
+        None,
+        "Ctrl+Q quits again, and it duplicates Ctrl+C"
+    );
+    assert_eq!(
+        keymap.resolve(&scopes, vibex_tui::keymap::Chord::ctrl('c')),
+        Some(vibex_tui::action::Intent::ContextualCancel),
+        "Ctrl+C no longer offers to leave a session"
     );
     assert_eq!(
         keymap.resolve(

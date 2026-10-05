@@ -127,7 +127,14 @@ impl App {
                 self.select_global(vibex_ui::shell::GlobalDestination::Settings);
                 Outcome::effects(vec![])
             }
-            Intent::RequestQuit => self.confirm_quit(),
+            // The palette's Quit command. It leaves without asking: the chord
+            // that used to raise a modal is gone, and a command the reader
+            // typed and chose is already the deliberate version of the press
+            // `Ctrl+C` has to ask about.
+            Intent::RequestQuit => {
+                self.should_quit = true;
+                Outcome::effects(vec![])
+            }
             Intent::Back => self.go_back(),
             Intent::FocusNext => {
                 self.focus = if self.page.is_session_page() {
@@ -1120,7 +1127,12 @@ impl App {
                 };
                 return Outcome::effects(vec![]);
             }
-            Intent::RequestQuit => return self.confirm_quit(),
+            // A quit asked for from behind an overlay still leaves, so a
+            // rebind in `tui-keys.toml` cannot be trapped by one.
+            Intent::RequestQuit => {
+                self.should_quit = true;
+                return Outcome::effects(vec![]);
+            }
             _ => {}
         }
         let Some(overlay) = self.overlay.clone() else {
@@ -1477,10 +1489,6 @@ impl App {
                     reason: None,
                 }])
             }
-            Intent::RequestQuit => {
-                self.should_quit = true;
-                Outcome::effects(vec![])
-            }
             other => self.perform(other),
         }
     }
@@ -1616,15 +1624,6 @@ impl App {
     }
 
     // ---- focused helpers --------------------------------------------------
-
-    fn confirm_quit(&mut self) -> Outcome {
-        self.overlay = Some(Overlay::Confirm {
-            title: self.strings.close().to_string(),
-            body: self.strings.help_hint().to_string(),
-            confirm: Intent::RequestQuit,
-        });
-        Outcome::effects(vec![])
-    }
 
     fn go_back(&mut self) -> Outcome {
         if self.overlay.is_some() {
