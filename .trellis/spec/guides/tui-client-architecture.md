@@ -337,7 +337,7 @@ Rules that follow:
 
 | Surface | Contract |
 | --- | --- |
-| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. The location is a secondary label, never a status hue, and a path that does not fit folds its ancestors to initials (`/h/p/c/p/c/node_modules`) before the head is dropped, keeping the component that names the directory whole. On the prompt the band's last segment is a control: the session list's label and the chord that answers there, published as a click region so the mouse runs the same intent the key does. |
+| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. The location is a secondary label, never a status hue, and a path that does not fit folds its ancestors to initials (`/h/p/c/p/c/node_modules`) before the head is dropped, keeping the component that names the directory whole. On both session pages (`Page::is_session_page`) the band's last segment is a control: the session list's label and the chord that answers there — `Ctrl+L` while the composer holds the keyboard, the global `1` otherwise — published as a click region so the mouse runs the same intent the key does. |
 | Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle remains static so a connected session does not look busy. |
 | Composer | padded raised surface without a title or border; an empty box names the draft's vocabulary (`/ commands @ files $ skills`) in the reader's language, and runtime and run options sit on a separate line below it. |
 | Completion | a drawer above the composer: two full-width rules, no corners, count on the top rule, selection marker is the composer's own arrow. |
@@ -786,9 +786,11 @@ is never a column count.
   `vibex` in a directory came to write in it, so the page names that directory
   as the workspace (`App::starting_workspace`) and offers the sessions that
   already exist from a clickable corner entry in the status band. The entry
-  names the chord that answers where it is drawn — `Ctrl+L` while the composer
-  holds the keyboard, the global `1` otherwise — because the plain digits are
-  characters in a draft. `Esc` steps between the prompt and the list; from a
+  belongs to both session pages — the prompt and a session's own page — and is
+  drawn last so it holds the corner; it names the chord that answers where the
+  keyboard is: `Ctrl+L` while the composer holds it, the global `1` once the
+  reader has moved to the transcript, because the plain digits are characters in
+  a draft. `Esc` steps between the prompt and the list; from a
   session it is still session → list → prompt.
 * **The page's choices belong to the page until a creation consumes them.**
   Entering the composing page keeps the Agent and the directory already chosen

@@ -2444,7 +2444,7 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Tu
 /// The location sits on the left and the status segments are right-aligned as a
 /// group, so the left column is stable while the group grows and shrinks. A
 /// left-aligned list of everything would push the state off the edge exactly
-/// when a narrow terminal makes it most worth reading. The prompt's corner
+/// when a narrow terminal makes it most worth reading. A session page's corner
 /// holds the band's one control: the way to the sessions that already exist,
 /// drawn last so it stays where the reader learned to find it.
 fn render_status_band(
@@ -2572,13 +2572,14 @@ fn render_status_band(
     );
 
     // ---- the corner: the way to the sessions that already exist ----------
-    // The page a session is written on is where the client starts, and the
-    // list is the other half of that home. It is drawn last so it holds the
+    // Both session pages carry it. On the prompt — where the client starts —
+    // the list is the other half of that home; on a session's own page it is
+    // how the reader leaves for another one. It is drawn last so it holds the
     // corner, and it is the only chrome here that is a control: the reader who
     // wants to reopen something rather than write something should not have to
     // know a key the draft has taken.
     let mut entry: Option<(u16, u16)> = None;
-    if app.page == Page::NewSession {
+    if app.page.is_session_page() {
         let label = strings.nav_sessions();
         // The chord that answers *here*: the composer owns the plain digits
         // the global binding uses, so while it has the keyboard the page names
@@ -2590,23 +2591,39 @@ fn render_status_band(
             _ => None,
         }
         .or_else(|| app.keymap.chord_for(Intent::GotoSessions));
-        if !right.is_empty() {
-            right.push(sep.clone());
-        }
-        let offset = right.iter().map(Span::width).sum::<usize>() as u16;
-        right.push(Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(theme.roles.accent_user)
-                .add_modifier(Modifier::BOLD),
-        ));
+        let status_width = right.iter().map(Span::width).sum::<usize>() as u16;
+        let separator = if right.is_empty() {
+            0
+        } else {
+            sep.width() as u16
+        };
         let mut width = display_width(label) as u16;
-        if let Some(chord) = chord {
-            let chord = format!(" {}", chord.display());
-            width += display_width(&chord) as u16;
-            right.push(Span::styled(chord, theme.dimmed(theme.roles.gray_dim)));
+        let chord = chord.map(|chord| format!(" {}", chord.display()));
+        if let Some(chord) = &chord {
+            width += display_width(chord) as u16;
         }
-        entry = Some((offset, width));
+        // The entry is the group's only segment that can be given up: what
+        // precedes it is the state of the session the reader is in, and
+        // `render_zoned_line` drops a right-hand group that does not fit whole.
+        // An entry that pushed the group over the edge would take the
+        // connection, the approvals and the context readout with it on exactly
+        // the narrow terminals where they are worth most, so it yields instead,
+        // and the chord it names still answers where it is gone.
+        if status_width + separator + width + 1 < area.width {
+            if !right.is_empty() {
+                right.push(sep.clone());
+            }
+            right.push(Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some(chord) = chord {
+                right.push(Span::styled(chord, theme.dimmed(theme.roles.gray_dim)));
+            }
+            entry = Some((status_width + separator, width));
+        }
     }
 
     // The entry is a button: a click runs the same intent the chord would.

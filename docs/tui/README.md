@@ -315,7 +315,10 @@ columns; very narrow tables become vertical records so cell contents remain read
 
 The workspace appears on the left. Connection warnings, context usage and the
 current mode appear on the right. A ready connection does not label a running
-turn as complete; the turn status row reports whether work is active.
+turn as complete; the turn status row reports whether work is active. On the
+session pages the group's last segment is a control rather than a status: the
+clickable **Sessions** entry, which names the chord that answers where the
+keyboard is.
 
 The location is chrome, not a status: it is drawn in the bright grey a secondary
 label gets, so colour on that row means something happened rather than where the
@@ -565,7 +568,9 @@ and `Ctrl+Y` its metadata. `Enter` opens a block's details. The composer takes
 line — `Ctrl+J` does the same on a terminal that cannot report `Shift+Enter`,
 see [Terminal ownership](#terminal-ownership) — `Ctrl+O` hands the draft to
 `$EDITOR`, and `Ctrl+S` steers a running turn. `Ctrl+C` clears the draft, then
-interrupts, then offers to quit.
+interrupts, then offers to quit. The status band's corner keeps the prompt's
+**Sessions** entry, so another session is one gesture away without leaving the
+draft behind.
 
 `/` on the transcript opens a search: a regular expression, case-insensitive
 until it contains an uppercase letter, highlighted in place. `Enter` keeps the

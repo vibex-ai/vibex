@@ -217,6 +217,108 @@ fn the_prompt_offers_the_session_list_in_its_corner() {
     );
 }
 
+/// The corner entry is not the prompt's alone.
+///
+/// A reader already inside a session leaves for another one the same way, and
+/// the chord the entry names is the one that answers where the keyboard is:
+/// `Ctrl+L` while the composer holds it, the global `1` once focus has moved to
+/// the transcript.
+#[test]
+fn the_session_page_offers_the_session_list_in_its_corner() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::app::Focus;
+    let mut app = app(120, 40);
+    enter_session(&mut app, "session_corner0001");
+    app.focus = Focus::Composer;
+    let buffer = render_buffer(&mut app, 120, 40);
+    let (rect, intent) = app
+        .regions
+        .hints
+        .iter()
+        .find(|(_, intent)| *intent == Intent::GotoSessions)
+        .copied()
+        .expect("the corner entry is not clickable");
+    assert_eq!(rect.y, 1, "the entry is not on the status row");
+    assert_eq!(
+        rect.x + rect.width,
+        120 - 2,
+        "the entry does not end at the right padding"
+    );
+    let status = display_row(&buffer, rect.y, 120);
+    assert!(
+        status.trim_end().ends_with("Sessions Ctrl+L"),
+        "the composer's entry named the wrong chord: {status:?}"
+    );
+    let entry = (rect.x..rect.x + rect.width)
+        .map(|column| buffer.cell((column, rect.y)).expect("cell").symbol())
+        .collect::<String>();
+    assert!(
+        entry.contains("Sessions"),
+        "the clickable rect is not over the entry: {entry:?}"
+    );
+
+    // Browsing the transcript is not composing: the composer's chord is no
+    // longer bound there, so the entry stops naming it.
+    app.focus = Focus::Main;
+    let buffer = render_buffer(&mut app, 120, 40);
+    let status = display_row(&buffer, rect.y, 120);
+    assert!(
+        status.trim_end().ends_with("Sessions 1"),
+        "the transcript's entry named a chord it does not answer: {status:?}"
+    );
+
+    // The click is the same move as the chord, and it keeps the draft.
+    app.composer.set_text("half a thought");
+    app.perform(intent);
+    assert_eq!(app.page, Page::Sessions);
+    assert_eq!(
+        app.composer.text(),
+        "half a thought",
+        "reaching the list threw the draft away"
+    );
+}
+
+/// The entry yields to the state it sits beside.
+///
+/// `render_zoned_line` drops a right-hand group that does not fit whole, so an
+/// entry that pushed the group over the edge would take the connection and the
+/// seat with it. It is navigation, and the chord it names still answers when it
+/// is gone, so it is the segment that goes.
+#[test]
+fn the_corner_entry_yields_to_the_status_beside_it() {
+    use vibex_tui::action::Intent;
+    // 48 columns: the seat and the connection fit, the entry would not.
+    let mut narrow = app(48, 24);
+    let buffer = render_buffer(&mut narrow, 48, 24);
+    let status = display_row(&buffer, 1, 48);
+    assert!(
+        status.contains("Connecting") && status.contains("Remote mode"),
+        "the entry pushed the status off a narrow terminal: {status:?}"
+    );
+    assert!(
+        !status.contains("Sessions"),
+        "the entry was drawn where it did not fit: {status:?}"
+    );
+    assert!(
+        !narrow
+            .regions
+            .hints
+            .iter()
+            .any(|(_, intent)| *intent == Intent::GotoSessions),
+        "the entry published a rect it was not drawn in"
+    );
+
+    // A few columns wider and the group fits whole, so the entry is back in
+    // the corner it holds wherever it is drawn.
+    let mut wider = app(60, 24);
+    let buffer = render_buffer(&mut wider, 60, 24);
+    let status = display_row(&buffer, 1, 60);
+    assert!(
+        status.trim_end().ends_with("Sessions Ctrl+L"),
+        "the entry did not come back where it fits: {status:?}"
+    );
+}
+
 #[test]
 fn escape_walks_between_the_prompt_and_the_list() {
     use vibex_tui::action::Intent;
