@@ -127,7 +127,7 @@ use vibex_desktop_model::{
     NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
     NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
     PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    ReasoningExpansionMode, RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
     SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
     SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
@@ -19004,6 +19004,10 @@ impl VibexWorkbench {
             .session
             .reasoning_expanded_by_default
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_expansion_mode
+            .hash(&mut hasher);
         self.reasoning_expansion
             .get(&format!("reasoning-live:{}", turn.id))
             .copied()
@@ -19017,6 +19021,14 @@ impl VibexWorkbench {
             .enhanced_file_operation_display
             .hash(&mut hasher);
         turn.process_rows.len().hash(&mut hasher);
+        // A thought that is still arriving draws its window without being
+        // opened, so the trailing row's streaming flag is part of the turn's
+        // shape now. Only the trailing row can flip it, which keeps this O(1)
+        // like the rest of the key.
+        turn.process_rows
+            .last()
+            .map(|row| row.streaming)
+            .hash(&mut hasher);
         turn.process_activity_groups.len().hash(&mut hasher);
         turn.process_activity_groups_with_commands
             .len()
@@ -19071,6 +19083,10 @@ impl VibexWorkbench {
         self.ui_state
             .session
             .reasoning_expanded_by_default
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_expansion_mode
             .hash(&mut hasher);
         self.reasoning_expansion
             .get(&format!("reasoning-live:{}", turn.id))
@@ -19175,6 +19191,10 @@ impl VibexWorkbench {
         self.ui_state
             .session
             .reasoning_expanded_by_default
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_expansion_mode
             .hash(&mut hasher);
         self.reasoning_expansion
             .get(&format!("reasoning-live:{}", turn.id))
@@ -32188,6 +32208,28 @@ impl VibexWorkbench {
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
         self.sync_timeline_display_settings_to_runtime();
+        cx.notify();
+    }
+
+    /// Choose how an expanded reasoning body is drawn while it streams.
+    ///
+    /// The choice reshapes an expanded reasoning row, so it invalidates the
+    /// measurements taken against the old shape rather than merely repainting:
+    /// a thought's row is now a fixed window instead of the whole body, and a
+    /// virtual-list extent left holding the old height would leave the rows
+    /// below it either slack or clipped.
+    fn set_reasoning_expansion_mode(
+        &mut self,
+        mode: ReasoningExpansionMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ui_state.session.reasoning_expansion_mode == mode {
+            return;
+        }
+        self.ui_state.session.reasoning_expansion_mode = mode;
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
         cx.notify();
     }
 
@@ -47537,8 +47579,16 @@ impl VibexWorkbench {
             TimelineRowKind::Reasoning => {
                 if row.body.is_empty() {
                     4.0
-                } else if self.reasoning_row_expanded(&row.id) {
-                    estimated_markdown_body_height(&row.body, chars_per_line) + 4.0
+                } else if self.reasoning_row_open(&row.id, row.streaming) {
+                    // A windowed body costs the window rather than the thought:
+                    // the estimate has to see the same cap the renderer clips
+                    // to, or a streaming thought would keep reserving the height
+                    // its window no longer draws.
+                    let (_, remaining) = reasoning_source_parts(&row.body);
+                    match self.reasoning_window(row.streaming, remaining) {
+                        Some(window) => reasoning_window_row_height(window) + 4.0,
+                        None => estimated_markdown_body_height(&row.body, chars_per_line) + 4.0,
+                    }
                 } else {
                     28.0
                 }
@@ -48061,8 +48111,17 @@ impl VibexWorkbench {
                         })
                         .map(|body| {
                             let key = format!("reasoning-live:{}", turn.id);
-                            if self.reasoning_row_expanded(&key) {
-                                estimated_markdown_body_height(body, chars_per_line) + 4.0
+                            if self.reasoning_row_open(&key, true) {
+                                // The bottom panel draws the same live body the
+                                // timeline does, so it is held to the same
+                                // window while the Agent is still thinking.
+                                let (_, remaining) = reasoning_source_parts(body);
+                                match self.reasoning_window(true, remaining) {
+                                    Some(window) => reasoning_window_row_height(window) + 4.0,
+                                    None => {
+                                        estimated_markdown_body_height(body, chars_per_line) + 4.0
+                                    }
+                                }
                             } else {
                                 28.0
                             }
@@ -48602,21 +48661,46 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    fn reasoning_row_expanded(&self, row_id: &str) -> bool {
-        self.reasoning_expansion
-            .get(row_id)
-            .copied()
-            .unwrap_or(self.ui_state.session.reasoning_expanded_by_default)
+    /// Whether a row's reasoning body is drawn open.
+    ///
+    /// The reader's own answer outranks everything else: a row they expanded or
+    /// collapsed keeps that state for the rest of the turn. Without one, the
+    /// "expand reasoning by default" preference decides — and so does a thought
+    /// the Agent is still on, which opens into its window by itself. That is the
+    /// TUI's rule: a running thought's window is the shape the thought has while
+    /// it arrives, not something the reader has to ask for. A thought the Agent
+    /// has finished with is not streaming any more, so it goes back behind the
+    /// row's preview and chevron, and expanding it then shows it in full.
+    fn reasoning_row_open(&self, row_id: &str, streaming: bool) -> bool {
+        match self.reasoning_expansion.get(row_id).copied() {
+            Some(explicit) => explicit,
+            None => {
+                self.ui_state.session.reasoning_expanded_by_default
+                    || self.live_reasoning_window_opens(streaming)
+            }
+        }
     }
 
+    /// Whether a thought that is still arriving opens its window on its own.
+    fn live_reasoning_window_opens(&self, streaming: bool) -> bool {
+        streaming
+            && self.ui_state.session.reasoning_expansion_mode == ReasoningExpansionMode::Window
+    }
+
+    /// Flip a reasoning row between open and closed.
+    ///
+    /// `open` is the state the caller drew the row in, which is not always the
+    /// state [`Self::reasoning_row_open`] would report back: in window mode a
+    /// running thought opens itself, so the click on it has to mean "close
+    /// this" rather than "open it again".
     fn toggle_reasoning_expansion(
         &mut self,
         row_id: String,
         turn_id: Option<String>,
+        open: bool,
         cx: &mut Context<Self>,
     ) {
-        let expanded = self.reasoning_row_expanded(&row_id);
-        self.reasoning_expansion.insert(row_id, !expanded);
+        self.reasoning_expansion.insert(row_id, !open);
         if let Some(turn_id) = turn_id {
             self.invalidate_timeline_turn_measurement(&turn_id);
         }
@@ -48711,24 +48795,63 @@ impl VibexWorkbench {
         })
     }
 
+    /// Draw an expanded reasoning row: the first line beside the brain, then the
+    /// rest of the thought under the connector bar.
+    ///
+    /// `window` holds the body to a fixed viewport when the Agent is still
+    /// producing it and the reader chose [`ReasoningExpansionMode::Window`];
+    /// `None` renders every row the thought has, which is what a settled
+    /// thought always gets.
     fn render_expanded_reasoning_layout(
         &mut self,
         row_id: String,
         turn_id: Option<String>,
         first_line: AnyElement,
         remaining: Option<AnyElement>,
+        window: Option<ReasoningWindow>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tooltip = self.strings().agent_collapse_process;
         let toggle_id = row_id.clone();
-        render_reasoning_first_line_layout(cx.theme().muted_foreground, first_line, remaining)
-            .id(row_id)
-            .cursor_pointer()
-            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), cx)
-            }))
-            .into_any_element()
+        render_reasoning_first_line_layout(
+            cx.theme().muted_foreground,
+            first_line,
+            remaining,
+            window,
+            cx,
+        )
+        .id(row_id)
+        .cursor_pointer()
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            // The body is on screen, so the click closes it — however it came to
+            // be open.
+            this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), true, cx)
+        }))
+        .into_any_element()
+    }
+
+    /// The window a live reasoning body is drawn in, or `None` while the
+    /// reader's expansion mode asks for the whole thought.
+    ///
+    /// Only a body that is still arriving is windowed: the window exists to keep
+    /// a growing thought from rewriting the timeline under the reader's hand,
+    /// and a thought the Agent has finished with is not growing any more. The
+    /// same six rows the TUI keeps are measured from the body that goes *into*
+    /// the window — everything after the first line, which is drawn beside the
+    /// brain rather than inside the box.
+    fn reasoning_window(
+        &self,
+        streaming: bool,
+        remaining: Option<&str>,
+    ) -> Option<ReasoningWindow> {
+        if !self.live_reasoning_window_opens(streaming) {
+            return None;
+        }
+        Some(reasoning_window_for(
+            remaining.unwrap_or_default(),
+            self.estimated_timeline_chars_per_line(),
+        ))
     }
 
     fn render_live_reasoning(
@@ -48738,7 +48861,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row_id = format!("reasoning-live:{}", turn.id);
-        let expanded = self.reasoning_row_expanded(&row_id);
+        let expanded = self.reasoning_row_open(&row_id, true);
         let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
         if expanded {
@@ -48746,6 +48869,11 @@ impl VibexWorkbench {
             let revision = u64::try_from(sequence).unwrap_or_default();
             let (first_line_source, remaining_source) = reasoning_source_parts(source.as_ref());
             let first_line = self.reasoning_first_line_text(None, first_line_source, cx);
+            // This body has no `TimelineRow` of its own, but it is the live
+            // reasoning of the turn by construction — the caller only reaches it
+            // while the turn is unfinished — so the window applies to it exactly
+            // as it does to a streaming row.
+            let window = self.reasoning_window(true, remaining_source);
             let remaining = remaining_source.map(|source| {
                 self.reasoning_markdown_view(
                     format!("thought:{row_id}:remaining"),
@@ -48765,6 +48893,7 @@ impl VibexWorkbench {
                 Some(turn_id),
                 first_line,
                 remaining,
+                window,
                 cx,
             );
         }
@@ -48794,7 +48923,13 @@ impl VibexWorkbench {
                 .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
                 .child(Icon::new(IconName::ChevronRight).size(px(14.0)).flex_none())
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_reasoning_expansion(toggle_id.clone(), Some(turn_id.clone()), cx)
+                    // The preview is the closed shape, so the click opens it.
+                    this.toggle_reasoning_expansion(
+                        toggle_id.clone(),
+                        Some(turn_id.clone()),
+                        false,
+                        cx,
+                    )
                 }));
         }
         container.into_any_element()
@@ -48806,7 +48941,7 @@ impl VibexWorkbench {
         }
         let row_id = row.id.clone();
         let turn_id = row.turn_id.clone();
-        let expanded = self.reasoning_row_expanded(&row_id);
+        let expanded = self.reasoning_row_open(&row_id, row.streaming);
         if expanded {
             let search_highlight =
                 self.session_search_highlight_for_rows(std::slice::from_ref(row));
@@ -48818,6 +48953,7 @@ impl VibexWorkbench {
             // a long turn expands hundreds of rows per frame, so the header
             // stays plain text and only the body keeps the Markdown surface.
             let first_line = self.reasoning_first_line_text(Some(row), first_line_source, cx);
+            let window = self.reasoning_window(row.streaming, remaining_source);
             let remaining = remaining_source.map(|source| {
                 self.reasoning_markdown_view(
                     format!("thought:{}:remaining", row.id),
@@ -48832,8 +48968,9 @@ impl VibexWorkbench {
                 .text_color(cx.theme().muted_foreground)
                 .into_any_element()
             });
-            return self
-                .render_expanded_reasoning_layout(row_id, turn_id, first_line, remaining, cx);
+            return self.render_expanded_reasoning_layout(
+                row_id, turn_id, first_line, remaining, window, cx,
+            );
         }
         let summary = timeline_reasoning_summary_cached_at(
             &mut self.timeline_reasoning_summaries,
@@ -48877,7 +49014,13 @@ impl VibexWorkbench {
                 .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
                 .child(Icon::new(IconName::ChevronRight).size(px(14.0)).flex_none())
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_reasoning_expansion(toggle_id.clone(), toggle_turn_id.clone(), cx)
+                    // The preview is the closed shape, so the click opens it.
+                    this.toggle_reasoning_expansion(
+                        toggle_id.clone(),
+                        toggle_turn_id.clone(),
+                        false,
+                        cx,
+                    )
                 }));
         }
         container.into_any_element()
@@ -56321,13 +56464,119 @@ fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
     )
 }
 
+/// How many rows of a reasoning body the window shows before its oldest rows
+/// start leaving the top.
+///
+/// The same six the TUI's `STREAMING_WINDOW_LINES` keeps, so both clients show
+/// the same amount of a thought that is still arriving.
+const REASONING_WINDOW_LINES: f32 = 6.0;
+
+/// The Markdown surface's line height, which turns the window's row count into
+/// the pixel box the timeline clips against. The view lays its body out at
+/// `line_height(px(22.0))`, so a window of `REASONING_WINDOW_LINES` rows is
+/// that many lines of prose — a block gap inside the window only makes the
+/// visible slice slightly shorter than six lines, never taller.
+const REASONING_WINDOW_LINE_HEIGHT: f32 = 22.0;
+
+/// The height of the fixed window an expanded reasoning body is held to while
+/// the Agent is still producing it.
+const REASONING_WINDOW_HEIGHT: f32 = REASONING_WINDOW_LINES * REASONING_WINDOW_LINE_HEIGHT;
+
+/// The row of air that says older reasoning rows are above the window.
+const REASONING_WINDOW_FOLD_MARKER: &str = "…";
+
+/// How tall that fold marker row is: one line of small text with a little air.
+const REASONING_WINDOW_FOLD_MARKER_HEIGHT: f32 = 20.0;
+
+/// The fixed-height viewport a live reasoning body is drawn in.
+///
+/// `height` is the box the body is clipped to; `fold` says the body has already
+/// outgrown it, which the row answers with a marker above the window rather than
+/// inside it — a marker that were part of the clipped column would be the first
+/// thing pushed out of sight.
+#[derive(Clone, Copy)]
+struct ReasoningWindow {
+    height: f32,
+    fold: bool,
+}
+
+/// Whether a reasoning body has outgrown the window, and what the window costs
+/// the timeline row: the body capped at the window, plus the marker row once
+/// the body no longer fits.
+///
+/// The measurement is the same wrapped-line estimate the timeline already sizes
+/// its rows with, so the row's height and the drawn window agree about when the
+/// content stopped fitting. It is an estimate: Markdown reflows the source, and
+/// a body estimated just over the cap draws a marker above a window that turns
+/// out to hold all of it.
+fn reasoning_window_for(body: &str, chars_per_line: usize) -> ReasoningWindow {
+    let natural = estimated_markdown_body_height(body, chars_per_line);
+    ReasoningWindow {
+        height: natural.min(REASONING_WINDOW_HEIGHT),
+        fold: natural > REASONING_WINDOW_HEIGHT,
+    }
+}
+
+/// The pixel height [`reasoning_window_for`] costs a timeline row, marker
+/// included, so the estimator and the renderer cannot drift apart.
+fn reasoning_window_row_height(window: ReasoningWindow) -> f32 {
+    window.height
+        + if window.fold {
+            REASONING_WINDOW_FOLD_MARKER_HEIGHT
+        } else {
+            0.0
+        }
+}
+
+/// Hold a reasoning body to its window.
+///
+/// The body keeps its natural height and is pinned to the bottom of a box that
+/// is capped at the window: the free space is negative once the thought is
+/// longer than the window, so the first row sits above the box's top edge and
+/// the clip takes it — the newest rows are what stays in view, and every row a
+/// delta adds pushes one row off the top instead of making the row taller. The
+/// body is `flex_shrink_0` because a shrunken child would hand its overflow back
+/// to the bottom of the box and cut the newest rows instead.
+fn reasoning_window_body(body: AnyElement, height: f32) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .max_h(px(height))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .justify_end()
+        .child(div().w_full().min_w_0().flex_shrink_0().child(body))
+        .into_any_element()
+}
+
+/// The marker row that says rows have left the top of the window.
+fn reasoning_window_fold_marker(cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .h(px(REASONING_WINDOW_FOLD_MARKER_HEIGHT))
+        .flex_none()
+        .truncate()
+        .text_color(cx.theme().muted_foreground)
+        .child(REASONING_WINDOW_FOLD_MARKER)
+        .into_any_element()
+}
+
 /// Pure layout for the expanded reasoning row: a brain icon beside the first
 /// line (with a collapse chevron), and any remaining lines under a thin
 /// connector. Interaction handlers are attached by the caller.
+///
+/// The connector is the height bar of the body it stands beside: it stretches
+/// to whatever the remaining content takes, so a body held to
+/// [`ReasoningWindow`] draws a bar exactly as tall as the window the reader is
+/// watching instead of as tall as the whole thought.
 fn render_reasoning_first_line_layout(
     icon_color: Hsla,
     first_line: AnyElement,
     remaining: Option<AnyElement>,
+    window: Option<ReasoningWindow>,
+    cx: &App,
 ) -> gpui::Div {
     let connector_color = icon_color.opacity(0.46);
     let first_line_row = h_flex()
@@ -56359,6 +56608,21 @@ fn render_reasoning_first_line_layout(
         );
     let mut content = v_flex().min_w_0().flex_1().child(first_line_row);
     if let Some(remaining) = remaining {
+        // A windowed body is a column of its own so the fold marker can sit
+        // above the box without being clipped with the rows it announces; a
+        // body with no window stays the single element it has always been.
+        let body = match window {
+            Some(window) => {
+                let mut column = v_flex().min_w_0().flex_1();
+                if window.fold {
+                    column = column.child(reasoning_window_fold_marker(cx));
+                }
+                column
+                    .child(reasoning_window_body(remaining, window.height))
+                    .into_any_element()
+            }
+            None => remaining,
+        };
         content = content.child(
             h_flex()
                 .w_full()
@@ -56372,7 +56636,7 @@ fn render_reasoning_first_line_layout(
                         .items_center()
                         .child(div().w(px(1.0)).flex_1().bg(connector_color)),
                 )
-                .child(remaining),
+                .child(body),
         );
     }
 
@@ -61559,6 +61823,23 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            strings.reasoning_expansion_mode,
+            strings.reasoning_expansion_mode_description,
+            &[
+                "reasoning",
+                "thinking",
+                "window",
+                "expand",
+                "推理",
+                "思考",
+                "窗口",
+                "視窗",
+                "展开",
+                "展開",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             strings.enhanced_command_execution_display,
             strings.enhanced_command_execution_display_description,
             &["command", "execution", "tool", "命令", "指令"],
@@ -62695,6 +62976,24 @@ impl SearchableListItem for ReasoningDisplayChoice {
 }
 
 #[derive(Clone)]
+struct ReasoningExpansionChoice {
+    label: SharedString,
+    mode: ReasoningExpansionMode,
+}
+
+impl SearchableListItem for ReasoningExpansionChoice {
+    type Value = ReasoningExpansionMode;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.mode
+    }
+}
+
+#[derive(Clone)]
 struct FontChoice {
     label: SharedString,
     family: Option<String>,
@@ -62833,6 +63132,7 @@ struct FoundationSettings {
     dark_themes: Entity<SelectState<Vec<appearance_theme::ThemeOption>>>,
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
     reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
+    reasoning_expansion_modes: Entity<SelectState<Vec<ReasoningExpansionChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     browser_start_pages: Entity<SelectState<Vec<BrowserPresetChoice>>>,
     browser_search_engines: Entity<SelectState<Vec<BrowserPresetChoice>>>,
@@ -62896,6 +63196,7 @@ impl FoundationSettings {
         let code_choices = font_choices(&families, strings.system_monospace);
         let session_content_width_choices = session_content_width_choices(strings);
         let reasoning_display_choices = reasoning_display_choices(strings);
+        let reasoning_expansion_choices = reasoning_expansion_choices(strings);
         let shell_choices = shell_choices();
         let language_selected =
             selected_locale_index(&language_choices, ui_state.appearance.locale);
@@ -62912,6 +63213,10 @@ impl FoundationSettings {
         let reasoning_display_selected = selected_reasoning_display_index(
             &reasoning_display_choices,
             ui_state.session.reasoning_display_mode,
+        );
+        let reasoning_expansion_selected = selected_reasoning_expansion_index(
+            &reasoning_expansion_choices,
+            ui_state.session.reasoning_expansion_mode,
         );
         let terminal_shell_selected =
             selected_shell_index(&shell_choices, &ui_state.terminal_preferences.shell);
@@ -62964,6 +63269,14 @@ impl FoundationSettings {
             SelectState::new(
                 reasoning_display_choices,
                 reasoning_display_selected,
+                window,
+                cx,
+            )
+        });
+        let reasoning_expansion_modes = cx.new(|cx| {
+            SelectState::new(
+                reasoning_expansion_choices,
+                reasoning_expansion_selected,
                 window,
                 cx,
             )
@@ -63169,6 +63482,22 @@ impl FoundationSettings {
                 },
             )
             .detach();
+            let reasoning_expansion_workbench = workbench.clone();
+            cx.subscribe(
+                &reasoning_expansion_modes,
+                move |_: &mut FoundationSettings,
+                      _,
+                      event: &SelectEvent<Vec<ReasoningExpansionChoice>>,
+                      cx| {
+                    let SelectEvent::Confirm(mode) = event;
+                    if let Some(mode) = *mode {
+                        let _ = reasoning_expansion_workbench
+                            .update(cx, |this, cx| this.set_reasoning_expansion_mode(mode, cx));
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
             cx.subscribe(
                 &terminal_shells,
                 move |_: &mut FoundationSettings, _, event: &SelectEvent<Vec<ShellChoice>>, cx| {
@@ -63253,6 +63582,7 @@ impl FoundationSettings {
                 dark_themes,
                 session_content_widths,
                 reasoning_display_modes,
+                reasoning_expansion_modes,
                 terminal_shells,
                 browser_start_pages,
                 browser_search_engines,
@@ -65459,6 +65789,13 @@ impl FoundationSettings {
             None::<&str>,
             cx,
         );
+        let reasoning_expansion_select = settings_select(
+            &self.reasoning_expansion_modes,
+            Some(px(180.0)),
+            stacked,
+            None::<&str>,
+            cx,
+        );
         let show_agent_generation_status_switch = Switch::new("show-agent-generation-status")
             .small()
             .checked(session.show_agent_generation_status)
@@ -65642,6 +65979,13 @@ impl FoundationSettings {
                             strings.reasoning_expanded_by_default,
                             strings.reasoning_expanded_by_default_description,
                             reasoning_expanded_by_default_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.reasoning_expansion_mode,
+                            strings.reasoning_expansion_mode_description,
+                            reasoning_expansion_select,
                             stacked,
                             cx,
                         ),
@@ -68018,6 +68362,31 @@ fn reasoning_display_choices(strings: &'static Strings) -> Vec<ReasoningDisplayC
 fn selected_reasoning_display_index(
     choices: &[ReasoningDisplayChoice],
     selected: ReasoningDisplayMode,
+) -> Option<IndexPath> {
+    choices
+        .iter()
+        .position(|choice| choice.mode == selected)
+        .map(|row| IndexPath::default().row(row))
+}
+
+/// The two shapes an expanded reasoning body can take while it streams: every
+/// row the thought has produced, or a fixed window on its newest rows.
+fn reasoning_expansion_choices(strings: &'static Strings) -> Vec<ReasoningExpansionChoice> {
+    vec![
+        ReasoningExpansionChoice {
+            label: strings.reasoning_expansion_full.into(),
+            mode: ReasoningExpansionMode::Full,
+        },
+        ReasoningExpansionChoice {
+            label: strings.reasoning_expansion_window.into(),
+            mode: ReasoningExpansionMode::Window,
+        },
+    ]
+}
+
+fn selected_reasoning_expansion_index(
+    choices: &[ReasoningExpansionChoice],
+    selected: ReasoningExpansionMode,
 ) -> Option<IndexPath> {
     choices
         .iter()
@@ -72540,6 +72909,21 @@ mod tests {
         content_bottom: Rc<Cell<f32>>,
     }
 
+    /// A reasoning body long enough to outgrow a window several times over.
+    fn reasoning_window_probe_body() -> String {
+        (0..30)
+            .map(|line| format!("reasoning row {line} of a thought that keeps arriving"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    struct ReasoningWindowLayoutProbe {
+        window_top: Rc<Cell<f32>>,
+        window_bottom: Rc<Cell<f32>>,
+        body_top: Rc<Cell<f32>>,
+        body_bottom: Rc<Cell<f32>>,
+    }
+
     impl Render for ReasoningFirstLineLayoutProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
@@ -72601,6 +72985,45 @@ mod tests {
                                 content_bottom.set(f32::from(bounds.bottom()));
                             })),
                     ),
+            )
+        }
+    }
+
+    impl Render for ReasoningWindowLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let window_top = self.window_top.clone();
+            let window_bottom = self.window_bottom.clone();
+            let body_top = self.body_top.clone();
+            let body_bottom = self.body_bottom.clone();
+            div().w(px(520.0)).child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .on_prepaint(move |bounds, _, _| {
+                        window_top.set(f32::from(bounds.origin.y));
+                        window_bottom.set(f32::from(bounds.bottom()));
+                    })
+                    .child(reasoning_window_body(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .on_prepaint(move |bounds, _, _| {
+                                body_top.set(f32::from(bounds.origin.y));
+                                body_bottom.set(f32::from(bounds.bottom()));
+                            })
+                            .child(
+                                MarkdownView::new(
+                                    "reasoning-window-layout-probe",
+                                    MarkdownInput::new(reasoning_window_probe_body(), "", 1)
+                                        .surface(MarkdownSurface::Agent),
+                                )
+                                .presentation(MarkdownPresentation::Thought)
+                                .w_full()
+                                .min_w_0(),
+                            )
+                            .into_any_element(),
+                        REASONING_WINDOW_HEIGHT,
+                    )),
             )
         }
     }
@@ -78772,6 +79195,130 @@ mod tests {
             streaming_timeline_row_body_len(&turn, &live_state),
             Some(live_state.body_len)
         );
+    }
+
+    #[test]
+    fn a_reasoning_window_caps_the_body_and_folds_only_what_outgrows_it() {
+        // A thought the window holds: the box is as tall as the thought, and
+        // nothing has left the top.
+        let short = reasoning_window_for("checking the parser", 80);
+        assert!(!short.fold);
+        assert!(short.height < REASONING_WINDOW_HEIGHT);
+        assert_eq!(reasoning_window_row_height(short), short.height);
+
+        // A thought it does not: the box is the cap, and the row pays for the
+        // marker row that says older rows are above it.
+        let long = "reasoning row ".repeat(200);
+        let windowed = reasoning_window_for(&long, 80);
+        assert!(windowed.fold, "a body past the cap must fold");
+        assert_eq!(windowed.height, REASONING_WINDOW_HEIGHT);
+        assert_eq!(
+            reasoning_window_row_height(windowed),
+            REASONING_WINDOW_HEIGHT + REASONING_WINDOW_FOLD_MARKER_HEIGHT
+        );
+
+        // The same body measured against a wider pane still folds: the window
+        // is a row count, so it is the wrapped line count that decides.
+        assert!(reasoning_window_for(&long, 400).fold);
+    }
+
+    #[test]
+    fn only_a_streaming_body_opens_a_reasoning_window_and_the_choice_reshapes_rows() {
+        let source = include_str!("app.rs");
+
+        // The policy: the window is for a body that is still arriving, and only
+        // while the reader's choice asks for one.
+        let policy = source
+            .split_once("    fn reasoning_window(\n")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_live_reasoning("))
+            .map(|(body, _)| body)
+            .expect("the window policy should remain inspectable");
+        assert!(policy.contains("live_reasoning_window_opens(streaming)"));
+        assert!(policy.contains("reasoning_window_for("));
+
+        let rule = source
+            .split_once("    fn live_reasoning_window_opens(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Flip a reasoning row between open and closed.")
+            })
+            .map(|(body, _)| body)
+            .expect("the live window rule should remain inspectable");
+        assert!(rule.contains("streaming"));
+        assert!(rule.contains("ReasoningExpansionMode::Window"));
+
+        // A live thought opens that window by itself, but never over the
+        // reader's own answer about the row.
+        let open = source
+            .split_once("    fn reasoning_row_open(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Whether a thought that is still arriving opens its window on its own.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the open rule should remain inspectable");
+        assert!(open.contains("self.reasoning_expansion.get(row_id).copied()"));
+        assert!(open.contains("reasoning_expanded_by_default"));
+        assert!(open.contains("live_reasoning_window_opens(streaming)"));
+
+        // Both surfaces that draw a live body ask for the window, and the
+        // timeline row asks with the row's own streaming flag rather than
+        // assuming one.
+        let row = source
+            .split_once("    fn render_reasoning_row(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n        let summary = timeline_reasoning_summary_cached_at(")
+            })
+            .map(|(body, _)| body)
+            .expect("the reasoning row renderer should remain inspectable");
+        assert!(
+            row.contains("let window = self.reasoning_window(row.streaming, remaining_source);")
+        );
+        assert!(row.contains("render_expanded_reasoning_layout("));
+
+        let live = source
+            .split_once("    fn render_live_reasoning(")
+            .and_then(|(_, tail)| tail.split_once("\n        let sequence = i64::try_from("))
+            .map(|(body, _)| body)
+            .expect("the live reasoning renderer should remain inspectable");
+        assert!(live.contains("let window = self.reasoning_window(true, remaining_source);"));
+
+        // A window reshapes an expanded row from the whole thought to a fixed
+        // box, so choosing the mode drops the measurements taken against the old
+        // shape instead of repainting over them.
+        let setter = source
+            .split_once("    fn set_reasoning_expansion_mode(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_reasoning_expanded_by_default("))
+            .map(|(body, _)| body)
+            .expect("the expansion mode setter should remain inspectable");
+        assert!(setter.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(setter.contains("self.rebuild_timeline_sizes();"));
+        assert!(setter.contains("self.queue_ui_state();"));
+
+        // The mode is part of every fingerprint that decides whether a measured
+        // turn is still the shape it was measured as.
+        let shape_key = source
+            .split_once("    fn timeline_turn_shape_key(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn timeline_turn_layout_signature_uncached(")
+            })
+            .map(|(body, _)| body)
+            .expect("the turn shape key should remain inspectable");
+        assert!(shape_key.contains(".reasoning_expansion_mode"));
+        let signature = source
+            .split_once("    fn timeline_turn_layout_signature_uncached(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Cheap fingerprint of every input"))
+            .map(|(body, _)| body)
+            .expect("the turn layout signature should remain inspectable");
+        assert!(signature.contains(".reasoning_expansion_mode"));
+        let estimate = source
+            .split_once("    fn timeline_turn_estimate_signature(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Parks a turn height prepaint observed")
+            })
+            .map(|(body, _)| body)
+            .expect("the estimate signature should remain inspectable");
+        assert!(estimate.contains(".reasoning_expansion_mode"));
     }
 
     #[test]
@@ -87649,6 +88196,56 @@ mod tests {
         );
     }
 
+    /// The window is the whole feature: the body has to be laid out at its
+    /// natural height, pushed up out of the box's top edge, and clipped there,
+    /// so what stays in view is the newest rows rather than the oldest.
+    #[gpui::test]
+    fn a_reasoning_window_keeps_the_newest_rows_and_clips_the_oldest(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window_top = Rc::new(Cell::new(0.0));
+        let window_bottom = Rc::new(Cell::new(0.0));
+        let body_top = Rc::new(Cell::new(0.0));
+        let body_bottom = Rc::new(Cell::new(0.0));
+        let observed_window_top = window_top.clone();
+        let observed_window_bottom = window_bottom.clone();
+        let observed_body_top = body_top.clone();
+        let observed_body_bottom = body_bottom.clone();
+        let (_, cx) = cx.add_window_view(|_, _| ReasoningWindowLayoutProbe {
+            window_top,
+            window_bottom,
+            body_top,
+            body_bottom,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let window_height = observed_window_bottom.get() - observed_window_top.get();
+        assert!(
+            (window_height - REASONING_WINDOW_HEIGHT).abs() <= 1.0,
+            "the window should be exactly as tall as its cap, got {window_height}"
+        );
+        let body_height = observed_body_bottom.get() - observed_body_top.get();
+        assert!(
+            body_height > REASONING_WINDOW_HEIGHT * 2.0,
+            "the probe body should outgrow the window, got {body_height}"
+        );
+        assert!(
+            observed_body_top.get() < observed_window_top.get(),
+            "the oldest rows should sit above the window's top edge: body top {}, window top {}",
+            observed_body_top.get(),
+            observed_window_top.get()
+        );
+        assert!(
+            (observed_body_bottom.get() - observed_window_bottom.get()).abs() <= 1.0,
+            "the newest row should end where the window ends: body bottom {}, window bottom {}",
+            observed_body_bottom.get(),
+            observed_window_bottom.get()
+        );
+    }
+
     #[test]
     fn streaming_timeline_height_waits_for_rendered_markdown_measurement() {
         let source = include_str!("app.rs");
@@ -89491,7 +90088,7 @@ mod tests {
     }
 
     impl Render for ReasoningFirstLineProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured = self.measured.clone();
             let first_line = MarkdownView::new(
                 "reasoning-probe:first-line",
@@ -89526,6 +90123,8 @@ mod tests {
                         gpui::hsla(0.0, 0.0, 0.6, 1.0),
                         first_line,
                         remaining,
+                        None,
+                        cx,
                     )),
             )
         }

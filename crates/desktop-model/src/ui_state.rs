@@ -170,6 +170,24 @@ pub enum ReasoningDisplayMode {
     Timeline,
 }
 
+/// Controls how an expanded reasoning body is drawn while it is still arriving.
+///
+/// `Full` renders every row the thought has produced, so a long thought grows
+/// the timeline row as it streams. `Window` holds the body to a fixed-height
+/// viewport on its newest rows instead: a thought that outgrows the window
+/// pushes its oldest rows off the top rather than growing the row, which is the
+/// shape the TUI draws a running thought in. A thought the Agent has finished
+/// with is not streaming any more, so both modes render it in full — the window
+/// is for content that is still moving, and the reader who expands a settled
+/// thought asked to read all of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningExpansionMode {
+    Full,
+    #[default]
+    Window,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalWorkingDirectory {
@@ -1006,6 +1024,10 @@ pub struct SessionUiState {
     pub reasoning_display_mode: ReasoningDisplayMode,
     #[serde(default)]
     pub reasoning_expanded_by_default: bool,
+    /// How an expanded reasoning body is drawn while the Agent is still
+    /// producing it. See [`ReasoningExpansionMode`].
+    #[serde(default)]
+    pub reasoning_expansion_mode: ReasoningExpansionMode,
     #[serde(default = "default_show_agent_generation_status")]
     pub show_agent_generation_status: bool,
     #[serde(default = "default_enhanced_command_execution_display")]
@@ -1036,6 +1058,7 @@ impl Default for SessionUiState {
             turn_preview_rail: true,
             reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
             reasoning_expanded_by_default: false,
+            reasoning_expansion_mode: ReasoningExpansionMode::Window,
             show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
@@ -2837,6 +2860,10 @@ mod tests {
             ReasoningDisplayMode::LatestAtBottom
         );
         assert!(!SessionUiState::default().reasoning_expanded_by_default);
+        assert_eq!(
+            SessionUiState::default().reasoning_expansion_mode,
+            ReasoningExpansionMode::Window
+        );
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         let session = value
@@ -2848,6 +2875,7 @@ mod tests {
         session.remove("enhancedFileOperationDisplay");
         session.remove("reasoningDisplayMode");
         session.remove("reasoningExpandedByDefault");
+        session.remove("reasoningExpansionMode");
         session.remove("autoContinueProjectIds");
         session.remove("autoContinueSessionOverrides");
         session.remove("autoContinuePausedSessionIds");
@@ -2863,6 +2891,10 @@ mod tests {
             ReasoningDisplayMode::LatestAtBottom
         );
         assert!(!decoded.session.reasoning_expanded_by_default);
+        assert_eq!(
+            decoded.session.reasoning_expansion_mode,
+            ReasoningExpansionMode::Window
+        );
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
         assert!(decoded.session.auto_continue_paused_session_ids.is_empty());

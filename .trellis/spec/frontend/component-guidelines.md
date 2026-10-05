@@ -619,6 +619,22 @@ Render Agent activity through provider-neutral cards:
 Cards that can grow large must be collapsible. Tool, diff, terminal, and plan
 cards should support compact summaries for mobile.
 
+A reasoning card is the one card that is read while it is still arriving, so its
+body is drawn as a *window* while the Agent is still thinking rather than as a
+block that grows with the thought. The body keeps its natural height and is
+pinned to the bottom of a box capped at `REASONING_WINDOW_HEIGHT` — six rows of
+the Markdown surface's line height, the same count the TUI's
+`STREAMING_WINDOW_LINES` keeps — with `overflow_hidden`, so every row a delta
+adds pushes one row off the top instead of making the timeline row taller. A `…`
+row above the box says older rows have left it, and the card's existing connector
+bar stretches to the window, which is what makes it read as the window's height.
+The window is the default (`ReasoningExpansionMode::Window`), and it opens on its
+own for the thought the Agent is on, the way the TUI draws a running thought; the
+reader's own collapse still wins. `Full` renders every row the thought has
+produced as it arrives. Either way, a thought the Agent has finished with is not
+streaming any more and expands in full: the window is for content that is still
+moving.
+
 A user message delivered by a queued action marks itself on the bubble's lower
 edge through the kit's reaction region (`BubbleReactions` with an icon-only ghost
 `Button`), never through a chip above the bubble or a tinted bubble border. The
