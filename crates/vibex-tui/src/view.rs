@@ -1695,23 +1695,21 @@ fn session_row_lines(
     // the right edge, and the age is not drawn under them: two answers to
     // "when" and "act on this" in one column would be one too many.
     let active = selected || hovered;
-    let rename_icon = crate::glyphs::rename_icon(tier);
-    let delete_icon = crate::glyphs::delete_icon(tier);
     // The right end of the row keeps room for whichever of the two is wider,
     // *on every row* and not only on the row being acted on: a title that grew
     // when the pointer landed on it would rewrite the list under the reader's
     // hand, and the columns of the list would stop lining up.
     let control_block = SESSION_ROW_CONTROL_AIR
-        + session_row_control_width(app, rename_icon, Intent::BeginRenameSession)
+        + session_row_control_width(app, Intent::BeginRenameSession)
         + SESSION_ROW_CONTROL_GAP
-        + session_row_control_width(app, delete_icon, Intent::DeleteSession);
+        + session_row_control_width(app, Intent::DeleteSession);
     let reserved = time_block_width.max(control_block);
-    let control_labels = active.then(|| {
-        (
-            session_row_control_label(app, rename_icon, Intent::BeginRenameSession),
-            session_row_control_label(app, delete_icon, Intent::DeleteSession),
-        )
-    });
+    let control_labels = if active {
+        session_row_control_label(app, Intent::BeginRenameSession)
+            .zip(session_row_control_label(app, Intent::DeleteSession))
+    } else {
+        None
+    };
     let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
     let text_width = width
         .saturating_sub(indent)
@@ -1838,39 +1836,25 @@ fn session_row_lines(
     lines
 }
 
-/// What a row's control says: the glyph that names the action, and the chord
-/// that runs it where the chord is a single cell of its own.
+/// What a row's control says: the chord that runs it, in the spelling the key
+/// bar and the help page use.
 ///
-/// The hint is the terminal's answer to a tooltip — a pointer surface can say
-/// what a button does by hovering it, and a row of one-cell marks cannot — so
-/// the reader can learn the key from the row they are already acting on, in the
-/// same spelling the key bar and the help page use. A chord that would take
-/// more than one column (a modified key, a named key) is left out rather than
-/// allowed to widen the control: the row is a list of titles, not a key
-/// reference. A chord the glyph already spells is not repeated, which is what
-/// keeps the legacy tier's letter controls single-cell.
-fn session_row_control_label(app: &App, icon: &'static str, intent: Intent) -> String {
-    match session_row_control_hint(app, icon, intent) {
-        Some(hint) => format!("{icon} {hint}"),
-        None => icon.to_string(),
-    }
+/// A terminal has no tooltip to hover, so the key *is* the label — a mark that
+/// does not name the key would only be a puzzle the reader has to solve in the
+/// help page. An intent nobody has bound has nothing to name, so it gets no
+/// control at all rather than an empty target.
+fn session_row_control_label(app: &App, intent: Intent) -> Option<String> {
+    app.keymap
+        .chord_for_in(Scope::Sessions, intent)
+        .map(|chord| chord.display())
 }
 
 /// The same control's width, without building what it draws: the row measures
 /// its controls on every row, including the rows that do not draw them.
-fn session_row_control_width(app: &App, icon: &'static str, intent: Intent) -> usize {
-    display_width(icon)
-        + session_row_control_hint(app, icon, intent)
-            .map(|hint| 1 + display_width(&hint))
-            .unwrap_or(0)
-}
-
-/// The chord a control names, when naming it is worth the cells.
-fn session_row_control_hint(app: &App, icon: &str, intent: Intent) -> Option<String> {
-    app.keymap
-        .chord_for_in(Scope::Sessions, intent)
-        .map(|chord| chord.display())
-        .filter(|chord| display_width(chord) == 1 && !chord.eq_ignore_ascii_case(icon))
+fn session_row_control_width(app: &App, intent: Intent) -> usize {
+    session_row_control_label(app, intent)
+        .map(|label| display_width(&label))
+        .unwrap_or(0)
 }
 
 /// The marks a session row carries: pinned, unread, and whether the session is

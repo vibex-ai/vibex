@@ -6048,7 +6048,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     };
     let selected = screen.lines().nth(row_of("fix the flaky test")).unwrap();
     assert!(
-        selected.contains("╱ R") && selected.contains("✕ D"),
+        selected.trim_end().ends_with("R D"),
         "the row the cursor is on carries no controls: {selected:?}"
     );
     // The controls take the age's place: a row does not answer "when" and "act
@@ -6059,12 +6059,8 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     );
     let other = screen.lines().nth(row_of("the other one")).unwrap();
     assert!(
-        !other.contains('╱') && !other.contains('✕'),
-        "a row nobody is on was given controls: {other:?}"
-    );
-    assert!(
-        other.contains("now"),
-        "a row nobody is on lost its age: {other:?}"
+        other.trim_end().ends_with("now"),
+        "a row nobody is on does not end in its age: {other:?}"
     );
 
     // The pair is a click target, and each half names the row it belongs to.
@@ -6114,7 +6110,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     let screen = text(&render(&mut app, 100, 24));
     let hovered = screen.lines().nth(row_of("the other one")).unwrap();
     assert!(
-        hovered.contains("╱ R") && hovered.contains("✕ D"),
+        hovered.trim_end().ends_with("R D"),
         "the row under the pointer carries no controls: {hovered:?}"
     );
     assert!(
@@ -6192,30 +6188,29 @@ fn a_session_rows_controls_spell_the_chord_that_runs_them() {
     }
     let drawn = row(&mut app);
     assert!(
-        drawn.contains("╱ R") && drawn.contains("✕ D"),
+        drawn.trim_end().ends_with("R D") && !drawn.contains('╱'),
         "the row does not name the chords that run its controls: {drawn:?}"
     );
 
-    // A rebound key is spelled the way the key bar spells it, and the hint
-    // keeps naming the control it belongs to.
+    // A rebound key is spelled the way the key bar spells it.
     app.keymap
         .rebind(Intent::BeginRenameSession, "q".parse::<Chord>().unwrap());
     let drawn = row(&mut app);
     assert!(
-        drawn.contains("╱ Q") && !drawn.contains("╱ R"),
-        "the hint did not follow the binding: {drawn:?}"
+        drawn.trim_end().ends_with("Q D"),
+        "the control did not follow the binding: {drawn:?}"
     );
 
-    // A chord that cannot fit in one cell is dropped, not truncated: the
-    // control keeps its glyph and the row keeps its columns.
+    // A chord that takes more than one cell is spelled out rather than
+    // truncated: the control is the key, whatever the key is.
     app.keymap.rebind(
         Intent::BeginRenameSession,
         "ctrl+x".parse::<Chord>().unwrap(),
     );
     let drawn = row(&mut app);
     assert!(
-        drawn.contains('╱') && drawn.contains("✕ D") && !drawn.contains("Ctrl"),
-        "a chord too wide for the row was squeezed into it: {drawn:?}"
+        drawn.trim_end().ends_with("Ctrl+X D"),
+        "the control does not spell the whole chord: {drawn:?}"
     );
 }
 
@@ -6393,8 +6388,8 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
     assert!(
         drawn.contains(&(
             vibex_tui::action::Intent::BeginRenameSession,
-            "r".to_string()
-        )) && drawn.contains(&(vibex_tui::action::Intent::DeleteSession, "d".to_string())),
+            "R".to_string()
+        )) && drawn.contains(&(vibex_tui::action::Intent::DeleteSession, "D".to_string())),
         "the controls do not degrade to the legacy tier: {drawn:?}"
     );
 }

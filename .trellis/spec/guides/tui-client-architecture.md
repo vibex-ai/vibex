@@ -653,13 +653,12 @@ is never a column count.
   cannot answer "when" and "act on this" at once, and the desktop's own row
   hides the age behind the same pair. Every other row gives those columns back
   to its title, which is what keeps the list from becoming a field of buttons.
-  Each control is its glyph, a space and the single-cell chord that runs it in
-  the spelling the key bar and help page use (`╱ R`/`✕ D`, from
-  `glyphs::rename_icon`/`delete_icon` plus `Keymap::chord_for_in`); the legacy
-  tier's letters are the actions' initials, which are also their chords, so the
-  hint is not repeated and the control stays one cell. A chord too wide for one
-  cell — a modified key, a named key — drops the hint rather than widening the
-  row. The row reserves whichever of the age and the controls is wider *before*
+  Each control *is* the chord that runs it (`R`/`D`, from
+  `Keymap::chord_for_in`), in the spelling the key bar and help page use: a
+  terminal has no tooltip to hover, so a mark that did not name the key would
+  only send the reader to the help page to decode it, and the same lookup means
+  a rebind renames the button with no second table to keep in step. The row
+  reserves whichever of the age and the controls is wider *before*
   the reader arrives, so a title does not reflow when the pointer lands on it,
   and the pointer resting on a control lights that one alone — the delete in
   `danger`, the rename in the accent — for the width of its whole target. Each is
@@ -671,7 +670,9 @@ is never a column count.
   same two actions: `r` and `d`, both in the binding table and the palette.
   A control nobody can see is not published — a row the window has scrolled past
   and a pair a narrow terminal has pushed out of the band are dropped rather
-  than left as rects a click could land on.
+  than left as rects a click could land on. An intent with no binding has
+  nothing to spell, so it gets no control: an unlabelled target would be a
+  button whose only way to explain itself is a click.
 * **Depth is drawn, for headings and for the sessions under them.** A heading
   indents two cells per level, and so does a session row: a project heading is
   the leftmost thing in its band, its folders and sessions start a step in, and

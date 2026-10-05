@@ -445,10 +445,12 @@ includes archived sessions. Nesting is drawn rather than implied: a project is
 the leftmost thing in its band, its folders and sessions start a step in, and a
 folder's own sessions a step in from the folder. The row the reader is on — the
 cursor's, or the one under the pointer — carries its two controls where the age
-is: `╱ R` renames and `✕ D` deletes, the letter being the chord the key bar and
-the `?` help name. The age is not drawn under them — one column does not answer
-"when" and "act on this" at once — and it comes back when the reader moves on.
-A click on either control runs the same action as the key.
+is: `R` renames and `D` deletes. The control *is* the chord the key bar and the
+`?` help name — there is no tooltip to hover in a terminal, so a mark that did
+not name the key would only be a puzzle — which also means a rebind renames the
+button. The age is not drawn under them — one column does not answer "when" and
+"act on this" at once — and it comes back when the reader moves on. A click on
+either control runs the same action as the key.
 
 ### Auto-continue
 
