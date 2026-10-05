@@ -2395,6 +2395,77 @@ mod tests {
     }
 
     #[test]
+    fn a_streamed_tool_call_stays_one_row_in_the_transcript() {
+        use vibex_core::{TimelinePayload, ToolCallPayload, ToolCallStatus};
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        let mut session = isolation_session(id.clone(), "deepseek-harness");
+        session.state = vibex_core::AgentSessionState::Running;
+        app.agent.state.selected_session_id = Some(id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(id.clone(), vec![]);
+
+        // One tool call arrives as a run of updates: the same call id with a
+        // growing payload, from the first fragment to the finished input.
+        let inputs = [
+            r#"{"arguments":""}"#,
+            r#"{"arguments":"{\"command"}"#,
+            r#"{"command":"ls -la"}"#,
+        ];
+        for (index, input) in inputs.into_iter().enumerate() {
+            let sequence = index as i64 + 1;
+            let item = conversation_item(
+                &id,
+                sequence,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "execute".into(),
+                    status: if index + 1 == inputs.len() {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Progress
+                    },
+                    summary: "ls -la".into(),
+                    input_summary: Some(input.into()),
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            );
+            apply_message(
+                &mut app,
+                &worker,
+                AppMessage::Event(vibex_backend::BackendEvent::Timeline(
+                    vibex_core::TimelineLiveEvent {
+                        session_id: id.clone(),
+                        sequence,
+                        item,
+                    },
+                )),
+            )
+            .unwrap();
+            assert_eq!(
+                app.transcript.len(),
+                1,
+                "update {sequence} drew a second row for one tool call"
+            );
+        }
+
+        assert_eq!(app.transcript.blocks()[0].id, "tool:call-1");
+        let screen = conversation_frame(&mut app, 100, 30);
+        assert!(screen.contains("ls -la"), "{screen}");
+        assert!(
+            !screen.contains("arguments"),
+            "a half-parsed payload reached the screen: {screen}"
+        );
+    }
+
+    #[test]
     fn a_gap_starts_one_refetch_and_streaming_resumes_after_the_snapshot() {
         use vibex_core::{AgentMessageDeltaPayload, TimelinePayload};
         let worker = isolation_worker();

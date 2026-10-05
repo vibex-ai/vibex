@@ -1348,6 +1348,17 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   at most its first and last source item ids; `turn_item_count` and the inclusive
   sequence range retain the count and navigation semantics without one heap String
   per token.
+- One operation is one row in every row projection, not only inside a Turn. A
+  provider narrates a tool call, command, file operation, or search as a run of
+  items under one identity — the same call id with a growing payload — and
+  `timeline_rows` folds them: the newest item supplies title, body, and status,
+  the row keeps the place and first sequence it opened at, and `item_ids` stays
+  bounded to the first and last source item. Folding is scoped to one turn,
+  because an id is only unique inside the turn that issued it; a later turn that
+  reuses an id keeps its own row. Without this a streamed tool call draws one row
+  per chunk for every client that reads rows directly (the TUI builds its
+  transcript from `TimelineModel::rows()`), and the chunk count inflates the
+  collapsed-run `+N` summary.
 - Streaming row height estimates keep a compact text-metrics accumulator. After
   the first full scan, each accepted delta updates only the appended chunk;
   replacement/final snapshots clear the accumulator before measuring the new body.
@@ -1832,6 +1843,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   delta/final reconciliation, attribution/event fences, process compaction,
   sequence-gap refetch, collapsed search, follow-bottom/unread, 5,000 rows, and
   bounded streamed-row aggregation.
+- A run of tool-call updates under one call id projects to one row in both
+  projections: `timeline_rows` and the Turn's `process_rows` see the same count,
+  the row keeps the first sequence and both boundary item ids, and the newest
+  status settles it. The same call id in a later turn stays a second row.
+  `vibex-tui` streams the updates through `BackendEvent::Timeline` and asserts
+  one transcript block whose summary is the call, not a half-parsed payload.
 - Multiple permission requests in one turn resolve independently: after the
   first resolution, its row is non-pending while an unresolved sibling and the
   turn-level pending flag remain pending.

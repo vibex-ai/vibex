@@ -289,6 +289,13 @@ Rules that follow:
   and runtime folds into its first member (`MIN_GROUP_RUN`), which reports `+N`
   before its summary. Expanded and failed rows break the run. Opening the head
   reveals every member; keyboard navigation skips members while folded.
+* **A tool call reaches the transcript as one row.** An Agent narrates it as a
+  run of timeline items — the same call id with a growing payload — and the rows
+  are folded by the shared projection before the transcript sees them, so the
+  newest update replaces the row's text in place. The transcript must not draw
+  one block per update: that turns a single call into a column of half-parsed
+  JSON, inflates the `+N` run summary, and hands every duplicate the same block
+  id, which breaks selection and click targets keyed by it.
 * The current block is marked with a pointer in the margin plus a lifted header.
   Never a full-width reversed row: it is the heaviest emphasis a terminal has.
 * Focus is expressed as a fade toward the canvas (`TuiTheme::fade`), not as a

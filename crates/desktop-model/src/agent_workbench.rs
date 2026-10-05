@@ -650,7 +650,9 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                     }
                 }
             }
-            turn_rows = compact_conversation_process_rows(turn_rows, &turn.response_items);
+            // The rows arrive already folded by `timeline_rows_from_refs`: a
+            // run of updates for one operation is one row before any client
+            // sees it, so a turn only has to order what it is given.
             let process_activity_groups = timeline_process_activity_groups(&turn_rows);
             let process_activity_groups_with_commands =
                 timeline_process_activity_groups_with_commands(&turn_rows);
@@ -827,17 +829,27 @@ fn consistent_row_runtime_attribution(rows: &[TimelineRow]) -> Option<String> {
     attribution
 }
 
-fn compact_conversation_process_rows(
-    rows: Vec<TimelineRow>,
-    items: &[&TimelineItem],
-) -> Vec<TimelineRow> {
+/// Fold the repeated updates of one operation into the row it opened.
+///
+/// A provider narrates one operation as a run of items — a tool call streams
+/// its growing input, a terminal-backed command its output — and every update
+/// is its own timeline item. They are one operation, so they are one row: the
+/// newest update supplies the text, the row keeps the place and the first
+/// sequence it opened at, and every item it stands for stays addressable
+/// through `item_ids`. Without this a streamed tool call draws one row per
+/// chunk, which is a wall of half-parsed JSON rather than a call.
+///
+/// The turn is part of the key. Identity is only unique inside one turn, and a
+/// later turn may reuse an id (a provider that numbers its calls from one), so
+/// a row that belongs to a turn is only ever folded with its own.
+fn compact_process_rows(rows: Vec<TimelineRow>, items: &[&TimelineItem]) -> Vec<TimelineRow> {
     let items_by_id = items
         .iter()
         .copied()
         .map(|item| (item.id.to_string(), item))
         .collect::<BTreeMap<_, _>>();
     let mut compacted = Vec::<TimelineRow>::new();
-    let mut index_by_key = BTreeMap::<String, usize>::new();
+    let mut index_by_key = BTreeMap::<(Option<String>, String), usize>::new();
     for mut row in rows {
         let key = row.item_ids.iter().rev().find_map(|item_id| {
             items_by_id
@@ -848,8 +860,9 @@ fn compact_conversation_process_rows(
             compacted.push(row);
             continue;
         };
-        let Some(existing_index) = index_by_key.get(&key).copied() else {
-            index_by_key.insert(key, compacted.len());
+        let scoped_key = (row.turn_id.clone(), key);
+        let Some(existing_index) = index_by_key.get(&scoped_key).copied() else {
+            index_by_key.insert(scoped_key, compacted.len());
             compacted.push(row);
             continue;
         };
@@ -1447,7 +1460,9 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
         }
     }
     decorate_turn_metadata(&mut rows, items);
-    rows
+    // One operation is one row in every projection, so the folding happens
+    // here rather than only where a client asks for turns.
+    compact_process_rows(rows, items)
 }
 
 pub fn timeline_agent_message_count_after_sequence(
@@ -2024,6 +2039,113 @@ mod tests {
             timeline_agent_message_count_after_sequence(&items, Some(5)),
             1
         );
+    }
+
+    #[test]
+    fn streamed_tool_call_updates_fold_into_one_row() {
+        let mut items = vec![item(
+            1,
+            None,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Inspect".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        )];
+        // A provider narrates one tool call as a run of updates: the same call
+        // id, a growing payload, started -> progress -> completed.
+        for (sequence, input, status) in [
+            (2, r#"{"arguments":""}"#, ToolCallStatus::Started),
+            (3, r#"{"arguments":"{\"command"}"#, ToolCallStatus::Progress),
+            (4, r#"{"command":"ls -la"}"#, ToolCallStatus::Completed),
+        ] {
+            items.push(item(
+                sequence,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "execute".into(),
+                    status,
+                    summary: "ls -la".into(),
+                    input_summary: Some(input.into()),
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ));
+        }
+
+        let rows = timeline_rows(&items);
+        let tools = rows
+            .iter()
+            .filter(|row| row.kind == TimelineRowKind::ToolCall)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, "tool:call-1");
+        assert_eq!(tools[0].body, r#"{"command":"ls -la"}"#);
+        assert!(!tools[0].streaming);
+        assert_eq!(tools[0].first_sequence, 2);
+        assert_eq!(tools[0].last_sequence, 4);
+        assert_eq!(tools[0].item_ids, vec!["timeline_2", "timeline_4"]);
+
+        // The Turn projection reads the same folded row rather than folding the
+        // same items a second time into a different count.
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows[0].id, "tool:call-1");
+    }
+
+    #[test]
+    fn the_same_tool_call_id_in_two_turns_stays_two_rows() {
+        let turn = |sequence: i64, call: &str, text: &str| {
+            item(
+                sequence,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: call.into(),
+                    tool_name: "execute".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: text.into(),
+                    input_summary: Some(text.into()),
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            )
+        };
+        let items = vec![
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "First".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            turn(2, "call-1", "first"),
+            item(
+                3,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Second".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            turn(4, "call-1", "second"),
+        ];
+
+        let rows = timeline_rows(&items);
+        let tools = rows
+            .iter()
+            .filter(|row| row.kind == TimelineRowKind::ToolCall)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tools.len(), 2);
+        assert_ne!(tools[0].turn_id, tools[1].turn_id);
+        assert_eq!(tools[0].body, "first");
+        assert_eq!(tools[1].body, "second");
     }
 
     #[test]
