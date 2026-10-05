@@ -505,6 +505,38 @@ fn the_workspace_picker_opens_a_folder_and_takes_it() {
 }
 
 #[test]
+fn the_workspace_picker_takes_the_folder_under_the_cursor() {
+    // The key takes the row the reader pointed at rather than the directory the
+    // picker happens to be showing: with the cursor on `project`, `Space` makes
+    // that folder the workspace without walking into it, and the footer says so
+    // before the key is pressed.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir(root.path().join("project")).expect("a folder to point at");
+    let mut session = Session::start_at(Some(root.path()), 120, 40, &[]);
+    session.wait_for_first_frame();
+    session.send(b"\x17");
+    session.wait_for(|screen| screen.contains("project"));
+
+    // The cursor starts on `..`, where the footer promises the directory being
+    // shown; one Down moves it onto the folder and changes the promise.
+    session.send(b"\x1b[B");
+    let screen = session.wait_for(|screen| screen.contains("use selected"));
+    assert!(
+        !screen.contains("use this directory"),
+        "the footer still promised the directory being shown:\n{screen}"
+    );
+
+    // Space takes the folder, and the picker closes over the choice.
+    session.send(b" ");
+    let screen = session
+        .wait_for(|screen| !screen.contains("Parent directory") && screen.contains("project"));
+    assert!(
+        !screen.contains("Parent directory"),
+        "the picker stayed open:\n{screen}"
+    );
+}
+
+#[test]
 fn a_resize_storm_does_not_lose_the_frame() {
     let mut session = Session::start(120, 40);
     session.wait_for_first_frame();

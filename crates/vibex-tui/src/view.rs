@@ -5516,10 +5516,18 @@ fn render_overlay(
                 // rather than promising a choice the key no longer makes.
                 ModalHint::new("Enter", strings.hint_open()),
             ];
-            // The key that takes the directory being shown is named only once
-            // there is one to take.
+            // The key that takes a directory is named only once there is one
+            // to take, and it says which one it would take: the folder under
+            // the cursor, or — on the `..` row, where the cursor names a step
+            // rather than a folder — the directory the picker is showing.
             if !path.is_empty() {
-                hints.push(ModalHint::new("Space", strings.workspace_use_this()));
+                let label = match rows.get(*selected) {
+                    Some(crate::app::WorkspacePickerRow::Entry { .. }) => {
+                        strings.workspace_use_selected()
+                    }
+                    _ => strings.workspace_use_this(),
+                };
+                hints.push(ModalHint::new("Space", label));
             }
             // The way up is named only where there is somewhere to go: a footer
             // that offers a step the listing cannot take is the same lie as an

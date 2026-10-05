@@ -5855,8 +5855,9 @@ fn the_workspace_picker_draws_the_way_out_of_the_directory() {
         .expect("the listing is not drawn");
     assert!(up < entry, "the way up is below the listing:\n{screen}");
     // The footer says what the keys do: `Enter` opens the row under the
-    // cursor, `Space` takes the directory being shown, and the way up is
-    // named only while there is one.
+    // cursor, the way up is named only while there is one, and the key that
+    // takes a directory says *which* one it would take — the cursor starts on
+    // `..`, so that is the directory being shown.
     assert!(
         screen.contains(app.strings.hint_open()),
         "the footer does not say Enter opens a directory:\n{screen}"
@@ -5868,6 +5869,18 @@ fn the_workspace_picker_draws_the_way_out_of_the_directory() {
     assert!(
         screen.contains(app.strings.workspace_parent()),
         "the footer does not name the way up:\n{screen}"
+    );
+
+    // Moved onto the folder, the same key names that folder instead.
+    app.perform(Intent::SelectNext);
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(
+        screen.contains(app.strings.workspace_use_selected()),
+        "the footer does not say the key takes the highlighted folder:\n{screen}"
+    );
+    assert!(
+        !screen.contains(app.strings.workspace_use_this()),
+        "the footer still promises the directory being shown:\n{screen}"
     );
 
     // An empty directory still offers the step out of it.

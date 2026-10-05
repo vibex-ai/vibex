@@ -1086,12 +1086,26 @@ impl App {
         self.workspace_browse(parent)
     }
 
-    /// The directory the picker is showing, which is what "use this directory"
-    /// names: the path in the title, not whichever row the cursor is on.
+    /// The directory the picker is showing — the path in its title.
     fn workspace_picker_here(&self) -> Option<String> {
         self.workspace_browse
             .as_ref()
             .map(|listing| listing.path.clone())
+    }
+
+    /// The directory "use this directory" would take, given the drawn row the
+    /// cursor is on.
+    ///
+    /// A folder under the cursor is the answer: the reader pointed at it, and
+    /// the whole listing is a menu of folders. The `..` row is a step rather
+    /// than one of those folders — and an empty directory has nothing else to
+    /// offer — so there the answer is the directory being shown, which is what
+    /// makes the picker's own directory choosable at all.
+    fn workspace_picker_target(&self, row: usize) -> Option<String> {
+        match self.workspace_picker_rows().get(row) {
+            Some(WorkspacePickerRow::Entry { path, .. }) => Some(path.clone()),
+            _ => self.workspace_picker_here(),
+        }
     }
 
     /// Make `path` where the next session works, closing the picker over it.
@@ -1369,9 +1383,11 @@ impl App {
                         None => Outcome::quiet(),
                     }
                 }
-                // The directory named in the title becomes where the next
-                // session works, and the picker closes over the choice.
-                Intent::WorkspaceBrowseSelect => match self.workspace_picker_here() {
+                // The folder under the cursor becomes where the next session
+                // works, and the picker closes over the choice. On the `..` row
+                // there is no such folder, so the directory being shown is the
+                // answer rather than nothing.
+                Intent::WorkspaceBrowseSelect => match self.workspace_picker_target(selected) {
                     Some(path) => self.use_workspace_directory(path),
                     None => Outcome::quiet(),
                 },
@@ -4743,16 +4759,29 @@ mod tests {
             app.overlay
         );
 
-        // "Use this directory" is the choice: it takes the directory the picker
-        // is *showing* — `/home/peatboy/vibex-dev`, the title it walked from —
-        // rather than whichever row the cursor happens to sit on.
+        // "Use directory" is the choice, and it takes the folder the reader
+        // pointed at: the cursor is on `vibex`, so that is where the session
+        // works — not the directory the picker happens to be showing.
         app.overlay = Some(Overlay::WorkspacePicker { selected: 1 });
         app.perform(Intent::WorkspaceBrowseSelect);
         assert!(app.overlay.is_none(), "the choice left the picker open");
         assert_eq!(
             app.workspace_path.as_deref(),
+            Some("/home/peatboy/vibex-dev/vibex"),
+            "the highlighted folder was not taken"
+        );
+
+        // On the `..` row the cursor names a step rather than a folder, so the
+        // key falls back to the directory being shown — which is also all an
+        // empty listing has to offer.
+        app.overlay = Some(Overlay::WorkspacePicker { selected: 0 });
+        app.workspace_path = None;
+        app.perform(Intent::WorkspaceBrowseSelect);
+        assert!(app.overlay.is_none(), "the choice left the picker open");
+        assert_eq!(
+            app.workspace_path.as_deref(),
             Some("/home/peatboy/vibex-dev"),
-            "the wrong directory was taken"
+            "the directory being shown was not taken"
         );
     }
 
@@ -4793,8 +4822,8 @@ mod tests {
         );
 
         // And the first row is the first directory, not a step that is not
-        // there: entering it opens `/home`, and the directory being shown can
-        // still be taken as it is.
+        // there: entering it opens `/home`, and the key that takes a directory
+        // takes that same folder when the cursor has not moved.
         let before = app.workspace_path.clone();
         let opened = app.perform(Intent::ConfirmOverlay);
         assert!(
@@ -4806,7 +4835,11 @@ mod tests {
         );
         assert_eq!(app.workspace_path, before, "opening a directory chose one");
         app.perform(Intent::WorkspaceBrowseSelect);
-        assert_eq!(app.workspace_path.as_deref(), Some("/"));
+        assert_eq!(
+            app.workspace_path.as_deref(),
+            Some("/home"),
+            "the folder under the cursor was not taken at a root"
+        );
     }
 
     #[test]
