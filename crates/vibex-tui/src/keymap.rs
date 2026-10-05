@@ -541,7 +541,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Sessions,
-        Chord::ctrl('x'),
+        Chord::plain(KeyCode::Char('d')),
         Intent::DeleteSession,
         "Delete",
     ),
@@ -1918,6 +1918,27 @@ mod tests {
             }
         }
         assert!(keymap.warnings.is_empty(), "{:?}", keymap.warnings);
+    }
+
+    /// The row controls' two actions answer on the letters beside them, not on
+    /// a chord the reader has to be told: `r` renames and `d` deletes the row
+    /// the cursor is on.
+    #[test]
+    fn the_session_list_renames_on_r_and_deletes_on_d() {
+        let keymap = Keymap::built_in();
+        assert_eq!(
+            keymap.resolve(&[Scope::Sessions], Chord::plain(KeyCode::Char('r'))),
+            Some(Intent::BeginRenameSession)
+        );
+        assert_eq!(
+            keymap.resolve(&[Scope::Sessions], Chord::plain(KeyCode::Char('d'))),
+            Some(Intent::DeleteSession)
+        );
+        // And the key the band advertises is the key that answers.
+        assert_eq!(
+            keymap.chord_for_in(Scope::Sessions, Intent::DeleteSession),
+            Some(Chord::plain(KeyCode::Char('d')))
+        );
     }
 
     #[test]

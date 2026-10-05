@@ -630,7 +630,7 @@ is never a column count.
   that row before running the intent — an intent that resolves its session
   through `App::list_session_target()` would otherwise rename or delete the row
   the cursor happened to be on. The keyboard is still the primary path and the
-  same two actions: `r` and `Ctrl+X`, both in the binding table and the palette.
+  same two actions: `r` and `d`, both in the binding table and the palette.
   A control nobody can see is not published — a row the window has scrolled past
   and a pair a narrow terminal has pushed out of the band are dropped rather
   than left as rects a click could land on.

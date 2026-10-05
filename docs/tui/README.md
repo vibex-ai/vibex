@@ -440,8 +440,10 @@ Order and folders are the desktop's, because they are the desktop's to own: the
 list draws the arrangement the authority publishes — its folders (nested, with
 whatever is folded), the order of projects and sessions, the pinned band, and
 the unread marks the desktop has already cleared. `Enter` opens, `n` starts a
-new one, `r` renames, `f` forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A`
-includes archived sessions.
+new one, `r` renames, `f` forks, `a` archives, `d` deletes, and `Ctrl+A`
+includes archived sessions. The row the reader is on — the cursor's, or the one
+under the pointer — carries `✎` and `✕` at its right end, and a click on either
+runs the same action as the key.
 
 ### Auto-continue
 
