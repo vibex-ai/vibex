@@ -5828,6 +5828,10 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
     failed.state = vibex_core::AgentSessionState::Error;
     let mut app = app(110, 24);
     app.navigate_to(Page::Sessions);
+    // The location is the client's starting directory, which differs from one
+    // checkout to the next: name one so the header is the same on every machine
+    // and the hint's room does not depend on how deep the repository sits.
+    app.workspace_path = Some("/tmp/vibex-workspace".to_string());
     app.agent
         .apply_sessions(Ok(vec![waiting, working, failed]))
         .expect("sessions apply");
@@ -5848,7 +5852,7 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
     // The workspace is where the reader is, and the key that moves it sits
     // beside it.
     assert!(
-        header.contains("vibex-tui"),
+        header.contains("/tmp/vibex-workspace"),
         "the header does not say where the reader is: {header:?}"
     );
     assert!(
