@@ -1278,15 +1278,23 @@ struct SessionRowControl {
     intent: Intent,
 }
 
-/// How many columns a session row's two controls take when they are drawn: two
-/// of air, then a cell of icon and a cell of padding each.
+/// The air a session row keeps between its content and its two controls, and
+/// between the controls themselves.
 ///
-/// A control's target is its glyph *and* the column after it, so a pointer does
-/// not have to land on the character itself. The width is given back to the
-/// title on every row that is not being acted on.
-const SESSION_ROW_CONTROL_AIR: usize = 2;
-const SESSION_ROW_CONTROL_WIDTH: usize = 2;
-const SESSION_ROW_CONTROLS_WIDTH: usize = SESSION_ROW_CONTROL_AIR + SESSION_ROW_CONTROL_WIDTH * 2;
+/// A control's target is everything it draws, so a pointer does not have to
+/// land on the character itself, and the two targets never touch: the column
+/// between them belongs to neither. The glyph-and-hint width is the keymap's to
+/// say (`session_row_control_label`); these are the two gaps around it.
+const SESSION_ROW_CONTROL_AIR: usize = 1;
+const SESSION_ROW_CONTROL_GAP: usize = 1;
+
+/// How far one level of the tree moves a row's content off the left edge.
+///
+/// Headings and the sessions under them are indented by the same rule, so a
+/// folder's children hang under the folder and a project's rows under the
+/// project: without it a folder's sessions start to the left of their own
+/// heading and the nesting reads backwards.
+const SESSION_ROW_INDENT: usize = 2;
 
 /// The columns a session row spends before its title: the selection bar and the
 /// state mark, each with the column of air that keeps it off what follows.
@@ -1538,7 +1546,7 @@ fn session_heading_line(
     // is *for*, and the end of the row is where the eye lands after the rule
     // has carried it there.
     let count_style = Style::default().fg(theme.roles.gray);
-    let indent = usize::from(row.depth) * 2;
+    let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
     let count_label = if count > 0 {
         count.to_string()
     } else {
@@ -1649,24 +1657,46 @@ fn session_row_lines(
     } else {
         badge_width + 2
     };
-    // The age column ends one cell short of the edge, so the numbers are not
-    // glued to the frame.
-    let meta_width = if time_column > 0 { time_column + 2 } else { 0 };
+    // What the row draws at its right end when it is not being acted on: the
+    // age, right-aligned in the room the controls would take, so the two can
+    // trade places without the row's edge moving.
+    let time_block = time.filter(|_| time_column > 0).map(|time| {
+        format!(
+            " {}{time}",
+            " ".repeat(time_column.saturating_sub(display_width(time)))
+        )
+    });
+    let time_block_width = time_block.as_deref().map(display_width).unwrap_or(0);
     // The row's own controls are drawn only while the row is the reader's: the
-    // selected row, or the one the pointer is on. Their width comes off the
-    // title, which is the only thing that can pay for them.
+    // selected row, or the one the pointer is on. They take the age's place at
+    // the right edge, and the age is not drawn under them: two answers to
+    // "when" and "act on this" in one column would be one too many.
     let active = selected || hovered;
-    let control_block = if active {
-        SESSION_ROW_CONTROLS_WIDTH
-    } else {
-        0
-    };
+    let rename_icon = crate::glyphs::rename_icon(tier);
+    let delete_icon = crate::glyphs::delete_icon(tier);
+    // The right end of the row keeps room for whichever of the two is wider,
+    // *on every row* and not only on the row being acted on: a title that grew
+    // when the pointer landed on it would rewrite the list under the reader's
+    // hand, and the columns of the list would stop lining up.
+    let control_block = SESSION_ROW_CONTROL_AIR
+        + session_row_control_width(app, rename_icon, Intent::BeginRenameSession)
+        + SESSION_ROW_CONTROL_GAP
+        + session_row_control_width(app, delete_icon, Intent::DeleteSession);
+    let reserved = time_block_width.max(control_block);
+    let control_labels = active.then(|| {
+        (
+            session_row_control_label(app, rename_icon, Intent::BeginRenameSession),
+            session_row_control_label(app, delete_icon, Intent::DeleteSession),
+        )
+    });
+    let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
     let text_width = width
+        .saturating_sub(indent)
         .saturating_sub(SESSION_ROW_LEAD)
-        .saturating_sub(meta_width)
-        .saturating_sub(badge_block)
-        .saturating_sub(control_block);
+        .saturating_sub(reserved)
+        .saturating_sub(badge_block);
     let mut spans = vec![
+        Span::styled(" ".repeat(indent), blank_style),
         Span::styled(format!("{bar} "), bar_style),
         Span::styled(format!("{icon} "), icon_style),
     ];
@@ -1692,12 +1722,13 @@ fn session_row_lines(
         spans.push(Span::styled("  ", blank_style));
         spans.extend(badges);
     }
-    if active {
-        // The pair sits just inside the age column, so the age keeps the edge
-        // on every row whether a row is being acted on or not. Each control is
-        // its glyph plus the column after it: the target is the pair of cells,
-        // and the pointer resting on one lights that one alone.
-        let control_start = SESSION_ROW_LEAD + text_width + badge_block;
+    if let Some((rename, delete)) = control_labels {
+        // The pair ends at the edge the age would have ended at, so a row being
+        // acted on does not move its right end. Each control is one span, so the
+        // whole target lights when the pointer is on it rather than only the
+        // character under it, and the column between the two belongs to neither.
+        let control_start =
+            indent + SESSION_ROW_LEAD + text_width + badge_block + (reserved - control_block);
         let resting = || paint(theme.roles.gray_bright);
         let lit = |accent: ratatui::style::Color| {
             Style::default()
@@ -1715,39 +1746,43 @@ fn session_row_lines(
         } else {
             resting()
         };
-        // Each control is one span of glyph and padding, so the whole target
-        // lights when the pointer is on it rather than only the character.
+        // The pad is what right-aligns the pair in the room the age would have
+        // used; the air is the gap the pointer can rest in without choosing.
         spans.push(Span::styled(
-            " ".repeat(SESSION_ROW_CONTROL_AIR),
+            " ".repeat(reserved - control_block + SESSION_ROW_CONTROL_AIR),
             blank_style,
         ));
+        let rename_width = display_width(&rename);
+        spans.push(Span::styled(rename, rename_style));
         spans.push(Span::styled(
-            format!("{} ", crate::glyphs::rename_icon(tier)),
-            rename_style,
+            " ".repeat(SESSION_ROW_CONTROL_GAP),
+            blank_style,
         ));
-        spans.push(Span::styled(
-            format!("{} ", crate::glyphs::delete_icon(tier)),
-            delete_style,
-        ));
+        let delete_width = display_width(&delete);
+        spans.push(Span::styled(delete, delete_style));
         controls.push(SessionRowControl {
             line: 0,
             column: (control_start + SESSION_ROW_CONTROL_AIR) as u16,
-            width: SESSION_ROW_CONTROL_WIDTH as u16,
+            width: rename_width as u16,
             intent: Intent::BeginRenameSession,
         });
         controls.push(SessionRowControl {
             line: 0,
-            column: (control_start + SESSION_ROW_CONTROL_AIR + SESSION_ROW_CONTROL_WIDTH) as u16,
-            width: SESSION_ROW_CONTROL_WIDTH as u16,
+            column: (control_start
+                + SESSION_ROW_CONTROL_AIR
+                + rename_width
+                + SESSION_ROW_CONTROL_GAP) as u16,
+            width: delete_width as u16,
             intent: Intent::DeleteSession,
         });
-    }
-    if let Some(time) = time.filter(|_| time_column > 0) {
-        let padding = time_column.saturating_sub(display_width(time));
+    } else if let Some(time) = time_block {
+        // The age is right-aligned in the room the controls would have used, so
+        // it keeps the edge of the row whatever the row is doing.
         spans.push(Span::styled(
-            format!(" {}{time}", " ".repeat(padding)),
-            dim_style,
+            " ".repeat(reserved - time_block_width),
+            blank_style,
         ));
+        spans.push(Span::styled(time, dim_style));
     }
     let mut lines = vec![Line::from(spans)];
     // The second line is what the session last did, and nothing else: the
@@ -1765,19 +1800,54 @@ fn session_row_lines(
             None => (String::new(), false),
         };
         if !text.is_empty() {
-            let budget = width.saturating_sub(4);
+            let budget = width.saturating_sub(indent + 4);
             let style = if actionable {
                 paint(theme.roles.warning)
             } else {
                 dim_style
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{bar}   "), bar_style),
+                Span::styled(format!("{bar}{}", " ".repeat(indent + 3)), bar_style),
                 Span::styled(truncate_to_width(&text, budget, "…"), style),
             ]));
         }
     }
     lines
+}
+
+/// What a row's control says: the glyph that names the action, and the chord
+/// that runs it where the chord is a single cell of its own.
+///
+/// The hint is the terminal's answer to a tooltip — a pointer surface can say
+/// what a button does by hovering it, and a row of one-cell marks cannot — so
+/// the reader can learn the key from the row they are already acting on, in the
+/// same spelling the key bar and the help page use. A chord that would take
+/// more than one column (a modified key, a named key) is left out rather than
+/// allowed to widen the control: the row is a list of titles, not a key
+/// reference. A chord the glyph already spells is not repeated, which is what
+/// keeps the legacy tier's letter controls single-cell.
+fn session_row_control_label(app: &App, icon: &'static str, intent: Intent) -> String {
+    match session_row_control_hint(app, icon, intent) {
+        Some(hint) => format!("{icon} {hint}"),
+        None => icon.to_string(),
+    }
+}
+
+/// The same control's width, without building what it draws: the row measures
+/// its controls on every row, including the rows that do not draw them.
+fn session_row_control_width(app: &App, icon: &'static str, intent: Intent) -> usize {
+    display_width(icon)
+        + session_row_control_hint(app, icon, intent)
+            .map(|hint| 1 + display_width(&hint))
+            .unwrap_or(0)
+}
+
+/// The chord a control names, when naming it is worth the cells.
+fn session_row_control_hint(app: &App, icon: &str, intent: Intent) -> Option<String> {
+    app.keymap
+        .chord_for_in(Scope::Sessions, intent)
+        .map(|chord| chord.display())
+        .filter(|chord| display_width(chord) == 1 && !chord.eq_ignore_ascii_case(icon))
 }
 
 /// The marks a session row carries: pinned, unread, and whether the session is

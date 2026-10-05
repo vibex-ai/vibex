@@ -5831,13 +5831,23 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     };
     let selected = screen.lines().nth(row_of("fix the flaky test")).unwrap();
     assert!(
-        selected.contains('✎') && selected.contains('✕'),
+        selected.contains("╱ R") && selected.contains("✕ D"),
         "the row the cursor is on carries no controls: {selected:?}"
+    );
+    // The controls take the age's place: a row does not answer "when" and "act
+    // on this" in the same column.
+    assert!(
+        !selected.contains("now"),
+        "the age is still drawn under the controls: {selected:?}"
     );
     let other = screen.lines().nth(row_of("the other one")).unwrap();
     assert!(
-        !other.contains('✎') && !other.contains('✕'),
+        !other.contains('╱') && !other.contains('✕'),
         "a row nobody is on was given controls: {other:?}"
+    );
+    assert!(
+        other.contains("now"),
+        "a row nobody is on lost its age: {other:?}"
     );
 
     // The pair is a click target, and each half names the row it belongs to.
@@ -5867,11 +5877,18 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
         rename.rect.right() <= delete.rect.x && delete.rect.right() <= 100,
         "the pair does not fit the row: {rename:?} {delete:?}"
     );
-    // The age keeps the right edge on every row: the controls sit inside it
-    // rather than pushing it off.
-    assert!(
-        delete.rect.right() < 100,
-        "the controls have taken the column the age ends at: {delete:?}"
+    // The age keeps the right edge on the rows nobody is on, and the controls
+    // end where it does: a row being acted on does not move its right end.
+    let age_edge = |line: &str| {
+        let at = line
+            .find("now")
+            .unwrap_or_else(|| panic!("no age on the row: {line:?}"));
+        vibex_tui::text::display_width(&line[..at]) + 3
+    };
+    assert_eq!(
+        usize::from(delete.rect.right()),
+        age_edge(other),
+        "the controls do not end where the age does: {delete:?} {other:?}"
     );
 
     // The pointer's row answers the same way, without moving the cursor: the
@@ -5880,7 +5897,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     let screen = text(&render(&mut app, 100, 24));
     let hovered = screen.lines().nth(row_of("the other one")).unwrap();
     assert!(
-        hovered.contains('✎') && hovered.contains('✕'),
+        hovered.contains("╱ R") && hovered.contains("✕ D"),
         "the row under the pointer carries no controls: {hovered:?}"
     );
     assert!(
@@ -5928,6 +5945,60 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
         changed(control(&app, Intent::BeginRenameSession)),
         0,
         "the hover spilled onto the control beside it"
+    );
+}
+
+/// A control names the chord that runs it, in the spelling the key bar and the
+/// help page use. A single cell is worth a hint; a chord that would take more
+/// than one is left out rather than allowed to widen the row, because the row
+/// is a list of titles and not a key reference.
+#[test]
+fn a_session_rows_controls_spell_the_chord_that_runs_them() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::keymap::{Chord, Scope};
+    let now = vibex_core::unix_timestamp_ms();
+    let mut session = seeded_session("session_hint0001", "name the key");
+    session.last_message_at_ms = now;
+    let mut app = app(100, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![session]))
+        .expect("sessions apply");
+    app.set_selection(Scope::Sessions, 1);
+    fn row(app: &mut App) -> String {
+        let screen = text(&render(app, 100, 24));
+        screen
+            .lines()
+            .find(|line| line.contains("name the key"))
+            .expect("the session row")
+            .to_string()
+    }
+    let drawn = row(&mut app);
+    assert!(
+        drawn.contains("╱ R") && drawn.contains("✕ D"),
+        "the row does not name the chords that run its controls: {drawn:?}"
+    );
+
+    // A rebound key is spelled the way the key bar spells it, and the hint
+    // keeps naming the control it belongs to.
+    app.keymap
+        .rebind(Intent::BeginRenameSession, "q".parse::<Chord>().unwrap());
+    let drawn = row(&mut app);
+    assert!(
+        drawn.contains("╱ Q") && !drawn.contains("╱ R"),
+        "the hint did not follow the binding: {drawn:?}"
+    );
+
+    // A chord that cannot fit in one cell is dropped, not truncated: the
+    // control keeps its glyph and the row keeps its columns.
+    app.keymap.rebind(
+        Intent::BeginRenameSession,
+        "ctrl+x".parse::<Chord>().unwrap(),
+    );
+    let drawn = row(&mut app);
+    assert!(
+        drawn.contains('╱') && drawn.contains("✕ D") && !drawn.contains("Ctrl"),
+        "a chord too wide for the row was squeezed into it: {drawn:?}"
     );
 }
 
@@ -6105,7 +6176,7 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
     assert!(
         drawn.contains(&(
             vibex_tui::action::Intent::BeginRenameSession,
-            "e".to_string()
+            "r".to_string()
         )) && drawn.contains(&(vibex_tui::action::Intent::DeleteSession, "d".to_string())),
         "the controls do not degrade to the legacy tier: {drawn:?}"
     );
@@ -6223,6 +6294,23 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
         lines[kept].contains('★'),
         "the pinned row lost its marker: {:?}",
         lines[kept]
+    );
+
+    // The tree is drawn as a tree: a heading is the leftmost thing in its band,
+    // and everything the arrangement put inside it starts to its right — the
+    // folder a step in from the project, and the session that lives in the
+    // folder a step in from the folder. Without this a folder's children start
+    // left of their own heading, which is what makes the nesting unreadable.
+    let left_edge = |index: usize| {
+        let line = lines[index];
+        vibex_tui::text::display_width(&line[..line.len() - line.trim_start().len()])
+    };
+    let project = row_of("vibex-card-workspace");
+    assert!(
+        left_edge(recent) > left_edge(project)
+            && left_edge(archive) > left_edge(project)
+            && left_edge(row_of("put away")) > left_edge(archive),
+        "the arrangement's depth is not drawn:\n{screen}"
     );
 }
 

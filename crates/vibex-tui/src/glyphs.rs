@@ -185,13 +185,16 @@ pub fn state_marker(state: &str, tier: GlyphTier) -> &'static str {
 
 /// The control that renames the row it sits on. One column.
 ///
-/// A pencil is the shape every list uses for "edit this name", and the legacy
-/// tier gets the initial of the action rather than a box-drawing substitute: a
-/// console font has no pencil, and a mark it cannot draw is not a control.
+/// The mark is a single pen stroke rather than a drawn pencil: the pencil
+/// dingbat is missing from every console font and falls back to a serif
+/// typeface, where it renders as a busy picture at one cell. A box-drawing
+/// diagonal is in the same family as the heading rule, so a terminal that can
+/// draw the list can draw the control. At the legacy tier the letter is the
+/// action's own initial, which is also the chord that runs it.
 pub fn rename_icon(tier: GlyphTier) -> &'static str {
     match tier {
-        GlyphTier::Full => "✎",
-        GlyphTier::Legacy => "e",
+        GlyphTier::Full => "╱",
+        GlyphTier::Legacy => "r",
     }
 }
 

@@ -624,14 +624,21 @@ is never a column count.
   the title a third of the row and said nothing the mark did not.
 * **A row's own controls act on their row, not on the cursor.** Rename and
   delete are drawn at the right end of a session row while the reader is on it —
-  the selected row, or the row under the pointer — just inside the age column,
-  so the age keeps the edge and its column on every row whether one is being
-  acted on or not. Every other row gives those six columns back to its title,
-  which is what keeps the list from becoming a field of buttons. The pair is one
-  column each plus a column of padding (`✎`/`✕`, `e`/`d` at the legacy tier,
-  from `glyphs::rename_icon`/`delete_icon`), and the pointer resting on one
-  lights that one alone — the delete in `danger`, the rename in the accent — for
-  the width of its target, glyph and padding together. Each is
+  the selected row, or the row under the pointer — *in the age's place*, flush
+  with the edge the age ends at, and the age is not drawn under them: one column
+  cannot answer "when" and "act on this" at once, and the desktop's own row
+  hides the age behind the same pair. Every other row gives those columns back
+  to its title, which is what keeps the list from becoming a field of buttons.
+  Each control is its glyph, a space and the single-cell chord that runs it in
+  the spelling the key bar and help page use (`╱ R`/`✕ D`, from
+  `glyphs::rename_icon`/`delete_icon` plus `Keymap::chord_for_in`); the legacy
+  tier's letters are the actions' initials, which are also their chords, so the
+  hint is not repeated and the control stays one cell. A chord too wide for one
+  cell — a modified key, a named key — drops the hint rather than widening the
+  row. The row reserves whichever of the age and the controls is wider *before*
+  the reader arrives, so a title does not reflow when the pointer lands on it,
+  and the pointer resting on a control lights that one alone — the delete in
+  `danger`, the rename in the accent — for the width of its whole target. Each is
   published as a `RowActionRegion` carrying its rect *and the row it belongs
   to*: the pointer is what chose the target, so the click moves the cursor to
   that row before running the intent — an intent that resolves its session
@@ -641,6 +648,14 @@ is never a column count.
   A control nobody can see is not published — a row the window has scrolled past
   and a pair a narrow terminal has pushed out of the band are dropped rather
   than left as rects a click could land on.
+* **Depth is drawn, for headings and for the sessions under them.** A heading
+  indents two cells per level, and so does a session row: a project heading is
+  the leftmost thing in its band, its folders and sessions start a step in, and
+  a folder's own sessions a step in from the folder. A session row that ignored
+  its depth would start left of the folder that holds it, which is what makes an
+  arrangement's tree unreadable — the rows would look like one flat list with
+  headings scattered through it. The indent is part of the title's budget (and
+  of the published control columns), not padding painted over the row.
 * **The list is a window over lines, not a selection over rows.** A workspace can
   hold hundreds of sessions and a row can carry a detail card, so the page lays
   every row out, measures them in lines, and draws the window it is scrolled to

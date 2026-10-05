@@ -441,9 +441,14 @@ list draws the arrangement the authority publishes — its folders (nested, with
 whatever is folded), the order of projects and sessions, the pinned band, and
 the unread marks the desktop has already cleared. `Enter` opens, `n` starts a
 new one, `r` renames, `f` forks, `a` archives, `d` deletes, and `Ctrl+A`
-includes archived sessions. The row the reader is on — the cursor's, or the one
-under the pointer — carries `✎` and `✕` at its right end, and a click on either
-runs the same action as the key.
+includes archived sessions. Nesting is drawn rather than implied: a project is
+the leftmost thing in its band, its folders and sessions start a step in, and a
+folder's own sessions a step in from the folder. The row the reader is on — the
+cursor's, or the one under the pointer — carries its two controls where the age
+is: `╱ R` renames and `✕ D` deletes, the letter being the chord the key bar and
+the `?` help name. The age is not drawn under them — one column does not answer
+"when" and "act on this" at once — and it comes back when the reader moves on.
+A click on either control runs the same action as the key.
 
 ### Auto-continue
 
