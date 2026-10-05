@@ -474,8 +474,7 @@ mod tests {
         let close = close_rect(dimensions(area, ModalSizing::picker()));
         terminal
             .draw(|frame| {
-                let chrome =
-                    ModalChrome::new("Test", ModalSizing::picker()).close_hovered(hovered);
+                let chrome = ModalChrome::new("Test", ModalSizing::picker()).close_hovered(hovered);
                 render_modal(frame, frame.area(), &chrome, &theme);
             })
             .expect("frame draws");
