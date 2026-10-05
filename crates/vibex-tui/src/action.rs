@@ -93,7 +93,7 @@ intents! {
     SwitchWorkspace => { scope: Sessions, id: "workspace_switch", label: "Workspace", help: "Change the workspace used for new sessions." },
     OpenWorkspaceBrowser => { scope: Sessions, id: "workspace_browse", label: "Browse", help: "List directories on the authority host." },
     WorkspaceBrowseUp => { scope: Sessions, id: "workspace_up", label: "Parent", help: "Go to the parent directory." },
-    WorkspaceBrowseSelect => { scope: Sessions, id: "workspace_select", label: "Use directory", help: "Choose the highlighted directory." },
+    WorkspaceBrowseSelect => { scope: Sessions, id: "workspace_select", label: "Use directory", help: "Work in the directory the picker is showing." },
 
     // ---- agent transcript -----------------------------------------------
     FocusComposer => { scope: Agent, id: "composer_focus", label: "Write", help: "Put the cursor in the message composer." },

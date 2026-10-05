@@ -105,6 +105,7 @@ strings! {
     // modal footer is a key legend, not a sentence.
     hint_nav => { "nav", "移动", "移動" },
     hint_select => { "select", "选择", "選擇" },
+    hint_open => { "open", "进入", "進入" },
     hint_scroll => { "scroll", "滚动", "捲動" },
     hint_run => { "run", "执行", "執行" },
     hint_expand => { "expand", "展开", "展開" },

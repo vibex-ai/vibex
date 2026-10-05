@@ -513,15 +513,12 @@ impl App {
             }
             Intent::WorkspaceBrowseUp => self.workspace_browse_parent(),
             Intent::WorkspaceBrowseSelect => {
-                let row = self.selection_for(Scope::Sessions);
-                match self.workspace_picker_rows().get(row).cloned() {
-                    Some(WorkspacePickerRow::Entry { path, .. }) => {
-                        self.use_workspace_directory(path)
-                    }
-                    // The way up is a step, not a choice: `Enter` in the
-                    // picker climbs with it, and "use this directory" keeps
-                    // naming a directory the reader can actually work in.
-                    _ => Outcome::quiet(),
+                // The same gesture the picker answers to: "use this directory"
+                // names the one the listing is in, not whichever row a cursor
+                // somewhere else happens to be on.
+                match self.workspace_picker_here() {
+                    Some(path) => self.use_workspace_directory(path),
+                    None => Outcome::quiet(),
                 }
             }
 
@@ -1056,13 +1053,24 @@ impl App {
 
     // ---- overlay dispatch -----------------------------------------------
 
-    /// Ask for the directory above the one being listed, if there is one.
+    /// Ask for a listing of `path`, staying inside the picker.
     ///
-    /// Climbing out of a directory is part of browsing it, so this answers with
-    /// the listing to fetch and leaves the picker open on the parent. It is the
-    /// effect rather than a `perform` of the intent because the picker's own
-    /// handler calls it: re-entering the overlay with the same intent is how
-    /// the way up used to recurse until the stack ran out.
+    /// Walking the tree is part of browsing it, so this answers with the
+    /// listing to fetch rather than closing anything. It is the effect rather
+    /// than a `perform` of an intent because the picker's own handler calls it:
+    /// re-entering the overlay is how the way up used to recurse until the
+    /// stack ran out.
+    fn workspace_browse(&mut self, path: String) -> Outcome {
+        // The cursor goes back to the top with the listing it was on: a row
+        // index into the directory being left would name a different directory
+        // in the new one, or none at all.
+        if let Some(Overlay::WorkspacePicker { selected }) = self.overlay.as_mut() {
+            *selected = 0;
+        }
+        Outcome::effects(vec![Effect::BrowseDirectories { path: Some(path) }])
+    }
+
+    /// Ask for the directory above the one being listed, if there is one.
     fn workspace_browse_parent(&mut self) -> Outcome {
         let parent = self
             .workspace_browse
@@ -1075,17 +1083,18 @@ impl App {
             self.toast(Toast::warning(self.strings.workspace_at_root().to_string()));
             return Outcome::quiet();
         };
-        // The cursor goes back to the top with the listing it was on: a row
-        // index into the directory being left would name a different directory
-        // in the parent, or none at all.
-        if let Some(Overlay::WorkspacePicker { selected }) = self.overlay.as_mut() {
-            *selected = 0;
-        }
-        Outcome::effects(vec![Effect::BrowseDirectories { path: Some(parent) }])
+        self.workspace_browse(parent)
     }
 
-    /// Take a drawn row of the picker: a listing row becomes where the next
-    /// session works, and the way up is handled by the caller that offers it.
+    /// The directory the picker is showing, which is what "use this directory"
+    /// names: the path in the title, not whichever row the cursor is on.
+    fn workspace_picker_here(&self) -> Option<String> {
+        self.workspace_browse
+            .as_ref()
+            .map(|listing| listing.path.clone())
+    }
+
+    /// Make `path` where the next session works, closing the picker over it.
     fn use_workspace_directory(&mut self, path: String) -> Outcome {
         let composing = self.page == Page::NewSession;
         self.workspace_path = Some(path);
@@ -1347,21 +1356,25 @@ impl App {
                 _ => Outcome::quiet(),
             },
             Overlay::WorkspacePicker { selected } => match intent {
-                // Enter takes the highlighted row. The `..` row is the way out
-                // of the directory and keeps the picker open; a directory is
-                // the answer the picker was opened for, so it closes over it —
-                // one gesture, one meaning, exactly as choosing it from the
-                // session list does.
+                // Enter *opens* the highlighted row rather than choosing it:
+                // the reader walks the tree the way a file manager does, and
+                // the `..` row is the way back up. Choosing the directory the
+                // picker is in is its own gesture (`Space`), exactly as the
+                // desktop's picker opens a row and confirms the folder it is
+                // showing.
                 Intent::ConfirmOverlay | Intent::ApprovalApprove => {
                     match self.workspace_picker_rows().get(selected).cloned() {
                         Some(WorkspacePickerRow::Parent { .. }) => self.workspace_browse_parent(),
-                        Some(WorkspacePickerRow::Entry { path, .. }) => {
-                            self.set_selection(Scope::Sessions, selected);
-                            self.use_workspace_directory(path)
-                        }
+                        Some(WorkspacePickerRow::Entry { path, .. }) => self.workspace_browse(path),
                         None => Outcome::quiet(),
                     }
                 }
+                // The directory named in the title becomes where the next
+                // session works, and the picker closes over the choice.
+                Intent::WorkspaceBrowseSelect => match self.workspace_picker_here() {
+                    Some(path) => self.use_workspace_directory(path),
+                    None => Outcome::quiet(),
+                },
                 Intent::SelectNext => {
                     // Every drawn row is walked, `..` included: a reader who
                     // only ever presses Down has to be able to reach it.
@@ -4712,15 +4725,34 @@ mod tests {
             "the key did not ask for the parent directory: {keyed:?}"
         );
 
-        // A directory is still the answer the picker exists for: selecting the
-        // entry behind the `..` row chooses it rather than the row above it.
+        // A directory is a door, not an answer: `Enter` on the entry behind
+        // the `..` row walks into it and leaves the picker open on it.
         app.overlay = Some(Overlay::WorkspacePicker { selected: 1 });
-        app.perform(Intent::ConfirmOverlay);
+        let opened = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            opened.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::BrowseDirectories { path: Some(path) }
+                    if path == "/home/peatboy/vibex-dev/vibex"
+            )),
+            "the highlighted directory was not opened: {opened:?}"
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::WorkspacePicker { .. })),
+            "opening a directory closed the picker: {:?}",
+            app.overlay
+        );
+
+        // "Use this directory" is the choice: it takes the directory the picker
+        // is *showing* — `/home/peatboy/vibex-dev`, the title it walked from —
+        // rather than whichever row the cursor happens to sit on.
+        app.overlay = Some(Overlay::WorkspacePicker { selected: 1 });
+        app.perform(Intent::WorkspaceBrowseSelect);
         assert!(app.overlay.is_none(), "the choice left the picker open");
         assert_eq!(
             app.workspace_path.as_deref(),
-            Some("/home/peatboy/vibex-dev/vibex"),
-            "the wrong row was chosen"
+            Some("/home/peatboy/vibex-dev"),
+            "the wrong directory was taken"
         );
     }
 
@@ -4761,9 +4793,20 @@ mod tests {
         );
 
         // And the first row is the first directory, not a step that is not
-        // there: entering it chooses `/home`.
-        app.perform(Intent::ConfirmOverlay);
-        assert_eq!(app.workspace_path.as_deref(), Some("/home"));
+        // there: entering it opens `/home`, and the directory being shown can
+        // still be taken as it is.
+        let before = app.workspace_path.clone();
+        let opened = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            opened.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::BrowseDirectories { path: Some(path) } if path == "/home"
+            )),
+            "the highlighted directory was not opened: {opened:?}"
+        );
+        assert_eq!(app.workspace_path, before, "opening a directory chose one");
+        app.perform(Intent::WorkspaceBrowseSelect);
+        assert_eq!(app.workspace_path.as_deref(), Some("/"));
     }
 
     #[test]

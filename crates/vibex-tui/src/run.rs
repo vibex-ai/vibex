@@ -686,16 +686,27 @@ fn handle_key(
                 return Ok(false);
             }
         }
-        // The directory picker climbs out of the directory with the arrow a
-        // reader reaches for, the same step `u` and the `..` row take. The
-        // overlay's own `←` binding folds a tree, which this picker has none
-        // of, so the key is free here and only here.
-        if let Some(Overlay::WorkspacePicker { .. }) = app.overlay
-            && key.code == KeyCode::Left
-        {
-            let outcome = app.perform(crate::action::Intent::WorkspaceBrowseUp);
-            dispatch_all(worker, &outcome);
-            return Ok(false);
+        // The directory picker is a place a reader walks: `←` climbs out of the
+        // directory and `→` opens the highlighted row, the two arrows every
+        // file manager answers to. `Space` takes the directory the picker is
+        // showing — the workspace list's own "use this directory" key — which
+        // the overlay table cannot carry because the shared overlay `Space`
+        // toggles a value in the elicitation form. All three are answered
+        // before the binding table, and only while this picker is the overlay.
+        if let Some(Overlay::WorkspacePicker { .. }) = app.overlay {
+            let intent = match key.code {
+                KeyCode::Left => Some(crate::action::Intent::WorkspaceBrowseUp),
+                KeyCode::Right => Some(crate::action::Intent::ConfirmOverlay),
+                KeyCode::Char(' ') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(crate::action::Intent::WorkspaceBrowseSelect)
+                }
+                _ => None,
+            };
+            if let Some(intent) = intent {
+                let outcome = app.perform(intent);
+                dispatch_all(worker, &outcome);
+                return Ok(false);
+            }
         }
     } else if composer_takes_keys(app)
         && let Some(exit) = handle_composer_key(app, worker, key)?

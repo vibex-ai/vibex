@@ -469,6 +469,42 @@ fn the_workspace_picker_walks_out_of_the_directory_it_opened_on() {
 }
 
 #[test]
+fn the_workspace_picker_opens_a_folder_and_takes_it() {
+    // `Enter` opens the highlighted directory — the picker walks the tree the
+    // way a file manager does — and `Space` takes the directory the picker is
+    // showing, which is what the page then works in. Both keys are answered
+    // before the binding table, so this is also the end-to-end proof that the
+    // arrows and the space bar reach the picker at all.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(root.path().join("project").join("nested")).expect("a tree to walk");
+    let mut session = Session::start_at(Some(root.path()), 120, 40, &[]);
+    session.wait_for_first_frame();
+    session.send(b"\x17");
+    session.wait_for(|screen| screen.contains("project"));
+
+    // The cursor starts on the `..` row; Down walks it onto the only directory
+    // and Enter opens that directory rather than choosing it.
+    session.send(b"\x1b[B");
+    session.send(b"\r");
+    session.wait_for(|screen| screen.contains("nested"));
+
+    // Down again onto the nested directory, Enter opens it: the picker is now
+    // showing a directory with nothing in it but the way back up.
+    session.send(b"\x1b[B");
+    session.send(b"\r");
+    session.wait_for(|screen| screen.contains("Parent directory"));
+
+    // `Space` takes the directory being shown, and the page names it.
+    session.send(b" ");
+    let screen = session
+        .wait_for(|screen| !screen.contains("Parent directory") && screen.contains("nested"));
+    assert!(
+        !screen.contains("Parent directory"),
+        "the picker stayed open:\n{screen}"
+    );
+}
+
+#[test]
 fn a_resize_storm_does_not_lose_the_frame() {
     let mut session = Session::start(120, 40);
     session.wait_for_first_frame();

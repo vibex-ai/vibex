@@ -4788,14 +4788,40 @@ fn the_composing_page_can_choose_the_directory_it_works_in() {
     );
     assert!(screen.contains("notes"), "{screen}");
 
+    // `Enter` opens the highlighted directory; the listing that comes back is
+    // the one the runtime sends, and the reader is standing in it.
     app.perform(Intent::SelectNext);
     app.perform(Intent::SelectNext);
-    app.perform(Intent::ConfirmOverlay);
+    let opened = app.perform(Intent::ConfirmOverlay);
+    assert!(
+        opened.effects.iter().any(|effect| matches!(
+            effect,
+            vibex_tui::Effect::BrowseDirectories { path: Some(path) }
+                if path == "/home/peatboy/notes"
+        )),
+        "the highlighted directory was not opened: {opened:?}"
+    );
+    assert!(
+        matches!(
+            app.overlay,
+            Some(vibex_tui::app::Overlay::WorkspacePicker { .. })
+        ),
+        "opening a directory closed the picker"
+    );
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy/notes".to_string(),
+        parent: Some("/home/peatboy".to_string()),
+        entries: vec![],
+    });
+
+    // `Space` takes the directory the picker is showing.
+    app.perform(Intent::WorkspaceBrowseSelect);
     assert!(app.overlay.is_none(), "the picker stayed open");
     assert_eq!(
         app.workspace_path.as_deref(),
         Some("/home/peatboy/notes"),
-        "the highlighted directory was not chosen"
+        "the directory being shown was not taken"
     );
     assert_eq!(app.page, vibex_tui::app::Page::NewSession);
     assert_eq!(app.composer.text(), "keep me", "the draft was lost");
@@ -5746,11 +5772,35 @@ fn the_workspace_key_on_the_new_session_page_picks_a_directory() {
         "the listing is not drawn:\n{screen}"
     );
 
-    // Enter chooses it, and the page names the directory it will use. The
+    // Enter opens it — the reader walks into the directory rather than
+    // choosing it — and `Space` then takes the directory the picker shows. The
     // cursor starts on the `..` row the listing carries, so the directory is
     // one step below it.
     app.perform(Intent::SelectNext);
-    app.perform(Intent::ConfirmOverlay);
+    let opened = app.perform(Intent::ConfirmOverlay);
+    assert!(
+        opened.effects.iter().any(|effect| matches!(
+            effect,
+            vibex_tui::Effect::BrowseDirectories { path: Some(path) }
+                if path == "/home/peatboy/vibex-dev"
+        )),
+        "Enter did not open the directory: {opened:?}"
+    );
+    assert!(
+        matches!(
+            app.overlay,
+            Some(vibex_tui::app::Overlay::WorkspacePicker { .. })
+        ),
+        "opening a directory closed the picker"
+    );
+    // The runtime answers with the listing of the directory that was opened.
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy/vibex-dev".to_string(),
+        parent: Some("/home/peatboy".to_string()),
+        entries: vec![],
+    });
+    app.perform(Intent::WorkspaceBrowseSelect);
     assert!(app.overlay.is_none());
     assert_eq!(
         app.new_session_workspace(),
@@ -5804,6 +5854,17 @@ fn the_workspace_picker_draws_the_way_out_of_the_directory() {
         .position(|line| line.contains("vibex-dev"))
         .expect("the listing is not drawn");
     assert!(up < entry, "the way up is below the listing:\n{screen}");
+    // The footer says what the keys do: `Enter` opens the row under the
+    // cursor, `Space` takes the directory being shown, and the way up is
+    // named only while there is one.
+    assert!(
+        screen.contains(app.strings.hint_open()),
+        "the footer does not say Enter opens a directory:\n{screen}"
+    );
+    assert!(
+        screen.contains(app.strings.workspace_use_this()),
+        "the footer does not name the key that takes this directory:\n{screen}"
+    );
     assert!(
         screen.contains(app.strings.workspace_parent()),
         "the footer does not name the way up:\n{screen}"
@@ -5868,10 +5929,32 @@ fn the_workspace_key_from_the_session_list_does_not_move_the_reader() {
             path: "/home/peatboy/notes".to_string(),
         }],
     });
-    // The `..` row is above the single directory, so the cursor has to step
-    // past it to reach one.
+    // Enter opens the highlighted directory, and the reader stays on the list
+    // they opened the picker from while they walk.
     app.perform(Intent::SelectNext);
-    app.perform(Intent::ConfirmOverlay);
+    let opened = app.perform(Intent::ConfirmOverlay);
+    assert!(
+        opened.effects.iter().any(|effect| matches!(
+            effect,
+            vibex_tui::Effect::BrowseDirectories { path: Some(path) }
+                if path == "/home/peatboy/notes"
+        )),
+        "Enter did not open the directory: {opened:?}"
+    );
+    assert_eq!(
+        app.page,
+        Page::Sessions,
+        "the reader was moved off the list"
+    );
+    // The runtime answers with the listing of the directory that was opened;
+    // `Space` takes it without moving the reader into a new session.
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy/notes".to_string(),
+        parent: Some("/home/peatboy".to_string()),
+        entries: vec![],
+    });
+    app.perform(Intent::WorkspaceBrowseSelect);
     assert_eq!(
         app.page,
         Page::Sessions,

@@ -5510,17 +5510,26 @@ fn render_overlay(
                 compact_path(&path, 40)
             );
             let rows = app.workspace_picker_rows();
-            let mut hints = vec![ModalHint::new("↑↓", strings.hint_nav())];
-            // The key is named only where there is somewhere to go: a footer
+            let mut hints = vec![
+                ModalHint::new("↑↓", strings.hint_nav()),
+                // Enter opens the row under the cursor, so the footer says so
+                // rather than promising a choice the key no longer makes.
+                ModalHint::new("Enter", strings.hint_open()),
+            ];
+            // The key that takes the directory being shown is named only once
+            // there is one to take.
+            if !path.is_empty() {
+                hints.push(ModalHint::new("Space", strings.workspace_use_this()));
+            }
+            // The way up is named only where there is somewhere to go: a footer
             // that offers a step the listing cannot take is the same lie as an
             // empty directory with no way out of it.
             if rows
                 .iter()
                 .any(|row| matches!(row, crate::app::WorkspacePickerRow::Parent { .. }))
             {
-                hints.push(ModalHint::new("u", strings.workspace_parent()));
+                hints.push(ModalHint::new("←", strings.workspace_parent()));
             }
-            hints.push(ModalHint::new("Enter", strings.hint_select()));
             hints.push(ModalHint::new("Esc", strings.close()));
             let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
             let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
