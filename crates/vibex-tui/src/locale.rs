@@ -596,6 +596,7 @@ strings! {
     workspace_browse => { "Browse", "浏览", "瀏覽" },
     workspace_parent => { "Parent directory", "上级目录", "上層目錄" },
     workspace_use_this => { "Use this directory", "使用此目录", "使用此目錄" },
+    workspace_at_root => { "Already at the top", "已是最上层目录", "已是最上層目錄" },
     workspace_empty => { "No workspaces", "没有工作区", "沒有工作區" },
 
     // ---- management -----------------------------------------------------

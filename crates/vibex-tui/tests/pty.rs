@@ -434,6 +434,41 @@ fn the_workspace_key_opens_the_picker_on_the_new_session_page() {
 }
 
 #[test]
+fn the_workspace_picker_walks_out_of_the_directory_it_opened_on() {
+    // The picker opens on the directory the page names, so a reader choosing a
+    // workspace somewhere else on the machine has to be able to walk out of it.
+    // The listing draws the way up as its own `..` row, `u` is the key the
+    // footer names, and `←` is the arrow a reader reaches for; all three ask
+    // for the parent listing. The key did not: it re-entered the picker's own
+    // handler until the stack ran out, which is a crash no state test can see.
+    let parent = tempfile::tempdir().expect("a temporary directory");
+    let project = parent.path().join("project");
+    let notes = parent.path().join("notes");
+    std::fs::create_dir(&project).expect("a directory to open on");
+    std::fs::create_dir(&notes).expect("a sibling to walk to");
+    let mut session = Session::start_at(Some(&project), 120, 40, &[]);
+    session.wait_for_first_frame();
+    session.send(b"\x17");
+    let screen = session.wait_for(|screen| screen.contains(".."));
+    assert!(
+        !screen.contains("notes"),
+        "the picker opened above the directory it was told to open on:\n{screen}"
+    );
+
+    // `←` climbs: the parent is where the sibling shows up.
+    session.send(b"\x1b[D");
+    session.wait_for(|screen| screen.contains("notes"));
+
+    // `u` climbs on from there, and the way up is still drawn.
+    session.send(b"u");
+    let screen = session.wait_for(|screen| !screen.contains("notes"));
+    assert!(
+        screen.contains(".."),
+        "the way out of the directory was lost:\n{screen}"
+    );
+}
+
+#[test]
 fn a_resize_storm_does_not_lose_the_frame() {
     let mut session = Session::start(120, 40);
     session.wait_for_first_frame();

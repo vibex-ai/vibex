@@ -4649,6 +4649,7 @@ fn the_composing_page_can_choose_the_directory_it_works_in() {
     assert!(screen.contains("notes"), "{screen}");
 
     app.perform(Intent::SelectNext);
+    app.perform(Intent::SelectNext);
     app.perform(Intent::ConfirmOverlay);
     assert!(app.overlay.is_none(), "the picker stayed open");
     assert_eq!(
@@ -5605,7 +5606,10 @@ fn the_workspace_key_on_the_new_session_page_picks_a_directory() {
         "the listing is not drawn:\n{screen}"
     );
 
-    // Enter chooses it, and the page names the directory it will use.
+    // Enter chooses it, and the page names the directory it will use. The
+    // cursor starts on the `..` row the listing carries, so the directory is
+    // one step below it.
+    app.perform(Intent::SelectNext);
     app.perform(Intent::ConfirmOverlay);
     assert!(app.overlay.is_none());
     assert_eq!(
@@ -5630,6 +5634,82 @@ fn the_workspace_key_on_the_new_session_page_picks_a_directory() {
 }
 
 #[test]
+fn the_workspace_picker_draws_the_way_out_of_the_directory() {
+    // The picker opens on one directory, so a reader choosing a workspace
+    // somewhere else on the machine has to be able to see how to leave it: the
+    // parent is drawn as the `..` row above the listing, and the footer names
+    // the key that takes the same step. A directory with nothing in it is not a
+    // dead end either — the way up is still drawn above it.
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::SwitchWorkspace);
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy".to_string(),
+        parent: Some("/home".to_string()),
+        entries: vec![vibex_core::RemoteWorkspaceDirectoryEntry {
+            name: "vibex-dev".to_string(),
+            path: "/home/peatboy/vibex-dev".to_string(),
+        }],
+    });
+    let lines = render(&mut app, 110, 30);
+    let screen = text(&lines);
+    let up = lines
+        .iter()
+        .position(|line| line.contains(".."))
+        .expect("the way up is not drawn");
+    let entry = lines
+        .iter()
+        .position(|line| line.contains("vibex-dev"))
+        .expect("the listing is not drawn");
+    assert!(up < entry, "the way up is below the listing:\n{screen}");
+    assert!(
+        screen.contains(app.strings.workspace_parent()),
+        "the footer does not name the way up:\n{screen}"
+    );
+
+    // An empty directory still offers the step out of it.
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home/peatboy/empty".to_string(),
+        parent: Some("/home/peatboy".to_string()),
+        entries: vec![],
+    });
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(
+        screen.contains(".."),
+        "an empty directory has no way out:\n{screen}"
+    );
+    assert!(
+        !screen.contains(app.strings.workspace_empty()),
+        "an empty directory was called empty where the way out belongs:\n{screen}"
+    );
+
+    // At the top there is no way up, so nothing offers one — not a row, not a
+    // key in the footer.
+    app.workspace_browse = Some(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: vec!["/home".to_string()],
+        path: "/home".to_string(),
+        parent: None,
+        entries: vec![],
+    });
+    let screen = text(&render(&mut app, 110, 30));
+    assert!(
+        !screen.contains(".."),
+        "a row promises a step that does not exist:\n{screen}"
+    );
+    assert!(
+        !screen.contains(app.strings.workspace_parent()),
+        "the footer names a step that does not exist:\n{screen}"
+    );
+    assert!(
+        screen.contains(app.strings.workspace_empty()),
+        "an empty root says nothing:\n{screen}"
+    );
+}
+
+#[test]
 fn the_workspace_key_from_the_session_list_does_not_move_the_reader() {
     // The same key is global. Wherever it is pressed, the picker answers that
     // page — a reader choosing a directory from the list is not asking to be
@@ -5648,6 +5728,9 @@ fn the_workspace_key_from_the_session_list_does_not_move_the_reader() {
             path: "/home/peatboy/notes".to_string(),
         }],
     });
+    // The `..` row is above the single directory, so the cursor has to step
+    // past it to reach one.
+    app.perform(Intent::SelectNext);
     app.perform(Intent::ConfirmOverlay);
     assert_eq!(
         app.page,

@@ -5502,8 +5502,8 @@ fn render_overlay(
             frame.render_stateful_widget(List::new(items), content, &mut state);
         }
         Overlay::WorkspacePicker { selected } => {
-            let listing = app.workspace_browse.clone();
-            let path = listing
+            let path = app
+                .workspace_browse
                 .as_ref()
                 .map(|listing| listing.path.clone())
                 .unwrap_or_default();
@@ -5512,38 +5512,54 @@ fn render_overlay(
                 strings.session_workspace_label(),
                 compact_path(&path, 40)
             );
-            let chrome = modal_chrome(
-                app,
-                &title,
-                ModalSizing::picker(),
-                vec![
-                    ModalHint::new("↑↓", strings.hint_nav()),
-                    ModalHint::new("Enter", strings.hint_select()),
-                    ModalHint::new("Esc", strings.close()),
-                ],
-            );
+            let rows = app.workspace_picker_rows();
+            let mut hints = vec![ModalHint::new("↑↓", strings.hint_nav())];
+            // The key is named only where there is somewhere to go: a footer
+            // that offers a step the listing cannot take is the same lie as an
+            // empty directory with no way out of it.
+            if rows
+                .iter()
+                .any(|row| matches!(row, crate::app::WorkspacePickerRow::Parent { .. }))
+            {
+                hints.push(ModalHint::new("u", strings.workspace_parent()));
+            }
+            hints.push(ModalHint::new("Enter", strings.hint_select()));
+            hints.push(ModalHint::new("Esc", strings.close()));
+            let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
             let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
-            let entries = listing
-                .as_ref()
-                .map(|listing| listing.entries.clone())
-                .unwrap_or_default();
-            let items = entries
+            let items = rows
                 .iter()
                 .enumerate()
-                .map(|(index, entry)| {
+                .map(|(index, row)| {
                     let style = if index == *selected {
                         theme.selected()
                     } else {
                         theme.base()
+                    };
+                    // The way up is drawn where a reader looks for it, and
+                    // dimmed while unselected so it reads as the step the
+                    // listing carries rather than a directory inside it.
+                    let (label, style) = match row {
+                        crate::app::WorkspacePickerRow::Parent { .. } => (
+                            "..".to_string(),
+                            if index == *selected {
+                                style
+                            } else {
+                                theme.dimmed(theme.roles.gray_dim)
+                            },
+                        ),
+                        crate::app::WorkspacePickerRow::Entry { name, .. } => {
+                            (truncate_to_width(name, 44, "…"), style)
+                        }
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if index == *selected { "❯ " } else { "  " }.to_string(),
                             Style::default().fg(theme.roles.accent_user),
                         ),
-                        Span::styled(truncate_to_width(&entry.name, 44, "…"), style),
+                        Span::styled(label, style),
                     ]))
                 })
                 .collect::<Vec<_>>();

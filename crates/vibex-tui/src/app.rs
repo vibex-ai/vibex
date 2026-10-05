@@ -214,6 +214,33 @@ pub enum Overlay {
     },
 }
 
+/// One row the workspace picker draws, top to bottom.
+///
+/// The picker chooses a directory on a whole machine, so a listing that only
+/// offered its own children would trap the reader in the directory the page
+/// happened to name. The parent is therefore a row like any other — the `..`
+/// a reader already knows to put the cursor on — and not only a key they would
+/// have to be told about. It is drawn exactly where the listing names a parent:
+/// a paired authority withholds one at the top of its browse roots and a
+/// filesystem withholds one at `/`, so the reader is never offered a step that
+/// does not exist, and never loses the one that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspacePickerRow {
+    /// The directory above the one being listed.
+    Parent { path: String },
+    /// One directory inside the listing.
+    Entry { name: String, path: String },
+}
+
+impl WorkspacePickerRow {
+    /// The directory this row names.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Parent { path } | Self::Entry { path, .. } => path,
+        }
+    }
+}
+
 /// Which single-line field a prompt is editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptField {
@@ -1925,6 +1952,35 @@ impl App {
         }
         let path = self.new_session_workspace();
         std::path::Path::new(&path).is_dir().then_some(path)
+    }
+
+    /// The rows the picker draws: the way up, then the listing itself.
+    ///
+    /// This is the one place that decides what a drawn row index means, so the
+    /// renderer and the keys that move the cursor cannot disagree about where
+    /// `..` is — the cursor is stored as an index, and an index that meant a
+    /// directory in one and a step in the other would choose the wrong
+    /// directory.
+    pub fn workspace_picker_rows(&self) -> Vec<WorkspacePickerRow> {
+        let Some(listing) = self.workspace_browse.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::with_capacity(listing.entries.len() + 1);
+        if let Some(parent) = listing.parent.as_ref() {
+            rows.push(WorkspacePickerRow::Parent {
+                path: parent.clone(),
+            });
+        }
+        rows.extend(
+            listing
+                .entries
+                .iter()
+                .map(|entry| WorkspacePickerRow::Entry {
+                    name: entry.name.clone(),
+                    path: entry.path.clone(),
+                }),
+        );
+        rows
     }
 
     /// Workspace the session pages read from.

@@ -686,6 +686,17 @@ fn handle_key(
                 return Ok(false);
             }
         }
+        // The directory picker climbs out of the directory with the arrow a
+        // reader reaches for, the same step `u` and the `..` row take. The
+        // overlay's own `←` binding folds a tree, which this picker has none
+        // of, so the key is free here and only here.
+        if let Some(Overlay::WorkspacePicker { .. }) = app.overlay
+            && key.code == KeyCode::Left
+        {
+            let outcome = app.perform(crate::action::Intent::WorkspaceBrowseUp);
+            dispatch_all(worker, &outcome);
+            return Ok(false);
+        }
     } else if composer_takes_keys(app)
         && let Some(exit) = handle_composer_key(app, worker, key)?
     {
