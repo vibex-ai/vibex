@@ -1185,12 +1185,23 @@ impl Transcript {
         let rendered = self.rendered.get(&index)?.clone();
         // The block's own trailing blank rows are the separator before the next
         // block, not content: a header clipped down to them would reserve a row
-        // to show nothing, so the clip stops at the last row with text on it.
-        let content_rows = rendered
+        // to show nothing, so the clip stops at the last row with text on it —
+        // plus the rows of a band that closes the block, because the padding
+        // inside the reader's own box belongs to the box and a pinned prompt
+        // missing its floor would look like a rendering fault.
+        let last_text = rendered
             .plain
             .iter()
             .rposition(|line| !line.trim().is_empty())
             .map_or(0, |last| last + 1);
+        let content_rows = last_text
+            + rendered
+                .lines
+                .get(last_text..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|line| line.style.bg == Some(theme.roles.surface_raised))
+                .count();
         if content_rows == 0 {
             return None;
         }
@@ -1687,6 +1698,21 @@ const CLOCK_GAP: usize = 2;
 /// cell the session list leaves after its own age column.
 const CLOCK_EDGE: usize = 1;
 
+/// Columns the reader's own message keeps clear inside its band, on each side.
+///
+/// One cell, the same the composer insets its draft by. The message and the box
+/// it was typed in are the same surface: text that touched the edge of one
+/// would make them read as two different objects.
+const BOX_INSET: usize = 1;
+
+/// Empty rows the reader's own message keeps above and below its text.
+///
+/// The composer's padding, row for row. A message drawn as one row of text on a
+/// band is a highlight behind a sentence; the box the reader wrote into has
+/// room in it, and the transcript draws the message they sent rather than a
+/// compressed copy of it.
+const BOX_PAD_ROWS: usize = 1;
+
 /// The clock a message carries on its right, if it has one.
 ///
 /// Only the conversation is stamped. A work item is a row of activity whose
@@ -1722,16 +1748,17 @@ fn clock_columns(block: &Block, strings: Strings) -> usize {
 /// on the width or the last settled line and the first live one would break in
 /// different places.
 pub fn body_width_for(block: &Block, width: usize, strings: Strings) -> usize {
-    // The prompt mark costs two cells on the reader's own message; the clock
-    // costs whatever its label needs on a message of either kind.
-    let prompt = if block.kind == TimelineRowKind::UserMessage {
-        2
+    // The reader's own message pays for its box — the padding cell the text is
+    // inset by, then the prompt mark — and a message of either kind pays for
+    // the clock, whatever its label needs.
+    let boxed = if band_fills_row(block) {
+        BOX_INSET + 2
     } else {
         0
     };
     chrome::content_width(width.max(8))
         .max(8)
-        .saturating_sub(prompt)
+        .saturating_sub(boxed)
         .saturating_sub(clock_columns(block, strings))
         .max(8)
 }
@@ -1743,6 +1770,32 @@ pub fn body_width_for(block: &Block, width: usize, strings: Strings) -> usize {
 /// highlight behind a sentence instead of as the block the reader wrote into.
 fn band_fills_row(block: &Block) -> bool {
     block.kind == TimelineRowKind::UserMessage
+}
+
+/// One empty row of a banded block: the padding above and below the text.
+///
+/// It is a row of the box rather than a gap between blocks, which is why it
+/// carries the band to the content edge and the pointer, and why it keeps an
+/// empty plain line — the copy of a message is the message, not its padding.
+fn band_row(
+    row: usize,
+    live: bool,
+    pointer: bool,
+    phase: u32,
+    content_width: usize,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    let band = Style::default().bg(theme.roles.surface_raised);
+    let mut spans = vec![Span::raw(" ".repeat(BOX_INSET))];
+    close_body_row(
+        &mut spans,
+        BOX_INSET,
+        content_width,
+        Some(band),
+        None,
+        Style::default(),
+    );
+    row_line(row_marker(row, live, pointer, phase, theme), spans).style(band)
 }
 
 /// Whether a block kind is a dense, foldable work item.
@@ -2259,6 +2312,25 @@ pub fn render_block_with_attribution(
             Some(band) => band.fg(theme.roles.gray_dim),
             None => Style::default().fg(theme.roles.gray_dim),
         };
+        // The reader's own message carries the box the composer does: a cell of
+        // padding on every side. A band that hugged its text would read as a
+        // highlight behind a sentence rather than as the thing they wrote into.
+        let inset = band.map_or(0, |_| BOX_INSET);
+        let mut block_row = 0usize;
+        if band.is_some() {
+            for _ in 0..BOX_PAD_ROWS {
+                lines.push(band_row(
+                    block_row,
+                    live,
+                    block_row == 0 && selected,
+                    phase,
+                    content_width,
+                    theme,
+                ));
+                plain.push(String::new());
+                block_row += 1;
+            }
+        }
         for (index, (line, text)) in rendered.lines.into_iter().zip(rendered.plain).enumerate() {
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
@@ -2285,12 +2357,17 @@ pub fn render_block_with_attribution(
                 spans.insert(0, Span::raw("  "));
                 text = format!("  {text}");
             }
+            if inset > 0 {
+                // The band's own left padding, outside the message's text: the
+                // prompt mark sits one cell in from the edge of the box.
+                spans.insert(0, Span::raw(" ".repeat(inset)));
+            }
             // Neither the band nor the clock is text, so neither enters
             // `plain`: what a reader drags out of the transcript is the message
             // they wrote, without the chrome that framed it.
             close_body_row(
                 &mut spans,
-                display_width(&text),
+                display_width(&text) + inset,
                 content_width,
                 band,
                 (index == 0).then_some(clock.as_deref()).flatten(),
@@ -2298,15 +2375,35 @@ pub fn render_block_with_attribution(
             );
             // The pointer is the first body row's marker only where there is no
             // rail to give it up: a live window's rail runs unbroken, and the
-            // header above already carries the cursor.
-            let pointer = selected && index == 0 && !live;
-            let mut row = row_line(row_marker(index + 1, live, pointer, phase, theme), spans)
-                .style(row_style);
-            if index == 0 && selected {
+            // header above already carries the cursor. The rail counts from the
+            // header, so the body's first row is cell one whatever padding the
+            // block drew above it.
+            let pointer = selected && block_row == 0 && !live;
+            let mut row = row_line(
+                row_marker(block_row + 1, live, pointer, phase, theme),
+                spans,
+            )
+            .style(row_style);
+            if block_row == 0 && selected {
                 row = row.style(Style::default().bg(theme.roles.surface_highlight));
             }
             lines.push(row);
             plain.push(text);
+            block_row += 1;
+        }
+        if band.is_some() {
+            for _ in 0..BOX_PAD_ROWS {
+                lines.push(band_row(
+                    block_row,
+                    live,
+                    false,
+                    phase,
+                    content_width,
+                    theme,
+                ));
+                plain.push(String::new());
+                block_row += 1;
+            }
         }
     }
 
@@ -3542,8 +3639,10 @@ mod density_tests {
             false,
         );
         let rendered = render_block(&row, &theme(), 30, strings());
-        assert!(rendered.plain[0].contains("# heading  **literal**"));
-        assert!(rendered.plain[1].starts_with("  第二行"));
+        // The box pads the text on both sides, so the message starts one row in.
+        assert_eq!(rendered.plain[BOX_PAD_ROWS - 1], "");
+        assert!(rendered.plain[BOX_PAD_ROWS].contains("# heading  **literal**"));
+        assert!(rendered.plain[BOX_PAD_ROWS + 1].starts_with("  第二行"));
         for line in rendered.lines.iter().take(rendered.height - 1) {
             assert_eq!(line.style.bg, Some(theme().roles.surface_raised));
             assert!(line.width() <= 30);
@@ -3577,7 +3676,10 @@ mod density_tests {
         let width = 60;
         let rendered = render_block(&row, &theme(), width, strings());
         let clock = clock_of(&row);
-        let first = line_text(&rendered.lines[0]);
+        // The box pads its text, so the message itself starts below the first
+        // row — and the clock rides on the text, not on the padding above it.
+        let text_row = BOX_PAD_ROWS;
+        let first = line_text(&rendered.lines[text_row]);
         assert!(first.contains(&clock), "no clock on {first:?}");
 
         // The label ends one cell short of the content's edge, so the row is
@@ -3593,8 +3695,11 @@ mod density_tests {
             "the stamped row is not full width: {first:?}"
         );
 
-        // One clock per message, on the row it starts at.
-        for line in rendered.lines.iter().skip(1) {
+        // One clock per message, on the row the message starts at.
+        for (index, line) in rendered.lines.iter().enumerate() {
+            if index == text_row {
+                continue;
+            }
             assert!(!line_text(line).contains(&clock), "{:?}", line_text(line));
         }
     }
@@ -3615,10 +3720,10 @@ mod density_tests {
         let width = 60;
         let rendered = render_block(&row, &theme(), width, strings());
         let clock = clock_of(&row);
-        let first = line_text(&rendered.lines[0]);
+        let first = line_text(&rendered.lines[BOX_PAD_ROWS]);
         let at = first.find(&clock).expect("the clock is on the first row");
         let text_before = display_width(&first[..at]);
-        let text_width = display_width(&rendered.plain[0]);
+        let text_width = display_width(&rendered.plain[BOX_PAD_ROWS]);
         assert!(
             text_before >= text_width + CLOCK_GAP,
             "the clock is {text_before} columns in, on text {text_width} wide"
@@ -3627,7 +3732,7 @@ mod density_tests {
     }
 
     #[test]
-    fn the_readers_message_is_a_band_that_fills_the_row() {
+    fn the_readers_message_is_a_box_that_fills_the_row() {
         let row = item("user", TimelineRowKind::UserMessage, "a question", false);
         let width = 60;
         let content_width = chrome::content_width(width);
@@ -3649,6 +3754,18 @@ mod density_tests {
                 tail.content
             );
         }
+        // The text is padded above and below, the way the composer pads the
+        // draft it holds: one line of text is a three-row box, and the padding
+        // is not text — it would otherwise be copied out with the message.
+        let box_rows = rendered.height - chrome::GAP;
+        assert_eq!(box_rows, BOX_PAD_ROWS * 2 + 1, "the box is not padded");
+        assert!(rendered.plain[..BOX_PAD_ROWS].iter().all(String::is_empty));
+        assert!(
+            rendered.plain[box_rows - BOX_PAD_ROWS..box_rows]
+                .iter()
+                .all(String::is_empty)
+        );
+        assert!(!rendered.plain[BOX_PAD_ROWS].is_empty());
     }
 
     #[test]
@@ -3667,7 +3784,7 @@ mod density_tests {
         assert_eq!(clock_label(&unstamped, strings()), None);
         assert_eq!(
             body_width_for(&unstamped, 60, strings()),
-            chrome::content_width(60) - 2
+            chrome::content_width(60) - BOX_INSET - 2
         );
         let rendered = render_block(&unstamped, &theme(), 60, strings());
         assert!(rendered.lines[0].width() < 60);
