@@ -381,6 +381,13 @@ pub enum AcpEvent {
         text_delta: String,
         chunk_index: u32,
         phase: Option<AgentMessagePhase>,
+        /// The Agent's own id for the assistant message this delta belongs to.
+        ///
+        /// DeepSeek Harness publishes `<turn>:<step>` on every projected chunk
+        /// and repeats it on the completed message. It is retained as the
+        /// timeline correlation id so a fork can name the exact message it
+        /// cuts at.
+        message_id: Option<String>,
     },
     AssistantMessage {
         text: String,
@@ -389,6 +396,9 @@ pub enum AcpEvent {
     Reasoning {
         text: String,
         is_final: bool,
+        /// See [`AcpEvent::AssistantDelta::message_id`]; the bridge attributes
+        /// a thought chunk to the same message id as its text.
+        message_id: Option<String>,
     },
     Plan {
         title: String,
@@ -1043,6 +1053,7 @@ impl AcpClient for OpenCodeAcpClient {
             events.push(AcpEvent::Reasoning {
                 text: prompt_result.reasoning_text,
                 is_final: true,
+                message_id: None,
             });
         }
         if !prompt_result.assistant_text.trim().is_empty() {
@@ -3432,13 +3443,15 @@ pub(crate) fn map_acp_event(
             text_delta,
             chunk_index,
             phase,
-        } => ProviderEvent::agent(TimelinePayload::AgentMessageDelta(
-            AgentMessageDeltaPayload {
+            message_id,
+        } => ProviderEvent::agent_with_correlation(
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta,
                 chunk_index,
                 phase,
-            },
-        )),
+            }),
+            message_id,
+        ),
         AcpEvent::SessionTitle { title } => ProviderEvent::session_title(title),
         AcpEvent::AssistantMessage { text, is_final } => {
             ProviderEvent::agent(TimelinePayload::AgentMessage(AgentMessagePayload {
@@ -3446,12 +3459,14 @@ pub(crate) fn map_acp_event(
                 is_final,
             }))
         }
-        AcpEvent::Reasoning { text, is_final } => {
-            ProviderEvent::agent(TimelinePayload::Reasoning(ReasoningPayload {
-                text,
-                is_final,
-            }))
-        }
+        AcpEvent::Reasoning {
+            text,
+            is_final,
+            message_id,
+        } => ProviderEvent::agent_with_correlation(
+            TimelinePayload::Reasoning(ReasoningPayload { text, is_final }),
+            message_id,
+        ),
         AcpEvent::Plan { title, steps } => {
             ProviderEvent::agent(TimelinePayload::Plan(PlanPayload { title, steps }))
         }
@@ -4781,11 +4796,13 @@ mod tests {
                     AcpEvent::Reasoning {
                         text: "thinking".to_string(),
                         is_final: true,
+                        message_id: None,
                     },
                     AcpEvent::AssistantDelta {
                         text_delta: "hello".to_string(),
                         chunk_index: 0,
                         phase: Some(AgentMessagePhase::FinalAnswer),
+                        message_id: Some("1:1".to_string()),
                     },
                     AcpEvent::ToolCall {
                         tool_call_id: "tool-1".to_string(),

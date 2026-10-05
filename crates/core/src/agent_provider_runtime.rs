@@ -23,8 +23,9 @@ use crate::{
     ProjectionEvidenceReference, ProjectionEvidenceState, ProviderSecretKind,
     ProviderSwitchBehavior, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
     WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
-    WIRE_PROTOCOL_GOOGLE_VERTEX, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries,
+    WIRE_PROTOCOL_GOOGLE_VERTEX, WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
+    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
+    acp_agent_catalog_entries,
 };
 use crate::{AgentModelProviderBindingId, AgentRuntimeProbeId, AgentRuntimeProfileId};
 
@@ -397,6 +398,11 @@ fn catalog_projection_shape(
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
                     catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                    // 0.2.0 of the bundled Harness runtime added this protocol
+                    // to its pi-ai gate; the capability resolver drops it for
+                    // installs older than `DEEPSEEK_HARNESS_MISTRAL_WIRE_SINCE`
+                    // because those runtimes refuse a route that names it.
+                    catalog_interface(WIRE_PROTOCOL_MISTRAL_CONVERSATIONS, true, true),
                 ],
             )),
             // Kimi Code CLI ships four chat providers: `openai_legacy`,
@@ -2031,12 +2037,16 @@ mod tests {
             protocols("codebuddy-code"),
             vec![WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS]
         );
+        // The Harness accepts the three chat protocols plus the one its 0.2.0
+        // runtime added; the capability resolver drops the Mistral interface
+        // again for an install older than that runtime.
         assert_eq!(
             protocols("deepseek-harness"),
             vec![
                 WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
                 WIRE_PROTOCOL_OPENAI_RESPONSES,
                 WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
             ]
         );
         assert_eq!(

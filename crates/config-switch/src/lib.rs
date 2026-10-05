@@ -5763,6 +5763,18 @@ fn run_provider_api_probe(
         vibex_core::ProviderModelWireApi::AwsBedrockConverse => {
             run_bedrock_converse_probe(profile, probe_kind)
         }
+        // Mistral Conversations is projected for Agents whose own client owns
+        // the wire format; Vibex has no probe that speaks it yet, so it reports
+        // the gap instead of running an OpenAI-shaped request the endpoint
+        // would answer differently.
+        vibex_core::ProviderModelWireApi::MistralConversations => Ok(provider_api_probe_fail(
+            "agent_model_provider_protocol_unsupported",
+            "Provider API probe is not implemented for the Mistral Conversations protocol",
+            vec![diagnostic(
+                "wireProtocolId",
+                vibex_core::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
+            )],
+        )),
     }
 }
 
@@ -6177,6 +6189,15 @@ fn fetch_provider_profile_models(
         }
         Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse) => {
             fetch_bedrock_profile_models(profile)
+        }
+        // No model-listing call speaks the Mistral Conversations wire format
+        // yet. Declaring that is better than listing models through the
+        // OpenAI-compatible route, whose endpoint and response shape differ.
+        Some(vibex_core::ProviderModelWireApi::MistralConversations) => {
+            Err(VibexError::validation(
+                "agent_model_provider_protocol_unsupported",
+                "Model discovery is not implemented for the Mistral Conversations protocol; add models manually",
+            ))
         }
         None => Err(VibexError::validation(
             "agent_model_provider_protocol_missing",

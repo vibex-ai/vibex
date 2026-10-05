@@ -1134,16 +1134,18 @@ pub enum ProviderModelWireApi {
     OpenaiResponses,
     OpenaiChatCompletions,
     AnthropicMessages,
+    MistralConversations,
     GoogleGenerativeAi,
     GoogleVertex,
     AwsBedrockConverse,
 }
 
 impl ProviderModelWireApi {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::OpenaiResponses,
         Self::OpenaiChatCompletions,
         Self::AnthropicMessages,
+        Self::MistralConversations,
         Self::GoogleGenerativeAi,
         Self::GoogleVertex,
         Self::AwsBedrockConverse,
@@ -1154,6 +1156,7 @@ impl ProviderModelWireApi {
             Self::OpenaiResponses => crate::WIRE_PROTOCOL_OPENAI_RESPONSES,
             Self::OpenaiChatCompletions => crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
             Self::AnthropicMessages => crate::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            Self::MistralConversations => crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
             Self::GoogleGenerativeAi => crate::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
             Self::GoogleVertex => crate::WIRE_PROTOCOL_GOOGLE_VERTEX,
             Self::AwsBedrockConverse => crate::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
@@ -1165,6 +1168,7 @@ impl ProviderModelWireApi {
             crate::WIRE_PROTOCOL_OPENAI_RESPONSES => Some(Self::OpenaiResponses),
             crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => Some(Self::OpenaiChatCompletions),
             crate::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => Some(Self::AnthropicMessages),
+            crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS => Some(Self::MistralConversations),
             crate::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => Some(Self::GoogleGenerativeAi),
             crate::WIRE_PROTOCOL_GOOGLE_VERTEX => Some(Self::GoogleVertex),
             crate::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => Some(Self::AwsBedrockConverse),
@@ -2837,7 +2841,7 @@ mod tests {
 
     #[test]
     fn model_wire_protocol_ids_round_trip_the_canonical_protocols() {
-        assert_eq!(ProviderModelWireApi::ALL.len(), 6);
+        assert_eq!(ProviderModelWireApi::ALL.len(), 7);
         for wire_api in ProviderModelWireApi::ALL {
             let protocol_id = wire_api.wire_protocol_id();
             assert_eq!(

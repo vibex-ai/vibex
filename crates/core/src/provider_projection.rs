@@ -24,6 +24,10 @@ pub const PROVIDER_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const WIRE_PROTOCOL_OPENAI_RESPONSES: &str = "openai_responses";
 pub const WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS: &str = "openai_chat_completions";
 pub const WIRE_PROTOCOL_ANTHROPIC_MESSAGES: &str = "anthropic_messages";
+/// Mistral's own Conversations surface. It is not OpenAI-compatible — request
+/// body, tool-call shape and streaming frames all differ — so an Agent that
+/// speaks it needs a spelling of its own rather than a compatibility switch.
+pub const WIRE_PROTOCOL_MISTRAL_CONVERSATIONS: &str = "mistral_conversations";
 pub const WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI: &str = "google_generative_ai";
 /// Vertex AI's Gemini surface. It carries the same
 /// `generateContent`/`streamGenerateContent` body as
@@ -1101,11 +1105,29 @@ impl AgentProviderProjectionRegistry {
                 "agent_projection_version_untrusted",
             ));
         }
+        // A Model interface a newer Adapter introduced is dropped for an older
+        // installation before anything else reads the descriptor: its bundled
+        // runtime validates the whole route and refuses one that names a
+        // protocol it does not know, so the choice must not reach the provider
+        // editor and a binding already holding it must fail its projection
+        // check instead of writing an unusable route.
+        let for_identity = |descriptor: &AgentProviderProjectionDescriptor| {
+            let mut descriptor = descriptor.clone();
+            descriptor.model_interfaces.retain(|interface| {
+                crate::model_interface_available_for_adapter(
+                    identity.route.agent_id.as_str(),
+                    interface.wire_protocol_id.as_str(),
+                    identity.adapter_version.as_deref(),
+                    identity.agent_version.as_deref(),
+                )
+            });
+            descriptor
+        };
         if let Some(descriptor) = self.descriptors.values().find(|descriptor| {
             descriptor.route == identity.route && descriptor.compatibility.matches_exact(identity)
         }) {
             return Ok(AgentProviderProjectionResolution {
-                descriptor: descriptor.clone(),
+                descriptor: for_identity(descriptor),
                 match_kind: ProjectionDescriptorMatch::Exact,
                 diagnostic_code: descriptor.evidence.diagnostic_code.clone(),
             });
@@ -1114,7 +1136,7 @@ impl AgentProviderProjectionRegistry {
             descriptor.route == identity.route && descriptor.compatibility.matches_range(identity)
         }) {
             return Ok(AgentProviderProjectionResolution {
-                descriptor: descriptor.clone(),
+                descriptor: for_identity(descriptor),
                 match_kind: ProjectionDescriptorMatch::SemverRange,
                 diagnostic_code: descriptor.evidence.diagnostic_code.clone(),
             });
@@ -2243,6 +2265,102 @@ mod tests {
             resolution.diagnostic_code.as_deref(),
             Some("agent_projection_version_mismatch")
         );
+
+        // The wire protocol the 0.2.0 bundled runtime introduced is offered
+        // only once the bridge that bundles it is installed; an older runtime
+        // refuses a route that names it.
+        let supports_mistral = |version: &str| {
+            let identity = identity(version);
+            let resolution = registry.resolve(&identity).unwrap();
+            AgentProviderProjectionCapability::from_resolution(
+                &identity,
+                &resolution,
+                ProjectionAuthState::Missing,
+            )
+            .model_interfaces
+            .iter()
+            .any(|interface| {
+                interface.wire_protocol_id == crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS
+            })
+        };
+        assert!(!supports_mistral("0.4.35"));
+        assert!(supports_mistral("0.4.36"));
+        assert!(supports_mistral("0.4.37"));
+    }
+
+    /// A binding already holding the Mistral protocol must not project onto an
+    /// install whose bundled runtime refuses that route: the interface is
+    /// dropped from the resolved descriptor, so the plan-time validation fails
+    /// before a file is written.
+    #[test]
+    fn mistral_binding_is_refused_on_a_runtime_without_the_protocol() {
+        let registry = AgentProviderProjectionRegistry::builtin().unwrap();
+        let route = route(
+            "deepseek-harness",
+            crate::agent_provider_runtime::default_acp_adapter_id(
+                &AgentId::parse("deepseek-harness").unwrap(),
+            )
+            .as_str(),
+        )
+        .unwrap();
+        let resolve = |version: &str| {
+            registry
+                .resolve(&AgentRuntimeVersionIdentity {
+                    route: route.clone(),
+                    adapter_version: None,
+                    agent_version: Some(version.to_string()),
+                    runtime_dependencies: BTreeMap::new(),
+                    source: AgentVersionSource::Managed,
+                })
+                .unwrap()
+        };
+        let binding = |descriptor_id| AgentModelProviderBinding {
+            id: AgentModelProviderBindingId::new(),
+            legacy_provider_profile_id: None,
+            agent_id: AgentId::parse("deepseek-harness").unwrap(),
+            runtime_profile_id: AgentRuntimeProfileId::new(),
+            model_provider_profile_id: ModelProviderProfileId::new(),
+            projection_descriptor_id: descriptor_id,
+            projection_overrides: AgentProviderProjectionOverrides::default(),
+            configured_models: vec![AgentConfiguredModelBinding {
+                id: AgentConfiguredModelBindingId::new(),
+                provider_model_id: "mistral-large".to_string(),
+                agent_model_id: "mistral-large".to_string(),
+                wire_protocol_id: WIRE_PROTOCOL_MISTRAL_CONVERSATIONS.to_string(),
+                sdk_adapter_id: None,
+                deployment: None,
+                enabled: true,
+                process_scoped: false,
+            }],
+            projection_fingerprint: None,
+            status: AgentModelProviderBindingStatus::Draft,
+            verification: ProjectionVerificationState {
+                state: ProjectionEvidenceState::Verified,
+                descriptor_version: "1".to_string(),
+                source_evidence_reference: None,
+                runtime_evidence_reference: None,
+                verified_at_ms: None,
+            },
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+        };
+
+        let current = resolve("0.4.37");
+        let current_binding = binding(current.descriptor.id.clone());
+        assert!(
+            current_binding
+                .validate_against_descriptor(&current.descriptor)
+                .is_ok()
+        );
+
+        let legacy = resolve("0.4.35");
+        let legacy_binding = binding(legacy.descriptor.id.clone());
+        let error = legacy_binding
+            .validate_against_descriptor(&legacy.descriptor)
+            .unwrap_err();
+        assert_eq!(error.code, "agent_model_interface_unsupported");
     }
 
     #[test]

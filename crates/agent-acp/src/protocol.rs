@@ -788,6 +788,12 @@ pub(crate) fn build_initialize_params(
         // the feature permanently off rather than merely degraded.
         let mut reserved_meta = serde_json::Map::new();
         reserved_meta.insert("terminal_output".to_string(), json!(terminal_tools));
+        // DeepSeek Harness reads this to relay a subagent's transcript onto the
+        // root session, tagging every relayed update with `_meta.dsh.subagent`.
+        // Vibex scopes those updates to the child that produced them, so the
+        // statement holds for every Agent: one that ignores the key behaves
+        // exactly as before.
+        reserved_meta.insert("subagent-transcript".to_string(), json!(true));
         if parameterized_model_picker {
             // Cursor reads the spec's reserved `_meta` (not the plain `meta`
             // extension above) to decide whether each model parameter becomes
@@ -873,6 +879,44 @@ pub(crate) fn build_session_fork_params(
         "cwd": cwd.display().to_string(),
         "mcpServers": mcp_servers,
     })
+}
+
+/// The inclusive-fork extension version this runtime knows how to request.
+///
+/// Advertised by an Agent as `agentCapabilities._meta.jetbrains.air.fork`;
+/// a request must echo the same version or the Agent answers `-32602` rather
+/// than guessing a cut.
+pub(crate) const ACP_INCLUSIVE_FORK_VERSION: u32 = 1;
+
+/// Build `session/fork` params that keep one assistant message and drop every
+/// later one.
+///
+/// The extension block is what DeepSeek Harness 0.4.37 reads to cut at
+/// `message_id` (its own `<turn>:<step>` id); without it the bridge copies the
+/// source's whole committed log instead of cutting.
+pub(crate) fn build_inclusive_session_fork_params(
+    native_session_id: &str,
+    cwd: &Path,
+    mcp_servers: Value,
+    message_id: &str,
+) -> Value {
+    let mut params = build_session_fork_params(native_session_id, cwd, mcp_servers);
+    if let Some(object) = params.as_object_mut() {
+        object.insert(
+            "_meta".to_string(),
+            json!({
+                "jetbrains": {
+                    "air": {
+                        "fork": {
+                            "version": ACP_INCLUSIVE_FORK_VERSION,
+                            "messageId": message_id,
+                        }
+                    }
+                }
+            }),
+        );
+    }
+    params
 }
 
 /// Build `session/prompt` params through the typed `PromptRequest`.
@@ -1011,7 +1055,7 @@ mod tests {
                         "terminal-auth": true,
                         "mcpServers": true
                     },
-                    "_meta": { "terminal_output": false }
+                    "_meta": { "terminal_output": false, "subagent-transcript": true }
                 },
                 "clientInfo": {
                     "name": "vibex",
@@ -1034,7 +1078,11 @@ mod tests {
             &build_initialize_params(true, true, false, false, false, true)["clientCapabilities"];
         assert_eq!(
             capabilities["_meta"],
-            json!({ "terminal_output": false, "parameterizedModelPicker": true })
+            json!({
+                "terminal_output": false,
+                "subagent-transcript": true,
+                "parameterizedModelPicker": true
+            })
         );
         assert_eq!(capabilities["meta"]["mcpServers"], json!(false));
 
@@ -1042,8 +1090,35 @@ mod tests {
             &build_initialize_params(true, true, false, false, false, false)["clientCapabilities"];
         assert_eq!(
             without["_meta"],
-            json!({ "terminal_output": false }),
-            "the reserved key stays reserved for terminal_output alone"
+            json!({ "terminal_output": false, "subagent-transcript": true }),
+            "subagent-transcript is unconditional; the picker stays opt-in"
+        );
+    }
+
+    /// A `session/fork` request that names a message must carry the extension
+    /// the Agent advertised. The plain shape is the whole-log copy the Agent
+    /// performs when the block is absent.
+    #[test]
+    fn session_fork_params_carry_the_inclusive_cut_only_when_asked() {
+        let servers = json!([]);
+        assert_eq!(
+            build_session_fork_params("native-1", Path::new("/tmp/w"), servers.clone()),
+            json!({ "sessionId": "native-1", "cwd": "/tmp/w", "mcpServers": [] })
+        );
+        assert_eq!(
+            build_inclusive_session_fork_params("native-1", Path::new("/tmp/w"), servers, "3:1",),
+            json!({
+                "sessionId": "native-1",
+                "cwd": "/tmp/w",
+                "mcpServers": [],
+                "_meta": {
+                    "jetbrains": {
+                        "air": {
+                            "fork": { "version": ACP_INCLUSIVE_FORK_VERSION, "messageId": "3:1" }
+                        }
+                    }
+                }
+            })
         );
     }
 

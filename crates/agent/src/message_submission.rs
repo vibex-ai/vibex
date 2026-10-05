@@ -171,8 +171,10 @@ impl MessageRuntimeSelection for RuntimeSelectionService {
     ) -> VibexResult<()> {
         // Deferred initialization lets the queued message poll on the
         // resulting `Preparing` state; the switch watcher commits it.
-        RuntimeSelectionService::initialize_new_session_deferred(self, session_id, desired, None)
-            .await?;
+        RuntimeSelectionService::initialize_new_session_deferred(
+            self, session_id, desired, None, None,
+        )
+        .await?;
         Ok(())
     }
 }

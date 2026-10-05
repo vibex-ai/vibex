@@ -3798,6 +3798,11 @@ fn deepseek_harness_api(model: Option<&AgentConfiguredModelBinding>) -> &'static
     match projection_wire_protocol(model) {
         vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai-responses",
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic-messages",
+        // Only the runtime bundled with adapter 0.4.36+ accepts this spelling.
+        // The capability resolver keeps the interface out of an older install's
+        // descriptor, and the projection engine refuses the binding before the
+        // route is written, so this arm is never reached for one.
+        vibex_core::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS => "mistral-conversations",
         _ => "openai-completions",
     }
 }
@@ -4641,6 +4646,11 @@ mod tests {
             (
                 vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
                 "anthropic-messages",
+                false,
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
+                "mistral-conversations",
                 false,
             ),
         ] {

@@ -999,14 +999,14 @@ mod tests {
 
         assert_eq!(
             installed(AgentManagedDistributionKind::Npm, "0.4.32").rollback_version(&agent),
-            Some("0.4.35")
+            Some("0.4.37")
         );
         assert_eq!(
             installed(AgentManagedDistributionKind::Uvx, "0.4.32").rollback_version(&agent),
-            Some("0.4.35")
+            Some("0.4.37")
         );
         assert_eq!(
-            installed(AgentManagedDistributionKind::Npm, "0.4.35").rollback_version(&agent),
+            installed(AgentManagedDistributionKind::Npm, "0.4.37").rollback_version(&agent),
             None,
             "reinstalling the pinned version is not a rollback"
         );

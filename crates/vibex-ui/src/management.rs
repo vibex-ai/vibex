@@ -2411,6 +2411,7 @@ mod tests {
                 vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
                 vibex_core::ProviderModelWireApi::OpenaiResponses,
                 vibex_core::ProviderModelWireApi::AnthropicMessages,
+                vibex_core::ProviderModelWireApi::MistralConversations,
             ]
         );
         assert_eq!(editor.supported_wire_apis(), editor.wire_api_choices());

@@ -789,6 +789,20 @@ fn build_session_fork_params(
     protocol::build_session_fork_params(native_session_id, cwd, mcp_servers_json(mcp_servers))
 }
 
+fn build_inclusive_session_fork_params(
+    native_session_id: &str,
+    cwd: &Path,
+    mcp_servers: &[AcpMcpServerDescriptor],
+    message_id: &str,
+) -> Value {
+    protocol::build_inclusive_session_fork_params(
+        native_session_id,
+        cwd,
+        mcp_servers_json(mcp_servers),
+        message_id,
+    )
+}
+
 fn build_session_load_params(
     native_session_id: &str,
     cwd: &Path,
@@ -2144,6 +2158,9 @@ struct AcpAttachmentShared {
     current_mode_id: Option<String>,
     model_ids: Vec<String>,
     current_model_id: Option<String>,
+    /// The last Model replacement this attachment reported, so the user is
+    /// told once per distinct substitution instead of on every config update.
+    model_substitution_notice: Option<(String, String)>,
     session_config_state: Option<ProviderSessionConfigState>,
     session_runtime_config_state: SessionRuntimeConfigState,
     session_config_planner: Option<SessionConfigPlanner>,
@@ -2367,6 +2384,9 @@ struct ProcessShared {
     agent_version: Option<String>,
     supports_load_session: bool,
     supports_fork_session: bool,
+    /// `agentCapabilities._meta.jetbrains.air.fork.version`; `Some` only for a
+    /// version this runtime can echo on `session/fork`.
+    inclusive_fork_version: Option<u32>,
     supports_resume_session: bool,
     supports_list_sessions: bool,
     /// `agentCapabilities.mcpCapabilities.http` / `.sse`. Stdio is mandatory
@@ -3170,6 +3190,93 @@ impl AcpSessionAttachment {
                 true
             }
         }
+    }
+
+    /// Emits one state event, into the open turn when there is one and through
+    /// the session-scoped sink otherwise.
+    ///
+    /// A Model substitution is discovered while the session is configured as
+    /// often as during a turn, so the notice must survive both.
+    fn emit_session_state_event(&self, event: AcpEvent) -> bool {
+        if self.emit_turn_event(event.clone()) {
+            return true;
+        }
+        let sender = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.session_event_sender.clone());
+        sender.is_some_and(|sender| {
+            sender
+                .send(crate::map_acp_event(
+                    self.logical_session_id().clone(),
+                    event,
+                ))
+                .is_ok()
+        })
+    }
+
+    /// Records one Model replacement and returns whether it is newly observed.
+    ///
+    /// The pair is remembered per attachment so a repeatedly reported
+    /// substitution produces one notice, not one per config update.
+    fn note_model_substitution(&self, requested: &str, effective: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let pair = (requested.to_string(), effective.to_string());
+        if state.model_substitution_notice.as_ref() == Some(&pair) {
+            return false;
+        }
+        state.model_substitution_notice = Some(pair);
+        true
+    }
+
+    /// Records the Model a completed-message marker reports.
+    ///
+    /// Only an Agent that substitutes an unavailable Model is read this way:
+    /// it is the one case where the Agent runs a Model other than the
+    /// requested one without a client-side switch. The marker is authoritative
+    /// for the step, so the attachment's recorded Model follows it and the
+    /// replacement is announced once. An Agent that does not substitute
+    /// (DeepSeek Harness 0.4.35 and older) leaves both untouched: a different
+    /// Model there is an unexplained mismatch, not a replacement.
+    fn record_agent_reported_model(&self, model: &str) {
+        let process = self.process();
+        if !process.substitutes_unavailable_models() {
+            return;
+        }
+        let reported = process.product_model_id(model);
+        let notice = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.current_model_id.as_deref() == Some(reported.as_str()) {
+                return;
+            }
+            let Some(requested) = state
+                .session_runtime_config_state
+                .preferred_model
+                .clone()
+                .or_else(|| state.current_model_id.clone())
+            else {
+                return;
+            };
+            if requested == reported {
+                return;
+            }
+            state.current_model_id = Some(reported.clone());
+            let pair = (requested, reported.clone());
+            if state.model_substitution_notice.as_ref() == Some(&pair) {
+                return;
+            }
+            state.model_substitution_notice = Some(pair.clone());
+            pair
+        };
+        self.emit_session_state_event(AcpEvent::SystemNotice {
+            level: SystemNoticeLevel::Warning,
+            message: model_substitution_notice_text(&notice.0, &notice.1),
+        });
     }
 
     /// Registers the session-scoped sink for out-of-turn state events.
@@ -4459,6 +4566,9 @@ impl AcpSessionAttachment {
         // turn, even when it carries no model output (command confirmations,
         // title, mode, config, or usage updates).
         self.mark_turn_activity_seen();
+        // A forwarded subagent transcript shares the root session's id space;
+        // every id derived below is scoped to the child that produced it.
+        let subagent = acp_subagent_attribution(update);
         let retry_signal = parse_acp_retry_signal(update);
         let terminal_error = parse_acp_terminal_error(update);
         if let Some(signal) = retry_signal.as_ref() {
@@ -4484,6 +4594,17 @@ impl AcpSessionAttachment {
                 {
                     self.emit_turn_event(AcpEvent::SessionTitle { title });
                 }
+                // A forwarded transcript announces each child run here. The
+                // child's own rows arrive as ordinary updates, so the two
+                // boundaries are what make them readable as one subagent.
+                if let Some(lifecycle) = acp_subagent_lifecycle(update)
+                    && let Some(message) = subagent_lifecycle_notice_text(&lifecycle)
+                {
+                    self.emit_session_state_event(AcpEvent::SystemNotice {
+                        level: SystemNoticeLevel::Info,
+                        message,
+                    });
+                }
                 if let Some(channel) = self.process().goal_channel()
                     && let Some(goal_update) =
                         crate::goal::goal_update_from_session_info(update, &channel)
@@ -4502,6 +4623,12 @@ impl AcpSessionAttachment {
                 }
             }
             "agent_message_chunk" => {
+                // The bridge marks the completed message with `_meta.dsh`. Read
+                // it before the empty-text bail-out: on a streaming bridge the
+                // marker carries no text of its own.
+                if let Some(model) = assistant_message_marker_model(update) {
+                    self.record_agent_reported_model(model);
+                }
                 // An Agent that generates media delivers it as an image content
                 // block on this same notification rather than as a tool call.
                 // The bytes have nowhere to go yet — the desktop preview
@@ -4609,6 +4736,7 @@ impl AcpSessionAttachment {
                         text_delta: text,
                         chunk_index,
                         phase,
+                        message_id: acp_message_id(update, subagent.as_ref()),
                     });
                 }
             }
@@ -4623,6 +4751,7 @@ impl AcpSessionAttachment {
                     self.emit_turn_event(AcpEvent::Reasoning {
                         text,
                         is_final: false,
+                        message_id: acp_message_id(update, subagent.as_ref()),
                     });
                 }
             }
@@ -4640,7 +4769,7 @@ impl AcpSessionAttachment {
                     self.record_opencode_stream_progress();
                 }
                 self.recover_active_retries();
-                for event in self.merge_tool_call_update(kind, update) {
+                for event in self.merge_tool_call_update(kind, update, subagent.as_ref()) {
                     self.emit_turn_event(event);
                 }
             }
@@ -4769,12 +4898,19 @@ impl AcpSessionAttachment {
         }
     }
 
-    fn merge_tool_call_update(&self, kind: &str, update: &Value) -> Vec<AcpEvent> {
+    fn merge_tool_call_update(
+        &self,
+        kind: &str,
+        update: &Value,
+        subagent: Option<&AcpSubagentAttribution>,
+    ) -> Vec<AcpEvent> {
+        // A forwarded child transcript shares the root's tool-call namespace,
+        // so the id is scoped before it becomes the state key.
         let Some(tool_call_id) = update
             .get("toolCallId")
             .or_else(|| update.get("id"))
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .map(|id| subagent_scoped_id(subagent, id))
         else {
             return Vec::new();
         };
@@ -4964,6 +5100,33 @@ impl AcpProcess {
 
     fn product_model_id(&self, runtime_model_id: &str) -> String {
         self.model_id_projection.product_id(runtime_model_id)
+    }
+
+    /// Whether this Agent's installed release replaces a Model its projected
+    /// route no longer lists.
+    ///
+    /// The installed version is the one Vibex resolved for the launch; an
+    /// unmanaged install reports `unknown`, which is deliberately read as "no
+    /// substitution" so an unreleased bridge never gets the newer behavior.
+    fn substitutes_unavailable_models(&self) -> bool {
+        let reported = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.agent_version.clone());
+        vibex_core::adapter_substitutes_unavailable_models(
+            self.agent_id.as_str(),
+            Some(self.adapter_version.as_str()),
+            reported.as_deref(),
+        )
+    }
+
+    /// The inclusive fork extension version negotiated at `initialize`.
+    fn inclusive_fork_version(&self) -> Option<u32> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.inclusive_fork_version)
     }
 
     fn normalize_session_config_models(&self, config: &mut ProviderSessionConfigState) {
@@ -8352,6 +8515,7 @@ impl AcpRuntimeSwitchBridge {
             active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
             requested_session_config: None,
             fork_native_session_id: None,
+            fork_cut_message_id: None,
             created_at_ms: unix_timestamp_ms(),
         };
         let prepared = match self
@@ -9083,6 +9247,10 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
                     .fork_native_session_id
                     .clone()
                     .filter(|native| !native.trim().is_empty());
+                let fork_cut_message_id = intent
+                    .fork_cut_message_id
+                    .clone()
+                    .filter(|message_id| !message_id.trim().is_empty());
                 // Best-effort native fork: the provider copies its live
                 // context into a new ACP session so the fresh binding starts
                 // fully primed. The fork attempt and the plain `session/new`
@@ -9105,6 +9273,7 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
                                     .fork_new_session_for_attachment(
                                         &process,
                                         source_native_session_id,
+                                        fork_cut_message_id.as_deref(),
                                         generation,
                                     )
                                     .await
@@ -13128,6 +13297,7 @@ impl AcpRuntimeClient {
             .and_then(|capabilities| capabilities.get("sessionCapabilities"))
             .and_then(|capabilities| capabilities.get("fork"))
             .is_some();
+        let inclusive_fork_version = negotiated_inclusive_fork_version(&result);
         if supports_fork_session {
             // Codex advertises fork through a versioned `_meta` extension on
             // top of the pinned adapter identity; other agents accept the
@@ -13247,6 +13417,7 @@ impl AcpRuntimeClient {
             shared.supports_load_session = supports_load_session;
             shared.supports_resume_session = supports_resume_session;
             shared.supports_fork_session = supports_fork_session;
+            shared.inclusive_fork_version = inclusive_fork_version;
             shared.supports_list_sessions = supports_list_sessions;
             shared.supports_mcp_http = supports_mcp_http;
             shared.supports_mcp_sse = supports_mcp_sse;
@@ -13374,11 +13545,17 @@ impl AcpRuntimeClient {
         &self,
         process: &Arc<AcpProcess>,
         source_native_session_id: &str,
+        cut_message_id: Option<&str>,
         generation: i64,
     ) -> VibexResult<OpenedAcpSession> {
         let started = Instant::now();
         let result = self
-            .fork_new_session_for_attachment_inner(process, source_native_session_id, generation)
+            .fork_new_session_for_attachment_inner(
+                process,
+                source_native_session_id,
+                cut_message_id,
+                generation,
+            )
             .await;
         self.record_session_open(
             process,
@@ -13393,6 +13570,7 @@ impl AcpRuntimeClient {
         &self,
         process: &Arc<AcpProcess>,
         source_native_session_id: &str,
+        cut_message_id: Option<&str>,
         generation: i64,
     ) -> VibexResult<OpenedAcpSession> {
         let evidence = process
@@ -13411,7 +13589,25 @@ impl AcpRuntimeClient {
                 "ACP session fork support is not negotiated for this activation",
             ));
         }
-        let params = if evidence.encoding == AcpWireEncoding::VersionedRaw {
+        let params = if let Some(message_id) = cut_message_id {
+            // An inclusive cut is only expressible through the extension that
+            // advertises it. Without the negotiation the request would fall
+            // back to a whole-log copy on an Agent that ignores `_meta`, which
+            // would leave the new session holding messages the app-level
+            // timeline does not have; refusing keeps the fresh-session path.
+            if process.inclusive_fork_version().is_none() {
+                return Err(VibexError::capability(
+                    "acp_session_inclusive_fork_not_advertised",
+                    "ACP agent did not advertise an inclusive session fork",
+                ));
+            }
+            build_inclusive_session_fork_params(
+                source_native_session_id,
+                &process.workspace_root,
+                &process.wire_mcp_servers(),
+                message_id,
+            )
+        } else if evidence.encoding == AcpWireEncoding::VersionedRaw {
             plan_codex_fork(
                 Some(&evidence),
                 &process.compatibility_identity,
@@ -14185,9 +14381,19 @@ impl AcpRuntimeClient {
                             .await;
                         match response {
                             Ok(response) => {
-                                if let Some(error_code) = runtime_config_response_conflict(
-                                    &process, &response, &field, &plan,
-                                ) {
+                                // An Agent that substitutes an unavailable Model
+                                // answers with the Model it actually runs. That
+                                // answer is authoritative, not a conflict; an
+                                // Agent that does not substitute keeps the
+                                // mismatch error.
+                                let substituted = runtime_config_substituted_model(
+                                    &process, &field, &plan, &response,
+                                );
+                                if substituted.is_none()
+                                    && let Some(error_code) = runtime_config_response_conflict(
+                                        &process, &response, &field, &plan,
+                                    )
+                                {
                                     outcomes.push(runtime_config_outcome(
                                         &field,
                                         SessionRuntimeConfigApplyStatus::Failed,
@@ -14202,6 +14408,7 @@ impl AcpRuntimeClient {
                                     mutation_revision,
                                     &response,
                                     mutation_mode,
+                                    substituted.as_deref(),
                                 )? {
                                     RuntimeConfigConfirmation::Applied(state) => {
                                         next_state = state;
@@ -14211,6 +14418,21 @@ impl AcpRuntimeClient {
                                             Some(&plan),
                                             None,
                                         ));
+                                        if let Some(effective) = substituted.as_deref()
+                                            && let Some(requested) = field.value.as_deref()
+                                            && attachment
+                                                .payload()
+                                                .note_model_substitution(requested, effective)
+                                        {
+                                            attachment.payload().emit_session_state_event(
+                                                AcpEvent::SystemNotice {
+                                                    level: SystemNoticeLevel::Warning,
+                                                    message: model_substitution_notice_text(
+                                                        requested, effective,
+                                                    ),
+                                                },
+                                            );
+                                        }
                                     }
                                     RuntimeConfigConfirmation::Stale(state) => {
                                         next_state = state;
@@ -14470,6 +14692,7 @@ impl AcpRuntimeClient {
         mutation_revision: i64,
         response: &Value,
         mutation_mode: AttachmentMutationMode,
+        substituted_model: Option<&str>,
     ) -> VibexResult<RuntimeConfigConfirmation> {
         let previous_runtime_state = attachment.payload().runtime_config_state();
         let mut persisted = None;
@@ -14487,6 +14710,16 @@ impl AcpRuntimeClient {
                     ));
                 }
                 set_runtime_config_effective(&mut state.session_runtime_config_state, field);
+                if let Some(effective) = substituted_model {
+                    // The Agent runs this Model, so it replaces the requested
+                    // one on both sides of the convergence fence: a preference
+                    // the route cannot serve would otherwise never converge and
+                    // every later apply would ask for it again.
+                    state.session_runtime_config_state.effective_model =
+                        Some(effective.to_string());
+                    state.session_runtime_config_state.preferred_model =
+                        Some(effective.to_string());
+                }
                 // Discovery is attachment-local as well.  Apply the response
                 // only after the revision/fence check, so a late response
                 // cannot overwrite a replacement generation's view.
@@ -14545,13 +14778,17 @@ impl AcpRuntimeClient {
                 }
                 match field.kind {
                     SessionConfigFieldKind::Model => {
-                        if let Some(value) = field.value.as_deref() {
-                            state.current_model_id = Some(value.to_string());
+                        // A substituted Model is the Agent's answer, so the
+                        // recorded current Model is the replacement rather than
+                        // the id that was asked for.
+                        let value = substituted_model
+                            .map(str::to_string)
+                            .or_else(|| field.value.clone());
+                        if let Some(value) = value {
+                            state.current_model_id = Some(value.clone());
                             if let Some(config) = state.session_config_state.as_mut() {
-                                config.current_model = Some(ProviderSessionConfigValue {
-                                    value: value.to_string(),
-                                    label: None,
-                                });
+                                config.current_model =
+                                    Some(ProviderSessionConfigValue { value, label: None });
                             }
                         }
                     }
@@ -15867,6 +16104,34 @@ fn runtime_config_outcome(
     }
 }
 
+/// The Model an Agent reported instead of the one that was requested, when the
+/// Agent is known to substitute a Model its route no longer lists.
+///
+/// DeepSeek Harness 0.4.36 resolves an unknown id to the removed-id successor
+/// or the route's first Model and answers with that. The answer is
+/// authoritative for such an Agent; before 0.4.36 the same answer is
+/// unexplained and stays `acp_session_config_response_mismatch`.
+fn runtime_config_substituted_model(
+    process: &AcpProcess,
+    field: &RuntimeConfigField,
+    plan: &SessionConfigPlan,
+    response: &Value,
+) -> Option<String> {
+    if field.kind != SessionConfigFieldKind::Model
+        || !matches!(
+            plan,
+            SessionConfigPlan::Live { .. } | SessionConfigPlan::Extension { .. }
+        )
+        || !process.substitutes_unavailable_models()
+    {
+        return None;
+    }
+    let target = field.value.as_deref()?;
+    let reported =
+        extract_current_model_id(response).map(|model| process.product_model_id(&model))?;
+    (reported != target).then_some(reported)
+}
+
 fn is_capability_negative(error: &VibexError) -> bool {
     error.diagnostics.iter().any(|diagnostic| {
         (diagnostic.key == "protocolErrorKind"
@@ -16204,15 +16469,23 @@ impl OpenCodeWireApi {
     }
 }
 
-impl From<ProviderModelWireApi> for OpenCodeWireApi {
-    fn from(value: ProviderModelWireApi) -> Self {
+impl OpenCodeWireApi {
+    /// Map a Vibex wire protocol onto OpenCode's provider vocabulary.
+    ///
+    /// `None` when the OpenCode composition has no provider for the protocol:
+    /// such a Model stays out of the generated config instead of being
+    /// projected under a wire format OpenCode does not speak. The Model
+    /// interfaces a descriptor offers for OpenCode exclude these protocols, so
+    /// this is a guard rather than a supported combination.
+    fn from_provider_wire_api(value: ProviderModelWireApi) -> Option<Self> {
         match value {
-            ProviderModelWireApi::OpenaiResponses => Self::OpenaiResponses,
-            ProviderModelWireApi::OpenaiChatCompletions => Self::OpenaiChatCompletions,
-            ProviderModelWireApi::AnthropicMessages => Self::AnthropicMessages,
-            ProviderModelWireApi::GoogleGenerativeAi => Self::GoogleGenerativeAi,
-            ProviderModelWireApi::GoogleVertex => Self::GoogleVertex,
-            ProviderModelWireApi::AwsBedrockConverse => Self::AwsBedrockConverse,
+            ProviderModelWireApi::OpenaiResponses => Some(Self::OpenaiResponses),
+            ProviderModelWireApi::OpenaiChatCompletions => Some(Self::OpenaiChatCompletions),
+            ProviderModelWireApi::AnthropicMessages => Some(Self::AnthropicMessages),
+            ProviderModelWireApi::GoogleGenerativeAi => Some(Self::GoogleGenerativeAi),
+            ProviderModelWireApi::GoogleVertex => Some(Self::GoogleVertex),
+            ProviderModelWireApi::AwsBedrockConverse => Some(Self::AwsBedrockConverse),
+            ProviderModelWireApi::MistralConversations => None,
         }
     }
 }
@@ -16284,7 +16557,7 @@ fn opencode_model_wire_api(
                 == model_id
         })
         .and_then(|model| model.wire_api)
-        .map(OpenCodeWireApi::from)
+        .and_then(OpenCodeWireApi::from_provider_wire_api)
         .unwrap_or(default_wire_api)
 }
 
@@ -16319,10 +16592,13 @@ fn opencode_model_provider_env(profile: &ProviderProfile) -> Vec<(String, String
         if model_id.is_empty() || is_opencode_default_model(&model_id) {
             continue;
         }
-        let wire_api = model
+        let Some(wire_api) = model
             .wire_api
-            .map(OpenCodeWireApi::from)
-            .unwrap_or(default_wire_api);
+            .map(OpenCodeWireApi::from_provider_wire_api)
+            .unwrap_or(Some(default_wire_api))
+        else {
+            continue;
+        };
         let mut model_config = serde_json::Map::new();
         if let Some(name) = model
             .display_name
@@ -16669,13 +16945,15 @@ fn profile_process_options_revision(profile: &ProviderProfile) -> Option<String>
         .filter_map(|model| {
             let id =
                 opencode_unqualified_model_id(&base_provider_id, default_wire_api, model.id.trim());
-            (!id.is_empty() && !is_opencode_default_model(&id)).then(|| {
-                let wire_api = model
-                    .wire_api
-                    .map(OpenCodeWireApi::from)
-                    .unwrap_or(default_wire_api);
-                (id, wire_api)
-            })
+            (!id.is_empty() && !is_opencode_default_model(&id))
+                .then(|| {
+                    model
+                        .wire_api
+                        .map(OpenCodeWireApi::from_provider_wire_api)
+                        .unwrap_or(Some(default_wire_api))
+                        .map(|wire_api| (id, wire_api))
+                })
+                .flatten()
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| {
@@ -19601,6 +19879,116 @@ fn agent_message_phase(update: &Value) -> Option<AgentMessagePhase> {
     }
 }
 
+/// The inclusive fork extension an `initialize` result advertises.
+///
+/// DeepSeek Harness 0.4.37 publishes `agentCapabilities._meta.jetbrains.air.fork`
+/// beside `sessionCapabilities.fork`. Only a version this runtime implements is
+/// accepted; the bridge refuses an unknown one with `-32602` rather than
+/// silently copying the whole log.
+fn negotiated_inclusive_fork_version(initialize: &Value) -> Option<u32> {
+    initialize
+        .pointer("/agentCapabilities/_meta/jetbrains/air/fork/version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .filter(|version| *version == crate::protocol::ACP_INCLUSIVE_FORK_VERSION)
+}
+
+/// The Model a completed-message marker reports, when the Agent publishes one.
+fn assistant_message_marker_model(update: &Value) -> Option<&str> {
+    (update.pointer("/_meta/dsh/event").and_then(Value::as_str) == Some("assistant_message"))
+        .then(|| {
+            update
+                .pointer("/_meta/dsh/model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+        })
+        .flatten()
+}
+
+/// Subagent attribution a forwarded child-session update carries.
+///
+/// The bridge marks every update it relays from a child session with
+/// `_meta.dsh.subagent` once the client advertises `subagent-transcript`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AcpSubagentAttribution {
+    child_session_id: Option<String>,
+    provider: Option<String>,
+    state: Option<String>,
+    stop_reason: Option<String>,
+}
+
+fn acp_subagent_attribution(update: &Value) -> Option<AcpSubagentAttribution> {
+    let subagent = update.pointer("/_meta/dsh/subagent")?;
+    let field = |key: &str| {
+        subagent
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let attribution = AcpSubagentAttribution {
+        child_session_id: field("childSessionId"),
+        provider: field("provider"),
+        state: field("state"),
+        stop_reason: field("stopReason"),
+    };
+    (attribution != AcpSubagentAttribution::default()).then_some(attribution)
+}
+
+/// The subagent lifecycle marker the bridge publishes at start and end.
+fn acp_subagent_lifecycle(update: &Value) -> Option<AcpSubagentAttribution> {
+    (update.pointer("/_meta/dsh/event").and_then(Value::as_str) == Some("subagent/lifecycle"))
+        .then(|| acp_subagent_attribution(update))
+        .flatten()
+}
+
+/// Scope one provider-native id under the child session that produced it.
+///
+/// A forwarded transcript shares the root session's id space, so a child's
+/// `messageId` or `toolCallId` can equal one of the root's. Prefixing keeps two
+/// children — or a child and its parent — from folding into one row.
+fn subagent_scoped_id(attribution: Option<&AcpSubagentAttribution>, id: &str) -> String {
+    match attribution.and_then(|attribution| attribution.child_session_id.as_deref()) {
+        Some(child) => format!("subagent:{child}:{id}"),
+        None => id.to_string(),
+    }
+}
+
+/// The Agent's id for the message one update belongs to.
+fn acp_message_id(update: &Value, subagent: Option<&AcpSubagentAttribution>) -> Option<String> {
+    update
+        .get("messageId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| subagent_scoped_id(subagent, value))
+        .map(|value| bounded_session_content(&value))
+}
+
+/// The user-facing text for one Model substitution.
+fn model_substitution_notice_text(requested: &str, effective: &str) -> String {
+    bounded_session_content(&format!(
+        "DeepSeek Harness replaced Model \"{requested}\" with \"{effective}\": the projected route no longer lists the requested Model"
+    ))
+}
+
+/// The notice text for one forwarded subagent lifecycle marker.
+fn subagent_lifecycle_notice_text(attribution: &AcpSubagentAttribution) -> Option<String> {
+    let provider = attribution.provider.as_deref().unwrap_or("subagent");
+    let child = attribution.child_session_id.as_deref().unwrap_or("unknown");
+    let text = match attribution.state.as_deref() {
+        Some("started") => format!("Subagent started: {provider} ({child})"),
+        Some("finished") => match attribution.stop_reason.as_deref() {
+            Some(reason) => format!("Subagent finished: {provider} ({child}), {reason}"),
+            None => format!("Subagent finished: {provider} ({child})"),
+        },
+        _ => return None,
+    };
+    Some(bounded_session_content(&text))
+}
+
 fn tool_call_content_summary(content: Option<&Value>) -> Option<String> {
     let items = content?.as_array()?;
     let mut parts = Vec::new();
@@ -21823,7 +22211,8 @@ mod tests {
                         "mcpServers": false
                     },
                     "_meta": {
-                        "terminal_output": false
+                        "terminal_output": false,
+                        "subagent-transcript": true
                     }
                 },
                 "clientInfo": {
@@ -24854,6 +25243,9 @@ fs_paths = {}
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_fork = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_FORK") == "true"
+advertise_inclusive_fork = (
+    os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_INCLUSIVE_FORK") == "true"
+)
 advertise_steering = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_STEERING") == "true"
 advertise_goal = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_GOAL") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
@@ -24965,6 +25357,10 @@ for line in sys.stdin:
             if "sessionCapabilities" not in capabilities:
                 capabilities["sessionCapabilities"] = {}
             capabilities["sessionCapabilities"]["fork"] = {}
+        if advertise_inclusive_fork:
+            capabilities["_meta"] = {
+                "jetbrains": {"air": {"fork": {"version": 1, "inclusive": True}}}
+            }
         if advertise_auth:
             capabilities["auth"] = {"logout": {}}
         result = {
@@ -26326,6 +26722,35 @@ for line in sys.stdin:
             self.set_control_value("prompt_mode", mode);
         }
 
+        /// Adds the inclusive fork extension env before any process spawn, so
+        /// the next initialize advertises `jetbrains.air.fork` version 1.
+        fn set_advertise_inclusive_fork(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            if config
+                .env
+                .iter()
+                .any(|entry| entry.key == "VIBEX_MOCK_ACP_ADVERTISE_INCLUSIVE_FORK")
+            {
+                return;
+            }
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_ADVERTISE_INCLUSIVE_FORK".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock inclusive fork capability".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
         /// Adds the mock fork-capability env before any process spawn, so the
         /// next initialize advertises `sessionCapabilities.fork`.
         fn set_advertise_fork(&self) {
@@ -27327,6 +27752,16 @@ for line in sys.stdin:
         runtime_switch_fixture_with_options(label, None, true).await
     }
 
+    /// A fork fixture whose mock also advertises the inclusive fork extension,
+    /// so a cut request has an Agent that can honour it.
+    async fn runtime_switch_fixture_with_inclusive_fork(
+        label: &str,
+    ) -> Option<RuntimeSwitchFixture> {
+        let fixture = runtime_switch_fixture_with_fork(label).await?;
+        fixture.fixture.set_advertise_inclusive_fork();
+        Some(fixture)
+    }
+
     async fn runtime_switch_fixture_with_model_prefix(
         label: &str,
         model_prefix: Option<&str>,
@@ -28086,6 +28521,7 @@ for line in sys.stdin:
                 })
                 .unwrap(),
             ),
+            fork_cut_message_id: None,
             fork_native_session_id: None,
             created_at_ms: unix_timestamp_ms(),
         }
@@ -30077,6 +30513,110 @@ for line in sys.stdin:
             Some("mock-forked-1")
         );
         assert_eq!(prepared.restore_result, None);
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// A mid-timeline fork asks the Agent to cut at one of its own assistant
+    /// messages: the request must carry both the source session and the
+    /// versioned extension the Agent advertised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_fresh_bridge_requests_an_inclusive_fork_cut() {
+        let Some(fixture) =
+            runtime_switch_fixture_with_inclusive_fork("fresh-bridge-inclusive-fork").await
+        else {
+            return;
+        };
+        fixture.fixture.set_control_value("fork_mode", "success");
+        let target_binding_id = RuntimeBindingId::new();
+        let mut intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        intent.fork_native_session_id = Some("mock-session-1".to_string());
+        intent.fork_cut_message_id = Some("2:1".to_string());
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+
+        let log = fixture.fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/fork"), 1);
+        let fork_request = find_logged_request(&log, "session/fork");
+        assert_eq!(fork_request["params"]["sessionId"], "mock-session-1");
+        assert_eq!(
+            fork_request["params"]["_meta"]["jetbrains"]["air"]["fork"],
+            json!({ "version": 1, "messageId": "2:1" })
+        );
+        assert_eq!(
+            prepared.binding.native_session_id.as_deref(),
+            Some("mock-forked-1")
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// An Agent that advertises only the plain fork copies the whole log, so a
+    /// cut request must be refused instead of silently forking past the app's
+    /// timeline: the fresh-session fallback runs and no `session/fork` is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_refuses_an_inclusive_cut_without_the_extension() {
+        let Some(fixture) = runtime_switch_fixture_with_fork("fresh-bridge-plain-fork-cut").await
+        else {
+            return;
+        };
+        fixture.fixture.set_control_value("fork_mode", "success");
+        let target_binding_id = RuntimeBindingId::new();
+        let mut intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        intent.fork_native_session_id = Some("mock-session-1".to_string());
+        intent.fork_cut_message_id = Some("2:1".to_string());
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+
+        let log = fixture.fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/fork"), 0);
+        assert!(logged_request_count(&log, "session/new") >= 1);
+        assert_eq!(
+            prepared.binding.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
 
         drop(fixture.manager);
         drop(fixture.bridge);
@@ -36974,5 +37514,217 @@ for line in sys.stdin:
 
         manager.delete_session(&session.id).await.unwrap();
         fixture.cleanup();
+    }
+
+    /// DeepSeek Harness 0.4.37 advertises the inclusive fork extension beside
+    /// `sessionCapabilities.fork`. Only the version this runtime implements is
+    /// accepted: an unknown one would be refused by the bridge with `-32602`
+    /// anyway, and reading it as "supported" would turn that refusal into a
+    /// failed fork after the process was already leased.
+    #[test]
+    fn inclusive_fork_extension_is_read_only_for_an_implemented_version() {
+        assert_eq!(
+            negotiated_inclusive_fork_version(&json!({
+                "agentCapabilities": {
+                    "_meta": {
+                        "dsh": { "cordis": { "protocol": 0 } },
+                        "jetbrains": { "air": { "fork": { "version": 1, "inclusive": true } } }
+                    }
+                }
+            })),
+            Some(1)
+        );
+        assert_eq!(
+            negotiated_inclusive_fork_version(&json!({
+                "agentCapabilities": {
+                    "sessionCapabilities": { "fork": {} },
+                    "_meta": { "jetbrains": { "air": { "fork": { "version": 2 } } } }
+                }
+            })),
+            None
+        );
+        assert_eq!(
+            negotiated_inclusive_fork_version(&json!({
+                "agentCapabilities": { "sessionCapabilities": { "fork": {} } }
+            })),
+            None
+        );
+        assert_eq!(negotiated_inclusive_fork_version(&json!({})), None);
+    }
+
+    /// A forwarded subagent transcript shares the root session's id space, so
+    /// the ids Vibex derives from it are scoped to the child that produced
+    /// them; an un-attributed update keeps its native id.
+    #[test]
+    fn subagent_updates_are_scoped_to_the_child_session() {
+        let forwarded = json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "2:1",
+            "content": { "type": "text", "text": "child" },
+            "_meta": {
+                "dsh": {
+                    "event": "assistant_message",
+                    "subagent": {
+                        "state": "started",
+                        "runId": "run-1",
+                        "childSessionId": "child-1",
+                        "provider": "explore",
+                        "local": true
+                    }
+                }
+            }
+        });
+        let attribution = acp_subagent_attribution(&forwarded).expect("attribution is present");
+        assert_eq!(attribution.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(attribution.provider.as_deref(), Some("explore"));
+        assert_eq!(
+            acp_message_id(&forwarded, Some(&attribution)).as_deref(),
+            Some("subagent:child-1:2:1")
+        );
+        assert_eq!(
+            subagent_scoped_id(Some(&attribution), "call-7"),
+            "subagent:child-1:call-7"
+        );
+        assert_eq!(subagent_scoped_id(None, "2:1"), "2:1");
+        assert!(acp_subagent_attribution(&json!({})).is_none());
+        assert!(acp_subagent_attribution(&json!({ "_meta": {} })).is_none());
+
+        let lifecycle = json!({
+            "sessionUpdate": "session_info_update",
+            "_meta": {
+                "dsh": {
+                    "event": "subagent/lifecycle",
+                    "subagent": {
+                        "state": "finished",
+                        "runId": "run-1",
+                        "childSessionId": "child-1",
+                        "provider": "explore",
+                        "stopReason": "completed"
+                    }
+                }
+            }
+        });
+        let finished = acp_subagent_lifecycle(&lifecycle).expect("lifecycle is present");
+        assert_eq!(
+            subagent_lifecycle_notice_text(&finished).as_deref(),
+            Some("Subagent finished: explore (child-1), completed")
+        );
+        assert!(acp_subagent_lifecycle(&forwarded).is_none());
+    }
+
+    /// A Model the Agent reports back that differs from the requested one is a
+    /// conflict for a bridge that sends the id verbatim, and an accepted
+    /// substitution for the release that documents the replacement. The gate
+    /// is the installed Adapter release, so 0.4.35 keeps the strict answer.
+    #[test]
+    fn model_substitution_is_accepted_only_from_a_release_that_substitutes() {
+        let mut process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        {
+            let process_mut = Arc::get_mut(&mut process).expect("the fixture is not shared yet");
+            process_mut.agent_id = AgentId::parse("deepseek-harness").unwrap();
+            process_mut.adapter_version = "0.4.37".to_string();
+            process_mut.shared.lock().unwrap().agent_version = Some("0.4.37".to_string());
+        }
+
+        let field = RuntimeConfigField {
+            key: CanonicalSessionConfigKey::parse("model").unwrap(),
+            kind: SessionConfigFieldKind::Model,
+            value: Some("deepseek-v4.1-flash".to_string()),
+        };
+        let plan = SessionConfigPlan::Live {
+            operation: AcpOperation::SessionSetModel,
+            encoding: AcpWireEncoding::VersionedRaw,
+            source: CapabilitySource::NegotiatedRuntime,
+            option_id: Some("model".to_string()),
+        };
+        let response = json!({ "currentModelId": "deepseek-flash" });
+
+        assert!(process.substitutes_unavailable_models());
+        assert_eq!(
+            runtime_config_substituted_model(&process, &field, &plan, &response).as_deref(),
+            Some("deepseek-flash")
+        );
+        // The same answer is not a substitution when the Agent echoes the
+        // requested Model back.
+        assert_eq!(
+            runtime_config_substituted_model(
+                &process,
+                &field,
+                &plan,
+                &json!({ "currentModelId": "deepseek-v4.1-flash" })
+            ),
+            None
+        );
+        // Nor for a field that is not the Model.
+        let mode = RuntimeConfigField {
+            key: CanonicalSessionConfigKey::parse("mode").unwrap(),
+            kind: SessionConfigFieldKind::Mode,
+            value: Some("code".to_string()),
+        };
+        assert_eq!(
+            runtime_config_substituted_model(&process, &mode, &plan, &response),
+            None
+        );
+
+        // 0.4.35 sends the requested id verbatim, so a different answer is an
+        // unexplained mismatch that must stay a conflict.
+        {
+            let process_mut = Arc::get_mut(&mut process).expect("still uniquely owned");
+            process_mut.adapter_version = "0.4.35".to_string();
+            process_mut.shared.lock().unwrap().agent_version = Some("0.4.35".to_string());
+        }
+        assert!(!process.substitutes_unavailable_models());
+        assert_eq!(
+            runtime_config_substituted_model(&process, &field, &plan, &response),
+            None
+        );
+
+        // An unmanaged install reports `unknown`, which is read the same way.
+        {
+            let process_mut = Arc::get_mut(&mut process).expect("still uniquely owned");
+            process_mut.adapter_version = "unknown".to_string();
+            process_mut.shared.lock().unwrap().agent_version = None;
+        }
+        assert!(!process.substitutes_unavailable_models());
+    }
+
+    /// The completed-message marker carries the Model the bridge actually ran,
+    /// and the marker is read before the empty-text bail-out that a streaming
+    /// bridge triggers.
+    #[test]
+    fn assistant_message_marker_reports_the_effective_model() {
+        assert_eq!(
+            assistant_message_marker_model(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "" },
+                "_meta": { "dsh": { "event": "assistant_message", "model": "deepseek-flash" } }
+            })),
+            Some("deepseek-flash")
+        );
+        assert_eq!(
+            assistant_message_marker_model(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "hi" }
+            })),
+            None
+        );
+        assert_eq!(
+            assistant_message_marker_model(&json!({
+                "_meta": { "dsh": { "event": "assistant_message", "model": "  " } }
+            })),
+            None
+        );
+        assert_eq!(
+            model_substitution_notice_text("deepseek-v4.1-flash", "deepseek-flash"),
+            "DeepSeek Harness replaced Model \"deepseek-v4.1-flash\" with \"deepseek-flash\": the projected route no longer lists the requested Model"
+        );
     }
 }

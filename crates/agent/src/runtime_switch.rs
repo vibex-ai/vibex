@@ -100,10 +100,16 @@ pub struct SwitchIntent {
     pub active_work_policy: RuntimeSwitchActiveWorkPolicy,
     pub requested_session_config: Option<serde_json::Value>,
     /// Native provider session id the initial materialization should fork
-    /// from instead of opening a fresh `session/new`. Carried only by
-    /// session-creation switches whose fork point is the tip of the source
-    /// timeline; `None` keeps the plain fresh-session path.
+    /// from instead of opening a fresh `session/new`. `None` keeps the plain
+    /// fresh-session path.
     pub fork_native_session_id: Option<String>,
+    /// The provider's own id of the assistant message a native fork keeps.
+    ///
+    /// `Some` asks the provider for an inclusive cut at that message (DeepSeek
+    /// Harness 0.4.37+); an Agent that cannot cut that way refuses the fork and
+    /// the runtime falls back to a fresh session with the app-level timeline.
+    /// `None` with a fork id copies the source's whole committed log.
+    pub fork_cut_message_id: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -136,6 +142,10 @@ impl fmt::Debug for SwitchIntent {
                 "has_fork_native_session_id",
                 &self.fork_native_session_id.is_some(),
             )
+            .field(
+                "has_fork_cut_message_id",
+                &self.fork_cut_message_id.is_some(),
+            )
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
@@ -148,6 +158,8 @@ struct DurableRequestedConfig {
     session_config: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fork_native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork_cut_message_id: Option<String>,
 }
 
 impl SwitchIntent {
@@ -195,6 +207,7 @@ impl SwitchIntent {
             active_work_policy,
             requested_session_config: durable.session_config,
             fork_native_session_id: durable.fork_native_session_id,
+            fork_cut_message_id: durable.fork_cut_message_id,
             created_at_ms: record.created_at_ms,
         })
     }
@@ -637,18 +650,20 @@ impl RuntimeSwitchCoordinator {
         target_selection: &SessionRuntimeSelection,
         session_config: Option<serde_json::Value>,
     ) -> VibexResult<serde_json::Value> {
-        Self::encode_requested_config_with_fork_origin(target_selection, session_config, None)
+        Self::encode_requested_config_with_fork_origin(target_selection, session_config, None, None)
     }
 
     pub fn encode_requested_config_with_fork_origin(
         target_selection: &SessionRuntimeSelection,
         session_config: Option<serde_json::Value>,
         fork_native_session_id: Option<String>,
+        fork_cut_message_id: Option<String>,
     ) -> VibexResult<serde_json::Value> {
         serde_json::to_value(DurableRequestedConfig {
             effective_selection: target_selection.clone(),
             session_config,
             fork_native_session_id,
+            fork_cut_message_id,
         })
         .map_err(|_| {
             VibexError::validation(
@@ -2973,6 +2988,7 @@ mod tests {
                 effective_selection: self.selection.clone(),
                 session_config: Some(serde_json::json!({"model": "model-next"})),
                 fork_native_session_id: None,
+                fork_cut_message_id: None,
             })
             .unwrap();
             let mut conn = self.connection();
@@ -4434,22 +4450,34 @@ mod tests {
             &selection,
             None,
             Some("thread-abc".to_string()),
+            Some("3:1".to_string()),
         )
         .unwrap();
         assert_eq!(encoded["forkNativeSessionId"], "thread-abc");
+        assert_eq!(encoded["forkCutMessageId"], "3:1");
 
         let durable: DurableRequestedConfig = serde_json::from_value(encoded).unwrap();
         assert_eq!(
             durable.fork_native_session_id.as_deref(),
             Some("thread-abc")
         );
+        assert_eq!(durable.fork_cut_message_id.as_deref(), Some("3:1"));
 
-        // Payloads persisted before the field existed must decode without a
-        // fork origin.
+        // Payloads persisted before the fields existed must decode without a
+        // fork origin, and a tip fork keeps carrying only the session id.
         let legacy = serde_json::json!({
             "effectiveSelection": serde_json::to_value(&selection).unwrap(),
         });
         let durable: DurableRequestedConfig = serde_json::from_value(legacy).unwrap();
         assert_eq!(durable.fork_native_session_id, None);
+        assert_eq!(durable.fork_cut_message_id, None);
+        let tip = RuntimeSwitchCoordinator::encode_requested_config_with_fork_origin(
+            &selection,
+            None,
+            Some("thread-abc".to_string()),
+            None,
+        )
+        .unwrap();
+        assert!(tip.get("forkCutMessageId").is_none());
     }
 }

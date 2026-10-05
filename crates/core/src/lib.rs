@@ -41,8 +41,10 @@ pub mod workbench;
 pub mod workspace;
 
 pub use acp_catalog::{
-    ACP_AGENT_MANUAL_VERSION, AcpAgentCatalogEntry, acp_agent_catalog_entries,
-    acp_agent_verified_version,
+    ACP_AGENT_MANUAL_VERSION, AcpAgentCatalogEntry, DEEPSEEK_HARNESS_MISTRAL_WIRE_SINCE,
+    DEEPSEEK_HARNESS_MODEL_SUBSTITUTION_SINCE, DEEPSEEK_HARNESS_SESSION_FORK_SINCE,
+    acp_agent_catalog_entries, acp_agent_verified_version, adapter_substitutes_unavailable_models,
+    adapter_version_at_least, installed_adapter_version, model_interface_available_for_adapter,
 };
 
 pub use agent::{

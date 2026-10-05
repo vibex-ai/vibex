@@ -176,31 +176,36 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "deepseek-harness",
         "DeepSeek Harness",
         "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
-        // 0.4.35 keeps reading `$DSH_HOME/settings.yaml` for its standalone
-        // default model, but its bundled runtime moved from `0.1.5` to
-        // `0.1.7`, which dropped `dsh-settings-file` and no longer derives llm
-        // routes from that file. Vibex therefore registers the projected route
-        // through the `$DSH_HOME/cordis.patch.yml` home patch the bridge
-        // composes on every launch, and keeps writing `settings.yaml` beside it
-        // so 0.4.32/0.4.33 (runtime `0.1.5`) project the same route. The
-        // bundled runtime still recognises every `api` spelling the projection
-        // writes (`openai-completions`, `openai-responses`,
-        // `anthropic-messages`). The release's moves to the Messages API and
-        // its shrunken default catalogue apply to the official
+        // 0.4.37 bundles Harness runtime `0.2.0-rc.2` (0.4.35 bundled
+        // `0.1.7-rc.2`). The runtime move changed three behaviors Vibex reads:
+        // token deltas now arrive as live `agent/assistant-stream` frames
+        // (0.4.36 taught the bridge to project them; 0.4.35 stayed silent and
+        // fell back to one whole-message chunk per step), `ask_user_question`
+        // reaches the client as standard form elicitation, and a Model that is
+        // not in the projected route catalog is substituted at session restore
+        // instead of being sent verbatim. 0.4.37 adds ACP `session/fork`,
+        // including the inclusive `jetbrains.air.fork` cut. The route is still
+        // registered through the `$DSH_HOME/cordis.patch.yml` home patch the
+        // bridge composes on every launch, with `settings.yaml` beside it for
+        // 0.4.32/0.4.33 (runtime `0.1.5`); the bundled runtime still recognises
+        // every `api` spelling the projection writes (`openai-completions`,
+        // `openai-responses`, `anthropic-messages`) and 0.2.0 additionally
+        // accepts `mistral-conversations`. The release's moves to the Messages
+        // API and its shrunken default catalogue apply to the official
         // `deepseek-official` route, which the projected route does not use.
-        "0.4.35",
+        "0.4.37",
         "https://github.com/openma-ai/deepseek-harness-acp",
         &[
             "npx",
             "-y",
-            "@openma/deepseek-harness-acp@0.4.35",
+            "@openma/deepseek-harness-acp@0.4.37",
         ],
     )
     // 0.4.33 qualifies every ACP model option id as `route::model`; Vibex keeps
     // the bare id on the wire and reads the qualified spelling back as an alias
     // so 0.4.32 keeps working. The projection floor therefore stays on 0.4.32
-    // even though the pin moved past it; that qualification is byte-identical in
-    // 0.4.35, so the floor still describes a release the alias covers.
+    // even though the pin moved past it; that qualification is byte-identical
+    // through 0.4.37, so the floor still describes a release the alias covers.
     .with_compatible_version("0.4.32"),
     AcpAgentCatalogEntry::new(
         "devin",
@@ -456,6 +461,98 @@ pub fn acp_agent_verified_version(agent_id: &str) -> Option<&'static str> {
         .filter(|version| *version != ACP_AGENT_MANUAL_VERSION)
 }
 
+/// The DeepSeek Harness bridge release whose bundled runtime substitutes a
+/// Model missing from the projected route instead of sending the id verbatim.
+///
+/// 0.4.35 (runtime `0.1.7-rc.2`) resolves the requested Model and fails the
+/// request when the route cannot serve it; 0.4.36 (runtime `0.2.0-rc.2`) picks
+/// the removed-id successor or the route's first Model and reports the
+/// substitute through its config options. A caller that reads a different
+/// Model back than it requested must therefore treat that as expected on
+/// 0.4.36+ and as an unexplained mismatch before it.
+pub const DEEPSEEK_HARNESS_MODEL_SUBSTITUTION_SINCE: &str = "0.4.36";
+
+/// The DeepSeek Harness bridge release that bundles `mistral-conversations`
+/// among the wire protocols its pi-ai gate accepts.
+///
+/// 0.4.35's runtime refuses an `api` spelling outside its compat gate, so a
+/// route projected with this protocol must fall back to a supported spelling
+/// (or refuse the projection) on older installs.
+pub const DEEPSEEK_HARNESS_MISTRAL_WIRE_SINCE: &str = "0.4.36";
+
+/// The DeepSeek Harness bridge release that advertises ACP `session/fork`,
+/// including the inclusive `jetbrains.air.fork` cut. 0.4.35 advertises only
+/// `session/list` and `session/resume`.
+pub const DEEPSEEK_HARNESS_SESSION_FORK_SINCE: &str = "0.4.37";
+
+/// The installed release of an Agent, when its Adapter is the Agent itself.
+///
+/// DeepSeek Harness ships its ACP bridge as the Agent, so a managed install
+/// records the release in `agent_version` while `adapter_version` stays empty.
+/// An explicit Adapter version wins when both are present.
+pub fn installed_adapter_version<'a>(
+    adapter_version: Option<&'a str>,
+    agent_version: Option<&'a str>,
+) -> Option<&'a str> {
+    let usable = |value: Option<&'a str>| value.map(str::trim).filter(|value| !value.is_empty());
+    usable(adapter_version).or_else(|| usable(agent_version))
+}
+
+/// Whether an installed Agent release is at least `minimum`.
+///
+/// `None` (an unknown or manually installed Agent) is never at least anything:
+/// a release-gated capability must be proven by a version Vibex can read. A
+/// malformed version is likewise refused rather than assumed current.
+pub fn adapter_version_at_least(version: Option<&str>, minimum: &str) -> bool {
+    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let (Ok(version), Ok(minimum)) = (
+        semver::Version::parse(version),
+        semver::Version::parse(minimum),
+    ) else {
+        return false;
+    };
+    version >= minimum
+}
+
+/// Whether one declared Model interface is available on an exact Agent release.
+///
+/// Interfaces that a newer bridge introduced must not be offered to — or
+/// projected onto — an older installation: the bundled runtime validates the
+/// complete route, so an unknown `api` spelling makes it refuse the route
+/// rather than ignore the field.
+pub fn model_interface_available_for_adapter(
+    agent_id: &str,
+    wire_protocol_id: &str,
+    adapter_version: Option<&str>,
+    agent_version: Option<&str>,
+) -> bool {
+    match (agent_id, wire_protocol_id) {
+        ("deepseek-harness", crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS) => {
+            adapter_version_at_least(
+                installed_adapter_version(adapter_version, agent_version),
+                DEEPSEEK_HARNESS_MISTRAL_WIRE_SINCE,
+            )
+        }
+        _ => true,
+    }
+}
+
+/// Whether an Agent release substitutes a Model that the projected route no
+/// longer lists.
+pub fn adapter_substitutes_unavailable_models(
+    agent_id: &str,
+    adapter_version: Option<&str>,
+    agent_version: Option<&str>,
+) -> bool {
+    agent_id == "deepseek-harness"
+        && adapter_version_at_least(
+            installed_adapter_version(adapter_version, agent_version),
+            DEEPSEEK_HARNESS_MODEL_SUBSTITUTION_SINCE,
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -501,11 +598,11 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "deepseek-harness")
             .unwrap();
-        assert_eq!(deepseek.version, "0.4.35");
+        assert_eq!(deepseek.version, "0.4.37");
         assert_eq!(deepseek.compatible_version, Some("0.4.32"));
         assert_eq!(
             deepseek.command,
-            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.35"]
+            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.37"]
         );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
@@ -514,7 +611,7 @@ mod tests {
     fn verified_versions_skip_agents_vibex_does_not_pin() {
         assert_eq!(
             acp_agent_verified_version("deepseek-harness"),
-            Some("0.4.35")
+            Some("0.4.37")
         );
         assert_eq!(acp_agent_verified_version("gemini"), Some("0.62.0"));
         assert_eq!(acp_agent_verified_version("devin"), None);
@@ -572,5 +669,94 @@ mod tests {
                 entry.version
             );
         }
+    }
+
+    /// DeepSeek Harness behavior changes travel with the bundled Harness
+    /// runtime, so each release gate must sit on the bridge version that first
+    /// shipped it and must refuse an unknown or malformed release instead of
+    /// assuming the newest behavior.
+    #[test]
+    fn deepseek_harness_release_gates_follow_the_bundled_runtime() {
+        // 0.4.35 is the last release on runtime 0.1.7-rc.2: the bridge sends
+        // the requested Model verbatim, refuses a `mistral-conversations`
+        // route, and advertises no `session/fork`.
+        assert!(!adapter_substitutes_unavailable_models(
+            "deepseek-harness",
+            None,
+            Some("0.4.35")
+        ));
+        assert!(!model_interface_available_for_adapter(
+            "deepseek-harness",
+            crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
+            None,
+            Some("0.4.35")
+        ));
+        assert!(!adapter_version_at_least(
+            Some("0.4.35"),
+            DEEPSEEK_HARNESS_SESSION_FORK_SINCE
+        ));
+
+        // 0.4.36 moved to runtime 0.2.0-rc.2: substitution and the Mistral
+        // protocol arrive, fork does not.
+        assert!(adapter_substitutes_unavailable_models(
+            "deepseek-harness",
+            None,
+            Some("0.4.36")
+        ));
+        assert!(model_interface_available_for_adapter(
+            "deepseek-harness",
+            crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
+            None,
+            Some("0.4.36")
+        ));
+        assert!(!adapter_version_at_least(
+            Some("0.4.36"),
+            DEEPSEEK_HARNESS_SESSION_FORK_SINCE
+        ));
+
+        // 0.4.37 adds the negotiated fork surface.
+        assert!(adapter_version_at_least(
+            Some("0.4.37"),
+            DEEPSEEK_HARNESS_SESSION_FORK_SINCE
+        ));
+        // An explicit Adapter version wins over the Agent version, which is
+        // how a manually installed bridge under a newer Agent is read.
+        assert!(adapter_substitutes_unavailable_models(
+            "deepseek-harness",
+            Some("0.4.37"),
+            Some("0.4.35")
+        ));
+        assert!(!adapter_substitutes_unavailable_models(
+            "deepseek-harness",
+            Some("0.4.35"),
+            Some("0.4.37")
+        ));
+
+        // A release Vibex cannot read proves nothing, and neither does another
+        // Agent's version.
+        assert!(!adapter_version_at_least(None, "0.4.36"));
+        assert!(!adapter_version_at_least(Some("  "), "0.4.36"));
+        assert!(!adapter_version_at_least(Some("not-a-version"), "0.4.36"));
+        assert!(!adapter_substitutes_unavailable_models(
+            "claude",
+            None,
+            Some("9.9.9")
+        ));
+        assert!(model_interface_available_for_adapter(
+            "claude",
+            crate::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS,
+            None,
+            None
+        ));
+
+        assert_eq!(
+            installed_adapter_version(None, Some("0.4.37")),
+            Some("0.4.37")
+        );
+        assert_eq!(
+            installed_adapter_version(Some("0.4.36"), Some("0.4.37")),
+            Some("0.4.36")
+        );
+        assert_eq!(installed_adapter_version(None, None), None);
     }
 }

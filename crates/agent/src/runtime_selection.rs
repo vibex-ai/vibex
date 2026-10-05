@@ -181,9 +181,15 @@ impl RuntimeSelectionService {
         session_id: &VibexSessionId,
         desired: SessionRuntimeSelection,
         fork_native_session_id: Option<String>,
+        fork_cut_message_id: Option<String>,
     ) -> VibexResult<AgentSessionRuntimeSelectionState> {
         let record = self
-            .enqueue_initial_runtime_switch(session_id, desired, fork_native_session_id)
+            .enqueue_initial_runtime_switch(
+                session_id,
+                desired,
+                fork_native_session_id,
+                fork_cut_message_id,
+            )
             .await?;
         let outcome = self
             .inner
@@ -210,9 +216,15 @@ impl RuntimeSelectionService {
         session_id: &VibexSessionId,
         desired: SessionRuntimeSelection,
         fork_native_session_id: Option<String>,
+        fork_cut_message_id: Option<String>,
     ) -> VibexResult<AgentSessionRuntimeSelectionState> {
         let record = self
-            .enqueue_initial_runtime_switch(session_id, desired, fork_native_session_id)
+            .enqueue_initial_runtime_switch(
+                session_id,
+                desired,
+                fork_native_session_id,
+                fork_cut_message_id,
+            )
             .await?;
         let event = self.emit_authoritative(session_id)?;
         self.start_watcher(&record)?;
@@ -224,6 +236,7 @@ impl RuntimeSelectionService {
         session_id: &VibexSessionId,
         desired: SessionRuntimeSelection,
         fork_native_session_id: Option<String>,
+        fork_cut_message_id: Option<String>,
     ) -> VibexResult<RuntimeSwitchRecord> {
         let resolved = self
             .inner
@@ -235,6 +248,7 @@ impl RuntimeSelectionService {
                 &resolved.selection,
                 resolved.session_config,
                 fork_native_session_id,
+                fork_cut_message_id,
             )?;
         // A brand new session materializes through this durable intent, so a
         // transient write race must not fail session creation.
@@ -1700,7 +1714,7 @@ mod tests {
 
         let ready = env
             .service
-            .initialize_new_session(&session.id, env.effective.clone(), None)
+            .initialize_new_session(&session.id, env.effective.clone(), None, None)
             .await
             .unwrap();
         assert_eq!(ready.status, SessionRuntimeSelectionStatus::Ready);
@@ -1728,7 +1742,7 @@ mod tests {
 
         let preparing = env
             .service
-            .initialize_new_session_deferred(&session_id, env.effective.clone(), None)
+            .initialize_new_session_deferred(&session_id, env.effective.clone(), None, None)
             .await
             .unwrap();
         assert_eq!(preparing.status, SessionRuntimeSelectionStatus::Preparing);
@@ -1778,7 +1792,7 @@ mod tests {
 
         let record = env
             .service
-            .enqueue_initial_runtime_switch(&session_id, env.effective.clone(), None)
+            .enqueue_initial_runtime_switch(&session_id, env.effective.clone(), None, None)
             .await
             .unwrap();
         let now = unix_timestamp_ms();
@@ -1830,7 +1844,7 @@ mod tests {
 
         let record = env
             .service
-            .enqueue_initial_runtime_switch(&session_id, env.effective.clone(), None)
+            .enqueue_initial_runtime_switch(&session_id, env.effective.clone(), None, None)
             .await
             .unwrap();
         let mut conn = open_database(&env.db_path).unwrap();

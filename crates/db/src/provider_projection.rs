@@ -1756,6 +1756,9 @@ fn legacy_wire_protocol(
         Some(ProviderModelWireApi::OpenaiResponses) => WIRE_PROTOCOL_OPENAI_RESPONSES,
         Some(ProviderModelWireApi::OpenaiChatCompletions) => WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
         Some(ProviderModelWireApi::AnthropicMessages) => WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+        Some(ProviderModelWireApi::MistralConversations) => {
+            vibex_core::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS
+        }
         Some(ProviderModelWireApi::GoogleGenerativeAi) => {
             vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI
         }

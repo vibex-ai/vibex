@@ -22606,6 +22606,7 @@ fn provider_wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'stat
         vibex_core::ProviderModelWireApi::OpenaiResponses => "OpenAI Responses",
         vibex_core::ProviderModelWireApi::OpenaiChatCompletions => "Chat Completions",
         vibex_core::ProviderModelWireApi::AnthropicMessages => "Anthropic Messages",
+        vibex_core::ProviderModelWireApi::MistralConversations => "Mistral Conversations",
         vibex_core::ProviderModelWireApi::GoogleGenerativeAi => "Google Generative AI",
         vibex_core::ProviderModelWireApi::GoogleVertex => "Google Vertex AI",
         vibex_core::ProviderModelWireApi::AwsBedrockConverse => "AWS Bedrock Converse",

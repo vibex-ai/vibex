@@ -317,6 +317,16 @@ enum InitialRuntimeMaterialization {
     Deferred,
 }
 
+/// Native provider fork carried into a session-creation switch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionForkOrigin {
+    /// Source provider session id. `None` keeps the plain fresh-session path.
+    native_session_id: Option<String>,
+    /// Provider message id to cut at when the caller asked for a mid-timeline
+    /// fork. `None` copies the source's whole committed log.
+    cut_message_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextBridgeTurnBehavior {
     ConsumePending,
@@ -892,7 +902,7 @@ impl AgentManager {
             |_| {},
             InitialRuntimeMaterialization::WaitForReady,
             Some(session_id),
-            None,
+            SessionForkOrigin::default(),
         )
         .await
     }
@@ -911,7 +921,7 @@ impl AgentManager {
             |_| {},
             InitialRuntimeMaterialization::Deferred,
             None,
-            None,
+            SessionForkOrigin::default(),
         )
         .await
     }
@@ -927,7 +937,7 @@ impl AgentManager {
             |_| {},
             InitialRuntimeMaterialization::Deferred,
             Some(session_id),
-            None,
+            SessionForkOrigin::default(),
         )
         .await
     }
@@ -937,8 +947,13 @@ impl AgentManager {
         request: CreateAgentSessionRequest,
         initial_timeline: Vec<TimelineAppend>,
     ) -> VibexResult<AgentSession> {
-        self.create_session_with_timeline_callback(request, initial_timeline, |_| {}, None)
-            .await
+        self.create_session_with_timeline_callback(
+            request,
+            initial_timeline,
+            |_| {},
+            SessionForkOrigin::default(),
+        )
+        .await
     }
 
     async fn create_session_with_timeline_callback<F>(
@@ -946,7 +961,7 @@ impl AgentManager {
         request: CreateAgentSessionRequest,
         initial_timeline: Vec<TimelineAppend>,
         on_created: F,
-        fork_native_session_id: Option<String>,
+        fork: SessionForkOrigin,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -957,7 +972,7 @@ impl AgentManager {
             on_created,
             InitialRuntimeMaterialization::WaitForReady,
             None,
-            fork_native_session_id,
+            fork,
         )
         .await
     }
@@ -969,7 +984,7 @@ impl AgentManager {
         on_created: F,
         materialization: InitialRuntimeMaterialization,
         requested_session_id: Option<VibexSessionId>,
-        fork_native_session_id: Option<String>,
+        fork: SessionForkOrigin,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -1111,12 +1126,22 @@ impl AgentManager {
         let initialization = match materialization {
             InitialRuntimeMaterialization::WaitForReady => {
                 runtime_selection
-                    .initialize_new_session(&session.id, desired, fork_native_session_id)
+                    .initialize_new_session(
+                        &session.id,
+                        desired,
+                        fork.native_session_id.clone(),
+                        fork.cut_message_id.clone(),
+                    )
                     .await
             }
             InitialRuntimeMaterialization::Deferred => {
                 runtime_selection
-                    .initialize_new_session_deferred(&session.id, desired, fork_native_session_id)
+                    .initialize_new_session_deferred(
+                        &session.id,
+                        desired,
+                        fork.native_session_id.clone(),
+                        fork.cut_message_id.clone(),
+                    )
                     .await
             }
         };
@@ -1231,23 +1256,37 @@ impl AgentManager {
         } else {
             TimelineRepository::fetch_range(&conn, &source.id, 1, request.through_sequence)?
         };
-        // A native provider fork (ACP `session/fork`) copies the provider's
-        // live context, so it can only express a fork point at the tip of the
-        // source timeline. Mid-timeline forks keep the fresh-session fallback.
-        let fork_native_session_id = if request.through_sequence == source_end_sequence {
-            runtime_state
-                .current_binding_id
-                .as_ref()
-                .and_then(|binding_id| {
-                    RuntimeBindingRepository::get(&conn, binding_id)
-                        .ok()
-                        .flatten()
-                })
-                .and_then(|binding| binding.native_session_id)
-                .filter(|native| !native.trim().is_empty())
-        } else {
-            None
+        let native_session_id = runtime_state
+            .current_binding_id
+            .as_ref()
+            .and_then(|binding_id| {
+                RuntimeBindingRepository::get(&conn, binding_id)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|binding| binding.native_session_id)
+            .filter(|native| !native.trim().is_empty());
+        // A tip fork copies the provider's whole committed log. A mid-timeline
+        // fork can only stay consistent when the provider cuts at one of its
+        // own assistant messages, so the copy is anchored to the last streamed
+        // message at or before the requested sequence. An Agent that cannot cut
+        // there refuses the fork and the fresh-session path below runs instead;
+        // without a message id the request never asks for a cut at all.
+        let fork_cut = (native_session_id.is_some()
+            && request.through_sequence != source_end_sequence)
+            .then(|| fork_cut_point(&source_items, request.through_sequence))
+            .flatten();
+        let (source_items, fork_cut_message_id) = match fork_cut {
+            Some((sequence, message_id)) => (
+                source_items
+                    .into_iter()
+                    .filter(|item| item.sequence <= sequence)
+                    .collect::<Vec<_>>(),
+                Some(message_id),
+            ),
+            None => (source_items, None),
         };
+        let fork_native_session_id = native_session_id;
         drop(conn);
 
         self.create_session_with_timeline_callback(
@@ -1262,7 +1301,10 @@ impl AgentManager {
             },
             fork_timeline_appends(&source_items),
             on_created,
-            fork_native_session_id,
+            SessionForkOrigin {
+                native_session_id: fork_native_session_id,
+                cut_message_id: fork_cut_message_id,
+            },
         )
         .await
     }
@@ -2167,7 +2209,7 @@ impl AgentManager {
                 )
             })?;
         runtime_selection
-            .initialize_new_session(session_id, desired, None)
+            .initialize_new_session(session_id, desired, None, None)
             .await?;
         let conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
@@ -5348,6 +5390,30 @@ fn should_coalesce_provider_event(event: &ProviderEvent) -> bool {
         }
 }
 
+/// The last assistant segment at or before `through_sequence` that belongs to
+/// one provider message, as `(sequence, message id)`.
+///
+/// Only a segment the provider identified carries a correlation id, so an
+/// Agent whose chunks are anonymous yields `None` and the fork keeps the
+/// fresh-session path.
+fn fork_cut_point(items: &[TimelineItem], through_sequence: i64) -> Option<(i64, String)> {
+    items
+        .iter()
+        .rev()
+        .filter(|item| item.sequence <= through_sequence)
+        .find_map(|item| {
+            let assistant_segment = matches!(
+                &item.payload,
+                TimelinePayload::AgentMessageDelta(_) | TimelinePayload::Reasoning(_)
+            );
+            assistant_segment
+                .then(|| item.provider_correlation_id.clone())
+                .flatten()
+                .filter(|message_id| !message_id.trim().is_empty())
+                .map(|message_id| (item.sequence, message_id))
+        })
+}
+
 fn fork_timeline_appends(items: &[TimelineItem]) -> Vec<TimelineAppend> {
     items
         .iter()
@@ -5367,6 +5433,8 @@ fn fork_timeline_appends(items: &[TimelineItem]) -> Vec<TimelineAppend> {
             payload: item.payload.clone(),
             timestamp_ms: Some(item.timestamp_ms),
             correlation_id: None,
+            // Provider ids name rows in the source provider session; a fork's
+            // own turns publish their own, so the copy carries none.
             provider_correlation_id: None,
             redaction_state: item.redaction_state,
             execution_attribution: None,
@@ -7898,6 +7966,65 @@ mod tests {
         assert!(projected.iter().all(|item| item.correlation_id.is_none()
             && item.provider_correlation_id.is_none()
             && item.execution_attribution.is_none()));
+    }
+
+    /// A mid-timeline fork anchors its copy — and any native cut request — to
+    /// the last streamed assistant segment at or before the requested
+    /// sequence. An anonymous segment yields no cut, and a tip fork never asks
+    /// for one.
+    #[test]
+    fn fork_cut_point_anchors_to_the_last_identified_assistant_segment() {
+        let session_id = VibexSessionId::new();
+        let segment =
+            |sequence: i64, payload: TimelinePayload, correlation: Option<&str>| TimelineItem {
+                id: vibex_core::TimelineItemId::parse(format!("timeline_cut_{sequence}")).unwrap(),
+                session_id: session_id.clone(),
+                sequence,
+                timestamp_ms: 100 + sequence,
+                source: TimelineSource::Agent,
+                kind: payload.kind(),
+                correlation_id: None,
+                provider_correlation_id: correlation.map(str::to_string),
+                redaction_state: TimelineRedactionState::None,
+                execution_attribution: None,
+                payload,
+            };
+        let delta = |text: &str| {
+            TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                text_delta: text.to_string(),
+                chunk_index: 0,
+                phase: None,
+            })
+        };
+        let tool = TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+            tool_call_id: "tool-1".to_string(),
+            tool_name: "bash".to_string(),
+            status: vibex_core::ToolCallStatus::Completed,
+            summary: "ran".to_string(),
+            input_summary: None,
+            output_summary: None,
+            raw_extension: None,
+        });
+        let items = vec![
+            segment(1, delta("one"), Some("1:1")),
+            segment(2, tool.clone(), None),
+            segment(3, delta("two"), Some("1:2")),
+            segment(4, delta("three"), None),
+        ];
+
+        assert_eq!(
+            fork_cut_point(&items, 4),
+            Some((3, "1:2".to_string())),
+            "the last identified segment wins even past an anonymous one"
+        );
+        assert_eq!(fork_cut_point(&items, 3), Some((3, "1:2".to_string())));
+        assert_eq!(fork_cut_point(&items, 2), Some((1, "1:1".to_string())));
+        assert_eq!(fork_cut_point(&items, 0), None);
+
+        let anonymous = vec![segment(1, delta("one"), None)];
+        assert_eq!(fork_cut_point(&anonymous, 1), None);
+        let empty: Vec<TimelineItem> = Vec::new();
+        assert_eq!(fork_cut_point(&empty, 4), None);
     }
 
     #[test]

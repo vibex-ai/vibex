@@ -402,6 +402,21 @@ impl ProviderEvent {
         }
     }
 
+    /// One Agent event carrying the provider-native id it belongs to.
+    ///
+    /// A streamed segment keeps the Agent's own message id so a later
+    /// operation — a native session fork at that exact message — can name the
+    /// durable row again.
+    pub fn agent_with_correlation(
+        payload: TimelinePayload,
+        provider_correlation_id: Option<String>,
+    ) -> Self {
+        Self {
+            provider_correlation_id,
+            ..Self::agent(payload)
+        }
+    }
+
     pub fn provider(payload: TimelinePayload) -> Self {
         Self {
             source: TimelineSource::Provider,
