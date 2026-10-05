@@ -226,12 +226,12 @@ Rules that make this work:
   carries the transcript rect, a `ListRegion` (rect, scope, row count, first
   line), the composer's text rows, the queue band, the dock, the turn rail's
   ticks, the shortcut band's hints with their intents, the banner and a modal's
-  close control. A band that can disappear without a repaint clearing the field
-  (the dock) is reset to `None` by its renderer's caller, so a closed panel
-  cannot keep a stale hit rect. Every one of them is written by the renderer that drew it, because
-  only that code knows where the band landed; `run.rs` does nothing but
-  hit-test. A click on a hint runs the intent its key would run, so the mouse
-  cannot grow a second, divergent command set.
+  close control. Every one of them is written by the renderer that drew it,
+  because only that code knows where the band landed, and every one of them is
+  dropped by `FrameRegions::begin_frame` with the frame that drew it, so a closed
+  panel or a modal that has left cannot keep a stale hit rect; `run.rs` does
+  nothing but hit-test. A click on a hint runs the intent its key would run, so
+  the mouse cannot grow a second, divergent command set.
 * **The banner row has one owner.** `BannerPriority` orders the claimants
   (transient < tip < mode < warning); `App::set_banner` refuses to displace a
   higher-priority message, and `refresh_banner` re-derives the row from the
@@ -299,9 +299,10 @@ Rules that follow:
   always two columns and every spinner frame always one, so a degradation never
   shifts the layout.
 * **A frame's click regions are per-frame.** A rect describes where something
-  was when the frame drew it, so the lists the frame rewrites — the turn ticks
-  and the shortcut hints — are cleared at the start of every frame. A list that
-  only grows leaks memory and lets a click land on a row that has moved or gone.
+  was when the frame drew it, so `FrameRegions::begin_frame` drops all of them:
+  the turn ticks and shortcut hints, the list, the banner, the composer's box and
+  the modal's close control. One that outlives its control lets a click land on a
+  row that has moved or gone — or answer a surface that is no longer drawn.
 * **A scroll offset is clamped to the transcript, not to itself.** The bottom is
   the last row of content at the last row of the viewport, and it is measured
   against the band the frame actually drew — the bands above and below take

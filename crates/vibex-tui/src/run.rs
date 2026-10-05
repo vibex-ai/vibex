@@ -2696,6 +2696,55 @@ mod tests {
         );
     }
 
+    /// The composer's box belongs to the pages that draw one: a click where it
+    /// used to be must not take the keyboard for a box nobody can see.
+    #[test]
+    fn a_composer_rect_dies_with_the_page_that_drew_it() {
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        conversation_frame(&mut app, 100, 30);
+        let composer = app
+            .regions
+            .composer
+            .expect("the session page drew no composer");
+
+        // The settings page has no composer, so the box goes with the page.
+        app.navigate_to(Page::Settings);
+        conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.regions.composer.is_none() && app.regions.composer_band.is_none(),
+            "the composer's box outlived the page that drew it"
+        );
+        assert_eq!(app.focus, Focus::Main);
+
+        // The click lands on the row the box used to start on, which no other
+        // control the page published covers.
+        let cell = (composer.x + 1, composer.y);
+        assert!(
+            !app.regions
+                .hints
+                .iter()
+                .any(|(rect, _)| rect_contains(*rect, cell.0, cell.1)),
+            "the test clicked a control the page drew"
+        );
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: cell.0,
+                row: cell.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Main,
+            "a composer that is gone took the keyboard"
+        );
+    }
+
     #[test]
     fn mouse_opens_a_group_and_keyboard_skips_its_folded_members() {
         use crate::action::Intent;

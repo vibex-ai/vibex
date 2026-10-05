@@ -1014,13 +1014,17 @@ impl FrameRegions {
         self.turns.clear();
         self.hints.clear();
         self.runtime_picker = None;
-        // A list, a banner row and a modal's close affordance each belong to
-        // the frame that drew them: left standing, the session list's rect
-        // would hit-test transcript rows instead, and a modal that has closed
-        // would still answer a click where its close used to be.
+        // A list, a banner row, a composer's box and a modal's close affordance
+        // each belong to the frame that drew them: left standing, the session
+        // list's rect would hit-test transcript rows instead, a modal that has
+        // closed would still answer a click where its close used to be, and a
+        // composer nobody can see would take the keyboard.
         self.list = None;
         self.banner = None;
         self.modal_close = None;
+        self.composer = None;
+        self.composer_band = None;
+        self.composer_scroll = 0;
     }
 }
 
