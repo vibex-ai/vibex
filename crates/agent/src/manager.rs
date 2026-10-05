@@ -27,14 +27,15 @@ use vibex_core::{
     ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest, RetryPhase,
-    RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SteerAgentMessageRequest, SteerAgentMessageResult,
-    SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
-    TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
-    TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessageDelivery,
-    UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
-    agent_id_for_provider_kind, agent_session_turn_requires_continuation,
-    builtin_agent_definitions, latest_timeline_turn_ended_normally, normalize_agent_session_title,
+    RuntimeLeaseRole, RuntimeModelSelection, SESSION_INITIALIZING_NOTICE, SendAgentMessageRequest,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SteerAgentMessageRequest,
+    SteerAgentMessageResult, SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload,
+    TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
+    TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
+    UsageExecutionId, UserMessageDelivery, UserMessagePayload, VibexError, VibexResult,
+    VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
+    agent_session_turn_requires_continuation, builtin_agent_definitions,
+    latest_timeline_turn_ended_normally, normalize_agent_session_title, turn_startup_notice,
     unix_timestamp_ms,
 };
 use vibex_db::{
@@ -1091,7 +1092,7 @@ impl AgentManager {
         self.append_system_notice(
             &mut conn,
             &session.id,
-            "Agent session is initializing",
+            SESSION_INITIALIZING_NOTICE,
             SystemNoticeLevel::Info,
         )?;
         drop(conn);
@@ -4590,16 +4591,7 @@ impl AgentManager {
             &capabilities,
         )?;
         let provider_label = provider_display_name(ProviderKind::Acp);
-        let message = match resource_summary {
-            Some(summary) => {
-                format!(
-                    "Starting {provider_label} agent runtime; preparing context with {summary}; waiting for first response..."
-                )
-            }
-            None => {
-                format!("Starting {provider_label} agent runtime; waiting for first response...")
-            }
-        };
+        let message = turn_startup_notice(provider_label, resource_summary.as_deref());
 
         Ok(vec![self.append_timeline_item(
             conn,

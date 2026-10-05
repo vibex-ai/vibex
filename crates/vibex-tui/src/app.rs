@@ -4890,7 +4890,19 @@ pub fn row_is_rendered(row: &TimelineRow) -> bool {
             | vibex_desktop_model::TimelineRowKind::Plan
             | vibex_desktop_model::TimelineRowKind::PermissionResolution
             | vibex_desktop_model::TimelineRowKind::ElicitationResolution
-    )
+    ) && !is_runtime_startup_notice(row)
+}
+
+/// Whether a row is the runtime announcing its own startup.
+///
+/// A session appends one as it is created and a turn appends one as it starts
+/// its provider. They stand for work the turn line above the composer is
+/// already drawing, and in the transcript they are read as the opening words of
+/// a conversation that has not started — so the reader pays a row for them and
+/// learns nothing.
+fn is_runtime_startup_notice(row: &TimelineRow) -> bool {
+    row.kind == vibex_desktop_model::TimelineRowKind::SystemNotice
+        && vibex_core::is_runtime_startup_message(&row.body)
 }
 
 /// Project one authoritative `TimelineRow` into a transcript block.
@@ -5676,5 +5688,66 @@ mod tests {
             vibex_backend::CapabilityAvailability::Offline
         );
         let _ = DomainCapabilities::unavailable();
+    }
+
+    /// The row one timeline payload projects to, so the test reads the same
+    /// projection the transcript does.
+    fn projected_row(payload: vibex_core::TimelinePayload) -> TimelineRow {
+        let item = vibex_core::TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: vibex_core::VibexSessionId::new(),
+            sequence: 1,
+            timestamp_ms: 1,
+            source: vibex_core::TimelineSource::System,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        };
+        vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
+            .into_iter()
+            .next()
+            .expect("a payload projects to a row")
+    }
+
+    fn notice_row(message: String) -> TimelineRow {
+        projected_row(vibex_core::TimelinePayload::SystemNotice(
+            vibex_core::SystemNoticePayload {
+                level: vibex_core::SystemNoticeLevel::Info,
+                message,
+            },
+        ))
+    }
+
+    #[test]
+    fn the_runtime_starting_up_is_not_a_line_in_the_transcript() {
+        // The rows a session writes before it has said anything: that it is
+        // being created, and that a turn is starting its runtime. Each is a row
+        // the reader pays for a sentence the line above the composer already
+        // says.
+        for message in [
+            vibex_core::SESSION_INITIALIZING_NOTICE.to_string(),
+            vibex_core::turn_startup_notice("ACP", Some("2 MCP servers")),
+            vibex_core::turn_startup_notice("Claude", None),
+        ] {
+            assert!(
+                !row_is_rendered(&notice_row(message.clone())),
+                "{message} earned a line"
+            );
+        }
+
+        // A notice that carries something the reader has to know keeps its row,
+        // and a body that merely shares the wording is not a notice at all.
+        assert!(row_is_rendered(&notice_row(
+            "Imported 3 local sessions as read-only".to_string()
+        )));
+        assert!(row_is_rendered(&projected_row(
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: vibex_core::turn_startup_notice("ACP", None),
+                is_final: true,
+            })
+        )));
     }
 }

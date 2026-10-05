@@ -533,54 +533,60 @@ impl Transcript {
         }
     }
 
-    /// How many turns the transcript contains.
+    /// The block that opens each turn, in conversation order.
     ///
-    /// A turn is a run of blocks sharing a `turn_id`; blocks without one are
-    /// grouped into a single implicit turn so the rail always has an answer.
-    pub fn turn_count(&self) -> usize {
-        let mut seen: Vec<&str> = Vec::new();
-        for block in &self.blocks {
-            let key = block.turn_id.as_deref().unwrap_or("");
-            if !seen.contains(&key) {
-                seen.push(key);
+    /// A turn is one the reader opened. The projection attributes runs of
+    /// blocks to a turn, and a run counts when the message that began the
+    /// conversation is in it: the runtime also writes rows of its own — the
+    /// lines a session appends as it starts up, the hidden continuation that
+    /// follows a failed turn — and a run with no message in it is that work,
+    /// not a turn the reader took. Counting those put a tick on the rail for a
+    /// conversation that had not begun, and one more for every restart.
+    ///
+    /// The rail needs the head rather than the turn's key: the send the runtime
+    /// has not echoed yet carries no key at all, and it is a turn of the
+    /// conversation from the moment it is drawn.
+    fn turn_heads(&self) -> Vec<usize> {
+        let mut heads: Vec<usize> = Vec::new();
+        let mut head: Option<usize> = None;
+        let mut key: Option<&str> = None;
+        for (index, block) in self.blocks.iter().enumerate() {
+            let block_key = block.turn_id.as_deref();
+            if index > 0 && block_key != key {
+                heads.extend(head.take());
+            }
+            key = block_key;
+            if head.is_none() && block.kind == TimelineRowKind::UserMessage {
+                head = Some(index);
             }
         }
-        seen.len().max(usize::from(!self.blocks.is_empty()))
+        heads.extend(head);
+        heads
+    }
+
+    /// How many turns the transcript contains.
+    pub fn turn_count(&self) -> usize {
+        self.turn_heads().len()
     }
 
     /// The turn the viewport top is on, for the rail's current-tick marker.
+    ///
+    /// A row that belongs to no turn of its own reads as the turn above it: a
+    /// notice between turns is the tail of the turn it follows, and a
+    /// continuation is more of the turn that failed before it. Above the first
+    /// turn there is nothing to mark, and no tick wears the marker.
     pub fn active_turn(&mut self) -> Option<usize> {
         self.ensure_layout();
         let offset = self.scroll_offset;
         let index = self.block_at_line(offset)?;
-        let key = self.blocks.get(index)?.turn_id.clone();
-        let mut turn = 0usize;
-        let mut seen: Vec<Option<String>> = Vec::new();
-        for block in &self.blocks {
-            if !seen.contains(&block.turn_id) {
-                if block.turn_id == key {
-                    return Some(turn);
-                }
-                seen.push(block.turn_id.clone());
-                turn += 1;
-            }
-        }
-        Some(0)
+        self.turn_heads()
+            .partition_point(|head| *head <= index)
+            .checked_sub(1)
     }
 
-    /// The first block of the `turn`-th turn, for a click on the rail.
+    /// The block that opens the `turn`-th turn, for a click on the rail.
     pub fn block_of_turn(&self, turn: usize) -> Option<usize> {
-        let mut seen: Vec<Option<&str>> = Vec::new();
-        for (index, block) in self.blocks.iter().enumerate() {
-            let key = block.turn_id.as_deref();
-            if !seen.contains(&key) {
-                if seen.len() == turn {
-                    return Some(index);
-                }
-                seen.push(key);
-            }
-        }
-        None
+        self.turn_heads().get(turn).copied()
     }
 
     /// The line offset the viewport currently starts at.
@@ -3200,6 +3206,92 @@ mod tests {
                 "a row overflowed the chrome: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_turn_is_one_the_reader_opened() {
+        // The runtime writes rows of its own: a session's startup line lands
+        // before anyone has spoken, and the hidden continuation that follows a
+        // failed turn gets a turn id of its own from the projection. Neither is
+        // a turn the reader took — counting them put a tick on the rail for a
+        // conversation that had not started, and one more for every restart.
+        let notice = |id: &str, body: &str| {
+            let mut entry = block(id, TimelineRowKind::SystemNotice, body);
+            entry.turn_id = None;
+            entry
+        };
+        let turn_block = |id: &str, kind: TimelineRowKind, body: &str, turn: &str| {
+            let mut entry = block(id, kind, body);
+            entry.turn_id = Some(turn.to_string());
+            entry
+        };
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(vec![
+            notice("startup", "Agent session is initializing"),
+            turn_block(
+                "u1",
+                TimelineRowKind::UserMessage,
+                "the first question",
+                "turn-1",
+            ),
+            turn_block(
+                "a1",
+                TimelineRowKind::AgentMessage,
+                "the first answer",
+                "turn-1",
+            ),
+            notice("compaction", "Context compacted"),
+            turn_block(
+                "u2",
+                TimelineRowKind::UserMessage,
+                "the second question",
+                "turn-2",
+            ),
+            turn_block(
+                "a2",
+                TimelineRowKind::AgentMessage,
+                "the second answer",
+                "turn-2",
+            ),
+            turn_block(
+                "continued",
+                TimelineRowKind::AgentMessage,
+                "the turn the runtime continued on its own",
+                "turn:continuation:9",
+            ),
+        ]);
+
+        assert_eq!(
+            transcript.turn_count(),
+            2,
+            "a row the reader did not write was counted as a turn"
+        );
+        assert_eq!(
+            transcript.block_of_turn(0),
+            Some(1),
+            "a turn does not start at the message that opened it"
+        );
+        assert_eq!(transcript.block_of_turn(1), Some(4));
+        assert_eq!(transcript.block_of_turn(2), None);
+
+        // The rail's marker follows the same rule. Above the first turn the
+        // notice belongs to no turn, so nothing is marked...
+        transcript.scroll_offset = 0;
+        assert_eq!(transcript.active_turn(), None);
+        // ...a notice between turns is the tail of the turn above it, so the
+        // marker stays there until the next message reaches the top...
+        let between = transcript.line_of_block(3);
+        transcript.scroll_offset = between;
+        assert_eq!(transcript.active_turn(), Some(0));
+        // ...the second turn's message moves it...
+        let second = transcript.line_of_block(4);
+        transcript.scroll_offset = second;
+        assert_eq!(transcript.active_turn(), Some(1));
+        // ...and the continuation is more of the turn above it, not a turn.
+        let continued = transcript.line_of_block(6);
+        transcript.scroll_offset = continued;
+        assert_eq!(transcript.active_turn(), Some(1));
     }
 }
 

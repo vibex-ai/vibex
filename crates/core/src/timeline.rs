@@ -802,6 +802,45 @@ pub enum SystemNoticeLevel {
     Error,
 }
 
+/// The notice a session appends as it is created, before it can answer.
+///
+/// The wording lives here rather than at the one call site so the client that
+/// leaves the notice out of its conversation reads the same string the runtime
+/// writes — see [`is_runtime_startup_message`].
+pub const SESSION_INITIALIZING_NOTICE: &str = "Agent session is initializing";
+
+/// What every turn-startup notice opens with, and what every one ends with.
+///
+/// The predicate and the builder share these, so a rewording cannot leave one
+/// of them behind.
+const TURN_STARTUP_HEAD: &str = "Starting ";
+const TURN_STARTUP_TAIL: &str = "waiting for first response...";
+
+/// The notice a turn appends as it starts its provider runtime.
+///
+/// `provider_label` names the runtime, and `resource_summary` is what it
+/// prepares the context from, when there is anything to name.
+pub fn turn_startup_notice(provider_label: &str, resource_summary: Option<&str>) -> String {
+    let context = match resource_summary {
+        Some(summary) => format!("preparing context with {summary}; "),
+        None => String::new(),
+    };
+    format!("{TURN_STARTUP_HEAD}{provider_label} agent runtime; {context}{TURN_STARTUP_TAIL}")
+}
+
+/// Whether a system notice announces that the runtime is starting up.
+///
+/// A session writes [`SESSION_INITIALIZING_NOTICE`] as it is created, and
+/// [`turn_startup_notice`] at the top of each turn. Both say that work is under
+/// way; neither holds a word the Agent said. A client that draws the
+/// conversation can leave them to its own progress line, and a client that
+/// counts the reader's turns must not count one of them as a turn.
+pub fn is_runtime_startup_message(message: &str) -> bool {
+    let message = message.trim();
+    message == SESSION_INITIALIZING_NOTICE
+        || (message.starts_with(TURN_STARTUP_HEAD) && message.ends_with(TURN_STARTUP_TAIL))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemNoticePayload {
@@ -810,6 +849,11 @@ pub struct SystemNoticePayload {
 }
 
 impl SystemNoticePayload {
+    /// Returns whether this notice announces the runtime's own startup.
+    pub fn is_runtime_startup(&self) -> bool {
+        is_runtime_startup_message(&self.message)
+    }
+
     /// Returns whether this notice records a provider-neutral context compaction.
     ///
     /// ACP currently surfaces compaction as a bounded system notice rather than
@@ -1233,6 +1277,53 @@ mod tests {
         assert!(notice("*Context compacted").is_context_compaction());
         assert!(notice("Context window compacted.").is_context_compaction());
         assert!(!notice("ACP agent switched to mode default").is_context_compaction());
+    }
+
+    #[test]
+    fn runtime_startup_notices_are_recognizable_by_their_wording() {
+        // The exact sentences the runtime writes, because the predicate is the
+        // only thing a client can hide them by: a rewording that moves one and
+        // not the other puts a turn the reader never took back on the timeline.
+        assert_eq!(SESSION_INITIALIZING_NOTICE, "Agent session is initializing");
+        assert_eq!(
+            turn_startup_notice("ACP", Some("2 MCP servers")),
+            "Starting ACP agent runtime; preparing context with 2 MCP servers; waiting for first response..."
+        );
+        assert_eq!(
+            turn_startup_notice("Claude", None),
+            "Starting Claude agent runtime; waiting for first response..."
+        );
+
+        assert!(is_runtime_startup_message(SESSION_INITIALIZING_NOTICE));
+        assert!(is_runtime_startup_message(&turn_startup_notice(
+            "ACP",
+            Some("2 MCP servers and 1 skill/prompt")
+        )));
+        assert!(is_runtime_startup_message(&turn_startup_notice(
+            "Codex", None
+        )));
+
+        // Everything else stays: the notices a reader does need to see, and
+        // text that merely shares a word with the startup pair.
+        for message in [
+            "Context compacted",
+            "Imported 3 local sessions as read-only",
+            "Ignored unsupported ACP event kind: foo",
+            "Starting a new turn without a runtime",
+            "The runtime is waiting for first response...",
+        ] {
+            assert!(
+                !is_runtime_startup_message(message),
+                "{message} was classified as startup"
+            );
+        }
+
+        let notice = SystemNoticePayload {
+            level: SystemNoticeLevel::Info,
+            message: turn_startup_notice("ACP", None),
+        };
+        assert!(notice.is_runtime_startup());
+        assert!(!notice.is_context_compaction());
     }
 
     fn sample_turn_attribution() -> TurnExecutionAttribution {

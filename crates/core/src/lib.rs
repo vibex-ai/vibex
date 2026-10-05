@@ -578,11 +578,12 @@ pub use timeline::{
     AgentRetryPayload, CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind,
     FileOperationPatch, FileOperationPatchFormat, FileOperationPayload, GitNoticePayload,
     ImageGenerationPayload, MessageAttachment, PlanPayload, PlanStepPayload, PlanStepStatus,
-    ReasoningPayload, RetryKind, RetryPhase, SystemNoticeLevel, SystemNoticePayload,
-    TimelineErrorPayload, TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload,
-    ToolCallStatus, TurnExecutionAttribution, TurnExecutionAttributionView, UserMessageDelivery,
-    UserMessagePayload, WebSearchPayload, latest_timeline_turn_ended_normally,
+    ReasoningPayload, RetryKind, RetryPhase, SESSION_INITIALIZING_NOTICE, SystemNoticeLevel,
+    SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineItemKind, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, TodoUpdatePayload,
+    ToolCallPayload, ToolCallStatus, TurnExecutionAttribution, TurnExecutionAttributionView,
+    UserMessageDelivery, UserMessagePayload, WebSearchPayload, is_runtime_startup_message,
+    latest_timeline_turn_ended_normally, turn_startup_notice,
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,
