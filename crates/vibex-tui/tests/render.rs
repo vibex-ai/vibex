@@ -1101,9 +1101,9 @@ fn a_session_with_turns_gets_a_turn_rail_in_the_gutter() {
     app.navigate_to(Page::Agent);
     // Two turns is the threshold: one turn has nowhere to navigate.
     app.transcript.set_blocks(vec![
-        block("a", "turn-1"),
+        opened("a", "turn-1"),
         block("b", "turn-1"),
-        block("c", "turn-2"),
+        opened("c", "turn-2"),
     ]);
     let lines = render(&mut app, 120, 40);
     // The rail occupies the transcript's last two columns.
@@ -1122,7 +1122,7 @@ fn a_single_turn_draws_one_tick() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
     app.transcript
-        .set_blocks(vec![block("a", "turn-1"), block("b", "turn-1")]);
+        .set_blocks(vec![opened("a", "turn-1"), block("b", "turn-1")]);
     let lines = render(&mut app, 120, 40);
     let ticks = lines
         .iter()
@@ -1149,6 +1149,16 @@ fn block(id: &str, turn: &str) -> vibex_tui::transcript::Block {
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
     }
+}
+
+/// The row that opens a turn: the message the reader sent.
+///
+/// The rail counts turns by the messages that began them, so a fixture that
+/// stands for a turn has to carry the message and not only the answer to it.
+fn opened(id: &str, turn: &str) -> vibex_tui::transcript::Block {
+    let mut block = block(id, turn);
+    block.kind = vibex_desktop_model::TimelineRowKind::UserMessage;
+    block
 }
 
 #[test]
@@ -2519,6 +2529,7 @@ fn the_turn_rail_publishes_a_tick_per_turn() {
     let mut app = transcript_app(120, 44);
     // Two turns, so the rail draws ticks rather than a scrollbar.
     let mut blocks = app.transcript.blocks().to_vec();
+    blocks[1].kind = vibex_desktop_model::TimelineRowKind::UserMessage;
     blocks[1].turn_id = Some("turn-2".to_string());
     app.transcript.set_blocks(blocks);
     app.scroll.follow = false;
@@ -3659,6 +3670,90 @@ fn a_new_session_shows_one_tick_per_turn_and_nothing_when_empty() {
 }
 
 #[test]
+fn the_runtime_starting_up_earns_neither_a_row_nor_a_tick() {
+    // The reproduction. A fresh session writes a line as it is created and
+    // another as its first turn starts its runtime; the first stands before any
+    // message, so the projection made a turn of it. Both were drawn as rows and
+    // the pair read as two turns, on a session the reader had asked one
+    // question of.
+    let session_id = vibex_core::VibexSessionId::new();
+    let mut app = app(100, 24);
+    app.navigate_to(Page::Agent);
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    let items = vec![
+        seeded_item(
+            &session_id,
+            1,
+            vibex_core::TimelineItemKind::SystemNotice,
+            vibex_core::TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                level: vibex_core::SystemNoticeLevel::Info,
+                message: vibex_core::SESSION_INITIALIZING_NOTICE.to_string(),
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            2,
+            vibex_core::TimelineItemKind::UserMessage,
+            vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: "what is this project?".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            3,
+            vibex_core::TimelineItemKind::SystemNotice,
+            vibex_core::TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                level: vibex_core::SystemNoticeLevel::Info,
+                message: vibex_core::turn_startup_notice("ACP", Some("2 MCP servers")),
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            4,
+            vibex_core::TimelineItemKind::AgentMessage,
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "Vibex is a local-first AI coding workbench.".into(),
+                is_final: true,
+            }),
+        ),
+    ];
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id, items);
+    app.sync_transcript();
+
+    let screen = text(&render(&mut app, 100, 24));
+    assert!(screen.contains("what is this project?"), "{screen}");
+    assert!(
+        screen.contains("Vibex is a local-first AI coding workbench."),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("initializing"),
+        "the startup line is on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Starting ACP agent runtime"),
+        "the turn startup line is on screen:\n{screen}"
+    );
+
+    // One question is one turn, however many lines the runtime wrote around it.
+    assert_eq!(
+        app.transcript.turn_count(),
+        1,
+        "the startup line took a turn"
+    );
+    assert_eq!(
+        app.regions.turns.len(),
+        1,
+        "the rail drew a tick for the runtime's own line"
+    );
+}
+
+#[test]
 fn the_first_scroll_after_opening_a_session_is_a_step_not_a_leap() {
     use vibex_desktop_model::TimelineRowKind;
     let mut app = app(100, 24);
@@ -3737,7 +3832,7 @@ fn the_frames_click_regions_do_not_accumulate() {
             .map(|turn| {
                 let mut block = seeded_block(
                     &format!("t{turn}"),
-                    vibex_desktop_model::TimelineRowKind::AgentMessage,
+                    vibex_desktop_model::TimelineRowKind::UserMessage,
                     "body",
                 );
                 block.turn_id = Some(format!("turn-{turn}"));

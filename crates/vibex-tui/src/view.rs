@@ -1859,14 +1859,14 @@ fn render_management_view(
 
 /// The right gutter: one tick per turn.
 ///
-/// A tick stands for a turn, in conversation order, and the turn the viewport
-/// starts on wears the heavier one — so the count of the reader's conversation
-/// and their place in it are the same object, and the rail is a map of the
-/// session rather than of the buffer. Nothing else is drawn there: a scrollbar
-/// in the same columns would be counted as turns, which is exactly the mistake
-/// the rail exists to prevent. When there are more turns than rows the ticks
-/// window around the active one, because an unwindowed rail would fold many
-/// turns onto a single row.
+/// A tick stands for a turn — one the reader opened — in conversation order, and
+/// the turn the viewport starts on wears the heavier one, so the count of the
+/// reader's conversation and their place in it are the same object, and the rail
+/// is a map of the session rather than of the buffer. Nothing else is drawn
+/// there: a scrollbar in the same columns would be counted as turns, which is
+/// exactly the mistake the rail exists to prevent. When there are more turns
+/// than rows the ticks window around the active one, because an unwindowed rail
+/// would fold many turns onto a single row.
 fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     let turns = app.transcript.turn_count();
     let tier = app.glyph_tier();
