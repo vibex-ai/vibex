@@ -1014,6 +1014,10 @@ impl FrameRegions {
         self.turns.clear();
         self.hints.clear();
         self.runtime_picker = None;
+        // A list belongs to the page that drew it. Left standing, the previous
+        // page's rect would hit-test rows that are no longer on screen: a
+        // double click on the transcript would open the session list's row.
+        self.list = None;
     }
 }
 

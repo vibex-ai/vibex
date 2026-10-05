@@ -2515,6 +2515,79 @@ mod tests {
         assert!(opened.contains("clickable 1"), "{opened}");
     }
 
+    /// A list rect describes the frame that drew it, so it must not outlive
+    /// that page: a click on the next page would otherwise land on rows that
+    /// are no longer on screen and open the session under them.
+    #[test]
+    fn a_list_rect_does_not_outlive_the_page_that_drew_it() {
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        let sessions = (1..=2)
+            .map(|index| vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse(format!("session_stale{index:04}"))
+                    .expect("valid session id"),
+                title: format!("stale {index}"),
+                project_id: vibex_core::ProjectId::parse("project_stale0001")
+                    .expect("valid project id"),
+                workspace_id: vibex_core::WorkspaceId::new(),
+                workspace_root: "/tmp/vibex-stale-workspace".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: index,
+                updated_at_ms: index,
+                last_message_at_ms: index,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+        app.agent.apply_sessions(Ok(sessions)).expect("apply");
+        app.navigate_to(Page::Sessions);
+        conversation_frame(&mut app, 100, 30);
+        let list = app
+            .regions
+            .list
+            .clone()
+            .expect("the sessions page drew a list");
+
+        // The page that drew the list is gone, so its rows went with it.
+        app.navigate_to(Page::Agent);
+        conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.regions.list.is_none(),
+            "the session list's rect outlived the page that drew it"
+        );
+
+        // A click where the list used to be is a transcript gesture, not a
+        // second click on a row nobody is looking at: the session cursor does
+        // not move, and no session is opened behind the reader's back.
+        let before = (
+            app.selection_for(crate::keymap::Scope::Sessions),
+            app.selected_session_id().cloned(),
+        );
+        for _ in 0..2 {
+            handle_mouse(
+                &mut app,
+                &worker,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: list.rect.x + 3,
+                    row: list.rect.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+        assert_eq!(
+            (
+                app.selection_for(crate::keymap::Scope::Sessions),
+                app.selected_session_id().cloned()
+            ),
+            before,
+            "a click on the transcript moved the session list's cursor"
+        );
+    }
+
     #[test]
     fn mouse_opens_a_group_and_keyboard_skips_its_folded_members() {
         use crate::action::Intent;
