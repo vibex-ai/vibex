@@ -1843,6 +1843,49 @@ pub struct AgentModelProviderProfileFetchModelsResponse {
     pub diagnostics: Vec<ProviderBindingMetadata>,
 }
 
+/// Asks an endpoint the Provider editor has not saved yet for its Model list.
+///
+/// A saved Profile owns its address and its credential; a draft only holds them
+/// inside the editor, so the caller supplies what the user typed. Nothing about
+/// the draft is persisted by the call, and the typed key is used for this one
+/// request only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDraftFetchModelsRequest {
+    pub agent_id: AgentId,
+    pub base_url: String,
+    pub api_key: String,
+    /// The Models the draft already configures, which pin the wire protocol
+    /// exactly as a saved Profile's do.
+    #[serde(default)]
+    pub configured_models: Vec<ProviderConfiguredModel>,
+    /// The draft's Provider options, so a per-protocol address override and
+    /// `apiRequestFullUrl` behave as they would after saving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<ProviderOptions>,
+}
+
+impl std::fmt::Debug for AgentModelProviderDraftFetchModelsRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentModelProviderDraftFetchModelsRequest")
+            .field("agent_id", &self.agent_id)
+            .field("base_url", &self.base_url)
+            .field("has_api_key", &!self.api_key.is_empty())
+            .field("configured_models", &self.configured_models)
+            .field("provider_options", &self.provider_options)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDraftFetchModelsResponse {
+    pub agent_id: AgentId,
+    pub models: Vec<ProviderConfiguredModel>,
+    pub diagnostics: Vec<ProviderBindingMetadata>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentModelProviderProfileTestRequest {
@@ -2798,9 +2841,32 @@ pub struct AdapterDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderConfiguredModel, ProviderKind, ProviderModelWireApi, ProviderProfile,
-        ProviderProfileStatus, ProviderReasoningEffortLevel,
+        AgentModelProviderDraftFetchModelsRequest, ProviderConfiguredModel, ProviderKind,
+        ProviderModelWireApi, ProviderProfile, ProviderProfileStatus,
+        ProviderReasoningEffortLevel,
     };
+
+    /// The typed key has to travel (the endpoint is asked with it) but must never
+    /// appear in Debug output, which is what logs and diagnostics keep.
+    #[test]
+    fn draft_fetch_carries_the_typed_key_without_printing_it() {
+        let request = AgentModelProviderDraftFetchModelsRequest {
+            agent_id: crate::AgentId::parse("codex").unwrap(),
+            base_url: "https://gateway.example.test".to_string(),
+            api_key: "sk-draft-secret".to_string(),
+            configured_models: Vec::new(),
+            provider_options: None,
+        };
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("sk-draft-secret"));
+        assert!(debug.contains("has_api_key: true"));
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["apiKey"], "sk-draft-secret");
+        assert_eq!(encoded["baseUrl"], "https://gateway.example.test");
+        assert_eq!(encoded["agentId"], "codex");
+    }
 
     #[test]
     fn launch_revision_tracks_the_launch_contract_only() {

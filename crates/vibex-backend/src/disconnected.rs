@@ -6,7 +6,8 @@ use vibex_core::{
     AgentCommandExecuteResult, AgentId, AgentListRequest, AgentListResponse,
     AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
     AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderDraftFetchModelsRequest,
+    AgentModelProviderDraftFetchModelsResponse, AgentModelProviderProfileCreateRequest,
     AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
     AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueRequest,
     AgentModelProviderProfileSecretValueResponse,
@@ -1375,6 +1376,13 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: AgentModelProviderProfileFetchModelsRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse> {
+        disconnected_future!()
+    }
+
+    fn fetch_agent_model_provider_draft_models(
+        &self,
+        _request: AgentModelProviderDraftFetchModelsRequest,
+    ) -> BackendFuture<'_, AgentModelProviderDraftFetchModelsResponse> {
         disconnected_future!()
     }
 

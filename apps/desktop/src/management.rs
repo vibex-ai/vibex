@@ -5675,6 +5675,56 @@ impl ManagementCenter {
         );
     }
 
+    /// Applies a Model-discovery answer to the picker.
+    ///
+    /// Discovery fills the catalogue; it never writes the draft. Which of these
+    /// Models this Provider offers is the user's answer, so a fetch must not
+    /// silently configure anything. An authoritative catalogue replaces the
+    /// previous one, because ids the Agent no longer advertises cannot be
+    /// selected and keeping them would offer dead rows.
+    fn apply_fetched_models(
+        &mut self,
+        outcome: Result<
+            VibexResult<Vec<vibex_core::ProviderConfiguredModel>>,
+            gpui_tokio::JoinError,
+        >,
+        authoritative: bool,
+        active_locale: ResolvedLocale,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutation = None;
+        match outcome {
+            Ok(Ok(models)) => {
+                let count = models.len();
+                if authoritative {
+                    replace_provider_models_keeping_capabilities(
+                        &mut self.profile_available_models,
+                        models,
+                    );
+                } else {
+                    merge_provider_models(&mut self.profile_available_models, models);
+                }
+                self.navigation.mark_dirty(ManagementSection::Agents, true);
+                self.notice = Some(match active_locale {
+                    ResolvedLocale::En => format!("Fetched {count} model(s)"),
+                    ResolvedLocale::ZhCn => format!("已拉取 {count} 个模型"),
+                    ResolvedLocale::ZhTw => format!("已擷取 {count} 個模型"),
+                });
+            }
+            Ok(Err(error)) => {
+                // The Models section is inside the Provider dialog, so its
+                // failures report next to the dialog's own actions.
+                self.profile_submit_error = Some(format!("{}: {}", error.code, error.message));
+            }
+            Err(error) => {
+                let failed =
+                    management_error_text("Model detection failed", "模型探测失败", "模型探測失敗");
+                self.profile_submit_error = Some(format!("{}: {error}", failed));
+            }
+        }
+        cx.notify();
+    }
+
     fn fetch_provider_models(
         &mut self,
         profile_id: String,
@@ -5711,20 +5761,14 @@ impl ManagementCenter {
             if agent_owns_catalog {
                 // The Agent owns the catalogue, so discovery launches the
                 // installed bridge on whichever runtime owns it.
-                let models = backend
+                backend
                     .agent()
                     .discover_agent_owned_model_catalog(AgentModelOwnedCatalogRequest {
                         agent_id: agent_id.clone(),
                         provider_profile_id: provider_profile_id.clone(),
                     })
                     .await
-                    .map_err(crate::app::remote_error_into_vibex)?;
-                Ok::<_, VibexError>(vibex_core::AgentModelProviderProfileFetchModelsResponse {
-                    agent_id: agent_id.clone(),
-                    provider_profile_id: provider_profile_id.clone(),
-                    models,
-                    diagnostics: Vec::new(),
-                })
+                    .map_err(crate::app::remote_error_into_vibex)
             } else {
                 backend
                     .management()
@@ -5735,61 +5779,106 @@ impl ManagementCenter {
                         },
                     )
                     .await
+                    .map(|response| response.models)
                     .map_err(crate::app::remote_error_into_vibex)
             }
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(Ok(result)) => {
-                        let count = result.models.len();
-                        // Discovery fills the picker's catalogue; it never
-                        // writes the draft. Which of these Models this Provider
-                        // offers is the user's answer, so a fetch must not
-                        // silently configure anything.
-                        if agent_owns_catalog {
-                            // An authoritative catalogue replaces the previous
-                            // one: ids the bridge no longer advertises cannot be
-                            // selected, so keeping them would offer dead rows.
-                            replace_provider_models_keeping_capabilities(
-                                &mut this.profile_available_models,
-                                result.models,
-                            );
-                        } else {
-                            merge_provider_models(
-                                &mut this.profile_available_models,
-                                result.models,
-                            );
-                        }
-                        this.navigation.mark_dirty(ManagementSection::Agents, true);
-                        this.notice = Some(match active_locale {
-                            ResolvedLocale::En => format!("Fetched {count} model(s)"),
-                            ResolvedLocale::ZhCn => format!("已拉取 {count} 个模型"),
-                            ResolvedLocale::ZhTw => format!("已擷取 {count} 個模型"),
-                        });
-                    }
-                    Ok(Err(error)) => {
-                        // The Models section is inside the Provider dialog, so
-                        // its failures report next to the dialog's own actions.
-                        this.profile_submit_error =
-                            Some(format!("{}: {}", error.code, error.message));
-                    }
-                    Err(error) => {
-                        this.profile_submit_error = Some(format!(
-                            "{}: {error}",
-                            management_error_text(
-                                "Model detection failed",
-                                "模型探测失败",
-                                "模型探測失敗",
-                            )
-                        ));
-                    }
-                }
-                cx.notify();
+                this.apply_fetched_models(outcome, agent_owns_catalog, active_locale, cx);
             });
         }));
+    }
+
+    /// Fetches the catalogue of the endpoint the editor is drafting.
+    ///
+    /// Nothing is saved first: the typed address and key are what the request
+    /// carries, and the key is used for this call only. The draft's own Models
+    /// and per-protocol address overrides still decide which protocol and
+    /// endpoint the fetch speaks, so the answer is the one a save would get.
+    fn fetch_provider_draft_models(
+        &mut self,
+        agent_id: String,
+        base_url: String,
+        api_key: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = AgentId::parse(agent_id).ok() else {
+            self.profile_submit_error = Some(
+                management_error_text(
+                    "Select an Agent before fetching models",
+                    "请先选择 Agent，再拉取模型",
+                    "請先選擇 Agent，再擷取模型",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            self.profile_submit_error = Some(
+                management_error_text(
+                    "Management runtime is not connected",
+                    "配置中心运行时未连接",
+                    "配置中心執行階段未連線",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "draft-models:{agent_id}"
+        )));
+        self.profile_submit_error = None;
+        let active_locale = locale::current_locale();
+        let entity = cx.weak_entity();
+        let configured_models = normalized_provider_models(&self.profile_configured_models);
+        let provider_options = self.draft_provider_options(cx);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .fetch_agent_model_provider_draft_models(
+                    vibex_core::AgentModelProviderDraftFetchModelsRequest {
+                        agent_id,
+                        base_url,
+                        api_key,
+                        configured_models,
+                        provider_options: Some(provider_options),
+                    },
+                )
+                .await
+                .map(|response| response.models)
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                // The endpoint is the draft's only catalogue source, so its
+                // answer is authoritative for the rows it advertises.
+                this.apply_fetched_models(outcome, true, active_locale, cx);
+            });
+        }));
+    }
+
+    /// The Provider options a draft fetch honors: every per-protocol address
+    /// override the editor holds, so the endpoint asked is the one a save would
+    /// record.
+    fn draft_provider_options(&self, cx: &Context<Self>) -> vibex_core::ProviderOptions {
+        let mut options = self.profile_provider_options.clone();
+        for (wire_api, input) in &self.profile_protocol_base_urls {
+            let value = input.read(cx).value().trim().to_string();
+            options = with_provider_option(
+                options,
+                &wire_api.protocol_base_url_option_key(),
+                (!value.is_empty()).then_some(value),
+            );
+        }
+        options
     }
 
     fn confirm_managed_delete(
@@ -12323,14 +12412,31 @@ impl ManagementCenter {
         let pending =
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let editing_profile_id = self.editing_profile_id.clone();
-        let fetchable = editing_profile_id.is_some();
-        let fetching_models = editing_profile_id.as_ref().is_some_and(|profile_id| {
-            matches!(
-                &self.mutation,
-                Some(ManagementMutation::ProviderProbe(action))
-                    if action == &format!("models:{profile_id}")
-            )
-        });
+        // A saved Profile fetches from its stored address and Secret. A draft
+        // has neither yet, so its fetch appears once the editor itself holds
+        // what a fetch needs — a request URL and a key — and the Agent accepts a
+        // caller-supplied endpoint. An Agent that pins its own endpoint owns its
+        // catalogue too, and that one is only discovered after saving.
+        let draft_endpoint_editable = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::Endpoint)
+            && self.projection_editor.fixed_endpoint().is_none()
+            && self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
+        let draft_available = editing_profile_id.is_none()
+            && draft_endpoint_editable
+            && !selected_agent_id.is_empty();
+        let draft_base_url = self.profile_base_url.read(cx).value().trim().to_string();
+        let draft_api_key = self.profile_api_key.read(cx).value().trim().to_string();
+        let draft_ready =
+            draft_available && !draft_base_url.is_empty() && !draft_api_key.is_empty();
+        let fetchable = editing_profile_id.is_some() || draft_available;
+        let fetching_models = match &self.mutation {
+            Some(ManagementMutation::ProviderProbe(action)) => match &editing_profile_id {
+                Some(profile_id) => action == &format!("models:{profile_id}"),
+                None => action == &format!("draft-models:{selected_agent_id}"),
+            },
+            _ => false,
+        };
         let filter = self
             .profile_model_search
             .read(cx)
@@ -12354,24 +12460,40 @@ impl ManagementCenter {
         } else {
             management_model_count(configured)
         };
-        let fetch = editing_profile_id.map(|profile_id| {
+        let shows_fetch = editing_profile_id.is_some() || draft_ready;
+        let fetch = shows_fetch.then(|| {
             let agent_id = selected_agent_id.clone();
-            Button::new("provider-candidates-fetch")
-                .xsmall()
-                .outline()
-                // A refresh glyph, not the search glyph: this asks the
-                // endpoint for its list instead of filtering one.
-                .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                .label(if fetching_models {
-                    management_locale_text("Fetching...", "获取中...", "取得中...")
-                } else {
-                    management_fetch_models_label()
-                })
-                .loading(fetching_models)
-                .disabled(pending)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
-                }))
+            let profile_id = editing_profile_id.clone();
+            let base_url = draft_base_url.clone();
+            let api_key = draft_api_key.clone();
+            div()
+                .debug_selector(|| "provider-candidates-fetch".to_string())
+                .child(
+                    Button::new("provider-candidates-fetch")
+                        .xsmall()
+                        .outline()
+                        // A refresh glyph, not the search glyph: this asks the
+                        // endpoint for its list instead of filtering one.
+                        .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                        .label(if fetching_models {
+                            management_locale_text("Fetching...", "获取中...", "取得中...")
+                        } else {
+                            management_fetch_models_label()
+                        })
+                        .loading(fetching_models)
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| match &profile_id {
+                            Some(profile_id) => {
+                                this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
+                            }
+                            None => this.fetch_provider_draft_models(
+                                agent_id.clone(),
+                                base_url.clone(),
+                                api_key.clone(),
+                                cx,
+                            ),
+                        })),
+                )
                 .into_any_element()
         });
         let header = profile_pane_header(
@@ -12456,9 +12578,17 @@ impl ManagementCenter {
 
         let mut body = v_flex().w_full().gap_1().p_1p5();
         if total == 0 {
-            // The command that fetches models only exists once the Provider is
-            // saved, so the empty state promises exactly what is available.
-            let description = if fetchable {
+            // The empty state names the command that is actually available: a
+            // saved Profile already has what a fetch needs, a draft needs the
+            // two fields a fetch reads, and an Agent-owned catalogue is only
+            // discovered after saving.
+            let description = if !fetchable {
+                management_locale_text(
+                    "Save this Provider to fetch models, or add a model ID directly.",
+                    "保存后可以拉取模型，也可以直接添加模型 ID。",
+                    "儲存後可以擷取模型，也可以直接新增模型 ID。",
+                )
+            } else if editing_profile_id.is_some() || draft_ready {
                 management_locale_text(
                     "Fetch the endpoint's list, or add a model ID directly.",
                     "可以拉取模型，也可以直接添加模型 ID。",
@@ -12466,9 +12596,9 @@ impl ManagementCenter {
                 )
             } else {
                 management_locale_text(
-                    "Save this Provider to fetch models, or add a model ID directly.",
-                    "保存后可以拉取模型，也可以直接添加模型 ID。",
-                    "儲存後可以擷取模型，也可以直接新增模型 ID。",
+                    "Enter an API key and request URL to fetch models, or add a model ID directly.",
+                    "填写 API Key 与请求地址后即可拉取模型，也可以直接添加模型 ID。",
+                    "填寫 API Key 與請求位址後即可擷取模型，也可以直接新增模型 ID。",
                 )
             };
             body = body.child(bare_empty_state(
@@ -25873,17 +26003,41 @@ mod tests {
     #[test]
     fn model_discovery_fills_the_picker_without_configuring_anything() {
         let source = include_str!("management.rs");
-        let fetch = source
-            .split_once("    fn fetch_provider_models(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_managed_delete("))
+        let apply = source
+            .split_once("    fn apply_fetched_models(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn fetch_provider_models("))
             .map(|(body, _)| body)
-            .expect("Model discovery should remain inspectable");
+            .expect("The catalogue applier should remain inspectable");
+        let profile_fetch = source
+            .split_once("    fn fetch_provider_models(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Fetches the catalogue of the endpoint the editor is drafting.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("Saved-Profile discovery should remain inspectable");
+        let draft_fetch = source
+            .split_once("    fn fetch_provider_draft_models(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The Provider options a draft fetch honors")
+            })
+            .map(|(body, _)| body)
+            .expect("Draft discovery should remain inspectable");
 
-        assert!(fetch.contains("&mut this.profile_available_models,"));
+        // Discovery writes the catalogue the picker reads, and never the Models
+        // the user has chosen.
+        assert!(apply.contains("&mut self.profile_available_models,"));
         assert!(
-            !fetch.contains("profile_configured_models"),
+            !apply.contains("profile_configured_models"),
             "a fetch must not configure Models the user has not chosen"
         );
+        for fetch in [profile_fetch, draft_fetch] {
+            assert!(
+                !fetch.contains("profile_configured_models ="),
+                "a fetch must not configure Models the user has not chosen"
+            );
+        }
     }
 
     #[test]
@@ -26172,6 +26326,73 @@ mod tests {
             center.read_with(cx, |center, _| center.profile_configured_models.len()),
             1,
             "opening a row is not the same intention as checking it"
+        );
+    }
+
+    /// The fetch command exists for an unsaved Provider as soon as the editor
+    /// holds the two things a fetch reads — a request URL and a key — instead of
+    /// waiting for the Provider to be saved first.
+    #[gpui::test]
+    fn provider_draft_fetch_waits_for_a_request_url_and_a_key(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, _| {
+            center.profile_editor_open = true;
+            // A draft fetch belongs to an Agent: the protocol an endpoint is
+            // asked in comes from the Agent's own interfaces.
+            center.selected_agent_id = Some("codex".to_string());
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_models());
+        });
+
+        let dialog = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
+        let (_, cx) = cx.add_window_view(move |_, _| ProfileDialogHarness {
+            dialog: dialog.clone(),
+        });
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1080.0), px(720.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("provider-candidates-fetch").is_none(),
+            "an empty draft has nothing to fetch from"
+        );
+
+        // The address alone is not enough: an endpoint without a credential
+        // cannot list anything either.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_base_url.update(cx, |state, cx| {
+                    state.set_value("https://api.example.com", window, cx)
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("provider-candidates-fetch").is_none(),
+            "a request URL without a key is not a fetchable draft"
+        );
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center
+                    .profile_api_key
+                    .update(cx, |state, cx| state.set_value("sk-draft-key", window, cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("provider-candidates-fetch").is_some(),
+            "a typed address and key make the draft fetchable"
         );
     }
 

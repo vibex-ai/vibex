@@ -14,6 +14,7 @@ use vibex_core::{
     AgentListRequest, AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
     AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderDraftFetchModelsRequest, AgentModelProviderDraftFetchModelsResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
     AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
@@ -2717,6 +2718,22 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .fetch_agent_model_provider_profile_models(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn fetch_agent_model_provider_draft_models(
+        &self,
+        request: AgentModelProviderDraftFetchModelsRequest,
+    ) -> BackendFuture<'_, AgentModelProviderDraftFetchModelsResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .fetch_agent_model_provider_draft_models(request)
                 .map_err(Into::into)
         })
     }

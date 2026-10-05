@@ -4774,3 +4774,85 @@ match selection.auth_source {
     }
 }
 ```
+
+## Scenario: Unsaved Provider Draft Model Discovery
+
+### 1. Scope / Trigger
+
+- Trigger: the Provider editor asks an endpoint for its Model list while the
+  Provider is still a draft, because the user has typed a request URL and an API
+  key but has not saved anything.
+- This contract crosses the desktop Provider editor, the typed Backend boundary,
+  the config-switch Model-discovery path, and the remote provider RPC.
+
+### 2. Signatures
+
+```text
+AgentModelProviderDraftFetchModelsRequest {
+  agent_id, base_url, api_key, configured_models[], provider_options?
+}
+AgentModelProviderDraftFetchModelsResponse { agent_id, models[], diagnostics[] }
+
+ManagementBackend::fetch_agent_model_provider_draft_models(request)
+  -> response
+```
+
+### 3. Contracts
+
+- Draft discovery is offered as soon as the editor holds what a fetch reads: an
+  Agent is selected, the credential surface is an API key, the Agent accepts a
+  caller-supplied endpoint, and both the request URL and the key are non-empty.
+  An Agent that pins its own endpoint owns its catalogue too, so it keeps the
+  saved-Profile path instead of a draft one.
+- The request carries the typed key for exactly one call. It creates no Profile
+  row, persists nothing, and the key never appears in Debug output: the request
+  implements `Debug` by hand and reports `has_api_key` instead.
+- The draft is described to the fetch path exactly as a saved Profile is: the
+  normalized Models the draft already configures can pin the wire protocol, the
+  first enabled one is the default a save would record, and the draft's Provider
+  options carry per-protocol address overrides and `apiRequestFullUrl`. When no
+  Model pins a protocol, `agent_id` resolves the default through the projection
+  registry.
+- A blank key is refused before any request leaves the runtime
+  (`agent_model_provider_secret_missing`); a missing address fails the protocol
+  fetch (`agent_model_provider_endpoint_missing`).
+- The answer fills the picker's catalogue only. It never writes the Models the
+  Provider offers, and it is authoritative for the rows it advertises.
+- A paired device reaches the same command through
+  `RemoteProviderRequest::FetchAgentModelProviderDraftModels` under
+  `ReadProviderSettings`, and the call hands it no stored Secret.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Draft key blank after trimming | `agent_model_provider_secret_missing`; no HTTP request. |
+| Draft has no request URL | `agent_model_provider_endpoint_missing`. |
+| Protocol is Mistral Conversations | `agent_model_provider_protocol_unsupported`; add Models manually. |
+| No Model pins a protocol and the Agent declares none | `agent_model_provider_protocol_missing`. |
+| Endpoint answers 404/405 on one candidate path | try the next candidate; other HTTP failures surface with a redacted endpoint and status. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the user types an address and a key in "Add model provider", fetches, and
+  picks from the returned ids before saving anything.
+- Good: a draft whose only configured Model declares Anthropic Messages lists
+  through the Anthropic endpoint, and a per-protocol override wins over the
+  default URL.
+- Base: the fetch fails; the editor reports it beside the dialog's own actions
+  and the draft stays exactly as typed.
+- Bad: create a hidden Profile row so a fetch can run, send an empty bearer
+  credential, or let the typed key reach Profile JSON, diagnostics, or Debug.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-core draft_fetch` asserts the typed key survives
+  serialization and is absent from Debug output, both on the request and through
+  the remote provider envelope.
+- `cargo test -p vibex-config-switch provider_draft_fetch` asserts the draft is
+  described like a saved Profile (protocol pinning, per-protocol override,
+  default Model) and that a blank key never reaches the endpoint.
+- `cargo test -p vibex-desktop provider_draft_fetch_waits_for_a_request_url_and_a_key`
+  asserts the fetch command appears only once the request URL and the key are
+  both typed.
+

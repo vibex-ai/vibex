@@ -2231,6 +2231,7 @@ pub enum RemoteProviderOperationKind {
     SetAgentModelProviderDisplayOrder,
     TestAgentModelProviderProfile,
     FetchAgentModelProviderProfileModels,
+    FetchAgentModelProviderDraftModels,
     ListCapabilitySummaries,
     RunCapabilityProbes,
     ListMcpServers,
@@ -3488,6 +3489,13 @@ pub struct RemoteAgentModelProviderProfileFetchModelsRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDraftFetchModelsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderDraftFetchModelsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteProviderCapabilitySummaryListRequest {
     pub auth: RemoteAuthProof,
 }
@@ -3539,6 +3547,12 @@ pub struct RemoteAgentModelProviderProfileTestResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentModelProviderProfileFetchModelsResponse {
     pub response: crate::AgentModelProviderProfileFetchModelsResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDraftFetchModelsResponse {
+    pub response: crate::AgentModelProviderDraftFetchModelsResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3595,6 +3609,7 @@ pub enum RemoteProviderRequest {
     SetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderSetRequest),
     TestAgentModelProviderProfile(RemoteAgentModelProviderProfileTestRequest),
     FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
+    FetchAgentModelProviderDraftModels(RemoteAgentModelProviderDraftFetchModelsRequest),
     ListCapabilitySummaries(RemoteProviderCapabilitySummaryListRequest),
     RunCapabilityProbes(RemoteProviderRunCapabilityProbesRequest),
     ListMcpServers(RemoteProviderMcpListRequest),
@@ -3779,6 +3794,9 @@ impl RemoteProviderRequest {
             }
             Self::FetchAgentModelProviderProfileModels(_) => {
                 RemoteProviderOperationKind::FetchAgentModelProviderProfileModels
+            }
+            Self::FetchAgentModelProviderDraftModels(_) => {
+                RemoteProviderOperationKind::FetchAgentModelProviderDraftModels
             }
             Self::ListCapabilitySummaries(_) => {
                 RemoteProviderOperationKind::ListCapabilitySummaries
@@ -5318,6 +5336,39 @@ mod tests {
             "git_worktree_snapshot"
         );
         assert!(!format!("{eligibility:?}{snapshot:?}").contains("auth-token-returned-once"));
+    }
+
+    /// A draft fetch is a read-class Provider action, and the key it carries for
+    /// its one call never reaches Debug output on either side of the envelope.
+    #[test]
+    fn remote_draft_fetch_keeps_the_typed_key_out_of_debug() {
+        let request = RemoteProviderRequest::FetchAgentModelProviderDraftModels(
+            RemoteAgentModelProviderDraftFetchModelsRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "auth-token-returned-once".to_string(),
+                },
+                request: crate::AgentModelProviderDraftFetchModelsRequest {
+                    agent_id: AgentId::parse("codex").unwrap(),
+                    base_url: "https://gateway.example.test".to_string(),
+                    api_key: "sk-draft-secret".to_string(),
+                    configured_models: Vec::new(),
+                    provider_options: None,
+                },
+            },
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            request.operation_kind(),
+            RemoteProviderOperationKind::FetchAgentModelProviderDraftModels
+        );
+        assert_eq!(json["type"], "fetch_agent_model_provider_draft_models");
+        assert_eq!(json["data"]["request"]["apiKey"], "sk-draft-secret");
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("sk-draft-secret"));
+        assert!(!debug.contains("auth-token-returned-once"));
     }
 
     #[test]

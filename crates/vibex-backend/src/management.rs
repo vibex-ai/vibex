@@ -6,6 +6,7 @@ use vibex_core::{
     AgentModelProviderBindingListRequest, AgentModelProviderBindingUpdateRequest,
     AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderDraftFetchModelsRequest, AgentModelProviderDraftFetchModelsResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
     AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
@@ -283,6 +284,14 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: AgentModelProviderProfileFetchModelsRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse>;
+
+    /// Fetches the model catalogue an endpoint the editor has not saved yet
+    /// exposes. The request carries the typed address and key; nothing is
+    /// persisted and no Profile row is required.
+    fn fetch_agent_model_provider_draft_models(
+        &self,
+        request: AgentModelProviderDraftFetchModelsRequest,
+    ) -> BackendFuture<'_, AgentModelProviderDraftFetchModelsResponse>;
 
     fn capability_summaries(&self) -> BackendFuture<'_, Vec<ProviderCapabilitySummary>>;
 

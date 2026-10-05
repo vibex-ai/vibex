@@ -17,6 +17,7 @@ use vibex_core::{
     AgentListRequest, AgentListResponse, AgentModelProviderDefaultRequest,
     AgentModelProviderDefaultSelection, AgentModelProviderDisplayOrderEntry,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderDraftFetchModelsRequest, AgentModelProviderDraftFetchModelsResponse,
     AgentModelProviderFailoverEntry, AgentModelProviderFailoverListRequest,
     AgentModelProviderFailoverListResponse, AgentModelProviderFailoverSetRequest,
     AgentModelProviderProfile, AgentModelProviderProfileCreateRequest,
@@ -888,6 +889,42 @@ impl ProviderConfigService {
         Ok(AgentModelProviderProfileFetchModelsResponse {
             agent_id: request.agent_id,
             provider_profile_id: request.provider_profile_id,
+            models: models
+                .into_iter()
+                .map(|model| ProviderConfiguredModel {
+                    id: model,
+                    display_name: None,
+                    enabled: true,
+                    wire_api: None,
+                    capabilities: Default::default(),
+                })
+                .collect(),
+            diagnostics,
+        })
+    }
+
+    /// Lists the Models an endpoint the editor is still drafting advertises.
+    ///
+    /// The Provider has no row yet, so the address and the credential come from
+    /// the request instead of storage, and the typed key is used for exactly
+    /// this call. The draft is otherwise treated like a saved Profile: the
+    /// Models it already configures decide the wire protocol, and its Provider
+    /// options carry any per-protocol address override.
+    pub fn fetch_agent_model_provider_draft_models(
+        &self,
+        request: AgentModelProviderDraftFetchModelsRequest,
+    ) -> VibexResult<AgentModelProviderDraftFetchModelsResponse> {
+        let api_key = request.api_key.trim();
+        if api_key.is_empty() {
+            return Err(VibexError::validation(
+                "agent_model_provider_secret_missing",
+                "Provider draft is missing an API key",
+            ));
+        }
+        let profile = draft_provider_profile(&request);
+        let (models, diagnostics) = fetch_provider_models_with_secret(&profile, Some(api_key))?;
+        Ok(AgentModelProviderDraftFetchModelsResponse {
+            agent_id: request.agent_id,
             models: models
                 .into_iter()
                 .map(|model| ProviderConfiguredModel {
@@ -6164,31 +6201,78 @@ fn provider_model_wire_api_from_alias(value: &str) -> Option<vibex_core::Provide
 fn fetch_provider_profile_models(
     profile: &ProviderProfile,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
+    let api_key = resolved_profile_secret_value(profile)?;
+    fetch_provider_models_with_secret(profile, api_key.as_deref())
+}
+
+/// Describes an unsaved Provider draft as the transient Profile a fetch reads.
+///
+/// The identity is freshly minted and never written: discovery only needs the
+/// Agent (for the default wire protocol), the typed address and options, and the
+/// Models the draft already configures, because those can pin the protocol
+/// themselves. The credential travels beside this value instead of inside it.
+fn draft_provider_profile(request: &AgentModelProviderDraftFetchModelsRequest) -> ProviderProfile {
+    let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+    profile.id = ProviderProfileId::new();
+    profile.agent_id = request.agent_id.clone();
+    profile.display_name = "Provider draft".to_string();
+    profile.status = ProviderProfileStatus::Enabled;
+    let base_url = request.base_url.trim();
+    profile.base_url = (!base_url.is_empty()).then(|| base_url.to_string());
+    profile.configured_models = request.configured_models.clone();
+    // The first enabled Model is the one a save would record as the default,
+    // and the default decides the protocol when several Models declare one.
+    profile.default_model = profile
+        .configured_models
+        .iter()
+        .find(|model| model.enabled)
+        .map(|model| model.id.clone());
+    profile.provider_options = request
+        .provider_options
+        .clone()
+        .unwrap_or_else(ProviderOptions::empty);
+    profile
+}
+
+/// Fetches a Provider's catalogue with a credential the caller already holds.
+///
+/// A saved Profile resolves its own Secret; the Provider editor's unsaved draft
+/// carries the key the user typed. Everything else about the call — protocol,
+/// endpoint, and response shape — is the same either way.
+fn fetch_provider_models_with_secret(
+    profile: &ProviderProfile,
+    api_key: Option<&str>,
+) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
     match effective_profile_wire_api(profile)? {
         Some(vibex_core::ProviderModelWireApi::OpenaiResponses) => {
             fetch_openai_compatible_profile_models(
                 profile,
+                api_key,
                 vibex_core::ProviderModelWireApi::OpenaiResponses,
             )
         }
         Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions) => {
             fetch_openai_compatible_profile_models(
                 profile,
+                api_key,
                 vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
             )
         }
         Some(vibex_core::ProviderModelWireApi::AnthropicMessages) => {
-            fetch_anthropic_profile_models(profile)
+            fetch_anthropic_profile_models(profile, api_key)
         }
         Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi) => fetch_google_profile_models(
             profile,
+            api_key,
             vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
         ),
-        Some(vibex_core::ProviderModelWireApi::GoogleVertex) => {
-            fetch_google_profile_models(profile, vibex_core::ProviderModelWireApi::GoogleVertex)
-        }
+        Some(vibex_core::ProviderModelWireApi::GoogleVertex) => fetch_google_profile_models(
+            profile,
+            api_key,
+            vibex_core::ProviderModelWireApi::GoogleVertex,
+        ),
         Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse) => {
-            fetch_bedrock_profile_models(profile)
+            fetch_bedrock_profile_models(profile, api_key)
         }
         // No model-listing call speaks the Mistral Conversations wire format
         // yet. Declaring that is better than listing models through the
@@ -6208,9 +6292,10 @@ fn fetch_provider_profile_models(
 
 fn fetch_openai_compatible_profile_models(
     profile: &ProviderProfile,
+    api_key: Option<&str>,
     wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+    let Some(api_key) = api_key else {
         return Err(VibexError::validation(
             "agent_model_provider_secret_missing",
             "Provider profile is missing an available API key",
@@ -6227,15 +6312,16 @@ fn fetch_openai_compatible_profile_models(
     fetch_models_from_endpoints(
         &client,
         &model_list_endpoint_candidates(base_url, profile_uses_full_api_url(profile), false),
-        |request| request.bearer_auth(&api_key),
+        |request| request.bearer_auth(api_key),
     )
 }
 
 fn fetch_google_profile_models(
     profile: &ProviderProfile,
+    api_key: Option<&str>,
     wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+    let Some(api_key) = api_key else {
         return Err(VibexError::validation(
             "agent_model_provider_secret_missing",
             "Provider profile is missing an available API key",
@@ -6256,7 +6342,7 @@ fn fetch_google_profile_models(
             profile_uses_full_api_url(profile),
             wire_api,
         ),
-        |request| request.header("x-goog-api-key", &api_key),
+        |request| request.header("x-goog-api-key", api_key),
     )
 }
 
@@ -6275,8 +6361,9 @@ fn google_endpoint_candidates(
 
 fn fetch_bedrock_profile_models(
     profile: &ProviderProfile,
+    api_key: Option<&str>,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+    let Some(api_key) = api_key else {
         return Err(VibexError::validation(
             "agent_model_provider_secret_missing",
             "Provider profile is missing an available API key",
@@ -6295,14 +6382,15 @@ fn fetch_bedrock_profile_models(
     fetch_models_from_endpoints(
         &client,
         &model_list_endpoint_candidates(base_url, profile_uses_full_api_url(profile), false),
-        |request| request.bearer_auth(&api_key),
+        |request| request.bearer_auth(api_key),
     )
 }
 
 fn fetch_anthropic_profile_models(
     profile: &ProviderProfile,
+    api_key: Option<&str>,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+    let Some(api_key) = api_key else {
         return Err(VibexError::validation(
             "agent_model_provider_secret_missing",
             "Provider profile is missing an available auth token",
@@ -6323,7 +6411,7 @@ fn fetch_anthropic_profile_models(
         &model_list_endpoint_candidates(base_url, profile_uses_full_api_url(profile), true),
         |request| {
             request
-                .header("x-api-key", &api_key)
+                .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
         },
     )
@@ -12528,5 +12616,76 @@ Authorization = "Bearer should-not-be-stored"
                 .map(|profile| profile.id.clone()),
             Some(candidate.id)
         );
+    }
+
+    /// A draft is described to the fetch path exactly as a saved Profile is, so
+    /// the Models it already configures can pin the protocol and a per-protocol
+    /// address override still wins over the typed default URL.
+    #[test]
+    fn provider_draft_fetch_describes_the_editor_draft_as_a_profile() {
+        let agent_id = AgentId::parse("deepseek-harness").unwrap();
+        let draft = AgentModelProviderDraftFetchModelsRequest {
+            agent_id: agent_id.clone(),
+            base_url: "  https://gateway.example.invalid  ".to_string(),
+            api_key: "draft-key".to_string(),
+            configured_models: vec![ProviderConfiguredModel {
+                id: "claude-draft".to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                capabilities: Default::default(),
+            }],
+            provider_options: Some(ProviderOptions {
+                schema_version: 1,
+                entries: vec![option_entry(
+                    vibex_core::ProviderModelWireApi::AnthropicMessages
+                        .protocol_base_url_option_key(),
+                    "https://anthropic.example.invalid",
+                )],
+            }),
+        };
+
+        let profile = draft_provider_profile(&draft);
+
+        assert_eq!(profile.agent_id, agent_id);
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("https://gateway.example.invalid"),
+            "the typed address is trimmed like a saved one"
+        );
+        // The draft's own Model pins the protocol, and the override beside it
+        // is the endpoint that protocol actually calls.
+        assert_eq!(
+            effective_profile_wire_api(&profile).unwrap(),
+            Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+        );
+        assert_eq!(
+            profile_protocol_base_url(
+                &profile,
+                vibex_core::ProviderModelWireApi::AnthropicMessages
+            ),
+            Some("https://anthropic.example.invalid")
+        );
+        assert_eq!(profile.default_model.as_deref(), Some("claude-draft"));
+    }
+
+    /// The draft has no stored Secret, so a blank key is refused before any
+    /// request leaves the runtime instead of being sent as an empty credential.
+    #[test]
+    fn provider_draft_fetch_requires_a_typed_key() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+
+        let error = service
+            .fetch_agent_model_provider_draft_models(AgentModelProviderDraftFetchModelsRequest {
+                agent_id: AgentId::parse("deepseek-harness").unwrap(),
+                base_url: "https://gateway.example.invalid".to_string(),
+                api_key: "   ".to_string(),
+                configured_models: Vec::new(),
+                provider_options: None,
+            })
+            .expect_err("a draft without a key must not reach the endpoint");
+
+        assert_eq!(error.code, "agent_model_provider_secret_missing");
     }
 }

@@ -314,6 +314,16 @@ impl ProviderManagementFacade {
             .fetch_agent_model_provider_profile_models(request)
     }
 
+    /// Lists Models from an endpoint the editor has not saved yet. Nothing about
+    /// the draft is persisted, and the typed key is used for this call only.
+    pub fn fetch_agent_model_provider_draft_models(
+        &self,
+        request: vibex_core::AgentModelProviderDraftFetchModelsRequest,
+    ) -> VibexResult<vibex_core::AgentModelProviderDraftFetchModelsResponse> {
+        self.service
+            .fetch_agent_model_provider_draft_models(request)
+    }
+
     pub fn test_agent_model_provider_profile(
         &self,
         request: vibex_core::AgentModelProviderProfileTestRequest,

@@ -1183,6 +1183,7 @@ mod tests {
         AgentCatalogListResponse, AgentManagedInstallState,
         AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
         AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+        AgentModelProviderDraftFetchModelsRequest, AgentModelProviderDraftFetchModelsResponse,
         AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
         AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
         AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
@@ -1521,6 +1522,13 @@ mod tests {
             &self,
             _request: AgentModelProviderProfileFetchModelsRequest,
         ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse> {
+            error_future()
+        }
+
+        fn fetch_agent_model_provider_draft_models(
+            &self,
+            _request: AgentModelProviderDraftFetchModelsRequest,
+        ) -> BackendFuture<'_, AgentModelProviderDraftFetchModelsResponse> {
             error_future()
         }
 

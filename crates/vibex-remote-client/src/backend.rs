@@ -4285,6 +4285,34 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn fetch_agent_model_provider_draft_models(
+        &self,
+        request: vibex_core::AgentModelProviderDraftFetchModelsRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderDraftFetchModelsResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::FetchAgentModelProviderDraftModels(
+                vibex_core::RemoteAgentModelProviderDraftFetchModelsRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(
+                decode::<vibex_core::RemoteAgentModelProviderDraftFetchModelsResponse>(value)?
+                    .response,
+            )
+        })
+    }
+
     fn capability_summaries(
         &self,
     ) -> BackendFuture<'_, Vec<vibex_core::ProviderCapabilitySummary>> {

@@ -3044,6 +3044,20 @@ async fn dispatch_provider_request(
             )
             .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::FetchAgentModelProviderDraftModels(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let response = service.fetch_agent_model_provider_draft_models(request.request)?;
+            serde_json::to_value(
+                vibex_core::RemoteAgentModelProviderDraftFetchModelsResponse { response },
+            )
+            .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::ListCapabilitySummaries(request) => {
             authorize_provider_action(
                 runtime,
