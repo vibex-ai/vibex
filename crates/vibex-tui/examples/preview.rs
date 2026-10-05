@@ -352,6 +352,22 @@ fn turn_of(id: &str) -> &'static str {
     }
 }
 
+/// The clock a sample row is stamped with, if it is a row that carries one.
+///
+/// A message is what the transcript stamps, so those are the rows a preview has
+/// to stamp too. The times are fixed rather than read from the clock: a design
+/// frame whose labels moved every run could not be compared with the one before
+/// it.
+fn sample_timestamp(kind: TimelineRowKind) -> Option<i64> {
+    // 2025-09-30 13:12 UTC, the hour the sample conversation was written.
+    const SPOKEN_AT_MS: i64 = 1_759_237_920_000;
+    match kind {
+        TimelineRowKind::UserMessage => Some(SPOKEN_AT_MS),
+        TimelineRowKind::AgentMessage => Some(SPOKEN_AT_MS + 240_000),
+        _ => None,
+    }
+}
+
 fn entry(id: &str, kind: TimelineRowKind, title: &str, body: &str, failed: bool) -> Block {
     Block {
         id: id.to_string(),
@@ -360,6 +376,7 @@ fn entry(id: &str, kind: TimelineRowKind, title: &str, body: &str, failed: bool)
         body: body.to_string(),
         turn_id: Some(turn_of(id).to_string()),
         sequence: 1,
+        timestamp_ms: sample_timestamp(kind),
         expanded: false,
         collapsible: matches!(
             kind,

@@ -144,6 +144,12 @@ pub struct Block {
     pub body: String,
     pub turn_id: Option<String>,
     pub sequence: i64,
+    /// When this block's newest row item was written, in Unix milliseconds.
+    ///
+    /// `None` for a block no item stands behind — one the client projected
+    /// itself — and for a row the runtime never stamped. A message draws it as
+    /// the clock on its right; nothing else draws it at all.
+    pub timestamp_ms: Option<i64>,
     pub expanded: bool,
     pub collapsible: bool,
     pub streaming: bool,
@@ -173,6 +179,10 @@ impl Block {
         self.file_path.hash(&mut hasher);
         self.group.hash(&mut hasher);
         self.runtime_attribution.hash(&mut hasher);
+        // Not content, but drawn from the block: a row whose clock moved has to
+        // be laid out again, or the transcript would keep showing the hour the
+        // row was first measured at.
+        self.timestamp_ms.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -908,7 +918,7 @@ impl Transcript {
         } else {
             theme.prose()
         };
-        let body_width = chrome::content_width(self.width.max(8)).max(8);
+        let body_width = body_width_for(&block, self.width, strings);
         // Only a body that will be drawn is worth parsing as it arrives: a
         // dense row shows one live line, and re-rendering the whole thought to
         // keep a renderer it never reads is work the session does not need.
@@ -1320,6 +1330,9 @@ impl Transcript {
         if let Some(turn_id) = &block.turn_id {
             fields.push(format!("turn={turn_id}"));
         }
+        if let Some(at_ms) = block.timestamp_ms {
+            fields.push(format!("at={at_ms}"));
+        }
         if let Some(path) = &block.file_path {
             fields.push(format!("path={path}"));
         }
@@ -1660,6 +1673,76 @@ fn pointer_glyph(theme: &TuiTheme) -> &'static str {
 /// The separator used between chrome items across the interface.
 pub fn chrome_separator() -> &'static str {
     "│"
+}
+
+/// Columns between a message's text and the clock on its right.
+///
+/// The clock is a margin note, not a column of the message: two cells are
+/// enough to keep it from reading as the last word of the sentence.
+const CLOCK_GAP: usize = 2;
+
+/// Columns between the clock and the content's right edge.
+///
+/// One, so the clock is not glued to the edge of the band it sits in — the same
+/// cell the session list leaves after its own age column.
+const CLOCK_EDGE: usize = 1;
+
+/// The clock a message carries on its right, if it has one.
+///
+/// Only the conversation is stamped. A work item is a row of activity whose
+/// place in the transcript is already given by the messages around it, and a
+/// clock on each of forty tool calls is forty labels saying the same minute.
+fn clock_label(block: &Block, strings: Strings) -> Option<String> {
+    if !matches!(
+        block.kind,
+        TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+    ) {
+        return None;
+    }
+    let at_ms = block.timestamp_ms.filter(|at_ms| *at_ms > 0)?;
+    let label = crate::text::format_clock(at_ms, strings.locale);
+    (!label.is_empty()).then_some(label)
+}
+
+/// Columns a block reserves on its right for the clock, gutter included.
+///
+/// The body is wrapped to what is left, which is what keeps the clock off the
+/// text it belongs to: a label drawn over the words of a message is worse than
+/// no label at all.
+fn clock_columns(block: &Block, strings: Strings) -> usize {
+    clock_label(block, strings)
+        .map(|label| display_width(&label) + CLOCK_GAP + CLOCK_EDGE)
+        .unwrap_or(0)
+}
+
+/// The columns a block's body is wrapped to inside the transcript band.
+///
+/// Shared by the incremental streaming renderer and the block renderer: a
+/// streamed answer is laid out from a frozen prefix, so the two have to agree
+/// on the width or the last settled line and the first live one would break in
+/// different places.
+pub fn body_width_for(block: &Block, width: usize, strings: Strings) -> usize {
+    // The prompt mark costs two cells on the reader's own message; the clock
+    // costs whatever its label needs on a message of either kind.
+    let prompt = if block.kind == TimelineRowKind::UserMessage {
+        2
+    } else {
+        0
+    };
+    chrome::content_width(width.max(8))
+        .max(8)
+        .saturating_sub(prompt)
+        .saturating_sub(clock_columns(block, strings))
+        .max(8)
+}
+
+/// Whether a block's body is drawn on a band that fills the whole row.
+///
+/// The reader's own message is an object rather than an entry: the band is its
+/// container, and a container that stopped where the words did would read as a
+/// highlight behind a sentence instead of as the block the reader wrote into.
+fn band_fills_row(block: &Block) -> bool {
+    block.kind == TimelineRowKind::UserMessage
 }
 
 /// Whether a block kind is a dense, foldable work item.
@@ -2075,10 +2158,11 @@ pub fn render_block_with_attribution(
     } else {
         None
     };
-    // The mark costs two columns, so the text is wrapped that much narrower.
-    let body_width = content_width
-        .saturating_sub(prompt_mark.map_or(0, |_| 2))
-        .max(8);
+    // The mark costs two columns and the clock whatever its label needs, so the
+    // text is wrapped that much narrower. The same width is what the streaming
+    // renderer froze its prefix at, which is why it is asked for by one
+    // function.
+    let body_width = body_width_for(block, width, strings);
 
     // A dense row is one row: its body is what the fold is for, and the detail
     // overlay can show all of it. Messages render every arriving line; work
@@ -2164,6 +2248,17 @@ pub fn render_block_with_attribution(
     if let Some(rendered) = rendered {
         let body_background = body_band(block, theme);
         let style = body_style(block, theme);
+        // The reader's own message is drawn on a band that fills the row: the
+        // band is the message's container, not a highlight behind its words.
+        let band = band_fills_row(block).then(|| Style::default().bg(theme.roles.surface_raised));
+        // The clock is furniture on the row the message starts on: the reader
+        // asking "when was this said" reads the first line, not the last one a
+        // long answer happened to reach.
+        let clock = clock_label(block, strings);
+        let clock_style = match band {
+            Some(band) => band.fg(theme.roles.gray_dim),
+            None => Style::default().fg(theme.roles.gray_dim),
+        };
         for (index, (line, text)) in rendered.lines.into_iter().zip(rendered.plain).enumerate() {
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
@@ -2190,6 +2285,17 @@ pub fn render_block_with_attribution(
                 spans.insert(0, Span::raw("  "));
                 text = format!("  {text}");
             }
+            // Neither the band nor the clock is text, so neither enters
+            // `plain`: what a reader drags out of the transcript is the message
+            // they wrote, without the chrome that framed it.
+            close_body_row(
+                &mut spans,
+                display_width(&text),
+                content_width,
+                band,
+                (index == 0).then_some(clock.as_deref()).flatten(),
+                clock_style,
+            );
             // The pointer is the first body row's marker only where there is no
             // rail to give it up: a live window's rail runs unbroken, and the
             // header above already carries the cursor.
@@ -2327,6 +2433,51 @@ fn fold_live_window(rendered: &mut crate::markdown::RenderedMarkdown, theme: &Tu
     }
 }
 
+/// Close a body row: fill its band to the content edge and, on the row a
+/// message starts on, place the clock at the right.
+///
+/// `used` is the width the row's text already occupies. The body was wrapped to
+/// leave the clock's columns free, so the clock lands in the margin rather than
+/// on the words; a row whose text overran them anyway — a markdown table is
+/// wider than the prose around it — closes its band and goes without a stamp.
+fn close_body_row(
+    spans: &mut Vec<Span<'static>>,
+    used: usize,
+    content_width: usize,
+    band: Option<Style>,
+    clock: Option<&str>,
+    clock_style: Style,
+) {
+    let remaining = content_width.saturating_sub(used);
+    // Filling is what turns a band into a block; a row without one only ever
+    // gets the empty cells that hold the clock off its text, and those are left
+    // unstyled so the page shows through.
+    let fill = |spans: &mut Vec<Span<'static>>, width: usize| {
+        if let Some(band) = band
+            && width > 0
+        {
+            spans.push(Span::styled(" ".repeat(width), band));
+        }
+    };
+    let Some(clock) = clock else {
+        return fill(spans, remaining);
+    };
+    let clock_width = display_width(clock);
+    if remaining < clock_width + CLOCK_EDGE {
+        return fill(spans, remaining);
+    }
+    // Everything the text did not take, less the clock and the cell kept clear
+    // between it and the edge of the row.
+    let pad = remaining - clock_width - CLOCK_EDGE;
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), band.unwrap_or_default()));
+    }
+    spans.push(Span::styled(
+        format!("{clock}{}", " ".repeat(CLOCK_EDGE)),
+        clock_style,
+    ));
+}
+
 /// The background band a block body sits on, when it benefits from one.
 fn body_band(block: &Block, theme: &TuiTheme) -> Option<Style> {
     if block.kind == TimelineRowKind::UserMessage {
@@ -2398,6 +2549,7 @@ mod tests {
             body: body.to_string(),
             turn_id: Some("turn-1".into()),
             sequence: 1,
+            timestamp_ms: None,
             expanded: false,
             collapsible: true,
             streaming: false,
@@ -3398,6 +3550,142 @@ mod density_tests {
         }
     }
 
+    /// The visible text of one rendered line, spans joined.
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    /// The clock label a block renders, which is what the assertions look for
+    /// in the line: the hour itself belongs to the reader's timezone, and the
+    /// placement does not.
+    fn clock_of(block: &Block) -> String {
+        clock_label(block, strings()).expect("the block carries a clock")
+    }
+
+    #[test]
+    fn a_message_is_stamped_at_the_right_of_its_first_row() {
+        let mut row = item(
+            "user",
+            TimelineRowKind::UserMessage,
+            "what does the retry helper do?",
+            false,
+        );
+        row.timestamp_ms = Some(1_759_237_920_000);
+        let width = 60;
+        let rendered = render_block(&row, &theme(), width, strings());
+        let clock = clock_of(&row);
+        let first = line_text(&rendered.lines[0]);
+        assert!(first.contains(&clock), "no clock on {first:?}");
+
+        // The label ends one cell short of the content's edge, so the row is
+        // exactly as wide as every other row of the band.
+        assert!(
+            first.ends_with(&format!("{clock}{}", " ".repeat(CLOCK_EDGE))),
+            "{first:?}"
+        );
+        let content_width = chrome::content_width(width);
+        assert_eq!(
+            display_width(&first),
+            chrome::PAD_LEFT + content_width,
+            "the stamped row is not full width: {first:?}"
+        );
+
+        // One clock per message, on the row it starts at.
+        for line in rendered.lines.iter().skip(1) {
+            assert!(!line_text(line).contains(&clock), "{:?}", line_text(line));
+        }
+    }
+
+    #[test]
+    fn the_clock_never_lands_on_the_message() {
+        // A message long enough to wrap: every line of it has to stop short of
+        // the clock, not only the row the clock is drawn on.
+        let mut row = item(
+            "user",
+            TimelineRowKind::UserMessage,
+            "The upload helper gives up on the first 5xx. It should retry with a short \
+             backoff and give up after three attempts, and the retry has to be covered \
+             by a test that fails on the old code.",
+            false,
+        );
+        row.timestamp_ms = Some(1_759_237_920_000);
+        let width = 60;
+        let rendered = render_block(&row, &theme(), width, strings());
+        let clock = clock_of(&row);
+        let first = line_text(&rendered.lines[0]);
+        let at = first.find(&clock).expect("the clock is on the first row");
+        let text_before = display_width(&first[..at]);
+        let text_width = display_width(&rendered.plain[0]);
+        assert!(
+            text_before >= text_width + CLOCK_GAP,
+            "the clock is {text_before} columns in, on text {text_width} wide"
+        );
+        assert!(rendered.plain.len() > 1, "the message did not wrap");
+    }
+
+    #[test]
+    fn the_readers_message_is_a_band_that_fills_the_row() {
+        let row = item("user", TimelineRowKind::UserMessage, "a question", false);
+        let width = 60;
+        let content_width = chrome::content_width(width);
+        let band = theme().roles.surface_raised;
+        let rendered = render_block(&row, &theme(), width, strings());
+        for line in rendered.lines.iter().take(rendered.height - 1) {
+            let text = line_text(line);
+            assert_eq!(
+                display_width(&text),
+                chrome::PAD_LEFT + content_width,
+                "the message band stopped early: {text:?}"
+            );
+            // The cells past the words are part of the block, not empty page.
+            let tail = line.spans.last().expect("the row ends in a span");
+            assert_eq!(
+                tail.style.bg,
+                Some(band),
+                "the band stopped at the text: {:?}",
+                tail.content
+            );
+        }
+    }
+
+    #[test]
+    fn work_rows_and_unstamped_rows_draw_no_clock() {
+        // Only the conversation is stamped: a work item's clock would be one of
+        // forty labels saying the same minute.
+        let mut work = item("tool", TimelineRowKind::ToolCall, "read Cargo.toml", false);
+        work.timestamp_ms = Some(1_759_237_920_000);
+        assert_eq!(clock_label(&work, strings()), None);
+        assert_eq!(clock_columns(&work, strings()), 0);
+
+        // A row the runtime never stamped has nothing to draw and keeps the
+        // whole row for its text.
+        let unstamped = item("user", TimelineRowKind::UserMessage, "a question", false);
+        assert_eq!(unstamped.timestamp_ms, None);
+        assert_eq!(clock_label(&unstamped, strings()), None);
+        assert_eq!(
+            body_width_for(&unstamped, 60, strings()),
+            chrome::content_width(60) - 2
+        );
+        let rendered = render_block(&unstamped, &theme(), 60, strings());
+        assert!(rendered.lines[0].width() < 60);
+    }
+
+    #[test]
+    fn a_stamped_body_is_wrapped_to_leave_the_clock_its_columns() {
+        let mut stamped = item("user", TimelineRowKind::UserMessage, "a question", false);
+        stamped.timestamp_ms = Some(1_759_237_920_000);
+        let unstamped = item("user", TimelineRowKind::UserMessage, "a question", false);
+        let columns = clock_columns(&stamped, strings());
+        assert!(columns > 0);
+        assert_eq!(
+            body_width_for(&stamped, 60, strings()) + columns,
+            body_width_for(&unstamped, 60, strings())
+        );
+    }
+
     fn item(id: &str, kind: TimelineRowKind, body: &str, streaming: bool) -> Block {
         Block {
             id: id.to_string(),
@@ -3410,6 +3698,7 @@ mod density_tests {
             body: body.to_string(),
             turn_id: Some("turn-1".into()),
             sequence: 1,
+            timestamp_ms: None,
             expanded: false,
             collapsible: true,
             streaming,

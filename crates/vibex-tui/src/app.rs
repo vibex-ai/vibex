@@ -554,6 +554,12 @@ pub struct PendingSend {
     /// correlation identity, never a text/sequence guess.
     pub after_sequence: i64,
     pub submitted_at: std::time::Instant,
+    /// When the reader pressed send, on the wall clock.
+    ///
+    /// `submitted_at` measures the wait and cannot be turned into an hour; the
+    /// projected row is stamped with this until the runtime's own row — and its
+    /// own timestamp — replaces it.
+    pub submitted_at_ms: i64,
 }
 
 impl PendingSend {
@@ -590,6 +596,9 @@ impl PendingSend {
             conclusion: false,
             first_sequence: self.after_sequence.saturating_add(1),
             last_sequence: self.after_sequence.saturating_add(1),
+            // The row is the client's own, so it carries the clock the reader
+            // sent it at rather than an item's.
+            timestamp_ms: self.submitted_at_ms,
             title: "You".to_string(),
             body: crate::attachment::with_attachments(&self.text, &self.attachments, strings),
             streaming: false,
@@ -3886,6 +3895,7 @@ impl App {
                 attachments,
                 after_sequence,
                 submitted_at: std::time::Instant::now(),
+                submitted_at_ms: vibex_core::unix_timestamp_ms(),
             },
         );
         if session_id.is_some() && session_id == self.selected_session_id() {
@@ -4914,6 +4924,9 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
         body: row.body.clone(),
         turn_id: row.turn_id.clone(),
         sequence: row.last_sequence,
+        // A row the runtime never stamped carries the epoch; the transcript
+        // draws no clock rather than one reading 1970.
+        timestamp_ms: (row.timestamp_ms > 0).then_some(row.timestamp_ms),
         expanded: false,
         // A dense row shows one line by shape, so it has to be openable to be
         // readable in full: the transcript is where its body lives.
@@ -5749,5 +5762,46 @@ mod tests {
                 is_final: true,
             })
         )));
+    }
+
+    #[test]
+    fn a_transcript_block_carries_the_clock_the_row_was_stamped_with() {
+        // The runtime stamps a row with the item that closed it and the
+        // transcript draws that time beside the message, so the projection has
+        // to hand it on rather than drop it at the door.
+        let session_id = vibex_core::VibexSessionId::new();
+        let item = vibex_core::TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence: 4,
+            timestamp_ms: 1_759_237_920_000,
+            source: vibex_core::TimelineSource::User,
+            kind: vibex_core::TimelineItemKind::UserMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: "what does the retry helper do?".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        };
+        let row = vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
+            .into_iter()
+            .next()
+            .expect("the item projects to a row");
+        assert_eq!(row.timestamp_ms, 1_759_237_920_000);
+        assert_eq!(
+            block_from_row(&row).timestamp_ms,
+            Some(1_759_237_920_000),
+            "the block dropped the row's clock"
+        );
+
+        // A row with no stamped item behind it draws no clock rather than one
+        // reading the epoch.
+        let mut untimed = row;
+        untimed.timestamp_ms = 0;
+        assert_eq!(block_from_row(&untimed).timestamp_ms, None);
     }
 }

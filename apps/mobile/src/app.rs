@@ -9220,6 +9220,9 @@ impl MobileApp {
             conclusion: false,
             first_sequence: 0,
             last_sequence: 0,
+            // A thought still arriving is drawn from the live stream, which
+            // carries no item of its own to be stamped with.
+            timestamp_ms: 0,
             title: locale::common("Reasoning").to_string(),
             body: body.to_string(),
             streaming: true,

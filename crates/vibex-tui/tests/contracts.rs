@@ -75,13 +75,18 @@ fn the_client_never_reaches_past_the_backend_traits() {
 #[test]
 fn the_manifest_declares_no_gui_or_runtime_dependency() {
     let manifest = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"));
+    // The block runs to the next section header rather than to the next `[`: a
+    // dependency's own feature list is written in brackets, and reading one as
+    // the start of a section cut the block off before the crate names it was
+    // there to inspect.
     let dependencies = manifest
         .split("[dependencies]")
         .nth(1)
         .expect("a dependencies section")
-        .split('[')
-        .next()
-        .expect("dependency block");
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
     for forbidden in [
         "gpui",
         "vibex-desktop-runtime",
