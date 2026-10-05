@@ -10,7 +10,7 @@ use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, ElementId, Entity,
     FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement, KeyBinding,
     ListAlignment, ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
-    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase,
+    Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase,
     Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
     img, list, percentage, point, prelude::*, px, rgb, svg, uniform_list,
 };
@@ -206,11 +206,12 @@ enum NearbyPairingState {
     },
 }
 
-/// Which pairing fallback is open underneath its own row.
+/// Which pairing fallback is open in a sheet over the page.
 ///
-/// The pairing page is one screen: a primary action plus two fallbacks that
-/// expand in place, so pairing never pushes a page, opens an overlay, or needs
-/// a back gesture. Only one can be open at a time.
+/// The pairing page is one screen: the runtimes this phone knows, a primary
+/// action, and two fallbacks. A fallback takes the shape of a sheet so opening
+/// one never reflows the page behind it, and the back gesture closes it before
+/// it can leave the app. Only one can be open at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairingPanel {
     None,
@@ -937,7 +938,6 @@ pub struct MobileApp {
     /// The runtime a host overlay (detail, actions, rename, remove) refers to.
     host_overlay_target: Option<String>,
     host_name_input: Entity<InputState>,
-    pairing_from_hosts: bool,
     elicitation_request_id: Option<RequestId>,
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_draft: Option<ElicitationFormDraft>,
@@ -1228,7 +1228,6 @@ impl MobileApp {
                     "執行環境名稱",
                 ))
             }),
-            pairing_from_hosts: false,
             elicitation_request_id: None,
             elicitation_inputs: BTreeMap::new(),
             elicitation_draft: None,
@@ -1630,7 +1629,6 @@ impl MobileApp {
                 self.timeline_metadata_tip = None;
                 self.attachment_preview = None;
                 self.attachment_preview_loading = None;
-                self.pairing_from_hosts = false;
                 self.mode = RootMode::Connecting;
                 self.error = None;
                 self.backend = Some(backend.clone());
@@ -2090,9 +2088,9 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Opens or closes the local-network fallback in place.
+    /// Opens or closes the local-network fallback's sheet.
     ///
-    /// Opening starts discovery immediately: the row the user tapped is the
+    /// Opening starts discovery immediately: the entry the user tapped is the
     /// only thing that changed, so a second "find" tap would be a step with no
     /// decision behind it.
     fn toggle_nearby_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2110,7 +2108,7 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Opens or closes the manual-entry fallback in place.
+    /// Opens or closes the manual-entry fallback's sheet.
     fn toggle_manual_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.pairing_busy {
             return;
@@ -2126,8 +2124,24 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Returns the panel region to the top. A panel opened while the previous
-    /// one was scrolled down has to start at its own first line, not halfway
+    /// Closes the open fallback sheet, whatever opened it, and leaves the page
+    /// exactly as it was before: the scrim, the back gesture and the sheet's own
+    /// close control all land here.
+    ///
+    /// A pairing action in flight is not interrupted — the sheet stays until the
+    /// claim it is showing resolves.
+    fn dismiss_pairing_panel(&mut self, cx: &mut Context<Self>) {
+        if self.pairing_busy || self.pairing_panel == PairingPanel::None {
+            return;
+        }
+        crate::platform::hide_keyboard();
+        self.pairing_panel = PairingPanel::None;
+        self.stop_nearby_pairing();
+        cx.notify();
+    }
+
+    /// Returns the sheet body to the top. A sheet opened while the previous one
+    /// was scrolled down has to start at its own first line, not halfway
     /// through it.
     fn reset_pairing_panel_scroll(&self) {
         self.pairing_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -4730,6 +4744,12 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A pairing fallback is a sheet over the first screen, so back closes it
+        // the way it closes every other sheet instead of leaving the app.
+        if self.mode == RootMode::Pairing && self.pairing_panel != PairingPanel::None {
+            self.dismiss_pairing_panel(cx);
+            return;
+        }
         if matches!(self.mode, RootMode::Pairing | RootMode::Connecting) {
             return;
         }
@@ -4955,7 +4975,6 @@ impl MobileApp {
         self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
         self.timeline_display_settings_sync_busy = false;
         self.fork_session_busy = false;
-        self.pairing_from_hosts = false;
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
@@ -5135,7 +5154,6 @@ impl MobileApp {
         self.reset_drawers();
         self.clear_overlay();
         self.mode = RootMode::Pairing;
-        self.pairing_from_hosts = true;
         self.error = None;
         self.workspaces.clear();
         self.workspace_summaries.clear();
@@ -6103,7 +6121,6 @@ impl MobileApp {
         self.fork_session_busy = false;
         self.timeline_display_settings_overrides.clear();
         let _ = self.storage.clear_timeline_display_settings_overrides();
-        self.pairing_from_hosts = false;
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
@@ -6338,103 +6355,84 @@ impl MobileApp {
     /// way back. The three entries are not peers: scanning is the only one that
     /// reaches both a desktop and a headless cloud runtime, because both
     /// publish a `vibex://` link; the other two cover the cases where scanning
-    /// is not possible, and each opens the panel that explains it above the
-    /// entries, so they never move under the user's finger.
+    /// is not possible, and each opens the sheet that explains it.
     ///
     /// A phone that has never paired anything has no runtimes to show, so the
     /// three entries stack in the middle of the page where the eye already is
     /// instead of hanging off the bottom edge; the first pairing turns them
     /// back into the row above the thumb.
-    fn render_pairing(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// Nothing here moves when a fallback opens: `render_pairing_sheet` lays the
+    /// panel over the page instead of taking room in it, so an entry keeps the
+    /// exact place the finger just left.
+    fn render_pairing(&self, sheet_max_height: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         let scan_busy = self.pairing_action == Some(PairingAction::Scan);
         let scan_enabled = !self.pairing_busy;
         let saved_runtimes = !self.known_hosts.is_empty();
-        let panel_open = self.pairing_panel != PairingPanel::None;
         let error_here = (self.pairing_panel != PairingPanel::Manual)
             .then(|| self.pairing_error_line())
             .flatten();
         div()
             .size_full()
-            .flex()
-            .flex_col()
+            .relative()
             .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
-            .px(px(theme::SPACING_XL))
             .child(
                 div()
-                    .w_full()
-                    .flex_1()
-                    .min_h_0()
+                    .size_full()
                     .flex()
                     .flex_col()
-                    .items_center()
+                    .px(px(theme::SPACING_XL))
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(theme::CARD_WIDTH))
                             .flex_1()
                             .min_h_0()
                             .flex()
                             .flex_col()
-                            .pt(px(PAIRING_PAGE_TOP_PAD))
-                            .child(self.render_pairing_brand())
-                            .child(self.render_pairing_runtimes(cx))
+                            .items_center()
                             .child(
                                 div()
-                                    .id("pairing-panel-scroll")
-                                    .debug_selector(|| "pairing-panel-scroll".to_string())
                                     .w_full()
+                                    .max_w(px(theme::CARD_WIDTH))
                                     .flex_1()
                                     .min_h_0()
                                     .flex()
                                     .flex_col()
-                                    .track_scroll(&self.pairing_scroll)
-                                    .overflow_y_scroll()
-                                    .restrict_scroll_to_axis()
-                                    // The stacked entries are the only content
-                                    // on a page with nothing paired, so they
-                                    // take the middle; an open panel owns the
-                                    // region from its own first line instead.
-                                    .when(!saved_runtimes && !panel_open, |region| {
-                                        region.justify_center()
+                                    .pt(px(PAIRING_PAGE_TOP_PAD))
+                                    .child(self.render_pairing_brand())
+                                    .child(self.render_pairing_runtimes(cx))
+                                    .when_some(error_here, |page, line| {
+                                        page.child(div().mb(px(theme::SPACING_MD)).child(line))
                                     })
-                                    .when_some(error_here, |region, line| {
-                                        region.child(div().mb(px(theme::SPACING_MD)).child(line))
-                                    })
-                                    .child(self.render_pairing_panel(cx))
-                                    .when(!saved_runtimes, |region| {
-                                        region.child(self.render_pairing_stack(
-                                            scan_busy,
-                                            scan_enabled,
-                                            cx,
-                                        ))
-                                    })
-                                    .when(self.pairing_from_hosts, |region| {
-                                        region.child(
-                                            div()
-                                                .id("back-to-mobile-hosts")
-                                                .mt(px(theme::SPACING_SM))
-                                                .h(px(theme::TOUCH_TARGET))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_size(px(theme::FONT_CAPTION))
-                                                .text_color(theme::text_muted())
-                                                .cursor_pointer()
-                                                .active(|style| style.opacity(0.7))
-                                                .on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(Self::cancel_pairing_host),
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "pairing-entry-region".to_string())
+                                            .w_full()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .flex()
+                                            .flex_col()
+                                            // The stacked entries are the only
+                                            // content on a page with nothing
+                                            // paired, so they take its middle.
+                                            .when(!saved_runtimes, |region| {
+                                                region.justify_center().child(
+                                                    self.render_pairing_stack(
+                                                        scan_busy,
+                                                        scan_enabled,
+                                                        cx,
+                                                    ),
                                                 )
-                                                .child(locale::common("Back to hosts")),
-                                        )
-                                    }),
+                                            }),
+                                    ),
                             ),
-                    ),
+                    )
+                    .when(saved_runtimes, |page| {
+                        page.child(self.render_pairing_actions(scan_busy, scan_enabled, cx))
+                    }),
             )
-            .when(saved_runtimes, |page| {
-                page.child(self.render_pairing_actions(scan_busy, scan_enabled, cx))
-            })
+            .child(self.render_pairing_sheet(sheet_max_height, cx))
     }
 
     /// The product wordmark. The brand mark supplies the capital "V" and the
@@ -6607,24 +6605,145 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// The open fallback, framed so it reads as a panel the row below opened
-    /// rather than as another card in the runtime strip.
-    fn render_pairing_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let content = match self.pairing_panel {
-            PairingPanel::Nearby => self.render_nearby_pairing_section(cx),
-            PairingPanel::Manual => self.render_manual_pairing_section(cx),
+    /// The open fallback, as a sheet over the page.
+    ///
+    /// The entries behind it keep every pixel they had: the sheet is what the
+    /// finger brought up, and the keyboard lifts the sheet rather than
+    /// reflowing the page under it. The scrim, the back gesture and the sheet's
+    /// own header all dismiss it.
+    fn render_pairing_sheet(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (header, body) = match self.pairing_panel {
             PairingPanel::None => return div().into_any_element(),
+            PairingPanel::Nearby => {
+                let retry = matches!(
+                    self.nearby_pairing_state,
+                    NearbyPairingState::Empty
+                        | NearbyPairingState::PermissionDenied
+                        | NearbyPairingState::Rejected
+                        | NearbyPairingState::Expired
+                        | NearbyPairingState::Failed { .. }
+                );
+                let trailing = retry.then(|| {
+                    pairing_sheet_header_action("pairing-nearby-retry", locale::common("Try Again"))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::start_nearby_pairing))
+                        .into_any_element()
+                });
+                (
+                    self.render_pairing_sheet_header(
+                        locale::text("Find on this network", "在同一网络查找", "在同一網路上尋找"),
+                        trailing,
+                        cx,
+                    ),
+                    self.render_nearby_pairing(cx),
+                )
+            }
+            PairingPanel::Manual => (
+                self.render_pairing_sheet_header(
+                    locale::text(
+                        "Paste a code or link",
+                        "粘贴配对码或链接",
+                        "貼上配對碼或連結",
+                    ),
+                    None,
+                    cx,
+                ),
+                self.render_manual_pairing(cx),
+            ),
         };
         div()
-            .w_full()
+            .id("pairing-sheet-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.72))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.dismiss_pairing_panel(cx)),
+            )
+            .child(
+                div()
+                    .id("pairing-sheet")
+                    .debug_selector(|| "pairing-sheet".to_string())
+                    .w_full()
+                    .max_h(max_height)
+                    .flex()
+                    .flex_col()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .overflow_hidden()
+                    // The sheet owns its own taps: only the scrim around it
+                    // dismisses what it is showing.
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(header)
+                    .child(
+                        div()
+                            .id("pairing-sheet-body")
+                            .flex_1()
+                            .min_h_0()
+                            .track_scroll(&self.pairing_scroll)
+                            .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
+                            .child(body),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The header every fallback sheet carries: what the sheet is, whatever its
+    /// own state needs beside that, and the one control that closes it.
+    fn render_pairing_sheet_header(
+        &self,
+        title: &'static str,
+        trailing: Option<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .h(px(theme::DRAWER_HEADER_HEIGHT))
             .flex_shrink_0()
-            .mb(px(theme::SPACING_MD))
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_default())
-            .bg(theme::bg_card())
-            .overflow_hidden()
-            .child(content)
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .pl(px(theme::SPACING_MD))
+            .pr(px(theme::SPACING_XS))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(theme::FONT_HEADING))
+                    .text_color(theme::text_primary())
+                    .child(title),
+            )
+            .children(trailing)
+            .child(
+                div()
+                    .id("pairing-sheet-close")
+                    .aria_label(locale::common("Close"))
+                    .size(px(theme::TOUCH_TARGET))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.65))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.dismiss_pairing_panel(cx)),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/x.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -6766,79 +6885,8 @@ impl MobileApp {
         })
     }
 
-    /// The local-network fallback, as the panel the "find" entry opens.
-    ///
-    /// The header carries the one action the state needs — stop a search that
-    /// is running, retry one that failed — and the body is whatever discovery
-    /// has to say right now.
-    fn render_nearby_pairing_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let title = locale::text("Find on this network", "在同一网络查找", "在同一網路上尋找");
-        let retry = matches!(
-            self.nearby_pairing_state,
-            NearbyPairingState::Empty
-                | NearbyPairingState::PermissionDenied
-                | NearbyPairingState::Rejected
-                | NearbyPairingState::Expired
-                | NearbyPairingState::Failed { .. }
-        );
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .min_h(px(48.0))
-                    .px(px(theme::SPACING_MD))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .id("pairing-nearby-action")
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px(px(theme::SPACING_SM))
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(theme::FONT_DETAIL))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text_primary())
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.7))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(if retry {
-                                    Self::start_nearby_pairing
-                                } else {
-                                    Self::toggle_nearby_pairing
-                                }),
-                            )
-                            .child(if retry {
-                                locale::common("Try Again")
-                            } else {
-                                locale::common("Stop")
-                            }),
-                    ),
-            )
-            .child(self.render_nearby_pairing(cx))
-            .into_any_element()
-    }
-
-    /// The manual-entry fallback, as the panel the "link" entry opens.
-    fn render_manual_pairing_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let title = locale::text(
-            "Paste a code or link",
-            "粘贴配对码或链接",
-            "貼上配對碼或連結",
-        );
+    /// The manual-entry fallback, as the body of the "link" sheet.
+    fn render_manual_pairing(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entry = self.pairing_code_input.read(cx).value().trim().to_string();
         // A link already carries its address and certificate, so the address
         // field only earns its place once the text is a bare code.
@@ -6852,14 +6900,8 @@ impl MobileApp {
             .flex_col()
             .gap(px(theme::SPACING_SM))
             .px(px(theme::SPACING_MD))
-            .py(px(theme::SPACING_MD))
-            .child(
-                div()
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text_primary())
-                    .child(title),
-            )
+            .pt(px(theme::SPACING_MD))
+            .pb(px(theme::SPACING_LG))
             .when(needs_address, |panel| {
                 panel
                     .child(pairing_field_label(locale::text(
@@ -6879,7 +6921,11 @@ impl MobileApp {
             .child(pairing_field_label(if needs_address {
                 locale::text("Pairing code", "配对码", "配對碼")
             } else {
-                title
+                locale::text(
+                    "Paste a code or link",
+                    "粘贴配对码或链接",
+                    "貼上配對碼或連結",
+                )
             }))
             .child(
                 div()
@@ -6978,8 +7024,7 @@ impl MobileApp {
         })
     }
 
-    /// The result of the local-network fallback, rendered underneath the row
-    /// that started it.
+    /// The result of the local-network fallback: the body of its sheet.
     fn render_nearby_pairing(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         match &self.nearby_pairing_state {
             NearbyPairingState::Idle => div().into_any_element(),
@@ -13878,8 +13923,8 @@ impl MobileApp {
         match state {
             RuntimeStatus::Connected | RuntimeStatus::Unstable => {
                 // Disconnecting leaves the pairing in place: it hands the phone
-                // back to the pairing screen, whose "Back to hosts" restores
-                // this runtime, matching the cancel-connect flow already here.
+                // back to the pairing screen, where this runtime's own card is
+                // what restores it, matching the cancel-connect flow here.
                 row = row.child(
                     button("mobile-runtime-disconnect", locale::common("Disconnect"))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
@@ -13902,8 +13947,8 @@ impl MobileApp {
             RuntimeStatus::NotConnected => {
                 // A runtime is selected but no transport is bound to it — the
                 // connect attempt was cancelled or its credentials failed to
-                // install. Re-installing the bundle is what reconnects, and it
-                // is the same path the pairing screen's "Back to hosts" uses.
+                // install. Re-installing the bundle is what reconnects, and the
+                // pairing screen's runtime cards do exactly the same thing.
                 row = row.child(
                     button("mobile-runtime-connect", locale::common("Connect"))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_pairing_host)),
@@ -14487,7 +14532,9 @@ impl Render for MobileApp {
             .pb(insets.bottom)
             .pl(insets.left)
             .child(match self.mode {
-                RootMode::Pairing => self.render_pairing(cx).into_any_element(),
+                RootMode::Pairing => self
+                    .render_pairing(pairing_sheet_max_height(window), cx)
+                    .into_any_element(),
                 RootMode::Connecting => self.render_connecting(cx).into_any_element(),
                 RootMode::Workspace => self.render_workspace(page_width, cx).into_any_element(),
             })
@@ -14495,6 +14542,14 @@ impl Render for MobileApp {
             // belongs to. It positions itself in window coordinates.
             .child(self.selection_menu.clone())
     }
+}
+
+/// How tall a pairing sheet may grow before its body scrolls instead.
+///
+/// A sheet never takes the whole page: the wordmark above it and the entries
+/// it explains stay in sight behind the scrim.
+fn pairing_sheet_max_height(window: &Window) -> Pixels {
+    px(f32::from(window.viewport_size().height) * PAIRING_SHEET_HEIGHT_RATIO)
 }
 
 fn workspace_page_width(window: &Window) -> f32 {
@@ -17296,10 +17351,16 @@ fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
 
 /// Top spacing of the pairing page.
 ///
-/// Fixed rather than centered: expanding a fallback has to grow downward, and
-/// a vertically centered page would shift every control under the user's finger
-/// each time one opened.
+/// Fixed rather than centered: the wordmark and the entries have to stay put,
+/// and a vertically centered page would shift every control under the user's
+/// finger each time a sheet opened or the keyboard arrived.
 const PAIRING_PAGE_TOP_PAD: f32 = 88.0;
+
+/// The share of the page a pairing sheet may cover before its body scrolls.
+///
+/// A sheet always leaves the wordmark and the entries above it in sight, so the
+/// screen never becomes a sheet with nothing behind it.
+const PAIRING_SHEET_HEIGHT_RATIO: f32 = 0.62;
 
 /// The pairing page's product wordmark, at the size the first screen wants.
 ///
@@ -17334,7 +17395,7 @@ fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
 ///
 /// Every entry keeps the same metrics so the three read as one control group:
 /// `primary` marks the entry that reaches both kinds of runtime, `selected`
-/// marks the entry whose panel is open, and a missing `icon` is where the busy
+/// marks the entry whose sheet is open, and a missing `icon` is where the busy
 /// spinner goes.
 fn pairing_action_button(
     id: impl Into<ElementId>,
@@ -17399,6 +17460,28 @@ fn pairing_action_button(
                 .text_color(content_color)
                 .child(label),
         )
+}
+
+/// A state action in a pairing sheet header, beside its close control: retry a
+/// search that came back empty, for instance.
+fn pairing_sheet_header_action(
+    id: impl Into<ElementId>,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(theme::TOUCH_TARGET))
+        .px(px(theme::SPACING_SM))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(theme::FONT_DETAIL))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::text_primary())
+        .cursor_pointer()
+        .active(|style| style.opacity(0.7))
+        .child(label)
 }
 
 fn pairing_field_label(label: &'static str) -> gpui::AnyElement {
@@ -19243,6 +19326,83 @@ mod tests {
             "a sideways pan should scroll the runtime strip"
         );
 
+        // A fallback opens as a sheet over the page, so the entries stay exactly
+        // where the finger left them — opening one used to reflow the row.
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Nearby;
+            app.nearby_pairing_state = NearbyPairingState::Discovering;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("pairing-sheet").is_some(),
+            "the find sheet should be laid out"
+        );
+        assert_eq!(
+            cx.debug_bounds("pairing-actions").expect("the row stays"),
+            actions,
+            "opening a sheet must not move the bottom row"
+        );
+        assert_eq!(
+            cx.debug_bounds("pairing-runtimes")
+                .expect("the strip stays"),
+            strip,
+            "opening a sheet must not move the runtime strip"
+        );
+
+        // A long result list grows into the page only up to the sheet's cap,
+        // and then scrolls inside it: the sheet never swallows the whole page.
+        app.update(cx, |app, cx| {
+            app.nearby_candidates = (0..20)
+                .map(|index| {
+                    (
+                        format!("candidate-{index}"),
+                        crate::discovery::LanDiscoveryCandidate {
+                            advertisement_id: format!("advertisement-{index}"),
+                            service_instance: format!("instance-{index}"),
+                            display_name: format!("studio-{index}"),
+                            origin: "studio.local".to_string(),
+                            mode: crate::discovery::LanDiscoveryMode::ZeroConfig,
+                            server_id: None,
+                            server_identity_public_key: None,
+                            interface_scope: String::new(),
+                        },
+                    )
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let sheet = cx
+            .debug_bounds("pairing-sheet")
+            .expect("the find sheet should stay laid out");
+        let cap = cx.update(|window, _| pairing_sheet_max_height(window));
+        assert!(
+            sheet.size.height <= cap,
+            "the sheet should stop at its cap: {:?} vs {cap:?}",
+            sheet.size
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.pairing_scroll.max_offset().y) > px(0.0),
+            "a long result list should scroll inside the sheet"
+        );
+
+        app.update(cx, |app, cx| {
+            app.nearby_candidates.clear();
+            app.dismiss_pairing_panel(cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("pairing-sheet").is_none(),
+            "dismissing should take the sheet away"
+        );
+
         // The same page with the runtime list empty is what a fresh install
         // paints: no strip, no empty-state copy, and the three entries stacked
         // in the middle of the page instead of hanging off the bottom edge.
@@ -19263,8 +19423,8 @@ mod tests {
             "the bottom row belongs to the page that has runtimes to show"
         );
         let region = cx
-            .debug_bounds("pairing-panel-scroll")
-            .expect("the content region should be laid out");
+            .debug_bounds("pairing-entry-region")
+            .expect("the entry region should be laid out");
         let stack = cx
             .debug_bounds("pairing-actions-stack")
             .expect("the stacked entries should be laid out");
@@ -19278,6 +19438,25 @@ mod tests {
         assert!(
             above - below < px(1.0) && below - above < px(1.0),
             "the stacked entries should sit in the middle: above={above:?} below={below:?}"
+        );
+
+        // The stacked entries keep their place under the "link" sheet too.
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Manual;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("pairing-sheet").is_some(),
+            "the link sheet should be laid out"
+        );
+        assert_eq!(
+            cx.debug_bounds("pairing-actions-stack")
+                .expect("the stack stays"),
+            stack,
+            "opening a sheet must not move the stacked entries"
         );
     }
 
@@ -19306,6 +19485,7 @@ mod tests {
             "self.render_pairing_runtimes(cx)",
             "self.render_pairing_actions(scan_busy, scan_enabled, cx)",
             "self.render_pairing_stack(",
+            "self.render_pairing_sheet(sheet_max_height, cx)",
         ] {
             assert!(page.contains(call), "the page should still render {call}");
         }
@@ -19345,6 +19525,46 @@ mod tests {
                 >= 3
         );
         assert!(renderer_source(source, "render_pairing_scan_action").contains("scan-pairing-qr"));
+
+        // The sheet is an overlay: it takes no room in the page, so nothing
+        // behind it can be laid out again because it opened.
+        let sheet = renderer_source(source, "render_pairing_sheet");
+        assert!(sheet.contains(".absolute()"));
+        assert!(sheet.contains(".occlude()"));
+        assert!(sheet.contains(".justify_end()"));
+        assert!(sheet.contains(".max_h(max_height)"));
+        for panel in ["PairingPanel::Nearby", "PairingPanel::Manual"] {
+            assert!(sheet.contains(panel), "the sheet should serve {panel}");
+        }
+    }
+
+    /// Back closes the open pairing sheet before it does anything else, because
+    /// the sheet is the topmost thing on the screen while it is up.
+    #[gpui::test]
+    fn back_keystroke_closes_the_open_pairing_sheet(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Manual;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(cx.debug_bounds("pairing-sheet").is_some());
+
+        cx.simulate_keystrokes("back");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.pairing_panel),
+            PairingPanel::None,
+            "back should close the sheet"
+        );
+        assert!(app.read_with(cx, |app, _| app.back_stack.is_empty()));
     }
 
     #[gpui::test]
