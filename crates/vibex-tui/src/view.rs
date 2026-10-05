@@ -1304,10 +1304,17 @@ fn render_session_rows(
         .max()
         .unwrap_or(0)
         .min(usize::from(area.width) / 4);
-    let mut items = Vec::with_capacity(rows.len());
+    // Every row is laid out, and the page draws a window of the result. The
+    // list is taller than any terminal — a workspace can hold hundreds of
+    // sessions and a row can carry a detail card — so the window is measured in
+    // lines and moved by line, which is what the wheel and the page keys step
+    // through.
+    let mut all = Vec::new();
     let mut heights = Vec::with_capacity(rows.len());
+    let mut starts = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        let lines = session_list_item(
+        starts.push(all.len());
+        let row_lines = session_list_item(
             row,
             list.counts.get(index).copied().unwrap_or(0),
             index == selected,
@@ -1320,24 +1327,56 @@ fn render_session_rows(
             theme,
             strings,
         );
-        heights.push(lines.len().min(usize::from(u16::MAX)) as u16);
-        items.push(ListItem::new(Text::from(lines)));
+        heights.push(row_lines.len().max(1));
+        all.extend(row_lines);
     }
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(rows.len().saturating_sub(1))));
-    frame.render_stateful_widget(List::new(items), area, &mut state);
+    let window = usize::from(area.height);
+    app.session_band_rows = window;
+    // The cursor's row keeps itself in sight until the reader takes the window
+    // over; a row taller than the window shows its top, not its middle.
+    if !app.session_scroll_manual
+        && let Some(top) = starts
+            .get(selected.min(rows.len().saturating_sub(1)))
+            .copied()
+    {
+        let bottom = top + heights.get(selected).copied().unwrap_or(1);
+        if top < app.session_scroll {
+            app.session_scroll = top;
+        } else if bottom > app.session_scroll.saturating_add(window) {
+            app.session_scroll = bottom.saturating_sub(window);
+        }
+    }
+    // Clamp to the last page, then land on a row's first line: a window that
+    // starts mid-row shows half a row at the top, which reads as a torn frame.
+    let clamped = app.session_scroll.min(all.len().saturating_sub(window));
+    let offset = starts
+        .iter()
+        .rev()
+        .find(|start| **start <= clamped)
+        .copied()
+        .unwrap_or(0);
+    app.session_scroll = offset;
+    let visible = all
+        .into_iter()
+        .skip(offset)
+        .take(window)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(visible)), area);
     // The rows are not all one line tall, so the mouse needs to know which row
-    // the drawn window starts on and how tall each row in it is.
-    let first_row = state.offset().min(rows.len());
+    // the drawn window starts on and how many of its lines are on screen.
+    let first_row = starts
+        .iter()
+        .rposition(|start| *start <= offset)
+        .unwrap_or(0);
     let mut drawn = 0usize;
-    let mut visible = Vec::new();
+    let mut visible_heights = Vec::new();
     for height in heights.iter().skip(first_row) {
-        if drawn >= usize::from(area.height) {
+        if drawn >= window {
             break;
         }
-        let height = usize::from((*height).max(1));
-        visible.push(height as u16);
-        drawn += height;
+        let clipped = (*height).min(window - drawn);
+        visible_heights.push(clipped.min(usize::from(u16::MAX)) as u16);
+        drawn += clipped;
     }
     app.regions.list = Some(crate::app::ListRegion {
         rect: area,
@@ -1345,7 +1384,7 @@ fn render_session_rows(
         rows: rows.len(),
         first_line: 0,
         first_row,
-        heights: visible,
+        heights: visible_heights,
     });
 }
 

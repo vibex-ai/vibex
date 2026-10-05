@@ -706,6 +706,19 @@ pub struct App {
     /// against, and the band is not the terminal: the bands above and below it
     /// take their rows first. The renderer records what it actually drew.
     pub transcript_band_rows: usize,
+    /// Lines the session list shows, published by the frame that drew it: the
+    /// window is what a page key and the wheel step through.
+    pub session_band_rows: usize,
+    /// The first line of the session list the page draws, snapped to a row.
+    ///
+    /// The list is taller than the window it sits in, so it scrolls by line
+    /// rather than by selection: the wheel and the page keys move the window
+    /// and leave the cursor where the reader put it.
+    pub session_scroll: usize,
+    /// Whether the reader moved the window directly. While this is set the
+    /// window stays where they put it; moving the selection — a key, a click,
+    /// a filter — hands it back to the cursor.
+    pub session_scroll_manual: bool,
     /// Regions the last frame published for mouse hit-testing: the transcript
     /// band and the close affordance of the modal, when one is open.
     pub regions: FrameRegions,
@@ -1257,6 +1270,9 @@ impl App {
             text_view: None,
             viewport: (120, 40),
             transcript_band_rows: 20,
+            session_band_rows: 12,
+            session_scroll: 0,
+            session_scroll_manual: false,
             regions: FrameRegions::default(),
             runtime_options: None,
             runtime_picker_pending: false,
@@ -2342,7 +2358,40 @@ impl App {
     }
 
     pub fn set_selection(&mut self, scope: Scope, value: usize) {
+        if scope == Scope::Sessions {
+            // The cursor owns the window again: whatever moved it, the reader
+            // is now looking at a row and the list has to show it.
+            self.session_scroll_manual = false;
+        }
         self.selection.insert(scope, value);
+    }
+
+    /// Move the session list's window by `lines`, without moving the cursor.
+    ///
+    /// The window is clamped where it is drawn — only the frame knows how tall
+    /// the rows are and how much room it has — so this only has to refuse to
+    /// run off the top.
+    pub fn scroll_session_list(&mut self, lines: i64) {
+        self.session_scroll_manual = true;
+        self.session_scroll = if lines.is_negative() {
+            self.session_scroll
+                .saturating_sub(lines.unsigned_abs() as usize)
+        } else {
+            self.session_scroll.saturating_add(lines as usize)
+        };
+    }
+
+    /// Put the session list's window at its first line.
+    pub fn session_list_home(&mut self) {
+        self.session_scroll_manual = true;
+        self.session_scroll = 0;
+    }
+
+    /// Put the session list's window at a line past the end, which the frame
+    /// clamps to the last page of rows.
+    pub fn session_list_end(&mut self) {
+        self.session_scroll_manual = true;
+        self.session_scroll = usize::MAX;
     }
 
     /// Row count for the page that currently owns the selection.

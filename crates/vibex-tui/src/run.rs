@@ -1056,6 +1056,13 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 dispatch_all(worker, &outcome);
                 return true;
             }
+            // On the session list the wheel moves the list: the transcript
+            // behind it is not what the reader is looking at, and a list that
+            // only answers the arrow keys is a list that cannot be scanned.
+            if app.page == crate::app::Page::Sessions && app.overlay.is_none() {
+                app.scroll_session_list(-3);
+                return true;
+            }
             app.scroll_lines(-3);
             // The wheel is the other way to reach the top of the loaded
             // window; the controller ignores the ask when there is nothing
@@ -1071,6 +1078,10 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.runtime_picker_is_open() {
                 let outcome = app.step_runtime_picker(3);
                 dispatch_all(worker, &outcome);
+                return true;
+            }
+            if app.page == crate::app::Page::Sessions && app.overlay.is_none() {
+                app.scroll_session_list(3);
                 return true;
             }
             app.scroll_lines(3);
@@ -2442,6 +2453,74 @@ mod tests {
         );
         assert_eq!(app.page, Page::NewSession);
         assert_eq!(app.composer.text(), "keep this draft");
+    }
+
+    /// The wheel moves the session list's window and leaves the cursor where
+    /// the reader put it: a list that answers only the arrow keys is a list
+    /// that cannot be scanned.
+    #[test]
+    fn the_wheel_scrolls_the_session_list() {
+        let worker = isolation_worker();
+        let mut app = test_app(100, 24);
+        let sessions = (1..=30)
+            .map(|index| vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse(format!("session_wheel{index:04}"))
+                    .expect("valid session id"),
+                title: format!("wheelable {index}"),
+                project_id: vibex_core::ProjectId::parse("project_wheel001")
+                    .expect("valid project id"),
+                // One workspace for all of them: a fresh id per session would
+                // scatter them into headings whose order is random, and this
+                // test is about the window, not about the arrangement.
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_wheel01")
+                    .expect("valid workspace id"),
+                workspace_root: "/tmp/vibex-wheel".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: index,
+                updated_at_ms: index,
+                last_message_at_ms: index,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+        app.agent.apply_sessions(Ok(sessions)).expect("apply");
+        app.navigate_to(crate::app::Page::Sessions);
+        let before_screen = conversation_frame(&mut app, 100, 24);
+        assert!(
+            before_screen.contains("wheelable"),
+            "no session is drawn:\n{before_screen}"
+        );
+        let before = app.session_scroll;
+        let selected = app.selection_for(crate::keymap::Scope::Sessions);
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollDown] {
+            handle_mouse(
+                &mut app,
+                &worker,
+                MouseEvent {
+                    kind,
+                    column: 10,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+        let after_screen = conversation_frame(&mut app, 100, 24);
+        assert!(
+            app.session_scroll > before,
+            "the wheel did not move the list's window"
+        );
+        assert_eq!(
+            app.selection_for(crate::keymap::Scope::Sessions),
+            selected,
+            "the wheel moved the cursor"
+        );
+        assert_ne!(
+            after_screen, before_screen,
+            "the wheel moved nothing on screen"
+        );
     }
 
     /// A click on a heading folds it, the way a tree folds everywhere else. A

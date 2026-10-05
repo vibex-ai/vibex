@@ -6174,6 +6174,76 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
     assert!(button.width > 0 && button.y == app.regions.list.unwrap().rect.y - 2);
 }
 
+/// A list longer than the page scrolls by page and by end without moving the
+/// cursor: the reader scans it, and the row they left the cursor on is still
+/// the row it was on.
+#[test]
+fn a_long_session_list_pages_without_moving_the_cursor() {
+    use vibex_tui::action::Intent;
+    let mut first = seeded_session("session_long0001", "long session 1");
+    // One workspace, and an age per row: the list is built from one heading and
+    // forty rows in an order the test can name, newest first.
+    first.workspace_id =
+        vibex_core::WorkspaceId::parse("workspace_long01").expect("valid workspace id");
+    let sessions = (1..=40)
+        .map(|index| {
+            let mut session = first.clone();
+            session.id = vibex_core::VibexSessionId::parse(format!("session_long{index:04}"))
+                .expect("valid session id");
+            session.title = format!("long session {index}");
+            session.last_message_at_ms = index;
+            session.created_at_ms = index;
+            session
+        })
+        .collect::<Vec<_>>();
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(sessions))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    assert!(screen.contains("long session 40"), "{screen}");
+    assert!(
+        !screen.contains("long session 1"),
+        "the whole list is on one page, so nothing here is being tested"
+    );
+
+    // A page key moves the window, not the cursor.
+    let before = app.session_scroll;
+    app.perform(Intent::ScrollPageDown);
+    let _ = render(&mut app, 110, 24);
+    assert!(
+        app.session_scroll > before,
+        "the page key did not move the window"
+    );
+    assert_eq!(
+        app.selection_for(Scope::Sessions),
+        0,
+        "paging moved the cursor"
+    );
+
+    // The end of the list is reachable in one gesture, and the top again.
+    app.perform(Intent::ScrollToBottom);
+    let screen = text(&render(&mut app, 110, 24));
+    assert!(screen.contains("long session 1"), "{screen}");
+    app.perform(Intent::ScrollToTop);
+    let screen = text(&render(&mut app, 110, 24));
+    assert!(screen.contains("long session 40"), "{screen}");
+
+    // Moving the cursor hands the window back to it: the row the reader lands
+    // on is the row they see.
+    app.perform(Intent::ScrollToBottom);
+    let _ = render(&mut app, 110, 24);
+    for _ in 0..3 {
+        app.perform(Intent::SelectNext);
+    }
+    let screen = text(&render(&mut app, 110, 24));
+    assert!(
+        screen.contains("long session 37"),
+        "the cursor's row is off screen after paging and stepping:\n{screen}"
+    );
+}
+
 /// A control answers the pointer before the click does: the new-session button
 /// carries its own surface while the mouse rests on it, and only then.
 #[test]

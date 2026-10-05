@@ -213,28 +213,56 @@ impl App {
             Intent::SelectPrevious => self.move_selection(-1),
             Intent::SelectNext => self.move_selection(1),
             Intent::ScrollPageUp => {
-                self.scroll_by(-1, true);
+                if self.scrolls_session_list() {
+                    let step = self.session_page_step();
+                    self.scroll_session_list(-(step as i64));
+                } else {
+                    self.scroll_by(-1, true);
+                }
                 Outcome::effects(vec![])
             }
             Intent::ScrollPageDown => {
-                self.scroll_by(1, true);
+                if self.scrolls_session_list() {
+                    let step = self.session_page_step();
+                    self.scroll_session_list(step as i64);
+                } else {
+                    self.scroll_by(1, true);
+                }
                 Outcome::effects(vec![])
             }
             Intent::ScrollHalfPageUp => {
-                self.scroll_by(-1, false);
+                if self.scrolls_session_list() {
+                    let step = self.session_page_step() / 2;
+                    self.scroll_session_list(-(step.max(1) as i64));
+                } else {
+                    self.scroll_by(-1, false);
+                }
                 Outcome::effects(vec![])
             }
             Intent::ScrollHalfPageDown => {
-                self.scroll_by(1, false);
+                if self.scrolls_session_list() {
+                    let step = self.session_page_step() / 2;
+                    self.scroll_session_list(step.max(1) as i64);
+                } else {
+                    self.scroll_by(1, false);
+                }
                 Outcome::effects(vec![])
             }
             Intent::ScrollToTop => {
-                self.scroll.follow = false;
-                self.scroll.offset = 0;
+                if self.scrolls_session_list() {
+                    self.session_list_home();
+                } else {
+                    self.scroll.follow = false;
+                    self.scroll.offset = 0;
+                }
                 Outcome::effects(vec![])
             }
             Intent::ScrollToBottom => {
-                self.scroll.follow = true;
+                if self.scrolls_session_list() {
+                    self.session_list_end();
+                } else {
+                    self.scroll.follow = true;
+                }
                 Outcome::effects(vec![])
             }
             Intent::LoadOlderHistory => {
@@ -1762,6 +1790,20 @@ impl App {
             self.scroll.offset = offset;
         }
         Outcome::effects(vec![])
+    }
+
+    /// Whether the page in front of the reader is the session list, whose
+    /// window the scroll keys move rather than the transcript's behind it.
+    fn scrolls_session_list(&self) -> bool {
+        self.page == Page::Sessions && self.overlay.is_none()
+    }
+
+    /// How far a page key moves the session list.
+    ///
+    /// A page leaves a margin of overlap, the way the transcript's does: the
+    /// reader keeps the row they were reading instead of hunting for it.
+    fn session_page_step(&self) -> usize {
+        self.session_band_rows.saturating_sub(2).max(1)
     }
 
     fn scroll_by(&mut self, direction: i64, page: bool) {

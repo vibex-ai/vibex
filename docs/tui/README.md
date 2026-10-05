@@ -374,6 +374,14 @@ every control is a click target. The action is never the one that goes; a
 right-hand hint that does not fit whole is dropped rather than truncated, because
 half a key is a key the reader cannot use.
 
+The list itself is a window over every row, measured in lines rather than in
+rows: a workspace can hold hundreds of sessions and a row can carry a detail
+card, so nothing fits the page at once. The window follows the cursor while the
+cursor is what moves — a step, a click, a filter — and the page keys, `Home` and
+`End`, and the wheel move the window instead, leaving the cursor where the reader
+put it. The window never starts mid-row: a half row at the top reads as a torn
+frame.
+
 Under them come the sections the reader arranged — the desktop's folders,
 projects and order — each with a heading that closes with its count past the rule:
 `▾ vibex ──────────────────────────── 3`. The rule is in the dim step, the count

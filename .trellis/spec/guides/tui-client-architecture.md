@@ -613,6 +613,20 @@ is never a column count.
   own `▶`/`✗`/`◇`/`◆`/`▤`, and `↻`/`↻N` for auto-continue. The state is *only* a
   mark: the words were removed once the shapes were learned, because they cost
   the title a third of the row and said nothing the mark did not.
+* **The list is a window over lines, not a selection over rows.** A workspace can
+  hold hundreds of sessions and a row can carry a detail card, so the page lays
+  every row out, measures them in lines, and draws the window it is scrolled to
+  (`App::session_scroll`, with `session_band_rows` published by the frame that
+  drew it). The window follows the cursor while the cursor is what moves — a
+  step, a click, a filter, all of which go through `set_selection` — and the
+  window's own gestures hand it over: `PageUp`/`PageDown`, half pages, `Home`/
+  `End` and the wheel move `session_scroll` and leave the selection alone
+  (`session_scroll_manual` is what tells the two apart). The offset is clamped to
+  the last page and snapped down to a row's first line, because a window that
+  starts mid-row shows half a row at the top. Rendering the window by hand — a
+  `Paragraph` of the visible lines rather than ratatui's `List` — is what makes
+  this possible: `List` scrolls by item and cannot show the inside of a row
+  taller than its area, which a session with an open detail card is.
 * **Rows are not all one line tall, so a click is measured against the row it
   landed in.** The frame publishes each drawn row's height and the index of the
   row at the top of the list in its `ListRegion`, and `list_row_at` walks those
