@@ -2241,12 +2241,14 @@ impl RemoteAccessPairing {
             .child(
                 h_flex()
                     .min_w_0()
+                    .flex_1()
                     .items_center()
                     .gap_3()
                     .child(icon_tile(IconName::SquareTerminal, px(40.0), px(20.0), cx))
                     .child(
                         v_flex()
                             .min_w_0()
+                            .flex_1()
                             .gap_1()
                             .child(div().text_lg().font_semibold().child(locale::text(
                                 "Connect a mobile device",
@@ -2318,6 +2320,7 @@ impl RemoteAccessPairing {
             .child(
                 h_flex()
                     .min_w_0()
+                    .flex_1()
                     .items_center()
                     .gap_2()
                     .child(
@@ -2328,6 +2331,7 @@ impl RemoteAccessPairing {
                     .child(
                         div()
                             .min_w_0()
+                            .flex_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(locale::text(
