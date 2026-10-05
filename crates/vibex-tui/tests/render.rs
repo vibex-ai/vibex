@@ -2929,12 +2929,84 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
         "{screen}"
     );
 
-    // Running a command remembers it, and the next open puts it first.
+    // Running a command remembers it, and the next open leads with it.
     app.remember_command(Intent::GotoUsage);
     let entries = app.palette_entries("");
-    assert_eq!(entries[0].intent, Intent::GotoUsage);
+    assert_eq!(entries[0].entry.intent, Intent::GotoUsage);
+    assert_eq!(entries[0].group, vibex_tui::view::PaletteGroup::Recent);
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("Recent"), "{screen}");
+
+    // The `Recent` band is a shortcut, not a move: the command is still filed
+    // under its own heading, so a section never empties as it is used.
+    let groups = entries
+        .iter()
+        .filter(|listing| listing.entry.intent == Intent::GotoUsage)
+        .map(|listing| listing.group)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        groups,
+        vec![
+            vibex_tui::view::PaletteGroup::Recent,
+            vibex_tui::view::PaletteGroup::View
+        ],
+        "the remembered command left its own section"
+    );
+
+    // The frame draws it twice, under the two headings those listings name: the
+    // rows the frame published say which line each one landed on.
+    let buffer = render_buffer(&mut app, 120, 40);
+    let region = app
+        .regions
+        .palette
+        .clone()
+        .expect("the palette published no rows");
+    let line_text = |line: usize| -> String {
+        (region.rect.x..region.rect.right())
+            .filter_map(|column| buffer.cell((column, region.rect.y + line as u16)))
+            .map(|cell| cell.symbol().to_string())
+            .collect()
+    };
+    let line_of = |index: usize| -> usize {
+        region
+            .rows
+            .iter()
+            .position(|row| *row == Some(index))
+            .unwrap_or_else(|| panic!("entry {index} was not drawn:\n{screen}"))
+    };
+    let heading_above = |mut line: usize| -> String {
+        while line > 0 {
+            line -= 1;
+            if region.rows[line].is_none() {
+                return line_text(line).trim().to_string();
+            }
+        }
+        panic!("no heading above line {line}:\n{screen}");
+    };
+    let recent = entries
+        .iter()
+        .position(|listing| {
+            listing.entry.intent == Intent::GotoUsage
+                && listing.group == vibex_tui::view::PaletteGroup::Recent
+        })
+        .expect("no remembered listing");
+    let filed = entries
+        .iter()
+        .position(|listing| {
+            listing.entry.intent == Intent::GotoUsage
+                && listing.group == vibex_tui::view::PaletteGroup::View
+        })
+        .expect("no `View` listing");
+    assert_eq!(
+        heading_above(line_of(recent)),
+        "Recent",
+        "the remembered command is not drawn under `Recent`:\n{screen}"
+    );
+    assert_eq!(
+        heading_above(line_of(filed)),
+        "View",
+        "`Usage` is no longer drawn in the `View` section:\n{screen}"
+    );
 }
 
 #[test]

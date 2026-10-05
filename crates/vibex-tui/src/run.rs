@@ -1119,6 +1119,23 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 let outcome = app.perform(crate::action::Intent::Back);
                 dispatch_all(worker, &outcome);
                 app.regions.modal_close = None;
+                // The control goes with the modal it belonged to; the pointer
+                // is over the cell, not over the affordance that has left.
+                app.hovered_modal_close = false;
+                return true;
+            }
+            // A command palette row runs the command under the pointer. The
+            // palette is a menu, and the hover has already moved the cursor onto
+            // the row the reader is pointing at, so the press is the choice
+            // rather than a step towards one.
+            if let Some(row) = app
+                .regions
+                .palette
+                .as_ref()
+                .and_then(|region| region.entry_at(mouse.column, mouse.row))
+            {
+                let outcome = app.select_palette_row(row, true);
+                dispatch_all(worker, &outcome);
                 return true;
             }
             // The switcher's rows select and activate exactly as the other
@@ -1275,6 +1292,26 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Moved => {
+            // The palette's list follows the pointer: hovering a row moves the
+            // cursor onto it, which is the highlight `↑↓` paints, so the row
+            // that is lit and the row `Enter` would run cannot disagree.
+            if let Some(row) = app
+                .regions
+                .palette
+                .as_ref()
+                .and_then(|region| region.entry_at(mouse.column, mouse.row))
+            {
+                let outcome = app.select_palette_row(row, false);
+                dispatch_all(worker, &outcome);
+                return outcome.dirty;
+            }
+            // The modal's close affordance is a control before it is a click
+            // target: the pointer resting on it is how the reader learns it can
+            // be pressed.
+            let close = app
+                .regions
+                .modal_close
+                .is_some_and(|rect| rect_contains(rect, mouse.column, mouse.row));
             let hover = hover_target(app, mouse.column, mouse.row);
             // A hint is a control: the pointer resting on it is how the reader
             // learns it can be pressed.
@@ -1295,10 +1332,12 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.hover != hover
                 || app.hovered_hint != hint
                 || app.hovered_row_action != row_action
+                || app.hovered_modal_close != close
             {
                 app.hover = hover;
                 app.hovered_hint = hint;
                 app.hovered_row_action = row_action;
+                app.hovered_modal_close = close;
                 return true;
             }
             false
@@ -2963,6 +3002,48 @@ mod tests {
             .modal_close
             .expect("the drawn modal published no close affordance");
 
+        // The affordance answers the pointer before it answers the click: the
+        // pointer resting on it is how the reader learns it can be pressed.
+        assert!(!app.hovered_modal_close, "the affordance started lit");
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.hovered_modal_close,
+            "the close affordance ignored the pointer"
+        );
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: close.x,
+                row: close.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            !app.hovered_modal_close,
+            "the affordance stayed lit after the pointer left it"
+        );
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
         // The affordance answers while the modal is up.
         handle_mouse(
             &mut app,
@@ -2975,6 +3056,10 @@ mod tests {
             },
         );
         assert!(app.overlay.is_none(), "the close affordance did nothing");
+        assert!(
+            !app.hovered_modal_close,
+            "the hover outlived the affordance that drew it"
+        );
 
         // A modal also leaves by the keyboard, and its rect goes with it: a
         // frame that draws no modal publishes no close.
@@ -3011,6 +3096,109 @@ mod tests {
         assert_eq!(
             app.page, page,
             "a closed modal's rect still ran the close intent"
+        );
+    }
+
+    /// The palette's list is a menu the pointer can drive: the row under the
+    /// pointer takes the highlight `↑↓` paints, and a click runs it. Both go
+    /// through the cursor the keys move, so the row that is lit and the command
+    /// that runs cannot disagree.
+    #[test]
+    fn the_palette_rows_answer_the_pointer() {
+        use crate::action::Intent;
+        use crate::view::PaletteGroup;
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        app.overlay = Some(Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        });
+        conversation_frame(&mut app, 100, 30);
+        let region = app
+            .regions
+            .palette
+            .clone()
+            .expect("the drawn palette published no rows");
+        let entries = app.palette_entries("");
+        let command = entries
+            .iter()
+            .position(|listing| {
+                listing.entry.intent == Intent::NewSession
+                    && listing.group == PaletteGroup::Session
+            })
+            .expect("no session command in the palette");
+        let line = region
+            .rows
+            .iter()
+            .position(|row| *row == Some(command))
+            .expect("the session command was not drawn");
+        let cell = (region.rect.x + 4, region.rect.y + line as u16);
+
+        // The pointer resting on a row moves the cursor onto it, whichever row
+        // that is: the highlight follows the pointer the way the arrows do.
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: cell.0,
+                row: cell.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::Palette {
+                query: String::new(),
+                selected: command
+            }),
+            "the pointer did not move the palette's cursor"
+        );
+
+        // A heading names a section rather than a row, so the pointer on it
+        // moves nothing and the cursor never lands on a line `Enter` cannot run.
+        let heading = region
+            .rows
+            .iter()
+            .position(Option::is_none)
+            .expect("no heading was drawn");
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: region.rect.x + 2,
+                row: region.rect.y + heading as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::Palette {
+                query: String::new(),
+                selected: command
+            }),
+            "a heading took the cursor"
+        );
+
+        // A click runs the row it landed on: the palette is a menu, and the
+        // pointer has already taken the highlight on it.
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: cell.0,
+                row: cell.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.overlay.is_none(), "the click left the palette open");
+        assert_eq!(
+            app.page,
+            Page::NewSession,
+            "the click did not run the command under it"
         );
     }
 

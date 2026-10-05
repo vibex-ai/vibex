@@ -1440,12 +1440,12 @@ impl App {
         match intent {
             Intent::ConfirmOverlay | Intent::PaletteRun => {
                 let matches = self.palette_entries(&query);
-                let Some(entry) = matches.get(selected).copied() else {
+                let Some(listing) = matches.get(selected).copied() else {
                     return Outcome::quiet();
                 };
                 self.overlay = None;
-                self.remember_command(entry.intent);
-                self.perform(entry.intent)
+                self.remember_command(listing.entry.intent);
+                self.perform(listing.entry.intent)
             }
             Intent::SelectNext => {
                 let count = self.palette_entries(&query).len();
@@ -2561,6 +2561,42 @@ impl App {
             return self.perform_runtime_picker(Intent::ConfirmOverlay, view, row);
         }
         Outcome::effects(vec![])
+    }
+
+    /// Put the palette's cursor on one of its rows, opting to run it.
+    ///
+    /// The pointer and the arrows move the same cursor through the same
+    /// reducer: a mouse path of its own is how the row that is lit and the
+    /// command that runs drift apart. Hovering selects, and a click runs — the
+    /// palette is a menu, and a row the pointer has already taken the highlight
+    /// on answers the press that lands on it; asking for a second click would
+    /// make the first one look broken.
+    pub fn select_palette_row(&mut self, row: usize, activate: bool) -> Outcome {
+        let Some(Overlay::Palette { query, selected }) = self.overlay.clone() else {
+            return Outcome::quiet();
+        };
+        // A frame can outlive the list it published — the query changed under
+        // the pointer, or the list scrolled — so the row is clamped to what the
+        // palette holds now rather than trusted.
+        let count = self.palette_entries(&query).len();
+        if count == 0 {
+            return Outcome::quiet();
+        }
+        let row = row.min(count - 1);
+        if row != selected {
+            self.overlay = Some(Overlay::Palette {
+                query,
+                selected: row,
+            });
+        }
+        if activate {
+            return self.perform(Intent::ConfirmOverlay);
+        }
+        if row == selected {
+            Outcome::quiet()
+        } else {
+            Outcome::effects(vec![])
+        }
     }
 
     /// How far a page key moves the catalogue: the rows the last frame drew,

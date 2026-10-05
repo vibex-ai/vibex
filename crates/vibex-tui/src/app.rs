@@ -840,6 +840,11 @@ pub struct App {
     /// hover state names the row as well as the control: lighting a button on a
     /// row the reader is not pointing at would promise the wrong target.
     pub hovered_row_action: Option<(usize, crate::action::Intent)>,
+    /// Whether the pointer is over the open modal's close affordance.
+    ///
+    /// The modal chrome is the control's owner, so it reads this to light it,
+    /// the same way a hint button reads [`Self::hovered_hint`].
+    pub hovered_modal_close: bool,
     /// Which sent message the composer's history drawer points at.
     pub history_selection: usize,
     /// Commands run from the palette, most recent first.
@@ -1065,6 +1070,8 @@ pub struct FrameRegions {
     /// indexes a window rather than a rect, so the region carries where the
     /// window started as well as where it was drawn.
     pub runtime_picker: Option<RuntimePickerRegion>,
+    /// The command palette's rows, when it is the modal on screen.
+    pub palette: Option<PaletteRegion>,
     /// The turn rail's ticks, one rect per turn.
     pub turns: Vec<(ratatui::layout::Rect, usize)>,
     /// The shortcut band's hints, so a click runs the same intent as the key.
@@ -1086,6 +1093,7 @@ impl FrameRegions {
         self.hints.clear();
         self.row_actions.clear();
         self.runtime_picker = None;
+        self.palette = None;
         // A list, a banner row, a composer's box and a modal's close affordance
         // each belong to the frame that drew them: left standing, the session
         // list's rect would hit-test transcript rows instead, a modal that has
@@ -1159,6 +1167,33 @@ impl RuntimePickerRegion {
         }
         let index = self.offset + usize::from(row - self.rect.y);
         (index < self.rows).then_some(index)
+    }
+}
+
+/// Where the command palette drew its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteRegion {
+    /// The rows the list was drawn into.
+    pub rect: ratatui::layout::Rect,
+    /// The palette entry each drawn line shows, top to bottom. A heading is
+    /// `None`: it names a section, and the cursor never lands on it.
+    pub rows: Vec<Option<usize>>,
+}
+
+impl PaletteRegion {
+    /// Which palette entry a pointer is over, if any.
+    pub fn entry_at(&self, column: u16, row: u16) -> Option<usize> {
+        if column < self.rect.x
+            || column >= self.rect.right()
+            || row < self.rect.y
+            || row >= self.rect.bottom()
+        {
+            return None;
+        }
+        self.rows
+            .get(usize::from(row - self.rect.y))
+            .copied()
+            .flatten()
     }
 }
 
@@ -1374,6 +1409,7 @@ impl App {
             hover: None,
             hovered_hint: None,
             hovered_row_action: None,
+            hovered_modal_close: false,
             history_selection: 0,
             recent_commands: options.remembered.recent_commands.clone(),
             text_selection: None,
@@ -3837,27 +3873,9 @@ impl App {
         true
     }
 
-    /// The palette's entries: recents first, then everything else.
-    pub fn palette_entries(&self, query: &str) -> Vec<crate::view::PaletteEntry> {
+    /// The palette's entries, each with the heading it is drawn under.
+    pub fn palette_entries(&self, query: &str) -> Vec<crate::view::PaletteListing> {
         crate::view::palette_matches_recent(query, self.strings, &self.recent_commands)
-    }
-
-    /// How many of the palette's leading entries are remembered commands.
-    ///
-    /// Only meaningful for an empty query, which is when the recents are
-    /// lifted to the top; the renderer uses it to draw the `Recent` heading.
-    pub fn palette_recent_count(&self) -> usize {
-        self.recent_commands
-            .iter()
-            .filter(|id| {
-                Intent::from_id(id).is_some_and(|intent| {
-                    crate::view::PALETTE
-                        .iter()
-                        .any(|entry| entry.intent == intent)
-                })
-            })
-            .count()
-            .min(MAX_RECENT_COMMANDS)
     }
 
     /// Remember a command so the palette can offer it first next time.

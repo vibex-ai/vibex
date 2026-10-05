@@ -188,6 +188,11 @@ pub struct ModalChrome<'a> {
     pub hints: Vec<ModalHint>,
     /// Whether the top-right close affordance is drawn.
     pub close: bool,
+    /// Whether the pointer is over the close affordance.
+    ///
+    /// The chrome owns the control, so the chrome is what lights it: a caller
+    /// that drew its own highlight would be describing a rect it did not place.
+    pub close_hovered: bool,
 }
 
 impl<'a> ModalChrome<'a> {
@@ -197,6 +202,7 @@ impl<'a> ModalChrome<'a> {
             sizing,
             hints: Vec::new(),
             close: true,
+            close_hovered: false,
         }
     }
 
@@ -207,6 +213,11 @@ impl<'a> ModalChrome<'a> {
 
     pub fn close(mut self, close: bool) -> Self {
         self.close = close;
+        self
+    }
+
+    pub fn close_hovered(mut self, hovered: bool) -> Self {
+        self.close_hovered = hovered;
         self
     }
 }
@@ -263,10 +274,17 @@ pub fn render_modal(
     frame.render_widget(block, popup);
 
     if let Some(close) = close_rect {
+        // Chrome is muted until the pointer is on it; a control the reader is
+        // pointing at says so before the press, the same way a hint does.
+        let style = if chrome.close_hovered {
+            theme.accent().add_modifier(Modifier::BOLD)
+        } else {
+            theme.muted()
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("[{0}]", glyphs::ballot_x(GlyphTier::of(theme))),
-                theme.muted(),
+                style,
             ))),
             Rect { width: 3, ..close },
         );
@@ -445,6 +463,46 @@ mod tests {
         let footer = layout.footer.expect("a footer is reserved");
         assert_eq!(footer.bottom(), layout.area.bottom() - 1);
         assert!(layout.close.is_some());
+    }
+
+    /// The style the chrome paints the close glyph with.
+    fn close_glyph_style(hovered: bool) -> Style {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let theme = theme();
+        let area = terminal.size().expect("a terminal has a size").into();
+        let close = close_rect(dimensions(area, ModalSizing::picker()));
+        terminal
+            .draw(|frame| {
+                let chrome =
+                    ModalChrome::new("Test", ModalSizing::picker()).close_hovered(hovered);
+                render_modal(frame, frame.area(), &chrome, &theme);
+            })
+            .expect("frame draws");
+        terminal
+            .backend()
+            .buffer()
+            .cell((close.x, close.y))
+            .expect("the close affordance is inside the terminal")
+            .style()
+    }
+
+    /// The close affordance is a control, so the pointer resting on it has to
+    /// say so before the press — it is the only control a modal hands the
+    /// mouse, and a reader who cannot see that it answers has no way to learn.
+    #[test]
+    fn the_close_affordance_lights_up_under_the_pointer() {
+        let plain = close_glyph_style(false);
+        let hovered = close_glyph_style(true);
+        assert_ne!(
+            plain, hovered,
+            "hovering the close affordance changed nothing about how it is drawn"
+        );
+        assert_ne!(
+            hovered,
+            Style::default(),
+            "the hovered affordance is drawn as if it were not there"
+        );
     }
 
     #[test]

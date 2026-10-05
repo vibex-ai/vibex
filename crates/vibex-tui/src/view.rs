@@ -342,35 +342,52 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
     Some(score)
 }
 
+/// One palette command, together with the heading it is drawn under.
+///
+/// The grouping travels with the entry rather than being read back from its
+/// position, because the same command can be listed under two headings: the
+/// `Recent` band is a shortcut, not a move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteListing {
+    pub group: PaletteGroup,
+    pub entry: PaletteEntry,
+}
+
 /// Palette entries matching `query`, best first, with `recent` boosted.
+///
+/// With nothing typed the remembered commands lead the list under `Recent` — and
+/// are still filed under their own heading further down. Hoisting a command out
+/// of its section the first time it is used empties the section the reader
+/// learned to find it in: `Rename session` is a session command before it is a
+/// recent one, and the recents band is there to save a search, not to take the
+/// command away.
 pub fn palette_matches_recent(
     query: &str,
     strings: Strings,
     recent: &[String],
-) -> Vec<PaletteEntry> {
+) -> Vec<PaletteListing> {
     let needle = query.trim().to_lowercase();
     let mut entries = palette_matches(&needle, strings);
     if needle.is_empty() && !recent.is_empty() {
         // With nothing typed the palette opens on what was just used, which is
         // the whole point of remembering it.
-        let mut recent_entries = recent
+        let mut listings = recent
             .iter()
             .filter_map(|id| {
                 let intent = Intent::from_id(id)?;
                 PALETTE.iter().find(|entry| entry.intent == intent).copied()
             })
+            .map(|entry| PaletteListing {
+                group: PaletteGroup::Recent,
+                entry,
+            })
             .collect::<Vec<_>>();
-        recent_entries.dedup_by_key(|entry| entry.intent);
-        let seen = recent_entries
-            .iter()
-            .map(|entry| entry.intent)
-            .collect::<Vec<_>>();
-        recent_entries.extend(
-            entries
-                .into_iter()
-                .filter(|entry| !seen.contains(&entry.intent)),
-        );
-        return recent_entries;
+        listings.dedup_by_key(|listing| listing.entry.intent);
+        listings.extend(entries.into_iter().map(|entry| PaletteListing {
+            group: palette_group(entry.intent),
+            entry,
+        }));
+        return listings;
     }
     if !needle.is_empty() {
         // Recent use is a tie-break, not a filter: a command the reader has
@@ -389,6 +406,12 @@ pub fn palette_matches_recent(
         });
     }
     entries
+        .into_iter()
+        .map(|entry| PaletteListing {
+            group: palette_group(entry.intent),
+            entry,
+        })
+        .collect()
 }
 
 /// Palette entries matching `query`.
@@ -5208,71 +5231,61 @@ fn render_overlay(
                 rows[0],
             );
             // Grouped so the list reads in sections; the selection index is
-            // over the flat entry list, so a header is skipped by the cursor
-            // rather than counted as a row.
-            let recent_count = if query.trim().is_empty() {
-                app.palette_recent_count()
-            } else {
-                0
-            };
+            // over the flat entry list, so a heading is skipped by the cursor
+            // rather than counted as a row. Which entry each drawn line shows
+            // is recorded beside the line as it is built, so the frame can
+            // publish where every row landed without walking the list a second
+            // time — the pointer hit-tests the same lines the reader sees.
             let mut lines: Vec<Line<'static>> = Vec::new();
+            let mut row_of_line: Vec<Option<usize>> = Vec::new();
             let mut last_group = None;
-            for (index, entry) in matches.iter().enumerate() {
-                let group = if index < recent_count {
-                    PaletteGroup::Recent
-                } else {
-                    palette_group(entry.intent)
-                };
-                if last_group != Some(group) {
-                    last_group = Some(group);
+            let mut selected_line = 0usize;
+            for (index, listing) in matches.iter().enumerate() {
+                if last_group != Some(listing.group) {
+                    last_group = Some(listing.group);
                     lines.push(Line::from(Span::styled(
-                        group.label(strings).to_string(),
+                        listing.group.label(strings).to_string(),
                         Style::default()
                             .fg(theme.roles.gray)
                             .add_modifier(Modifier::BOLD),
                     )));
+                    row_of_line.push(None);
                 }
-                let style = if index == *selected {
+                let selected_here = index == *selected;
+                if selected_here {
+                    selected_line = lines.len();
+                }
+                let style = if selected_here {
                     theme.selected()
                 } else {
                     theme.base()
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(if index == *selected { "▸ " } else { "  " }, style),
-                    Span::styled(format!("{:<24}", entry.label), style),
-                    Span::styled(entry.hint, theme.muted()),
+                    Span::styled(if selected_here { "▸ " } else { "  " }, style),
+                    Span::styled(format!("{:<24}", listing.entry.label), style),
+                    Span::styled(listing.entry.hint, theme.muted()),
                 ]));
+                row_of_line.push(Some(index));
             }
             let height = usize::from(rows[1].height);
             // Keep the selection on screen: the list can be longer than the
             // drawer, and the cursor is the anchor.
-            let selected_line = {
-                let mut line = 0usize;
-                let mut group = None;
-                for (index, entry) in matches.iter().enumerate() {
-                    let entry_group = if index < recent_count {
-                        PaletteGroup::Recent
-                    } else {
-                        palette_group(entry.intent)
-                    };
-                    if group != Some(entry_group) {
-                        group = Some(entry_group);
-                        line += 1;
-                    }
-                    if index == *selected {
-                        break;
-                    }
-                    line += 1;
-                }
-                line
-            };
             let offset = selected_line.saturating_sub(height.saturating_sub(1));
             let visible = lines
                 .into_iter()
                 .skip(offset)
                 .take(height)
                 .collect::<Vec<_>>();
+            let visible_rows = row_of_line
+                .into_iter()
+                .skip(offset)
+                .take(height)
+                .collect::<Vec<_>>();
             frame.render_widget(Paragraph::new(Text::from(visible)), rows[1]);
+            app.regions.palette = Some(crate::app::PaletteRegion {
+                rect: rows[1],
+                rows: visible_rows,
+            });
         }
         Overlay::Help {
             query,
@@ -6517,7 +6530,9 @@ fn modal_chrome<'a>(
     } else {
         sizing
     };
-    ModalChrome::new(title, sizing).hints(hints)
+    ModalChrome::new(title, sizing)
+        .hints(hints)
+        .close_hovered(app.hovered_modal_close)
 }
 
 /// Labels used by the status line when the seat failed to attach.
