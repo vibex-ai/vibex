@@ -4689,6 +4689,12 @@ impl App {
             let (prefix, _) = crate::text::take_width(rest, to.saturating_sub(from));
             output.push(prefix.trim_end().to_string());
         }
+        // Blank rows at either end are furniture the selection passed over —
+        // the padding inside the reader's own box, the gap between two blocks —
+        // rather than lines they meant to copy.
+        while output.first().is_some_and(|line| line.is_empty()) {
+            output.remove(0);
+        }
         while output.last().is_some_and(|line| line.is_empty()) {
             output.pop();
         }

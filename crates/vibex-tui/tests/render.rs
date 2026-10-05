@@ -1559,25 +1559,34 @@ fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
         app.regions.scrollback.height > 0,
         "the transcript band must be published for the mouse"
     );
-    let expected = app
-        .transcript
-        .plain_lines(0, 1, &app.theme.clone(), Strings::for_locale(Locale::En))
-        .into_iter()
-        .next()
-        .expect("a first line");
-    let (prefix, _) = vibex_tui::text::take_width(&expected, 4);
+    // The reader's own message pads its text, so the first line with anything
+    // on it is not necessarily the first line of the transcript.
+    let lines =
+        app.transcript
+            .plain_lines(0, 12, &app.theme.clone(), Strings::for_locale(Locale::En));
+    let row = lines
+        .iter()
+        .position(|line| !line.is_empty())
+        .expect("a line with text on it");
+    let next = row
+        + 1
+        + lines[row + 1..]
+            .iter()
+            .position(|line| !line.is_empty())
+            .expect("a second block under the first");
+    let (prefix, _) = vibex_tui::text::take_width(&lines[row], 4);
 
-    app.begin_text_selection(0, 0);
-    app.extend_text_selection(0, 4);
+    app.begin_text_selection(row, 0);
+    app.extend_text_selection(row, 4);
     assert!(app.finish_text_selection(), "the drag covered cells");
     let copied = app.selected_text().expect("a non-empty selection");
     assert_eq!(copied, prefix.trim_end());
 
     // A selection over several lines joins them with newlines and drops the
-    // padding a terminal would otherwise put on the clipboard. Block rows are
-    // dense, so the second *text* row is the next block's first line.
-    app.begin_text_selection(0, 0);
-    app.extend_text_selection(2, 6);
+    // padding a terminal would otherwise put on the clipboard — the blank rows
+    // inside the reader's own box among them.
+    app.begin_text_selection(row, 0);
+    app.extend_text_selection(next, 6);
     let copied = app.selected_text().expect("a multi-line selection");
     assert!(copied.contains('\n'), "lines are not joined: {copied:?}");
     for line in copied.lines() {
@@ -3180,9 +3189,10 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         "bookkeeping rows reached the transcript:\n{screen}"
     );
     // The whole turn fits in a screen and a half, where one row per event plus
-    // a body for each section would not.
+    // a body for each section would not. The reader's own message is a box with
+    // padding above and below its text, and that box is part of the count.
     assert!(
-        app.transcript.total_height() <= 14,
+        app.transcript.total_height() <= 16,
         "the turn costs {} rows",
         app.transcript.total_height()
     );
