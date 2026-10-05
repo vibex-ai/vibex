@@ -1107,12 +1107,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Runtime,
-        Chord::ctrl('s'),
-        Intent::ApplyRuntimeEdit,
-        "Apply",
-    ),
-    binding(
-        Scope::Runtime,
         Chord::plain(KeyCode::Char('r')),
         Intent::ResetRunOption,
         "Reset",

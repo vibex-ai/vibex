@@ -126,7 +126,7 @@ do.
 terminal caret show where typing lands. `Tab` switches between the transcript
 and composer; `Up` in an empty composer enters the transcript at its last row.
 
-**One chrome, many modals.** Every popup — the command palette, the runtime
+**One chrome, many modals.** Every popup — the command palette, the Agent setup
 picker, an approval card, a diff view, a confirmation — is drawn through one
 chrome: the same border, the same title on the top rule, the same `[✗]` in the
 same corner, the same inner padding, and a footer whose key hints are
@@ -352,7 +352,7 @@ pages a message is written on: a session page spends that row on the draft
 instead, and everything the band would advertise is a `?` away. Where it is
 drawn it prioritizes the actions available at the current focus: send and
 newline while composing, expand, details and reply while browsing the
-transcript. Runtime switching remains available through `Ctrl+G`. Hints use the
+transcript. Agent setup remains available through `Ctrl+G`. Hints use the
 current keymap, and clicking a hint runs the same action as its key.
 
 ## Pages
@@ -514,8 +514,8 @@ otherwise). `n` opens the same page from the list.
 
 `n` does not ask a question: it opens a page. The reader who asked for a session
 asked to *write*, so the page hands them the composer with the mark above it and
-the runtime the message will go through named under that — the Agent and model,
-the workspace, and the keys that change both (`Ctrl+G` for the runtime, `Ctrl+W`
+the Agent the message will go through named under that — the Agent and model,
+the workspace, and the keys that change both (`Ctrl+G` for Agent setup, `Ctrl+W`
 for the directory). The draft's vocabulary is not repeated on the page: the
 empty composer under it spells out `/ commands @ files $ skills` itself, and the
 box is read every time it is written in where the hero is read once.
@@ -535,14 +535,20 @@ box, so the gesture is repeatable.
 The page names what it will create, at every step: the Agent and model on the
 page, on the composer's line and in the switcher's caption are read from the
 page's own choice, never from the session the reader came from, and that same
-choice is what the creation carries. `Ctrl+G` opens the switcher — `↑↓` walk the
-Agents, accounts and models the runtime publishes, and the row in effect is
-marked — and `Tab` shows the run options of the row the cursor is on: thinking
-depth, conversation mode, then the session features that Agent advertises.
-Choosing a row on this page (with `Enter`, or by pressing `Tab` on it) makes it
-the runtime the new session is born with, so the run options that open belong to
-the Agent the reader just picked; a page that has chosen nothing names — and
-creates with — the catalogue's first available entry.
+choice is what the creation carries. `Ctrl+G` opens Agent setup: the catalogue
+opens as a list of Agents with only the one in use unfolded, published in the
+order the Desktop arranges them in (its sort strategy, its manual drag and the
+usage it counts), so `↑↓` walk the Agents, the pinned recent rows and — once a
+group is opened with `→` or `Enter` — the accounts and models under them. The
+row in effect is marked, and the pinned rows carry what a heading would have
+said, the Agent they belong to, plus the run options last set on them.
+`Enter` on a row chooses it *and* moves to its run options, so picking an Agent
+and saying how it runs are one visit rather than two; `Tab` opens the run
+options of the row under the cursor without choosing it. Either way the run
+options are sent as they are set — thinking depth, conversation mode, then the
+session features that Agent advertises — with no apply step to remember. A page
+that has chosen nothing names — and creates with — the catalogue's first
+available entry.
 
 The mark is drawn from characters — block glyphs where the terminal has them,
 two rows of ASCII where it does not — and a light sweeps across it while the

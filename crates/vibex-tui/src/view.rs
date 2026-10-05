@@ -5916,14 +5916,13 @@ fn render_text_view(
     frame.render_widget(Paragraph::new(Text::from(lines)), layout.content);
 }
 
-/// Build a modal's chrome, giving the margins back on a compact terminal.
-/// The runtime switcher.
+/// The Agent setup picker.
 ///
 /// Two views of one question. The catalogue is a tree — Agent headings with
 /// their accounts and models under them, and the pinned recent and starred
 /// entries above the lot — because a flat list of every model on the machine
 /// says nothing about which Agent is which. The run options are the other side
-/// of `Tab`: how the entry under the cursor runs.
+/// of `Tab`: how the entry the reader chose runs.
 fn render_runtime_picker(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -5935,41 +5934,23 @@ fn render_runtime_picker(
     let strings = app.strings;
     let show_choices = view == crate::app::RuntimePickerView::Choices;
     let run_options = app.picker_run_options();
-    // The title names what the choice moves. A page showing no session — the
-    // list, or the page where a session is being written — has nothing to move,
-    // so the choice is the next session's, and saying so here is what keeps the
-    // reader from expecting the session behind the page to change.
+    // The title names the surface's two halves: the catalogue chooses an Agent,
+    // and the second view says how it runs. What the choice *moves* is said by
+    // the rows instead — the entry in use is marked, and the run options name
+    // the Agent they belong to — so the title does not have to guess which
+    // session the reader came from.
     let title = if show_choices {
-        match app.page_shows_session() {
-            true => strings.runtime_title().to_string(),
-            false => format!(
-                "{} · {}",
-                strings.runtime_title(),
-                strings.runtime_next_session()
-            ),
-        }
+        format!(
+            "{} · {}",
+            strings.runtime_title(),
+            strings.runtime_choose_agent()
+        )
     } else {
-        // The staged count rides in the title: the footer's hints are static
-        // words, and the one number a reader wants while editing is how much is
-        // waiting to be sent.
-        match app
-            .runtime_picker
-            .draft
-            .as_ref()
-            .filter(|draft| draft.is_dirty())
-        {
-            Some(draft) => format!(
-                "{} · {} ({})",
-                strings.runtime_title(),
-                strings.runtime_run_options(),
-                draft.change_count()
-            ),
-            None => format!(
-                "{} · {}",
-                strings.runtime_title(),
-                strings.runtime_run_options()
-            ),
-        }
+        format!(
+            "{} · {}",
+            strings.runtime_title(),
+            strings.runtime_run_options()
+        )
     };
     let hints = if show_choices {
         vec![
@@ -5981,29 +5962,15 @@ fn render_runtime_picker(
             ModalHint::new("Esc", strings.close()),
         ]
     } else {
-        let mut hints = vec![
+        // No apply key: a run option is sent the moment it is set, so the
+        // footer promises only what the rows do.
+        vec![
             ModalHint::new("↑↓", strings.hint_nav()),
             ModalHint::new("Enter", strings.hint_select()),
             ModalHint::new("r", strings.runtime_reset()),
-        ];
-        hints.push(ModalHint::new("Ctrl+S", strings.runtime_apply()));
-        hints.push(ModalHint::new("Tab", strings.runtime_title()));
-        // Leaving the run options with something staged drops it, which is what
-        // the hint has to say: "back" would read as "keep them".
-        let dirty = app
-            .runtime_picker
-            .draft
-            .as_ref()
-            .is_some_and(|draft| draft.is_dirty());
-        hints.push(ModalHint::new(
-            "Esc",
-            if dirty {
-                strings.cancel()
-            } else {
-                strings.hint_back()
-            },
-        ));
-        hints
+            ModalHint::new("Tab", strings.runtime_title()),
+            ModalHint::new("Esc", strings.hint_back()),
+        ]
     };
     let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
     let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
@@ -6270,18 +6237,44 @@ fn runtime_picker_entry_line(
         None => " ".to_string(),
     };
     let indent = if in_group { 4 } else { 2 };
+    // A pinned row names an entry out of its group, so it has to carry what the
+    // heading above it would otherwise say — the Agent it belongs to — and, as
+    // the rows a reader comes back to, how that entry ran last time. An entry
+    // under its own heading needs neither: the heading is right above it, and a
+    // whole group of repeated run options would be a wall rather than a list.
+    let overrides = if in_group {
+        None
+    } else {
+        app.run_option_overrides(&app.runtime_prefs.with_remembered_options(option))
+    };
     let status_width = status.as_deref().map(display_width).unwrap_or_default();
-    let gap = if status_width > 0 { 2 } else { 0 };
-    let available = width.saturating_sub(indent + 2 + status_width + gap);
+    let status_gap = if status_width > 0 { 2 } else { 0 };
+    let summary_width = overrides
+        .as_deref()
+        .map(|summary| pinned_summary_width(display_width(summary), width))
+        .unwrap_or_default();
+    let summary_gap = if summary_width > 0 { 2 } else { 0 };
+    let available =
+        width.saturating_sub(indent + 2 + status_width + status_gap + summary_width + summary_gap);
     // The model is what a reader scans for, so it takes the larger share and the
     // account truncates first: "Default CLI account/…" names the provenance, but
     // two rows of the same model on two accounts are still two rows.
-    let (auth_width, model_width) = runtime_columns(available);
-    let body = format!(
-        "{} · {}",
-        truncate_to_width(&option.auth_source_label, auth_width, "…"),
-        truncate_to_width(&option.model_label, model_width, "…"),
-    );
+    let body = if in_group {
+        let (auth_width, model_width) = runtime_columns(available);
+        format!(
+            "{} · {}",
+            truncate_to_width(&option.auth_source_label, auth_width, "…"),
+            truncate_to_width(&option.model_label, model_width, "…"),
+        )
+    } else {
+        let (agent_width, auth_width, model_width) = pinned_columns(available);
+        format!(
+            "{} · {} · {}",
+            truncate_to_width(&option.agent_label, agent_width, "…"),
+            truncate_to_width(&option.auth_source_label, auth_width, "…"),
+            truncate_to_width(&option.model_label, model_width, "…"),
+        )
+    };
     let mut spans = vec![
         Span::styled(" ".repeat(indent), theme.base()),
         Span::styled(
@@ -6297,8 +6290,16 @@ fn runtime_picker_entry_line(
             if current { theme.base() } else { theme.muted() },
         ),
     ];
+    if let Some(summary) = overrides {
+        let summary = truncate_to_width(&summary, summary_width, "…");
+        spans.push(Span::styled(" ".repeat(summary_gap), theme.base()));
+        spans.push(Span::styled(
+            pad_to_width(&summary, summary_width),
+            theme.dimmed(theme.roles.gray),
+        ));
+    }
     if let Some(status) = status {
-        spans.push(Span::styled(" ".repeat(gap), theme.base()));
+        spans.push(Span::styled(" ".repeat(status_gap), theme.base()));
         spans.push(Span::styled(
             status,
             if current {
@@ -6321,31 +6322,21 @@ fn runtime_picker_preview(
     theme: &TuiTheme,
 ) -> Line<'static> {
     let strings = app.strings;
-    // A heading has no entry of its own, so the preview answers for the page's
-    // selection — which is exactly what `Tab` would show from there.
-    let run_options = match option {
-        Some(option) => app.run_options_for(&app.runtime_prefs.with_remembered_options(option)),
-        None => app.picker_run_options(),
+    // A heading has no entry of its own, so the preview answers for the entry the
+    // picker is on — which is exactly what `Tab` would show from there.
+    let selection = match option {
+        Some(option) => app.runtime_prefs.with_remembered_options(option),
+        None => match app.picker_selection() {
+            Some(selection) => selection,
+            None => return Line::from(""),
+        },
     };
-    if run_options.is_empty() {
+    if app.run_options_for(&selection).is_empty() {
         return Line::from("");
     }
-    let labels = run_options
-        .iter()
-        .filter(|option| option.is_explicit())
-        .map(|option| {
-            format!(
-                "{} {}",
-                option.label,
-                option.resolved_label(strings.runtime_default())
-            )
-        })
-        .collect::<Vec<_>>();
-    let body = if labels.is_empty() {
-        strings.runtime_default().to_string()
-    } else {
-        labels.join(" · ")
-    };
+    let body = app
+        .run_option_overrides(&selection)
+        .unwrap_or_else(|| strings.runtime_default().to_string());
     let text = format!(
         "{}: {body} · {}",
         strings.runtime_run_options(),
@@ -6357,8 +6348,8 @@ fn runtime_picker_preview(
     ))
 }
 
-/// The run options of the entry the page is on, with what the reader has staged
-/// marked as staged.
+/// The run options of the entry the picker is on, each row showing what is in
+/// effect: a value is sent as it is chosen, so there is no staged copy to mark.
 fn render_runtime_options(
     frame: &mut Frame<'_>,
     content: Rect,
@@ -6368,7 +6359,10 @@ fn render_runtime_options(
     theme: &TuiTheme,
 ) {
     let strings = app.strings;
-    let (agent, model) = app.composer_runtime_labels();
+    // The caption names the entry the rows belong to: the reader may have picked
+    // it a moment ago, and the page's own selection catches up a round trip
+    // later.
+    let (agent, model) = app.picker_runtime_labels();
     let mut content = content;
     if content.height > 1 {
         let caption = if model.is_empty() {
@@ -6395,22 +6389,10 @@ fn render_runtime_options(
     let width = usize::from(content.width);
     let mut lines = Vec::with_capacity(run_options.len());
     for (index, option) in run_options.iter().enumerate() {
-        let staged = app
-            .runtime_picker
-            .draft
-            .as_ref()
-            .is_some_and(|draft| draft.changed(&option.key));
         let set = option.is_explicit();
         let value = option.resolved_label(strings.runtime_default());
-        let tag = if staged {
-            strings.runtime_modified()
-        } else {
-            ""
-        };
-        let tag_width = display_width(tag);
-        let gap = if tag_width > 0 { 2 } else { 0 };
-        let value_width = width.saturating_sub(2 + 18 + tag_width + gap);
-        let mut spans = vec![
+        let value_width = width.saturating_sub(2 + 18);
+        let spans = vec![
             Span::styled(
                 if set { "● " } else { "  " }.to_string(),
                 Style::default().fg(theme.roles.accent_user),
@@ -6426,13 +6408,6 @@ fn render_runtime_options(
                 if set { theme.base() } else { theme.muted() },
             ),
         ];
-        if tag_width > 0 {
-            spans.push(Span::styled(" ".repeat(gap), theme.base()));
-            spans.push(Span::styled(
-                tag.to_string(),
-                Style::default().fg(theme.roles.accent_user),
-            ));
-        }
         lines.push(selected_line(spans, index == selected, width, theme));
     }
     frame.render_widget(
@@ -6466,6 +6441,37 @@ fn selected_line(
         theme.selected(),
     ));
     Line::from(spans).style(theme.selected())
+}
+
+/// Split the width left for "Agent · account · model" between the three names.
+///
+/// Three names in one row is a squeeze, so the model keeps the largest share and
+/// the account the smallest: two rows of the same model on two accounts are
+/// still two rows, but the model is what a reader scans for and the account is
+/// what they check second.
+fn pinned_columns(available: usize) -> (usize, usize, usize) {
+    const SEPARATORS: usize = 6;
+    if available <= SEPARATORS {
+        return (0, 0, available);
+    }
+    let body = available - SEPARATORS;
+    let model = (body * 4 / 9).max(6).min(body);
+    let rest = body - model;
+    let agent = (rest * 3 / 5).max(4).min(rest);
+    (agent, rest - agent, model)
+}
+
+/// How much of a pinned row the remembered run options may take.
+///
+/// Enough to read "Thinking depth High · Conversation mode Plan", and never so
+/// much that the entry's own names are squeezed out of the row: the summary is
+/// what the reader set on the entry, and the entry is what they are looking for.
+fn pinned_summary_width(summary: usize, width: usize) -> usize {
+    const NAMES_MINIMUM: usize = 20;
+    if width <= NAMES_MINIMUM + 6 {
+        return 0;
+    }
+    summary.min(width - NAMES_MINIMUM - 2)
 }
 
 /// Split the width left for "account · model" between the two names.
@@ -6519,6 +6525,7 @@ fn render_scroll_indicator(
     frame.render_widget(Paragraph::new(Text::from(lines)), bar);
 }
 
+/// Build a modal's chrome, giving the margins back on a compact terminal.
 fn modal_chrome<'a>(
     app: &App,
     title: &'a str,

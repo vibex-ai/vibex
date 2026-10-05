@@ -46,8 +46,8 @@ fn app(columns: u16, rows: u16) -> App {
 /// The page stopped naming itself — it is the prompt, and a reader who typed the
 /// client's name to get here knows which page the cursor is in — so the tests
 /// that ask "is the composing page on screen" have to ask for the one row that
-/// is nobody else's: the runtime the message would be sent through.
-const COMPOSING_PAGE: &str = "Runtime";
+/// is nobody else's: the Agent the message would be sent through.
+const COMPOSING_PAGE: &str = "Agent setup";
 
 /// Draw one frame and return the terminal buffer, for checks that need cells
 /// rather than the text a person would read.
@@ -763,8 +763,14 @@ fn open_session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) 
 /// The list is a tree — an Agent heading above its entries, and the pinned
 /// recent and starred rows above those — so the row an entry is drawn on is not
 /// its index in the catalogue. Tests ask for the row the way the renderer finds
-/// it.
+/// it, and open the group first: the picker opens as a list of Agents, with
+/// every Agent but the one in use folded away.
 fn pick_entry(app: &mut App, index: usize) {
+    let agent_id = app.runtime_options.as_ref().expect("catalogue").options[index]
+        .selection
+        .agent_id
+        .clone();
+    app.fold_runtime_group(&agent_id, false);
     let row = app
         .runtime_picker_rows()
         .iter()
@@ -774,6 +780,58 @@ fn pick_entry(app: &mut App, index: usize) {
         view: vibex_tui::app::RuntimePickerView::Choices,
         selected: row,
     });
+}
+
+#[test]
+fn a_pinned_row_names_the_agent_and_how_it_ran() {
+    // A pinned row stands outside every Agent group, so it has to carry what the
+    // heading above it would otherwise say — the Agent — and, as the row the
+    // reader comes back to, how that entry ran last time. An entry under its own
+    // heading leaves both to the heading: the group is right above it, and a
+    // whole list of repeated run options would be a wall rather than a list.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog.clone());
+    open_session_on(&mut app, desired.clone());
+
+    // The reader ran the entry with a thinking depth, and it is remembered.
+    let mut remembered = desired;
+    remembered.reasoning_effort = Some("high".to_string());
+    app.remember_runtime_selection(&remembered);
+    app.show_runtime_picker();
+
+    let screen = text(&render(&mut app, 140, 40));
+    assert!(
+        screen.contains("Recent"),
+        "the entry the reader used last is not offered:\n{screen}"
+    );
+    let row = screen
+        .lines()
+        .find(|line| line.contains("Thinking depth High"))
+        .unwrap_or_else(|| panic!("the recent row is not on screen:\n{screen}"));
+    for expected in ["codex", "bal", "gpt-5"] {
+        assert!(
+            row.contains(expected),
+            "the recent row does not name {expected:?}: {row:?}"
+        );
+    }
+    assert!(
+        row.contains("Thinking depth High"),
+        "the recent row does not say how it ran: {row:?}"
+    );
+    // The Agent's own entries say none of that twice: the heading above them is
+    // the Agent, and the run options belong to the pinned row.
+    let entry = screen
+        .lines()
+        .find(|line| line.contains("● bal · gpt-5"))
+        .unwrap_or_else(|| panic!("the entry in use is not on screen:\n{screen}"));
+    assert!(
+        !entry.contains("Thinking depth"),
+        "an entry under its heading repeats the run options: {entry:?}"
+    );
 }
 
 #[test]
@@ -827,12 +885,14 @@ fn the_switcher_keeps_the_run_options_one_key_away_from_the_catalogue() {
 }
 
 #[test]
-fn the_switcher_names_the_session_a_choice_will_move() {
-    // The runtime key is global, so the surface it opens has to say what the
-    // choice applies to: on a session's own page it moves that session, and on a
-    // page showing no session — the list, or the page writing a new one — it is
-    // the Agent the *next* session will be created with. Nothing else may move,
-    // which is what keeps the two independent.
+fn the_switcher_names_what_the_choice_applies_to() {
+    // The Agent key is global, so the surface it opens has to answer "what am I
+    // on" before it asks "what do you want": the entry in use is marked, and the
+    // catalogue opens on it. On a session's own page that is the session's
+    // Agent; on a page showing no session — the list, or the page writing a new
+    // one — it is the Agent the *next* session would be created with, never the
+    // one the list has open behind it. Nothing else may move, which is what
+    // keeps the two independent.
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -843,8 +903,12 @@ fn the_switcher_names_the_session_a_choice_will_move() {
     app.show_runtime_picker();
     let screen = text(&render(&mut app, 120, 40));
     assert!(
-        screen.contains("Runtime") && !screen.contains("Next session"),
-        "a session's own picker claims to be for another session:\n{screen}"
+        screen.contains("Agent setup · Choose an Agent"),
+        "the picker does not name the surface it is:\n{screen}"
+    );
+    assert!(
+        screen.contains("Current"),
+        "the picker does not mark the Agent the session is on:\n{screen}"
     );
 
     // The reader steps back to the list, where no session is shown: the same key
@@ -852,16 +916,14 @@ fn the_switcher_names_the_session_a_choice_will_move() {
     app.overlay = None;
     app.navigate_to(Page::Sessions);
     app.show_runtime_picker();
-    // The picker opens on the page's own answer, not on the Agent of the
-    // session the list has open behind it.
     assert!(
         app.runtime_option_is_current(&app.runtime_options.as_ref().expect("catalogue").options[0]),
         "the list's picker opened on the session behind it"
     );
     let screen = text(&render(&mut app, 120, 40));
     assert!(
-        screen.contains("Next session"),
-        "the list's picker does not say what the choice is for:\n{screen}"
+        screen.contains("Current"),
+        "the list's picker does not mark the Agent a creation would use:\n{screen}"
     );
 }
 

@@ -167,7 +167,6 @@ intents! {
     OverlayFoldClosed => { scope: Overlay, id: "overlay_fold_close", label: "Fold", help: "Fold the highlighted group, or step out to its heading." },
     StarRuntimeModel => { scope: Overlay, id: "overlay_star_model", label: "Star", help: "Star or unstar the highlighted model in the runtime switcher." },
     ManageRuntimeAccount => { scope: Overlay, id: "overlay_manage_account", label: "Account", help: "Open the highlighted runtime's Agent account in the management pages." },
-    ApplyRuntimeEdit => { scope: Overlay, id: "overlay_apply_runtime", label: "Apply", help: "Apply the run options staged in the runtime switcher." },
     ResetRunOption => { scope: Overlay, id: "overlay_reset_run_option", label: "Reset", help: "Stage the highlighted run option back to the Agent's own default." },
 
     // ---- approvals ------------------------------------------------------
@@ -340,15 +339,14 @@ impl Intent {
                 | Intent::SettingPrevious
                 | Intent::SettingNext
                 | Intent::ResetSetting
-                // Folding the catalogue, starring a model and staging a run
+                // Folding the catalogue, starring a model and resetting a run
                 // option are all local: the switcher can be read and arranged
-                // while the runtime is unreachable. Applying what was staged
-                // does need the runtime, which is why `ManageRuntimeAccount`
+                // while the runtime is unreachable. Sending what a row was set
+                // to does need the runtime, which is why `ManageRuntimeAccount`
                 // is deliberately absent.
                 | Intent::OverlayFoldOpen
                 | Intent::OverlayFoldClosed
                 | Intent::StarRuntimeModel
-                | Intent::ApplyRuntimeEdit
                 | Intent::ResetRunOption
         )
     }

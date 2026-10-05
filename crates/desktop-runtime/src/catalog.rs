@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -16,9 +17,10 @@ use vibex_core::{
 use vibex_db::{
     AgentAuthModelCatalogRepository, AgentConfigRepository, AgentRuntimeOptionSnapshotRecord,
     AgentRuntimeOptionSnapshotRepository, ProviderModelRuntimeOptionSnapshotRecord,
-    ProviderModelRuntimeOptionSnapshotRepository, ProviderProfileRepository, apply_migrations,
-    open_database,
+    ProviderModelRuntimeOptionSnapshotRepository, ProviderProfileRepository, SessionRepository,
+    apply_migrations, open_database,
 };
+use vibex_desktop_model::{AgentOrderEntry, AgentOrdering, UiStateStore, ordered_agent_ids};
 use vibex_remote::RemoteRuntimeOptionCatalogSource;
 
 use crate::AgentAuthContextService;
@@ -70,6 +72,12 @@ pub struct RuntimeOptionCatalogService {
     provider_config: ProviderConfigService,
     live_runtime: Option<Arc<AcpRuntimeClient>>,
     auth_contexts: Option<Arc<AgentAuthContextService>>,
+    /// Where the Desktop shell persists the order it lists Agents in.
+    ///
+    /// The catalogue is published in that order, so a compact client draws the
+    /// same list the reader arranged on the Desktop. `None` — a runtime with no
+    /// shell attached, and every test — publishes the catalogue's own order.
+    ui_state_path: Option<PathBuf>,
     probe_locks:
         Arc<tokio::sync::Mutex<BTreeMap<RuntimeOptionProbeKey, Weak<tokio::sync::Mutex<()>>>>>,
 }
@@ -81,6 +89,7 @@ impl RuntimeOptionCatalogService {
             provider_config,
             live_runtime: None,
             auth_contexts: None,
+            ui_state_path: None,
             probe_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
@@ -95,6 +104,7 @@ impl RuntimeOptionCatalogService {
             provider_config,
             live_runtime: Some(live_runtime),
             auth_contexts: None,
+            ui_state_path: None,
             probe_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
@@ -104,6 +114,12 @@ impl RuntimeOptionCatalogService {
         auth_contexts: Arc<AgentAuthContextService>,
     ) -> Self {
         self.auth_contexts = Some(auth_contexts);
+        self
+    }
+
+    /// Read the Desktop's Agent order from the UI state it persists.
+    pub fn with_ui_state_path(mut self, path: PathBuf) -> Self {
+        self.ui_state_path = Some(path);
         self
     }
 
@@ -172,25 +188,99 @@ impl RuntimeOptionCatalogService {
         );
         let account_fingerprints =
             self.merge_agent_account_sources(&mut catalog, &agents.agents)?;
+        let agent_rank = self.agent_rank(&agents.agents);
         catalog.auth_sources.sort_by(|left, right| {
-            left.agent_id
-                .cmp(&right.agent_id)
+            let rank = |agent_id: &AgentId| agent_rank.get(agent_id).copied().unwrap_or(usize::MAX);
+            rank(&left.agent_id)
+                .cmp(&rank(&right.agent_id))
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
                 .then_with(|| left.kind.cmp(&right.kind))
                 .then_with(|| left.label.cmp(&right.label))
                 .then_with(|| left.source.cmp(&right.source))
         });
         catalog.options.sort_by(|left, right| {
-            left.selection
-                .agent_id
-                .cmp(&right.selection.agent_id)
+            let rank = |agent_id: &AgentId| agent_rank.get(agent_id).copied().unwrap_or(usize::MAX);
+            rank(&left.selection.agent_id)
+                .cmp(&rank(&right.selection.agent_id))
+                .then_with(|| left.selection.agent_id.cmp(&right.selection.agent_id))
                 .then_with(|| left.selection.auth_source.cmp(&right.selection.auth_source))
                 .then_with(|| left.model_label.cmp(&right.model_label))
+        });
+        catalog.agents.sort_by(|left, right| {
+            agent_rank
+                .get(&left.agent_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &agent_rank
+                        .get(&right.agent_id)
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
         });
         refresh_runtime_option_catalog_revision(
             &mut catalog,
             account_fingerprints.iter().map(String::as_bytes),
         );
         Ok(catalog)
+    }
+
+    /// The order the Desktop lists Agents in, as a rank per Agent id.
+    ///
+    /// The catalogue is what compact clients draw their Agent list from, so it
+    /// has to carry the Desktop's own order — its sort strategy, any manual drag
+    /// and how often each Agent has been used — rather than whichever order the
+    /// Agent definitions happen to sit in. The shell owns that state; its
+    /// persisted UI state is the copy this reads, and a runtime with no shell
+    /// behind it (or a state file that is missing or unreadable) ranks nothing,
+    /// which leaves the catalogue's own order in place.
+    fn agent_rank(&self, agents: &[vibex_core::AgentSnapshotEntry]) -> BTreeMap<AgentId, usize> {
+        let Some(path) = self.ui_state_path.as_ref() else {
+            return BTreeMap::new();
+        };
+        let ordering = match UiStateStore::new(path).load_read_only() {
+            Ok(load) => {
+                AgentOrdering::new(load.state.agent_sort_strategy, load.state.agent_tab_order)
+                    .with_usage_counts(self.agent_usage_counts())
+            }
+            Err(_) => return BTreeMap::new(),
+        };
+        let entries = agents
+            .iter()
+            .filter(|agent| agent.added && agent.enabled)
+            .map(|agent| AgentOrderEntry {
+                id: agent.id.as_str().to_string(),
+                label: agent.label.clone(),
+            })
+            .collect::<Vec<_>>();
+        ordered_agent_ids(&entries, &ordering)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, id)| AgentId::parse(&id).ok().map(|id| (id, rank)))
+            .collect()
+    }
+
+    /// How often each Agent has been used, counted from the sessions the
+    /// authority holds.
+    ///
+    /// The Desktop counts the same thing from the sessions it has loaded; a
+    /// session that has been deleted is not usage, and a session that has been
+    /// archived still is, so the count outlives the list it came from.
+    fn agent_usage_counts(&self) -> BTreeMap<String, u64> {
+        let Ok(connection) = open_database(self.provider_config.database_path()) else {
+            return BTreeMap::new();
+        };
+        let Ok(sessions) = SessionRepository::list(&connection, true) else {
+            return BTreeMap::new();
+        };
+        let mut counts = BTreeMap::new();
+        for session in sessions {
+            *counts
+                .entry(session.agent_id.as_str().to_string())
+                .or_insert(0) += 1;
+        }
+        counts
     }
 
     fn merge_agent_account_sources(
@@ -1002,8 +1092,9 @@ mod tests {
         AgentReasoningEffort, AgentRuntimeRouteKey, AgentSessionConfigProbe,
         AgentUpdateConfigRequest, ProviderBinding, ProviderCapabilities, ProviderConfiguredModel,
         ProviderProfile, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
-        ProviderSessionConfigValue, TransportKind, VibexResult,
+        ProviderSessionConfigValue, TransportKind, VibexResult, WorkspaceMode,
     };
+    use vibex_db::WorkspaceRepository;
 
     struct CountingProvider {
         calls: AtomicUsize,
@@ -1360,6 +1451,150 @@ mod tests {
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.model_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// One durable session on `agent_id`, which is what usage is counted from.
+    fn record_session(
+        provider_config: &ProviderConfigService,
+        workspace_root: &std::path::Path,
+        agent_id: &AgentId,
+    ) {
+        let connection = open_database(provider_config.database_path()).unwrap();
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &connection,
+            workspace_root,
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = vibex_core::unix_timestamp_ms();
+        SessionRepository::insert(
+            &connection,
+            &vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::new(),
+                title: "a session".to_string(),
+                project_id: project.id,
+                workspace_id: workspace.id,
+                workspace_root: workspace.root_path,
+                workspace_mode: workspace.mode,
+                agent_id: agent_id.clone(),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: now,
+                updated_at_ms: now,
+                last_message_at_ms: now,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_published_catalogue_follows_the_desktop_agent_order() {
+        // The catalogue is the menu every compact client picks an Agent from, so
+        // it is published in the order the Desktop lists Agents in: its sort
+        // strategy, with the usage it counts. `gemini` sorts before `opencode`
+        // by name, and the sessions the authority holds say the opposite — the
+        // catalogue has to say what the Desktop says.
+        let (directory, catalog, provider_config, gemini, _provider) =
+            catalog_fixture_for_agent("gemini", false);
+        let opencode = AgentId::parse("opencode").unwrap();
+        provider_config
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: opencode.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: Some(AgentCommandConfig {
+                    command: "/bin/true".to_string(),
+                    args: Vec::new(),
+                }),
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        provider_config
+            .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                agent_id: opencode.clone(),
+                cwd_scope: None,
+            })
+            .unwrap();
+        for (agent_id, model) in [(&gemini, "gemini-pro"), (&opencode, "gpt-5")] {
+            provider_config
+                .create_acp_profile(AcpProviderProfileCreateRequest {
+                    agent_id: Some(agent_id.clone()),
+                    display_name: format!("{} ACP", agent_id.as_str()),
+                    account_alias: None,
+                    preset_id: None,
+                    config: Some(AcpProviderConfig {
+                        command: "/bin/true".to_string(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        cwd_template: Some("{workspaceRoot}".to_string()),
+                        process_strategy: AcpProcessStrategy::default(),
+                        terminal_tools: false,
+                        terminal_auth: false,
+                        models: vec![model.to_string()],
+                        modes: Vec::new(),
+                        features: Vec::new(),
+                        disabled_tools: Vec::new(),
+                    }),
+                })
+                .unwrap();
+        }
+        record_session(&provider_config, directory.path(), &opencode);
+        record_session(&provider_config, directory.path(), &opencode);
+
+        let ui_state_path = directory.path().join("desktop-ui-state.json");
+        let state = vibex_desktop_model::DesktopUiStateV1 {
+            agent_sort_strategy: vibex_desktop_model::AgentSortStrategy::UsageFrequency,
+            ..vibex_desktop_model::DesktopUiStateV1::default()
+        };
+        vibex_desktop_model::UiStateStore::new(&ui_state_path)
+            .save(&state)
+            .unwrap();
+
+        let catalog = catalog.with_ui_state_path(ui_state_path);
+        let published = catalog.list().await.unwrap();
+        assert_eq!(
+            published
+                .options
+                .first()
+                .map(|option| option.selection.agent_id.clone()),
+            Some(opencode.clone()),
+            "the catalogue was not published in the Desktop's order"
+        );
+        assert_eq!(
+            published.agents.first().map(|agent| agent.agent_id.clone()),
+            Some(opencode),
+            "the Agent list disagrees with the options below it"
+        );
+
+        // A manual drag on the Desktop wins over the strategy, and the runtime
+        // answers with it: the reader's own arrangement is the order they see.
+        let ui_state_path = directory.path().join("desktop-ui-state.json");
+        let state = vibex_desktop_model::DesktopUiStateV1 {
+            agent_sort_strategy: vibex_desktop_model::AgentSortStrategy::UsageFrequency,
+            agent_tab_order: vec![gemini.as_str().to_string()],
+            ..vibex_desktop_model::DesktopUiStateV1::default()
+        };
+        vibex_desktop_model::UiStateStore::new(&ui_state_path)
+            .save(&state)
+            .unwrap();
+        let catalog = catalog.with_ui_state_path(ui_state_path);
+        assert_eq!(
+            catalog
+                .list()
+                .await
+                .unwrap()
+                .options
+                .first()
+                .map(|option| option.selection.agent_id.clone()),
+            Some(gemini),
+            "the manual order was ignored"
+        );
     }
 
     #[tokio::test]

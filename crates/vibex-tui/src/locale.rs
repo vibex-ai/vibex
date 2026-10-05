@@ -138,7 +138,7 @@ strings! {
         "還沒有工作階段 — 按 n 新增"
     },
     session_new => { "New session", "新建会话", "新增工作階段" },
-    session_runtime_label => { "Runtime", "运行时", "執行環境" },
+    session_runtime_label => { "Agent setup", "Agent 配置", "Agent 設定" },
     session_workspace_label => { "Workspace", "工作区", "工作區" },
     // The list's summary chips count sessions by state. Lower case because a
     // chip is a count first and a word second: `◇ 5 idle` reads as a tally,
@@ -499,14 +499,14 @@ strings! {
     elicitation_field_multi => { "Multi-select", "多选", "多選" },
 
     // ---- runtime / model ------------------------------------------------
-    runtime_title => { "Runtime", "运行时", "執行階段" },
+    runtime_title => { "Agent setup", "Agent 配置", "Agent 設定" },
     runtime_desired => { "Requested", "期望", "期望" },
     runtime_effective => { "Effective", "实际", "實際" },
     runtime_switching => { "Switching…", "切换中…", "切換中…" },
     runtime_switch_failed => {
-        "Switch failed — still using the previous runtime",
-        "切换失败 — 仍在用之前的运行时",
-        "切換失敗 — 仍在使用先前的執行階段"
+        "Switch failed — still using the previous Agent",
+        "切换失败 — 仍在用之前的 Agent",
+        "切換失敗 — 仍在使用先前的 Agent"
     },
     runtime_model => { "Model", "模型", "模型" },
     runtime_agent => { "Agent", "Agent", "Agent" },
@@ -515,10 +515,6 @@ strings! {
     runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },
     runtime_current => { "Current", "当前", "目前" },
     runtime_unavailable => { "Unavailable", "不可用", "無法使用" },
-    // Where a runtime choice lands when the page shows no session to move: it
-    // is the Agent the *next* session will be created with. Read as a caption
-    // ("Runtime · Next session") and as a toast ("Next session: Agent · model").
-    runtime_next_session => { "Next session", "下一个会话", "下一個工作階段" },
     // A creation is named by the Agent it will run on; until the catalogue has
     // arrived there is nothing to name, so the message waits.
     runtime_catalogue_reading => {
@@ -535,15 +531,19 @@ strings! {
     // is no runtime to move. Said instead of opening a picker whose Enter could
     // only fail, and instead of swallowing the key.
     runtime_session_creating => {
-        "The new session is still being created — its runtime can change once it exists",
-        "新会话还在创建中 — 创建完成后才能切换运行时",
-        "新工作階段仍在建立中 — 建立完成後才能切換執行階段"
+        "The new session is still being created — its Agent can change once it exists",
+        "新会话还在创建中 — 创建完成后才能切换 Agent",
+        "新工作階段仍在建立中 — 建立完成後才能切換 Agent"
     },
     runtime_session_uncreated => {
-        "The session could not be created — send the message again to switch its runtime",
-        "会话没有创建成功 — 请重新发送消息后再切换运行时",
-        "工作階段沒有建立成功 — 請重新傳送訊息後再切換執行階段"
+        "The session could not be created — send the message again to switch its Agent",
+        "会话没有创建成功 — 请重新发送消息后再切换 Agent",
+        "工作階段沒有建立成功 — 請重新傳送訊息後再切換 Agent"
     },
+    // What the catalogue view chooses. The picker is titled by the two halves
+    // of the surface, and this is the first one: an Agent, its account and its
+    // model.
+    runtime_choose_agent => { "Choose an Agent", "选择 Agent", "選擇 Agent" },
     // The run options the chosen Agent publishes, one Tab away from the
     // catalogue rows.
     runtime_run_options => { "Run options", "运行选项", "執行選項" },
@@ -567,28 +567,14 @@ strings! {
     runtime_fold => { "fold", "折叠", "摺疊" },
     runtime_star => { "star", "收藏", "收藏" },
     runtime_manage_account => { "account", "账号", "帳號" },
-    // Staged run options: several changes, one apply.
-    runtime_modified => { "changed", "已修改", "已修改" },
-    runtime_apply => { "apply", "应用", "套用" },
     runtime_reset => { "reset", "重置", "重設" },
-    runtime_discarded => {
-        "Run options discarded",
-        "已放弃运行选项的修改",
-        "已放棄執行選項的修改"
-    },
-    runtime_applied => { "Run options applied", "运行选项已应用", "執行選項已套用" },
-    runtime_no_change => {
-        "Nothing to apply",
-        "没有需要应用的修改",
-        "沒有需要套用的修改"
-    },
     // The row statuses, in the same column as "Current".
     runtime_status_sign_in => { "Sign in", "需登录", "需登入" },
     runtime_status_verifying => { "Checking…", "校验中…", "校驗中…" },
     runtime_status_discovering => { "Listing models…", "发现模型中…", "探索模型中…" },
     runtime_status_configure => { "Set up", "需配置", "需設定" },
     runtime_status_failed => { "Failed", "切换失败", "切換失敗" },
-    runtime_no_match => { "No matching runtime", "没有匹配的运行时", "沒有符合的執行階段" },
+    runtime_no_match => { "No matching Agent", "没有匹配的 Agent", "沒有符合的 Agent" },
     runtime_summary_hint => { "Tab edits", "Tab 编辑", "Tab 編輯" },
 
     // ---- workspace ------------------------------------------------------

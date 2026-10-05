@@ -1972,6 +1972,30 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The Agent and model the picker's run options are editing.
+    ///
+    /// The picker's own selection rather than the page's: choosing a model and
+    /// tuning how it runs are one errand, and a caption naming the entry the
+    /// page is still on would describe rows that belong to another one.
+    pub fn picker_runtime_labels(&self) -> (String, String) {
+        let Some(selection) = self.picker_selection() else {
+            return self.composer_runtime_labels();
+        };
+        if let Some(option) = self.runtime_option_for(&selection) {
+            return (option.agent_label.clone(), option.model_label.clone());
+        }
+        // The catalogue no longer publishes this selection (an Agent that has
+        // since gone away): its own words still name it.
+        (
+            selection.agent_id.to_string(),
+            selection
+                .model
+                .model_id()
+                .map(str::to_string)
+                .unwrap_or_default(),
+        )
+    }
+
     /// Where the directory picker opens.
     ///
     /// A backend that can browse the authority's filesystem answers a first
@@ -3405,10 +3429,15 @@ impl App {
             || &self.new_draft_id == session_id
     }
 
+    /// Close the picker and forget the visit.
+    ///
+    /// The selection the run options were editing goes with it: it belongs to
+    /// the visit, and the next `Ctrl+G` asks the page what it is on rather than
+    /// answering with an entry the reader chose a surface ago.
     pub fn cancel_runtime_picker(&mut self) {
         self.runtime_picker_pending = false;
         self.runtime_picker_target = None;
-        self.runtime_picker.draft = None;
+        self.runtime_picker.working = None;
         self.runtime_picker.option_row = 0;
         self.runtime_picker.filtering = false;
         self.run_option_prompt = None;

@@ -2407,7 +2407,12 @@ impl DesktopRuntime {
                 provider_config_service.clone(),
                 acp_runtime.clone(),
             )
-            .with_auth_context_service(auth_contexts.clone()),
+            .with_auth_context_service(auth_contexts.clone())
+            // The catalogue is published in the order the Desktop lists Agents
+            // in, which is the shell's own UI state rather than anything the
+            // runtime holds: a compact client should draw the list the reader
+            // arranged, not the order the Agent definitions were added in.
+            .with_ui_state_path(config.home_dir.join(DESKTOP_UI_STATE_FILE)),
         );
         let install_service = Arc::new(AgentInstallService::new_with_runtime_options(
             db_path.clone(),

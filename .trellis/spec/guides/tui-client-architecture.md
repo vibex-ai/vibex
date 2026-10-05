@@ -523,12 +523,18 @@ is never a column count.
   `Alt+↑`/`Alt+↓` (and the arrow keys while the drawer is open), and `Ctrl+P`,
   `Ctrl+Q`, `Ctrl+G` and `Esc` resolve to their global intents with the composer
   focused.
-* **The runtime switcher is visible where the reader is.** The composer's info
-  line names the session's Agent and its `provider/model` plus the key that moves
-  them (`Ctrl+G`); the picker opens with the cursor on the session's current
-  choice and marks it, refuses an option the catalogue says is unavailable, and
-  submits a compare-and-set switch. A backend that cannot switch runtimes gets a
-  toast instead of an overlay whose Enter does nothing.
+* **Agent setup is visible where the reader is.** The composer's info line names
+  the session's Agent and its `provider/model` plus the key that moves them
+  (`Ctrl+G`); the picker opens with the cursor on the session's current choice
+  and marks it, refuses an option the catalogue says is unavailable, and submits
+  a compare-and-set switch. A backend that cannot switch runtimes gets a toast
+  instead of an overlay whose Enter does nothing. The catalogue opens as a *list
+  of Agents*: every group but the one in use is folded, because the catalogue is
+  as long as the machine has models and the reader who opened the surface asked
+  "what am I on"; `←`/`→` (and `Enter` on a heading) open and close the rest. The
+  groups are published in the order the Desktop lists Agents in — the runtime's
+  catalogue carries the shell's own sort strategy, manual drag and usage counts —
+  so every client draws the same list.
 * **An Agent is more than its model, so the switcher carries its run options.**
   What the chosen Agent publishes — thinking depth, conversation mode, then its
   session features — is read through the shared `RuntimeCascadeProjection`
@@ -540,21 +546,28 @@ is never a column count.
   `RuntimePickerView::Options`, `selected` indexes the rows of whichever view is
   up (`App::runtime_picker_row_count()`), the options view opens on a caption
   naming whose options they are, and a view with nothing in it says so rather
-  than swallowing the key. On the composing page `Tab` first takes the row the
-  cursor is on, because there is no live session to move: the reader who has
-  just picked an Agent gets *that* Agent's options rather than the ones belonging
-  to the entry the page started on, and the page's choice becomes the row the
-  cursor was on. A row opens a value list whose first entry is the
-  Agent's own default (`On`/`Off` for a switch, free text for a string feature,
-  which the prompt overlay collects); `Esc` steps out one view at a time — value
-  list, run options, catalogue, closed — and the value list carries the option
-  with it rather than an index, so a catalogue read that lands while it is open
-  cannot move a value onto another option. Every apply re-checks the value
-  against the catalogue and re-uses `Effect::SwitchRuntime` — the composing page
-  keeps it in `new_session_runtime` for the session it creates — and the
-  composer's info line names the depth and mode in effect beside the runtime,
-  because the question "what will this message be sent through" is answered
-  there.
+  than swallowing the key.
+
+  The run options a view lists are those of the row the reader is on, held in
+  `RuntimePickerState::working` for as long as the picker is up: `Tab` seeds it
+  from the catalogue row under the cursor without choosing it, and `Enter` on a
+  row chooses it and moves straight to its options, so picking an Agent and
+  saying how it runs are one visit rather than two. An entry with nothing to tune
+  closes the picker instead of opening an empty view.
+
+  A row opens a value list whose first entry is the Agent's own default
+  (`On`/`Off` for a switch, free text for a string feature, which the prompt
+  overlay collects); `Esc` steps out one view at a time — value list, run
+  options, catalogue, closed — and the value list carries the option with it
+  rather than an index, so a catalogue read that lands while it is open cannot
+  move a value onto another option. **A row that changes is a row that is sent**:
+  there is no staged draft and no apply chord, because a setting that only lived
+  in the client would be a lie about the session it names. Every change re-checks
+  the value against the catalogue and re-uses `Effect::SwitchRuntime` — the
+  composing page keeps it in `new_session_runtime` for the session it creates —
+  and the composer's info line names the depth and mode in effect beside the
+  Agent, because the question "what will this message be sent through" is
+  answered there.
 * Every action has a keyboard path. The mouse is an enhancement only.
 * Every page renders through the shared page frame; no page hand-rolls chrome.
 * **Every popup renders through `crate::modal`.** One chrome — border, title on
@@ -798,11 +811,14 @@ is never a column count.
   session happens to be selected, and keep the choice on the page until
   `CreateSession` carries it.
   The reading side is the same rule, or the page lies about what it will make:
-  the Agent and model the page and the composer's info line name, the entry the
-  picker opens on and marks as current, and the run options a view lists all
-  come from `App::page_runtime_selection()` — the page's own choice, or the
-  entry a creation with no choice falls back to (`default_runtime_selection`
-  mirrors the worker's own rule: first available, else first published) — and
+  the Agent and model the page and the composer's info line name, and the entry
+  the picker opens on and marks as current, all come from
+  `App::page_runtime_selection()` — the page's own choice, or the entry a
+  creation with no choice falls back to (`default_runtime_selection` mirrors the
+  worker's own rule: first available, else first published). The run options a
+  view lists come from `App::picker_selection()` instead: the row the reader is
+  editing while the picker is up, and that same page selection otherwise, because
+  the page's copy of a choice the picker just made catches up a round trip later.
   `Effect::CreateSession` carries that same selection instead of leaving the
   runtime to reach for a default of its own. The rule is one predicate,
   `App::page_owns_session()`: every session-scoped read that describes the page

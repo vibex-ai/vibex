@@ -2319,6 +2319,13 @@ mod tests {
     }
 
     fn isolation_highlight_runtime(app: &mut App, index: usize) {
+        // The picker opens with every Agent but the one in use folded, so a test
+        // that points at another group opens it first, the way a reader does.
+        let agent_id = app.runtime_options.as_ref().expect("catalogue").options[index]
+            .selection
+            .agent_id
+            .clone();
+        app.fold_runtime_group(&agent_id, false);
         let row = app
             .runtime_picker_rows()
             .iter()
@@ -3124,8 +3131,7 @@ mod tests {
         let command = entries
             .iter()
             .position(|listing| {
-                listing.entry.intent == Intent::NewSession
-                    && listing.group == PaletteGroup::Session
+                listing.entry.intent == Intent::NewSession && listing.group == PaletteGroup::Session
             })
             .expect("no session command in the palette");
         let line = region

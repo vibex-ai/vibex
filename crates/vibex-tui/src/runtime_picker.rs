@@ -1,5 +1,5 @@
-//! The runtime switcher's own state: the catalogue grouped, folded and
-//! filtered, and the run options staged on it before they are applied.
+//! The Agent setup picker's own state: the catalogue grouped, folded and
+//! filtered, and the selection its run options are editing.
 //!
 //! Three ideas live here rather than in the reducer, because the renderer needs
 //! them as much as the key handlers do:
@@ -7,8 +7,9 @@
 //! * the *rows* the catalogue view draws — Agent headings with their entries
 //!   under them, plus the pinned recent and starred sections — so a heading can
 //!   never be selected as though it were an entry;
-//! * the *draft*: the run options a reader has changed but not yet applied, so
-//!   several of them cost one runtime switch rather than one each;
+//! * the *edit*: the selection the run options are open on, kept for as long as
+//!   the picker is up, because every change is sent at once and the next one
+//!   builds on the last;
 //! * the *status* one entry reports: whether it can be chosen at all, and
 //!   whether the session is already moving onto it.
 
@@ -19,15 +20,17 @@ use vibex_core::{
     SessionRuntimeSelection, SessionRuntimeSelectionStatus,
 };
 
-use crate::app::{App, RunOption, RunOptionKey, RuntimePickerView};
+use crate::app::{App, RunOption, RuntimePickerView};
 use crate::locale::Strings;
 use crate::runtime_prefs::identity_matches;
 
 /// How many remembered models the pinned "recent" section offers.
 ///
 /// Small on purpose: the section is a shortcut past a long catalogue, and it is
-/// also what the number keys choose from, so it has to fit in one glance.
-pub const RECENT_LIMIT: usize = 5;
+/// also what the number keys choose from, so it has to fit in one glance. Six
+/// rows are what a picker with a preview line under them can show without the
+/// Agents themselves sliding off the bottom.
+pub const RECENT_LIMIT: usize = 6;
 
 /// Rows one page key moves the picker's cursor.
 pub const PICKER_PAGE_ROWS: usize = 10;
@@ -50,12 +53,17 @@ pub struct RuntimePickerState {
     pub filtering: bool,
     /// The Agents whose groups are folded away.
     pub folded: BTreeSet<AgentId>,
-    /// The run options staged on the picker and not yet applied.
-    pub draft: Option<RuntimeDraft>,
+    /// The selection the run options are editing.
+    ///
+    /// Seeded when they open — from the row the reader picked, or from the
+    /// page's own selection — and kept until the picker closes. Every edit is
+    /// sent at once, so the page's copy of the selection catches up a round trip
+    /// later; reading it back per edit would undo the change just made.
+    pub working: Option<SessionRuntimeSelection>,
     /// The run-option row the cursor was last on.
     ///
-    /// Kept outside the draft so leaving the run options does not lose the
-    /// reader's place in them.
+    /// Kept outside the editing selection so leaving the run options does not
+    /// lose the reader's place in them.
     pub option_row: usize,
     /// The first catalogue row the last frame drew.
     ///
@@ -65,71 +73,6 @@ pub struct RuntimePickerState {
     pub scroll: usize,
     /// How many catalogue rows that frame had room for.
     pub page_rows: usize,
-}
-
-/// The run options one reader has changed but not applied.
-///
-/// Both halves are kept: `base` is what the Agent is on now, which is what
-/// "discard" returns to and what the rows compare against to say what changed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeDraft {
-    pub base: SessionRuntimeSelection,
-    pub working: SessionRuntimeSelection,
-}
-
-impl RuntimeDraft {
-    pub fn new(selection: SessionRuntimeSelection) -> Self {
-        Self {
-            base: selection.clone(),
-            working: selection,
-        }
-    }
-
-    /// Whether anything was staged at all.
-    pub fn is_dirty(&self) -> bool {
-        self.working != self.base
-    }
-
-    /// Whether one row's value is staged rather than in effect.
-    pub fn changed(&self, key: &RunOptionKey) -> bool {
-        match key {
-            RunOptionKey::ReasoningEffort => {
-                self.base.reasoning_effort != self.working.reasoning_effort
-            }
-            RunOptionKey::Mode => self.base.mode_id != self.working.mode_id,
-            RunOptionKey::Feature(id) => {
-                self.base.config_values.get(id) != self.working.config_values.get(id)
-            }
-        }
-    }
-
-    /// How many rows the draft moves.
-    pub fn change_count(&self) -> usize {
-        changed_run_options(&self.base, &self.working).len()
-    }
-}
-
-/// The run options two selections disagree about.
-pub fn changed_run_options(
-    base: &SessionRuntimeSelection,
-    working: &SessionRuntimeSelection,
-) -> Vec<RunOptionKey> {
-    let mut keys = Vec::new();
-    if base.reasoning_effort != working.reasoning_effort {
-        keys.push(RunOptionKey::ReasoningEffort);
-    }
-    if base.mode_id != working.mode_id {
-        keys.push(RunOptionKey::Mode);
-    }
-    let mut ids = BTreeSet::new();
-    ids.extend(base.config_values.keys().cloned());
-    ids.extend(working.config_values.keys().cloned());
-    for id in ids {
-        if base.config_values.get(&id) != working.config_values.get(&id) {
-            keys.push(RunOptionKey::Feature(id));
-        }
-    }
-    keys
 }
 
 /// One row of the catalogue view.
@@ -236,26 +179,82 @@ impl RuntimeEntryStatus {
 impl App {
     /// The selection the picker's run options read and write.
     ///
-    /// A staged draft answers while it belongs to the selection the page is on:
-    /// the rows have to show what the reader is about to apply, not what is
-    /// still in effect behind the panel. The catalogue marker keeps asking the
-    /// *page* ([`App::page_runtime_selection`]) instead, because staging a
-    /// thinking depth does not move the session to another entry.
+    /// An open edit answers while it belongs to the page's own choice: the rows
+    /// have to show what the reader is on, not what a switch still in flight has
+    /// yet to move. The catalogue marker keeps asking the *page*
+    /// ([`App::page_runtime_selection`]) instead, because tuning a thinking
+    /// depth does not move the session to another entry.
     pub fn picker_selection(&self) -> Option<SessionRuntimeSelection> {
-        let selection = self.page_runtime_selection()?;
-        match self.runtime_picker.draft.as_ref() {
-            Some(draft) if identity_matches(&draft.base, &selection) => Some(draft.working.clone()),
-            _ => Some(selection),
-        }
+        self.runtime_picker
+            .working
+            .clone()
+            .or_else(|| self.page_runtime_selection())
     }
 
-    /// The run options the picker lists: the page's Agent, staged values in
+    /// The catalogue index of the entry the picker itself is on.
+    ///
+    /// The entry being edited while the run options are open, and the page's own
+    /// entry otherwise, so `Tab` back into the catalogue lands on the row the
+    /// reader last chose rather than on the one the page has not left yet.
+    pub fn picker_runtime_option_index(&self) -> Option<usize> {
+        let catalog = self.runtime_options.as_ref()?;
+        let selection = self.picker_selection()?;
+        catalog
+            .options
+            .iter()
+            .position(|option| identity_matches(&option.selection, &selection))
+    }
+
+    /// The run options the picker lists: the page's Agent, edited values in
     /// place.
     pub fn picker_run_options(&self) -> Vec<RunOption> {
         match self.picker_selection() {
             Some(selection) => self.run_options_for(&selection),
             None => Vec::new(),
         }
+    }
+
+    /// Fold every Agent but the one the picker is on.
+    ///
+    /// The catalogue is as long as the machine has models, so it opens as a list
+    /// of Agents rather than of models: the group the reader is already using is
+    /// the one that is open, and `←`/`→` opens the others. A reader who opened
+    /// the picker to see *which* Agent they are on should not have to walk past
+    /// every model of every other one to find out.
+    pub fn fold_runtime_picker_to_current(&mut self) {
+        let Some(catalog) = self.runtime_options.as_ref() else {
+            self.runtime_picker.folded.clear();
+            return;
+        };
+        let current = self.picker_selection().map(|selection| selection.agent_id);
+        self.runtime_picker.folded = catalog
+            .options
+            .iter()
+            .map(|option| option.selection.agent_id.clone())
+            .filter(|agent_id| Some(agent_id) != current.as_ref())
+            .collect();
+    }
+
+    /// What one selection overrides, in the words the run-option view uses.
+    ///
+    /// `None` when the entry is on everything the Agent published: a remembered
+    /// row that carries no overrides has nothing to say beyond its own name, and
+    /// "Default" on every row of the list would be noise rather than
+    /// information.
+    pub fn run_option_overrides(&self, selection: &SessionRuntimeSelection) -> Option<String> {
+        let labels = self
+            .run_options_for(selection)
+            .into_iter()
+            .filter(|option| option.is_explicit())
+            .map(|option| {
+                format!(
+                    "{} {}",
+                    option.label,
+                    option.resolved_label(self.strings.runtime_default())
+                )
+            })
+            .collect::<Vec<_>>();
+        (!labels.is_empty()).then(|| labels.join(" · "))
     }
 
     /// How many rows one view of the switcher lists.
@@ -619,35 +618,6 @@ mod tests {
             ProviderProfileId::new(),
             model,
         )
-    }
-
-    #[test]
-    fn changed_run_options_names_every_field_the_draft_moves() {
-        let base = selection("codex", "gpt-5");
-        let mut working = base.clone();
-        working.reasoning_effort = Some("high".to_string());
-        working
-            .config_values
-            .insert("web_search".to_string(), "true".to_string());
-        assert_eq!(
-            changed_run_options(&base, &working),
-            vec![
-                RunOptionKey::ReasoningEffort,
-                RunOptionKey::Feature("web_search".to_string())
-            ]
-        );
-        let draft = RuntimeDraft {
-            base: base.clone(),
-            working: working.clone(),
-        };
-        assert!(draft.is_dirty());
-        assert_eq!(draft.change_count(), 2);
-        assert!(draft.changed(&RunOptionKey::ReasoningEffort));
-        assert!(!draft.changed(&RunOptionKey::Mode));
-        // A draft returned to its base is not dirty, which is what makes
-        // `r`-ing every row back to the default the same as never having
-        // touched them.
-        assert!(!RuntimeDraft::new(base).is_dirty());
     }
 
     #[test]
