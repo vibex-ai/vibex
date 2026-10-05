@@ -37448,7 +37448,9 @@ impl VibexWorkbench {
                             .when(!renaming, |this| this.child(div().flex_1()))
                             .when(!renaming && reorder_enabled, |this| {
                                 this.child(
-                                    div()
+                                    // A row, not a column: the actions sit side by
+                                    // side, the way the project row's do.
+                                    h_flex()
                                         .id(format!("sidebar-folder-actions-{folder_id}"))
                                         .flex_none()
                                         .h(px(24.0))
@@ -77646,6 +77648,11 @@ mod tests {
         assert!(folder.contains("let folder_starts_sessions = self"));
         assert!(folder.contains("is_some_and(|folder| folder.project_id.is_some())"));
         assert!(folder.contains(".when(folder_starts_sessions, |this| {"));
+        // The actions are a row: a column would stack the glyphs the moment a
+        // second one joins the folder menu.
+        assert!(folder.contains(
+            "h_flex()\n                                        .id(format!(\"sidebar-folder-actions-{folder_id}\"))"
+        ));
         assert!(folder.contains("sidebar-folder-new-{folder_id}"));
         assert!(folder.contains("IconName::Plus"));
         assert!(folder.contains("this.open_new_session_in_folder("));
