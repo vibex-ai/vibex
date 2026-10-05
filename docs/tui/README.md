@@ -552,8 +552,10 @@ The transcript is a block list with a streaming tail. `e` folds the selected
 block, `F2` folds them all, `Ctrl+E` toggles reasoning, `y` copies a block body
 and `Ctrl+Y` its metadata. `Enter` opens a block's details. The composer takes
 `/` commands, `@` files and `$` skills, `Enter` sends, `Shift+Enter` breaks the
-line, `Ctrl+O` hands the draft to `$EDITOR`, and `Ctrl+S` steers a running turn.
-`Ctrl+C` clears the draft, then interrupts, then offers to quit.
+line — `Ctrl+J` does the same on a terminal that cannot report `Shift+Enter`,
+see [Terminal ownership](#terminal-ownership) — `Ctrl+O` hands the draft to
+`$EDITOR`, and `Ctrl+S` steers a running turn. `Ctrl+C` clears the draft, then
+interrupts, then offers to quit.
 
 `/` on the transcript opens a search: a regular expression, case-insensitive
 until it contains an uppercase letter, highlighted in place. `Enter` keeps the
@@ -728,6 +730,21 @@ dropped silently: the client names the file when it exits, and the file is
 `VIBEX_TUI_LOG` when that is set. Remote mode writes nothing at all, so no
 notice is printed and no file is named.
 
+Ownership covers the keyboard too. On entering, the client pushes the terminal's
+keyboard protocol — disambiguate escape codes plus alternate keys — and pops it
+on the way out. Until a terminal has been asked for it, `Shift+Enter` is not a
+key it can report: the same carriage return arrives for `Enter` and
+`Shift+Enter`, which is why the newline chord needed the push. A terminal that
+ignores it keeps its legacy keys, where `Ctrl+J` — a line feed, which every
+terminal sends as a byte of its own — is the newline chord, and where a terminal
+can be configured to send it for `Shift+Enter` itself.
+
+The flags are pushed optimistically rather than probed. The query for them
+travels through the same input queue the interface is about to read, so asking
+first would cost a stalled startup on every terminal that answers the companion
+device-attributes query but not this one — and the answer would change nothing
+but the wording of the key bar.
+
 ## Degradation
 
 Every one of these has a defined behaviour rather than a broken screen:
@@ -740,6 +757,7 @@ Every one of these has a defined behaviour rather than a broken screen:
 | `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal |
 | non-UTF-8 locale | ASCII borders and markers |
 | sixteen colours only | the page keeps the terminal's own background; the palette carries ink, accents and rules, and no plane is painted |
+| no keyboard protocol | `Shift+Enter` arrives as `Enter`; `Ctrl+J` breaks the line, and the help panel lists it |
 | disconnected | a banner, mutations disabled, the last known state marked stale |
 | read-only device | actions are visible, disabled, and say which permission they need |
 | very long conversation | the transcript is capped and the oldest blocks are dropped |

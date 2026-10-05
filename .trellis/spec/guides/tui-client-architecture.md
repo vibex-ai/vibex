@@ -130,7 +130,16 @@ Rules:
 * `VIBEX_TUI_LOG` chooses the spill file; the default is
   `$TMPDIR/vibex-tui-<pid>.log`;
 * the PTY layer asserts that a byte written while the interface owns the screen
-  never reaches the terminal, which is the measured form of this rule.
+  never reaches the terminal, which is the measured form of this rule;
+* **the keyboard protocol is pushed with the screen and popped with it.**
+  `DISAMBIGUATE_ESCAPE_CODES` (plus `REPORT_ALTERNATE_KEYS`, so the first flag
+  does not cost shifted text) is what lets a terminal report `Shift+Enter` as
+  something other than `Enter`; push and pop are paired, so the next program in
+  the pane reads the keys it expects. The push is **optimistic, not probed**:
+  the query that would detect support travels through the same input queue the
+  interface is about to read, so asking first stalls startup on every terminal
+  that answers the companion device-attributes query but not this one, and the
+  answer would only change the wording of the key bar.
 
 ## 4. Screen composition
 
@@ -469,7 +478,16 @@ is never a column count.
 * Bindings are data, so `~/.vibex/tui-keys.toml` remaps them without a rebuild.
   A malformed file produces warnings and the affected binding keeps its default.
 * Uppercase letters fold into lowercase on the event path, so a
-  shift-only binding is unreachable. Use a modifier or a function key.
+  shift-only binding is unreachable. Use a modifier or a function key. A shifted
+  key that arrives as its *unshifted* code plus `Shift` — what a terminal
+  implementing the protocol's disambiguation without its alternate keys sends —
+  is folded into the character it produced at the same door, so no reader
+  downstream has to know which form its terminal chose.
+* **A key the legacy encoding cannot express gets a chord it can.** `Enter` and
+  `Shift+Enter` are the same carriage return until the terminal has been asked
+  for its keyboard protocol, so the newline action is bound twice: `Shift+Enter`
+  where the protocol answers, and `Ctrl+J` — a line feed, a byte of its own in
+  every terminal — everywhere else. Help lists both; the send key stays `Enter`.
 * `Esc` only walks back one level; it never cancels a running turn. `Ctrl+C`
   owns clear-draft / interrupt / quit-confirm.
 * **The composer is not a room without a door.** `Esc` in the composer returns

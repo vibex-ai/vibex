@@ -20,11 +20,17 @@
 //!
 //! The clipboard goes through OSC 52, so the client never links an
 //! X11/Wayland clipboard crate and never touches the user's display server.
+//!
+//! Taking the screen is also where the keyboard protocol is asked for, because
+//! without it a terminal cannot report a chord like `Shift+Enter` at all — see
+//! [`push_keyboard_enhancement`].
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -32,6 +38,29 @@ use crossterm::terminal::{
 };
 
 use vibex_backend::{BackendError, BackendResult};
+
+/// The keyboard-protocol flags the client asks a capable terminal for.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` is what makes `Shift+Enter` a key of its own: a
+/// terminal that has not been asked for the protocol sends the same carriage
+/// return for `Enter` and `Shift+Enter`, so "break the line" and "send" arrive
+/// as one event and only one of them can win.
+///
+/// `REPORT_ALTERNATE_KEYS` is what keeps *text* intact under it. The protocol
+/// reports a shifted key as its unshifted code plus a `Shift` modifier, and the
+/// character the reader actually pressed travels only in the alternate keycode;
+/// without the flag `Shift+2` would type `2` rather than `@`.
+const KEYBOARD_ENHANCEMENT: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
+/// Whether those flags are currently pushed onto the terminal's stack.
+///
+/// A terminal that does not implement the protocol ignores both sequences, so
+/// this exists only to keep the pop balanced with the push: a `Pop` a terminal
+/// never had pushed is not an error, but it is also not ours to send when a
+/// parent program may have flags of its own.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 /// Whether both stdin and stdout are interactive terminals.
 ///
@@ -47,6 +76,12 @@ pub fn restore_terminal() {
     // cursor hidden is worse than a failed mouse-mode reset.
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    // The keyboard protocol is popped first and only when it was pushed, so the
+    // program that gets the terminal back reads the keys it expects rather than
+    // one it never asked to have reported this way.
+    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         stdout,
         LeaveAlternateScreen,
@@ -58,6 +93,24 @@ pub fn restore_terminal() {
     // `stderr` comes back last: whatever is printed after the screen is
     // restored — a panic message, a late diagnostic — is visible again.
     crate::console::restore_stderr();
+}
+
+/// Ask the terminal to report keys the legacy encoding cannot distinguish.
+///
+/// Deliberately optimistic. The two sequences are defined to be ignored by a
+/// terminal that does not implement the protocol, and the question can only be
+/// asked through the same input queue the interface is about to read: asking
+/// first would stall startup on every terminal that answers the companion
+/// device-attributes query but not this one, for an answer that changes nothing
+/// but the wording of the key bar. A terminal that ignores the push keeps its
+/// legacy keys, where `Ctrl+J` — a line feed, which every terminal sends as a
+/// byte of its own — is the newline chord.
+fn push_keyboard_enhancement() {
+    let mut stdout = io::stdout();
+    let pushed = execute!(stdout, PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT));
+    if pushed.is_ok() {
+        KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Report the diagnostics captured while the interface owned the terminal.
@@ -106,6 +159,9 @@ impl TerminalGuard {
                 error.to_string(),
             ));
         }
+        // Asked for after the screen is taken, and a terminal that will not
+        // answer is not a terminal that cannot run the interface.
+        push_keyboard_enhancement();
         install_panic_hook();
         Ok(Self { active: true })
     }
@@ -694,6 +750,26 @@ mod tests {
         let mut guard = TerminalGuard { active: false };
         guard.release();
         guard.release();
+    }
+
+    #[test]
+    fn the_keyboard_protocol_asks_for_disambiguation_and_alternate_keys() {
+        // The exact wire form, because it is the whole fix: without the push a
+        // terminal has no way to report `Shift+Enter` as anything but `Enter`.
+        // Disambiguate is bit 1 and alternate keys bit 4.
+        use crossterm::Command;
+
+        let mut push = String::new();
+        PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT)
+            .write_ansi(&mut push)
+            .expect("the push has an ANSI form");
+        assert_eq!(push, "\u{1b}[>5u");
+
+        let mut pop = String::new();
+        PopKeyboardEnhancementFlags
+            .write_ansi(&mut pop)
+            .expect("the pop has an ANSI form");
+        assert_eq!(pop, "\u{1b}[<1u");
     }
 
     #[test]

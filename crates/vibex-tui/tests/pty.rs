@@ -195,6 +195,15 @@ impl Session {
         }
     }
 
+    /// Wait for the first frame the interface paints.
+    ///
+    /// The prompt is what the composing page — the page a fresh client opens on
+    /// — keeps at every size; the product name lives in the empty-state panels,
+    /// which that page does not draw.
+    fn wait_for_first_frame(&mut self) -> String {
+        self.wait_for(|screen| screen.contains('❯'))
+    }
+
     fn screen(&mut self) -> String {
         let snapshot = self.emulator.frame();
         let mut output = String::new();
@@ -255,9 +264,7 @@ impl Drop for Session {
 #[test]
 fn startup_paints_a_first_frame() {
     let mut session = Session::start(120, 40);
-    let screen = session.wait_for(|screen| {
-        screen.contains("Vibex") && screen.contains("New session") && screen.contains("Sessions")
-    });
+    let screen = session.wait_for_first_frame();
     // The status band, the prompt and the corner entry are three different
     // bands; seeing all three proves the stack was assembled rather than
     // half-painted. The band names the seat the frame is attached to — a
@@ -271,12 +278,16 @@ fn startup_paints_a_first_frame() {
         screen.contains("Runtime") && screen.contains("Workspace"),
         "the prompt does not name what the message goes through:\n{screen}"
     );
+    assert!(
+        screen.contains("Sessions"),
+        "the corner entry to the session list is missing:\n{screen}"
+    );
 }
 
 #[test]
 fn quitting_restores_the_terminal() {
     let mut session = Session::start(100, 30);
-    session.wait_for(|screen| screen.contains("Vibex"));
+    session.wait_for_first_frame();
     session.send(b"\x11"); // Ctrl+Q
     session.pump(Duration::from_millis(300));
     // Accept the confirmation.
@@ -312,7 +323,7 @@ fn quitting_restores_the_terminal() {
 #[test]
 fn an_idle_interface_writes_nothing() {
     let mut session = Session::start(120, 40);
-    session.wait_for(|screen| screen.contains("Vibex"));
+    session.wait_for_first_frame();
     // The landing mark's greeting is real content and repaints while it runs,
     // as a startup notice would; the contract under test is that nothing
     // repaints once the greeting is over, so this waits it out rather than
@@ -338,7 +349,7 @@ fn an_idle_interface_writes_nothing() {
 #[test]
 fn in_process_diagnostics_never_reach_the_terminal() {
     let mut session = Session::start_with(120, 40, &[("VIBEX_TUI_HARNESS_STRAY_STDERR", "1")]);
-    session.wait_for(|screen| screen.contains("Vibex"));
+    session.wait_for_first_frame();
     // Let a burst of stray writes happen while the interface owns the screen.
     session.pump(Duration::from_millis(700));
 
@@ -387,7 +398,7 @@ fn typing_echoes_into_the_frame() {
     // The client opens with the prompt in front of the reader, so a fresh
     // client can be typed into without opening anything first.
     let mut session = Session::start(120, 40);
-    session.wait_for(|screen| screen.contains("Vibex"));
+    session.wait_for_first_frame();
     session.send("中文 abc".as_bytes());
     let screen = session.wait_for(|screen| screen.contains("abc"));
     assert!(screen.contains("abc"), "{screen}");
@@ -411,7 +422,7 @@ fn the_workspace_key_opens_the_picker_on_the_new_session_page() {
     std::fs::create_dir(directory.path().join("clash-report")).expect("a directory to choose");
     let mut session = Session::start_at(Some(directory.path()), 120, 40, &[]);
     // The prompt is the first screen, so there is nothing to open first.
-    session.wait_for(|screen| screen.contains("New session"));
+    session.wait_for_first_frame();
     // Ctrl+W, with the empty draft the page is in when it makes the promise.
     session.send(b"\x17");
     let screen = session.wait_for(|screen| screen.contains("clash-report"));
@@ -426,14 +437,14 @@ fn the_workspace_key_opens_the_picker_on_the_new_session_page() {
 #[test]
 fn a_resize_storm_does_not_lose_the_frame() {
     let mut session = Session::start(120, 40);
-    session.wait_for(|screen| screen.contains("Vibex"));
+    session.wait_for_first_frame();
     // The pty is resized from the master side; the client sees SIGWINCH and
     // re-lays out. Rapid changes must not leave a torn frame.
     for (columns, rows) in [(80u16, 24u16), (200, 50), (100, 30), (120, 40)] {
         session.resize(columns, rows);
         session.pump(Duration::from_millis(150));
     }
-    let screen = session.wait_for(|screen| screen.contains("Vibex"));
+    let screen = session.wait_for_first_frame();
     assert!(screen.contains("Sessions"), "{screen}");
 }
 
@@ -473,7 +484,7 @@ fn a_non_utf8_locale_still_renders_the_frame() {
     // a bare writing surface, so the check steps to the list — with the chord
     // the prompt's corner names — which is a framed page.
     let mut session = Session::start(100, 30);
-    let screen = session.wait_for(|screen| screen.contains("Vibex"));
+    let screen = session.wait_for_first_frame();
     assert!(!screen.is_empty());
     session.send(b"\x0c"); // Ctrl+L: the session list, from the prompt.
     // The frame has to be complete, not only started: the prompt's corner
@@ -499,4 +510,129 @@ fn a_non_utf8_locale_still_renders_the_frame() {
         !framed.is_empty(),
         "the framed page never assembled:\n{screen}"
     );
+}
+
+/// `Shift+Enter` as a terminal that has been asked for the keyboard protocol
+/// sends it: `CSI 13 ; 2 u`. A terminal that ignores the protocol sends the same
+/// carriage return `Enter` sends — which is why `Ctrl+J`, a line feed every
+/// terminal sends as a byte of its own, is the chord that works everywhere.
+const SHIFT_ENTER: &[u8] = b"\x1b[13;2u";
+
+/// The row a frame draws `needle` on, so an assertion can name *where* something
+/// is rather than only that it is there.
+fn row_of(screen: &str, needle: &str) -> Option<usize> {
+    screen.lines().position(|line| line.contains(needle))
+}
+
+/// Quit a running client and wait for it to exit.
+fn quit(session: &mut Session) {
+    session.send(b"\x11"); // Ctrl+Q
+    session.pump(Duration::from_millis(300));
+    session.send(b"\r"); // accept the confirmation
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    while session.child.try_wait().ok().flatten().is_none() {
+        if Instant::now() >= deadline {
+            panic!("the client did not exit after the quit confirmation");
+        }
+        session.pump(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn the_client_asks_the_terminal_for_disambiguated_keys() {
+    // Without this push a terminal cannot report `Shift+Enter` as anything but
+    // `Enter`, so it is the whole reason the chord can work: disambiguate escape
+    // codes (bit 1) plus alternate keys (bit 4), which is what keeps shifted
+    // text intact under the first flag.
+    let mut session = Session::start(120, 40);
+    session.wait_for_first_frame();
+    let raw = String::from_utf8_lossy(&session.captured).to_string();
+    assert!(
+        raw.contains("\u{1b}[>5u"),
+        "the client never asked for disambiguated keys:\n{}",
+        session.raw_tail()
+    );
+
+    quit(&mut session);
+
+    // Popped on the way out, so the program that gets the terminal back reads
+    // the keys it expects.
+    let raw = String::from_utf8_lossy(&session.captured).to_string();
+    assert!(
+        raw.contains("\u{1b}[<1u"),
+        "the client never gave the keyboard protocol back:\n{}",
+        session.raw_tail()
+    );
+}
+
+#[test]
+fn the_newline_chords_break_the_line_instead_of_sending() {
+    // `Shift+Enter` is the chord the keyboard protocol makes possible and
+    // `Ctrl+J` the one that works without it; both have to reach the composer as
+    // a line break. Three words on three rows of the draft is what proves the
+    // newline landed: a chord that submitted instead would send the draft and
+    // leave the *next* word concatenated onto the last one, which is exactly the
+    // bug this pair of chords exists to prevent.
+    let mut session = Session::start(120, 40);
+    session.wait_for_first_frame();
+    for (word, chord) in [
+        ("alpha", SHIFT_ENTER),
+        ("bravo", b"\n".as_slice()),
+        ("charlie", b"".as_slice()),
+    ] {
+        session.send(word.as_bytes());
+        session.pump(Duration::from_millis(200));
+        session.send(chord);
+        session.pump(Duration::from_millis(200));
+    }
+    let screen = session.wait_for(|screen| screen.contains("charlie"));
+    let rows = ["alpha", "bravo", "charlie"].map(|word| {
+        row_of(&screen, word).unwrap_or_else(|| panic!("{word} is not on screen:\n{screen}"))
+    });
+    assert!(
+        rows[0] < rows[1] && rows[1] < rows[2],
+        "the words are not on rows of their own:\n{screen}"
+    );
+    for concatenated in ["alphabravo", "bravocharlie"] {
+        assert!(
+            !screen.contains(concatenated),
+            "{concatenated} was typed on one line:\n{screen}"
+        );
+    }
+    // The draft's first row carries the prompt mark and its continuations are
+    // indented past it — which is what says these are lines of one draft rather
+    // than rows of three.
+    let lines = screen.lines().collect::<Vec<_>>();
+    assert!(
+        lines[rows[0]].contains('❯'),
+        "the first line is not the draft's:\n{screen}"
+    );
+    for row in &rows[1..] {
+        assert!(
+            !lines[*row].contains('❯'),
+            "a continuation line started a new draft:\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn enter_still_sends_where_the_newline_chords_do_not() {
+    // The other half of the contract: a newline chord must not take `Enter`'s
+    // job. A draft of nothing but line breaks is the case the two paths can be
+    // told apart in — the send path refuses it by name, the newline chord says
+    // nothing at all.
+    let mut session = Session::start(120, 40);
+    session.wait_for_first_frame();
+    for chord in [SHIFT_ENTER, b"\n".as_slice()] {
+        session.send(chord);
+        session.pump(Duration::from_millis(250));
+        let screen = session.screen();
+        assert!(
+            !screen.contains("Message is empty"),
+            "a newline chord took the send path:\n{screen}"
+        );
+    }
+    session.send(b"\r");
+    let screen = session.wait_for(|screen| screen.contains("Message is empty"));
+    assert!(screen.contains('❯'), "{screen}");
 }

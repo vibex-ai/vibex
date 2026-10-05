@@ -275,6 +275,34 @@ fn dispatch_all(worker: &Worker, outcome: &Outcome) {
     }
 }
 
+/// Fold a `Shift` modifier into the character it produced.
+///
+/// The keyboard protocol reports a shifted key as its *unshifted* code plus a
+/// `Shift` modifier, and the character the reader pressed travels only in the
+/// alternate keycode — which is why the client asks for
+/// [`crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS`]. A
+/// terminal that implements the protocol's first flag without its second
+/// therefore sends `Shift+a` as `Char('a')` + `Shift`, which would type a
+/// lowercase letter and match no binding at all.
+///
+/// Folding it at the one door every key comes through means the composer's text
+/// path, the binding table and the rebinding overlay all keep reading the single
+/// representation they already assume.
+fn normalized_key(key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(character) = key.code
+        && character.is_ascii_lowercase()
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        return KeyEvent::new_with_kind_and_state(
+            KeyCode::Char(character.to_ascii_uppercase()),
+            key.modifiers - KeyModifiers::SHIFT,
+            key.kind,
+            key.state,
+        );
+    }
+    key
+}
+
 /// Reduce one key press. Returns `true` when the program should exit.
 fn handle_key(
     app: &mut App,
@@ -282,6 +310,7 @@ fn handle_key(
     guard: &mut TerminalGuard,
     key: KeyEvent,
 ) -> BackendResult<bool> {
+    let key = normalized_key(key);
     // The transcript search bar is a text field, so it takes printable keys
     // before the binding table sees them — the same rule the list filter uses.
     // Control chords still fall through, so `Ctrl+Q`, `Ctrl+P` and `Ctrl+C`
@@ -2005,6 +2034,80 @@ mod tests {
         assert_eq!(app.page, crate::app::Page::Sessions);
         app.focus = crate::app::Focus::Composer;
         assert!(!composer_takes_keys(&app));
+    }
+
+    #[test]
+    fn the_newline_chords_break_the_line_instead_of_sending() {
+        // `Shift+Enter` is only a key of its own once the terminal has been
+        // asked for the keyboard protocol, and `Ctrl+J` is the chord that works
+        // whether it was or not. Both have to reach the composer as a line
+        // break: a newline chord that submits the draft is the bug this pair
+        // exists to prevent.
+        let (worker, _messages) = Worker::start(vibex_backend::DisconnectedBackend::facade())
+            .expect("a worker over a client with no backend");
+        let mut app = test_app(100, 30);
+        app.live = crate::app::LiveState::Ready;
+        app.perform(crate::action::Intent::NewSession);
+        assert!(
+            composer_takes_keys(&app),
+            "the composer does not own its keys"
+        );
+
+        // What a protocol terminal sends for `Shift+Enter`, through the same
+        // normalisation every key goes through.
+        let key = normalized_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(
+            handle_composer_key(&mut app, &worker, key).expect("the key is handled"),
+            Some(false),
+            "Shift+Enter was not consumed"
+        );
+
+        app.composer.insert_char('x');
+        // What a terminal without the protocol sends for `Ctrl+J`: the binding
+        // table, which is where a control chord is resolved.
+        let chord = Chord::from_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.keymap.resolve(&[crate::keymap::Scope::Composer], chord),
+            Some(crate::action::Intent::InsertNewline),
+            "Ctrl+J is not the newline chord in the composer"
+        );
+        app.perform(crate::action::Intent::InsertNewline);
+
+        assert_eq!(app.composer.text(), "\nx\n");
+        assert_eq!(
+            app.page,
+            crate::app::Page::NewSession,
+            "a newline chord submitted the draft"
+        );
+    }
+
+    #[test]
+    fn a_shifted_letter_is_text_not_a_modifier() {
+        // A terminal that implements the protocol's disambiguation without its
+        // alternate keys reports `Shift+a` as `Char('a')` + `Shift`. Reading the
+        // character as it arrives would type a lowercase letter for an
+        // uppercase key, so the modifier is folded in at the door.
+        let folded = normalized_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT));
+        assert_eq!(folded.code, KeyCode::Char('A'));
+        assert_eq!(folded.modifiers, KeyModifiers::NONE);
+
+        // The alternate-keycode form the protocol does send is already the
+        // uppercase character, and is left alone.
+        let reported = normalized_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+        assert_eq!(reported.code, KeyCode::Char('A'));
+        assert_eq!(reported.modifiers, KeyModifiers::NONE);
+
+        // Everything else keeps its modifiers: an unshifted letter, a chord the
+        // protocol disambiguates (`Shift+Enter`), and a character the ASCII
+        // fold cannot answer for.
+        for key in [
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('é'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(normalized_key(key), key, "{key:?} was rewritten");
+        }
     }
 
     #[test]

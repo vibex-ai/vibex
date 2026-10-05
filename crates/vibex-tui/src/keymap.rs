@@ -782,11 +782,23 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::SubmitComposer,
         "Send",
     ),
+    // Two chords for the one action, and the second is not a convenience: a
+    // terminal that does not implement the keyboard protocol sends `Shift+Enter`
+    // as the same carriage return `Enter` sends, so the chord cannot arrive
+    // there at all. `Ctrl+J` is a line feed — a byte of its own in every
+    // terminal, and what a terminal's own key mapping is usually told to send
+    // when the reader rebinds `Shift+Enter` outside the client.
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Enter, KeyModifiers::SHIFT),
         Intent::InsertNewline,
         "Newline",
+    ),
+    binding(
+        Scope::Composer,
+        Chord::ctrl('j'),
+        Intent::InsertNewline,
+        "Newline (any terminal)",
     ),
     binding(
         Scope::Composer,
