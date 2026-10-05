@@ -4744,13 +4744,20 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A pairing fallback is a sheet over the first screen, so back closes it
-        // the way it closes every other sheet instead of leaving the app.
-        if self.mode == RootMode::Pairing && self.pairing_panel != PairingPanel::None {
-            self.dismiss_pairing_panel(cx);
+        // A pairing fallback is a sheet over the first screen, and a runtime's
+        // own surfaces stack on top of it, so back closes the topmost one the
+        // way it closes every other sheet instead of leaving the app.
+        if self.mode == RootMode::Pairing {
+            if self.overlay.is_some() {
+                self.dismiss_overlay(Some(window), cx);
+                return;
+            }
+            if self.pairing_panel != PairingPanel::None {
+                self.dismiss_pairing_panel(cx);
+            }
             return;
         }
-        if matches!(self.mode, RootMode::Pairing | RootMode::Connecting) {
+        if matches!(self.mode, RootMode::Connecting) {
             return;
         }
         self.sync_back_stack_with_ui();
@@ -4994,10 +5001,13 @@ impl MobileApp {
         self.persist_known_hosts();
         if !was_active {
             // The list is still valid; return to it rather than to the action
-            // sheet that pointed at the runtime just removed.
-            self.overlay = Some(MobileOverlay::Hosts);
-            self.overlay_parent = None;
-            self.host_overlay_target = None;
+            // sheet that pointed at the runtime just removed. The pairing page
+            // shows the runtimes themselves and has no list to go back to, so
+            // it stays where it is.
+            self.clear_overlay();
+            if self.mode != RootMode::Pairing {
+                self.overlay = Some(MobileOverlay::Hosts);
+            }
             cx.notify();
             return;
         }
@@ -6433,6 +6443,13 @@ impl MobileApp {
                     }),
             )
             .child(self.render_pairing_sheet(sheet_max_height, cx))
+            // Last, so a runtime's own surfaces sit above the page that opened
+            // them: the cards here are the same runtime list, so the same
+            // actions, rename and remove sheets belong to them.
+            .when_some(
+                self.overlay.filter(|overlay| overlay.is_host_overlay()),
+                |page, overlay| page.child(self.render_mobile_overlay(overlay, cx)),
+            )
     }
 
     /// The product wordmark. The brand mark supplies the capital "V" and the
@@ -6507,10 +6524,10 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// One saved runtime: what it is called, what it is, and how it last
-    /// answered. Only the runtime the phone is bound to has a live status; the
-    /// others show what is actually known, which is when they were last
-    /// reached.
+    /// One saved runtime: what it is called, what it is, what state it is in,
+    /// and the way into its own actions. Only the runtime the phone is bound to
+    /// has a live status; the others show what is actually known, which is when
+    /// they were last reached.
     fn render_pairing_runtime_card(
         &self,
         host: &MobileHostEntry,
@@ -6518,17 +6535,35 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let selected = self.active_host_id.as_deref() == Some(host.id.as_str());
         let status = self.host_status(&host.id);
-        let last_connected = if selected {
-            None
+        let switching = matches!(
+            status.status,
+            RuntimeStatus::Connecting | RuntimeStatus::Reconnecting
+        );
+        // Only the runtime the phone is bound to has a live status; the others
+        // show what is actually known, which is when they were last reached.
+        let status_text = if selected {
+            status.label()
         } else {
-            host.last_connected_at_ms.map(host_last_connected_label)
+            host.last_connected_at_ms
+                .map(host_last_connected_label)
+                .unwrap_or_else(|| RuntimeStatus::NotConnected.label(status.reconnect_attempt))
+        };
+        // The words carry the state on their own; the color is the second
+        // reading of it, so a grey runtime never looks like a failing one.
+        let status_color = match status.status {
+            RuntimeStatus::NotConnected => theme::text_muted(),
+            other => other.dot_color(),
         };
         let switch_id = host.id.clone();
+        let menu_id = host.id.clone();
         div()
             .id(format!("pairing-runtime-{}", host.id))
             .aria_label(locale::common("Connect"))
             .w(px(PAIRING_RUNTIME_CARD_WIDTH))
-            .h(px(PAIRING_RUNTIME_CARD_HEIGHT))
+            // A floor rather than a fixed height: the card is this tall at
+            // rest, and the tallest card sets the strip's height when a name or
+            // a state would need more room than that.
+            .min_h(px(PAIRING_RUNTIME_CARD_HEIGHT))
             .flex_shrink_0()
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
@@ -6558,15 +6593,17 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_SM))
+                    // The live state leads the card: the dot is the runtime's
+                    // identity while it is at rest, and the spinner is the one
+                    // state a phone has to look at to believe.
+                    .child(if switching {
+                        sidebar_running_indicator(status_color)
+                    } else {
+                        sidebar_status_dot(status_color)
+                    })
                     .child(
                         div()
-                            .size(px(theme::ICON_STATUS))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(status.status.dot_color()),
-                    )
-                    .child(
-                        div()
+                            .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
@@ -6579,6 +6616,35 @@ impl MobileApp {
                                 theme::text_secondary()
                             })
                             .child(host.display_label()),
+                    )
+                    .child(
+                        div()
+                            .id(format!("pairing-runtime-menu-{}", host.id))
+                            .aria_label(locale::common("Runtime actions"))
+                            .size(px(theme::SIDEBAR_ACTION_WIDTH))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    // The card underneath connects; the menu
+                                    // must not also open the runtime it belongs
+                                    // to.
+                                    cx.stop_propagation();
+                                    this.open_host_actions(menu_id.clone(), window, cx);
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/ellipsis-vertical.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
                     ),
             )
             .child(
@@ -6596,11 +6662,8 @@ impl MobileApp {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_size(px(theme::FONT_MICRO))
-                    .text_color(theme::text_muted())
-                    .child(match last_connected {
-                        Some(last_connected) => format!("{} · {}", status.label(), last_connected),
-                        None => status.label(),
-                    }),
+                    .text_color(status_color)
+                    .child(status_text),
             )
             .into_any_element()
     }
@@ -14107,6 +14170,7 @@ impl MobileApp {
         let switch_id = host.id.clone();
         let mut sheet = div()
             .w_full()
+            .debug_selector(|| "mobile-runtime-actions-sheet".to_string())
             .rounded_t(px(theme::RADIUS_CARD))
             .border_t_1()
             .border_color(theme::border_default())
@@ -17368,11 +17432,13 @@ const PAIRING_SHEET_HEIGHT_RATIO: f32 = 0.62;
 /// size, so the mark stays a little wider than the label is tall.
 const PAIRING_WORDMARK_FONT: f32 = 36.0;
 
-/// One saved runtime card in the pairing page's strip. Wide enough for a name
-/// and the two lines under it, narrow enough that the next card shows through
-/// and tells the user the strip scrolls.
-const PAIRING_RUNTIME_CARD_WIDTH: f32 = 164.0;
-const PAIRING_RUNTIME_CARD_HEIGHT: f32 = 84.0;
+/// One saved runtime card in the pairing page's strip. Wide enough for a name,
+/// the line under it and its own actions, narrow enough that the next card
+/// shows through and tells the user the strip scrolls.
+const PAIRING_RUNTIME_CARD_WIDTH: f32 = 180.0;
+/// How tall a card is at rest: the name row with its actions control, the kind
+/// line and the state line, with the padding they sit in.
+const PAIRING_RUNTIME_CARD_HEIGHT: f32 = 92.0;
 
 /// The busy indicator the pairing actions share.
 fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
@@ -19299,6 +19365,11 @@ mod tests {
             "the runtimes should share one row: {:?}",
             strip.size
         );
+        assert!(
+            strip.size.height >= px(PAIRING_RUNTIME_CARD_HEIGHT),
+            "a card should keep its resting height: {:?}",
+            strip.size
+        );
 
         // The three ways to add a runtime sit on one row at the foot of the
         // page, so the row is a single touch target tall.
@@ -19460,6 +19531,105 @@ mod tests {
         );
     }
 
+    /// A pairing card is the phone's whole runtime surface on this page, so it
+    /// carries the runtime's own state and the way into its actions — including
+    /// removing it.
+    #[gpui::test]
+    fn pairing_cards_show_state_and_remove_their_runtime(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let bundles = (0..2)
+            .map(|index| host_bundle(&format!("runtime-{index}"), &format!("studio-{index}")))
+            .collect::<Vec<_>>();
+        let active_id = bundles[0].host_id().to_string();
+        let inactive_id = bundles[1].host_id().to_string();
+        app.update(cx, |app, cx| {
+            app.active_host_id = Some(active_id.clone());
+            app.known_hosts = bundles
+                .iter()
+                .map(|bundle| MobileHostEntry::from_bundle(bundle, RemoteServerKind::Desktop))
+                .collect();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let strip = cx.debug_bounds("pairing-runtimes").expect("the strip");
+
+        // A card's own menu opens the runtime sheet the rest of the app uses,
+        // and the strip behind it keeps its place.
+        cx.update(|window, cx| {
+            let inactive_id = inactive_id.clone();
+            app.update(cx, |app, cx| app.open_host_actions(inactive_id, window, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("mobile-runtime-actions-sheet").is_some(),
+            "the runtime actions should paint over the pairing page"
+        );
+        assert_eq!(
+            cx.debug_bounds("pairing-runtimes")
+                .expect("the strip stays"),
+            strip,
+            "a runtime's own sheet must not move the strip"
+        );
+
+        // Back closes that sheet first: it is the topmost surface on the page.
+        cx.simulate_keystrokes("back");
+        assert!(app.read_with(cx, |app, _| app.overlay.is_none()));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.known_hosts.len()),
+            2,
+            "back must not touch the runtimes"
+        );
+
+        // Removing a runtime the phone is not on leaves the page where it is,
+        // with the card gone and nothing left pointing at it.
+        cx.update(|window, cx| {
+            let inactive_id = inactive_id.clone();
+            app.update(cx, |app, cx| app.remove_host(inactive_id, window, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(app.read_with(cx, |app, _| app.known_hosts.len()), 1);
+        assert!(app.read_with(cx, |app, _| app.overlay.is_none()));
+        assert!(app.read_with(cx, |app, _| matches!(app.mode, RootMode::Pairing)));
+        assert!(
+            cx.debug_bounds("mobile-runtime-actions-sheet").is_none(),
+            "the removed runtime's sheet should be gone"
+        );
+
+        // Removing the last one, which is also the runtime the phone is on,
+        // hands the page back to the stacked entries.
+        cx.update(|window, cx| {
+            let active_id = active_id.clone();
+            app.update(cx, |app, cx| app.remove_host(active_id, window, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(app.read_with(cx, |app, _| app.known_hosts.is_empty()));
+        assert!(app.read_with(cx, |app, _| app.overlay.is_none()));
+        assert!(app.read_with(cx, |app, _| matches!(app.mode, RootMode::Pairing)));
+        assert!(
+            cx.debug_bounds("pairing-runtimes").is_none(),
+            "the strip goes with the last runtime"
+        );
+        assert!(
+            cx.debug_bounds("pairing-actions-stack").is_some(),
+            "the entries take the page again"
+        );
+    }
+
     /// One renderer out of `app.rs`, from its signature to the item after it,
     /// so a test can assert on the page a helper builds.
     fn renderer_source<'a>(source: &'a str, name: &str) -> &'a str {
@@ -19486,6 +19656,9 @@ mod tests {
             "self.render_pairing_actions(scan_busy, scan_enabled, cx)",
             "self.render_pairing_stack(",
             "self.render_pairing_sheet(sheet_max_height, cx)",
+            // The cards here are a runtime list, so a runtime's own surfaces
+            // belong to this page too.
+            "self.render_mobile_overlay(overlay, cx)",
         ] {
             assert!(page.contains(call), "the page should still render {call}");
         }
@@ -19508,6 +19681,20 @@ mod tests {
         let strip = renderer_source(source, "render_pairing_runtimes");
         assert!(strip.contains("self.known_hosts"));
         assert!(strip.contains(".overflow_x_scroll()"));
+
+        // A card is a runtime's whole surface on this page: its live state, what
+        // it is, and the way into its own actions — removing it included.
+        let card = renderer_source(source, "render_pairing_runtime_card");
+        assert!(card.contains("self.host_status(&host.id)"));
+        assert!(card.contains("sidebar_running_indicator("));
+        assert!(card.contains("sidebar_status_dot("));
+        for marker in [
+            "icons/ellipsis-vertical.svg",
+            "open_host_actions(",
+            ".stop_propagation()",
+        ] {
+            assert!(card.contains(marker), "the card should keep {marker}");
+        }
 
         // Both layouts offer the same three entries, and the stack keeps them
         // at their touch-target height instead of flexing them tall.
