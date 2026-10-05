@@ -183,6 +183,18 @@ pub fn state_marker(state: &str, tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The rule a section heading trails to the edge of its list. One column.
+///
+/// It is a box-drawing character, so a legacy console gets the hyphen rather
+/// than a blank: the rule is what turns a stack of rows into sections, and a
+/// heading with no rule is one more line of text.
+pub fn heading_rule(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "─",
+        GlyphTier::Legacy => "-",
+    }
+}
+
 /// A chevron pointing at what is not shown yet. One column.
 ///
 /// It survives the turn rail it was written for, which no longer jumps a turn
@@ -313,6 +325,7 @@ mod tests {
                 chevron(false, tier),
                 timeline_tick(tier),
                 timeline_tick_active(tier),
+                heading_rule(tier),
             ] {
                 assert_eq!(
                     crate::text::display_width(glyph),
@@ -361,6 +374,7 @@ mod tests {
             chevron(false, tier),
             timeline_tick(tier),
             timeline_tick_active(tier),
+            heading_rule(tier),
         ];
         drawn.extend_from_slice(spinner_frames(tier));
         drawn.extend_from_slice(idle_pulse_frames(tier));

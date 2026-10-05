@@ -988,23 +988,23 @@ fn render_session_view(
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    let inner = page_frame(frame, area, theme, strings.sessions_title(), true);
+    let page = session_page(area);
     let list = app.sidebar_view();
     // A terminal too short for chrome and a row keeps the rows instead: two
     // rows of chrome over two rows of list can only show a heading, and a
     // heading the reader cannot open is worth less than the session under it.
-    if inner.height < 5 {
-        render_session_rows(frame, inner, &list, app, theme, strings);
+    if page.height < 5 {
+        render_session_rows(frame, page, &list, app, theme, strings);
         return;
     }
     let list_area = Rect {
-        y: inner.y + 2,
-        height: inner.height - 2,
-        ..inner
+        y: page.y + 2,
+        height: page.height - 2,
+        ..page
     };
     render_session_header(
         frame,
-        Rect { height: 1, ..inner },
+        Rect { height: 1, ..page },
         &list.states,
         app,
         theme,
@@ -1013,9 +1013,9 @@ fn render_session_view(
     render_session_actions(
         frame,
         Rect {
-            y: inner.y + 1,
+            y: page.y + 1,
             height: 1,
-            ..inner
+            ..page
         },
         app,
         theme,
@@ -1024,12 +1024,28 @@ fn render_session_view(
     render_session_rows(frame, list_area, &list, app, theme, strings);
 }
 
-/// The list's first line: where the reader is, and how much work there is.
+/// The rect the session list draws in.
 ///
-/// The filter takes the line over while it is being typed. It is what the list
-/// is answering, and the workspace behind it has not moved — so the two share
-/// one row rather than pushing the list down a line the moment a reader
-/// searches.
+/// The list is the page, not a panel on it: there is no frame, so the rows and
+/// their headings own the two columns and the two rows a border would have
+/// taken. The margin is what keeps a title off the terminal's edge and lines
+/// the page up with the status band above it.
+fn session_page(area: Rect) -> Rect {
+    const MARGIN: u16 = 1;
+    let margin = MARGIN.min(area.width / 4);
+    Rect {
+        x: area.x + margin,
+        width: area.width.saturating_sub(margin * 2),
+        ..area
+    }
+}
+
+/// The list's first line: which page this is, and how much work there is.
+///
+/// The status band above already carries the location, so the line does not
+/// repeat it: it names the page, and the chips count what the list holds. The
+/// filter takes the name's place while it is being typed — it is what the list
+/// is answering, and the page has not stopped being the list.
 fn render_session_header(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1041,11 +1057,13 @@ fn render_session_header(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let chips = session_chip_spans(states, app, theme, strings);
+    let chips = trim_spans(
+        session_chip_spans(states, app, theme, strings),
+        usize::from(area.width),
+    );
     let chip_width = spans_width(&chips);
-    // The chips describe the list, so they keep their columns and the location
-    // gives way to them: a path the reader already knows is worth less than a
-    // count they do not.
+    // The chips describe the list, so they keep their columns and the name
+    // gives way to them.
     let left_budget = usize::from(area.width)
         .saturating_sub(chip_width)
         .saturating_sub(2);
@@ -1065,60 +1083,31 @@ fn render_session_header(
         }
         spans
     } else {
-        session_location_spans(app, theme, strings, left_budget)
+        vec![Span::styled(
+            strings.sessions_title().to_string(),
+            theme.strong(),
+        )]
     };
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(trim_spans(left, left_budget))),
+        area,
+    );
     if chips.is_empty() {
         return;
     }
     frame.render_widget(
-        Paragraph::new(Line::from(trim_spans(chips, usize::from(area.width))))
-            .alignment(Alignment::Right),
+        Paragraph::new(Line::from(chips)).alignment(Alignment::Right),
         area,
     );
 }
 
-/// The path the reader is working in, and the key that moves it.
-fn session_location_spans(
-    app: &App,
-    theme: &TuiTheme,
-    strings: Strings,
-    budget: usize,
-) -> Vec<Span<'static>> {
-    let Some(path) = app.workspace_path.as_deref() else {
-        return Vec::new();
-    };
-    // A location folded down to one character is not a location: the chips
-    // take the line rather than leaving a stray slash in front of them.
-    if budget < 8 {
-        return Vec::new();
-    }
-    let mut spans = vec![Span::styled(
-        compact_path(path, budget),
-        Style::default().fg(theme.roles.path),
-    )];
-    // The hint is drawn only when it fits whole: half a key is worse than no
-    // key, because the reader cannot tell which half is missing. The key is a
-    // global binding, so the chord is looked up by intent rather than by the
-    // scope this page owns.
-    if let Some(chord) = app.keymap.chord_for(Intent::SwitchWorkspace) {
-        let hint = format!(
-            "[{} {}]",
-            strings.session_workspace_label(),
-            chord.display()
-        );
-        if spans_width(&spans) + 1 + display_width(&hint) <= budget {
-            spans.push(Span::styled(
-                format!(" {hint}"),
-                theme.dimmed(theme.roles.gray_dim),
-            ));
-        }
-    }
-    spans
-}
-
-/// The list's second line: the one action a session list needs, and the mode
-/// the list is in with the key that changes it.
+/// The list's second line: the one action a session list needs, and the
+/// controls that answer the page — where the next session opens, and how the
+/// list is grouped — with their keys.
+///
+/// They are laid out from the right edge inwards and one that does not fit is
+/// dropped whole rather than truncated: half a key is a key the reader cannot
+/// use, and the action on the left is never the one that goes.
 fn render_session_actions(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1132,6 +1121,42 @@ fn render_session_actions(
     let new_session = format!("+ {}", strings.session_new());
     let new_session = truncate_to_width(&new_session, usize::from(area.width), "…");
     let label_width = display_width(&new_session);
+    let mut candidates: Vec<(String, Intent)> = Vec::new();
+    if let Some(chord) = app.keymap.chord_for(Intent::SwitchWorkspace) {
+        candidates.push((
+            format!(
+                "[{} {}]",
+                strings.session_workspace_label(),
+                chord.display()
+            ),
+            Intent::SwitchWorkspace,
+        ));
+    }
+    if let Some(chord) = app.keymap.chord_for(Intent::ToggleSidebarGrouping) {
+        let mode = if app.sidebar_grouped {
+            strings.sidebar_grouped()
+        } else {
+            strings.sidebar_flat()
+        };
+        candidates.push((
+            format!("{mode}  {}", chord.display()),
+            Intent::ToggleSidebarGrouping,
+        ));
+    }
+    // Right to left: the last candidate keeps the right edge, and the ones
+    // before it are placed to its left while they fit together.
+    let mut chosen: Vec<&(String, Intent)> = Vec::new();
+    let mut used = 0usize;
+    for candidate in candidates.iter().rev() {
+        let gap = if chosen.is_empty() { 0 } else { 2 };
+        let width = display_width(&candidate.0);
+        if label_width + 2 + used + gap + width > usize::from(area.width) {
+            break;
+        }
+        used += gap + width;
+        chosen.push(candidate);
+    }
+    chosen.reverse();
     // The button is a button: a click runs the same intent the key does.
     app.regions.hints.push((
         Rect {
@@ -1141,38 +1166,31 @@ fn render_session_actions(
         },
         Intent::NewSession,
     ));
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            new_session,
-            Style::default().fg(theme.roles.text_secondary),
-        ))),
-        area,
-    );
-    // The right-hand item names the mode the list is *in*: a reader looking at
-    // flat rows wants to know whether the list is grouped before pressing the
-    // key that changes it.
-    let Some(chord) = app.keymap.chord_for(Intent::ToggleSidebarGrouping) else {
-        return;
-    };
-    let mode = if app.sidebar_grouped {
-        strings.sidebar_grouped()
-    } else {
-        strings.sidebar_flat()
-    };
-    let hint = format!("{mode}  {}", chord.display());
-    // Strictly dropped rather than truncated, and only when the two sides
-    // cannot touch: half a hint is a key the reader cannot use.
-    if label_width + 2 + display_width(&hint) > usize::from(area.width) {
-        return;
+    let padding = usize::from(area.width).saturating_sub(label_width + used);
+    let mut spans = vec![
+        Span::styled(new_session, Style::default().fg(theme.roles.text_secondary)),
+        Span::raw(" ".repeat(padding)),
+    ];
+    let mut x = usize::from(area.x) + padding + label_width;
+    for (index, (text, intent)) in chosen.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+            x += 2;
+        }
+        let width = display_width(text);
+        app.regions.hints.push((
+            Rect {
+                x: x as u16,
+                y: area.y,
+                width: width as u16,
+                height: 1,
+            },
+            *intent,
+        ));
+        spans.push(Span::styled(text.clone(), theme.dimmed(theme.roles.gray)));
+        x += width;
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            theme.dimmed(theme.roles.gray),
-        )))
-        .alignment(Alignment::Right),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// What the header says about the list: how many sessions are waiting on the
@@ -1424,15 +1442,12 @@ fn session_heading_line(
     if rule_width > 0 {
         spans.push(Span::styled(" ", count_style));
         spans.push(Span::styled(
-            HORIZONTAL_RULE.to_string().repeat(rule_width),
+            crate::glyphs::heading_rule(tier).repeat(rule_width),
             Style::default().fg(theme.roles.border),
         ));
     }
     Line::from(spans)
 }
-
-/// The one glyph a heading's rule is drawn with.
-const HORIZONTAL_RULE: char = '─';
 
 /// A session's row: the title line and, under it, what the session last did.
 #[allow(clippy::too_many_arguments)]
@@ -1626,6 +1641,13 @@ fn session_state_mark(
         vibex_core::AgentSessionState::Error => crate::glyphs::state_marker("failed", tier),
         vibex_core::AgentSessionState::Archived => crate::glyphs::state_marker("archived", tier),
         vibex_core::AgentSessionState::Initializing => crate::glyphs::diamond_dotted(tier),
+        // A legacy console has one `o`, and the unread mark is already wearing
+        // it: an idle session keeps the dot its row used before rather than
+        // saying "something new" with the same shape.
+        vibex_core::AgentSessionState::Idle => match tier {
+            crate::glyphs::GlyphTier::Full => crate::glyphs::diamond_hollow(tier),
+            crate::glyphs::GlyphTier::Legacy => crate::glyphs::state_marker("idle", tier),
+        },
         _ => crate::glyphs::diamond_hollow(tier),
     }
 }

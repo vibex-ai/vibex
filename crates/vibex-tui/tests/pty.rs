@@ -478,37 +478,28 @@ fn shrinking_into_a_tiny_size_keeps_the_composer() {
 }
 
 #[test]
-fn a_non_utf8_locale_still_renders_the_frame() {
+fn the_session_list_paints_without_a_frame() {
     // The harness inherits the test process environment, so the assertion is
-    // that the ASCII border set is selected rather than assumed. The prompt is
-    // a bare writing surface, so the check steps to the list — with the chord
-    // the prompt's corner names — which is a framed page.
+    // that the glyph set is chosen for the terminal rather than assumed. The
+    // list is frameless — it is the page, not a panel on it — so what a
+    // complete paint looks like is the page's own name over its action, with
+    // no border drawn around either.
     let mut session = Session::start(100, 30);
     let screen = session.wait_for_first_frame();
     assert!(!screen.is_empty());
     session.send(b"\x0c"); // Ctrl+L: the session list, from the prompt.
-    // The frame has to be complete, not only started: the prompt's corner
-    // already says "Sessions", and a frame caught mid-paint has corners but no
-    // far edge yet. Whatever the glyph mode, the right border must reach the
-    // last column; the frame sits below the status band and its blank row.
-    let screen = session.wait_for(|screen| {
-        screen.lines().any(|line| {
-            let line = line.trim();
-            (line.starts_with('╭') && line.ends_with('╮'))
-                || (line.starts_with('+') && line.ends_with('+'))
-        })
-    });
-    let framed = screen
-        .lines()
-        .find(|line| {
-            let line = line.trim();
-            (line.starts_with('╭') && line.ends_with('╮'))
-                || (line.starts_with('+') && line.ends_with('+'))
-        })
-        .unwrap_or_default();
+    let screen =
+        session.wait_for(|screen| screen.contains("Sessions") && screen.contains("+ New session"));
     assert!(
-        !framed.is_empty(),
-        "the framed page never assembled:\n{screen}"
+        !screen.contains('╭') && !screen.contains('╰'),
+        "the session list is wearing a frame again:\n{screen}"
+    );
+    assert!(
+        !screen.lines().any(|line| {
+            let line = line.trim();
+            line.len() > 2 && line.starts_with('+') && line.ends_with('+')
+        }),
+        "the session list is wearing an ASCII frame:\n{screen}"
     );
 }
 

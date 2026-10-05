@@ -558,16 +558,23 @@ is never a column count.
   queue band subtracted past zero and killed the client. Containment checks wrap
   the arithmetic — `then(|| …)`, `if … && rect_contains(…)`, `saturating_sub` —
   and a test walks the corners of every band to keep it that way.
-* **The session list is a page of sections, and it says what it holds before
-  the reader reads a row.** The view gets the whole screen, and spends its first
-  two lines on the page: the location with the chord that moves it, one chip per
-  state family the list holds (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`) right
-  aligned, then `+ New session` as a click target with the grouping mode and its
-  key on the right. Chips are counted through the filter *and* through folded
+* **The session list is a page of sections, and it is the page.** Nothing draws
+  a frame around it: `session_page` insets the band by one column and the header,
+  the actions and the rows all paint straight onto it, so the two columns and two
+  rows a border would take belong to the list. The view spends its first two
+  lines on the page: the name with one chip per state family the list holds
+  (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`) right aligned, then `+ New session` as a
+  click target with the controls that answer the page on the right — the
+  workspace the next session opens in, and the grouping mode — each with its key
+  and each a click target too. The location is deliberately *not* repeated here:
+  the status band above owns it, and the same path in two adjacent rows reads as
+  a broken page. Chips are counted through the filter *and* through folded
   headings — a heading that hides its sessions still holds them — and a family
-  with nothing in it is not drawn as a zero. Neither hint row is truncated: the
-  location gives way to the chips, and a right-hand hint that does not fit whole
-  is dropped, because half a key is a key the reader cannot use.
+  with nothing in it is not drawn as a zero. The action on the left is never the
+  one that goes; a right-hand hint that does not fit whole is dropped rather than
+  truncated, because half a key is a key the reader cannot use. A heading's rule
+  comes from `glyphs::heading_rule`, so a legacy console gets a hyphen rather
+  than a box-drawing character it cannot draw.
 * **A list row carries the same facts as the desktop's.** The session list
   renders the shared projection's rows (order, pins, folders) under a heading
   per group — disclosure, name, the count of sessions in its subtree, and a rule

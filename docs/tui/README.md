@@ -356,14 +356,19 @@ current keymap, and clicking a hint runs the same action as its key.
 
 ### Sessions
 
-The list is a page of sections. Its first two lines are the page's own: where the
-reader is — the workspace path and the chord that moves it — with one chip per
-state the list holds on the right (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`), and,
-below it, the one action a session list needs: `+ New session` on the left, and
-the mode the list is in with the key that changes it (`Grouped by workspace  g`)
-on the right. The chips are counted through the filter and through folded
-headings, so a collapsed group still says how much work it holds; neither hint is
-truncated, because half a key is a key the reader cannot use.
+The list is a page of sections, and it is the page: nothing is drawn around it,
+so the rows and their headings own the columns and rows a border would have
+taken. Its first two lines are the page's own. The first names the page and
+counts what the list holds, one chip per state (`◆ 1 waiting  ▶ 1 running  ◇ 5
+idle`) on the right; the location stays in the status band above rather than
+being printed twice in two rows. The second is the one action a session list
+needs — `+ New session` on the left — with the controls that answer the page on
+the right: where the next session opens (`[Workspace Ctrl+W]`), and the mode the
+list is grouped by (`Grouped by workspace  g`). The chips are counted through the
+filter and through folded headings, so a collapsed group still says how much work
+it holds, and every control is a click target. The action is never the one that
+goes; a right-hand hint that does not fit whole is dropped rather than truncated,
+because half a key is a key the reader cannot use.
 
 Under them come the sections the reader arranged — the desktop's folders,
 projects and order — each with a heading: `▾ vibex 3 ────`. The heading carries

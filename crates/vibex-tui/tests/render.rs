@@ -5949,10 +5949,6 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
     failed.state = vibex_core::AgentSessionState::Error;
     let mut app = app(110, 24);
     app.navigate_to(Page::Sessions);
-    // The location is the client's starting directory, which differs from one
-    // checkout to the next: name one so the header is the same on every machine
-    // and the hint's room does not depend on how deep the repository sits.
-    app.workspace_path = Some("/tmp/vibex-workspace".to_string());
     app.agent
         .apply_sessions(Ok(vec![waiting, working, failed]))
         .expect("sessions apply");
@@ -5970,15 +5966,11 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
         !header.contains("idle"),
         "a state nothing is in was counted: {header:?}"
     );
-    // The workspace is where the reader is, and the key that moves it sits
-    // beside it.
+    // The line names the page. The location is the status band's, one row up:
+    // printing the same path twice in two rows is how a page looks broken.
     assert!(
-        header.contains("/tmp/vibex-workspace"),
-        "the header does not say where the reader is: {header:?}"
-    );
-    assert!(
-        header.contains("[Workspace"),
-        "the header does not name the key that moves the workspace: {header:?}"
+        header.contains("Sessions"),
+        "the header does not name the page: {header:?}"
     );
     let actions = screen
         .lines()
@@ -5987,6 +5979,10 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
     assert!(
         actions.contains("Grouped by workspace"),
         "the actions line does not say how the list is grouped: {actions:?}"
+    );
+    assert!(
+        actions.contains("[Workspace"),
+        "the actions line does not name the key that moves the workspace: {actions:?}"
     );
     // The button is a button: it publishes the rect a click would land on.
     let button = app
@@ -5997,6 +5993,39 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
         .map(|(rect, _)| *rect)
         .expect("the new-session button is not clickable");
     assert!(button.width > 0 && button.y == app.regions.list.unwrap().rect.y - 1);
+}
+
+/// The list is the page, not a panel on it: nothing draws a frame around it,
+/// and the rows own the columns and rows a border would have taken.
+#[test]
+fn the_session_list_is_not_drawn_inside_a_frame() {
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![seeded_session("session_frame0001", "no frame")]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    for corner in ['╭', '╮', '╰', '╯'] {
+        assert!(
+            !screen.contains(corner),
+            "the list is wearing a frame again ({corner}):\n{screen}"
+        );
+    }
+    // The page's own chrome is the first thing in the band: the name, then the
+    // action, then the list — with nothing between them.
+    let lines = screen.lines().collect::<Vec<_>>();
+    let named = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Sessions"))
+        .unwrap_or_else(|| panic!("the page does not name itself:\n{screen}"));
+    assert!(
+        lines[named + 1].contains("+ New session"),
+        "the action is not under the page's name:\n{screen}"
+    );
+    assert!(
+        lines[named + 2].trim_start().starts_with('▾'),
+        "the list does not start under the page's own chrome:\n{screen}"
+    );
 }
 
 /// A heading says what it holds and rules off the section, so a stack of rows
