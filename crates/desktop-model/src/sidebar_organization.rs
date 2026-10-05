@@ -1402,8 +1402,51 @@ impl SidebarOrganizationState {
         for placement in &mut moving_placements {
             placement.parent_folder_id = Some(target_folder_id.to_string());
         }
-        let insertion_index = self
+        let insertion_index = self.folder_child_insertion_index(target_folder_id);
+        self.placements
+            .splice(insertion_index..insertion_index, moving_placements);
+        self.placements != original
+    }
+
+    /// Files an item under `folder_id`, inserting the placement when the tree
+    /// has never seen the item before.
+    ///
+    /// [`Self::move_into`] only re-parents items that already carry a placement.
+    /// A Session created moments ago has none yet, so the new-session flow needs
+    /// an insert that honors the same scope rule: an item only lands in a folder
+    /// that shares its scope. The item becomes the folder's last child, exactly
+    /// where a drop into that folder would have put it.
+    pub fn place_into_folder(
+        &mut self,
+        item: &SidebarOrganizationItem,
+        target_folder_id: &str,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        if !self.can_move_into(item, target_folder_id, session_projects) {
+            return false;
+        }
+        if self
             .placements
+            .iter()
+            .any(|placement| &placement.item == item)
+        {
+            return self.move_into(item, target_folder_id, session_projects);
+        }
+        let insertion_index = self.folder_child_insertion_index(target_folder_id);
+        self.placements.insert(
+            insertion_index,
+            SidebarOrganizationPlacement {
+                item: item.clone(),
+                parent_folder_id: Some(target_folder_id.to_string()),
+            },
+        );
+        true
+    }
+
+    /// Where a new child of `target_folder_id` belongs: after the folder's last
+    /// existing child, or directly below the folder row when it has none.
+    fn folder_child_insertion_index(&self, target_folder_id: &str) -> usize {
+        self.placements
             .iter()
             .rposition(|placement| placement.parent_folder_id.as_deref() == Some(target_folder_id))
             .map_or_else(
@@ -1417,10 +1460,7 @@ impl SidebarOrganizationState {
                         .map_or(self.placements.len(), |index| index + 1)
                 },
                 |index| index + 1,
-            );
-        self.placements
-            .splice(insertion_index..insertion_index, moving_placements);
-        self.placements != original
+            )
     }
 
     pub fn move_to_scope_root_end(
@@ -2322,6 +2362,65 @@ mod tests {
                 SidebarOrganizationItem::Project("project-c".into()),
             ]
         );
+    }
+
+    #[test]
+    fn place_into_folder_files_a_session_the_tree_has_not_seen_yet() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("sessions", "Sessions", Some("project-a".into()), None,));
+        state.reconcile(
+            &["project-a".into()],
+            &[
+                ("session-a".into(), "project-a".into()),
+                ("session-b".into(), "project-a".into()),
+            ],
+        );
+        let sessions = BTreeMap::from([
+            ("session-a".to_string(), "project-a".to_string()),
+            ("session-b".to_string(), "project-a".to_string()),
+            ("session-fresh".to_string(), "project-a".to_string()),
+        ]);
+        let fresh = SidebarOrganizationItem::Session("session-fresh".into());
+
+        // A session created a moment ago has no placement yet, so `move_into`
+        // has nothing to re-parent and the new-session flow needs an insert.
+        assert!(state.can_move_into(&fresh, "sessions", &sessions));
+        assert!(!state.move_into(&fresh, "sessions", &sessions));
+        assert!(state.place_into_folder(&fresh, "sessions", &sessions));
+        assert_eq!(state.parent_of(&fresh).as_deref(), Some("sessions"));
+        assert_eq!(
+            state.ordered_children(Some("sessions"), std::slice::from_ref(&fresh)),
+            [SidebarOrganizationItem::Session("session-fresh".into())]
+        );
+
+        // Filing it again is a no-op, and re-aiming an item the tree already
+        // knows about still goes through the ordinary move rules.
+        assert!(!state.place_into_folder(&fresh, "sessions", &sessions));
+        assert!(state.place_into_folder(
+            &SidebarOrganizationItem::Session("session-a".into()),
+            "sessions",
+            &sessions,
+        ));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Session("session-a".into())),
+            Some("sessions".to_string())
+        );
+
+        // A root folder shares the scope of no session, so it can never own one.
+        assert!(state.create_folder("root", "Root", None, None));
+        assert!(!state.place_into_folder(&fresh, "root", &sessions));
+        assert_eq!(state.parent_of(&fresh).as_deref(), Some("sessions"));
+
+        // The placement survives the reconcile that follows session creation.
+        state.reconcile(
+            &["project-a".into()],
+            &[
+                ("session-a".into(), "project-a".into()),
+                ("session-b".into(), "project-a".into()),
+                ("session-fresh".into(), "project-a".into()),
+            ],
+        );
+        assert_eq!(state.parent_of(&fresh).as_deref(), Some("sessions"));
     }
 
     #[test]

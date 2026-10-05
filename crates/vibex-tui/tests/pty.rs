@@ -438,6 +438,35 @@ fn a_resize_storm_does_not_lose_the_frame() {
 }
 
 #[test]
+fn a_tiny_terminal_still_gets_the_interface() {
+    // There is no minimum terminal size: a split pane that reports 30×8 gets
+    // the interface rather than a notice saying the terminal is too small. The
+    // composer's prompt mark and its placeholder are what say the frame is the
+    // writing surface and not an error message.
+    let mut session = Session::start(30, 8);
+    let screen = session.wait_for(|screen| screen.contains('❯') && screen.contains("/ Commands"));
+    assert!(
+        !screen.contains("too small"),
+        "a 30x8 terminal was refused:\n{screen}"
+    );
+}
+
+#[test]
+fn shrinking_into_a_tiny_size_keeps_the_composer() {
+    // The other direction: a terminal that starts large and is dragged down to
+    // a few rows must keep the place the reader types, with the bands around it
+    // giving their rows back.
+    let mut session = Session::start(120, 40);
+    session.wait_for(|screen| screen.contains("Sessions"));
+    session.resize(24, 5);
+    let screen = session.wait_for(|screen| screen.contains('❯'));
+    assert!(
+        !screen.contains("too small"),
+        "a 24x5 terminal was refused:\n{screen}"
+    );
+}
+
+#[test]
 fn a_non_utf8_locale_still_renders_the_frame() {
     // The harness inherits the test process environment, so the assertion is
     // that the ASCII border set is selected rather than assumed. The prompt is

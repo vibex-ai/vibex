@@ -297,13 +297,25 @@ impl GlyphMode {
         Self::detect_from(|key| env::var(key).ok())
     }
 
+    /// The icon set the environment demands, when it names one this build
+    /// knows.
+    ///
+    /// Split out from [`GlyphMode::detect_from`] because an explicit choice has
+    /// to outrank what the interface remembered, while the locale fallback has
+    /// to lose to it: `VIBEX_TUI_ICONS` is this invocation's answer, and the
+    /// file is the reader's standing one.
+    pub fn explicit_from(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<Self> {
+        let explicit = lookup("VIBEX_TUI_ICONS")?;
+        match explicit.trim().to_ascii_lowercase().as_str() {
+            "ascii" | "text" => Some(Self::Ascii),
+            "emoji" | "unicode" | "auto" => Some(Self::Unicode),
+            _ => None,
+        }
+    }
+
     pub fn detect_from(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
-        if let Some(explicit) = lookup("VIBEX_TUI_ICONS") {
-            match explicit.trim().to_ascii_lowercase().as_str() {
-                "ascii" | "text" => return Self::Ascii,
-                "emoji" | "unicode" | "auto" => return Self::Unicode,
-                _ => {}
-            }
+        if let Some(explicit) = Self::explicit_from(&mut lookup) {
+            return explicit;
         }
         let locale = lookup("LC_ALL")
             .or_else(|| lookup("LC_CTYPE"))
@@ -1199,5 +1211,30 @@ mod tests {
         );
         // A missing locale must not flip the default.
         assert_eq!(GlyphMode::detect_from(env_map(&[])), GlyphMode::Unicode);
+    }
+
+    #[test]
+    fn only_a_named_icon_set_counts_as_explicit() {
+        // The explicit choice is the one the environment states, not the one
+        // detection inferred from the locale: a remembered choice has to lose
+        // to the first and win over the second.
+        assert_eq!(
+            GlyphMode::explicit_from(env_map(&[("VIBEX_TUI_ICONS", "ascii")])),
+            Some(GlyphMode::Ascii)
+        );
+        assert_eq!(
+            GlyphMode::explicit_from(env_map(&[("VIBEX_TUI_ICONS", "emoji")])),
+            Some(GlyphMode::Unicode)
+        );
+        assert_eq!(
+            GlyphMode::explicit_from(env_map(&[("LANG", "C")])),
+            None,
+            "a locale is not an explicit icon set"
+        );
+        assert_eq!(
+            GlyphMode::explicit_from(env_map(&[("VIBEX_TUI_ICONS", "fancy")])),
+            None,
+            "a value this build does not know is not a choice"
+        );
     }
 }

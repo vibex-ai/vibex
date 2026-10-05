@@ -857,9 +857,6 @@ strings! {
         "Vibex TUI 需要 stdin 和 stdout 都是交互式终端。",
         "Vibex TUI 需要 stdin 和 stdout 都是互動式終端機。"
     },
-    terminal_too_small => { "Terminal too small", "终端太小", "終端機太小" },
-    terminal_size_required => { "Minimum size", "最小尺寸", "最小尺寸" },
-    terminal_size_current => { "Current size", "当前尺寸", "目前尺寸" },
     cjk_font_hint => {
         "Chinese text needs a monospace CJK font in your terminal",
         "中文界面需要终端安装等宽 CJK 字体",

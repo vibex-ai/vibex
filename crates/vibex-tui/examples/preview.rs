@@ -90,6 +90,8 @@ fn main() {
             // A preview must not leave state behind.
             sidebar_path: None,
             runtime_path: None,
+            preferences_path: None,
+            ..Default::default()
         },
     );
     app.resize(width, height);

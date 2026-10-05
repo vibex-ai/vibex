@@ -88,6 +88,12 @@ before it touches the transcript or the composer. They belong to the session
 view, so the session list does not inherit the active session's plan or turn
 line: a global page keeps its own chrome.
 
+There is no minimum terminal size. Below the size that holds the whole stack,
+the outer padding, the status row and the blank rows between bands go too, then
+the running-turn and queue bands, and finally the transcript keeps one line
+while the composer shrinks to its own smallest form. Every size paints a whole
+frame of the interface; none of them paints a notice about being small.
+
 ## Visual language
 
 Your messages use a raised background and a prompt marker. Continuation lines
@@ -607,6 +613,20 @@ key-binding file. The page is one surface with four modes rather than four scree
 
 A reset asks first and then restores the shipped default.
 
+Every value the page changes is remembered for the next run: the appearance,
+the theme, the icon set, the language and the default workspace are written to
+`~/.vibex/tui-interface.json`, beside the arrangement and the key file. The
+theme is kept per appearance — a light palette and a dark one are two choices,
+so switching to light and back finds the dark one where it was. The command
+palette's **Recent** section is the same file: the commands the reader reached
+for last lead the list next time. A client with nowhere to write keeps the
+values for the run.
+
+Precedence is deliberate: a value named for this run — `--theme`, `VIBEX_THEME`
+or `VIBEX_TUI_ICONS` — wins over the remembered one and does not rewrite it,
+the reader's remembered choice wins over what the process locale or the
+terminal suggests, and the shipped default answers last.
+
 `Enter` on the Key bindings row opens the editor: every binding, grouped by
 scope, with the same `/` filter. `Enter` on a row captures the next chord,
 `d` puts that row back on its shipped chord and `s` writes
@@ -685,10 +705,11 @@ and `Esc` closes it.
 | --- | --- |
 | `VIBEX_HOME` | runtime home (default `~/.vibex/<channel>`) |
 | `VIBEX_CHANNEL` | `stable`, `rc`, or `preview` |
-| `VIBEX_THEME` | theme id |
+| `VIBEX_THEME` | theme id, for this run (outranks the remembered choice) |
 | `VIBEX_TUI_COLOR` | `truecolor`, `ansi256`, `16`, `none` |
 | `VIBEX_TUI_ICONS` | `auto`, `emoji`, `ascii` |
 | `VIBEX_TUI_KEYS` | key-remap file (default `<home>/tui-keys.toml`) |
+| `VIBEX_TUI_INTERFACE` | interface-settings file (default `<home>/tui-interface.json`) |
 | `VIBEX_TUI_LOG` | spill file for process diagnostics (default `$TMPDIR/vibex-tui-<pid>.log`) |
 | `NO_COLOR` | disable colour entirely |
 
@@ -714,7 +735,7 @@ Every one of these has a defined behaviour rather than a broken screen:
 | Condition | Behaviour |
 | --- | --- |
 | stdout is not a TTY | no raw mode; a clear message and a non-zero exit |
-| terminal below 60×16 | a size notice, not a half-rendered frame |
+| terminal below 60×16 | the bands around the conversation are given back; the transcript and the composer stay, and the frame is never refused |
 | in-process diagnostics | diverted to a spill file, named on exit; never drawn into a frame |
 | `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal |
 | non-UTF-8 locale | ASCII borders and markers |
@@ -749,12 +770,13 @@ cargo run -p vibex-tui --example preview -- 120 34 --welcome
 cargo test -p vibex-tui
 ```
 
-Four layers:
+Five layers:
 
 | Layer | Command | What it proves |
 | --- | --- | --- |
 | Reducer | `cargo test -p vibex-tui --lib` | the intent → effect mapping is a pure function |
 | Render | `cargo test -p vibex-tui --test render` | layout degrades at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
+| Tiny terminal | `cargo test -p vibex-tui --test tiny_terminal` | every page draws a whole frame down to 1×1, and a small terminal keeps a line of transcript and a composer that shows the draft |
 | Contract | `cargo test -p vibex-tui --test contracts` | dependency boundary, key tables, locale coverage, no secret-shaped copy |
 | PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, keeps in-process diagnostics out of the terminal, restores the terminal on exit, and survives a resize storm |
 

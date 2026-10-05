@@ -13,9 +13,35 @@
 //! commit, which is what makes "try it, `Esc` puts it back" true rather than
 //! approximately true.
 
+use vibex_desktop_model::ThemeSelection;
+
 use crate::app::App;
 use crate::locale::{Locale, Strings};
 use crate::theme::GlyphMode;
+
+/// The theme id held by the slot for one appearance.
+///
+/// A theme is authored for one appearance, so a choice is a pair of slots
+/// rather than one id: moving to light must not overwrite the dark palette the
+/// reader picked, and moving back must find it again.
+pub fn theme_slot(selection: &ThemeSelection, mode: vibex_ui::GpuiThemeMode) -> Option<&str> {
+    match mode {
+        vibex_ui::GpuiThemeMode::Dark => selection.dark(),
+        vibex_ui::GpuiThemeMode::Light => selection.light(),
+    }
+}
+
+/// Record a theme choice in the slot for one appearance.
+pub fn select_theme(
+    selection: &mut ThemeSelection,
+    mode: vibex_ui::GpuiThemeMode,
+    id: impl Into<String>,
+) {
+    match mode {
+        vibex_ui::GpuiThemeMode::Dark => selection.select_dark(id),
+        vibex_ui::GpuiThemeMode::Light => selection.select_light(id),
+    }
+}
 
 /// One adjustable setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -171,7 +197,9 @@ impl SettingsMode {
 /// Everything the settings page renders from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsState {
-    pub theme_id: String,
+    /// The reader's theme choice per appearance; an empty slot is the catalog's
+    /// default for that appearance.
+    pub themes: ThemeSelection,
     pub mode: vibex_ui::GpuiThemeMode,
     pub locale: Locale,
     pub glyphs: GlyphMode,
@@ -270,7 +298,7 @@ impl App {
                 vibex_ui::GpuiThemeMode::Dark => self.strings.settings_mode_dark().to_string(),
                 vibex_ui::GpuiThemeMode::Light => self.strings.settings_mode_light().to_string(),
             },
-            SettingRow::Theme => self.settings.theme_id.clone(),
+            SettingRow::Theme => self.theme.id.to_string(),
             SettingRow::Icons => match self.settings.glyphs {
                 GlyphMode::Unicode => self.strings.settings_icons_unicode().to_string(),
                 GlyphMode::Ascii => self.strings.settings_icons_ascii().to_string(),
@@ -316,7 +344,7 @@ impl App {
                 })
                 .collect(),
             SettingRow::Theme => {
-                let current = self.settings.theme_id.clone();
+                let current = self.theme.id;
                 vibex_ui::theme_catalog::themes_for(self.settings.mode)
                     .map(|theme| SettingChoice {
                         value: theme.id.to_string(),
@@ -357,7 +385,11 @@ impl App {
     pub fn default_setting_value(&self, row: SettingRow) -> String {
         match row {
             SettingRow::Mode => "dark".to_string(),
-            SettingRow::Theme => "vibex-dark".to_string(),
+            // The shipped default for the appearance on screen, not one fixed
+            // id: resetting the theme in light mode must not store a dark one.
+            SettingRow::Theme => {
+                vibex_ui::theme_catalog::default_theme_id(self.settings.mode).to_string()
+            }
             SettingRow::Icons => "unicode".to_string(),
             SettingRow::Language => Locale::En.tag().to_string(),
             SettingRow::Workspace => String::new(),
@@ -369,8 +401,17 @@ impl App {
     ///
     /// Returns whether anything changed. This is the only writer: the chooser's
     /// preview, its commit, the inline editor and the reset all come through
-    /// here, so they cannot disagree.
+    /// here, so they cannot disagree — and every change is written to the
+    /// interface's own file, so the next run starts where this one left off.
     pub fn apply_setting_value(&mut self, row: SettingRow, value: &str) -> bool {
+        let changed = self.apply_setting_value_inner(row, value);
+        if changed {
+            self.save_interface_preferences();
+        }
+        changed
+    }
+
+    fn apply_setting_value_inner(&mut self, row: SettingRow, value: &str) -> bool {
         match row {
             SettingRow::Mode => {
                 let mode = match value {
@@ -386,10 +427,13 @@ impl App {
                 true
             }
             SettingRow::Theme => {
-                if value.is_empty() || value == self.settings.theme_id {
+                if value.is_empty()
+                    || value == self.theme.id
+                    || vibex_ui::theme_catalog::theme_for(value, self.settings.mode).is_none()
+                {
                     return false;
                 }
-                self.settings.theme_id = value.to_string();
+                select_theme(&mut self.settings.themes, self.settings.mode, value);
                 self.rebuild_appearance();
                 true
             }
@@ -422,10 +466,15 @@ impl App {
             }
             SettingRow::Workspace => {
                 let path = (!value.trim().is_empty()).then(|| value.trim().to_string());
-                if path == self.workspace_path {
+                if path == self.workspace_path && path == self.preferred_workspace {
                     return false;
                 }
-                self.workspace_path = path;
+                self.workspace_path = path.clone();
+                // The row is the *default* for new sessions, not this run's
+                // choice of workspace: a path picked in the browser for one
+                // session leaves the file alone, and only this row writes the
+                // standing answer down.
+                self.preferred_workspace = path;
                 true
             }
             SettingRow::Keys | SettingRow::Backend | SettingRow::Seat | SettingRow::Version => {
@@ -438,7 +487,7 @@ impl App {
     pub fn rebuild_appearance(&mut self) {
         self.capability.glyphs = self.settings.glyphs;
         self.theme = crate::theme::TuiTheme::resolve(
-            Some(&self.settings.theme_id),
+            theme_slot(&self.settings.themes, self.settings.mode),
             self.settings.mode,
             self.capability,
         );

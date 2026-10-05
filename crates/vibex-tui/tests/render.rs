@@ -30,6 +30,8 @@ fn app(columns: u16, rows: u16) -> App {
             // home directory, and each test wants a clean list.
             sidebar_path: None,
             runtime_path: None,
+            preferences_path: None,
+            ..Default::default()
         },
     );
     // Rendering fixtures assert the built-in bindings, independent of a
@@ -1164,6 +1166,8 @@ fn color_less_mode_still_renders_every_label() {
             locale: Locale::En,
             sidebar_path: None,
             runtime_path: None,
+            preferences_path: None,
+            ..Default::default()
         },
     );
     app.resize(100, 30);
@@ -1187,25 +1191,6 @@ fn the_selection_marker_follows_the_scope() {
     // The third row is MCP servers; the list renders without panicking and the
     // row is present at the new index.
     assert!(screen.contains("MCP servers"), "{screen}");
-}
-
-#[test]
-fn a_tiny_terminal_shows_the_degradation_notice() {
-    let app = app(40, 10);
-    let message = vibex_tui::view::degradation_message(&app);
-    assert!(
-        message.is_some(),
-        "a 40x10 terminal must produce a degradation message"
-    );
-    let message = message.unwrap();
-    assert!(message.contains("60x16"), "{message}");
-    assert!(message.contains("40x10"), "{message}");
-}
-
-#[test]
-fn a_large_terminal_does_not_trigger_the_degradation_notice() {
-    let app = app(120, 40);
-    assert!(vibex_tui::view::degradation_message(&app).is_none());
 }
 
 #[test]
@@ -2374,7 +2359,7 @@ fn the_settings_chooser_previews_and_escape_puts_the_value_back() {
     use vibex_tui::settings::SettingRow;
     let mut app = settings_app(120, 40);
     select_setting(&mut app, SettingRow::Theme);
-    let original = app.settings.theme_id.clone();
+    let original = app.theme.id.to_string();
     app.perform(vibex_tui::action::Intent::ActivateSetting);
     assert!(
         matches!(app.settings.view, SettingsMode::Picking { .. }),
@@ -2392,13 +2377,15 @@ fn the_settings_chooser_previews_and_escape_puts_the_value_back() {
 
     app.step_setting_pick(1);
     assert_ne!(
-        app.settings.theme_id, original,
+        app.theme.id,
+        original.as_str(),
         "moving in the chooser must preview the value"
     );
 
     app.perform(vibex_tui::action::Intent::Back);
     assert_eq!(
-        app.settings.theme_id, original,
+        app.theme.id,
+        original.as_str(),
         "Esc must put the previewed value back"
     );
     assert!(app.settings.view.is_browse());
@@ -2442,7 +2429,7 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
         .find(|theme| theme.id != "vibex-dark")
         .expect("more than one theme ships");
     app.apply_setting_value(SettingRow::Theme, other.id);
-    assert_eq!(app.settings.theme_id, other.id);
+    assert_eq!(app.theme.id, other.id);
 
     app.perform(vibex_tui::action::Intent::ResetSetting);
     assert!(
@@ -2450,7 +2437,10 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
         "a reset is destructive enough to ask first"
     );
     app.perform(vibex_tui::action::Intent::ConfirmOverlay);
-    assert_eq!(app.settings.theme_id, "vibex-dark");
+    assert_eq!(
+        app.theme.id,
+        vibex_ui::theme_catalog::default_theme_id(app.settings.mode)
+    );
     assert!(app.overlay.is_none());
 }
 
@@ -5621,6 +5611,8 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
             locale: Locale::En,
             sidebar_path: None,
             runtime_path: None,
+            preferences_path: None,
+            ..Default::default()
         },
     );
     app.resize(110, 24);

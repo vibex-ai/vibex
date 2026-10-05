@@ -13,6 +13,7 @@ fn app() -> App {
         AppOptions {
             sidebar_path: None,
             runtime_path: None,
+            preferences_path: None,
             ..Default::default()
         },
     );

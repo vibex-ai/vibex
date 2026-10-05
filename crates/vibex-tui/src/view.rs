@@ -990,10 +990,10 @@ fn render_session_view(
 ) {
     let inner = page_frame(frame, area, theme, strings.sessions_title(), true);
     let list = app.sidebar_view();
-    // A terminal too short for two rows of chrome keeps the rows instead: on
-    // four lines of screen, a heading the reader can act on is worth more than
-    // a summary of it.
-    if inner.height < 4 {
+    // A terminal too short for chrome and a row keeps the rows instead: two
+    // rows of chrome over two rows of list can only show a heading, and a
+    // heading the reader cannot open is worth less than the session under it.
+    if inner.height < 5 {
         render_session_rows(frame, inner, &list, app, theme, strings);
         return;
     }
@@ -6119,23 +6119,6 @@ fn modal_chrome<'a>(
     ModalChrome::new(title, sizing).hints(hints)
 }
 
-/// The message shown when the terminal cannot host the interface at all.
-pub fn degradation_message(app: &App) -> Option<String> {
-    let (columns, rows) = app.viewport;
-    if columns < 60 || rows < 16 {
-        Some(format!(
-            "{}\n{}: {}x{}\n{}: 60x16",
-            app.strings.terminal_too_small(),
-            app.strings.terminal_size_current(),
-            columns,
-            rows,
-            app.strings.terminal_size_required()
-        ))
-    } else {
-        None
-    }
-}
-
 /// Labels used by the status line when the seat failed to attach.
 pub fn locked_seat_help(strings: Strings) -> String {
     format!(
@@ -6234,22 +6217,6 @@ mod tests {
         let rect = modal::dimensions(area, ModalSizing::document());
         assert!(rect.right() <= area.right());
         assert!(rect.bottom() <= area.bottom());
-    }
-
-    #[test]
-    fn degradation_message_fires_only_for_tiny_terminals() {
-        // The message is a pure function of the recorded viewport, so it can be
-        // checked without a terminal.
-        let text = format!(
-            "{}\n{}: {}x{}\n{}: 60x16",
-            strings().terminal_too_small(),
-            strings().terminal_size_current(),
-            40,
-            10,
-            strings().terminal_size_required()
-        );
-        assert!(text.contains("60x16"));
-        assert!(text.contains("40x10"));
     }
 
     #[test]
