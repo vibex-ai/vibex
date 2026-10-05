@@ -12,7 +12,7 @@ use gpui::{
     ListAlignment, ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
     Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase,
     Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
-    img, list, percentage, prelude::*, px, rgb, svg, uniform_list,
+    img, list, percentage, point, prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
@@ -951,6 +951,9 @@ pub struct MobileApp {
     pairing_code_input: Entity<InputState>,
     pairing_panel: PairingPanel,
     pairing_scroll: ScrollHandle,
+    /// The saved-runtime strip on the pairing page. It scrolls horizontally
+    /// once the phone knows about more runtimes than fit on one screen.
+    pairing_runtimes_scroll: ScrollHandle,
     nearby_pairing_state: NearbyPairingState,
     nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
     nearby_discovery_generation: u64,
@@ -1248,6 +1251,7 @@ impl MobileApp {
             }),
             pairing_panel: PairingPanel::None,
             pairing_scroll: ScrollHandle::new(),
+            pairing_runtimes_scroll: ScrollHandle::new(),
             nearby_pairing_state: NearbyPairingState::Idle,
             nearby_candidates: BTreeMap::new(),
             nearby_discovery_generation: 0,
@@ -2100,6 +2104,7 @@ impl MobileApp {
             self.stop_nearby_pairing();
         } else {
             self.pairing_panel = PairingPanel::Nearby;
+            self.reset_pairing_panel_scroll();
             self.begin_nearby_discovery(cx);
         }
         cx.notify();
@@ -2114,10 +2119,18 @@ impl MobileApp {
             PairingPanel::None
         } else {
             self.stop_nearby_pairing();
+            self.reset_pairing_panel_scroll();
             PairingPanel::Manual
         };
         self.error = None;
         cx.notify();
+    }
+
+    /// Returns the panel region to the top. A panel opened while the previous
+    /// one was scrolled down has to start at its own first line, not halfway
+    /// through it.
+    fn reset_pairing_panel_scroll(&self) {
+        self.pairing_scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     /// Sends the user to the OS page where a denied local-network permission
@@ -6317,13 +6330,16 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// The pairing page: one primary action and two fallbacks.
+    /// The pairing page: the runtimes this phone already knows, then the three
+    /// ways to reach one.
     ///
-    /// The three entries are not peers. Scanning is the only one that reaches
-    /// both a desktop and a headless cloud runtime, because both publish a
-    /// `vibex://` link; the other two cover the cases where scanning is not
-    /// possible. Leading with one action and hiding the fallbacks behind a
-    /// single question is what keeps the page to three decisions.
+    /// The saved runtimes lead because most visits are a return to a runtime
+    /// rather than a new pairing, and a tap on one of those cards is the whole
+    /// way back. The three entries at the bottom are not peers: scanning is the
+    /// only one that reaches both a desktop and a headless cloud runtime,
+    /// because both publish a `vibex://` link; the other two cover the cases
+    /// where scanning is not possible, and each opens the panel that explains
+    /// it above the row, so the buttons never move under the user's finger.
     fn render_pairing(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let scan_busy = self.pairing_action == Some(PairingAction::Scan);
         let scan_enabled = !self.pairing_busy;
@@ -6336,91 +6352,307 @@ impl MobileApp {
             .flex_col()
             .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
+            .px(px(theme::SPACING_XL))
             .child(
                 div()
-                    .id("pairing-scroll")
                     .w_full()
                     .flex_1()
                     .min_h_0()
-                    .track_scroll(&self.pairing_scroll)
-                    .overflow_y_scroll()
-                    .restrict_scroll_to_axis()
-                    .px(px(theme::SPACING_XL))
+                    .flex()
+                    .flex_col()
+                    .items_center()
                     .child(
-                        div().w_full().flex().flex_col().items_center().child(
-                            div()
-                                .w_full()
-                                .max_w(px(theme::CARD_WIDTH))
-                                .flex()
-                                .flex_col()
-                                .pt(px(PAIRING_PAGE_TOP_PAD))
-                                .pb(px(theme::SPACING_XL))
-                                .child(self.render_pairing_brand())
-                                .child(self.render_pairing_scan_action(scan_busy, scan_enabled, cx))
-                                .when_some(error_here, |page, line| {
-                                    page.child(div().mt(px(theme::SPACING_MD)).child(line))
-                                })
-                                .child(
-                                    div()
-                                        .mt(px(theme::SPACING_XL))
-                                        .mb(px(theme::SPACING_SM))
-                                        .text_size(px(theme::FONT_DETAIL))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "Can't scan?",
-                                            "扫码不方便？",
-                                            "不方便掃描？",
-                                        )),
-                                )
-                                .child(self.render_pairing_fallbacks(cx))
-                                .when(self.pairing_from_hosts, |page| {
-                                    page.child(
-                                        div()
-                                            .id("back-to-mobile-hosts")
-                                            .mt(px(theme::SPACING_LG))
-                                            .h(px(theme::TOUCH_TARGET))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(theme::FONT_CAPTION))
-                                            .text_color(theme::text_muted())
-                                            .cursor_pointer()
-                                            .active(|style| style.opacity(0.7))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::cancel_pairing_host),
-                                            )
-                                            .child(locale::common("Back to hosts")),
-                                    )
-                                }),
-                        ),
+                        div()
+                            .w_full()
+                            .max_w(px(theme::CARD_WIDTH))
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .pt(px(PAIRING_PAGE_TOP_PAD))
+                            .child(self.render_pairing_brand())
+                            .child(self.render_pairing_runtimes(cx))
+                            .child(
+                                div()
+                                    .id("pairing-panel-scroll")
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .track_scroll(&self.pairing_scroll)
+                                    .overflow_y_scroll()
+                                    .restrict_scroll_to_axis()
+                                    .when_some(error_here, |region, line| {
+                                        region.child(div().mb(px(theme::SPACING_MD)).child(line))
+                                    })
+                                    .child(self.render_pairing_panel(cx))
+                                    .when(self.pairing_from_hosts, |region| {
+                                        region.child(
+                                            div()
+                                                .id("back-to-mobile-hosts")
+                                                .mt(px(theme::SPACING_SM))
+                                                .h(px(theme::TOUCH_TARGET))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(theme::FONT_CAPTION))
+                                                .text_color(theme::text_muted())
+                                                .cursor_pointer()
+                                                .active(|style| style.opacity(0.7))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::cancel_pairing_host),
+                                                )
+                                                .child(locale::common("Back to hosts")),
+                                        )
+                                    }),
+                            ),
                     ),
             )
+            .child(self.render_pairing_actions(scan_busy, scan_enabled, cx))
     }
 
-    /// The logo and the page title. The page carries no subtitle: the sentence
-    /// that explains the primary action sits inside that action instead.
+    /// The product wordmark. The brand mark supplies the capital "V" and the
+    /// label completes it, so the page names the product instead of carrying a
+    /// title line that repeats what the buttons already say.
+    ///
+    /// The lockup is the desktop wordmark's geometry at this page's type size:
+    /// the mark stays a little wider than the label is tall and rides above the
+    /// baseline, which is what makes the two read as one word.
     fn render_pairing_brand(&self) -> impl IntoElement {
+        let scale = PAIRING_WORDMARK_FONT / 42.0;
         div()
             .flex()
-            .flex_col()
             .items_center()
+            .gap(px(1.0))
             .mb(px(theme::SPACING_XL))
+            .text_size(px(PAIRING_WORDMARK_FONT))
+            .font_weight(FontWeight::SEMIBOLD)
             .child(
                 svg()
-                    .path("brand/logo.svg")
-                    .size(px(34.0))
-                    .text_color(theme::text_primary())
-                    .mb(px(theme::SPACING_SM)),
+                    .path("icons/vibex-mark.svg")
+                    .w(px(46.0 * scale))
+                    .h(px(45.0 * scale))
+                    .mt(px(2.0 * scale))
+                    .relative()
+                    .top(px(-6.0 * scale))
+                    .flex_shrink_0()
+                    .text_color(theme::text_primary()),
             )
             .child(
                 div()
-                    .text_size(px(24.0))
-                    .font_weight(FontWeight::EXTRA_BOLD)
-                    .text_color(theme::text_primary())
-                    .child(locale::text("Add a device", "添加设备", "新增裝置")),
+                    .flex()
+                    .children(
+                        "ibex"
+                            .chars()
+                            .map(|character| div().flex_none().child(character.to_string())),
+                    )
+                    .text_color(theme::text_primary()),
             )
+    }
+
+    /// The runtimes this phone has saved, as one row of cards.
+    ///
+    /// A tap is the whole interaction: it installs that runtime's credential
+    /// and connects. The strip scrolls sideways rather than wrapping, so the
+    /// page keeps a single row of history however many runtimes are saved.
+    fn render_pairing_runtimes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.known_hosts.is_empty() {
+            return div()
+                .w_full()
+                .mb(px(theme::SPACING_MD))
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(theme::text_muted())
+                .child(locale::common("No runtimes yet"))
+                .into_any_element();
+        }
+        div()
+            .id("pairing-runtimes")
+            .debug_selector(|| "pairing-runtimes".to_string())
+            .w_full()
+            .flex_shrink_0()
+            .mb(px(theme::SPACING_MD))
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.pairing_runtimes_scroll)
+            .flex()
+            .gap(px(theme::SPACING_SM))
+            .children(
+                self.known_hosts
+                    .iter()
+                    .map(|host| self.render_pairing_runtime_card(host, cx))
+                    .collect::<Vec<_>>(),
+            )
+            .into_any_element()
+    }
+
+    /// One saved runtime: what it is called, what it is, and how it last
+    /// answered. Only the runtime the phone is bound to has a live status; the
+    /// others show what is actually known, which is when they were last
+    /// reached.
+    fn render_pairing_runtime_card(
+        &self,
+        host: &MobileHostEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let selected = self.active_host_id.as_deref() == Some(host.id.as_str());
+        let status = self.host_status(&host.id);
+        let last_connected = if selected {
+            None
+        } else {
+            host.last_connected_at_ms.map(host_last_connected_label)
+        };
+        let switch_id = host.id.clone();
+        div()
+            .id(format!("pairing-runtime-{}", host.id))
+            .aria_label(locale::common("Connect"))
+            .w(px(PAIRING_RUNTIME_CARD_WIDTH))
+            .h(px(PAIRING_RUNTIME_CARD_HEIGHT))
+            .flex_shrink_0()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            // The runtime the phone is on keeps a persistent selected treatment
+            // instead of relying on hover, which a phone does not have.
+            .border_color(if selected {
+                theme::border_default()
+            } else {
+                theme::border_subtle()
+            })
+            .when(selected, |card| card.bg(theme::bg_card()))
+            .p(px(theme::SPACING_MD))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .gap(px(theme::SPACING_XS))
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event, window, cx| {
+                    this.switch_host(switch_id.clone(), event, window, cx)
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .size(px(theme::ICON_STATUS))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(status.status.dot_color()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_SIDEBAR_ROW))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if selected {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(host.display_label()),
+                    ),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(theme::text_muted())
+                    .child(host_kind_label(host.server_kind)),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(theme::text_muted())
+                    .child(match last_connected {
+                        Some(last_connected) => format!("{} · {}", status.label(), last_connected),
+                        None => status.label(),
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The open fallback, framed so it reads as a panel the row below opened
+    /// rather than as another card in the runtime strip.
+    fn render_pairing_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let content = match self.pairing_panel {
+            PairingPanel::Nearby => self.render_nearby_pairing_section(cx),
+            PairingPanel::Manual => self.render_manual_pairing_section(cx),
+            PairingPanel::None => return div().into_any_element(),
+        };
+        div()
+            .w_full()
+            .flex_shrink_0()
+            .mb(px(theme::SPACING_MD))
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card())
+            .overflow_hidden()
+            .child(content)
+            .into_any_element()
+    }
+
+    /// The three ways to reach a runtime, in one row at the foot of the page.
+    fn render_pairing_actions(
+        &self,
+        scan_busy: bool,
+        scan_enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let panel_open = |panel: PairingPanel| self.pairing_panel == panel;
+        div()
+            .w_full()
+            .debug_selector(|| "pairing-actions".to_string())
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .py(px(theme::SPACING_MD))
+            .child(self.render_pairing_scan_action(scan_busy, scan_enabled, cx))
+            .child(
+                pairing_action_button(
+                    "pairing-nearby-toggle",
+                    Some("icons/wifi-outlined.svg"),
+                    locale::text("Find", "查找", "尋找"),
+                    false,
+                    panel_open(PairingPanel::Nearby),
+                )
+                .when(self.pairing_busy, |button| button.opacity(0.4))
+                .when(!self.pairing_busy, |button| {
+                    button
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_nearby_pairing))
+                }),
+            )
+            .child(
+                pairing_action_button(
+                    "pairing-manual-toggle",
+                    Some("icons/clipboard-paste.svg"),
+                    locale::text("Link", "链接", "連結"),
+                    false,
+                    panel_open(PairingPanel::Manual),
+                )
+                .when(self.pairing_busy, |button| button.opacity(0.4))
+                .when(!self.pairing_busy, |button| {
+                    button
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_manual_pairing))
+                }),
+            )
+            .into_any_element()
     }
 
     /// The one action that covers both kinds of runtime.
@@ -6434,115 +6666,34 @@ impl MobileApp {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id("scan-pairing-qr")
-            .w_full()
-            .py(px(theme::SPACING_MD))
-            .rounded(px(theme::RADIUS_CARD))
-            .bg(theme::text_primary())
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(theme::SPACING_XS))
-            .when(busy, |button| button.opacity(0.6))
-            .when(!busy && !enabled, |button| button.opacity(0.4))
-            .when(enabled, |button| {
-                button
-                    .cursor_pointer()
-                    .active(|style| style.opacity(0.85))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::scan_pairing_code))
-            })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .when(busy, |row| row.child(pairing_spinner(theme::bg_primary())))
-                    .when(!busy, |row| {
-                        row.child(
-                            svg()
-                                .path("icons/scan-line.svg")
-                                .size(px(20.0))
-                                .text_color(theme::bg_primary()),
-                        )
-                    })
-                    .child(
-                        div()
-                            .text_size(px(15.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::bg_primary())
-                            .child(if busy {
-                                locale::common("Pairing...")
-                            } else {
-                                locale::text("Scan QR code", "扫描二维码", "掃描 QR Code")
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(theme::FONT_CAPTION))
-                    .text_color(theme::bg_primary())
-                    .opacity(0.75)
-                    .child(locale::text(
-                        "Works for a computer or a cloud runtime",
-                        "电脑和云端运行时都能扫",
-                        "電腦和雲端執行階段都能掃",
-                    )),
-            )
+        pairing_action_button(
+            "scan-pairing-qr",
+            (!busy).then_some("icons/scan-line.svg"),
+            if busy {
+                locale::common("Pairing...")
+            } else {
+                locale::text("Scan", "扫码", "掃碼")
+            },
+            true,
+            false,
+        )
+        .when(busy, |button| button.opacity(0.6))
+        .when(!busy && !enabled, |button| button.opacity(0.4))
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.opacity(0.85))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::scan_pairing_code))
+        })
     }
 
-    /// The two fallbacks, in one bordered group so they read as the answer to
-    /// the question above them rather than as two more primary actions.
+    /// The local-network fallback, as the panel the "find" entry opens.
     ///
-    /// The group is not dimmed as a whole while something is running: the panel
-    /// that owns the running action stays legible and dims only its sibling, so
-    /// a busy page never hides the code the user is waiting on.
-    fn render_pairing_fallbacks(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w_full()
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_default())
-            .flex()
-            .flex_col()
-            .child(self.render_nearby_pairing_section(cx))
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mx(px(theme::SPACING_MD))
-                    .bg(theme::border_subtle()),
-            )
-            .child(self.render_manual_pairing_section(cx))
-    }
-
+    /// The header carries the one action the state needs — stop a search that
+    /// is running, retry one that failed — and the body is whatever discovery
+    /// has to say right now.
     fn render_nearby_pairing_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let title = locale::text("Find on this network", "在同一网络查找", "在同一網路上尋找");
-        if self.pairing_panel != PairingPanel::Nearby {
-            return div()
-                .id("pairing-nearby-row")
-                .min_h(px(62.0))
-                .px(px(theme::SPACING_MD))
-                .py(px(theme::SPACING_SM))
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(theme::SPACING_SM))
-                .when(self.pairing_busy, |row| row.opacity(0.4))
-                .cursor_pointer()
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_nearby_pairing))
-                .child(pairing_fallback_labels(
-                    title,
-                    locale::text(
-                        "Only computers on this Wi-Fi",
-                        "仅限同一 Wi-Fi 下的电脑",
-                        "僅限同一個 Wi-Fi 的電腦",
-                    ),
-                ))
-                .child(pairing_chevron())
-                .into_any_element();
-        }
         let retry = matches!(
             self.nearby_pairing_state,
             NearbyPairingState::Empty
@@ -6602,37 +6753,13 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The manual-entry fallback, as the panel the "link" entry opens.
     fn render_manual_pairing_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let title = locale::text(
             "Paste a code or link",
             "粘贴配对码或链接",
             "貼上配對碼或連結",
         );
-        if self.pairing_panel != PairingPanel::Manual {
-            return div()
-                .id("pairing-manual-row")
-                .min_h(px(62.0))
-                .px(px(theme::SPACING_MD))
-                .py(px(theme::SPACING_SM))
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(theme::SPACING_SM))
-                .when(self.pairing_busy, |row| row.opacity(0.4))
-                .cursor_pointer()
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_manual_pairing))
-                .child(pairing_fallback_labels(
-                    title,
-                    locale::text(
-                        "Your cloud runtime prints it at startup",
-                        "云端运行时启动时会打印",
-                        "雲端執行階段啟動時會列印",
-                    ),
-                ))
-                .child(pairing_chevron())
-                .into_any_element();
-        }
         let entry = self.pairing_code_input.read(cx).value().trim().to_string();
         // A link already carries its address and certificate, so the address
         // field only earns its place once the text is a bare code.
@@ -17095,6 +17222,18 @@ fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
 /// each time one opened.
 const PAIRING_PAGE_TOP_PAD: f32 = 88.0;
 
+/// The pairing page's product wordmark, at the size the first screen wants.
+///
+/// The lockup is drawn from the desktop wordmark's geometry scaled to this
+/// size, so the mark stays a little wider than the label is tall.
+const PAIRING_WORDMARK_FONT: f32 = 36.0;
+
+/// One saved runtime card in the pairing page's strip. Wide enough for a name
+/// and the two lines under it, narrow enough that the next card shows through
+/// and tells the user the strip scrolls.
+const PAIRING_RUNTIME_CARD_WIDTH: f32 = 164.0;
+const PAIRING_RUNTIME_CARD_HEIGHT: f32 = 84.0;
+
 /// The busy indicator the pairing actions share.
 fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
     svg()
@@ -17112,40 +17251,75 @@ fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// The two-line label every pairing fallback carries: what the user does, then
-/// where it applies. The second line is what lets the two rows sit as equals
-/// without the user having to guess which one is theirs.
-fn pairing_fallback_labels(title: &'static str, sub: &'static str) -> gpui::AnyElement {
+/// One entry of the pairing page's bottom row.
+///
+/// Every entry keeps the same metrics so the three read as one control group:
+/// `primary` marks the entry that reaches both kinds of runtime, `selected`
+/// marks the entry whose panel is open, and a missing `icon` is where the busy
+/// spinner goes.
+fn pairing_action_button(
+    id: impl Into<ElementId>,
+    icon: Option<&'static str>,
+    label: &'static str,
+    primary: bool,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let content_color = if primary {
+        theme::bg_primary()
+    } else if selected {
+        theme::text_primary()
+    } else {
+        theme::text_secondary()
+    };
     div()
+        .id(id)
+        .flex_1()
         .min_w_0()
+        .h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(if primary {
+            theme::text_primary()
+        } else if selected {
+            theme::border_default()
+        } else {
+            theme::border_subtle()
+        })
+        .bg(if primary {
+            theme::text_primary()
+        } else if selected {
+            theme::bg_card()
+        } else {
+            theme::bg_card_dim()
+        })
         .flex()
-        .flex_col()
-        .gap(px(2.0))
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM))
+        .child(match icon {
+            Some(path) => svg()
+                .path(path)
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(content_color)
+                .into_any_element(),
+            None => pairing_spinner(content_color),
+        })
         .child(
             div()
-                .truncate()
-                .text_size(px(15.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::text_primary())
-                .child(title),
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(theme::FONT_DETAIL))
+                .font_weight(if primary {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .text_color(content_color)
+                .child(label),
         )
-        .child(
-            div()
-                .truncate()
-                .text_size(px(theme::FONT_CAPTION))
-                .text_color(theme::text_muted())
-                .child(sub),
-        )
-        .into_any_element()
-}
-
-fn pairing_chevron() -> gpui::AnyElement {
-    svg()
-        .path("icons/chevron-right.svg")
-        .size(px(theme::ICON_SM))
-        .flex_shrink_0()
-        .text_color(theme::text_muted())
-        .into_any_element()
 }
 
 fn pairing_field_label(label: &'static str) -> gpui::AnyElement {
@@ -18918,6 +19092,140 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+    }
+
+    /// The first screen leads with the runtimes the phone already knows, in a
+    /// strip that scrolls once they stop fitting. A real paint is the only
+    /// thing between a layout mistake in that strip and a blank first screen.
+    #[gpui::test]
+    fn pairing_page_paints_the_saved_runtime_strip(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let bundles = (0..5)
+            .map(|index| host_bundle(&format!("runtime-{index}"), &format!("studio-{index}")))
+            .collect::<Vec<_>>();
+        app.update(cx, |app, cx| {
+            app.active_host_id = Some(bundles[0].host_id().to_string());
+            app.known_hosts = bundles
+                .iter()
+                .map(|bundle| MobileHostEntry::from_bundle(bundle, RemoteServerKind::Desktop))
+                .collect();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Five runtimes do not fit, and the strip is what gives: a sideways
+        // pan moves it, and the page never grows a second row of cards.
+        let strip = cx
+            .debug_bounds("pairing-runtimes")
+            .expect("the runtime strip should be laid out");
+        let max_offset = app.read_with(cx, |app, _| app.pairing_runtimes_scroll.max_offset());
+        assert!(
+            max_offset.x > px(0.0),
+            "the strip should overflow sideways: {max_offset:?}"
+        );
+        assert!(
+            strip.size.height < px(2.0 * PAIRING_RUNTIME_CARD_HEIGHT),
+            "the runtimes should share one row: {:?}",
+            strip.size
+        );
+
+        // The three ways to add a runtime sit on one row at the foot of the
+        // page, so the row is a single touch target tall.
+        let actions = cx
+            .debug_bounds("pairing-actions")
+            .expect("the action row should be laid out");
+        assert!(
+            actions.size.height < px(2.0 * theme::TOUCH_TARGET),
+            "the three entries should share one row: {:?}",
+            actions.size
+        );
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(
+                strip.origin.x + strip.size.width / 2.0,
+                strip.origin.y + strip.size.height / 2.0,
+            ),
+            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.pairing_runtimes_scroll.offset().x) < px(0.0),
+            "a sideways pan should scroll the runtime strip"
+        );
+
+        // The same page with the runtime list empty is what a fresh install
+        // paints, and it has to keep the same three ways to add one.
+        app.update(cx, |app, cx| {
+            app.known_hosts.clear();
+            app.active_host_id = None;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// One renderer out of `app.rs`, from its signature to the item after it,
+    /// so a test can assert on the page a helper builds.
+    fn renderer_source<'a>(source: &'a str, name: &str) -> &'a str {
+        let (_, tail) = source
+            .split_once(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("{name} should remain inspectable"));
+        let end = tail
+            .find("\n    /// ")
+            .or_else(|| tail.find("\n    fn "))
+            .unwrap_or(tail.len());
+        &tail[..end]
+    }
+
+    /// The pairing page is the product wordmark plus the runtimes this phone
+    /// already paired. A title above the wordmark, or a strip that wraps
+    /// instead of scrolling, would both undo what the page is for.
+    #[test]
+    fn the_pairing_page_keeps_the_wordmark_and_one_runtime_row() {
+        let source = include_str!("app.rs");
+        let page = renderer_source(source, "render_pairing");
+        for call in [
+            "self.render_pairing_brand()",
+            "self.render_pairing_runtimes(cx)",
+            "self.render_pairing_actions(scan_busy, scan_enabled, cx)",
+        ] {
+            assert!(page.contains(call), "the page should still render {call}");
+        }
+        assert!(!page.contains("Add a device"));
+
+        // The mark supplies the capital "V" and the label completes the name.
+        let brand = renderer_source(source, "render_pairing_brand");
+        assert!(brand.contains("icons/vibex-mark.svg"));
+        assert!(brand.contains("\"ibex\""));
+        assert!(!brand.contains("brand/logo.svg"));
+
+        // Every saved runtime is reachable, and the row scrolls sideways once
+        // they stop fitting.
+        let strip = renderer_source(source, "render_pairing_runtimes");
+        assert!(strip.contains("self.known_hosts"));
+        assert!(strip.contains(".overflow_x_scroll()"));
+
+        let actions = renderer_source(source, "render_pairing_actions");
+        assert!(actions.contains("self.render_pairing_scan_action("));
+        for entry in ["pairing-nearby-toggle", "pairing-manual-toggle"] {
+            assert!(
+                actions.contains(entry),
+                "the bottom row should keep {entry}"
+            );
+        }
+        assert!(renderer_source(source, "render_pairing_scan_action").contains("scan-pairing-qr"));
     }
 
     #[gpui::test]
