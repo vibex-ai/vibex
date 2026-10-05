@@ -488,8 +488,8 @@ fn the_session_list_paints_without_a_frame() {
     let screen = session.wait_for_first_frame();
     assert!(!screen.is_empty());
     session.send(b"\x0c"); // Ctrl+L: the session list, from the prompt.
-    let screen =
-        session.wait_for(|screen| screen.contains("Sessions") && screen.contains("+ New session"));
+    let screen = session
+        .wait_for(|screen| screen.contains("Session list") && screen.contains("+ New session"));
     assert!(
         !screen.contains('╭') && !screen.contains('╰'),
         "the session list is wearing a frame again:\n{screen}"

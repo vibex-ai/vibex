@@ -457,20 +457,10 @@ pub struct ManagementData {
 /// order; what it has never had is anything that writes those fields. They are
 /// the client's preference, so they live beside the key file rather than in the
 /// runtime's state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SidebarArrangement {
     pub sidebar: vibex_desktop_model::SidebarState,
-    pub grouped: bool,
-}
-
-impl Default for SidebarArrangement {
-    fn default() -> Self {
-        Self {
-            sidebar: vibex_desktop_model::SidebarState::default(),
-            grouped: true,
-        }
-    }
 }
 
 impl SidebarArrangement {
@@ -780,6 +770,9 @@ pub struct App {
     pub search: Option<crate::search::SearchState>,
     /// The list row the pointer is over, so a list can show it lit.
     pub hover: Option<(crate::keymap::Scope, usize)>,
+    /// The click target the pointer is over, so a control can show it can be
+    /// pressed before the reader presses it.
+    pub hovered_hint: Option<crate::action::Intent>,
     /// Which sent message the composer's history drawer points at.
     pub history_selection: usize,
     /// Commands run from the palette, most recent first.
@@ -790,9 +783,6 @@ pub struct App {
     /// Whether the button went down inside the composer, so a drag belongs to
     /// the draft instead of the transcript.
     pub draft_selecting: bool,
-    /// Whether the session list groups sessions under their workspace, or shows
-    /// them as one flat run. Persisted with the rest of the arrangement.
-    pub sidebar_grouped: bool,
     /// Whether the dock panel above the composer is open.
     pub dock_open: bool,
     /// Which dock row the cursor is on, while the dock owns the keys.
@@ -1220,7 +1210,6 @@ impl App {
                 rows: Vec::new(),
                 sidebar_collapsed: false,
             },
-            sidebar_grouped: arrangement.grouped,
             sidebar_path: options.sidebar_path,
             preferences_path: options.preferences_path,
             transcript: Transcript::new(),
@@ -1283,6 +1272,7 @@ impl App {
             session_cards: std::collections::BTreeSet::new(),
             search: None,
             hover: None,
+            hovered_hint: None,
             history_selection: 0,
             recent_commands: options.remembered.recent_commands.clone(),
             text_selection: None,
@@ -1882,7 +1872,7 @@ impl App {
     /// were built from is how a header ends up describing a list nobody is
     /// looking at.
     pub fn sidebar_view(&self) -> crate::sessions::SessionListRows {
-        let mut list = match self.projection.sidebar_organization.as_ref() {
+        match self.projection.sidebar_organization.as_ref() {
             Some(view) => {
                 let sessions = self
                     .agent
@@ -1923,19 +1913,18 @@ impl App {
                     states,
                 }
             }
-        };
-        if !self.sidebar_grouped {
-            // Flat mode keeps the order the tree computed -- pinned first, then
-            // the arrangement's positions -- and drops the headings: nothing
-            // nests, so nothing is indented under a row that is not there.
-            list.rows
-                .retain(|row| row.kind == vibex_desktop_model::AgentSidebarRowKind::Session);
-            list.counts = vec![0; list.rows.len()];
-            for row in &mut list.rows {
-                row.depth = 0;
-            }
         }
-        list
+    }
+
+    /// Whether the session list's row at `index` is a heading — a project, or a
+    /// folder the reader made — rather than a session.
+    ///
+    /// A heading is a control rather than a row to open, which is what lets a
+    /// single click fold it.
+    pub fn sidebar_row_is_heading(&self, index: usize) -> bool {
+        self.sidebar_rows()
+            .get(index)
+            .is_some_and(|row| row.session_id.is_none())
     }
 
     /// The row the session cursor is on.
@@ -2012,7 +2001,6 @@ impl App {
         }
         let arrangement = SidebarArrangement {
             sidebar: self.projection.sidebar.clone(),
-            grouped: self.sidebar_grouped,
         };
         if let Ok(body) = serde_json::to_string_pretty(&arrangement) {
             let _ = std::fs::write(path, body);
@@ -2322,13 +2310,6 @@ impl App {
         self.set_selection(Scope::Sessions, target_index);
         self.save_sidebar_arrangement();
         Some(true)
-    }
-
-    /// Show the list grouped by workspace, or as one flat run.
-    pub fn toggle_sidebar_grouping(&mut self) -> bool {
-        self.sidebar_grouped = !self.sidebar_grouped;
-        self.save_sidebar_arrangement();
-        self.sidebar_grouped
     }
 
     /// The approval cards currently waiting.
@@ -5399,7 +5380,6 @@ mod tests {
             .sidebar
             .collapsed_ids
             .insert("project_collapsed".to_string());
-        app.sidebar_grouped = false;
         app.save_sidebar_arrangement();
 
         let reloaded = arrangement_app(&path);
@@ -5423,10 +5403,6 @@ mod tests {
                 .sidebar
                 .collapsed_ids
                 .contains("project_collapsed")
-        );
-        assert!(
-            !reloaded.sidebar_grouped,
-            "grouping did not survive the save"
         );
     }
 

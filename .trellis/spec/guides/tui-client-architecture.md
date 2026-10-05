@@ -562,19 +562,31 @@ is never a column count.
   a frame around it: `session_page` insets the band by one column and the header,
   the actions and the rows all paint straight onto it, so the two columns and two
   rows a border would take belong to the list. The view spends its first two
-  lines on the page: the name with one chip per state family the list holds
+  lines on the page, each with a row of air around it: the name — `sessions_title`
+  reads "Session list" — with one chip per state family the list holds
   (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`) right aligned, then `+ New session` as a
-  click target with the controls that answer the page on the right — the
-  workspace the next session opens in, and the grouping mode — each with its key
-  and each a click target too. The location is deliberately *not* repeated here:
-  the status band above owns it, and the same path in two adjacent rows reads as
-  a broken page. Chips are counted through the filter *and* through folded
-  headings — a heading that hides its sessions still holds them — and a family
-  with nothing in it is not drawn as a zero. The action on the left is never the
-  one that goes; a right-hand hint that does not fit whole is dropped rather than
-  truncated, because half a key is a key the reader cannot use. A heading's rule
-  comes from `glyphs::heading_rule`, so a legacy console gets a hyphen rather
-  than a box-drawing character it cannot draw.
+  click target with the control that answers the page on the right: the workspace
+  the next session opens in, as a bracket hint with its key, also a click target.
+  A control answers the pointer before the click does — `App::hovered_hint` is
+  what the button reads to light its own surface. The location is deliberately
+  *not* repeated here: the status band above owns it, and the same path in two
+  adjacent rows reads as a broken page. Chips are counted through the filter
+  *and* through folded headings — a heading that hides its sessions still holds
+  them — and a family with nothing in it is not drawn as a zero. The action on
+  the left is never the one that goes; a right-hand hint that does not fit whole
+  is dropped rather than truncated, because half a key is a key the reader cannot
+  use. A heading's rule comes from `glyphs::heading_rule`, so a legacy console
+  gets a hyphen rather than a box-drawing character it cannot draw.
+* **The tree is the list: there is no flat run to switch to.** The grouping
+  toggle and the flat projection it chose between are gone, so `sidebar_view`
+  always renders the arrangement's headings and the persisted arrangement no
+  longer carries a `grouped` flag. A heading is a *control*: it closes with its
+  count past the rule (`▾ vibex ────────────────── 3`, the rule in `gray_dim` and
+  the count one step brighter) and keeps a row of air above and below it, so a
+  click on it folds it on the *first* press — a tree folds on one click, and
+  asking for two is how a reader concludes the list is inert. A session keeps the
+  two-step contract, because opening one leaves the page. `App::sidebar_row_is_heading`
+  is what the mouse layer asks before it decides which contract applies.
 * **A list row carries the same facts as the desktop's.** The session list
   renders the shared projection's rows (order, pins, folders) under a heading
   per group — disclosure, name, the count of sessions in its subtree, and a rule
@@ -586,8 +598,12 @@ is never a column count.
   echo is the client's own reading of events it already receives
   (`note_session_echo`: the Agent's messages, tool calls, commands, file
   operations and errors — never a delta, never the reader's own message),
-  pruned to the sessions the runtime still lists, falling back to the workspace
-  root. Unread is likewise the client's own notion — a final `AgentMessage` for
+  pruned to the sessions the runtime still lists. A row with nothing to report
+  is *one* line: the workspace is the heading it already sits under, so the row
+  never repeats its directory, and a session blocked on the reader says so even
+  with no echo to hang it on — that is the one thing on the row to act on. Every
+  item keeps a row of air under it, because rows that touch are read as one
+  block. Unread is likewise the client's own notion — a final `AgentMessage` for
   a session the reader was not looking at (`note_activity`), cleared by
   `open_session` — because the runtime does not track "read"; the authority's
   own unread set is folded in beside it. Marks are one column at every glyph

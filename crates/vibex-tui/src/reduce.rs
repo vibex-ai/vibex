@@ -455,16 +455,6 @@ impl App {
             // Up the screen is a smaller row index.
             Intent::MoveSessionUp => self.move_session(-1),
             Intent::MoveSessionDown => self.move_session(1),
-            Intent::ToggleSidebarGrouping => {
-                let grouped = self.toggle_sidebar_grouping();
-                let message = if grouped {
-                    self.strings.sidebar_grouped()
-                } else {
-                    self.strings.sidebar_flat()
-                };
-                self.toast(Toast::info(message));
-                Outcome::effects(vec![])
-            }
             Intent::SwitchWorkspace => {
                 // The key is on the composing page's own line, so it has to do
                 // what that line says: open the picker over the runtime's

@@ -358,28 +358,32 @@ current keymap, and clicking a hint runs the same action as its key.
 
 The list is a page of sections, and it is the page: nothing is drawn around it,
 so the rows and their headings own the columns and rows a border would have
-taken. Its first two lines are the page's own. The first names the page and
-counts what the list holds, one chip per state (`◆ 1 waiting  ▶ 1 running  ◇ 5
-idle`) on the right; the location stays in the status band above rather than
-being printed twice in two rows. The second is the one action a session list
-needs — `+ New session` on the left — with the controls that answer the page on
-the right: where the next session opens (`[Workspace Ctrl+W]`), and the mode the
-list is grouped by (`Grouped by workspace  g`). The chips are counted through the
-filter and through folded headings, so a collapsed group still says how much work
-it holds, and every control is a click target. The action is never the one that
-goes; a right-hand hint that does not fit whole is dropped rather than truncated,
-because half a key is a key the reader cannot use.
+taken. Its first two lines are the page's own, each with a row of air around it.
+The first names the page — `Session list` — and counts what it holds, one chip per
+state (`◆ 1 waiting  ▶ 1 running  ◇ 5 idle`) on the right; the location stays in
+the status band above rather than being printed twice in two rows. The second is
+the one action a session list needs — `+ New session` on the left, which carries
+its own surface while the pointer rests on it — with the control that answers the
+page on the right: where the next session opens, as a bracket hint with its key
+(`[Workspace Ctrl+W]`). The chips are counted through the filter and through
+folded headings, so a collapsed group still says how much work it holds, and
+every control is a click target. The action is never the one that goes; a
+right-hand hint that does not fit whole is dropped rather than truncated, because
+half a key is a key the reader cannot use.
 
 Under them come the sections the reader arranged — the desktop's folders,
-projects and order — each with a heading: `▾ vibex 3 ────`. The heading carries
-the disclosure, the name, the count of sessions beneath it and a rule to the edge
-of the list, so a stack of rows reads as groups rather than as one run. `g` folds
-the headings away for one flat run, `/` filters (a search opens closed folders
-rather than hiding what it matched), and `Enter` on a heading folds it.
+projects and order — each with a heading that closes with its count past the rule:
+`▾ vibex ──────────────────────────── 3`. The rule is in the dim step, the count
+one step brighter, and the heading keeps a row of air above and below it, so a
+stack of rows reads as groups rather than as one run. There is no flat list to
+switch to: the tree is the list. A single click on a heading folds it — it is a
+control, not a row to open — while a session keeps the two-step contract, because
+opening one leaves the page. `/` filters, and a search opens closed folders rather
+than hiding what it matched.
 
-Each session is two lines. The first carries the mark, the title, the Agent
-answering it after a middot, the marks it has earned and a coarse right-aligned
-age:
+A session with something to report is two lines, and keeps a row of air under it.
+The first carries the mark, the title, the Agent answering it after a middot, the
+marks it has earned and a coarse right-aligned age:
 
 ```
 ▶ fix the flaky test · Claude Code                                          3m
@@ -387,15 +391,16 @@ age:
 ```
 
 The second line says what the session last did, in the dim step; a session
-blocked on the reader puts `Pending:` in front of it in the attention colour,
+blocked on the reader says so instead — `Pending:` in front of what it said, or
+the blocked-until-you-answer line when this client has not seen it say anything —
 because that is the one thing on the row to act on. The line is the client's own
-reading of the events it already receives — the Agent's messages, tool calls,
-commands, file operations and errors, never a message still arriving and never
-the reader's own words, which are usually the title anyway — and it falls back to
-the session's workspace root when this client has not seen the session do
-anything. Rows are not all one line tall, so the frame publishes how many lines
-each drawn row takes and the mouse maps a click through that rather than through
-the line number.
+reading of the events it already receives: the Agent's messages, tool calls,
+commands, file operations and errors, never a message still arriving and never the
+reader's own words, which are usually the title anyway. A session with nothing to
+report is one line: the workspace is the heading it already sits under, so the row
+does not repeat its directory. Rows are not all the same height, so the frame
+publishes how many lines each drawn row takes and the mouse maps a click through
+that rather than through the line number.
 
 - **The Agent's name** follows the title: "who is answering" is the first thing a
   reader scanning several sessions wants, and a name is one word where a coloured

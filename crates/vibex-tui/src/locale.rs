@@ -131,7 +131,7 @@ strings! {
     nav_git => { "Git", "Git", "Git" },
 
     // ---- sessions -------------------------------------------------------
-    sessions_title => { "Sessions", "会话", "工作階段" },
+    sessions_title => { "Session list", "会话列表", "工作階段清單" },
     sessions_empty => {
         "No sessions yet — press n to start one",
         "还没有会话 — 按 n 新建",
@@ -217,8 +217,6 @@ strings! {
         "置顶会话始终在最前 — 先取消置顶才能越过",
         "置頂工作階段一律在最前 — 先取消置頂才能越過"
     },
-    sidebar_grouped => { "Grouped by workspace", "按工作区分组", "依工作區分組" },
-    sidebar_flat => { "One flat list", "平铺列表", "平鋪清單" },
     session_cards_none => {
         "No session detail cards are open",
         "没有打开会话详情卡片",

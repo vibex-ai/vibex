@@ -993,13 +993,14 @@ fn render_session_view(
     // A terminal too short for chrome and a row keeps the rows instead: two
     // rows of chrome over two rows of list can only show a heading, and a
     // heading the reader cannot open is worth less than the session under it.
-    if page.height < 5 {
+    // Each chrome line keeps a row of air around it, so the page needs four.
+    if page.height < 8 {
         render_session_rows(frame, page, &list, app, theme, strings);
         return;
     }
     let list_area = Rect {
-        y: page.y + 2,
-        height: page.height - 2,
+        y: page.y + 4,
+        height: page.height - 4,
         ..page
     };
     render_session_header(
@@ -1013,7 +1014,7 @@ fn render_session_view(
     render_session_actions(
         frame,
         Rect {
-            y: page.y + 1,
+            y: page.y + 2,
             height: 1,
             ..page
         },
@@ -1088,6 +1089,7 @@ fn render_session_header(
             theme.strong(),
         )]
     };
+
     frame.render_widget(
         Paragraph::new(Line::from(trim_spans(left, left_budget))),
         area,
@@ -1102,12 +1104,12 @@ fn render_session_header(
 }
 
 /// The list's second line: the one action a session list needs, and the
-/// controls that answer the page — where the next session opens, and how the
-/// list is grouped — with their keys.
+/// control that answers the page — where the next session opens — with its key.
 ///
-/// They are laid out from the right edge inwards and one that does not fit is
-/// dropped whole rather than truncated: half a key is a key the reader cannot
-/// use, and the action on the left is never the one that goes.
+/// The controls are laid out from the right edge inwards and one that does not
+/// fit is dropped whole rather than truncated: half a key is a key the reader
+/// cannot use, and the action on the left is never the one that goes. Each is
+/// published as a click target, and says so when the pointer is over it.
 fn render_session_actions(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1132,17 +1134,6 @@ fn render_session_actions(
             Intent::SwitchWorkspace,
         ));
     }
-    if let Some(chord) = app.keymap.chord_for(Intent::ToggleSidebarGrouping) {
-        let mode = if app.sidebar_grouped {
-            strings.sidebar_grouped()
-        } else {
-            strings.sidebar_flat()
-        };
-        candidates.push((
-            format!("{mode}  {}", chord.display()),
-            Intent::ToggleSidebarGrouping,
-        ));
-    }
     // Right to left: the last candidate keeps the right edge, and the ones
     // before it are placed to its left while they fit together.
     let mut chosen: Vec<&(String, Intent)> = Vec::new();
@@ -1157,7 +1148,8 @@ fn render_session_actions(
         chosen.push(candidate);
     }
     chosen.reverse();
-    // The button is a button: a click runs the same intent the key does.
+    // The button is a button: a click runs the same intent the key does, and
+    // the pointer resting on it says so before the click does.
     app.regions.hints.push((
         Rect {
             width: label_width as u16,
@@ -1166,9 +1158,18 @@ fn render_session_actions(
         },
         Intent::NewSession,
     ));
+    let hovered = app.hovered_hint == Some(Intent::NewSession);
+    let button_style = if hovered {
+        Style::default()
+            .fg(theme.roles.foreground)
+            .bg(theme.roles.surface_highlight)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.roles.text_secondary)
+    };
     let padding = usize::from(area.width).saturating_sub(label_width + used);
     let mut spans = vec![
-        Span::styled(new_session, Style::default().fg(theme.roles.text_secondary)),
+        Span::styled(new_session, button_style),
         Span::raw(" ".repeat(padding)),
     ];
     let mut x = usize::from(area.x) + padding + label_width;
@@ -1187,7 +1188,14 @@ fn render_session_actions(
             },
             *intent,
         ));
-        spans.push(Span::styled(text.clone(), theme.dimmed(theme.roles.gray)));
+        let style = if app.hovered_hint == Some(*intent) {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme.dimmed(theme.roles.gray)
+        };
+        spans.push(Span::styled(text.clone(), style));
         x += width;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1362,9 +1370,10 @@ fn session_list_item(
         .as_ref()
         .and_then(|session_id| sessions.iter().find(|session| &session.id == session_id));
     if row.kind != vibex_desktop_model::AgentSidebarRowKind::Session {
-        return vec![session_heading_line(
-            row, count, selected, hovered, width, app, theme,
-        )];
+        return vec![
+            session_heading_line(row, count, selected, hovered, width, app, theme),
+            Line::from(""),
+        ];
     }
     let mut lines = session_row_lines(
         row,
@@ -1383,6 +1392,9 @@ fn session_list_item(
     {
         lines.extend(session_card_lines(app, session, strings, theme, width));
     }
+    // The row keeps a blank line under it: rows that touch are read as one
+    // block, and a list of sessions is a list of separate pieces of work.
+    lines.push(Line::from(""));
     lines
 }
 
@@ -1411,40 +1423,48 @@ fn session_heading_line(
         Style::default().fg(theme.roles.gray_bright)
     }
     .add_modifier(Modifier::BOLD);
-    let count_style = Style::default().fg(theme.roles.gray_dim);
+    // The count is the line's last word, past the rule: it is what the heading
+    // is *for*, and the end of the row is where the eye lands after the rule
+    // has carried it there.
+    let count_style = Style::default().fg(theme.roles.gray);
     let indent = usize::from(row.depth) * 2;
     let count_label = if count > 0 {
-        format!(" {count}")
+        count.to_string()
     } else {
         String::new()
+    };
+    let tail = if count_label.is_empty() {
+        0
+    } else {
+        display_width(&count_label) + 1
     };
     // The name gives way before the shape of the heading does: a heading whose
     // rule ran out is still a heading, but a heading without its name is not.
     let label_width = width
         .saturating_sub(indent)
         .saturating_sub(2)
-        .saturating_sub(display_width(&count_label))
-        .saturating_sub(3)
+        .saturating_sub(tail)
+        .saturating_sub(2)
         .max(1);
     let label = truncate_to_width(&row.label, label_width, "…");
-    let used = indent + 2 + display_width(&label) + display_width(&count_label);
+    let used = indent + 2 + display_width(&label) + tail;
     let mut spans = vec![
         Span::raw(" ".repeat(indent)),
         Span::styled(format!("{disclosure} "), label_style),
         Span::styled(label, label_style),
     ];
-    if !count_label.is_empty() {
-        spans.push(Span::styled(count_label, count_style));
-    }
-    // One column of air between the count and the rule, then the rule to the
-    // edge of the list, so the eye follows it to the next heading.
+    // One column of air, then the rule to the far end of the list in the dim
+    // step: a rule is punctuation between sections, not a line of the page.
     let rule_width = width.saturating_sub(used + 1);
     if rule_width > 0 {
-        spans.push(Span::styled(" ", count_style));
+        spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
             crate::glyphs::heading_rule(tier).repeat(rule_width),
-            Style::default().fg(theme.roles.border),
+            Style::default().fg(theme.roles.gray_dim),
         ));
+    }
+    if !count_label.is_empty() {
+        spans.push(Span::styled(format!(" {count_label}"), count_style));
     }
     Line::from(spans)
 }
@@ -1553,32 +1573,32 @@ fn session_row_lines(
         ));
     }
     let mut lines = vec![Line::from(spans)];
-    // The second line: what the session last did, or where it works when this
-    // client has not seen it do anything yet. A session waiting on the reader
-    // says so first — it is the one thing on the row that has to be acted on.
+    // The second line is what the session last did, and nothing else: the
+    // workspace is the heading the row already sits under, so a row with
+    // nothing to report stays one line rather than repeating its directory.
     if let Some(session) = session {
         let pending = session.state == vibex_core::AgentSessionState::NeedsInput;
-        let prefix = if pending {
-            format!("{}: ", strings.pending())
-        } else {
-            String::new()
+        // What the line says, and whether it is news the reader has to act on:
+        // a session blocked on them says so even when this client has not seen
+        // it say anything yet.
+        let (text, actionable) = match app.session_echo(&session.id) {
+            Some(echo) if pending => (format!("{}: {echo}", strings.pending()), true),
+            Some(echo) => (echo.to_string(), false),
+            None if pending => (strings.approval_waiting().to_string(), true),
+            None => (String::new(), false),
         };
-        let budget = width
-            .saturating_sub(4)
-            .saturating_sub(display_width(&prefix));
-        let mut spans = vec![Span::styled(format!("{bar}   "), bar_style)];
-        if !prefix.is_empty() {
-            spans.push(Span::styled(prefix, paint(theme.roles.warning)));
+        if !text.is_empty() {
+            let budget = width.saturating_sub(4);
+            let style = if actionable {
+                paint(theme.roles.warning)
+            } else {
+                dim_style
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{bar}   "), bar_style),
+                Span::styled(truncate_to_width(&text, budget, "…"), style),
+            ]));
         }
-        let secondary = match app.session_echo(&session.id) {
-            Some(echo) => truncate_to_width(echo, budget, "…"),
-            None => {
-                let root = compact_path(&session.workspace_root, budget);
-                truncate_to_width(&root, budget, "…")
-            }
-        };
-        spans.push(Span::styled(secondary, dim_style));
-        lines.push(Line::from(spans));
     }
     lines
 }

@@ -1131,7 +1131,13 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             {
                 let repeat = app.double_click_at(mouse.column, mouse.row);
                 app.set_selection(region.scope, index);
-                if repeat {
+                // A heading is a control, not a row to open: it folds on the
+                // first click, the way a tree does everywhere else. A session
+                // keeps the two-step contract, because opening one leaves the
+                // page.
+                let heading = region.scope == crate::keymap::Scope::Sessions
+                    && app.sidebar_row_is_heading(index);
+                if repeat || heading {
                     let intent = match region.scope {
                         crate::keymap::Scope::Sessions => {
                             crate::action::Intent::OpenSelectedSession
@@ -1231,8 +1237,17 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
         }
         MouseEventKind::Moved => {
             let hover = hover_target(app, mouse.column, mouse.row);
-            if app.hover != hover {
+            // A hint is a control: the pointer resting on it is how the reader
+            // learns it can be pressed.
+            let hint = app
+                .regions
+                .hints
+                .iter()
+                .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
+                .map(|(_, intent)| *intent);
+            if app.hover != hover || app.hovered_hint != hint {
                 app.hover = hover;
+                app.hovered_hint = hint;
                 return true;
             }
             false
@@ -2427,6 +2442,77 @@ mod tests {
         );
         assert_eq!(app.page, Page::NewSession);
         assert_eq!(app.composer.text(), "keep this draft");
+    }
+
+    /// A click on a heading folds it, the way a tree folds everywhere else. A
+    /// session keeps the two-step contract, because opening one leaves the
+    /// page.
+    #[test]
+    fn a_single_click_folds_a_session_list_heading() {
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        let sessions = (1..=2)
+            .map(|index| vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse(format!("session_click{index:04}"))
+                    .expect("valid session id"),
+                title: format!("clickable {index}"),
+                project_id: vibex_core::ProjectId::parse("project_click0001")
+                    .expect("valid project id"),
+                workspace_id: vibex_core::WorkspaceId::new(),
+                workspace_root: "/tmp/vibex-click-workspace".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: index,
+                updated_at_ms: index,
+                last_message_at_ms: index,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+        app.agent.apply_sessions(Ok(sessions)).expect("apply");
+        app.navigate_to(crate::app::Page::Sessions);
+        let screen = conversation_frame(&mut app, 100, 30);
+        assert!(
+            screen.contains("vibex-click-workspace") && screen.contains("clickable 1"),
+            "the tree is not on screen:\n{screen}"
+        );
+
+        // Row 0 is the workspace heading; the two sessions follow it.
+        let list = app.regions.list.clone().expect("the list is clickable");
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: list.rect.x + 3,
+                row: list.rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        let folded = conversation_frame(&mut app, 100, 30);
+        assert!(
+            folded.contains("vibex-click-workspace"),
+            "the heading went with its members:\n{folded}"
+        );
+        assert!(
+            !folded.contains("clickable 1") && !folded.contains("clickable 2"),
+            "one click did not fold the heading:\n{folded}"
+        );
+        // The same click again opens it.
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: list.rect.x + 3,
+                row: list.rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        let opened = conversation_frame(&mut app, 100, 30);
+        assert!(opened.contains("clickable 1"), "{opened}");
     }
 
     #[test]

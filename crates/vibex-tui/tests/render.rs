@@ -1341,34 +1341,6 @@ fn a_manual_move_reorders_two_unpinned_sessions() {
     assert_eq!(app.selection_for(Scope::Sessions), 1);
 }
 
-#[test]
-fn grouping_can_be_folded_away_without_losing_the_sessions() {
-    use vibex_tui::action::Intent;
-    let mut app = app(120, 40);
-    app.agent.apply_sessions(Ok(session_pair())).expect("apply");
-    app.perform(Intent::GotoSessions);
-    let grouped = text(&render(&mut app, 120, 40));
-    assert!(
-        grouped.contains("vibex-card-workspace"),
-        "the heading is missing:\n{grouped}"
-    );
-    // A heading is the row that opens with a disclosure: the page frame is
-    // ruled too, so the rule alone cannot tell a heading from the border.
-    let is_heading = |line: &str| line.trim_start_matches(['│', ' ']).starts_with(['▾', '▸']);
-    assert!(
-        grouped.lines().any(is_heading),
-        "no heading was drawn:\n{grouped}"
-    );
-    app.perform(Intent::ToggleSidebarGrouping);
-    let flat = text(&render(&mut app, 120, 40));
-    assert!(
-        !flat.lines().any(is_heading),
-        "the heading survived the toggle:\n{flat}"
-    );
-    assert!(flat.contains("alpha session"), "{flat}");
-    assert!(flat.contains("beta session"), "{flat}");
-}
-
 fn seeded_block(
     id: &str,
     kind: vibex_desktop_model::TimelineRowKind,
@@ -6067,17 +6039,13 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
     // The line names the page. The location is the status band's, one row up:
     // printing the same path twice in two rows is how a page looks broken.
     assert!(
-        header.contains("Sessions"),
+        header.contains("Session list"),
         "the header does not name the page: {header:?}"
     );
     let actions = screen
         .lines()
         .find(|line| line.contains("+ New session"))
         .unwrap_or_else(|| panic!("no actions line:\n{screen}"));
-    assert!(
-        actions.contains("Grouped by workspace"),
-        "the actions line does not say how the list is grouped: {actions:?}"
-    );
     assert!(
         actions.contains("[Workspace"),
         "the actions line does not name the key that moves the workspace: {actions:?}"
@@ -6090,7 +6058,49 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
         .find(|(_, intent)| *intent == vibex_tui::action::Intent::NewSession)
         .map(|(rect, _)| *rect)
         .expect("the new-session button is not clickable");
-    assert!(button.width > 0 && button.y == app.regions.list.unwrap().rect.y - 1);
+    // A row of air under the action is what keeps the button off the list.
+    assert!(button.width > 0 && button.y == app.regions.list.unwrap().rect.y - 2);
+}
+
+/// A control answers the pointer before the click does: the new-session button
+/// carries its own surface while the mouse rests on it, and only then.
+#[test]
+fn the_new_session_button_lights_up_under_the_pointer() {
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![seeded_session("session_hover0001", "lit")]))
+        .expect("sessions apply");
+    let resting = render_buffer(&mut app, 110, 24);
+    let button = app
+        .regions
+        .hints
+        .iter()
+        .find(|(_, intent)| *intent == vibex_tui::action::Intent::NewSession)
+        .map(|(rect, _)| *rect)
+        .expect("the new-session button is a click target");
+    app.hovered_hint = Some(vibex_tui::action::Intent::NewSession);
+    let hovered = render_buffer(&mut app, 110, 24);
+    let lit = (button.x..button.right())
+        .filter(|column| {
+            resting.cell((*column, button.y)).map(|cell| cell.style())
+                != hovered.cell((*column, button.y)).map(|cell| cell.style())
+        })
+        .count();
+    assert_eq!(
+        lit,
+        usize::from(button.width),
+        "the button does not answer the pointer"
+    );
+    // The row it sits on is otherwise unchanged: a hover is the control's, not
+    // the page's.
+    for column in button.right()..110 {
+        assert_eq!(
+            resting.cell((column, button.y)).map(|cell| cell.style()),
+            hovered.cell((column, button.y)).map(|cell| cell.style()),
+            "the hover spilled past the button at column {column}"
+        );
+    }
 }
 
 /// The list is the page, not a panel on it: nothing draws a frame around it,
@@ -6109,19 +6119,27 @@ fn the_session_list_is_not_drawn_inside_a_frame() {
             "the list is wearing a frame again ({corner}):\n{screen}"
         );
     }
-    // The page's own chrome is the first thing in the band: the name, then the
-    // action, then the list — with nothing between them.
+    // The page's own chrome is the first thing in the band: the name, a row of
+    // air, the action, another row of air, then the list.
     let lines = screen.lines().collect::<Vec<_>>();
     let named = lines
         .iter()
-        .position(|line| line.trim_start().starts_with("Sessions"))
+        .position(|line| line.trim_start().starts_with("Session list"))
         .unwrap_or_else(|| panic!("the page does not name itself:\n{screen}"));
     assert!(
-        lines[named + 1].contains("+ New session"),
+        lines[named + 1].trim().is_empty(),
+        "there is no air under the page's name:\n{screen}"
+    );
+    assert!(
+        lines[named + 2].contains("+ New session"),
         "the action is not under the page's name:\n{screen}"
     );
     assert!(
-        lines[named + 2].trim_start().starts_with('▾'),
+        lines[named + 3].trim().is_empty(),
+        "there is no air under the action:\n{screen}"
+    );
+    assert!(
+        lines[named + 4].trim_start().starts_with('▾'),
         "the list does not start under the page's own chrome:\n{screen}"
     );
 }
@@ -6148,13 +6166,23 @@ fn a_group_heading_counts_its_sessions_and_rules_the_section() {
         .lines()
         .find(|line| line.trim_start_matches(['│', ' ']).starts_with('▾'))
         .unwrap_or_else(|| panic!("no heading:\n{screen}"));
-    assert!(
-        heading.contains("vibex-card-workspace 2"),
-        "the heading does not say how much it holds: {heading:?}"
+    // The count is the last word on the line, past the rule: the rule carries
+    // the eye to it.
+    let (before, count) = heading
+        .rsplit_once(' ')
+        .unwrap_or_else(|| panic!("the heading has one word: {heading:?}"));
+    assert_eq!(
+        count.trim(),
+        "2",
+        "the count does not close the line: {heading:?}"
     );
     assert!(
-        heading.contains('─'),
-        "the heading does not rule off its section: {heading:?}"
+        before.trim_end().ends_with('─'),
+        "the count is not past the rule: {heading:?}"
+    );
+    assert!(
+        before.contains("vibex-card-workspace"),
+        "the heading does not name the workspace: {heading:?}"
     );
     // A session row is not a heading: it carries the mark and the age instead.
     let row = screen
@@ -6220,18 +6248,48 @@ fn a_session_row_carries_what_it_last_did_under_its_title() {
         "the second line does not line up under the title:\n{screen}"
     );
 
-    // A session blocked on the reader says so on the same line.
-    let mut blocked = seeded_session("session_echo0002", "waiting on you");
+    // A session this client has not seen do anything is one line: the
+    // workspace is the heading it already sits under, and repeating the
+    // directory under every row is noise, not information.
+    let mut quiet = seeded_session("session_echo0002", "nothing to report");
+    quiet.project_id = session.project_id.clone();
+    quiet.workspace_id = session.workspace_id.clone();
+    quiet.workspace_root = session.workspace_root.clone();
+    app.agent
+        .apply_sessions(Ok(vec![quiet.clone()]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 110, 24));
+    let quiet_at = screen
+        .lines()
+        .position(|line| line.contains("nothing to report"))
+        .unwrap_or_else(|| panic!("no row for the quiet session:\n{screen}"));
+    assert!(
+        !screen
+            .lines()
+            .nth(quiet_at + 1)
+            .is_some_and(|line| { line.contains("/tmp") || line.contains("vibex-card-workspace") }),
+        "the row repeats its workspace under the title:\n{screen}"
+    );
+
+    // A session blocked on the reader says so even when it has not been seen
+    // saying anything: that is the one thing on the row to act on.
+    let mut blocked = seeded_session("session_echo0003", "waiting on you");
     blocked.state = vibex_core::AgentSessionState::NeedsInput;
+    blocked.project_id = session.project_id.clone();
+    blocked.workspace_id = session.workspace_id.clone();
+    blocked.workspace_root = session.workspace_root.clone();
     app.agent
         .apply_sessions(Ok(vec![blocked]))
         .expect("sessions apply");
     let screen = text(&render(&mut app, 110, 24));
     let line = screen
         .lines()
-        .find(|line| line.contains("Pending:"))
+        .find(|line| line.contains("blocked until you answer"))
         .unwrap_or_else(|| panic!("a waiting session does not say so:\n{screen}"));
-    assert!(line.contains("waiting on you") || screen.contains("waiting on you"));
+    assert!(
+        !line.contains("vibex-card-workspace"),
+        "the waiting row names its workspace instead of what it waits on: {line:?}"
+    );
     assert!(
         !screen.contains("Running") && !screen.contains("Idle"),
         "the state words are back on the rows:\n{screen}"

@@ -592,12 +592,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::MoveSessionDown,
         "Move down",
     ),
-    binding(
-        Scope::Sessions,
-        Chord::plain(KeyCode::Char('g')),
-        Intent::ToggleSidebarGrouping,
-        "Grouping",
-    ),
     // ---- agent (transcript) ---------------------------------------------
     binding(
         Scope::Agent,

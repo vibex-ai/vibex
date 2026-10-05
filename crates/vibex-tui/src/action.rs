@@ -90,7 +90,6 @@ intents! {
     ToggleAutoContinue => { scope: Sessions, id: "session_auto_continue", label: "Auto-continue", help: "Let the selected session continue itself when a turn stops without an answer." },
     MoveSessionUp => { scope: Sessions, id: "session_move_up", label: "Move up", help: "Move the selected session one place earlier in the list." },
     MoveSessionDown => { scope: Sessions, id: "session_move_down", label: "Move down", help: "Move the selected session one place later in the list." },
-    ToggleSidebarGrouping => { scope: Sessions, id: "sidebar_grouping", label: "Grouping", help: "Group the list by workspace, or show every session in one run." },
     SwitchWorkspace => { scope: Sessions, id: "workspace_switch", label: "Workspace", help: "Change the workspace used for new sessions." },
     OpenWorkspaceBrowser => { scope: Sessions, id: "workspace_browse", label: "Browse", help: "List directories on the authority host." },
     WorkspaceBrowseUp => { scope: Sessions, id: "workspace_up", label: "Parent", help: "Go to the parent directory." },
