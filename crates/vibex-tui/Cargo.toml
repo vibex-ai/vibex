@@ -13,6 +13,11 @@ description = "Character-grid client for the Vibex DesktopRuntime"
 # runtime and the PDF/Office content stack out of the manifest is what makes
 # the TUI linkable without a window server.
 [dependencies]
+# The clock beside a message is the reader's own wall clock, so a local
+# timezone has to be resolved rather than a UTC hour printed. `clock` is the
+# only feature this needs: the crate formats an hour and a minute, never a date,
+# and the terminal is never the wasm target.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 crossterm.workspace = true
 qrcode.workspace = true
 ratatui.workspace = true

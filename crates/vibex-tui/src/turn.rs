@@ -226,6 +226,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_000,
             title: String::new(),
             body: String::new(),
             streaming,

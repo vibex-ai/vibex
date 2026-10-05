@@ -16,6 +16,8 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::locale::Locale;
+
 /// How a line was separated from the following one during wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineJoiner {
@@ -587,16 +589,17 @@ pub fn contains_rtl(text: &str) -> bool {
 
 /// Format a Unix millisecond timestamp as a UTC civil date and time.
 ///
-/// The client shows absolute times in exactly one place — a session's detail
-/// card — and the runtime stores epoch milliseconds. A calendar library would
-/// be a dependency for one label, so the civil-date conversion is done here:
-/// days since the epoch are shifted to the 0000-03-01 era, where the leap-year
-/// rule is a single division, and the month/day are recovered from the
-/// 400-year cycle.
+/// The session detail card is the one place the client shows a date, and the
+/// runtime stores epoch milliseconds, so the civil-date conversion is done
+/// here: days since the epoch are shifted to the 0000-03-01 era, where the
+/// leap-year rule is a single division, and the month/day are recovered from
+/// the 400-year cycle.
 ///
 /// The result is `YYYY-MM-DD HH:MM` in UTC. It is deliberately not localised:
-/// a terminal has no reliable timezone database, and an hour that silently
-/// disagrees with the reader's clock is worse than one labelled UTC.
+/// the date travels with the time, so a reader can place the hour without the
+/// client knowing their timezone. A label that is read as "when in my day" —
+/// [`format_clock`], beside a message — cannot be answered that way and
+/// resolves the reader's own timezone instead.
 pub fn format_utc_timestamp(epoch_ms: i64) -> String {
     let seconds = epoch_ms.div_euclid(1_000);
     let days = seconds.div_euclid(86_400);
@@ -626,6 +629,48 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month_index - 9
     } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// The clock a message row carries on its right: the reader's own wall clock.
+///
+/// A message is stamped with a time the reader reads as "when in my day was
+/// this said", which only a local hour answers — the same hour the desktop
+/// prints beside an answer. `format_utc_timestamp` keeps the UTC stance for the
+/// label that carries a date with it; this one does not, so it resolves the
+/// timezone the client is running in.
+///
+/// The shape is the locale's: the English interface keeps the twelve-hour
+/// clock, the Chinese ones the twenty-four-hour clock their readers use. An
+/// empty string means the timestamp could not be placed at all, which the
+/// caller draws as no clock rather than as midnight.
+pub fn format_clock(epoch_ms: i64, locale: Locale) -> String {
+    let Some(local) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Local))
+    else {
+        return String::new();
+    };
+    format_clock_at(local, locale)
+}
+
+/// The clock label for one civil time, in the locale's own convention.
+///
+/// Split from [`format_clock`] so the shape of the label can be asserted
+/// without the machine's timezone deciding the hour.
+fn format_clock_at<Tz: chrono::TimeZone>(local: chrono::DateTime<Tz>, locale: Locale) -> String {
+    use chrono::Timelike;
+    let (hour, minute) = (local.hour(), local.minute());
+    match locale {
+        Locale::En => {
+            let (hour, meridiem) = match hour {
+                0 => (12, "AM"),
+                1..=11 => (hour, "AM"),
+                12 => (12, "PM"),
+                _ => (hour - 12, "PM"),
+            };
+            format!("{hour}:{minute:02} {meridiem}")
+        }
+        Locale::ZhCn | Locale::ZhTw => format!("{hour:02}:{minute:02}"),
+    }
 }
 
 /// A coarse "how long ago" label for a timestamp in milliseconds.
@@ -919,5 +964,40 @@ mod tests {
         assert_eq!(format_age(now - 61 * 86_400_000, now), "2mo");
         // A clock that runs backwards must not produce a negative age.
         assert_eq!(format_age(now + 60_000, now), "just now");
+    }
+
+    /// One civil time in a fixed zone, so the shape of the label is what the
+    /// assertion is about rather than the machine's own offset.
+    fn clock_at(hour: u32, minute: u32, locale: Locale) -> String {
+        let zone = chrono::FixedOffset::east_opt(8 * 3_600).expect("a zone");
+        let local = chrono::TimeZone::with_ymd_and_hms(&zone, 2026, 3, 4, hour, minute, 0)
+            .single()
+            .expect("a civil time");
+        format_clock_at(local, locale)
+    }
+
+    #[test]
+    fn a_clock_reads_in_the_locale_s_own_convention() {
+        assert_eq!(clock_at(9, 58, Locale::En), "9:58 AM");
+        assert_eq!(clock_at(15, 2, Locale::En), "3:02 PM");
+        assert_eq!(clock_at(9, 58, Locale::ZhCn), "09:58");
+        assert_eq!(clock_at(15, 2, Locale::ZhTw), "15:02");
+    }
+
+    #[test]
+    fn the_twelve_hour_clock_has_no_zero_hour() {
+        // Midnight and noon are the two the modulo arithmetic gets wrong if it
+        // is written as a subtraction: both read as twelve, and only the
+        // meridiem tells them apart.
+        assert_eq!(clock_at(0, 5, Locale::En), "12:05 AM");
+        assert_eq!(clock_at(12, 5, Locale::En), "12:05 PM");
+        assert_eq!(clock_at(23, 59, Locale::En), "11:59 PM");
+    }
+
+    #[test]
+    fn an_unplaceable_timestamp_draws_no_clock() {
+        // A row built before the timeline had an item carries no time; the
+        // renderer asks for one and must be told there is nothing to draw.
+        assert_eq!(format_clock(i64::MAX, Locale::En), "");
     }
 }

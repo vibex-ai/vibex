@@ -47,6 +47,7 @@ fn message(id: &str) -> vibex_tui::transcript::Block {
         body: "the conversation the reader came for".to_string(),
         turn_id: Some("turn-1".to_string()),
         sequence: 1,
+        timestamp_ms: None,
         expanded: false,
         collapsible: false,
         streaming: false,

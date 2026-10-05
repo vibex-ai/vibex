@@ -4464,6 +4464,9 @@ fn append_agent_streaming_deltas_to_cache(
             row.body.push_str(&update.text);
             record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
             row.last_sequence = update.sequence;
+            // As in the reasoning path: the same row the full projection would
+            // build, reached without rebuilding it.
+            row.timestamp_ms = update.timestamp_ms;
         }
         row.body.len()
     };
@@ -4591,6 +4594,10 @@ fn append_agent_reasoning_deltas_to_cache(
             row.body.push_str(&update.text);
             record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
             row.last_sequence = update.sequence;
+            // The row is stamped where it last spoke, exactly as the full
+            // projection stamps it: this path exists to reach the same rows
+            // without re-projecting the timeline.
+            row.timestamp_ms = update.timestamp_ms;
         }
         body_len = row.body.len();
     }
@@ -71505,6 +71512,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
             title: "Agent".into(),
             body: "first".into(),
             streaming: true,
@@ -71747,6 +71755,7 @@ mod tests {
                 conclusion: true,
                 first_sequence: 1,
                 last_sequence: 1,
+                timestamp_ms: 1_700_000_000_000,
                 title: "Agent".into(),
                 body: "Streaming".into(),
                 streaming: true,
@@ -71950,6 +71959,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
             title: String::new(),
             body: String::new(),
             streaming: false,
@@ -78713,6 +78723,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
             title: "Reasoning".into(),
             body: "Inspecting the workspace".into(),
             streaming: true,
@@ -78815,6 +78826,7 @@ mod tests {
             conclusion: kind == TimelineRowKind::AgentMessage,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
             title: String::new(),
             body: body.to_string(),
             streaming,
@@ -85186,6 +85198,7 @@ mod tests {
                 conclusion: kind == TimelineRowKind::AgentMessage,
                 first_sequence: 1,
                 last_sequence: 1,
+                timestamp_ms: 1_700_000_000_000,
                 title: id.into(),
                 body: body.into(),
                 streaming: false,
@@ -85308,6 +85321,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
             title: "prompt".into(),
             body: "prompt".into(),
             streaming: false,
@@ -88536,6 +88550,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
             title: id.into(),
             body: id.into(),
             streaming: false,

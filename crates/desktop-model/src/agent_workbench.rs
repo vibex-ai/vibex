@@ -173,6 +173,15 @@ pub struct TimelineRow {
     pub conclusion: bool,
     pub first_sequence: i64,
     pub last_sequence: i64,
+    /// When this row's newest item was written, in Unix milliseconds.
+    ///
+    /// A row is stamped with the moment it last said something rather than with
+    /// the moment it started, so a streamed answer carries the time it finished
+    /// and a growing thought the time of its newest token. Zero when no item
+    /// stands behind the row — a client projecting one of its own, or a row
+    /// built before the timeline had anything to say.
+    #[serde(default)]
+    pub timestamp_ms: i64,
     pub title: String,
     pub body: String,
     pub streaming: bool,
@@ -1043,6 +1052,17 @@ fn record_row_item_id(item_ids: &mut Vec<String>, item_id: String) {
     }
 }
 
+/// Fold one more item into the row it continues.
+///
+/// Every merge site closes the row's sequence range over the item it just
+/// absorbed, and every one of them moves the row's clock to that item: the two
+/// travel together, so they are recorded together.
+fn record_row_item(row: &mut TimelineRow, item: &TimelineItem) {
+    record_row_item_id(&mut row.item_ids, item.id.to_string());
+    row.last_sequence = item.sequence;
+    row.timestamp_ms = item.timestamp_ms;
+}
+
 pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
     let item_refs = items.iter().collect::<Vec<_>>();
     timeline_rows_from_refs(&item_refs)
@@ -1091,8 +1111,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                     if delta.text_delta.contains(RECONNECT_PROGRESS_PREFIX) {
                         previous.body = compact_reconnect_progress_text(&previous.body);
                     }
-                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
-                    previous.last_sequence = item.sequence;
+                    record_row_item(previous, item);
                     merge_runtime_attribution(previous, item);
                 } else {
                     rows.push(TimelineRow {
@@ -1106,6 +1125,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                         conclusion: final_answer,
                         first_sequence: item.sequence,
                         last_sequence: item.sequence,
+                        timestamp_ms: item.timestamp_ms,
                         title: "Agent".into(),
                         body: delta.text_delta.clone(),
                         streaming: true,
@@ -1129,8 +1149,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                         && runtime_attribution_is_compatible(row, item)
                 }) {
                     previous.body = message_text;
-                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
-                    previous.last_sequence = item.sequence;
+                    record_row_item(previous, item);
                     previous.streaming = !message.is_final;
                     merge_runtime_attribution(previous, item);
                 } else {
@@ -1163,8 +1182,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                     })
                 {
                     previous.body.push_str(&reasoning.text);
-                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
-                    previous.last_sequence = item.sequence;
+                    record_row_item(previous, item);
                     merge_runtime_attribution(previous, item);
                 } else {
                     rows.push(simple_row(
@@ -1274,8 +1292,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                         ToolCallStatus::Started | ToolCallStatus::Progress
                     );
                     previous.failed = matches!(collaboration.status, ToolCallStatus::Failed);
-                    previous.last_sequence = item.sequence;
-                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
+                    record_row_item(previous, item);
                 } else {
                     let mut row = simple_row(
                         item,
@@ -1400,8 +1417,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                     previous.title = title;
                     previous.body = body;
                     previous.streaming = streaming;
-                    previous.last_sequence = item.sequence;
-                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
+                    record_row_item(previous, item);
                     merge_runtime_attribution(previous, item);
                 } else {
                     rows.push(simple_row(
@@ -1542,6 +1558,7 @@ fn simple_row(
         conclusion: false,
         first_sequence: item.sequence,
         last_sequence: item.sequence,
+        timestamp_ms: item.timestamp_ms,
         title: title.into(),
         body,
         streaming,
@@ -1912,6 +1929,26 @@ mod tests {
         assert_eq!(rows[0].item_ids.len(), 2);
         assert!(rows[0].conclusion);
         assert_eq!(rows[0].turn_item_count, 3);
+        // The row is stamped with the item that closed it, not the one that
+        // opened it: a client drawing the row's clock shows when the answer
+        // finished arriving.
+        assert_eq!(rows[0].timestamp_ms, 3);
+    }
+
+    #[test]
+    fn a_single_item_row_carries_that_item_s_clock() {
+        let rows = timeline_rows(&[item(
+            7,
+            None,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "a question".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        )]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, TimelineRowKind::UserMessage);
+        assert_eq!(rows[0].timestamp_ms, 7);
     }
 
     #[test]
@@ -2837,6 +2874,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 0,
             title: id.into(),
             body: String::new(),
             streaming: false,
@@ -2876,6 +2914,7 @@ mod tests {
             conclusion: false,
             first_sequence: 1,
             last_sequence: 1,
+            timestamp_ms: 0,
             title: id.into(),
             body: String::new(),
             streaming: false,
