@@ -25,7 +25,7 @@ use crate::app::{
 use crate::keymap::Scope;
 use crate::layout::Bands;
 use crate::locale::Strings;
-use crate::modal::{self, ModalChrome, ModalHint, ModalSizing};
+use crate::modal::{self, ModalChrome, ModalHint, ModalLayout, ModalSizing};
 use crate::runtime_picker::RuntimePickerRow;
 use crate::text::{display_width, pad_to_width, truncate_to_width};
 use crate::theme::TuiTheme;
@@ -4907,6 +4907,23 @@ fn render_zoned_line(
     frame.render_widget(Paragraph::new(centre_line), centre_area);
 }
 
+/// Draw one modal and publish the one control its chrome hands the mouse.
+///
+/// The close affordance belongs to the frame that draws it: the rect is
+/// republished every frame the modal is up, and cleared with the frame once it
+/// is gone. Nothing remembers it across frames.
+fn render_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    chrome: &ModalChrome<'_>,
+    theme: &TuiTheme,
+    app: &mut App,
+) -> Option<ModalLayout> {
+    let layout = modal::render_modal(frame, area, chrome, theme)?;
+    app.regions.modal_close = layout.close;
+    Some(layout)
+}
+
 fn render_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4928,7 +4945,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.close()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             let rows = Layout::default()
@@ -5026,7 +5043,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.close()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             render_shortcut_cheatsheet(
@@ -5064,7 +5081,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.close()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             render_keys_editor(
@@ -5092,7 +5109,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.cancel()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             frame.render_widget(
@@ -5125,7 +5142,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.cancel()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             let masked = matches!(field, crate::app::PromptField::ProviderSecret);
@@ -5171,7 +5188,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.hint_back()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             // A long-winded option explains itself in a caption above the
@@ -5258,7 +5275,7 @@ fn render_overlay(
                     ModalHint::new("Esc", strings.close()),
                 ],
             );
-            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
             let entries = listing
@@ -5353,7 +5370,7 @@ fn render_approval(
             ModalHint::new("Esc", strings.close()),
         ],
     );
-    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
         return;
     };
 
@@ -5430,7 +5447,7 @@ fn render_elicitation(
             ModalHint::new("Esc", strings.close()),
         ],
     );
-    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
         return;
     };
 
@@ -5539,7 +5556,7 @@ fn render_pairing(
         ModalSizing::picker(),
         vec![ModalHint::new("Esc", strings.close())],
     );
-    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
         return;
     };
     let rows = Layout::default()
@@ -5582,7 +5599,7 @@ fn render_pairing(
 fn render_text_view(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     title: &str,
     body: &str,
     scroll: usize,
@@ -5597,7 +5614,7 @@ fn render_text_view(
             ModalHint::new("Esc", strings_of(app).close()),
         ],
     );
-    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
         return;
     };
     let lines = body
@@ -5713,7 +5730,7 @@ fn render_runtime_picker(
         hints
     };
     let chrome = modal_chrome(app, &title, ModalSizing::picker(), hints);
-    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
         return;
     };
     if show_choices {

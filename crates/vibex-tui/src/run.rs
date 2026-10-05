@@ -2588,6 +2588,114 @@ mod tests {
         );
     }
 
+    /// The modal's close affordance is the one control a modal hands the mouse,
+    /// and it is a control only while the modal is drawn: the frame publishes
+    /// the rect, and a click where it used to be is not a click on it.
+    #[test]
+    fn a_modal_close_rect_dies_with_the_modal() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        app.overlay = Some(Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        });
+        conversation_frame(&mut app, 100, 30);
+        let close = app
+            .regions
+            .modal_close
+            .expect("the drawn modal published no close affordance");
+
+        // The affordance answers while the modal is up.
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.overlay.is_none(), "the close affordance did nothing");
+
+        // A modal also leaves by the keyboard, and its rect goes with it: a
+        // frame that draws no modal publishes no close.
+        app.overlay = Some(Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        });
+        conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.regions.modal_close.is_some(),
+            "the reopened modal published no close affordance"
+        );
+        app.perform(Intent::Back);
+        assert!(app.overlay.is_none(), "the chord did not close the modal");
+        conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.regions.modal_close.is_none(),
+            "the close rect outlived the modal that drew it"
+        );
+
+        // The next click at that cell is not a second close, because there is
+        // nothing there to close.
+        let page = app.page;
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.page, page,
+            "a closed modal's rect still ran the close intent"
+        );
+    }
+
+    /// The banner's row is a control only while the banner is up: once it is
+    /// gone, a click there belongs to whatever the frame drew in its place.
+    #[test]
+    fn a_banner_rect_dies_with_the_banner() {
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        app.set_banner(crate::app::Banner::info("a notice"));
+        conversation_frame(&mut app, 100, 30);
+        let banner = app
+            .regions
+            .banner
+            .expect("the drawn banner published no row");
+
+        // The banner goes, and its row goes back to the transcript.
+        app.banner = None;
+        conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.regions.banner.is_none(),
+            "the banner's row outlived the banner"
+        );
+        app.clear_text_selection();
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: banner.x + 1,
+                row: banner.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.text_selection.is_some(),
+            "the click was swallowed by a banner that is gone"
+        );
+    }
+
     #[test]
     fn mouse_opens_a_group_and_keyboard_skips_its_folded_members() {
         use crate::action::Intent;

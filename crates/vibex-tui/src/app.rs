@@ -1005,7 +1005,7 @@ pub struct FrameRegions {
 }
 
 impl FrameRegions {
-    /// Start a frame: the row-per-something lists are rewritten, not extended.
+    /// Start a frame: every rect the last frame published is dropped.
     ///
     /// A rect describes where something was when the frame drew it. Keeping the
     /// previous frame's rects would let a click land on a row that has moved or
@@ -1014,10 +1014,13 @@ impl FrameRegions {
         self.turns.clear();
         self.hints.clear();
         self.runtime_picker = None;
-        // A list belongs to the page that drew it. Left standing, the previous
-        // page's rect would hit-test rows that are no longer on screen: a
-        // double click on the transcript would open the session list's row.
+        // A list, a banner row and a modal's close affordance each belong to
+        // the frame that drew them: left standing, the session list's rect
+        // would hit-test transcript rows instead, and a modal that has closed
+        // would still answer a click where its close used to be.
         self.list = None;
+        self.banner = None;
+        self.modal_close = None;
     }
 }
 
