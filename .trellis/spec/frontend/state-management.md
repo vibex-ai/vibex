@@ -449,6 +449,12 @@ Preserve the text, inline attachments, and selected command entry together: save
 the active draft before changing sessions and restore the target session's draft
 before rendering its Composer. A draft must never migrate into another session.
 
+Store the draft outside the bounded session-view cache. A cached view is evicted
+under memory pressure, or released when its session leaves a group, and the
+textarea it owns goes with it — a draft kept only in that textarea disappears
+even though the session is still in the sidebar. Save on every edit (and on the
+way out of a session) and restore it when the session's textarea is built again.
+
 Remove empty drafts, consume the active draft when it is sent, and delete stored
 drafts with their sessions. Regression coverage must switch between at least two
 sessions with different unsent text, assert that each Composer shows only its own

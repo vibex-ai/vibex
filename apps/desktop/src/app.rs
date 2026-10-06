@@ -49,9 +49,9 @@ use gpui_component::{
     input::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
         Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
-        InlineTokenClickEvent, Input, InputEvent, InputState, MoveDown as InputMoveDown,
-        MoveLeft as InputMoveLeft, MoveRight as InputMoveRight, MoveUp as InputMoveUp,
-        Paste as InputPaste, Textarea, TextareaState,
+        InlineTokenClickEvent, Input, InputContent, InputEvent, InputState,
+        MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
+        MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
     },
     kbd::Kbd,
     marker::{Marker, MarkerIcon},
@@ -937,6 +937,81 @@ fn composer_history_next(index: Option<usize>, len: usize) -> Option<usize> {
     match index {
         Some(index) if index + 1 < len => Some(index + 1),
         _ => None,
+    }
+}
+
+/// One session's unsent Composer content, saved outside that session's view.
+///
+/// The textarea is the live editor, but it belongs to a view the bounded view
+/// cache may evict — or release when the session leaves a group — so the draft
+/// is also kept here, keyed by session. Text, atomic reference tokens, inline
+/// attachments, the command entry the popup resolved and the marker serial stay
+/// together: restoring the text without the rest would turn an attachment back
+/// into raw marker text and drop the command the draft had selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposerDraft {
+    content: InputContent,
+    attachments: Vec<InlineComposerAttachment>,
+    command_entry: Option<AgentCommandEntry>,
+    attachment_serial: u64,
+}
+
+impl ComposerDraft {
+    /// Whether the draft has nothing left to send.
+    fn is_empty(&self) -> bool {
+        self.content.text().trim().is_empty() && self.attachments.is_empty()
+    }
+
+    /// Drops attachments whose marker the reader deleted from the text.
+    ///
+    /// The marker is what positions an attachment in the document; one whose
+    /// marker is gone is no longer part of the draft, and restoring it would
+    /// resurrect a file the reader removed.
+    fn normalize(&mut self) {
+        let text = self.content.text().clone();
+        self.attachments
+            .retain(|attachment| attachment.range_in(&text).is_some());
+    }
+}
+
+/// The unsent Composer drafts of the workbench, one per session.
+///
+/// Deliberately outside [`SessionView`]: a stored view is evicted under memory
+/// pressure and its textarea goes with it, while a draft the reader has typed
+/// but not sent has to survive the switch — and a later visit has to bring it
+/// back.
+#[derive(Debug, Default)]
+struct ComposerDraftStore {
+    drafts: BTreeMap<String, ComposerDraft>,
+}
+
+impl ComposerDraftStore {
+    /// Saves one session's draft, or removes it when nothing is left.
+    fn save(&mut self, session_id: &str, mut draft: ComposerDraft) {
+        draft.normalize();
+        if draft.is_empty() {
+            self.drafts.remove(session_id);
+        } else {
+            self.drafts.insert(session_id.to_string(), draft);
+        }
+    }
+
+    fn get(&self, session_id: &str) -> Option<&ComposerDraft> {
+        self.drafts.get(session_id)
+    }
+
+    /// Takes the draft a send consumed, so it cannot come back.
+    fn consume(&mut self, session_id: &str) -> Option<ComposerDraft> {
+        self.drafts.remove(session_id)
+    }
+
+    fn forget(&mut self, session_id: &str) {
+        self.drafts.remove(session_id);
+    }
+
+    /// Drops the drafts of sessions that no longer exist.
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.drafts.retain(|session_id, _| keep(session_id));
     }
 }
 
@@ -7072,6 +7147,14 @@ pub struct VibexWorkbench {
     /// never evicted, so a group member cannot lose its timeline while it is on
     /// screen.
     session_view_lru: VecDeque<String>,
+    /// Unsent Composer content, one entry per session, kept outside the view
+    /// cache.
+    ///
+    /// A stored view is evicted (or released when its session leaves a group),
+    /// and a draft kept only in the textarea would be lost with it. Saving here
+    /// on every edit and restoring when the session's Composer is built again is
+    /// what makes switching sessions keep the text a reader typed.
+    composer_drafts: ComposerDraftStore,
     /// Turn heights prepaint observed for a session, parked until that session's
     /// own view is the borrowed one.
     ///
@@ -7268,6 +7351,9 @@ fn subscribe_composer_input(
                 this.sync_inline_composer_attachments(false, cx);
                 this.sync_composer_command_entry(ComposerTarget::Session, cx);
                 this.refresh_suggestions(ComposerTarget::Session, window, cx);
+                // The edit is saved under the textarea's own session, so
+                // leaving the session cannot lose it with the view cache.
+                this.remember_composer_draft(cx);
             }
             InputEvent::PressEnter { secondary, shift } if !shift => {
                 let command_enter =
@@ -8038,6 +8124,7 @@ impl VibexWorkbench {
             view_session_id: selected_session_id,
             session_views: BTreeMap::new(),
             session_view_lru: VecDeque::new(),
+            composer_drafts: ComposerDraftStore::default(),
             pending_timeline_turn_measurements: BTreeMap::new(),
             child_agent_timelines: BTreeMap::new(),
             child_agent_expanded_delegations: BTreeSet::new(),
@@ -15794,7 +15881,9 @@ impl VibexWorkbench {
     ///
     /// Every session owns its own textarea, so a pane's draft, cursor and IME
     /// state belong to that session alone. That is what lets a pane render the
-    /// same composer as the main workbench without typing into it.
+    /// same composer as the main workbench without typing into it. The textarea
+    /// is built empty and then filled from the session's stored draft: the view
+    /// may be brand new because the cache evicted the one that held the text.
     fn ensure_composer_input(
         &mut self,
         window: &mut Window,
@@ -15813,7 +15902,61 @@ impl VibexWorkbench {
         let session_id = self.view_session_id.clone();
         self.composer_subscription = Some(subscribe_composer_input(&input, session_id, window, cx));
         self.composer_input = Some(input.clone());
+        if let Some(session_id) = self.view_session_id.clone() {
+            self.restore_composer_draft(&session_id, &input, window, cx);
+        }
         input
+    }
+
+    /// Saves the borrowed view's unsent Composer content under its session.
+    ///
+    /// Called from every edit that can change the draft, so the store is already
+    /// current when the session is left: a switch never has to read a textarea
+    /// whose view is about to be parked or evicted.
+    fn remember_composer_draft(&mut self, cx: &App) {
+        let Some(session_id) = self.view_session_id.clone() else {
+            return;
+        };
+        let Some(input) = self.composer_input.clone() else {
+            return;
+        };
+        let draft = ComposerDraft {
+            content: input.read(cx).content(),
+            attachments: self.composer_attachments.clone(),
+            command_entry: self.composer_command_entry.clone(),
+            attachment_serial: self.composer_attachment_serial,
+        };
+        self.composer_drafts.save(session_id.as_str(), draft);
+    }
+
+    /// Fills a freshly built textarea with the session's stored draft.
+    ///
+    /// Text, atomic reference tokens, attachments, the selected command entry
+    /// and the marker serial come back together, so a restored draft behaves
+    /// exactly like the one that was typed. `set_value` suppresses its own
+    /// change event, which is why the view fields are written here rather than
+    /// left to the composer's edit path.
+    fn restore_composer_draft(
+        &mut self,
+        session_id: &VibexSessionId,
+        input: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.composer_drafts.get(session_id.as_str()).cloned() else {
+            return;
+        };
+        self.composer_attachment_serial =
+            self.composer_attachment_serial.max(draft.attachment_serial);
+        self.composer_attachments = draft.attachments;
+        self.composer_command_entry = draft.command_entry;
+        input.update(cx, |input, cx| {
+            input.set_value(draft.content, window, cx);
+            // `set_value` resets a multi-line caret to the start; a restored
+            // draft keeps writing where the reader left off.
+            let end = input.value().len();
+            input.set_selected_range(end..end, cx);
+        });
     }
 
     /// Whether `session_id` already owns a view, borrowed or stored.
@@ -17101,6 +17244,11 @@ impl VibexWorkbench {
         record_history: bool,
         cx: &mut Context<Self>,
     ) {
+        // The draft of the session being left is saved before anything swaps its
+        // view out. Switching to the session that is already shown keeps it
+        // too, which is harmless: the store then holds exactly what the
+        // textarea does.
+        self.remember_composer_draft(cx);
         self.clear_sidebar_move_selection();
         self.new_session_open = false;
         self.new_session_error = None;
@@ -20407,6 +20555,9 @@ impl VibexWorkbench {
         self.sync_inline_composer_attachments(false, cx);
         self.sync_composer_command_entry(ComposerTarget::Session, cx);
         self.refresh_suggestions(ComposerTarget::Session, window, cx);
+        // `set_value` suppresses its own change event, so the store is told
+        // about the recalled message — or the restored draft — here.
+        self.remember_composer_draft(cx);
         cx.notify();
     }
 
@@ -21005,6 +21156,9 @@ impl VibexWorkbench {
         self.composer_attachments.clear();
         self.composer_command_entry = None;
         self.clear_suggestions();
+        // The message consumed the draft; the store must not hand it back when
+        // the session is shown again.
+        self.composer_drafts.consume(message.session_id.as_str());
         // The sent message becomes the newest history entry; a walk that was
         // still pointing at the previous timeline is stale from here on.
         self.reset_composer_history();
@@ -21044,6 +21198,9 @@ impl VibexWorkbench {
         self.composer_attachments.clear();
         self.composer_command_entry = None;
         self.clear_suggestions();
+        // The message consumed the draft; the store must not hand it back when
+        // the session is shown again.
+        self.composer_drafts.consume(message.session_id.as_str());
         // The sent message becomes the newest history entry; a walk that was
         // still pointing at the previous timeline is stale from here on.
         self.reset_composer_history();
@@ -23064,6 +23221,9 @@ impl VibexWorkbench {
         {
             attachment.attachment = updated_attachment;
         }
+        // Editing an image changes the draft without touching its text, so the
+        // store is updated here rather than waiting for a change event.
+        self.remember_composer_draft(cx);
         cx.notify();
         true
     }
@@ -25932,6 +26092,7 @@ impl VibexWorkbench {
         self.session_views.remove(session_id.as_str());
         self.session_view_lru
             .retain(|cached_session_id| cached_session_id != session_id.as_str());
+        self.composer_drafts.forget(session_id.as_str());
         self.reconcile_sidebar_state();
 
         if active && !self.new_session_open {
@@ -28730,6 +28891,8 @@ impl VibexWorkbench {
         self.session_views
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_view_lru
+            .retain(|session_id| !session_ids.contains(session_id));
+        self.composer_drafts
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_new_session_titles
             .retain(|session_id, _| !session_ids.contains(session_id));
@@ -78485,8 +78648,9 @@ mod tests {
         assert!(!selection.contains("self.agent_turn_pending = false;"));
     }
 
-    /// A composer draft lives in its session's own textarea, so navigating away
-    /// and back cannot park one session's text over another's.
+    /// Every session's composer has its own textarea, so no pane can type into
+    /// another session's draft; the per-session store outside the view cache is
+    /// what keeps that draft when the view itself is evicted.
     #[test]
     fn composer_drafts_live_in_their_sessions_own_textarea() {
         let source = include_str!("app.rs");
@@ -78521,6 +78685,188 @@ mod tests {
             .expect("composer subscription factory should remain inspectable");
         assert!(factory.contains("cx.subscribe_in(input, window"));
         assert!(!factory.contains("composer_input_syncing"));
+    }
+
+    /// Switching between two sessions with different unsent text must show each
+    /// Composer its own draft, and returning to the first must restore exactly
+    /// what was left there.
+    #[test]
+    fn composer_drafts_are_scoped_to_their_session_across_a_switch() {
+        let draft = |text: &str| ComposerDraft {
+            content: InputContent::new(text),
+            attachments: Vec::new(),
+            command_entry: None,
+            attachment_serial: 0,
+        };
+        let mut drafts = ComposerDraftStore::default();
+        drafts.save("session-one", draft("first draft"));
+        drafts.save("session-two", draft("second draft"));
+
+        // Each session restores its own text, never the other's.
+        assert_eq!(
+            drafts
+                .get("session-one")
+                .map(|draft| draft.content.text().to_string()),
+            Some("first draft".to_string())
+        );
+        assert_eq!(
+            drafts
+                .get("session-two")
+                .map(|draft| draft.content.text().to_string()),
+            Some("second draft".to_string())
+        );
+
+        // Sending consumes exactly the session it was sent from.
+        assert!(drafts.consume("session-one").is_some());
+        assert!(drafts.get("session-one").is_none());
+        assert_eq!(
+            drafts
+                .get("session-two")
+                .map(|draft| draft.content.text().to_string()),
+            Some("second draft".to_string())
+        );
+
+        // Deleting a session takes its draft with it.
+        drafts.retain(|session_id| session_id != "session-two");
+        assert!(drafts.get("session-two").is_none());
+    }
+
+    /// A picked reference is an atomic token, not plain text: the draft keeps
+    /// the token so a restored composer still edits it as one unit.
+    #[test]
+    fn composer_draft_keeps_reference_tokens() {
+        let text = "@src/file.rs";
+        let content = InputContent::new(text)
+            .with_token(
+                0..text.len(),
+                InlineToken::new("reference:file:src/file.rs", text),
+            )
+            .expect("the reference token should match its text");
+        let mut drafts = ComposerDraftStore::default();
+        drafts.save(
+            "session-one",
+            ComposerDraft {
+                content,
+                attachments: Vec::new(),
+                command_entry: None,
+                attachment_serial: 0,
+            },
+        );
+
+        let saved = drafts.get("session-one").unwrap();
+        assert_eq!(saved.content.text().as_ref(), text);
+        assert_eq!(saved.content.tokens().len(), 1);
+        assert_eq!(
+            saved.content.tokens()[0].token().id().as_ref(),
+            "reference:file:src/file.rs"
+        );
+    }
+
+    #[test]
+    fn composer_draft_keeps_only_the_attachments_still_in_its_text() {
+        let marker = inline_composer_attachment_marker(3);
+        let attachment = InlineComposerAttachment {
+            attachment: ComposerAttachment {
+                id: "attachment:3".into(),
+                label: "notes.txt".into(),
+                path: Some("/tmp/notes.txt".into()),
+                mime_type: None,
+            },
+            marker: marker.clone(),
+        };
+        let mut drafts = ComposerDraftStore::default();
+        drafts.save(
+            "session-one",
+            ComposerDraft {
+                content: InputContent::new(format!("review {marker}")),
+                attachments: vec![attachment.clone()],
+                command_entry: None,
+                attachment_serial: 3,
+            },
+        );
+        let saved = drafts.get("session-one").unwrap();
+        assert_eq!(saved.attachments.len(), 1);
+        assert_eq!(saved.attachment_serial, 3);
+
+        // The reader deleted the marker; the file must not come back with the
+        // draft.
+        drafts.save(
+            "session-one",
+            ComposerDraft {
+                content: InputContent::new("review"),
+                attachments: vec![attachment],
+                command_entry: None,
+                attachment_serial: 3,
+            },
+        );
+        assert!(drafts.get("session-one").unwrap().attachments.is_empty());
+
+        // Whitespace with nothing attached is not a draft.
+        drafts.save(
+            "session-one",
+            ComposerDraft {
+                content: InputContent::new("   "),
+                attachments: Vec::new(),
+                command_entry: None,
+                attachment_serial: 3,
+            },
+        );
+        assert!(drafts.get("session-one").is_none());
+    }
+
+    /// The store only works if the workbench actually saves on every edit, saves
+    /// before a switch, restores when a textarea is built, consumes on send and
+    /// forgets with the session.
+    #[test]
+    fn composer_drafts_are_saved_restored_consumed_and_deleted() {
+        let source = include_str!("app.rs");
+
+        let ensure = source
+            .split_once("    fn ensure_composer_input(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether `session_id` already owns a view")
+            })
+            .map(|(body, _)| body)
+            .expect("composer input creation should remain inspectable");
+        assert!(ensure.contains("self.restore_composer_draft(&session_id, &input, window, cx);"));
+
+        let selection = source
+            .split_once("    fn select_session_with_history(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
+            .map(|(body, _)| body)
+            .expect("session selection should remain inspectable");
+        assert!(selection.contains("self.remember_composer_draft(cx);"));
+
+        let factory = source
+            .split_once("fn subscribe_composer_input(")
+            .and_then(|(_, tail)| tail.split_once("\n/// Field access on the workbench"))
+            .map(|(body, _)| body)
+            .expect("composer subscription factory should remain inspectable");
+        assert!(factory.contains("this.remember_composer_draft(cx);"));
+
+        let take = source
+            .split_once("    fn take_composer_message(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Remote twin of [`Self::take_composer_message`]")
+            })
+            .map(|(body, _)| body)
+            .expect("composer submission should remain inspectable");
+        assert!(take.contains("self.composer_drafts.consume(message.session_id.as_str());"));
+
+        let take_remote = source
+            .split_once("    fn take_composer_message_remote(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Remote twin of the composer dispatch"))
+            .map(|(body, _)| body)
+            .expect("remote composer submission should remain inspectable");
+        assert!(take_remote.contains("self.composer_drafts.consume(message.session_id.as_str());"));
+
+        let removal = source
+            .split_once("    fn optimistically_remove_sessions(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_project("))
+            .map(|(body, _)| body)
+            .expect("session removal should remain inspectable");
+        assert!(removal.contains("self.composer_drafts"));
+        assert!(removal.contains(".retain(|session_id| !session_ids.contains(session_id));"));
     }
 
     #[test]
@@ -87642,11 +87988,12 @@ mod tests {
         ));
 
         // The store keeps one entry per session; borrowing removes it and
-        // releasing puts the very same entry back.
+        // releasing puts the very same entry back, so the path is scoped to the
+        // three borrow functions: a view is never copied on its way in or out.
         let borrow = source
             .split_once("    fn borrow_session_view(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Whether `session_id` already owns a view")
+                tail.split_once("\n    /// The session whose view is currently borrowed.")
             })
             .map(|(body, _)| body)
             .expect("view borrowing should remain inspectable");
