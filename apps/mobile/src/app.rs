@@ -648,6 +648,53 @@ impl MobileHostEntry {
 /// `MobileCredentialBundle::host_label` already applies to derived labels.
 const HOST_NAME_MAX_CHARS: usize = 48;
 
+/// What the phone knows about a saved runtime being up right now.
+///
+/// The first screen is the one place where nothing is connected — the phone is
+/// between runtimes — so the only state a saved runtime can honestly show there
+/// is whether it answers. That answer is the runtime's own, from a probe rather
+/// than from this phone's last attempt to reach it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HostReachability {
+    /// No answer yet: nothing has been asked, or an answer is still on its way.
+    #[default]
+    Probing,
+    /// The runtime answered.
+    Online,
+    /// The runtime did not answer.
+    Offline,
+}
+
+impl HostReachability {
+    /// The dot this state wears. A runtime that is up is green, one that does
+    /// not answer is red, and one the phone has not heard from yet is grey.
+    fn dot_color(self) -> Hsla {
+        match self {
+            Self::Probing => theme::text_muted(),
+            Self::Online => theme::accent_green(),
+            Self::Offline => theme::accent_red(),
+        }
+    }
+
+    /// The words behind the dot, for the row's accessible name.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Probing => locale::text("Checking", "检查中", "檢查中"),
+            Self::Online => locale::text("Online", "在线", "線上"),
+            Self::Offline => locale::common("Offline"),
+        }
+    }
+}
+
+/// Opens one reachability round: every saved runtime is being asked, and a
+/// runtime the phone no longer has saved stops being reported.
+fn begin_reachability_round(known: &[String], states: &mut BTreeMap<String, HostReachability>) {
+    states.retain(|id, _| known.iter().any(|known| known == id));
+    for id in known {
+        states.insert(id.clone(), HostReachability::Probing);
+    }
+}
+
 /// The transport's twelve connection states collapsed to the states the phone
 /// actually shows. Every surface maps through this so one runtime never reads
 /// "Connected" in the list and something else in the drawer.
@@ -951,9 +998,14 @@ pub struct MobileApp {
     pairing_code_input: Entity<InputState>,
     pairing_panel: PairingPanel,
     pairing_scroll: ScrollHandle,
-    /// The saved-runtime strip on the pairing page. It scrolls horizontally
-    /// once the phone knows about more runtimes than fit on one screen.
+    /// The saved-runtime list on the pairing page, which scrolls once the phone
+    /// knows about more runtimes than fit on one screen.
     pairing_runtimes_scroll: ScrollHandle,
+    /// Whether each saved runtime answered the last probe, keyed by host id.
+    /// Only the pairing page shows it: everywhere else the live connection is
+    /// the truth.
+    host_reachability: BTreeMap<String, HostReachability>,
+    reachability_generation: u64,
     nearby_pairing_state: NearbyPairingState,
     nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
     nearby_discovery_generation: u64,
@@ -1251,6 +1303,8 @@ impl MobileApp {
             pairing_panel: PairingPanel::None,
             pairing_scroll: ScrollHandle::new(),
             pairing_runtimes_scroll: ScrollHandle::new(),
+            host_reachability: BTreeMap::new(),
+            reachability_generation: 0,
             nearby_pairing_state: NearbyPairingState::Idle,
             nearby_candidates: BTreeMap::new(),
             nearby_discovery_generation: 0,
@@ -1359,6 +1413,12 @@ impl MobileApp {
         app.start_notification_action_stream(cx);
         app.start_lan_discovery_event_stream(cx);
         app.start_lifecycle_stream(cx);
+        app.watch_host_reachability(cx);
+        // A phone that starts on the first screen with runtimes already saved
+        // has to say which of them answer before the user asks.
+        if app.mode == RootMode::Pairing && !app.known_hosts.is_empty() {
+            app.refresh_host_reachability(cx);
+        }
         // Keep the window root on the dispatch path from the very first frame
         // so system back events reach `handle_navigate_back` before any text
         // input has taken focus.
@@ -1405,6 +1465,10 @@ impl MobileApp {
             MobileLifecycleEvent::Resumed => {
                 self.app_backgrounded = false;
                 self.refresh_battery_allowlist(cx);
+                if self.mode == RootMode::Pairing {
+                    // Nothing was probed while the app was away.
+                    self.refresh_host_reachability(cx);
+                }
                 let Some(backend) = self.backend.clone() else {
                     return;
                 };
@@ -1643,6 +1707,7 @@ impl MobileApp {
                 self.mode = RootMode::Pairing;
                 self.error = Some(error);
                 let _ = self.storage.clear();
+                self.refresh_host_reachability(cx);
                 cx.notify();
             }
         }
@@ -2145,6 +2210,111 @@ impl MobileApp {
     /// through it.
     fn reset_pairing_panel_scroll(&self) {
         self.pairing_scroll.set_offset(point(px(0.0), px(0.0)));
+    }
+
+    /// Asks every saved runtime whether it is up, and records the answers.
+    ///
+    /// The pairing page is the one place where nothing is connected, so this is
+    /// the only state a saved runtime can show there. Each probe is the
+    /// transport's own bounded `/api/v2/info` request, which cannot claim a
+    /// pairing offer or rotate a device grant.
+    fn refresh_host_reachability(&mut self, cx: &mut Context<Self>) {
+        let hosts = self
+            .known_hosts
+            .iter()
+            .map(|host| (host.id.clone(), host.bundle.clone()))
+            .collect::<Vec<_>>();
+        begin_reachability_round(
+            &hosts.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            &mut self.host_reachability,
+        );
+        self.reachability_generation = self.reachability_generation.wrapping_add(1);
+        let generation = self.reachability_generation;
+        if hosts.is_empty() {
+            cx.notify();
+            return;
+        }
+        // The probe is a network round trip, and a test build never makes one:
+        // the gpui test scheduler owns a single thread per test, so an answer
+        // arriving on a tokio worker would be recorded as that test's
+        // nondeterminism. Tests drive `host_reachability` directly instead.
+        #[cfg(not(test))]
+        {
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                futures_util::future::join_all(
+                    hosts
+                        .into_iter()
+                        .map(|(id, bundle)| async move { (id, bundle.probe_online().await) }),
+                )
+                .await
+            });
+            let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                let Ok(answers) = runner.await else {
+                    return;
+                };
+                let _ = entity.update(cx, |this, cx| {
+                    // A newer round already asked, so these answers are history.
+                    if this.reachability_generation != generation {
+                        return;
+                    }
+                    for (id, online) in answers {
+                        this.host_reachability.insert(
+                            id,
+                            if online {
+                                HostReachability::Online
+                            } else {
+                                HostReachability::Offline
+                            },
+                        );
+                    }
+                    cx.notify();
+                });
+            });
+            self.tasks.push(task);
+        }
+        #[cfg(test)]
+        {
+            let _ = (hosts, generation);
+        }
+        cx.notify();
+    }
+
+    /// Keeps the saved runtimes' reachability fresh for as long as the app
+    /// lives: the answer changes while the phone sits on the first screen, and
+    /// the phone is the one that has to notice.
+    fn watch_host_reachability(&mut self, cx: &mut Context<Self>) {
+        // Nothing to watch in a test build, where no probe is ever in flight.
+        #[cfg(test)]
+        {
+            let _ = cx;
+        }
+        #[cfg(not(test))]
+        {
+            let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                loop {
+                    let tick = gpui_tokio::Tokio::spawn(cx, async {
+                        tokio::time::sleep(REACHABILITY_REFRESH_INTERVAL).await;
+                    });
+                    if tick.await.is_err() {
+                        break;
+                    }
+                    let alive = entity
+                        .update(cx, |this, cx| {
+                            if this.mode == RootMode::Pairing
+                                && !this.known_hosts.is_empty()
+                                && !this.app_backgrounded
+                            {
+                                this.refresh_host_reachability(cx);
+                            }
+                        })
+                        .is_ok();
+                    if !alive {
+                        break;
+                    }
+                }
+            });
+            self.tasks.push(task);
+        }
     }
 
     /// Sends the user to the OS page where a denied local-network permission
@@ -4999,6 +5169,7 @@ impl MobileApp {
         let was_active = self.active_host_id.as_deref() == Some(host_id.as_str());
         self.known_hosts.retain(|host| host.id != host_id);
         self.persist_known_hosts();
+        self.host_reachability.remove(&host_id);
         if !was_active {
             // The list is still valid; return to it rather than to the action
             // sheet that pointed at the runtime just removed. The pairing page
@@ -5169,6 +5340,9 @@ impl MobileApp {
         self.workspace_summaries.clear();
         self.reset_sidebar_ui();
         crate::platform::hide_keyboard();
+        // The page about to show is the one that reports which saved runtimes
+        // answer, so it asks as soon as it is on screen.
+        self.refresh_host_reachability(cx);
         cx.notify();
     }
 
@@ -6535,40 +6709,27 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// One saved runtime, as one full-width row: the state in the leading dot,
-    /// what it is called, the kind it is as a glyph, and the way into its own
-    /// actions.
+    /// One saved runtime, as one full-width row: whether it is up in the
+    /// leading dot, what it is called, the kind it is as a glyph, and the way
+    /// into its own actions.
     ///
-    /// Only the runtime the phone is bound to has a live status; the others
-    /// show what is actually known, which is when they were last reached. Both
-    /// read as color and glyph here rather than as words — the words stay on
-    /// the row's accessible name, so the state is never color alone.
+    /// Nothing is connected on this page — the phone is between runtimes — so
+    /// the dot answers the only question that means anything here: did the
+    /// runtime answer the phone's probe? Both readings are color and glyph; the
+    /// words stay on the row's accessible name, so the state is never color
+    /// alone.
     fn render_pairing_runtime_card(
         &self,
         host: &MobileHostEntry,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let selected = self.active_host_id.as_deref() == Some(host.id.as_str());
-        let status = self.host_status(&host.id);
-        let switching = matches!(
-            status.status,
-            RuntimeStatus::Connecting | RuntimeStatus::Reconnecting
-        );
-        // Only the runtime the phone is bound to has a live status; the others
-        // show what is actually known, which is when they were last reached.
-        let status_text = if selected {
-            status.label()
-        } else {
-            host.last_connected_at_ms
-                .map(host_last_connected_label)
-                .unwrap_or_else(|| RuntimeStatus::NotConnected.label(status.reconnect_attempt))
-        };
-        // The dot reads the state at a glance; a grey runtime is idle rather
-        // than failing, so it never borrows the failure color.
-        let status_color = match status.status {
-            RuntimeStatus::NotConnected => theme::text_muted(),
-            other => other.dot_color(),
-        };
+        let reachability = self
+            .host_reachability
+            .get(&host.id)
+            .copied()
+            .unwrap_or_default();
+        let probing = reachability == HostReachability::Probing;
         let switch_id = host.id.clone();
         let menu_id = host.id.clone();
         div()
@@ -6577,7 +6738,7 @@ impl MobileApp {
                 "{} · {} · {}",
                 host.display_label(),
                 host_kind_label(host.server_kind),
-                status_text
+                reachability.label()
             ))
             .w_full()
             .min_h(px(PAIRING_RUNTIME_ROW_HEIGHT))
@@ -6610,13 +6771,12 @@ impl MobileApp {
                     this.switch_host(switch_id.clone(), event, window, cx)
                 }),
             )
-            // The live state leads the row: the dot is the runtime's identity
-            // while it is at rest, and the spinner is the one state a phone has
-            // to look at to believe.
-            .child(if switching {
-                sidebar_running_indicator(status_color)
+            // The dot leads the row: green once the runtime answers, red when
+            // it does not, and the spinner while the phone is still asking.
+            .child(if probing {
+                sidebar_running_indicator(reachability.dot_color())
             } else {
-                sidebar_status_dot(status_color)
+                sidebar_status_dot(reachability.dot_color())
             })
             .child(
                 div()
@@ -17463,6 +17623,11 @@ const PAIRING_WORDMARK_FONT: f32 = 36.0;
 /// dot, its name and its own actions control need.
 const PAIRING_RUNTIME_ROW_HEIGHT: f32 = 52.0;
 
+/// How often the first screen re-asks its saved runtimes whether they are up.
+/// A runtime can come and go while the phone sits on that screen, and nothing
+/// else in the app would notice.
+const REACHABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+
 /// The share of the page the saved-runtime list may cover before it scrolls.
 const PAIRING_RUNTIMES_HEIGHT_RATIO: f32 = 0.34;
 
@@ -19278,6 +19443,32 @@ mod tests {
         );
     }
 
+    /// The dot is the whole reading of a runtime's state on the first screen,
+    /// so each answer owns a color and words for the row's accessible name.
+    #[test]
+    fn every_reachability_answer_reads_as_its_own_state() {
+        let states = [
+            HostReachability::Probing,
+            HostReachability::Online,
+            HostReachability::Offline,
+        ];
+        for state in states {
+            assert!(!state.label().is_empty(), "{state:?}");
+        }
+        assert_ne!(
+            HostReachability::Online.label(),
+            HostReachability::Offline.label()
+        );
+        assert_ne!(
+            HostReachability::Online.dot_color(),
+            HostReachability::Offline.dot_color()
+        );
+        assert_ne!(
+            HostReachability::Online.dot_color(),
+            HostReachability::Probing.dot_color()
+        );
+    }
+
     #[test]
     fn pairing_entry_routing_distinguishes_links_from_bare_codes() {
         for link in [
@@ -19373,6 +19564,16 @@ mod tests {
                 .iter()
                 .map(|bundle| MobileHostEntry::from_bundle(bundle, RemoteServerKind::Desktop))
                 .collect();
+            // One of each answer, so the row draws the dot and the spinner
+            // branches this page can show.
+            for (index, host) in app.known_hosts.iter().enumerate() {
+                let reachability = match index % 3 {
+                    0 => HostReachability::Online,
+                    1 => HostReachability::Offline,
+                    _ => HostReachability::Probing,
+                };
+                app.host_reachability.insert(host.id.clone(), reachability);
+            }
             cx.notify();
         });
         cx.update(|window, cx| {
@@ -19718,15 +19919,18 @@ mod tests {
         assert!(rows.contains(".overflow_y_scroll()"));
         assert!(rows.contains(".max_h(max_height)"));
 
-        // A row is a runtime's whole surface on this page: its live state as
+        // A row is a runtime's whole surface on this page: whether it is up as
         // the leading dot, what it is as a glyph, and the way into its own
-        // actions — removing it included. The state and the kind read as an
-        // icon and a color here, never as a line of text.
+        // actions — removing it included. Both readings are an icon and a
+        // color on the row, never a line of text, and this page reports
+        // reachability rather than a connection it cannot have.
         let card = renderer_source(source, "render_pairing_runtime_card");
-        assert!(card.contains("self.host_status(&host.id)"));
+        assert!(card.contains(".host_reachability"));
+        assert!(card.contains("HostReachability::Probing"));
         assert!(card.contains("sidebar_running_indicator("));
         assert!(card.contains("sidebar_status_dot("));
         assert!(card.contains("host_kind_icon(host.server_kind)"));
+        assert!(!card.contains("self.host_status(&host.id)"));
         for marker in [
             "icons/ellipsis-vertical.svg",
             "open_host_actions(",
@@ -20538,6 +20742,54 @@ mod tests {
             display_name: Some(display_name.to_string()),
             route: None,
         }
+    }
+
+    /// A credential the phone refuses to build a transport for, so a probe
+    /// settles without a single packet leaving the machine.
+    fn unbuildable_host_bundle(server_id: &str, display_name: &str) -> MobileCredentialBundle {
+        let mut bundle = host_bundle(server_id, display_name);
+        // Insecure transport, and this credential is not marked as a local dev
+        // runtime, so building a backend for it fails before any I/O.
+        bundle.record.server_url = "http://desktop.example".to_string();
+        bundle
+    }
+
+    /// Nothing is connected on the first screen, so what a saved runtime shows
+    /// there is whether it answered the phone's probe: each round asks every
+    /// saved runtime and forgets the ones that are gone.
+    #[test]
+    fn a_reachability_round_asks_every_saved_runtime_and_forgets_the_rest() {
+        let mut states = BTreeMap::new();
+        states.insert("runtime-gone".to_string(), HostReachability::Online);
+        states.insert("runtime-a".to_string(), HostReachability::Offline);
+        begin_reachability_round(
+            &["runtime-a".to_string(), "runtime-b".to_string()],
+            &mut states,
+        );
+        assert_eq!(
+            states.len(),
+            2,
+            "only saved runtimes keep a reachability state"
+        );
+        assert_eq!(
+            states.get("runtime-a"),
+            Some(&HostReachability::Probing),
+            "a runtime already answered is asked again"
+        );
+        assert_eq!(states.get("runtime-b"), Some(&HostReachability::Probing));
+        assert!(!states.contains_key("runtime-gone"));
+    }
+
+    /// A credential the phone cannot turn into a transport is a runtime that
+    /// does not answer, and asking costs nothing: no request is made.
+    #[test]
+    fn an_unbuildable_credential_never_probes_online() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("probe runtime");
+        let bundle = unbuildable_host_bundle("runtime-a", "runtime-a");
+        assert!(!runtime.block_on(bundle.probe_online()));
     }
 
     /// The runtime is the authority for both names it publishes: the name it

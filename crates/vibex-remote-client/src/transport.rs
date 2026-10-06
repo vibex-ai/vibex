@@ -1242,6 +1242,24 @@ pub trait RemoteTransport: BackendBound {
     fn gateway_info(&self) -> Option<RemoteGatewayInfo>;
     fn connect(&self) -> BackendFuture<'_, RemoteServerInfoV2>;
     fn disconnect(&self) -> BackendFuture<'_, ()>;
+    /// Ask the peer whether it is up, without connecting, authenticating, or
+    /// consuming anything the server hands out once.
+    ///
+    /// This is the question a client asks about a runtime it is *not* using:
+    /// can this phone reach it right now? It is cheaper than `connect` and
+    /// harmless to repeat, and it carries the same pinned server identity
+    /// checks, so a host answering for another server counts as unreachable.
+    ///
+    /// The default refuses instead of answering: a transport whose only check
+    /// is `connect` must not claim it probed.
+    fn probe_online(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async {
+            Err(BackendError::failed(
+                "remote_probe_unsupported",
+                "this transport has no reachability probe",
+            ))
+        })
+    }
     fn request(&self, request: RemoteRpcRequestV2) -> BackendFuture<'_, RemoteRpcResponseV2>;
     fn subscribe(
         &self,
@@ -2786,6 +2804,10 @@ where
 }
 
 impl RemoteTransport for DirectWebSocketTransport {
+    fn probe_online(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async move { self.probe().await.map(|_| true) })
+    }
+
     fn state(&self) -> RemoteConnectionSnapshot {
         self.inner
             .state
@@ -3055,6 +3077,10 @@ impl RemoteTransport for DirectWebSocketTransport {
 }
 
 impl RemoteTransport for RelayE2eeTransport {
+    fn probe_online(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async move { self.probe().await.map(|_| true) })
+    }
+
     fn state(&self) -> RemoteConnectionSnapshot {
         self.inner
             .state
@@ -5279,6 +5305,31 @@ impl AutoRemoteTransport {
 }
 
 impl RemoteTransport for AutoRemoteTransport {
+    fn probe_online(&self) -> BackendFuture<'_, bool> {
+        Box::pin(async move {
+            // The bounded candidate probe Auto mode chooses a Direct route
+            // with, so a host that answers here is one this phone could
+            // actually connect to. A route this phone cannot even build is not
+            // an error to report: it is a route that did not answer.
+            if !self.config.direct_candidates.is_empty()
+                && let Ok(probe) = DirectWebSocketTransport::new(self.config.remote.clone())
+                && probe
+                    .probe_direct_candidates(self.config.direct_candidates.clone())
+                    .await
+                    .is_ok()
+            {
+                return Ok(true);
+            }
+            let Some(relay) = self.config.relay.clone() else {
+                return Ok(false);
+            };
+            let Ok(transport) = RelayE2eeTransport::new(relay) else {
+                return Ok(false);
+            };
+            Ok(transport.probe().await.is_ok())
+        })
+    }
+
     fn state(&self) -> RemoteConnectionSnapshot {
         // The selected transport owns its live connection lifecycle. Keep the
         // Auto wrapper's snapshot for probing/fallback only, so terminal

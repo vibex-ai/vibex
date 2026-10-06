@@ -20,6 +20,10 @@ use vibex_remote_client::{
 
 pub const MOBILE_CREDENTIAL_SCHEMA_VERSION: &str = "vibex-native-mobile-credentials.v1";
 
+/// How long a saved runtime has to answer the reachability probe before the
+/// phone stops waiting and calls it unreachable.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MobileCredentialBundle {
@@ -240,6 +244,22 @@ impl MobileCredentialBundle {
         self.validate()?;
         let transport = AutoRemoteTransport::new(self.auto_transport_config()?)?;
         Ok(Arc::new(WebRemoteBackend::from_auto(transport)))
+    }
+
+    /// Asks the runtime whether it is up, through the transport's own bounded
+    /// info probe.
+    ///
+    /// The probe carries the credential's pinned server identity, so a host
+    /// that answers for a different server counts as unreachable, and it cannot
+    /// claim a pairing offer or rotate a device grant. The transport it builds
+    /// belongs to this one call.
+    pub async fn probe_online(&self) -> bool {
+        let Ok(backend) = self.backend() else {
+            return false;
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, backend.transport().probe_online())
+            .await
+            .is_ok_and(|probe| probe.is_ok_and(|online| online))
     }
 
     pub(crate) fn auto_transport_config(&self) -> BackendResult<AutoRemoteTransportConfig> {
