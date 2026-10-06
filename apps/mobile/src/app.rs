@@ -6375,7 +6375,12 @@ impl MobileApp {
     /// Nothing here moves when a fallback opens: `render_pairing_sheet` lays the
     /// panel over the page instead of taking room in it, so an entry keeps the
     /// exact place the finger just left.
-    fn render_pairing(&self, sheet_max_height: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pairing(
+        &self,
+        runtimes_max_height: Pixels,
+        sheet_max_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let scan_busy = self.pairing_action == Some(PairingAction::Scan);
         let scan_enabled = !self.pairing_busy;
         let saved_runtimes = !self.known_hosts.is_empty();
@@ -6411,7 +6416,7 @@ impl MobileApp {
                                     .flex_col()
                                     .pt(px(PAIRING_PAGE_TOP_PAD))
                                     .child(self.render_pairing_brand())
-                                    .child(self.render_pairing_runtimes(cx))
+                                    .child(self.render_pairing_runtimes(runtimes_max_height, cx))
                                     .when_some(error_here, |page, line| {
                                         page.child(div().mb(px(theme::SPACING_MD)).child(line))
                                     })
@@ -6444,7 +6449,7 @@ impl MobileApp {
             )
             .child(self.render_pairing_sheet(sheet_max_height, cx))
             // Last, so a runtime's own surfaces sit above the page that opened
-            // them: the cards here are the same runtime list, so the same
+            // them: the rows here are the same runtime list, so the same
             // actions, rename and remove sheets belong to them.
             .when_some(
                 self.overlay.filter(|overlay| overlay.is_host_overlay()),
@@ -6492,15 +6497,19 @@ impl MobileApp {
             )
     }
 
-    /// The runtimes this phone has saved, as one row of cards.
+    /// The runtimes this phone has saved, one full-width row each.
     ///
     /// A tap is the whole interaction: it installs that runtime's credential
-    /// and connects. The strip scrolls sideways rather than wrapping, so the
-    /// page keeps a single row of history however many runtimes are saved.
+    /// and connects. The list scrolls rather than growing the page, so the
+    /// entries below keep their room however many runtimes are saved.
     ///
     /// A phone that has saved none renders nothing here: the entries below say
     /// what to do about that already.
-    fn render_pairing_runtimes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_pairing_runtimes(
+        &self,
+        max_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         if self.known_hosts.is_empty() {
             return div().into_any_element();
         }
@@ -6510,10 +6519,12 @@ impl MobileApp {
             .w_full()
             .flex_shrink_0()
             .mb(px(theme::SPACING_MD))
-            .overflow_x_scroll()
-            .restrict_scroll_to_axis()
+            .max_h(max_height)
             .track_scroll(&self.pairing_runtimes_scroll)
+            .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .flex()
+            .flex_col()
             .gap(px(theme::SPACING_SM))
             .children(
                 self.known_hosts
@@ -6524,10 +6535,14 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// One saved runtime: what it is called, what it is, what state it is in,
-    /// and the way into its own actions. Only the runtime the phone is bound to
-    /// has a live status; the others show what is actually known, which is when
-    /// they were last reached.
+    /// One saved runtime, as one full-width row: the state in the leading dot,
+    /// what it is called, the kind it is as a glyph, and the way into its own
+    /// actions.
+    ///
+    /// Only the runtime the phone is bound to has a live status; the others
+    /// show what is actually known, which is when they were last reached. Both
+    /// read as color and glyph here rather than as words — the words stay on
+    /// the row's accessible name, so the state is never color alone.
     fn render_pairing_runtime_card(
         &self,
         host: &MobileHostEntry,
@@ -6548,8 +6563,8 @@ impl MobileApp {
                 .map(host_last_connected_label)
                 .unwrap_or_else(|| RuntimeStatus::NotConnected.label(status.reconnect_attempt))
         };
-        // The words carry the state on their own; the color is the second
-        // reading of it, so a grey runtime never looks like a failing one.
+        // The dot reads the state at a glance; a grey runtime is idle rather
+        // than failing, so it never borrows the failure color.
         let status_color = match status.status {
             RuntimeStatus::NotConnected => theme::text_muted(),
             other => other.dot_color(),
@@ -6558,12 +6573,14 @@ impl MobileApp {
         let menu_id = host.id.clone();
         div()
             .id(format!("pairing-runtime-{}", host.id))
-            .aria_label(locale::common("Connect"))
-            .w(px(PAIRING_RUNTIME_CARD_WIDTH))
-            // A floor rather than a fixed height: the card is this tall at
-            // rest, and the tallest card sets the strip's height when a name or
-            // a state would need more room than that.
-            .min_h(px(PAIRING_RUNTIME_CARD_HEIGHT))
+            .aria_label(format!(
+                "{} · {} · {}",
+                host.display_label(),
+                host_kind_label(host.server_kind),
+                status_text
+            ))
+            .w_full()
+            .min_h(px(PAIRING_RUNTIME_ROW_HEIGHT))
             .flex_shrink_0()
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
@@ -6574,12 +6591,17 @@ impl MobileApp {
             } else {
                 theme::border_subtle()
             })
-            .when(selected, |card| card.bg(theme::bg_card()))
-            .p(px(theme::SPACING_MD))
+            .bg(if selected {
+                theme::bg_card()
+            } else {
+                theme::bg_card_dim()
+            })
+            .pl(px(theme::SPACING_MD))
+            .pr(px(theme::SPACING_XS))
+            .py(px(theme::SPACING_XS))
             .flex()
-            .flex_col()
-            .justify_between()
-            .gap(px(theme::SPACING_XS))
+            .items_center()
+            .gap(px(theme::SPACING_SM))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
@@ -6588,82 +6610,64 @@ impl MobileApp {
                     this.switch_host(switch_id.clone(), event, window, cx)
                 }),
             )
+            // The live state leads the row: the dot is the runtime's identity
+            // while it is at rest, and the spinner is the one state a phone has
+            // to look at to believe.
+            .child(if switching {
+                sidebar_running_indicator(status_color)
+            } else {
+                sidebar_status_dot(status_color)
+            })
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_SIDEBAR_ROW))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if selected {
+                        theme::text_primary()
+                    } else {
+                        theme::text_secondary()
+                    })
+                    .child(host.display_label()),
+            )
+            .child(
+                svg()
+                    .path(host_kind_icon(host.server_kind))
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::text_muted()),
+            )
+            .child(
+                div()
+                    .id(format!("pairing-runtime-menu-{}", host.id))
+                    .aria_label(locale::common("Runtime actions"))
+                    .size(px(theme::SIDEBAR_ACTION_WIDTH))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    // The live state leads the card: the dot is the runtime's
-                    // identity while it is at rest, and the spinner is the one
-                    // state a phone has to look at to believe.
-                    .child(if switching {
-                        sidebar_running_indicator(status_color)
-                    } else {
-                        sidebar_status_dot(status_color)
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_SIDEBAR_ROW))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if selected {
-                                theme::text_primary()
-                            } else {
-                                theme::text_secondary()
-                            })
-                            .child(host.display_label()),
+                    .justify_center()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            // The row underneath connects; the menu must not
+                            // also open the runtime it belongs to.
+                            cx.stop_propagation();
+                            this.open_host_actions(menu_id.clone(), window, cx);
+                        }),
                     )
                     .child(
-                        div()
-                            .id(format!("pairing-runtime-menu-{}", host.id))
-                            .aria_label(locale::common("Runtime actions"))
-                            .size(px(theme::SIDEBAR_ACTION_WIDTH))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    // The card underneath connects; the menu
-                                    // must not also open the runtime it belongs
-                                    // to.
-                                    cx.stop_propagation();
-                                    this.open_host_actions(menu_id.clone(), window, cx);
-                                }),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/ellipsis-vertical.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
+                        svg()
+                            .path("icons/ellipsis-vertical.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
                     ),
-            )
-            .child(
-                div()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(theme::FONT_MICRO))
-                    .text_color(theme::text_muted())
-                    .child(host_kind_label(host.server_kind)),
-            )
-            .child(
-                div()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(theme::FONT_MICRO))
-                    .text_color(status_color)
-                    .child(status_text),
             )
             .into_any_element()
     }
@@ -14597,7 +14601,11 @@ impl Render for MobileApp {
             .pl(insets.left)
             .child(match self.mode {
                 RootMode::Pairing => self
-                    .render_pairing(pairing_sheet_max_height(window), cx)
+                    .render_pairing(
+                        pairing_runtimes_max_height(window),
+                        pairing_sheet_max_height(window),
+                        cx,
+                    )
                     .into_any_element(),
                 RootMode::Connecting => self.render_connecting(cx).into_any_element(),
                 RootMode::Workspace => self.render_workspace(page_width, cx).into_any_element(),
@@ -14614,6 +14622,15 @@ impl Render for MobileApp {
 /// it explains stay in sight behind the scrim.
 fn pairing_sheet_max_height(window: &Window) -> Pixels {
     px(f32::from(window.viewport_size().height) * PAIRING_SHEET_HEIGHT_RATIO)
+}
+
+/// How much of the page the saved-runtime list may take before it scrolls.
+///
+/// The list is a shortcut, not the page: the wordmark above it and the entries
+/// below it keep their room, so a phone with a dozen runtimes still shows the
+/// three ways to reach one.
+fn pairing_runtimes_max_height(window: &Window) -> Pixels {
+    px(f32::from(window.viewport_size().height) * PAIRING_RUNTIMES_HEIGHT_RATIO)
 }
 
 fn workspace_page_width(window: &Window) -> f32 {
@@ -17243,6 +17260,16 @@ fn host_kind_label(kind: RemoteServerKind) -> &'static str {
     host_kind_label_for(locale::current(), kind)
 }
 
+/// The glyph a runtime's kind wears on its row. A computer on a desk and a
+/// machine that only exists as a server are the two shapes the phone can reach,
+/// and a peer that never said which it is keeps the generic server glyph.
+fn host_kind_icon(kind: RemoteServerKind) -> &'static str {
+    match kind {
+        RemoteServerKind::Desktop => "icons/monitor.svg",
+        RemoteServerKind::Headless | RemoteServerKind::Unknown => "icons/server.svg",
+    }
+}
+
 /// One read-only field of the runtime detail page: a label column and the
 /// stored value beside it.
 fn host_detail_field(
@@ -17432,13 +17459,12 @@ const PAIRING_SHEET_HEIGHT_RATIO: f32 = 0.62;
 /// size, so the mark stays a little wider than the label is tall.
 const PAIRING_WORDMARK_FONT: f32 = 36.0;
 
-/// One saved runtime card in the pairing page's strip. Wide enough for a name,
-/// the line under it and its own actions, narrow enough that the next card
-/// shows through and tells the user the strip scrolls.
-const PAIRING_RUNTIME_CARD_WIDTH: f32 = 180.0;
-/// How tall a card is at rest: the name row with its actions control, the kind
-/// line and the state line, with the padding they sit in.
-const PAIRING_RUNTIME_CARD_HEIGHT: f32 = 92.0;
+/// How tall one saved-runtime row is: a touch target with the room its state
+/// dot, its name and its own actions control need.
+const PAIRING_RUNTIME_ROW_HEIGHT: f32 = 52.0;
+
+/// The share of the page the saved-runtime list may cover before it scrolls.
+const PAIRING_RUNTIMES_HEIGHT_RATIO: f32 = 0.34;
 
 /// The busy indicator the pairing actions share.
 fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
@@ -19322,11 +19348,12 @@ mod tests {
         });
     }
 
-    /// The first screen leads with the runtimes the phone already knows, in a
-    /// strip that scrolls once they stop fitting. A real paint is the only
-    /// thing between a layout mistake in that strip and a blank first screen.
+    /// The first screen leads with the runtimes the phone already knows, as
+    /// full-width rows that scroll once they stop fitting. A real paint is the
+    /// only thing between a layout mistake in that list and a blank first
+    /// screen.
     #[gpui::test]
-    fn pairing_page_paints_the_saved_runtime_strip(cx: &mut TestAppContext) {
+    fn pairing_page_paints_the_saved_runtime_list(cx: &mut TestAppContext) {
         cx.update(bind_keys);
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
@@ -19335,7 +19362,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let bundles = (0..5)
+        // Enough runtimes to overflow whatever screen the test runs on, so the
+        // list is exercised as a scrollable list rather than as a short stack.
+        let bundles = (0..20)
             .map(|index| host_bundle(&format!("runtime-{index}"), &format!("studio-{index}")))
             .collect::<Vec<_>>();
         app.update(cx, |app, cx| {
@@ -19350,25 +19379,33 @@ mod tests {
             let _ = window.draw(cx);
         });
 
-        // Five runtimes do not fit, and the strip is what gives: a sideways
-        // pan moves it, and the page never grows a second row of cards.
-        let strip = cx
+        // The rows take the width of the page's column rather than sitting in a
+        // clump against its left edge, and the list stops at its share of the
+        // page and scrolls instead of growing the page.
+        let list = cx
             .debug_bounds("pairing-runtimes")
-            .expect("the runtime strip should be laid out");
+            .expect("the runtime list should be laid out");
+        assert_eq!(
+            list.size.width,
+            px(theme::CARD_WIDTH),
+            "a runtime row should span the column: {:?}",
+            list.size
+        );
+        let cap = cx.update(|window, _| pairing_runtimes_max_height(window));
+        assert!(
+            list.size.height <= cap,
+            "the list should stop at its share of the page: {:?} vs {cap:?}",
+            list.size
+        );
         let max_offset = app.read_with(cx, |app, _| app.pairing_runtimes_scroll.max_offset());
         assert!(
-            max_offset.x > px(0.0),
-            "the strip should overflow sideways: {max_offset:?}"
+            max_offset.y > px(0.0),
+            "the list should overflow downwards: {max_offset:?}"
         );
-        assert!(
-            strip.size.height < px(2.0 * PAIRING_RUNTIME_CARD_HEIGHT),
-            "the runtimes should share one row: {:?}",
-            strip.size
-        );
-        assert!(
-            strip.size.height >= px(PAIRING_RUNTIME_CARD_HEIGHT),
-            "a card should keep its resting height: {:?}",
-            strip.size
+        assert_eq!(
+            max_offset.x,
+            px(0.0),
+            "the list itself never scrolls sideways"
         );
 
         // The three ways to add a runtime sit on one row at the foot of the
@@ -19384,17 +19421,17 @@ mod tests {
 
         cx.simulate_event(ScrollWheelEvent {
             position: point(
-                strip.origin.x + strip.size.width / 2.0,
-                strip.origin.y + strip.size.height / 2.0,
+                list.origin.x + list.size.width / 2.0,
+                list.origin.y + list.size.height / 2.0,
             ),
-            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
         });
         cx.run_until_parked();
         assert!(
-            app.read_with(cx, |app, _| app.pairing_runtimes_scroll.offset().x) < px(0.0),
-            "a sideways pan should scroll the runtime strip"
+            app.read_with(cx, |app, _| app.pairing_runtimes_scroll.offset().y) < px(0.0),
+            "a pan down the list should scroll it"
         );
 
         // A fallback opens as a sheet over the page, so the entries stay exactly
@@ -19417,10 +19454,9 @@ mod tests {
             "opening a sheet must not move the bottom row"
         );
         assert_eq!(
-            cx.debug_bounds("pairing-runtimes")
-                .expect("the strip stays"),
-            strip,
-            "opening a sheet must not move the runtime strip"
+            cx.debug_bounds("pairing-runtimes").expect("the list stays"),
+            list,
+            "opening a sheet must not move the runtime list"
         );
 
         // A long result list grows into the page only up to the sheet's cap,
@@ -19475,7 +19511,7 @@ mod tests {
         );
 
         // The same page with the runtime list empty is what a fresh install
-        // paints: no strip, no empty-state copy, and the three entries stacked
+        // paints: no rows, no empty-state copy, and the three entries stacked
         // in the middle of the page instead of hanging off the bottom edge.
         app.update(cx, |app, cx| {
             app.known_hosts.clear();
@@ -19487,7 +19523,7 @@ mod tests {
         });
         assert!(
             cx.debug_bounds("pairing-runtimes").is_none(),
-            "an empty runtime list should render no strip"
+            "an empty runtime list should render no rows"
         );
         assert!(
             cx.debug_bounds("pairing-actions").is_none(),
@@ -19560,10 +19596,10 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        let strip = cx.debug_bounds("pairing-runtimes").expect("the strip");
+        let list = cx.debug_bounds("pairing-runtimes").expect("the list");
 
         // A card's own menu opens the runtime sheet the rest of the app uses,
-        // and the strip behind it keeps its place.
+        // and the list behind it keeps its place.
         cx.update(|window, cx| {
             let inactive_id = inactive_id.clone();
             app.update(cx, |app, cx| app.open_host_actions(inactive_id, window, cx));
@@ -19576,10 +19612,9 @@ mod tests {
             "the runtime actions should paint over the pairing page"
         );
         assert_eq!(
-            cx.debug_bounds("pairing-runtimes")
-                .expect("the strip stays"),
-            strip,
-            "a runtime's own sheet must not move the strip"
+            cx.debug_bounds("pairing-runtimes").expect("the list stays"),
+            list,
+            "a runtime's own sheet must not move the list"
         );
 
         // Back closes that sheet first: it is the topmost surface on the page.
@@ -19622,7 +19657,7 @@ mod tests {
         assert!(app.read_with(cx, |app, _| matches!(app.mode, RootMode::Pairing)));
         assert!(
             cx.debug_bounds("pairing-runtimes").is_none(),
-            "the strip goes with the last runtime"
+            "the list goes with the last runtime"
         );
         assert!(
             cx.debug_bounds("pairing-actions-stack").is_some(),
@@ -19644,15 +19679,15 @@ mod tests {
     }
 
     /// The pairing page is the product wordmark plus the runtimes this phone
-    /// already paired. A title above the wordmark, or a strip that wraps
-    /// instead of scrolling, would both undo what the page is for.
+    /// already paired. A title above the wordmark, or rows that wrap instead
+    /// of scrolling, would both undo what the page is for.
     #[test]
-    fn the_pairing_page_keeps_the_wordmark_and_one_runtime_row() {
+    fn the_pairing_page_keeps_the_wordmark_and_its_runtime_rows() {
         let source = include_str!("app.rs");
         let page = renderer_source(source, "render_pairing");
         for call in [
             "self.render_pairing_brand()",
-            "self.render_pairing_runtimes(cx)",
+            "self.render_pairing_runtimes(runtimes_max_height, cx)",
             "self.render_pairing_actions(scan_busy, scan_enabled, cx)",
             "self.render_pairing_stack(",
             "self.render_pairing_sheet(sheet_max_height, cx)",
@@ -19678,16 +19713,20 @@ mod tests {
 
         // Every saved runtime is reachable, and the row scrolls sideways once
         // they stop fitting.
-        let strip = renderer_source(source, "render_pairing_runtimes");
-        assert!(strip.contains("self.known_hosts"));
-        assert!(strip.contains(".overflow_x_scroll()"));
+        let rows = renderer_source(source, "render_pairing_runtimes");
+        assert!(rows.contains("self.known_hosts"));
+        assert!(rows.contains(".overflow_y_scroll()"));
+        assert!(rows.contains(".max_h(max_height)"));
 
-        // A card is a runtime's whole surface on this page: its live state, what
-        // it is, and the way into its own actions — removing it included.
+        // A row is a runtime's whole surface on this page: its live state as
+        // the leading dot, what it is as a glyph, and the way into its own
+        // actions — removing it included. The state and the kind read as an
+        // icon and a color here, never as a line of text.
         let card = renderer_source(source, "render_pairing_runtime_card");
         assert!(card.contains("self.host_status(&host.id)"));
         assert!(card.contains("sidebar_running_indicator("));
         assert!(card.contains("sidebar_status_dot("));
+        assert!(card.contains("host_kind_icon(host.server_kind)"));
         for marker in [
             "icons/ellipsis-vertical.svg",
             "open_host_actions(",
@@ -19695,6 +19734,11 @@ mod tests {
         ] {
             assert!(card.contains(marker), "the card should keep {marker}");
         }
+        // The words for the kind and the state survive only in the row's
+        // accessible name; nothing on the row renders them.
+        assert_eq!(card.matches("host_kind_label(host.server_kind)").count(), 1);
+        assert!(card.contains(".aria_label(format!("));
+        assert!(!card.contains("text_size(px(theme::FONT_MICRO))"));
 
         // Both layouts offer the same three entries, and the stack keeps them
         // at their touch-target height instead of flexing them tall.
