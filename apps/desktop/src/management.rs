@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::typography::code_font_weight;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -69,7 +70,6 @@ use vibex_desktop_model::{
     RedactedDiagnosticProjection, ordered_agent_ids,
 };
 use vibex_desktop_runtime::{DesktopRuntime, validate_external_open_url};
-use vibex_markdown::code_font_weight;
 use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::app::TITLE_BAR_HEIGHT;

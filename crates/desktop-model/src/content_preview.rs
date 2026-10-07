@@ -3,12 +3,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{FilePreviewKind, FileReadResponse};
-use vibex_markdown::ResourcePolicy;
-pub use vibex_markdown::{
-    DATA_IMAGE_MAX_ENCODED_BYTES, MARKDOWN_MAX_RESOURCES as MARKDOWN_MAX_ASSETS,
-    MARKDOWN_MAX_SOURCE_BYTES, MarkdownAsset, MarkdownAssetKind, MarkdownAssetRole,
-    MarkdownDocument, MarkdownInput, MarkdownSurface, parse_markdown,
-};
 
 pub const IMAGE_MAX_DIMENSION: u32 = 16_384;
 pub const IMAGE_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
@@ -59,40 +53,6 @@ pub fn content_preview_kind_for_path(path: &str) -> ContentPreviewKind {
             ContentPreviewKind::Office
         }
         _ => ContentPreviewKind::TextEditor,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarkdownDocumentModel {
-    pub source: String,
-    pub base_path: String,
-    pub assets: Vec<MarkdownAsset>,
-    pub truncated_assets: bool,
-    pub parse_error: Option<String>,
-}
-
-impl MarkdownDocumentModel {
-    pub fn parse(source: &str, file_path: &str) -> Self {
-        let policy = ResourcePolicy::for_file(file_path);
-        let document = parse_markdown(MarkdownInput::new(source, policy.base_path(), 0));
-        let truncated_assets = document
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "markdown_resource_limit");
-        Self {
-            source: document.source.to_string(),
-            base_path: document.base_path.to_string(),
-            assets: document.resources.to_vec(),
-            truncated_assets,
-            parse_error: None,
-        }
-    }
-
-    pub fn workspace_assets(&self) -> impl Iterator<Item = &MarkdownAsset> {
-        self.assets
-            .iter()
-            .filter(|asset| asset.kind == MarkdownAssetKind::Workspace)
     }
 }
 
@@ -274,47 +234,6 @@ mod tests {
             },
             content_revision: "r1".to_string(),
         }
-    }
-
-    #[test]
-    fn gfm_assets_use_one_parser_and_workspace_policy() {
-        let model = MarkdownDocumentModel::parse(
-            "![local](../assets/a.png) [web](https://example.com) ![bad](file:///etc/passwd)",
-            "docs/guide/readme.md",
-        );
-        assert_eq!(model.parse_error, None);
-        assert_eq!(model.assets.len(), 3);
-        assert_eq!(model.assets[0].kind, MarkdownAssetKind::Workspace);
-        assert_eq!(
-            model.assets[0].resolved.as_deref(),
-            Some("docs/assets/a.png")
-        );
-        assert_eq!(model.assets[1].kind, MarkdownAssetKind::Http);
-        assert_eq!(model.assets[2].kind, MarkdownAssetKind::Blocked);
-    }
-
-    #[test]
-    fn canonical_document_keeps_workspace_and_http_links_typed() {
-        let source = "Read [the guide](../guide.md) and [the site](https://example.com).";
-        let document = parse_markdown(MarkdownInput::new(source, "docs/notes", 1));
-
-        assert_eq!(document.source.as_ref(), source);
-        assert_eq!(document.resources[0].kind, MarkdownAssetKind::Workspace);
-        assert_eq!(
-            document.resources[0].resolved.as_deref(),
-            Some("docs/guide.md")
-        );
-        assert_eq!(document.resources[1].kind, MarkdownAssetKind::Http);
-    }
-
-    #[test]
-    fn data_images_are_bounded_and_scheme_allowlisted() {
-        let model = MarkdownDocumentModel::parse(
-            "![ok](data:image/png;base64,aGVsbG8=) [bad](javascript:alert(1))",
-            "README.md",
-        );
-        assert_eq!(model.assets[0].kind, MarkdownAssetKind::DataImage);
-        assert_eq!(model.assets[1].kind, MarkdownAssetKind::Blocked);
     }
 
     #[test]

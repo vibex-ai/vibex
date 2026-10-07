@@ -8,7 +8,38 @@
 //! information in a narrow column, so the steps are half-pixel apart and the
 //! section headings sit a full step below the row text.
 
-use gpui::{Rems, rems};
+use gpui::{App, FontWeight, Global, Rems, rems};
+
+/// The weight code surfaces paint at, as chosen in Appearance settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeTypography {
+    weight: u16,
+}
+
+impl Default for CodeTypography {
+    fn default() -> Self {
+        Self { weight: 400 }
+    }
+}
+
+impl Global for CodeTypography {}
+
+/// Publish the preferred code font weight for the whole application.
+pub fn apply_code_font_weight(weight: u16, cx: &mut App) {
+    cx.set_global(CodeTypography {
+        weight: weight.clamp(100, 900),
+    });
+}
+
+/// The preferred code font weight, defaulting to regular.
+pub fn code_font_weight(cx: &App) -> FontWeight {
+    FontWeight(
+        cx.try_global::<CodeTypography>()
+            .copied()
+            .unwrap_or_default()
+            .weight as f32,
+    )
+}
 
 /// The ladder's values in logical pixels at the default 16px root.
 pub const MENU_ROW: f32 = 12.5;

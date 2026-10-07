@@ -25,7 +25,6 @@ members = [
   "crates/relay",
   "crates/remote",
   "crates/terminal",
-  "crates/vibex-markdown",
   "crates/vibex-backend",
   "crates/vibex-remote-client",
   "crates/vibex-ui",
@@ -112,12 +111,13 @@ gpui-kit-assets = "0.7.0"
 gpui-base = "0.7.0"
 image = { version = "=0.25.10", default-features = false }
 tray-icon = { version = "0.24.2", default-features = false }
+# The Markdown parser the component text view renders with. The clients read
+# their plain-text and resource projections through it, so it stays a direct
+# dependency of the shared UI layer.
 markdown = { version = "=1.0.0", features = ["serde"] }
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
-mathjax-svg-rs = "=0.4.0"
 mdns-sd = { version = "0.21.0", default-features = false }
-mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 pulldown-cmark = { version = "=0.13.0", default-features = false, features = ["html", "serde", "simd"] }
 pdfium-render = { version = "=0.9.3", default-features = false, features = ["pdfium_7881", "thread_safe"] }
 quick-xml = "=0.41.0"
@@ -137,7 +137,6 @@ tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 url = { version = "=2.5.8", features = ["serde"] }
 webpki-root-certs = "1"
-ropey = "=2.0.0-beta.1"
 x25519-dalek = { version = "2", default-features = false, features = ["alloc", "precomputed-tables", "static_secrets", "zeroize"] }
 zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

@@ -5,12 +5,12 @@ use html5ever::tendril::TendrilSink as _;
 use html5ever::{ParseOpts, parse_document};
 use markup5ever_rcdom::{Node, NodeData, RcDom};
 
-use crate::limits::{MarkdownLimits, bounded_text, utf8_prefix};
-use crate::model::{
+use crate::markdown::limits::{MarkdownLimits, bounded_text, utf8_prefix};
+use crate::markdown::model::{
     Block, BlockNode, DefinitionItem, DiagnosticSeverity, Inline, InlineImage, InlineNode,
     ListItem, MarkdownDiagnostic, NodeId, SourceRange, TableAlignment, TableRow, stable_node_id,
 };
-use crate::resource::{ResolvedResource, ResourcePolicy, ResourceRole};
+use crate::markdown::resource::{ResolvedResource, ResourcePolicy, ResourceRole};
 
 pub(crate) struct HtmlParseResult {
     pub blocks: Vec<BlockNode>,
@@ -557,7 +557,7 @@ fn text_content(node: &Rc<Node>) -> String {
 }
 
 fn inline_text(nodes: &[InlineNode]) -> String {
-    crate::model::plain_text(nodes)
+    crate::markdown::model::plain_text(nodes)
 }
 
 fn is_block_node(node: &Rc<Node>) -> bool {
@@ -671,7 +671,7 @@ fn slugify(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::ResourceKind;
+    use crate::markdown::resource::ResourceKind;
 
     #[test]
     fn safe_subset_maps_semantics_and_rejects_active_content() {

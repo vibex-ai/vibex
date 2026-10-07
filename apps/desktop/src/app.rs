@@ -155,17 +155,18 @@ use vibex_desktop_runtime::{
     STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport,
     validate_external_open_url,
 };
-use vibex_markdown::{
-    Block, BlockNode, Inline, InlineNode, MarkdownDocument, MarkdownInput, MarkdownLimits,
-    MarkdownPresentation, MarkdownSurface, MarkdownView, NodeId, ResolvedResource, ResourceKind,
-    ResourceRole, SourceRange, apply_code_font_weight, code_font_weight,
-    parse_markdown_with_limits, utf8_prefix,
-};
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
     ManagementWorkflowController, ShellKind, TerminalWorkflowCapabilities,
     TerminalWorkflowController,
 };
+
+use crate::markdown::{
+    MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
+    escape_markdown_literal, plain_text as markdown_plain_text, resolve_workspace_path,
+    resources as markdown_resources, text_view_style, utf8_prefix,
+};
+use crate::typography::{apply_code_font_weight, code_font_weight};
 
 use crate::actions::{
     GoToLineInEditor, NavigateBack, NavigateForward, NewSession, OpenCommandPalette,
@@ -559,7 +560,6 @@ const AGENT_TURN_PREVIEW_RAIL_WIDTH: f32 = 35.2;
 const AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT: f32 = 12.0;
 const AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS: usize = 180;
 const AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES: usize = 8 * 1024;
-const AGENT_TURN_PREVIEW_MARKDOWN_MAX_NODES: usize = 4_096;
 const AGENT_TURN_PREVIEW_MARKDOWN_MAX_RESOURCES: usize = 32;
 const AGENT_TURN_PREVIEW_CARD_MAX_WIDTH: f32 = 320.0;
 const AGENT_TURN_PREVIEW_CARD_MIN_WIDTH: f32 = 248.0;
@@ -1879,6 +1879,28 @@ struct TimelineMarkdownSourceSnapshot {
     source: Arc<str>,
     refreshed_at: Instant,
 }
+
+/// One Markdown surface's retained gpui-component text view.
+///
+/// The text view parses and lays out; this holds the state that has to survive
+/// a frame — the parse itself, the selection, and the find-bar highlights —
+/// plus the source the state was last handed, so an unchanged streaming row
+/// does not re-hand it (and re-compare it) every frame.
+struct MarkdownTextState {
+    state: Entity<TextViewState>,
+    /// Keeps the parse observer alive; dropping it stops the highlight refresh.
+    _observed: Subscription,
+    source: Arc<str>,
+    query: Option<Arc<str>>,
+    active: bool,
+    /// The rendered text the highlights were last searched against, so a parse
+    /// notification that changed nothing does not search again.
+    searched: Option<RenderedText>,
+}
+
+/// How many Markdown surfaces keep a retained text view. The timeline clears
+/// the map when the session changes; this bound covers a long single session.
+const MARKDOWN_TEXT_STATE_LIMIT: usize = 192;
 
 #[derive(Clone)]
 struct AgentReasoningSummary {
@@ -3523,6 +3545,11 @@ pub struct SessionView {
     timeline_process_unit_heights: BTreeMap<String, TimelineProcessUnitHeight>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
+    /// The retained text-view state of every Markdown surface the timeline has
+    /// rendered, keyed by view id. Rendering itself belongs to the
+    /// gpui-component text view; this only keeps the parse, the selection and
+    /// the find-bar highlights alive across frames.
+    markdown_text_states: BTreeMap<String, MarkdownTextState>,
     timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
     timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
@@ -3624,6 +3651,7 @@ impl SessionView {
             timeline_process_unit_heights: BTreeMap::new(),
             timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
+            markdown_text_states: BTreeMap::new(),
             timeline_reasoning_summaries: BTreeMap::new(),
             timeline_tool_card_projections: BTreeMap::new(),
             timeline_file_diff_previews: BTreeMap::new(),
@@ -3693,6 +3721,7 @@ impl SessionView {
         *self.conversation_turns_render_cache.borrow_mut() = Rc::new(Vec::new());
         self.timeline_streaming_shrink_candidates.clear();
         self.timeline_markdown_sources.clear();
+        self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
@@ -19044,6 +19073,7 @@ impl VibexWorkbench {
         // from the estimator because the lengths no longer match.
         self.timeline_row_sizes = Rc::new(Vec::new());
         self.timeline_markdown_sources.clear();
+        self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
@@ -24054,33 +24084,140 @@ impl VibexWorkbench {
         self.open_code_file(path, window, cx);
     }
 
-    fn open_markdown_resource(
+    /// Retain the text-view state of one Markdown surface and return it.
+    ///
+    /// Rendering belongs to gpui-component; this keeps the parse, the
+    /// selection and the find-bar highlights across frames, and hands the
+    /// state the source only when that source actually changed.
+    fn markdown_text_state(
         &mut self,
-        resource: ResolvedResource,
+        id: &str,
+        source: &Arc<str>,
+        search: Option<&SessionSearchHighlight>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        let query = search.map(|highlight| highlight.query.clone());
+        let active = search.is_some_and(|highlight| highlight.active);
+        if let Some(entry) = self.markdown_text_states.get_mut(id) {
+            let state = entry.state.clone();
+            let query_changed = entry.query != query || entry.active != active;
+            if query_changed {
+                entry.query = query;
+                entry.active = active;
+                entry.searched = None;
+            }
+            let unchanged =
+                entry.source.len() == source.len() && Arc::ptr_eq(&entry.source, source);
+            if !unchanged {
+                entry.source = source.clone();
+                state.update(cx, |state, cx| state.set_text(source, cx));
+            }
+            if query_changed || !unchanged {
+                // The parse may already have landed (small documents parse on
+                // the spot), so try in the same frame; the observer covers the
+                // documents that land later.
+                self.refresh_markdown_search_highlights(id, cx);
+            }
+            return state;
+        }
+
+        let state = cx.new(|cx| TextViewState::markdown(source, cx));
+        let key = id.to_string();
+        let observed = cx.observe(&state, move |this, _, cx| {
+            this.refresh_markdown_search_highlights(&key, cx);
+        });
+        if self.markdown_text_states.len() >= MARKDOWN_TEXT_STATE_LIMIT
+            && let Some(evicted) = self
+                .markdown_text_states
+                .keys()
+                .find(|candidate| candidate.as_str() != id)
+                .cloned()
+        {
+            // Any bound is arbitrary here: an evicted surface simply reparses
+            // when it scrolls back into the window.
+            self.markdown_text_states.remove(&evicted);
+        }
+        self.markdown_text_states.insert(
+            id.to_string(),
+            MarkdownTextState {
+                state: state.clone(),
+                _observed: observed,
+                source: source.clone(),
+                query,
+                active,
+                searched: None,
+            },
+        );
+        state
+    }
+
+    /// Search one surface's rendered document for the find-bar query and paint
+    /// the hits.
+    ///
+    /// Runs from the parse observer as well as from a query change, so the
+    /// highlights land on the rendered text rather than on the source.
+    fn refresh_markdown_search_highlights(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self.markdown_text_states.get_mut(id) else {
+            return;
+        };
+        let Some(query) = entry.query.clone() else {
+            if entry.searched.take().is_some() {
+                entry
+                    .state
+                    .update(cx, |state, cx| state.clear_range_highlights(cx));
+            }
+            return;
+        };
+        let state = entry.state.clone();
+        let text = state.read(cx).rendered_text();
+        if entry.searched.as_ref() == Some(&text) {
+            return;
+        }
+        entry.searched = Some(text.clone());
+        let background = session_search_keyword_highlight(entry.active, cx)
+            .background_color
+            .unwrap_or_default();
+        let highlights = session_search_match_ranges(text.as_str(), &query)
+            .into_iter()
+            .map(|range| RangeHighlight::new(range, background));
+        state.update(cx, |state, cx| {
+            let _ = state.set_range_highlights(highlights, cx);
+        });
+    }
+
+    /// Open the destination a rendered Markdown link points at.
+    ///
+    /// The text view reports the destination exactly as the document wrote it:
+    /// an external URL opens in the system browser, a fragment stays in place,
+    /// and anything else is a workspace path relative to the document.
+    fn open_markdown_link(
+        &mut self,
+        url: &str,
+        base_path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match resource.kind {
-            ResourceKind::Workspace => {
-                let workspace_root = self
-                    .selected_session()
-                    .map(|session| session.workspace_root.as_str());
-                if let Some(target) = agent_markdown_preview_path(&resource, workspace_root) {
-                    self.open_code_file(target, window, cx);
-                }
-            }
-            ResourceKind::Http => {
-                let Some(target) = resource.resolved else {
-                    return;
-                };
-                if let Err(error) = validate_external_open_url(&target)
+        if url.starts_with('#') {
+            return;
+        }
+        if let Ok(parsed) = url::Url::parse(url) {
+            if matches!(parsed.scheme(), "http" | "https")
+                && let Err(error) = validate_external_open_url(url)
                     .and_then(|validated| crate::platform::open_external_url(&validated.url))
-                {
-                    self.agent_error = Some(format!("{}: {}", error.code, error.message));
-                    cx.notify();
-                }
+            {
+                self.agent_error = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
             }
-            ResourceKind::DataImage | ResourceKind::Fragment | ResourceKind::Blocked => {}
+            return;
+        }
+        let Some(resolved) = resolve_workspace_path(base_path, url) else {
+            return;
+        };
+        let workspace_root = self
+            .selected_session()
+            .map(|session| session.workspace_root.as_str());
+        if let Some(target) = agent_markdown_preview_path(url, &resolved, workspace_root) {
+            self.open_code_file(target, window, cx);
         }
     }
 
@@ -47641,14 +47778,6 @@ impl VibexWorkbench {
             .unwrap_or(&self.timeline)
     }
 
-    fn timeline_scroll_handle(&self) -> ScrollHandle {
-        if self.rendering_child_agent_timeline() {
-            self.child_agent_timeline_scroll.clone()
-        } else {
-            self.timeline_scroll.base_handle().clone()
-        }
-    }
-
     /// Refresh the id → position lookup when the timeline identity moved on.
     fn sync_timeline_item_index(&self) {
         let mut index = self.timeline_item_index.borrow_mut();
@@ -48671,36 +48800,23 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
-        let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
+        let (markdown_source, _) = self.timeline_markdown_source(row);
+        let markdown_state = self.markdown_text_state(
+            &format!("markdown:{}", row.id),
+            &markdown_source,
+            search_highlight.as_ref(),
+            cx,
+        );
         let markdown_entity = cx.weak_entity();
-        let markdown_view = MarkdownView::new(
-            format!("markdown:{}", row.id),
-            MarkdownInput::new(
-                markdown_source.clone(),
-                "",
-                u64::try_from(markdown_sequence).unwrap_or_default(),
-            )
-            .surface(MarkdownSurface::Agent),
-        )
-        .presentation(MarkdownPresentation::Agent)
-        .streaming(row.streaming)
-        .allow_http_images(true)
-        .scroll_handle(self.timeline_scroll_handle())
-        .search_query(
-            search_highlight
-                .as_ref()
-                .map(|highlight| highlight.query.clone()),
-        )
-        .search_active(
-            search_highlight
-                .as_ref()
-                .is_some_and(|highlight| highlight.active),
-        )
-        .on_open_resource(move |resource, window, cx| {
-            let _ = markdown_entity.update(cx, |this, cx| {
-                this.open_markdown_resource(resource, window, cx)
-            });
-        });
+        let markdown_view = markdown_text_view(
+            &markdown_state,
+            MarkdownPresentation::Agent,
+            cx,
+            move |url, _, window, cx| {
+                let _ = markdown_entity
+                    .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
+            },
+        );
         let timestamp = conversation_conclusion
             .then(|| self.timeline_row_timestamp(row))
             .flatten();
@@ -48927,35 +49043,22 @@ impl VibexWorkbench {
         &mut self,
         id: impl Into<ElementId>,
         source: Arc<str>,
-        sequence: u64,
-        streaming: bool,
         search_highlight: Option<SessionSearchHighlight>,
         cx: &mut Context<Self>,
-    ) -> MarkdownView {
+    ) -> TextView {
         let markdown_entity = cx.weak_entity();
-        MarkdownView::new(
-            id,
-            MarkdownInput::new(source, "", sequence).surface(MarkdownSurface::Agent),
+        let id: ElementId = id.into();
+        let state =
+            self.markdown_text_state(&format!("{id}"), &source, search_highlight.as_ref(), cx);
+        markdown_text_view(
+            &state,
+            MarkdownPresentation::Thought,
+            cx,
+            move |url, _, window, cx| {
+                let _ = markdown_entity
+                    .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
+            },
         )
-        .presentation(MarkdownPresentation::Thought)
-        .streaming(streaming)
-        .allow_http_images(true)
-        .scroll_handle(self.timeline_scroll_handle())
-        .search_query(
-            search_highlight
-                .as_ref()
-                .map(|highlight| highlight.query.clone()),
-        )
-        .search_active(
-            search_highlight
-                .as_ref()
-                .is_some_and(|highlight| highlight.active),
-        )
-        .on_open_resource(move |resource, window, cx| {
-            let _ = markdown_entity.update(cx, |this, cx| {
-                this.open_markdown_resource(resource, window, cx)
-            });
-        })
     }
 
     /// Draw an expanded reasoning row: the first line beside the brain, then the
@@ -49028,8 +49131,7 @@ impl VibexWorkbench {
         let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
         if expanded {
-            let (source, sequence) = self.timeline_live_reasoning_source(&turn_id, body);
-            let revision = u64::try_from(sequence).unwrap_or_default();
+            let (source, _) = self.timeline_live_reasoning_source(&turn_id, body);
             let (first_line_source, remaining_source) = reasoning_source_parts(source.as_ref());
             let first_line = self.reasoning_first_line_text(None, first_line_source, cx);
             // This body has no `TimelineRow` of its own, but it is the live
@@ -49041,8 +49143,6 @@ impl VibexWorkbench {
                 self.reasoning_markdown_view(
                     format!("thought:{row_id}:remaining"),
                     Arc::<str>::from(source),
-                    revision,
-                    true,
                     None,
                     cx,
                 )
@@ -49108,7 +49208,7 @@ impl VibexWorkbench {
         if expanded {
             let search_highlight =
                 self.session_search_highlight_for_rows(std::slice::from_ref(row));
-            let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
+            let (markdown_source, _) = self.timeline_markdown_source(row);
             let (first_line_source, remaining_source) = reasoning_source_parts(&markdown_source);
             // The disclosure header is one short, muted line. Rendering it as a
             // second `MarkdownView` bought nothing but a second element tree,
@@ -49121,8 +49221,6 @@ impl VibexWorkbench {
                 self.reasoning_markdown_view(
                     format!("thought:{}:remaining", row.id),
                     Arc::<str>::from(source),
-                    u64::try_from(markdown_sequence).unwrap_or_default(),
-                    row.streaming,
                     search_highlight,
                     cx,
                 )
@@ -49203,36 +49301,23 @@ impl VibexWorkbench {
             return div().id(row.id.clone()).into_any_element();
         }
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
-        let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
+        let (markdown_source, _) = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
-        let markdown_view = MarkdownView::new(
-            format!("thought:{}", row.id),
-            MarkdownInput::new(
-                markdown_source,
-                "",
-                u64::try_from(markdown_sequence).unwrap_or_default(),
-            )
-            .surface(MarkdownSurface::Agent),
-        )
-        .presentation(MarkdownPresentation::Thought)
-        .streaming(row.streaming)
-        .allow_http_images(true)
-        .scroll_handle(self.timeline_scroll_handle())
-        .search_query(
-            search_highlight
-                .as_ref()
-                .map(|highlight| highlight.query.clone()),
-        )
-        .search_active(
-            search_highlight
-                .as_ref()
-                .is_some_and(|highlight| highlight.active),
-        )
-        .on_open_resource(move |resource, window, cx| {
-            let _ = markdown_entity.update(cx, |this, cx| {
-                this.open_markdown_resource(resource, window, cx)
-            });
-        });
+        let markdown_state = self.markdown_text_state(
+            &format!("thought:{}", row.id),
+            &markdown_source,
+            search_highlight.as_ref(),
+            cx,
+        );
+        let markdown_view = markdown_text_view(
+            &markdown_state,
+            MarkdownPresentation::Thought,
+            cx,
+            move |url, _, window, cx| {
+                let _ = markdown_entity
+                    .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
+            },
+        );
         div()
             .id(row.id.clone())
             .w_full()
@@ -51487,40 +51572,29 @@ impl VibexWorkbench {
         body_max_width: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let id = format!("user-message-text:{message_id}");
         if attachments.is_empty() {
-            return render_user_message_text_segment(
-                format!("user-message-text:{message_id}"),
-                text,
-                search_highlight,
-                body_max_width,
-            )
-            .into_any_element();
+            return self.render_user_message_text(id, text, search_highlight, body_max_width, cx);
         }
 
         let workspace_root = self
             .view_session()
             .map(|session| session.workspace_root.as_str());
-        let (document, attachment_actions) = user_message_inline_document(
+        let (source, attachment_actions) = user_message_inline_document(
             &text,
             &attachments,
             self.resolved_locale(),
             workspace_root,
         );
+        let source: Arc<str> = Arc::from(source);
+        let state = self.markdown_text_state(&id, &source, search_highlight.as_ref(), cx);
         let view = cx.entity().downgrade();
-        MarkdownView::from_document(format!("user-message-text:{message_id}"), document)
-            .presentation(MarkdownPresentation::Agent)
-            .search_query(
-                search_highlight
-                    .as_ref()
-                    .map(|highlight| highlight.query.clone()),
-            )
-            .search_active(
-                search_highlight
-                    .as_ref()
-                    .is_some_and(|highlight| highlight.active),
-            )
-            .on_open_resource(move |resource, window, cx| {
-                let Some(action) = attachment_actions.get(&resource.source).cloned() else {
+        markdown_text_view(
+            &state,
+            MarkdownPresentation::Agent,
+            cx,
+            move |url, _, window, cx| {
+                let Some(action) = attachment_actions.get(url.as_ref()).cloned() else {
                     return;
                 };
                 let _ = view.update(cx, |this, cx| match action {
@@ -51531,13 +51605,31 @@ impl VibexWorkbench {
                         this.open_code_file(path, window, cx)
                     }
                 });
-            })
-            .w_auto()
-            .min_w_0()
-            .max_w_full()
-            .when_some(body_max_width, |this, width| this.max_w(px(width)))
-            .whitespace_normal()
-            .into_any_element()
+            },
+        )
+        .w_auto()
+        .min_w_0()
+        .max_w_full()
+        .when_some(body_max_width, |this, width| this.max_w(px(width)))
+        .whitespace_normal()
+        .into_any_element()
+    }
+
+    /// Render a user message body: its text exactly as written.
+    ///
+    /// The body is user-authored, so it is escaped and read literally; the
+    /// find bar still highlights its hits through the retained text view.
+    fn render_user_message_text(
+        &mut self,
+        id: String,
+        value: String,
+        search_highlight: Option<SessionSearchHighlight>,
+        body_max_width: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let source: Arc<str> = Arc::from(escape_markdown_literal(&value));
+        let state = self.markdown_text_state(&id, &source, search_highlight.as_ref(), cx);
+        user_message_text_body(&state, body_max_width, cx)
     }
 
     fn render_composer_suggestions(
@@ -68200,15 +68292,10 @@ impl FoundationSettings {
                             })
                             .px_3()
                             .py_2()
-                            .child(
-                                MarkdownView::new(
-                                    SharedString::from(format!(
-                                        "about-release-notes:{notes_version}"
-                                    )),
-                                    MarkdownInput::new(source, "", 0),
-                                )
-                                .presentation(MarkdownPresentation::Document),
-                            ),
+                            .child(TextView::markdown(
+                                SharedString::from(format!("about-release-notes:{notes_version}")),
+                                source,
+                            )),
                     )
                     .child(
                         h_flex().w_full().justify_end().child(
@@ -70372,42 +70459,38 @@ fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
     Some((format, bytes))
 }
 
+/// The plain text and the workspace paths an agent answer projects to.
+///
+/// Turn previews, labels and search excerpts read the text; the paths feed the
+/// file previews a message links to.
 fn agent_markdown_summary(source: &str) -> (String, Vec<String>) {
     let source = utf8_prefix(source, AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES);
-    let limits = MarkdownLimits {
-        max_source_bytes: AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES,
-        max_nodes: AGENT_TURN_PREVIEW_MARKDOWN_MAX_NODES,
-        max_resources: AGENT_TURN_PREVIEW_MARKDOWN_MAX_RESOURCES,
-        ..MarkdownLimits::default()
-    };
-    let document = parse_markdown_with_limits(
-        MarkdownInput::new(source, "", 0).surface(MarkdownSurface::Agent),
-        limits,
-    );
     let mut seen = BTreeSet::new();
-    let paths = document
-        .resources
-        .iter()
-        .filter(|resource| resource.kind == ResourceKind::Workspace)
-        .filter_map(|resource| resource.resolved.clone())
-        .filter(|path| seen.insert(path.clone()))
-        .take(32)
+    let paths = markdown_resources(source)
+        .into_iter()
+        .filter_map(|resource| {
+            let path = resolve_workspace_path("", &resource.url)?;
+            seen.insert(path.clone()).then_some(path)
+        })
+        .take(AGENT_TURN_PREVIEW_MARKDOWN_MAX_RESOURCES)
         .collect();
-    (document.plain_text(), paths)
+    (markdown_plain_text(source), paths)
 }
 
+/// The workspace-relative path a link destination opens.
+///
+/// A destination written from the filesystem root (`/ws/docs/a.md`) is made
+/// relative to the workspace root when it names a path inside it.
 fn agent_markdown_preview_path(
-    resource: &ResolvedResource,
+    source: &str,
+    resolved: &str,
     workspace_root: Option<&str>,
 ) -> Option<String> {
-    if resource.kind != ResourceKind::Workspace {
-        return None;
-    }
-    let target = resource.resolved.as_deref()?.trim_matches('/');
+    let target = resolved.trim_matches('/');
     if target.is_empty() {
         return None;
     }
-    let source = resource.source.trim().replace('\\', "/");
+    let source = source.trim().replace('\\', "/");
     if !source.starts_with('/') {
         return Some(target.to_string());
     }
@@ -70418,6 +70501,27 @@ fn agent_markdown_preview_path(
         .and_then(|prefix| target.strip_prefix(&prefix))
         .unwrap_or(target);
     (!relative.is_empty()).then(|| relative.to_string())
+}
+
+/// A configured gpui-component text view for one Markdown surface.
+///
+/// Vibex adds no rendering of its own here: the view owns layout, selection,
+/// code highlighting, tables and images, and the only decisions left are the
+/// presentation's style and what a link click does.
+fn markdown_text_view(
+    state: &Entity<TextViewState>,
+    presentation: MarkdownPresentation,
+    cx: &App,
+    on_link_click: impl Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
+) -> TextView {
+    let mut view = TextView::new(state)
+        .selectable(true)
+        .text_sm()
+        .line_height(px(22.0));
+    if let Some(style) = text_view_style(presentation, cx) {
+        view = view.style(style);
+    }
+    view.on_link_click(on_link_click)
 }
 
 fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -> Option<String> {
@@ -70453,51 +70557,80 @@ fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -
     (!relative.is_empty()).then_some(relative)
 }
 
-/// Renders the user message body inside the pill.
+/// The layout a user message body wears inside the pill.
 ///
 /// `body_max_width` is the definite width the pill will give the text (see
 /// [`user_message_body_max_width`]). Capping the body there keeps the wrap width
 /// identical in the intrinsic pass that sizes the pill and in the final layout
 /// that paints it, so the pill can never end up a wrapped line short.
-fn render_user_message_text_segment(
-    id: impl Into<ElementId>,
-    value: String,
-    search_highlight: Option<SessionSearchHighlight>,
+fn user_message_text_body(
+    state: &Entity<TextViewState>,
     body_max_width: Option<f32>,
-) -> MarkdownView {
-    MarkdownView::plain_text(id, MarkdownInput::new(value, "", 0))
-        .presentation(MarkdownPresentation::Agent)
-        .search_query(
-            search_highlight
-                .as_ref()
-                .map(|highlight| highlight.query.clone()),
-        )
-        .search_active(
-            search_highlight
-                .as_ref()
-                .is_some_and(|highlight| highlight.active),
-        )
+    cx: &App,
+) -> AnyElement {
+    markdown_text_view(state, MarkdownPresentation::Agent, cx, |_, _, _, _| {})
         .w_auto()
         .min_w_0()
         .max_w_full()
         .when_some(body_max_width, |this, width| this.max_w(px(width)))
         .flex_shrink(1.0)
         .whitespace_normal()
+        .into_any_element()
 }
 
+/// A user message body for a view that owns no retained state map.
+///
+/// The layout probes under test render the same body as the timeline, but they
+/// are not the workbench: their text view is keyed on the window and carries no
+/// find-bar highlight.
+#[cfg(test)]
+fn probe_user_message_text(
+    id: impl Into<ElementId>,
+    value: String,
+    body_max_width: Option<f32>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let id: ElementId = id.into();
+    let source: SharedString = escape_markdown_literal(&value).into();
+    let state = window.use_keyed_state(
+        SharedString::from(format!("{id}/probe-state")),
+        cx,
+        |_, cx| TextViewState::markdown(&source, cx),
+    );
+    state.update(cx, |state, cx| state.set_text(&source, cx));
+    user_message_text_body(&state, body_max_width, cx)
+}
+
+/// A keyed Markdown view for a probe that owns no retained state map.
+#[cfg(test)]
+fn probe_markdown_view(
+    id: impl Into<ElementId>,
+    source: impl Into<SharedString>,
+    presentation: MarkdownPresentation,
+    cx: &App,
+) -> TextView {
+    let mut view = TextView::markdown(id, source);
+    if let Some(style) = text_view_style(presentation, cx) {
+        view = view.style(style);
+    }
+    view
+}
+
+/// The Markdown source and attachment actions of a user message that carries
+/// attachments.
+///
+/// The body is user-authored text, so it is escaped and read literally; every
+/// attachment becomes a Markdown link whose destination is a
+/// `vibex-attachment:<index>` key the link handler resolves back to its action.
 fn user_message_inline_document(
     text: &str,
     attachments: &[MessageAttachment],
     locale: locale::ResolvedLocale,
     workspace_root: Option<&str>,
-) -> (
-    Arc<MarkdownDocument>,
-    Arc<BTreeMap<String, UserMessageAttachmentAction>>,
-) {
+) -> (String, Arc<BTreeMap<String, UserMessageAttachmentAction>>) {
     let mut source = String::with_capacity(text.len());
-    let mut inlines = Vec::new();
     let mut attachment_actions = BTreeMap::new();
-    let mut next_node_id = 1;
 
     let segments = user_message_inline_segments(text, attachments);
     for (segment_index, segment) in segments.iter().enumerate() {
@@ -70506,14 +70639,7 @@ fn user_message_inline_document(
                 if value.is_empty() {
                     continue;
                 }
-                let start = source.len();
-                source.push_str(value);
-                inlines.push(InlineNode {
-                    id: NodeId(next_node_id),
-                    range: SourceRange::new(start, source.len()),
-                    kind: Inline::Text(value.clone()),
-                });
-                next_node_id = next_node_id.saturating_add(1);
+                source.push_str(&escape_markdown_literal(value));
             }
             UserMessageInlineSegment::Attachment(attachment) => {
                 if source
@@ -70521,14 +70647,7 @@ fn user_message_inline_document(
                     .next_back()
                     .is_some_and(|character| !character.is_whitespace())
                 {
-                    let start = source.len();
                     source.push(' ');
-                    inlines.push(InlineNode {
-                        id: NodeId(next_node_id),
-                        range: SourceRange::new(start, source.len()),
-                        kind: Inline::Text(" ".to_string()),
-                    });
-                    next_node_id = next_node_id.saturating_add(1);
                 }
                 let label = if attachment.label.trim().is_empty() {
                     locale::text_for(locale, "Image", "图片", "圖片").to_string()
@@ -70540,23 +70659,8 @@ fn user_message_inline_document(
                 }
                 let composer_attachment = composer_attachment_from_message(
                     attachment,
-                    format!("message-attachment:{next_node_id}"),
+                    format!("message-attachment:{segment_index}"),
                 );
-                let start = source.len();
-                source.push_str(&label);
-                let range = SourceRange::new(start, source.len());
-                let text_node = InlineNode {
-                    id: NodeId(next_node_id),
-                    range,
-                    kind: Inline::Text(label.clone()),
-                };
-                next_node_id = next_node_id.saturating_add(1);
-                let marked_label = InlineNode {
-                    id: NodeId(next_node_id),
-                    range,
-                    kind: Inline::Mark(vec![text_node]),
-                };
-                next_node_id = next_node_id.saturating_add(1);
                 let action = if composer_attachment.is_image() {
                     Some(UserMessageAttachmentAction::PreviewImage(
                         composer_attachment.clone(),
@@ -70567,31 +70671,17 @@ fn user_message_inline_document(
                             .map(UserMessageAttachmentAction::OpenFile)
                     })
                 };
-                let kind = if let Some(action) = action {
-                    let image_key = format!("vibex-attachment:{next_node_id}");
-                    let resolved = composer_attachment.path.clone();
-                    attachment_actions.insert(image_key.clone(), action);
-                    Inline::Link {
-                        destination: ResolvedResource {
-                            role: ResourceRole::Link,
-                            source: image_key,
-                            kind: ResourceKind::Workspace,
-                            resolved,
-                            label: Some(label),
-                            error_code: None,
-                        },
-                        title: None,
-                        children: vec![marked_label],
-                    }
+                if let Some(action) = action {
+                    let key = format!("vibex-attachment:{segment_index}");
+                    attachment_actions.insert(key.clone(), action);
+                    source.push('[');
+                    source.push_str(&escape_markdown_literal(&label));
+                    source.push_str("](");
+                    source.push_str(&key);
+                    source.push(')');
                 } else {
-                    marked_label.kind
-                };
-                inlines.push(InlineNode {
-                    id: NodeId(next_node_id),
-                    range,
-                    kind,
-                });
-                next_node_id = next_node_id.saturating_add(1);
+                    source.push_str(&escape_markdown_literal(&label));
+                }
                 let next_starts_with_text =
                     segments
                         .get(segment_index + 1)
@@ -70603,46 +70693,15 @@ fn user_message_inline_document(
                             UserMessageInlineSegment::Attachment(_) => true,
                         });
                 if next_starts_with_text {
-                    let start = source.len();
                     source.push(' ');
-                    inlines.push(InlineNode {
-                        id: NodeId(next_node_id),
-                        range: SourceRange::new(start, source.len()),
-                        kind: Inline::Text(" ".to_string()),
-                    });
-                    next_node_id = next_node_id.saturating_add(1);
                 }
             }
         }
     }
 
-    let range = SourceRange::new(0, source.len());
-    let document = MarkdownDocument {
-        source: Arc::from(source),
-        base_path: Arc::from(""),
-        revision: 0,
-        blocks: vec![BlockNode {
-            id: NodeId(0),
-            range,
-            kind: Block::Paragraph(inlines),
-        }]
-        .into(),
-        outline: Arc::default(),
-        footnotes: Default::default(),
-        resources: Arc::default(),
-        diagnostics: Arc::default(),
-        truncated: false,
-    };
-    (Arc::new(document), Arc::new(attachment_actions))
+    (source, Arc::new(attachment_actions))
 }
 
-/// The mark a user message wears when a queued action delivered it.
-///
-/// The mark is an icon-only ghost button that rides the bubble's lower edge,
-/// carrying the delivery accent itself — steer is green, an interrupted resend
-/// is yellow — so the two deliveries stay distinguishable by glyph and by hue
-/// without tinting the bubble edge. The delivery label is the button's tooltip
-/// and its accessibility name.
 fn render_user_message_delivery_button(
     row_id: &str,
     delivery: UserMessageDelivery,
@@ -72987,9 +73046,9 @@ mod tests {
         assert!(!overlay.contains("count_label"));
         // Matched rows tint the keyword through their Markdown views, and the
         // find bar's current match is marked active so it paints stronger.
-        assert!(source.contains(".search_query("));
-        assert!(source.contains(".search_active("));
-        assert!(source.contains("MarkdownView::new("));
+        assert!(source.contains("refresh_markdown_search_highlights"));
+        assert!(source.contains("markdown_text_state("));
+        assert!(source.contains("markdown_text_view("));
 
         let rows = source
             .split_once("fn command_palette_row(")
@@ -73088,7 +73147,7 @@ mod tests {
     }
 
     impl Render for ReasoningFirstLineLayoutProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
             h_flex().w(px(640.0)).child(
                 div()
@@ -73096,12 +73155,12 @@ mod tests {
                         measured_width.set(f32::from(bounds.size.width));
                     })
                     .child(
-                        MarkdownView::new(
+                        probe_markdown_view(
                             "reasoning-first-line-layout-probe",
-                            MarkdownInput::new("Planning model naming and asset mapping", "", 1)
-                                .surface(MarkdownSurface::Agent),
+                            "Planning model naming and asset mapping",
+                            MarkdownPresentation::Thought,
+                            cx,
                         )
-                        .presentation(MarkdownPresentation::Thought)
                         .w_auto()
                         .min_w_0()
                         .max_w_full()
@@ -73153,7 +73212,7 @@ mod tests {
     }
 
     impl Render for ReasoningWindowLayoutProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let window_top = self.window_top.clone();
             let window_bottom = self.window_bottom.clone();
             let body_top = self.body_top.clone();
@@ -73175,12 +73234,12 @@ mod tests {
                                 body_bottom.set(f32::from(bounds.bottom()));
                             })
                             .child(
-                                MarkdownView::new(
+                                probe_markdown_view(
                                     "reasoning-window-layout-probe",
-                                    MarkdownInput::new(reasoning_window_probe_body(), "", 1)
-                                        .surface(MarkdownSurface::Agent),
+                                    reasoning_window_probe_body(),
+                                    MarkdownPresentation::Thought,
+                                    cx,
                                 )
-                                .presentation(MarkdownPresentation::Thought)
                                 .w_full()
                                 .min_w_0(),
                             )
@@ -73226,7 +73285,7 @@ mod tests {
     }
 
     impl Render for LongMarkdownLayoutProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured_height = self.measured_height.clone();
             h_flex()
                 .w(px(640.0))
@@ -73240,14 +73299,12 @@ mod tests {
                         .on_prepaint(move |bounds, _, _| {
                             measured_height.set(f32::from(bounds.size.height));
                         })
-                        .child(
-                            MarkdownView::new(
-                                "long-agent-markdown-probe",
-                                MarkdownInput::new(self.body.clone(), "", 1)
-                                    .surface(MarkdownSurface::Fixture),
-                            )
-                            .presentation(MarkdownPresentation::Agent),
-                        ),
+                        .child(probe_markdown_view(
+                            "long-agent-markdown-probe",
+                            self.body.clone(),
+                            MarkdownPresentation::Agent,
+                            cx,
+                        )),
                 )
         }
     }
@@ -73260,7 +73317,7 @@ mod tests {
     }
 
     impl Render for UserMessageBubbleLayoutProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
             let measured_height = self.measured_height.clone();
             h_flex().w(px(self.timeline_width)).justify_end().child(
@@ -73277,13 +73334,13 @@ mod tests {
                                 measured_height.set(f32::from(bounds.size.height));
                             })
                             .child(render_user_message_bubble(
-                                render_user_message_text_segment(
+                                probe_user_message_text(
                                     "user-message-layout-probe",
                                     self.body.clone(),
                                     None,
-                                    None,
-                                )
-                                .into_any_element(),
+                                    window,
+                                    cx,
+                                ),
                                 None,
                                 theme::semantic_color("muted", true),
                                 theme::semantic_color("foreground", true),
@@ -73323,6 +73380,8 @@ mod tests {
         body: String,
         body_max_width: Option<f32>,
         measured_column: Rc<Cell<(f32, f32, f32)>>,
+        window: &mut Window,
+        cx: &mut App,
     ) -> AnyElement {
         div()
             .flex()
@@ -73342,13 +73401,13 @@ mod tests {
                         ));
                     })
                     .child(render_user_message_bubble(
-                        render_user_message_text_segment(
+                        probe_user_message_text(
                             "user-message-fit-probe",
                             body,
-                            None,
                             body_max_width,
-                        )
-                        .into_any_element(),
+                            window,
+                            cx,
+                        ),
                         None,
                         theme::semantic_color("muted", true),
                         theme::semantic_color("foreground", true),
@@ -73386,11 +73445,13 @@ mod tests {
                         cx.entity(),
                         "user-message-fit-list",
                         row_sizes,
-                        move |_this, _range, _window, _cx| {
+                        move |_this, _range, window, cx| {
                             let row = user_message_fit_row(
                                 row_body.clone(),
                                 body_max_width,
                                 row_column.clone(),
+                                window,
+                                cx,
                             );
                             vec![
                                 h_flex()
@@ -84041,27 +84102,22 @@ mod tests {
     #[test]
     fn user_message_inline_document_keeps_attachment_in_one_text_flow() {
         let attachment = message_attachment("paste", Some(5));
-        let (document, image_attachments) = user_message_inline_document(
+        let (source, image_attachments) = user_message_inline_document(
             "alpha tail",
             std::slice::from_ref(&attachment),
             locale::ResolvedLocale::En,
             Some("/tmp"),
         );
 
-        assert!(!document.source.contains('\n'));
+        assert!(!source.contains('\n'));
         assert_eq!(image_attachments.len(), 1);
-        let [block] = document.blocks.as_ref() else {
-            panic!("inline attachment document should contain one paragraph");
-        };
-        let Block::Paragraph(inlines) = &block.kind else {
-            panic!("inline attachment document should render a paragraph");
-        };
         assert!(
-            inlines
+            markdown_resources(&source)
                 .iter()
-                .any(|inline| { matches!(inline.kind, Inline::Link { .. }) })
+                .any(|resource| !resource.image),
+            "{source}"
         );
-        assert_eq!(document.plain_text(), "alpha paste tail");
+        assert_eq!(markdown_plain_text(&source), "alpha paste tail");
     }
 
     #[test]
@@ -84072,7 +84128,7 @@ mod tests {
             uri: Some("file:///work/vibex/README.md".into()),
             inline_text_offset: Some(0),
         };
-        let (document, actions) = user_message_inline_document(
+        let (source, actions) = user_message_inline_document(
             "what is this?",
             std::slice::from_ref(&attachment),
             locale::ResolvedLocale::En,
@@ -84083,14 +84139,12 @@ mod tests {
         assert!(actions.values().any(|action| {
             action == &UserMessageAttachmentAction::OpenFile("README.md".into())
         }));
-        assert!(document.blocks.iter().any(|block| {
-            match &block.kind {
-                Block::Paragraph(inlines) => inlines
-                    .iter()
-                    .any(|inline| matches!(inline.kind, Inline::Link { .. })),
-                _ => false,
-            }
-        }));
+        assert!(
+            markdown_resources(&source)
+                .iter()
+                .any(|resource| !resource.image),
+            "{source}"
+        );
     }
 
     #[test]
@@ -85917,8 +85971,7 @@ mod tests {
         assert!(card.contains("What's new in Vibex"));
         assert!(card.contains("notes_version"));
         assert!(card.contains("about-release-notes"));
-        assert!(card.contains("MarkdownView::new("));
-        assert!(card.contains("MarkdownPresentation::Document"));
+        assert!(card.contains("TextView::markdown("));
         assert!(card.contains("open-release-notes"));
         assert!(card.contains("open-release-page"));
 
@@ -86397,7 +86450,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("user message renderer should remain inspectable");
         assert!(renderer.contains("render_inline_user_message_editor"));
-        assert!(source.contains("MarkdownView::plain_text(id"));
+        assert!(source.contains("fn render_user_message_text("));
         let timestamp_index = renderer
             .find(".when_some(timestamp")
             .expect("timestamp should be rendered for the user message actions");
@@ -88921,7 +88974,7 @@ mod tests {
     }
 
     impl Render for UserMessageDeliveryMarkerProbe {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured_marker_center = self.measured_marker_center.clone();
             let measured_body = self.measured_body.clone();
             let measured_next_row_top = self.measured_next_row_top.clone();
@@ -88953,11 +89006,12 @@ mod tests {
                         f32::from(bounds.size.height),
                     ));
                 })
-                .child(render_user_message_text_segment(
+                .child(probe_user_message_text(
                     "user-message-delivery-probe",
                     "hi".to_string(),
                     None,
-                    None,
+                    window,
+                    cx,
                 ));
             v_flex()
                 .w(px(320.0))
@@ -88993,7 +89047,7 @@ mod tests {
     }
 
     impl Render for UserMessageGoalBadgeProbe {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured_mark_center = self.measured_mark_center.clone();
             let measured_mark_span = self.measured_mark_span.clone();
             let measured_body = self.measured_body.clone();
@@ -89028,11 +89082,12 @@ mod tests {
                         f32::from(bounds.size.height),
                     ));
                 })
-                .child(render_user_message_text_segment(
+                .child(probe_user_message_text(
                     "user-message-goal-probe",
                     "/goal hi".to_string(),
                     None,
-                    None,
+                    window,
+                    cx,
                 ));
             v_flex().w(px(320.0)).items_end().gap_1().child(
                 render_user_message_bubble(
@@ -89668,33 +89723,22 @@ mod tests {
     #[test]
     fn agent_markdown_absolute_links_resolve_relative_to_the_session_workspace() {
         let workspace_root = "/work/vibex";
-        let document = parse_markdown_with_limits(
-            MarkdownInput::new(
-                "[app.rs](/work/vibex/apps/desktop/src/app.rs:9755:8)",
-                "",
-                0,
-            )
-            .surface(MarkdownSurface::Agent),
-            MarkdownLimits::default(),
-        );
-        let resource = document.resources.first().expect("workspace link");
+        let url = "/work/vibex/apps/desktop/src/app.rs:9755:8";
+        let resolved = resolve_workspace_path("", url).expect("workspace link");
 
         assert_eq!(
-            agent_markdown_preview_path(resource, Some(workspace_root)).as_deref(),
+            agent_markdown_preview_path(url, &resolved, Some(workspace_root)).as_deref(),
             Some("apps/desktop/src/app.rs")
         );
     }
 
     #[test]
     fn agent_markdown_workspace_root_links_keep_their_relative_target() {
-        let document = parse_markdown_with_limits(
-            MarkdownInput::new("[README.md](/README.md)", "", 0).surface(MarkdownSurface::Agent),
-            MarkdownLimits::default(),
-        );
-        let resource = document.resources.first().expect("workspace link");
+        let url = "/README.md";
+        let resolved = resolve_workspace_path("", url).expect("workspace link");
 
         assert_eq!(
-            agent_markdown_preview_path(resource, Some("/work/vibex")).as_deref(),
+            agent_markdown_preview_path(url, &resolved, Some("/work/vibex")).as_deref(),
             Some("README.md")
         );
     }
@@ -90437,12 +90481,12 @@ mod tests {
     impl Render for ReasoningFirstLineProbe {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let measured = self.measured.clone();
-            let first_line = MarkdownView::new(
+            let first_line = probe_markdown_view(
                 "reasoning-probe:first-line",
-                MarkdownInput::new(self.first_line_source.clone(), "", 1)
-                    .surface(MarkdownSurface::Agent),
+                self.first_line_source.clone(),
+                MarkdownPresentation::Thought,
+                cx,
             )
-            .presentation(MarkdownPresentation::Thought)
             .flex_auto()
             .min_w_0()
             .max_w_full()
@@ -90450,11 +90494,12 @@ mod tests {
             .whitespace_normal()
             .into_any_element();
             let remaining = self.remaining_source.clone().map(|source| {
-                MarkdownView::new(
+                probe_markdown_view(
                     "reasoning-probe:remaining",
-                    MarkdownInput::new(source, "", 1).surface(MarkdownSurface::Agent),
+                    source,
+                    MarkdownPresentation::Thought,
+                    cx,
                 )
-                .presentation(MarkdownPresentation::Thought)
                 .w_full()
                 .min_w_0()
                 .into_any_element()

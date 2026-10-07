@@ -1,8 +1,10 @@
 //! Markdown → terminal lines.
 //!
-//! Parsing is delegated to `vibex-markdown` with `default-features = false`,
-//! which is GPUI-free and already used by `vibex-desktop-model`. Everything the
-//! terminal cannot express degrades explicitly rather than silently:
+//! Parsing is done in-crate: `crate::markdown::parser` drives
+//! `pulldown-cmark` directly and produces the GPUI-free document model in
+//! `crate::markdown::model`, so the renderer carries no dependency on the
+//! desktop Markdown crate. Everything the terminal cannot express degrades
+//! explicitly rather than silently:
 //!
 //! | Source | Terminal rendering |
 //! | --- | --- |
@@ -16,11 +18,11 @@
 
 use std::collections::BTreeMap;
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use vibex_markdown::{
+use crate::markdown::{
     Block, BlockNode, DiagramKind, Inline, InlineNode, MarkdownInput, parse_markdown,
 };
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use crate::locale::Strings;
 use unicode_segmentation::UnicodeSegmentation;
@@ -786,8 +788,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn callout_style(&self, kind: vibex_markdown::CalloutKind) -> Style {
-        use vibex_markdown::CalloutKind;
+    fn callout_style(&self, kind: crate::markdown::CalloutKind) -> Style {
+        use crate::markdown::CalloutKind;
         match kind {
             CalloutKind::Note | CalloutKind::Tip => self.theme.accent(),
             CalloutKind::Important => self.theme.strong(),
@@ -843,9 +845,9 @@ impl<'a> Builder<'a> {
 
     fn table(
         &mut self,
-        alignments: &[vibex_markdown::TableAlignment],
-        header: Option<&vibex_markdown::TableRow>,
-        rows: &[vibex_markdown::TableRow],
+        alignments: &[crate::markdown::TableAlignment],
+        header: Option<&crate::markdown::TableRow>,
+        rows: &[crate::markdown::TableRow],
         indent: usize,
     ) {
         let columns = header
@@ -1126,7 +1128,7 @@ impl<'a> Builder<'a> {
 }
 
 /// Where a markdown resource actually points.
-fn resource_target(resource: &vibex_markdown::ResolvedResource) -> String {
+fn resource_target(resource: &crate::markdown::ResolvedResource) -> String {
     resource
         .resolved
         .clone()
@@ -1134,7 +1136,7 @@ fn resource_target(resource: &vibex_markdown::ResolvedResource) -> String {
 }
 
 /// How a resource should be described when it has no explicit alt text.
-fn resource_label(resource: &vibex_markdown::ResolvedResource) -> String {
+fn resource_label(resource: &crate::markdown::ResolvedResource) -> String {
     resource
         .label
         .clone()
@@ -1143,14 +1145,18 @@ fn resource_label(resource: &vibex_markdown::ResolvedResource) -> String {
 }
 
 /// Pad one table cell to `width` display columns.
-fn pad_cell(text: &str, width: usize, alignment: Option<vibex_markdown::TableAlignment>) -> String {
+fn pad_cell(
+    text: &str,
+    width: usize,
+    alignment: Option<crate::markdown::TableAlignment>,
+) -> String {
     let text = truncate(text, width);
     let padding = width.saturating_sub(display_width(&text));
     match alignment {
-        Some(vibex_markdown::TableAlignment::Right) => {
+        Some(crate::markdown::TableAlignment::Right) => {
             format!("{}{text}", " ".repeat(padding))
         }
-        Some(vibex_markdown::TableAlignment::Center) => format!(
+        Some(crate::markdown::TableAlignment::Center) => format!(
             "{}{text}{}",
             " ".repeat(padding / 2),
             " ".repeat(padding - padding / 2)
@@ -1274,7 +1280,7 @@ fn truncate(text: &str, width: usize) -> String {
 }
 
 pub fn plain_inlines(inlines: &[InlineNode]) -> String {
-    vibex_markdown::plain_text(inlines)
+    crate::markdown::plain_text(inlines)
 }
 
 /// Lexical colouring driven by the theme's `syntaxHighlight` palette.

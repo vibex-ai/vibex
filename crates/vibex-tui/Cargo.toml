@@ -19,21 +19,27 @@ description = "Character-grid client for the Vibex DesktopRuntime"
 # and the terminal is never the wasm target.
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 crossterm.workspace = true
+# Markdown is parsed in-crate (`src/markdown/`) so the terminal client owns its
+# own document model instead of depending on the desktop Markdown crate.
+html5ever.workspace = true
+markup5ever_rcdom.workspace = true
+pulldown-cmark.workspace = true
 qrcode.workspace = true
 ratatui.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sys-locale.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-bidi.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+url.workspace = true
 vibex-backend = { path = "../vibex-backend" }
 vibex-core = { path = "../core" }
 vibex-desktop-model = { path = "../desktop-model" }
-vibex-markdown = { path = "../vibex-markdown", default-features = false }
 vibex-terminal-ui = { path = "../vibex-terminal-ui" }
 vibex-ui = { path = "../vibex-ui", default-features = false }
 

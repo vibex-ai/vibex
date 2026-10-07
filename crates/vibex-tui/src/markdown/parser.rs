@@ -5,14 +5,14 @@ use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
-use crate::html::{HtmlParseResult, parse_html_fragment};
-use crate::limits::{MarkdownLimits, bounded_text, utf8_prefix};
-use crate::model::{
+use crate::markdown::html::{HtmlParseResult, parse_html_fragment};
+use crate::markdown::limits::{MarkdownLimits, bounded_text, utf8_prefix};
+use crate::markdown::model::{
     Block, BlockNode, CalloutKind, DefinitionItem, DiagnosticSeverity, DiagramKind, FootnoteIndex,
     Inline, InlineImage, InlineNode, ListItem, MarkdownDiagnostic, MarkdownDocument, MarkdownInput,
     NodeId, OutlineEntry, SourceRange, TableAlignment, TableRow, plain_text, stable_node_id,
 };
-use crate::resource::{ResolvedResource, ResourcePolicy, ResourceRole};
+use crate::markdown::resource::{ResolvedResource, ResourcePolicy, ResourceRole};
 
 pub fn parse_markdown(input: MarkdownInput) -> MarkdownDocument {
     parse_markdown_with_limits(input, MarkdownLimits::default())
@@ -1202,7 +1202,7 @@ fn is_void_inline_tag(token: &str, tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::ResourceKind;
+    use crate::markdown::resource::ResourceKind;
 
     fn input(source: &str, revision: u64) -> MarkdownInput {
         MarkdownInput::new(source, "docs", revision)
@@ -1297,7 +1297,7 @@ A -> B: hi
     fn agent_math_respects_markdown_code_fences() {
         let raw = parse_markdown(
             input("Inline $E = mc^2$.\n\n$$\n\\frac{a}{b}\n$$", 1)
-                .surface(crate::model::MarkdownSurface::Agent),
+                .surface(crate::markdown::model::MarkdownSurface::Agent),
         );
         assert!(raw.blocks.iter().any(|block| {
             matches!(&block.kind, Block::Paragraph(inlines) if inlines.iter().any(|inline| matches!(inline.kind, Inline::Math(_))))
@@ -1313,7 +1313,7 @@ A -> B: hi
                 "```markdown\nInline $E = mc^2$.\n\n$$\n\\frac{a}{b}\n$$\n```",
                 2,
             )
-            .surface(crate::model::MarkdownSurface::Agent),
+            .surface(crate::markdown::model::MarkdownSurface::Agent),
         );
         assert_eq!(fenced.blocks.len(), 1);
         assert!(matches!(
@@ -1511,7 +1511,7 @@ A -> B: hi
 
     #[test]
     fn checked_in_fixture_covers_the_native_feature_matrix() {
-        let document = parse_markdown(input(include_str!("../fixtures/advanced.md"), 11));
+        let document = parse_markdown(input(include_str!("fixtures/advanced.md"), 11));
         let callouts = document
             .blocks
             .iter()
@@ -1586,7 +1586,7 @@ A -> B: hi
 
     #[test]
     fn malformed_fixture_keeps_source_and_reports_blocked_html() {
-        let document = parse_markdown(input(include_str!("../fixtures/malformed.md"), 12));
+        let document = parse_markdown(input(include_str!("fixtures/malformed.md"), 12));
 
         assert!(!document.blocks.is_empty());
         assert!(

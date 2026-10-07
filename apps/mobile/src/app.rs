@@ -42,9 +42,6 @@ use vibex_desktop_model::{
     SidebarProjectLogoColor, SidebarState, TimelineConversationTurn, TimelineModel,
     TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
 };
-use vibex_markdown::{
-    MarkdownInput, MarkdownLimits, MarkdownSurface, parse_markdown_with_limits, utf8_prefix,
-};
 use vibex_remote_client::{
     ClientDeviceIdentity, RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend,
     ZeroConfigLanPairingSession,
@@ -18227,24 +18224,12 @@ fn reasoning_summary_cached(row_id: &str, sequence: i64, body: &str) -> Reasonin
     summary
 }
 
-/// Desktop parity: `agent_markdown_summary` — bounded markdown parse reduced
+/// Desktop parity: `agent_markdown_summary` — bounded markdown source reduced
 /// to plain reading-order text.
 fn reasoning_plain_text(source: &str) -> String {
     const MAX_SOURCE_BYTES: usize = 8 * 1024;
-    const MAX_NODES: usize = 4_096;
-    const MAX_RESOURCES: usize = 32;
-    let source = utf8_prefix(source, MAX_SOURCE_BYTES);
-    let limits = MarkdownLimits {
-        max_source_bytes: MAX_SOURCE_BYTES,
-        max_nodes: MAX_NODES,
-        max_resources: MAX_RESOURCES,
-        ..MarkdownLimits::default()
-    };
-    let document = parse_markdown_with_limits(
-        MarkdownInput::new(source, "", 0).surface(MarkdownSurface::Agent),
-        limits,
-    );
-    document.plain_text()
+    let source = vibex_ui::markdown::utf8_prefix(source, MAX_SOURCE_BYTES);
+    markdown::markdown_plain_text(source)
 }
 
 /// Desktop parity: `agent_progress_label` — project the live progress label
@@ -20668,7 +20653,7 @@ mod tests {
                 .expect("the module has production code");
             for field in ["Input::new(", "Textarea::new("] {
                 for (index, _) in source.match_indices(field) {
-                    // `MarkdownInput::new` only looks like a kit field.
+                    // A leading identifier byte means this is not the kit field.
                     if source[..index]
                         .chars()
                         .next_back()

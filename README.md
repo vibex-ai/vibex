@@ -388,7 +388,7 @@ Read the [UI architecture boundary](docs/architecture/ui-boundary.md),
 | **Native UI** | GPUI, `gpui-component`, shared Rust UI contracts, generated design tokens |
 | **Agent runtime** | Agent Client Protocol schema 1.6, managed ACP adapters, Tokio |
 | **Workspace runtime** | SQLite via `rusqlite`, filesystem and Git services, `xpty`, `alacritty_terminal` |
-| **Content** | `pulldown-cmark`, HTML5ever, MathJax SVG, Mermaid rendering, PDFium, ZIP/XML parsers |
+| **Content** | `markdown` (CommonMark/GFM through `gpui-component`), `pulldown-cmark`, HTML5ever, PDFium, ZIP/XML parsers |
 | **Remote transport** | Axum, HTTP/WebSocket v2, Rustls, `tokio-tungstenite`, X25519, HKDF, HMAC, ChaCha20-Poly1305 |
 | **Platforms** | Linux, macOS, and Windows desktop; native Android and iOS through `gpui-pre-mobile` |
 | **Tooling** | Node.js 22, pnpm 11.3.0, deterministic smoke tests and release quality gates |

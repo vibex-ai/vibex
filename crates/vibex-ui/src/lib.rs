@@ -11,6 +11,7 @@ mod generated_tokens;
 pub mod git;
 pub mod locale;
 pub mod management;
+pub mod markdown;
 pub mod shell;
 pub mod terminal;
 pub mod theme_catalog;

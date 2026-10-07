@@ -1864,12 +1864,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - GPUI source-contract coverage keeps the User bubble non-shrinking and bounded,
   rejects `min_w_0` or `overflow_y_scrollbar` in its intrinsic body helper, and
   keeps runtime catalog/Owner attach calls outside the timeline loading task.
-- The `vibex-markdown` GPUI fixture must render a document with hundreds of
-  top-level blocks inside a fixed-height outer scroll surface, assert that the
-  visible range is a strict subset, change the outer offset, and assert that the
-  range advances while total height remains larger than the viewport. Desktop
-  coverage must continue proving that long Agent Markdown exceeds the old height
-  cap and does not gain an inner scrollbar.
+- A long Agent Markdown document must render inside the timeline's own scroll
+  surface: the component text view fits its content and never opens an inner
+  scrollbar, and the timeline keeps proving that a long answer does not gain a
+  second scroll container.
 - GPUI unit tests cover LRU recency/eviction and complete-prefix pagination; a
   cached session switch must not clear its Timeline or enter a loading state.
 - GPUI unit/source-contract tests cover the session-cache byte budget, bounded
@@ -1879,10 +1877,8 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   updates, sequence gaps reject the fast path, incremental height metrics equal
   full estimation, and a throttled Markdown snapshot keeps its source and
   revision paired while replacement/final snapshots refresh immediately.
-  The `vibex-markdown` GPUI tests also cover append-only virtual-block geometry:
-  measured stable blocks and the continuing tail survive each parse, streaming
-  heights never shrink, and the first non-streaming measurement may settle to a
-  smaller final intrinsic height.
+  Desktop coverage also proves that an unchanged source is never re-handed to a
+  retained text view, so a repaint of an expanded turn does not re-parse it.
 - `desktop-model` runtime tests feed descriptions and shuffled Effort values,
   then assert value-derived names, semantic low-to-high ordering, deterministic
   unknown ordering, and no `Default` effort.

@@ -18,6 +18,7 @@ futures-util.workspace = true
 gpui.workspace = true
 gpui_tokio.workspace = true
 gpui-component.workspace = true
+gpui-base.workspace = true
 gpui-kit-assets.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +29,6 @@ tokio.workspace = true
 vibex-backend = { path = "../../crates/vibex-backend" }
 vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
-vibex-markdown = { path = "../../crates/vibex-markdown", default-features = false }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-terminal-ui = { path = "../../crates/vibex-terminal-ui" }
 vibex-ui = { path = "../../crates/vibex-ui" }

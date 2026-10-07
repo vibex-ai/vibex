@@ -326,7 +326,7 @@ DesktopRuntime
 | **原生 UI** | GPUI、`gpui-component`、共享 Rust UI 契约、生成式设计 token |
 | **Agent 运行时** | Agent Client Protocol schema 1.6、托管 ACP 适配器、Tokio |
 | **工作区运行时** | 基于 `rusqlite` 的 SQLite、文件系统与 Git 服务、`xpty`、`alacritty_terminal` |
-| **内容处理** | `pulldown-cmark`、HTML5ever、MathJax SVG、Mermaid 渲染、PDFium、ZIP/XML 解析器 |
+| **内容处理** | `markdown`（通过 `gpui-component` 渲染 CommonMark/GFM）、`pulldown-cmark`、HTML5ever、PDFium、ZIP/XML 解析器 |
 | **远程传输** | Axum、HTTP/WebSocket v2、Rustls、`tokio-tungstenite`、X25519、HKDF、HMAC、ChaCha20-Poly1305 |
 | **平台** | Linux、macOS 和 Windows 桌面端; 通过 `gpui-pre-mobile` 支持原生 Android 和 iOS |
 | **工具链** | Node.js 22、pnpm 11.3.0、确定性 smoke tests 和发布质量门禁 |

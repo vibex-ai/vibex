@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::typography::code_font_weight;
 use gpui::{
     AnyElement, App, BackgroundExecutor, BorderStyle, Bounds, ClipboardItem, Context,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle, FontWeight, Hsla,
@@ -35,7 +36,6 @@ use vibex_core::{
     WorkspaceId,
 };
 use vibex_desktop_runtime::validate_external_open_url;
-use vibex_markdown::code_font_weight;
 use vibex_terminal::{
     TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalCursorSnapshot,
     TerminalFrameSnapshot, TerminalGridPoint, TerminalManager,

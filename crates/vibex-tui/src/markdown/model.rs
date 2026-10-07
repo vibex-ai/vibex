@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::resource::ResolvedResource;
+use crate::markdown::resource::ResolvedResource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -513,7 +513,7 @@ pub fn plain_text(inlines: &[InlineNode]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_markdown;
+    use crate::markdown::parser::parse_markdown;
 
     #[test]
     fn document_plain_text_preserves_generated_sources_in_reading_order() {

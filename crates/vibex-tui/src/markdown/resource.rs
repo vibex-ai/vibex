@@ -1,9 +1,10 @@
+#[cfg(test)]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::limits::{DATA_IMAGE_MAX_ENCODED_BYTES, bounded_text};
+use crate::markdown::limits::{DATA_IMAGE_MAX_ENCODED_BYTES, bounded_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,16 +16,12 @@ pub enum ResourceKind {
     Blocked,
 }
 
-pub type MarkdownAssetKind = ResourceKind;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceRole {
     Image,
     Link,
 }
-
-pub type MarkdownAssetRole = ResourceRole;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,8 +33,6 @@ pub struct ResolvedResource {
     pub label: Option<String>,
     pub error_code: Option<String>,
 }
-
-pub type MarkdownAsset = ResolvedResource;
 
 #[derive(Debug, Clone)]
 pub struct ResourcePolicy {
@@ -51,16 +46,17 @@ impl ResourcePolicy {
         }
     }
 
+    /// Builds the policy for the document that lives in `file_path`.
+    ///
+    /// Only the parse tests use this now; the terminal renderer always passes
+    /// an explicit base path through [`ResourcePolicy::new`].
+    #[cfg(test)]
     pub fn for_file(file_path: impl AsRef<str>) -> Self {
         let base_path = Path::new(file_path.as_ref())
             .parent()
             .map(path_to_slash)
             .unwrap_or_default();
         Self::new(base_path)
-    }
-
-    pub fn base_path(&self) -> &str {
-        &self.base_path
     }
 
     pub fn resolve(
@@ -251,6 +247,7 @@ fn is_supported_data_image(source: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn path_to_slash(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::typography::apply_code_font_weight;
 use gpui::{App, Hsla, Window, px};
 use gpui_component::{
     Theme, ThemeMode as ComponentThemeMode,
     highlighter::{HighlightTheme, HighlightThemeStyle},
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode, ThemeSelection};
-use vibex_markdown::apply_code_font_weight;
 use vibex_ui::{
     CODE_TYPOGRAPHY, GpuiColorToken, GpuiThemeDefinition, GpuiThemeMode, INTERFACE_TYPOGRAPHY,
     RADII, SHADOWS_ENABLED, default_theme, semantic_token as catalog_token, theme_index,

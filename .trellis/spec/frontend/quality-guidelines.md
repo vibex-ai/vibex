@@ -1120,145 +1120,198 @@ push_decl::<FileLineEnding>(&mut output);
 push_decl::<FileReadResponse>(&mut output);
 ```
 
-## Scenario: Native Advanced Markdown Document Boundary
+## Scenario: Markdown Rendered By The Component Text View
 
 ### 1. Scope / Trigger
 
-- Trigger: Agent timeline content or workspace Markdown preview changes parsing,
-  rendering, navigation, selection/copy, resource handling, raw HTML, local math or
-  diagram artifacts, or syntax highlighting.
-- The framework-neutral document and policy live in `vibex-markdown`; GPUI is one
-  renderer of that contract. Product surfaces must not independently parse or
-  rewrite Markdown before rendering.
+- Trigger: anything that changes how Markdown reaches a screen in `apps/desktop` or
+  `apps/mobile` — timeline answers, reasoning rows, plan rows, user message bodies,
+  file previews, release notes — or that changes the shared projections in
+  `crates/vibex-ui/src/markdown.rs` or the code workbench's image/link resolution.
+- The renderer is gpui-component's text view (`gpui_base::text::TextView`, exposed
+  as `gpui_component::text::TextView`). Vibex owns no Markdown renderer, no Markdown
+  block model and no Markdown parser: parsing belongs to the `markdown` crate the
+  component parses with, and layout, selection, code highlighting, tables and
+  images belong to the text view.
 
 ### 2. Signatures
 
 ```text
-parse_markdown(MarkdownInput) -> MarkdownDocument
-ResourcePolicy::resolve(ResourceRole, source, label) -> ResolvedResource
-MarkdownView::new(ElementId, MarkdownInput) -> MarkdownView
-MarkdownView::from_document(ElementId, Arc<MarkdownDocument>) -> MarkdownView
-agent_markdown_preview_path(&ResolvedResource, Option<&str>) -> Option<String>
+vibex_ui::markdown::plain_text(&str) -> String
+vibex_ui::markdown::resources(&str) -> Vec<MarkdownResource>
+vibex_ui::markdown::resolve_workspace_path(base_path, source) -> Option<String>
+vibex_ui::markdown::base_path_for_file(path) -> String
+vibex_ui::markdown::escape_markdown_literal(&str) -> String
+vibex_ui::markdown::utf8_prefix(&str, max_bytes) -> &str
 
-ArtifactController::schedule(ArtifactRequest) -> ArtifactSchedule
-ArtifactController::complete(request, result, view_id, revision, live_nodes)
-  -> ArtifactCompletion
-render_local_artifact_with_timeout(request, SvgPolicy, timeout)
-  -> Result<Arc<SvgArtifact>, ArtifactError>
-SvgPolicy::sanitize(svg, id_prefix) -> Result<SvgArtifact, SvgPolicyError>
+apps/desktop: markdown_text_state(id, &Arc<str>, search, cx) -> Entity<TextViewState>
+apps/desktop: markdown_text_view(&Entity<TextViewState>, MarkdownPresentation, cx, on_link_click) -> TextView
+apps/desktop: agent_markdown_summary(&str) -> (String, Vec<String>)
+apps/desktop: agent_markdown_preview_path(source, resolved, workspace_root) -> Option<String>
+apps/desktop: markdown::data_url_image(&str) -> Option<Arc<Image>>
+
+gpui_base::text::TextView::markdown(ElementId, source) -> TextView
+gpui_base::text::TextView::image_source(resolver) -> TextView
+gpui_base::text::TextView::on_link_click(handler) -> TextView
+gpui_base::text::TextViewState::set_text(&str, cx)
+gpui_base::text::TextViewState::rendered_text() -> RenderedText
+gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(), RangeHighlightError>
 ```
 
 ### 3. Contracts
 
-- One canonical `MarkdownDocument` owns source ranges, stable `NodeId` values,
-  diagnostics, heading/footnote indexes, and typed resource decisions. Agent and
-  file-preview product paths render it with `MarkdownView`; direct
-  `TextView::markdown` product calls and `project_markdown_for_host` projections are
-  forbidden.
-- Parsing and artifact completion are revision-fenced. Streaming may keep the last
-  valid document visible, but a completion applies only when view id, revision,
-  node id, and artifact key still match live state. Generated math/diagram nodes
-  contribute their original source to document-order copy output.
-- Every Markdown/HTML link or image crosses the same `ResourcePolicy` and becomes
-  `Fragment`, `Workspace`, `DataImage`, `Http`, or `Blocked`. Raw HTML is inert and
-  per-tag/per-attribute allowlisted; event attributes, script/style/forms, unsafe
-  schemes, active embeds, and workspace escapes never reach GPUI.
-- A workspace file link may carry an editor location suffix (`:line` or
-  `:line:column`). `ResourcePolicy` removes that suffix from `resolved` while
-  preserving the original `source`. When an Agent link uses the current session's
-  absolute workspace prefix, the click boundary removes that prefix before calling
-  the workspace-scoped preview backend; a leading-slash workspace-root link such as
-  `/README.md` keeps its existing root-relative meaning. Do not pre-rewrite the
-  Markdown source for one product surface.
-- Artifact admission is bounded by source bytes, active slots, queue length, cache
-  entries/bytes, timeout, circuit breaker, and stale fencing. Timeout handling uses
-  one process-lifetime `OnceLock` worker per engine family with a bounded sync
-  channel; it must never spawn and abandon one thread per request after timeout.
-- Locally generated SVG is untrusted. `SvgPolicy` rejects DTD/entities, active or
-  external content, invalid references, oversized structure/text/path data, and
-  dimensions outside policy, then prefixes every allowed fragment id/reference.
-  Intrinsic `width` and `height` determine raster pixel budget when present;
-  `viewBox` coordinates remain vector-space bounds and are not multiplied as raster
-  pixels. A viewBox-only SVG uses its viewBox dimensions as intrinsic dimensions.
-- Syntax highlighting is bounded and cached by node/theme through the selected
-  `gpui-component` Tree-sitter registry. Unknown languages stay readable plain text;
-  diff rows retain prefix/status cues in addition to theme-aware color.
+- One renderer: every product surface renders with the component text view. A
+  surface may choose a presentation style, an image resolver and a link handler;
+  it must not parse Markdown itself. No product crate may reintroduce a Markdown
+  block/inline model or a hand-written block renderer.
+- Reading a document for something other than painting it goes through the shared
+  projections in `vibex_ui::markdown`, which read the same `markdown` crate the
+  text view parses with. `plain_text` is the reading-order text previews, labels
+  and search excerpts use; `resources` is the destination list a preview preloads.
+- Streaming is the text view's: the desktop keeps one `Entity<TextViewState>` per
+  surface id in `VibexWorkbench::markdown_text_states`, hands it the source only
+  when the source actually changed (pointer- or value-equal sources are skipped),
+  and lets the component parse, append and lay out. A surface that scrolls away
+  keeps its parse; the map is bounded at `MARKDOWN_TEXT_STATE_LIMIT` and cleared
+  with the other per-session caches.
+- Find-bar highlighting indexes the rendered text, not the source:
+  `refresh_markdown_search_highlights` searches `TextViewState::rendered_text()`
+  and paints hits with `set_range_highlights`, driven by a parse observer so a
+  document that lands after the query still highlights. Setting highlights must
+  be skipped when the rendered revision did not change, or the observer and the
+  repaint it causes would keep each other awake.
+- Links arrive exactly as the document wrote them. `http`/`https` opens through
+  `validate_external_open_url`; a fragment stays in place; anything else resolves
+  as a workspace path relative to the document's directory (`base_path_for_file`
+  plus `resolve_workspace_path`), with a `:line[:column]` editor suffix stripped.
+  A link written from the filesystem root is made workspace-relative by
+  `agent_markdown_preview_path` before it reaches the preview backend. Do not
+  pre-rewrite the Markdown source for one surface.
+- Images: a preview that preloads workspace bytes installs an `image_source`
+  resolver keyed by the destination exactly as written. Installing a resolver
+  replaces the text view's own handling, so the resolver must also decode embedded
+  `data:` images (`markdown::data_url_image`); an unresolved destination falls back
+  to its URI rather than to a Vibex-drawn placeholder. Preloading is bounded
+  (`MARKDOWN_LOCAL_IMAGE_LIMIT` files, `MARKDOWN_LOCAL_IMAGE_TOTAL_BYTES`) and
+  never fetches over the network.
+- User-authored text renders literally: `escape_markdown_literal` escapes ASCII
+  punctuation before the text view sees it, so a message body cannot become a
+  block or inline construct while selection copy still returns the typed text.
+  Attachments are `[label](vibex-attachment:<index>)` links the surface's link
+  handler resolves back to its action.
+- Reasoning rows and other muted surfaces get the muted foreground through an
+  explicit `TextViewStyle` built from the component theme; the component derives
+  colors only from its own theme, so a parent `text_color` does not reach it.
+- Math and diagram fences have no local renderer and no artifact engine: they
+  render as code blocks with their language label, exactly like any other fence.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| Source exceeds bytes/nodes/depth or parsing is incomplete/malformed | Return a bounded diagnostic and readable literal/last-valid content; never blank or panic. |
-| Resource has unsafe scheme, invalid data image, active HTML attribute/tag, or workspace escape | Return `Blocked` plus a stable diagnostic/disabled affordance; preserve readable label/source. |
-| Workspace file link carries `:line[:column]` or the current session's absolute workspace prefix | Resolve it as `Workspace`, remove only the editor location, and open the workspace-relative preview target. |
-| Artifact source/queue/cache/SVG limit is exceeded | Return a typed local error and source fallback; perform no network request. |
-| Artifact times out or completes for a stale revision/node | Ignore the late result, advance bounded queue state, and never create a residual per-request worker thread. |
-| SVG has DTD/entity, `script`, `foreignObject`, external URL/reference, unsafe CSS, duplicate root, or invalid dimensions | Reject before GPUI rasterization. |
-| MathJax has a large coordinate-space viewBox but bounded `ex`/`em` intrinsic dimensions | Validate viewBox bounds separately and budget pixels from intrinsic dimensions. |
-| Product source contains `TextView::markdown` or `project_markdown_for_host` | Fail the source audit; migrate the caller to the canonical document/view. |
+| Source is unparseable or exceeds the preview's byte cap | `plain_text` falls back to the (bounded) source; the text view renders what it can; never blank, never a panic. |
+| Destination is an external URL, a `data:` image, a fragment, or escapes the workspace | Not preloaded; the link opens externally, stays inert, or resolves to no target. Never a filesystem read outside the workspace. |
+| Workspace link carries `:line[:column]` or the session's absolute workspace prefix | Strip the editor location and the workspace prefix, then open the workspace-relative preview target. |
+| Destination has no preloaded bytes | The resolver returns the URI; the text view draws what GPUI can load and nothing when it cannot. |
+| More than the image bound, or a file over the byte budget | Preloading stops at the bound; the remaining destinations stay URI-backed. |
+| Product code parses Markdown itself (`Block::Paragraph`, `parse_markdown`, a hand-written block renderer) | Reject the change; route it through the shared adapter or `vibex_ui::markdown`. |
+| Search highlights computed from the source string | Reject the change; ranges index the rendered text and come from `rendered_text()`. |
 
 ### 5. Good / Base / Bad Cases
 
-- Good: one fixture renders GFM, highlighted code/diff, math, Mermaid, the bounded
-  local PlantUML subset, footnotes/ToC, callouts, definitions, tasks/progress,
-  details, and safe HTML through the same document and resource policy in both
-  product surfaces.
-- Good: `[app.rs](/work/vibex/src/app.rs:42)` in an Agent session rooted at
-  `/work/vibex` opens `src/app.rs` in the existing preview surface.
-- Good: a timed-out math job remains isolated on the fixed math worker; later work
-  is queue-bounded/circuit-broken and stale output cannot replace a newer revision.
-- Base: unknown code language or unsupported diagram syntax renders readable source
-  with a bounded diagnostic and working copy action.
-- Base: `[README](/README.md)` remains a workspace-root-relative link rather than
-  being mistaken for an external filesystem read.
-- Bad: pre-rewrite Markdown links for one surface, trust engine SVG because it was
-  generated locally, interpret a `viewBox="0 -1500 6000 2000"` as 12 million raster
-  pixels despite bounded intrinsic dimensions, or spawn a detached timeout thread
-  per artifact.
+- Good: one agent answer streams through a single `Entity<TextViewState>`; code
+  fences highlight through the component's tree-sitter registry, tables scroll
+  horizontally, selection copies the typed text, and the find bar paints its hits
+  on the rendered text after the parse lands.
+- Good: `[app.rs](/work/vibex/apps/desktop/src/app.rs:9755:8)` in a session rooted
+  at `/work/vibex` opens `apps/desktop/src/app.rs` in the existing preview surface.
+- Good: a Markdown preview with workspace images preloads only those files, decodes
+  its embedded `data:` images itself, and leaves `https:` images to GPUI.
+- Base: an unknown code language or an unsupported diagram renders as a readable
+  code block with its language label.
+- Base: `[README](/README.md)` stays workspace-root relative rather than being
+  mistaken for an external filesystem read.
+- Bad: reintroduce a Markdown AST to "just" format one surface, paint a second
+  block renderer next to the component text view, hand `set_range_highlights` the
+  byte ranges of the source, or install an image resolver that silently drops
+  every embedded image.
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-markdown --locked` covers canonical parsing/ranges/ids,
-  malformed and bounded fallback, HTML/resource attacks, SVG sanitization, local
-  engines, artifact queue/cache/circuit/stale behavior, native GPUI rendering,
-  mouse selection, clipboard copy, anchors, details state, theme, and narrow layout.
-- Desktop regression tests must parse real Agent Markdown and assert that relative
-  `:line[:column]`, absolute current-workspace, and leading-slash workspace-root
-  links all produce the exact workspace-relative target passed to Preview.
-- Run `cargo clippy -p vibex-markdown --all-targets -- -D warnings`, the affected
-  desktop model/GPUI tests, a locked no-default-feature check, and
-  `rg -n 'TextView::markdown|project_markdown_for_host' apps/desktop crates/desktop-model`.
-- Run `pnpm check:licenses`; regenerated notices/SBOM must bind the selected local
-  engines and contain no hidden browser, Node, JVM, remote-renderer, or separately
-  downloaded Graphviz runtime.
+- `cargo test -p vibex-ui --locked` covers the shared projections: reading-order
+  plain text (headings, lists, code, links), resource collection through link
+  references, workspace path resolution (`..`, absolute, `:line:column`, schemes,
+  fragments, workspace escapes), and literal escaping round-trips through
+  `plain_text`.
+- Desktop regression tests must assert that relative `:line[:column]`, absolute
+  current-workspace, and leading-slash workspace-root links all produce the exact
+  workspace-relative target passed to Preview.
+- `cargo test -p vibex-desktop --locked` covers the timeline surfaces, the user
+  message attachment flow (`[label](vibex-attachment:N)` source plus its action
+  map), and the layout probes that render Markdown through the component view.
+- `cargo test -p vibex-tui --locked` covers its own terminal renderer, which parses
+  with `pulldown-cmark` inside the crate and shares nothing with the GPUI surfaces.
+- Source audit: `rg -n 'vibex_markdown|MarkdownView::new|parse_markdown\(' apps crates`
+  finds no self-developed renderer or Markdown model.
+- Run `pnpm check:licenses`; the regenerated notices/SBOM must no longer contain
+  the removed crate or the artifact engines it carried.
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
 ```rust
-std::thread::spawn(move || render_local_artifact(&request, policy));
-// recv_timeout returns, but every timed-out request can leave another worker alive.
+// A second renderer: parse here and paint blocks by hand.
+let document = parse_markdown(input);
+div().children(document.blocks.iter().map(|block| render_block(block, cx)))
+```
 
-let raster_pixels = view_box.width * view_box.height;
-TextView::markdown(project_markdown_for_host(source, path).rendered_source)
-let desktop_source = source.replace(workspace_root, "");
-// Surface-specific source rewriting bypasses the canonical resource decision.
+```rust
+// Highlight ranges index the rendered text, not the source.
+let hits = session_search_match_ranges(source, query);
+state.set_range_highlights(hits.into_iter().map(RangeHighlight::new), cx);
+```
+
+```rust
+// Installing a resolver replaces the text view's own data-URL decoding.
+TextView::markdown(id, source).image_source(|uri| match images.get(uri.as_ref()) {
+    Some(image) => ImageSource::Image(image.clone()),
+    None => ImageSource::Resource(Resource::Uri(uri.clone())),
+})
 ```
 
 #### Correct
 
 ```rust
-static MATH: OnceLock<Result<ArtifactWorker, String>> = OnceLock::new();
-let worker = MATH.get_or_init(|| ArtifactWorker::start("math"));
-worker.sender.try_send((request, policy, completion))?;
-
-validate_view_box(view_box, limits.max_svg_dimension)?;
-validate_pixel_area(intrinsic_width, intrinsic_height, limits.max_svg_pixels)?;
-MarkdownView::from_document(id, Arc::new(parse_markdown(input)))
-let resource = ResourcePolicy::new("").resolve(ResourceRole::Link, target, label);
-let preview_path = agent_markdown_preview_path(&resource, Some(workspace_root));
+let state = self.markdown_text_state(id, &source, search_highlight.as_ref(), cx);
+markdown_text_view(&state, MarkdownPresentation::Agent, cx, move |url, _, window, cx| {
+    let _ = entity.update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
+})
 ```
+
+```rust
+let text = state.read(cx).rendered_text();
+let hits = session_search_match_ranges(text.as_str(), query);
+state.update(cx, |state, cx| {
+    let _ = state.set_range_highlights(hits.into_iter().map(|range| RangeHighlight::new(range, background)), cx);
+});
+```
+
+```rust
+TextView::markdown(id, source).image_source(move |uri| {
+    let uri = uri.as_ref();
+    if let Some(image) = images.get(uri) {
+        return ImageSource::Image(image.clone());
+    }
+    if uri.starts_with("data:") {
+        return data_url_image(uri).map(ImageSource::Image).unwrap_or_else(|| {
+            ImageSource::Resource(Resource::Embedded(uri.into()))
+        });
+    }
+    ImageSource::Resource(Resource::Uri(uri.into()))
+})
+```
+
 
 ## Scenario: GPUI Bounded Office Preview Surface
 

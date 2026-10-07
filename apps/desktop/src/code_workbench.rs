@@ -6,18 +6,23 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::markdown::{
+    MarkdownPresentation, TextView, base_path_for_file, data_url_image, resolve_workspace_path,
+    resources as markdown_resources, text_view_style,
+};
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
 };
+use crate::typography::code_font_weight;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
     DragMoveEvent, Entity, FocusHandle, Focusable as _, HighlightStyle, Hsla, Image, ImageFormat,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
+    ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
     ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, MouseDownEvent, Orientation,
-    ParentElement as _, PathBuilder, Render, RenderImage, Role, ScrollHandle, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
-    Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred, div, img, list, point,
-    prelude::*, px, relative, uniform_list,
+    ParentElement as _, PathBuilder, Render, RenderImage, Resource, Role, ScrollHandle,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred, div, img,
+    list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
@@ -80,10 +85,6 @@ use vibex_desktop_model::{
     content_preview_kind, content_preview_kind_for_path, file_icon_descriptor, mutation_scope,
 };
 use vibex_desktop_runtime::validate_external_open_url;
-use vibex_markdown::{
-    MarkdownDocument, MarkdownInput, MarkdownSurface, MarkdownView, ResolvedResource, ResourceKind,
-    ResourcePolicy, ResourceRole, code_font_weight, parse_markdown,
-};
 use vibex_terminal::TerminalManager;
 
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
@@ -486,8 +487,16 @@ struct FileSearchReveal {
 enum FilePresentation {
     Loading,
     Markdown {
-        document: Arc<MarkdownDocument>,
+        /// The document source, rendered by the gpui-component text view.
+        source: Arc<str>,
+        /// `(destination as written, workspace path)` for every workspace
+        /// image the document references.
+        image_sources: Arc<Vec<(String, String)>>,
+        /// The loaded bytes of those images, keyed by the destination exactly
+        /// as the source writes it.
         images: Arc<BTreeMap<String, Arc<Image>>>,
+        /// Workspace paths the document links to.
+        links: Arc<Vec<String>>,
     },
     Image {
         image: Arc<RenderImage>,
@@ -1572,7 +1581,7 @@ impl CodeWorkbench {
             },
         ));
 
-        let markdown = include_str!("../../../crates/vibex-markdown/fixtures/advanced.md");
+        let markdown = include_str!("../fixtures/advanced.md");
         this.editors.insert_read(FileReadResponse {
             workspace_id: workspace_id.clone(),
             path: "README.md".to_string(),
@@ -1592,12 +1601,14 @@ impl CodeWorkbench {
             input.set_highlighter("markdown", cx);
             input.set_value(markdown, window, cx);
         });
-        let document = parse_file_markdown(markdown, "README.md");
+        let scan = scan_markdown_resources(markdown, "README.md");
         this.presentations.insert(
             "README.md".to_string(),
             FilePresentation::Markdown {
-                document,
+                source: Arc::from(markdown),
+                image_sources: Arc::new(scan.images),
                 images: Arc::default(),
+                links: Arc::new(scan.links),
             },
         );
         let readme_tab = this
@@ -3273,7 +3284,7 @@ impl CodeWorkbench {
                             input.set_value(content.clone(), window, cx);
                         });
                         if content_preview_kind_for_path(&path) == ContentPreviewKind::Markdown {
-                            this.start_markdown_parse(path, content, cx);
+                            this.start_markdown_scan(path, content, cx);
                         }
                     } else {
                         this.open_file(path, false, window, cx);
@@ -5867,23 +5878,33 @@ impl CodeWorkbench {
         cx.notify();
     }
 
-    fn open_markdown_resource(
+    /// Open the destination a rendered Markdown link points at.
+    ///
+    /// The text view reports the destination exactly as the document wrote it:
+    /// an external URL opens in the system browser, a fragment stays in place,
+    /// and anything else is a workspace path relative to the document.
+    fn open_markdown_link(
         &mut self,
-        resource: ResolvedResource,
+        url: &str,
+        base_path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = resource.resolved else {
+        if url.starts_with('#') {
             return;
-        };
-        match resource.kind {
-            ResourceKind::Workspace => self.open_file(target, false, window, cx),
-            ResourceKind::Http => self.open_web_external(target, cx),
-            ResourceKind::DataImage | ResourceKind::Fragment | ResourceKind::Blocked => {}
+        }
+        if let Ok(parsed) = url::Url::parse(url) {
+            if matches!(parsed.scheme(), "http" | "https") {
+                self.open_web_external(url.to_string(), cx);
+            }
+            return;
+        }
+        if let Some(target) = resolve_workspace_path(base_path, url) {
+            self.open_file(target, false, window, cx);
         }
     }
 
-    fn start_markdown_parse(&mut self, path: String, source: String, cx: &mut Context<Self>) {
+    fn start_markdown_scan(&mut self, path: String, source: String, cx: &mut Context<Self>) {
         let Some(workspace_generation) = self
             .workspace
             .as_ref()
@@ -5898,38 +5919,46 @@ impl CodeWorkbench {
             self.presentations
                 .insert(path.clone(), FilePresentation::Loading);
         }
-        let parse_path = path.clone();
-        let parse = cx.background_spawn(async move { parse_file_markdown(&source, &parse_path) });
+        let scan_path = path.clone();
+        let scanned_source = source.clone();
+        let scan = cx
+            .background_spawn(async move { scan_markdown_resources(&scanned_source, &scan_path) });
         let task_path = path.clone();
-        let task_key = format!("markdown-parse:{path}");
+        let task_key = format!("markdown-scan:{path}");
         let completion_key = task_key.clone();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let document = parse.await;
-            let _ =
-                entity.update(cx, |this, cx| {
-                    this.file_tasks.remove(&completion_key);
-                    if this
-                        .workspace
-                        .as_ref()
-                        .map(|workspace| workspace.generation)
-                        != Some(workspace_generation)
-                        || this.editors.buffers.get(&task_path).is_none_or(|buffer| {
-                            buffer.content.as_str() != document.source.as_ref()
-                        })
-                    {
-                        return;
-                    }
-                    let images = match this.presentations.get(&task_path) {
-                        Some(FilePresentation::Markdown { images, .. }) => images.clone(),
-                        _ => Arc::default(),
-                    };
-                    this.presentations.insert(
-                        task_path.clone(),
-                        FilePresentation::Markdown { document, images },
-                    );
-                    this.load_markdown_assets(task_path.clone(), cx);
-                    cx.notify();
-                });
+            let scan = scan.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.file_tasks.remove(&completion_key);
+                if this
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.generation)
+                    != Some(workspace_generation)
+                    || this
+                        .editors
+                        .buffers
+                        .get(&task_path)
+                        .is_none_or(|buffer| buffer.content.as_str() != source.as_str())
+                {
+                    return;
+                }
+                let images = match this.presentations.get(&task_path) {
+                    Some(FilePresentation::Markdown { images, .. }) => images.clone(),
+                    _ => Arc::default(),
+                };
+                this.presentations.insert(
+                    task_path.clone(),
+                    FilePresentation::Markdown {
+                        source: Arc::from(source.as_str()),
+                        image_sources: Arc::new(scan.images),
+                        images,
+                        links: Arc::new(scan.links),
+                    },
+                );
+                this.load_markdown_assets(task_path.clone(), cx);
+                cx.notify();
+            });
         });
         self.file_tasks.insert(task_key, task);
     }
@@ -5986,7 +6015,7 @@ impl CodeWorkbench {
                                     input.set_value(content.clone(), window, cx);
                                 });
                                 if markdown {
-                                    this.start_markdown_parse(task_path.clone(), content, cx);
+                                    this.start_markdown_scan(task_path.clone(), content, cx);
                                 } else {
                                     this.presentations.remove(&task_path);
                                 }
@@ -6049,16 +6078,9 @@ impl CodeWorkbench {
             return;
         };
         let assets = match self.presentations.get(&path) {
-            Some(FilePresentation::Markdown { document, .. }) => document
-                .resources
-                .iter()
-                .filter(|asset| {
-                    asset.kind == ResourceKind::Workspace && asset.role == ResourceRole::Image
-                })
-                .filter_map(|asset| Some((asset.source.clone(), asset.resolved.as_ref()?.clone())))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>(),
+            Some(FilePresentation::Markdown { image_sources, .. }) => {
+                image_sources.as_ref().clone()
+            }
             _ => return,
         };
         if assets.is_empty() {
@@ -6387,7 +6409,7 @@ impl CodeWorkbench {
                 self.markdown_edit_paths.remove(path);
                 self.file_tasks.remove(path);
                 self.file_tasks.remove(&format!("markdown:{path}"));
-                self.file_tasks.remove(&format!("markdown-parse:{path}"));
+                self.file_tasks.remove(&format!("markdown-scan:{path}"));
                 self.file_tasks.remove(&format!("save:{path}"));
             }
         }
@@ -6499,7 +6521,7 @@ impl CodeWorkbench {
                 .get(&path)
                 .map(|buffer| buffer.content.clone())
             {
-                self.start_markdown_parse(path, source, cx);
+                self.start_markdown_scan(path, source, cx);
             }
         } else {
             self.markdown_edit_paths.insert(path);
@@ -9486,45 +9508,55 @@ impl CodeWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let markdown = self.presentations.get(&path).and_then(|presentation| {
-            if let FilePresentation::Markdown { document, images } = presentation {
-                Some((document.clone(), images.clone()))
+            if let FilePresentation::Markdown {
+                source,
+                images,
+                links,
+                ..
+            } = presentation
+            {
+                Some((source.clone(), images.clone(), links.clone()))
             } else {
                 None
             }
         });
-        if let Some((document, images)) = markdown
+        if let Some((source, images, links)) = markdown
             && !self.markdown_edit_paths.contains(&path)
         {
             let edit_path = path.clone();
-            let workspace_links = document
-                .resources
-                .iter()
-                .filter(|asset| {
-                    asset.kind == ResourceKind::Workspace && asset.role == ResourceRole::Link
-                })
-                .filter_map(|asset| asset.resolved.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .take(32)
-                .collect::<Vec<_>>();
+            let workspace_links = links.iter().take(32).cloned().collect::<Vec<_>>();
             let scroll = self
                 .markdown_scrolls
                 .entry(path.clone())
                 .or_default()
                 .clone();
-            let view_scroll = scroll.clone();
             let markdown_entity = cx.weak_entity();
             let locate_path = path.clone();
-            let markdown_view =
-                MarkdownView::from_document(format!("markdown-preview:{path}"), document)
-                    .images(images)
-                    .allow_http_images(true)
-                    .scroll_handle(view_scroll)
-                    .on_open_resource(move |resource, window, cx| {
+            let base_path = base_path_for_file(&path);
+            let mut markdown_view =
+                TextView::markdown(format!("markdown-preview:{path}"), source)
+                    .text_sm()
+                    .line_height(px(22.0))
+                    .image_source(move |uri| {
+                        let uri = uri.as_ref();
+                        if let Some(image) = images.get(uri) {
+                            return ImageSource::Image(image.clone());
+                        }
+                        if uri.starts_with("data:") {
+                            return data_url_image(uri).map(ImageSource::Image).unwrap_or_else(
+                                || ImageSource::Resource(Resource::Embedded(uri.into())),
+                            );
+                        }
+                        ImageSource::Resource(Resource::Uri(uri.into()))
+                    })
+                    .on_link_click(move |url, _, window, cx| {
                         let _ = markdown_entity.update(cx, |this, cx| {
-                            this.open_markdown_resource(resource, window, cx)
+                            this.open_markdown_link(url, &base_path, window, cx)
                         });
                     });
+            if let Some(style) = text_view_style(MarkdownPresentation::Document, cx) {
+                markdown_view = markdown_view.style(style);
+            }
             return v_flex()
                 .size_full()
                 .min_h_0()
@@ -17623,18 +17655,39 @@ fn tab_accessible_label(tab: &PreviewTab, dirty: bool) -> String {
     )
 }
 
-fn parse_file_markdown(source: &str, path: &str) -> Arc<MarkdownDocument> {
-    let policy = ResourcePolicy::for_file(path);
-    let mut digest = Sha256::new();
-    digest.update(path.as_bytes());
-    digest.update([0]);
-    digest.update(source.as_bytes());
-    let digest = digest.finalize();
-    let revision = u64::from_le_bytes(digest[..8].try_into().unwrap_or_default());
-    Arc::new(parse_markdown(
-        MarkdownInput::new(source, policy.base_path(), revision)
-            .surface(MarkdownSurface::FilePreview),
-    ))
+/// The workspace resources a Markdown preview needs before it can render.
+struct MarkdownScan {
+    /// `(destination as written, workspace path)` for every workspace image.
+    images: Vec<(String, String)>,
+    /// Workspace paths the document links to.
+    links: Vec<String>,
+}
+
+/// Resolve the links and images a Markdown document points at.
+///
+/// The text view fetches nothing by itself, so the preview preloads the
+/// workspace images and lists the workspace links a document names. Everything
+/// outside the workspace (an external URL, a fragment, an embedded image) is
+/// left to the renderer.
+fn scan_markdown_resources(source: &str, path: &str) -> MarkdownScan {
+    let base_path = base_path_for_file(path);
+    let mut images = Vec::new();
+    let mut links = Vec::new();
+    for resource in markdown_resources(source) {
+        let Some(resolved) = resolve_workspace_path(&base_path, &resource.url) else {
+            continue;
+        };
+        if resource.image {
+            images.push((resource.url, resolved));
+        } else {
+            links.push(resolved);
+        }
+    }
+    images.sort();
+    images.dedup();
+    links.sort();
+    links.dedup();
+    MarkdownScan { images, links }
 }
 
 fn language_for_path(path: &str) -> &'static str {

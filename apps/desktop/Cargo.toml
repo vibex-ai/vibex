@@ -14,12 +14,41 @@ e2e-test-support = []
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
-gpui-component.workspace = true
+# The Markdown surfaces render through the component text view, and the code
+# editor highlights through the component's tree-sitter registry, so the
+# syntax list lives here now.
+gpui-component = { workspace = true, features = [
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-kotlin",
+  "tree-sitter-lua",
+  "tree-sitter-markdown",
+  "tree-sitter-php",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-sql",
+  "tree-sitter-swift",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+  "tree-sitter-zig",
+] }
 gpui-base.workspace = true
 gpui-fps.workspace = true
 gpui-kit-assets.workspace = true
 anyhow.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
+markdown.workspace = true
 qrcode.workspace = true
 resvg.workspace = true
 pdfium-render.workspace = true
@@ -53,7 +82,6 @@ vibex-client = { path = "../tui" }
 vibex-tui = { path = "../../crates/vibex-tui" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-ui = { path = "../../crates/vibex-ui" }
-vibex-markdown = { path = "../../crates/vibex-markdown" }
 vibex-terminal = { path = "../../crates/terminal" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
