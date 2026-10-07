@@ -6444,6 +6444,75 @@ impl Render for SessionGroupPaneView {
     }
 }
 
+/// The sidebar's own render boundary.
+///
+/// The sidebar is the hottest subtree in the workbench: hover fades, the
+/// collapse tween, and every streaming session-status update repaint it. Giving
+/// it a view of its own keeps those repaints from rebuilding the timeline and
+/// composer. Hover fades inside it are owned by this view (see
+/// [`motion::with_hover_owner`]) rather than by [`VibexWorkbench`].
+struct SidebarView {
+    workbench: WeakEntity<VibexWorkbench>,
+}
+
+impl SidebarView {
+    fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
+        // The sidebar renders workbench state, so a workbench notify has to
+        // refresh it. Dropping the subscription would freeze it on frame one.
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+        }
+    }
+}
+
+impl Render for SidebarView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let owner = cx.entity_id();
+        motion::with_hover_owner(owner, || {
+            workbench.update(cx, |this, cx| this.render_agent_sidebar(cx))
+        })
+    }
+}
+
+/// The primary timeline's own render boundary.
+///
+/// The timeline and composer rebuild on every streamed token, and their hover
+/// washes run while scrolling. Isolating them behind this view means a sidebar
+/// hover or a shell chrome repaint reuses the cached timeline instead of
+/// walking every visible row again. Hover fades inside it are owned by this view
+/// rather than by [`VibexWorkbench`].
+///
+/// Group panes keep their own [`SessionGroupPaneView`]; only the focused
+/// workbench center uses this one.
+struct TimelineView {
+    workbench: WeakEntity<VibexWorkbench>,
+}
+
+impl TimelineView {
+    fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+        }
+    }
+}
+
+impl Render for TimelineView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let owner = cx.entity_id();
+        motion::with_hover_owner(owner, || {
+            workbench.update(cx, |this, cx| this.render_agent_workbench(window, cx))
+        })
+    }
+}
+
 /// Where a session tab would land inside a group workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionGroupPaneDropRegion {
@@ -7176,6 +7245,12 @@ pub struct VibexWorkbench {
     /// never evicted, so a group member cannot lose its timeline while it is on
     /// screen.
     session_view_lru: VecDeque<String>,
+    /// The sidebar's own render boundary, created on first render. See
+    /// [`SidebarView`]; `None` only before the first frame.
+    sidebar_view: Option<Entity<SidebarView>>,
+    /// The focused timeline's own render boundary, created on first render. See
+    /// [`TimelineView`]; `None` only before the first frame.
+    timeline_view: Option<Entity<TimelineView>>,
     /// Unsent Composer content, one entry per session, kept outside the view
     /// cache.
     ///
@@ -8153,6 +8228,8 @@ impl VibexWorkbench {
             view_session_id: selected_session_id,
             session_views: BTreeMap::new(),
             session_view_lru: VecDeque::new(),
+            sidebar_view: None,
+            timeline_view: None,
             composer_drafts: ComposerDraftStore::default(),
             pending_timeline_turn_measurements: BTreeMap::new(),
             child_agent_timelines: BTreeMap::new(),
@@ -54170,6 +54247,32 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The sidebar's render boundary, created on first use.
+    ///
+    /// Created during a render rather than in `new` because the host has to
+    /// observe `VibexWorkbench`, and the workbench entity is not registered yet
+    /// while its own constructor runs.
+    fn ensure_sidebar_view(&mut self, cx: &mut Context<Self>) -> Entity<SidebarView> {
+        if let Some(view) = self.sidebar_view.as_ref() {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| SidebarView::new(&workbench, cx));
+        self.sidebar_view = Some(view.clone());
+        view
+    }
+
+    /// The focused timeline's render boundary, created on first use.
+    fn ensure_timeline_view(&mut self, cx: &mut Context<Self>) -> Entity<TimelineView> {
+        if let Some(view) = self.timeline_view.as_ref() {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| TimelineView::new(&workbench, cx));
+        self.timeline_view = Some(view.clone());
+        view
+    }
+
     fn render_inline_sidebar(
         &mut self,
         visibility: WorkbenchVisibility,
@@ -54229,10 +54332,10 @@ impl VibexWorkbench {
                 .bg(cx.theme().sidebar)
                 .pt(px(TITLE_BAR_HEIGHT))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.render_agent_sidebar(cx)),
+                    div().flex_1().min_h_0().child(
+                        self.ensure_sidebar_view(cx)
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
                 );
             if visible {
                 panel = panel.child(self.render_sidebar_resize_handle(
@@ -54356,7 +54459,10 @@ impl VibexWorkbench {
             .shadow_lg()
             .occlude()
             .on_hover(cx.listener(|this, hovered, _, cx| this.handle_sidebar_hover(*hovered, cx)))
-            .child(self.render_agent_sidebar(cx));
+            .child(
+                self.ensure_sidebar_view(cx)
+                    .cached(StyleRefinement::default().size_full()),
+            );
         let panel = if !animate
             || (animation_state.animation.from_value == animation_state.animation.target_value
                 && animation_state.animation.from_opacity
@@ -54945,7 +55051,9 @@ impl VibexWorkbench {
         } else if let Some((group_id, group)) = self.active_session_group() {
             self.render_session_group_workspace(&group_id, &group, cx)
         } else {
-            self.render_agent_workbench(window, cx)
+            self.ensure_timeline_view(cx)
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         };
         shell = shell.child(
             div()

@@ -143,6 +143,14 @@ zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate
 [profile.dev]
 incremental = true
 
+# GPUI, taffy layout, text shaping, and syntax highlighting are all slow when
+# built unoptimized, so every dependency stays at a fixed optimization level in
+# debug builds while first-party crates keep the fast incremental profile. This
+# is the same split Zed uses: it removes most of the input-to-frame latency in
+# `cargo run` builds without slowing local rebuilds of our own code.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

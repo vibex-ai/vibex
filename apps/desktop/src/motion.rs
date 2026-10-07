@@ -36,7 +36,7 @@
 //! never set `position` themselves; an element's own positioning (relative is
 //! the gpui default) must survive the animation untouched.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -450,6 +450,33 @@ thread_local! {
     static HOVER_FADES: RefCell<HoverFades> = RefCell::new(HoverFades::default());
 }
 
+thread_local! {
+    /// The view a render pass is building on behalf of.
+    ///
+    /// The workbench renders its sidebar and timeline through child host views
+    /// (`SidebarView`, `TimelineView`) so those subtrees keep their own render
+    /// boundary. A host pushes its entity id here while it renders the
+    /// workbench's state, so every hover fade created inside that subtree is
+    /// owned by the host — a sidebar hover notifies the sidebar alone instead of
+    /// rebuilding the whole workbench. Nested scopes restore the previous owner.
+    static HOVER_OWNER_SCOPE: Cell<Option<EntityId>> = const { Cell::new(None) };
+}
+
+/// Runs `build` with `owner` as the hover-fade owner for every
+/// [`hover_listener`] built inside it. Used by the host views that render the
+/// workbench's state on the workbench's behalf.
+pub fn with_hover_owner<R>(owner: EntityId, build: impl FnOnce() -> R) -> R {
+    let previous = HOVER_OWNER_SCOPE.with(|scope| scope.replace(Some(owner)));
+    let result = build();
+    HOVER_OWNER_SCOPE.with(|scope| scope.set(previous));
+    result
+}
+
+/// The host view that currently owns the render pass, if any.
+fn scoped_hover_owner() -> Option<EntityId> {
+    HOVER_OWNER_SCOPE.with(Cell::get)
+}
+
 /// Stable store key for an element's hover fade. Namespaced by caller so the
 /// global store cannot collide across surfaces.
 pub fn hover_key(namespace: &str, id: impl std::fmt::Display) -> String {
@@ -483,6 +510,10 @@ pub fn hover_listener(
     key: impl Into<SharedString>,
 ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     let key = key.into();
+    // Resolve the owner now, not in the listener: a host view sets the scope
+    // only for the duration of its render, and the flip arrives later during
+    // event dispatch, when no scope is active.
+    let owner = scoped_hover_owner().unwrap_or(owner);
     move |hovered, _window, cx| {
         set_hover(&key, *hovered, cx.reduce_motion(), owner);
         // Event-dispatch context: `request_animation_frame` is draw-phase-only,
