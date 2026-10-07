@@ -425,6 +425,13 @@ struct MarkdownPreviewState {
     /// The source the state was last handed, so a reloaded file replaces the
     /// document and an unchanged one costs nothing.
     source: Arc<str>,
+    /// How many bytes of `source` the view has been handed so far.
+    fed_bytes: usize,
+    /// The block count the view reported when the last chunk was pushed, so the
+    /// next chunk waits for that one to land. `None` before the first push.
+    blocks_last_pushed: Option<usize>,
+    /// Frames the pending chunk has waited for the previous one to land.
+    frames_waited: u32,
 }
 
 /// How many open Markdown previews keep a retained text view.
@@ -433,6 +440,47 @@ struct MarkdownPreviewState {
 /// preview did before it was retained; the bound only keeps a session that
 /// opens many files from holding every parse.
 const MARKDOWN_PREVIEW_STATE_LIMIT: usize = 8;
+
+/// How much source one preview frame hands the text view.
+///
+/// The view measures every block it is handed, so a whole file in one piece
+/// costs one frame proportional to the document — a visible hitch on open, and
+/// a freeze of hundreds of milliseconds on a large file. Appending through the
+/// component's streaming path measures only the blocks the append added, so the
+/// same file arrives over several frames of work each: the top of the document
+/// is on screen after the first one.
+const MARKDOWN_PREVIEW_CHUNK_BYTES: usize = 12 * 1024;
+
+/// How many frames a chunk waits for the previous one to reach the list before
+/// it is pushed anyway.
+///
+/// The wait keeps appended blocks measured instead of re-measuring the whole
+/// document, but a chunk that merges into the block before it never adds a
+/// block, so the feed cannot wait forever.
+const MARKDOWN_PREVIEW_CHUNK_MAX_WAIT_FRAMES: u32 = 4;
+
+/// Where the chunk starting at `start` ends: the blank line nearest past
+/// `target` bytes, or the end of the source when there is none.
+///
+/// A blank line is where one block ends and the next begins, so a split there
+/// leaves both sides parsing whole blocks. A split inside a fenced block is not
+/// wrong — the component parses streamed text and the tail is measured again —
+/// but it costs the tail a second layout.
+fn markdown_preview_chunk_end(source: &str, start: usize, target: usize) -> usize {
+    let limit = source.len();
+    let mut wanted = start.saturating_add(target).min(limit);
+    while wanted < limit && !source.is_char_boundary(wanted) {
+        wanted += 1;
+    }
+    if wanted >= limit {
+        return limit;
+    }
+    match source[wanted..].find("\n\n") {
+        // Past the blank line, so the next chunk starts a block of its own.
+        Some(offset) => wanted + offset + 2,
+        None => limit,
+    }
+}
 
 /// Presentation state of the right-hand integrated panel for one workspace
 /// state scope.
@@ -5926,6 +5974,29 @@ impl CodeWorkbench {
         }
     }
 
+    /// Show a Markdown file's source before its resource scan lands.
+    ///
+    /// The scan parses the file to find the images and links it references; the
+    /// preview parses it to render it. Publishing the source first lets both
+    /// parses run at once, instead of the reader waiting for a second parse of
+    /// the same file before the document reaches the text view. The scan only
+    /// fills in the images and links of the presentation that is already there.
+    fn publish_markdown_source(&mut self, path: &str, source: Arc<str>) {
+        let images = match self.presentations.get(path) {
+            Some(FilePresentation::Markdown { images, .. }) => images.clone(),
+            _ => Arc::default(),
+        };
+        self.presentations.insert(
+            path.to_string(),
+            FilePresentation::Markdown {
+                source,
+                image_sources: Arc::default(),
+                images,
+                links: Arc::default(),
+            },
+        );
+    }
+
     fn start_markdown_scan(&mut self, path: String, source: String, cx: &mut Context<Self>) {
         let Some(workspace_generation) = self
             .workspace
@@ -5934,13 +6005,7 @@ impl CodeWorkbench {
         else {
             return;
         };
-        if !matches!(
-            self.presentations.get(&path),
-            Some(FilePresentation::Markdown { .. })
-        ) {
-            self.presentations
-                .insert(path.clone(), FilePresentation::Loading);
-        }
+        self.publish_markdown_source(&path, Arc::from(source.as_str()));
         let scan_path = path.clone();
         let scanned_source = source.clone();
         let scan = cx
@@ -5965,14 +6030,19 @@ impl CodeWorkbench {
                 {
                     return;
                 }
-                let images = match this.presentations.get(&task_path) {
-                    Some(FilePresentation::Markdown { images, .. }) => images.clone(),
-                    _ => Arc::default(),
+                // The source the preview is reading stays the one it was
+                // handed: only the destinations the scan found are new.
+                let Some(FilePresentation::Markdown { source, images, .. }) =
+                    this.presentations.get(&task_path)
+                else {
+                    // The preview went away while the scan ran.
+                    return;
                 };
+                let (source, images) = (source.clone(), images.clone());
                 this.presentations.insert(
                     task_path.clone(),
                     FilePresentation::Markdown {
-                        source: Arc::from(source.as_str()),
+                        source,
                         image_sources: Arc::new(scan.images),
                         images,
                         links: Arc::new(scan.links),
@@ -6031,14 +6101,22 @@ impl CodeWorkbench {
                                 let markdown = preview_kind == ContentPreviewKind::Markdown;
                                 let content = file.content.clone().unwrap_or_default();
                                 this.editors.insert_read(file);
+                                if markdown {
+                                    // The rendered preview owns the file's first
+                                    // frame, so its parse starts before the source
+                                    // editor is built around the same bytes.
+                                    this.start_markdown_scan(
+                                        task_path.clone(),
+                                        content.clone(),
+                                        cx,
+                                    );
+                                }
                                 let input = this.ensure_editor_binding(&task_path, window, cx);
                                 input.update(cx, |input, cx| {
                                     input.set_highlighter(language_for_path(&task_path), cx);
                                     input.set_value(content.clone(), window, cx);
                                 });
-                                if markdown {
-                                    this.start_markdown_scan(task_path.clone(), content, cx);
-                                } else {
+                                if !markdown {
                                     this.presentations.remove(&task_path);
                                 }
                             }
@@ -9528,25 +9606,34 @@ impl CodeWorkbench {
     /// The state carries the parse of the file, the reader's selection and the
     /// scroll offset, so a preview switched away from and back resumes instead
     /// of parsing again. It is handed the source only when that source actually
-    /// changed.
+    /// changed, and then only its first chunk: [`Self::feed_markdown_preview`]
+    /// hands over the rest across the frames that follow.
     fn markdown_preview_state(
         &mut self,
         path: &str,
         source: &Arc<str>,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
+        let first_chunk = markdown_preview_chunk_end(source, 0, MARKDOWN_PREVIEW_CHUNK_BYTES);
         if let Some(entry) = self.markdown_previews.get_mut(path) {
             let state = entry.state.clone();
-            let unchanged =
-                entry.source.len() == source.len() && Arc::ptr_eq(&entry.source, source);
+            // The pointer answers for the frame-by-frame path; the scan behind a
+            // load republishes the same bytes as a fresh `Arc<str>`, and a
+            // document that did not change keeps its parse, its scroll offset
+            // and the chunks it already holds.
+            let unchanged = entry.source.len() == source.len()
+                && (Arc::ptr_eq(&entry.source, source) || entry.source == *source);
             if !unchanged {
                 entry.source = source.clone();
-                state.update(cx, |state, cx| state.set_text(source, cx));
+                entry.fed_bytes = first_chunk;
+                entry.blocks_last_pushed = None;
+                entry.frames_waited = 0;
+                state.update(cx, |state, cx| state.set_text(&source[..first_chunk], cx));
             }
             return state;
         }
 
-        let state = cx.new(|cx| TextViewState::markdown(source, cx));
+        let state = cx.new(|cx| TextViewState::markdown(&source[..first_chunk], cx));
         if self.markdown_previews.len() >= MARKDOWN_PREVIEW_STATE_LIMIT
             && let Some(evicted) = self
                 .markdown_previews
@@ -9563,9 +9650,50 @@ impl CodeWorkbench {
             MarkdownPreviewState {
                 state: state.clone(),
                 source: source.clone(),
+                fed_bytes: first_chunk,
+                blocks_last_pushed: None,
+                frames_waited: 0,
             },
         );
         state
+    }
+
+    /// Hand the preview the next piece of its document, if it has one left.
+    ///
+    /// Driven from the frame that renders the preview, so the pace follows the
+    /// parse: a chunk is pushed once the list has the blocks of the chunk
+    /// before it, which is what keeps the append measuring only its own blocks
+    /// instead of the whole document. A preview that is not on screen keeps the
+    /// part of the document it already has and finishes the feed when it is
+    /// rendered again.
+    fn feed_markdown_preview(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self.markdown_previews.get_mut(path) else {
+            return;
+        };
+        let source = entry.source.clone();
+        if entry.fed_bytes >= source.len() {
+            return;
+        }
+        let blocks = entry.state.read(cx).list_state().item_count();
+        let landed = match entry.blocks_last_pushed {
+            // Nothing pushed yet: the first chunk has to reach the list before
+            // the second follows it, or the append would find a list that does
+            // not hold the blocks it extends.
+            None => blocks > 0,
+            Some(pushed) => blocks > pushed,
+        };
+        entry.frames_waited += 1;
+        if !landed && entry.frames_waited < MARKDOWN_PREVIEW_CHUNK_MAX_WAIT_FRAMES {
+            return;
+        }
+        let start = entry.fed_bytes;
+        let end = markdown_preview_chunk_end(&source, start, MARKDOWN_PREVIEW_CHUNK_BYTES);
+        entry
+            .state
+            .update(cx, |state, cx| state.push_str(&source[start..end], cx));
+        entry.fed_bytes = end;
+        entry.blocks_last_pushed = Some(blocks);
+        entry.frames_waited = 0;
     }
 
     fn render_file_content(
@@ -9593,6 +9721,7 @@ impl CodeWorkbench {
             let edit_path = path.clone();
             let workspace_links = links.iter().take(32).cloned().collect::<Vec<_>>();
             let state = self.markdown_preview_state(&path, &source, cx);
+            self.feed_markdown_preview(&path, cx);
             let markdown_entity = cx.weak_entity();
             let locate_path = path.clone();
             let base_path = base_path_for_file(&path);
@@ -20813,6 +20942,108 @@ mod tests {
         assert_eq!(
             offset.item_ix, 2,
             "the preview must come back to where the reader left it"
+        );
+    }
+
+    /// A large Markdown file reaches the preview over several frames, not in one.
+    ///
+    /// The text view measures every block it is handed, so a whole file in one
+    /// piece costs one frame proportional to the document — the hitch on open,
+    /// and a freeze on a file of hundreds of kilobytes. The feed appends the
+    /// rest through the component's streaming path, which measures only what it
+    /// appends, so no single frame pays for the whole file.
+    #[gpui::test]
+    fn a_large_markdown_preview_is_fed_in_chunks(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (fixture, cx) = cx.add_window_view(|window, cx| {
+            CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Markdown, window, cx)
+        });
+        draw_window(cx);
+        let workbench = fixture.read_with(cx, |fixture, _| fixture.workbench.clone());
+
+        // A document of several chunks: prose, a list and a table per section.
+        let mut source = String::new();
+        for section in 0..160 {
+            source.push_str(&format!(
+                "## Section {section}\n\nParagraph {section} of the report. The **dip window** is \
+                 08-18 -> 08-26, followed by a post-earnings jump; the numbers line up with what \
+                 the market priced in before the open.\n\n\
+                 - FOMC 09-16: +25bp to 3.75-4.00%, 12-0.\n\
+                 - XLE +45.2% YTD, the standout winner.\n\n"
+            ));
+        }
+        let total = source.len();
+        assert!(total > 3 * MARKDOWN_PREVIEW_CHUNK_BYTES);
+
+        workbench.update(cx, |this, _cx| {
+            this.presentations.insert(
+                "BIG.md".to_string(),
+                FilePresentation::Markdown {
+                    source: Arc::from(source.as_str()),
+                    image_sources: Arc::default(),
+                    images: Arc::default(),
+                    links: Arc::default(),
+                },
+            );
+            this.preview
+                .open(
+                    PreviewTarget::File {
+                        path: "BIG.md".to_string(),
+                    },
+                    None,
+                    1,
+                )
+                .expect("BIG.md target is valid");
+            this.preview.focus("file:BIG.md");
+        });
+        draw_window(cx);
+
+        let fed = |cx: &gpui::VisualTestContext| {
+            workbench.read_with(cx, |this, cx| {
+                let preview = this
+                    .markdown_previews
+                    .get("BIG.md")
+                    .expect("an open preview retains its text view");
+                (
+                    preview.fed_bytes,
+                    preview.source.len(),
+                    preview.state.read(cx).list_state().item_count(),
+                )
+            })
+        };
+        let (first, _, first_blocks) = fed(cx);
+        assert!(
+            first > 0 && first < total,
+            "the preview must not take the whole document in one hand-off: {first}/{total}"
+        );
+        assert!(
+            first_blocks > 1,
+            "the blocks of the first chunk must already be with the list, got {first_blocks}"
+        );
+
+        // The rest arrives over the frames that follow, until the document is
+        // whole; the blocks of the document grow with it.
+        let mut frames = 0;
+        let mut previous = first;
+        while previous < total {
+            draw_window(cx);
+            let (current, _, blocks) = fed(cx);
+            assert!(
+                current >= previous,
+                "the feed must not go backwards: {previous} -> {current}"
+            );
+            assert!(
+                blocks >= first_blocks,
+                "the document must keep its blocks as it grows"
+            );
+            previous = current;
+            frames += 1;
+            assert!(frames < 64, "the feed must finish");
+        }
+        assert_eq!(previous, total);
+        assert!(
+            fed(cx).2 > first_blocks,
+            "the whole document must reach the list, not just its first chunk"
         );
     }
 

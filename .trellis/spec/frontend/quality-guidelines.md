@@ -1189,6 +1189,25 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   survive a tab switch, and it hands the state a source only when that source
   changed. Timeline rows keep the fit-content view: a row has no definite height
   to virtualize inside, and the timeline's own list bounds how many of them paint.
+- A file preview is fed its source in chunks, not in one piece: the text view
+  measures every block it is handed, so a whole file in one `set_text` costs one
+  frame proportional to the document (a 129 KB file measured ~20-58 ms of
+  first-layout work in a debug build — the hitch on open, and a freeze on a file
+  of hundreds of kilobytes). `CodeWorkbench::feed_markdown_preview` appends
+  `MARKDOWN_PREVIEW_CHUNK_BYTES` at a time through `TextViewState::push_str`,
+  whose append path measures only the blocks the append added, and only once the
+  previous chunk reached the list — which is what keeps the measured blocks
+  measured. It is driven from the frame that renders the preview, so the pace is
+  the parse's; a chunk that never adds a block is pushed anyway after
+  `MARKDOWN_PREVIEW_CHUNK_MAX_WAIT_FRAMES`. The first chunk is the source's
+  prefix, so the top of the document is on screen from the first frame.
+- A file's preview does not wait for its resource scan: `start_markdown_scan`
+  publishes the source (`publish_markdown_source`) before it parses the same bytes
+  a second time to find images and links, and the scan's completion updates only
+  those destinations, so the preview's parse and the scan run at once. The
+  completion must keep the source `Arc<str>` the preview already holds — handing
+  over a fresh `Arc` of equal bytes makes the preview re-feed a document that did
+  not change (content equality is the fallback) and drops the reader's position.
 - Find-bar highlighting indexes the rendered text, not the source:
   `refresh_markdown_search_highlights` searches `TextViewState::rendered_text()`
   and paints hits with `set_range_highlights`, driven by a parse observer so a
@@ -1272,7 +1291,9 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   map), and the layout probes that render Markdown through the component view.
   `a_markdown_preview_virtualizes_its_document_and_keeps_it` pins the file
   preview to the virtualized list and its retained state — it fails when the
-  preview goes back to a fit-content text view.
+  preview goes back to a fit-content text view — and
+  `a_large_markdown_preview_is_fed_in_chunks` pins the feed: the preview must not
+  take a document of several chunks in one hand-off.
 - `cargo test -p vibex-tui --locked` covers its own terminal renderer, which parses
   with `pulldown-cmark` inside the crate and shares nothing with the GPUI surfaces.
 - Source audit: `rg -n 'vibex_markdown|MarkdownView::new|parse_markdown\(' apps crates`
