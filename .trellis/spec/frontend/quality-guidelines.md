@@ -1146,15 +1146,18 @@ vibex_ui::markdown::utf8_prefix(&str, max_bytes) -> &str
 
 apps/desktop: markdown_text_state(id, &Arc<str>, search, cx) -> Entity<TextViewState>
 apps/desktop: markdown_text_view(&Entity<TextViewState>, MarkdownPresentation, cx, on_link_click) -> TextView
+apps/desktop: CodeWorkbench::markdown_preview_state(path, &Arc<str>, cx) -> Entity<TextViewState>
 apps/desktop: agent_markdown_summary(&str) -> (String, Vec<String>)
 apps/desktop: agent_markdown_preview_path(source, resolved, workspace_root) -> Option<String>
 apps/desktop: markdown::data_url_image(&str) -> Option<Arc<Image>>
 
 gpui_base::text::TextView::markdown(ElementId, source) -> TextView
+gpui_base::text::TextView::scrollable(bool) -> TextView
 gpui_base::text::TextView::image_source(resolver) -> TextView
 gpui_base::text::TextView::on_link_click(handler) -> TextView
 gpui_base::text::TextViewState::set_text(&str, cx)
 gpui_base::text::TextViewState::rendered_text() -> RenderedText
+gpui_base::text::TextViewState::list_state() -> &ListState
 gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(), RangeHighlightError>
 ```
 
@@ -1174,6 +1177,18 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   and lets the component parse, append and lay out. A surface that scrolls away
   keeps its parse; the map is bounded at `MARKDOWN_TEXT_STATE_LIMIT` and cleared
   with the other per-session caches.
+- A surface whose document can be a whole file — the code workbench's Markdown
+  preview — gives the text view a definite height and lets it scroll the document
+  itself (`TextView::scrollable(true)`), which lays out and paints only the blocks
+  on screen. A fit-content text view lays out and paints every block of the
+  document on every frame: a 129 KB file (~368 blocks) cost ~47 ms a frame in a
+  debug build and dropped the frame rate to single digits in a release one. The
+  preview keeps one retained `Entity<TextViewState>` per path in
+  `CodeWorkbench::markdown_previews` (bounded at `MARKDOWN_PREVIEW_STATE_LIMIT`,
+  pruned with `presentations`), so the parse, the selection and the scroll offset
+  survive a tab switch, and it hands the state a source only when that source
+  changed. Timeline rows keep the fit-content view: a row has no definite height
+  to virtualize inside, and the timeline's own list bounds how many of them paint.
 - Find-bar highlighting indexes the rendered text, not the source:
   `refresh_markdown_search_highlights` searches `TextViewState::rendered_text()`
   and paints hits with `set_range_highlights`, driven by a parse observer so a
@@ -1227,6 +1242,9 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   at `/work/vibex` opens `apps/desktop/src/app.rs` in the existing preview surface.
 - Good: a Markdown preview with workspace images preloads only those files, decodes
   its embedded `data:` images itself, and leaves `https:` images to GPUI.
+- Good: a Markdown file preview scrolls through the text view's own virtualized
+  list, and switching the tab to the source editor and back returns to the same
+  scroll offset without parsing the file again.
 - Base: an unknown code language or an unsupported diagram renders as a readable
   code block with its language label.
 - Base: `[README](/README.md)` stays workspace-root relative rather than being
@@ -1235,6 +1253,9 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   block renderer next to the component text view, hand `set_range_highlights` the
   byte ranges of the source, or install an image resolver that silently drops
   every embedded image.
+- Bad: render a file preview fit-content inside a scroll container — the whole
+  document is laid out and painted every frame, so a large file costs the frame
+  budget many times over.
 
 ### 6. Tests Required
 
@@ -1249,6 +1270,9 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
 - `cargo test -p vibex-desktop --locked` covers the timeline surfaces, the user
   message attachment flow (`[label](vibex-attachment:N)` source plus its action
   map), and the layout probes that render Markdown through the component view.
+  `a_markdown_preview_virtualizes_its_document_and_keeps_it` pins the file
+  preview to the virtualized list and its retained state — it fails when the
+  preview goes back to a fit-content text view.
 - `cargo test -p vibex-tui --locked` covers its own terminal renderer, which parses
   with `pulldown-cmark` inside the crate and shares nothing with the GPUI surfaces.
 - Source audit: `rg -n 'vibex_markdown|MarkdownView::new|parse_markdown\(' apps crates`
@@ -1278,6 +1302,14 @@ TextView::markdown(id, source).image_source(|uri| match images.get(uri.as_ref())
     Some(image) => ImageSource::Image(image.clone()),
     None => ImageSource::Resource(Resource::Uri(uri.clone())),
 })
+```
+
+```rust
+// A file preview in an outer scroller: every block of the document is laid out
+// and painted on every frame, however little of it is on screen.
+div().id("markdown-scroll").flex_1().overflow_y_scrollbar().child(
+    TextView::markdown(id, source).text_sm(),
+)
 ```
 
 #### Correct
@@ -1310,6 +1342,15 @@ TextView::markdown(id, source).image_source(move |uri| {
     }
     ImageSource::Resource(Resource::Uri(uri.into()))
 })
+```
+
+```rust
+// The view scrolls the document, so only the blocks on screen are laid out and
+// painted, and the retained state carries the parse and the scroll offset.
+let state = self.markdown_preview_state(&path, &source, cx);
+div().flex_1().min_h_0().p_4().child(
+    TextView::new(&state).scrollable(true).text_sm(),
+)
 ```
 
 

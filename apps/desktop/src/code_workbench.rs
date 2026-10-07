@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::markdown::{
-    MarkdownPresentation, TextView, base_path_for_file, data_url_image, resolve_workspace_path,
-    resources as markdown_resources, text_view_style,
+    MarkdownPresentation, TextView, TextViewState, base_path_for_file, data_url_image,
+    resolve_workspace_path, resources as markdown_resources, text_view_style,
 };
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
@@ -412,6 +412,28 @@ struct PendingWorkspace {
     state_owner: Option<String>,
 }
 
+/// The retained text view of one Markdown preview.
+///
+/// The component's text view parses on its own and can lay out only the blocks
+/// on screen, but both live in the view's state: the parse, the selection and
+/// the scroll offset are kept by the state, and the state lives only as long as
+/// something holds it. The preview holds one per open file, so switching a
+/// preview away and back resumes where it was instead of re-parsing the file.
+#[derive(Clone)]
+struct MarkdownPreviewState {
+    state: Entity<TextViewState>,
+    /// The source the state was last handed, so a reloaded file replaces the
+    /// document and an unchanged one costs nothing.
+    source: Arc<str>,
+}
+
+/// How many open Markdown previews keep a retained text view.
+///
+/// An evicted preview re-parses when it is next rendered, which is what every
+/// preview did before it was retained; the bound only keeps a session that
+/// opens many files from holding every parse.
+const MARKDOWN_PREVIEW_STATE_LIMIT: usize = 8;
+
 /// Presentation state of the right-hand integrated panel for one workspace
 /// state scope.
 ///
@@ -429,7 +451,7 @@ struct PanelPresentationState {
     file_scroll: Option<(f32, f32)>,
     git_scroll: Option<(f32, f32)>,
     preview_tab_scrolls: BTreeMap<String, ScrollHandle>,
-    markdown_scrolls: BTreeMap<String, ScrollHandle>,
+    markdown_previews: BTreeMap<String, MarkdownPreviewState>,
 }
 
 impl PanelPresentationState {
@@ -444,7 +466,7 @@ impl PanelPresentationState {
             && self.file_scroll.is_none()
             && self.git_scroll.is_none()
             && self.preview_tab_scrolls.is_empty()
-            && self.markdown_scrolls.is_empty()
+            && self.markdown_previews.is_empty()
     }
 }
 
@@ -1263,7 +1285,7 @@ pub struct CodeWorkbench {
     commit_body_expanded: BTreeSet<String>,
     git_preview_errors: BTreeMap<String, String>,
     preview_tab_scrolls: BTreeMap<String, ScrollHandle>,
-    markdown_scrolls: BTreeMap<String, ScrollHandle>,
+    markdown_previews: BTreeMap<String, MarkdownPreviewState>,
     preview_revealed_tab_ids: BTreeMap<String, String>,
     pending_file_search_reveal: Option<FileSearchReveal>,
     pending_file_search_directory_reveal: Option<String>,
@@ -1440,7 +1462,7 @@ impl CodeWorkbench {
             commit_body_expanded: BTreeSet::new(),
             git_preview_errors: BTreeMap::new(),
             preview_tab_scrolls: BTreeMap::new(),
-            markdown_scrolls: BTreeMap::new(),
+            markdown_previews: BTreeMap::new(),
             preview_revealed_tab_ids: BTreeMap::new(),
             pending_file_search_reveal: None,
             pending_file_search_directory_reveal: None,
@@ -2301,7 +2323,7 @@ impl CodeWorkbench {
             file_scroll: scroll_offset(&self.file_scroll),
             git_scroll: scroll_offset(&self.git_scroll),
             preview_tab_scrolls: std::mem::take(&mut self.preview_tab_scrolls),
-            markdown_scrolls: std::mem::take(&mut self.markdown_scrolls),
+            markdown_previews: std::mem::take(&mut self.markdown_previews),
         }
     }
 
@@ -2326,7 +2348,7 @@ impl CodeWorkbench {
             set_scroll_offset(&self.git_scroll, x, y);
         }
         self.preview_tab_scrolls = panel.preview_tab_scrolls;
-        self.markdown_scrolls = panel.markdown_scrolls;
+        self.markdown_previews = panel.markdown_previews;
         self.git
             .presentation_snapshot()
             .selected_commit_hash
@@ -2379,7 +2401,7 @@ impl CodeWorkbench {
             .restore_presentation(GitWorkbenchPresentation::default());
         self.file_tree.restore_navigation_state(Vec::new(), None);
         self.preview_tab_scrolls.clear();
-        self.markdown_scrolls.clear();
+        self.markdown_previews.clear();
     }
 
     /// Apply a file rename or delete to the parked layouts of the current
@@ -7039,9 +7061,9 @@ impl CodeWorkbench {
             .into_iter()
             .map(|path| replace_path_prefix(&path, source, destination))
             .collect();
-        self.markdown_scrolls = std::mem::take(&mut self.markdown_scrolls)
+        self.markdown_previews = std::mem::take(&mut self.markdown_previews)
             .into_iter()
-            .map(|(path, scroll)| (replace_path_prefix(&path, source, destination), scroll))
+            .map(|(path, preview)| (replace_path_prefix(&path, source, destination), preview))
             .collect();
         self.lifecycles = std::mem::take(&mut self.lifecycles)
             .into_iter()
@@ -9501,6 +9523,51 @@ impl CodeWorkbench {
         .detach();
     }
 
+    /// Retain the text view state of one Markdown preview and return it.
+    ///
+    /// The state carries the parse of the file, the reader's selection and the
+    /// scroll offset, so a preview switched away from and back resumes instead
+    /// of parsing again. It is handed the source only when that source actually
+    /// changed.
+    fn markdown_preview_state(
+        &mut self,
+        path: &str,
+        source: &Arc<str>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        if let Some(entry) = self.markdown_previews.get_mut(path) {
+            let state = entry.state.clone();
+            let unchanged =
+                entry.source.len() == source.len() && Arc::ptr_eq(&entry.source, source);
+            if !unchanged {
+                entry.source = source.clone();
+                state.update(cx, |state, cx| state.set_text(source, cx));
+            }
+            return state;
+        }
+
+        let state = cx.new(|cx| TextViewState::markdown(source, cx));
+        if self.markdown_previews.len() >= MARKDOWN_PREVIEW_STATE_LIMIT
+            && let Some(evicted) = self
+                .markdown_previews
+                .keys()
+                .find(|candidate| candidate.as_str() != path)
+                .cloned()
+        {
+            // Any bound is arbitrary here: an evicted preview simply parses
+            // again the next time it is rendered.
+            self.markdown_previews.remove(&evicted);
+        }
+        self.markdown_previews.insert(
+            path.to_string(),
+            MarkdownPreviewState {
+                state: state.clone(),
+                source: source.clone(),
+            },
+        );
+        state
+    }
+
     fn render_file_content(
         &mut self,
         path: String,
@@ -9525,16 +9592,18 @@ impl CodeWorkbench {
         {
             let edit_path = path.clone();
             let workspace_links = links.iter().take(32).cloned().collect::<Vec<_>>();
-            let scroll = self
-                .markdown_scrolls
-                .entry(path.clone())
-                .or_default()
-                .clone();
+            let state = self.markdown_preview_state(&path, &source, cx);
             let markdown_entity = cx.weak_entity();
             let locate_path = path.clone();
             let base_path = base_path_for_file(&path);
             let mut markdown_view =
-                TextView::markdown(format!("markdown-preview:{path}"), source)
+                TextView::new(&state)
+                    // The view scrolls the document itself, and a scrolling text
+                    // view lays out and paints the blocks on screen rather than the
+                    // whole file. A fit-content view repaints every block of the
+                    // document on every frame, which turns a large file into a
+                    // slideshow.
+                    .scrollable(true)
                     .text_sm()
                     .line_height(px(22.0))
                     .image_source(move |uri| {
@@ -9645,16 +9714,7 @@ impl CodeWorkbench {
                             })),
                     )
                 })
-                .child(
-                    div()
-                        .id(format!("markdown-scroll:{path}"))
-                        .flex_1()
-                        .min_h_0()
-                        .track_scroll(&scroll)
-                        .overflow_y_scrollbar()
-                        .p_4()
-                        .child(markdown_view),
-                )
+                .child(div().flex_1().min_h_0().p_4().child(markdown_view))
                 .into_any_element();
         }
         if let Some(binding) = self.editor_bindings.get(&path).cloned() {
@@ -10781,7 +10841,7 @@ impl Render for CodeWorkbench {
             .collect::<BTreeSet<_>>();
         self.preview_tab_scrolls
             .retain(|pane_id, _| pane_ids.contains(pane_id));
-        self.markdown_scrolls
+        self.markdown_previews
             .retain(|path, _| self.presentations.contains_key(path));
         self.preview_revealed_tab_ids
             .retain(|pane_id, _| pane_ids.contains(pane_id));
@@ -20684,6 +20744,75 @@ mod tests {
         assert!(
             mirrored_selection_ranges(&workbench, cx).is_empty(),
             "the real highlight takes over again on focus"
+        );
+    }
+
+    /// A Markdown preview feeds its document to the text view's virtualized
+    /// list, and keeps that view while the tab shows the source editor instead.
+    ///
+    /// The list lays out and paints the blocks on screen. A fit-content text
+    /// view lays out and paints the whole document on every frame, which is what
+    /// turned a 129 KB file into single-digit frame rates.
+    #[gpui::test]
+    fn a_markdown_preview_virtualizes_its_document_and_keeps_it(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (fixture, cx) = cx.add_window_view(|window, cx| {
+            CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Markdown, window, cx)
+        });
+        draw_window(cx);
+        let workbench = fixture.read_with(cx, |fixture, _| fixture.workbench.clone());
+
+        let retained_state = |cx: &gpui::VisualTestContext| {
+            workbench.read_with(cx, |workbench, _| {
+                workbench
+                    .markdown_previews
+                    .get("README.md")
+                    .map(|preview| preview.state.clone())
+            })
+        };
+        let state = retained_state(cx).expect("an open Markdown preview retains its text view");
+
+        // Only a scrolling text view hands its blocks to the list, which is
+        // what keeps an off-screen block out of the frame.
+        let blocks = state.read_with(cx, |state, _| state.list_state().item_count());
+        assert!(
+            blocks > 1,
+            "the document must render through the virtualized list, got {blocks} blocks"
+        );
+
+        state.update(cx, |state, _| {
+            state.list_state().scroll_to(ListOffset {
+                item_ix: 2,
+                offset_in_item: px(0.),
+            });
+        });
+        draw_window(cx);
+        let scrolled = state.read_with(cx, |state, _| state.list_state().logical_scroll_top());
+        assert_eq!(
+            scrolled.item_ix, 2,
+            "the document scrolled to the third block"
+        );
+
+        // The source editor takes the tab over and gives it back.
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx)
+        });
+        draw_window(cx);
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx)
+        });
+        draw_window(cx);
+
+        let restored = retained_state(cx).expect("the preview still keeps its retained text view");
+        assert_eq!(
+            restored.entity_id(),
+            state.entity_id(),
+            "the preview must come back to the parse it already had"
+        );
+        let offset = restored.read_with(cx, |state, _| state.list_state().logical_scroll_top());
+        assert_eq!(
+            offset.item_ix, 2,
+            "the preview must come back to where the reader left it"
         );
     }
 
