@@ -224,6 +224,29 @@ new non-empty Agent message rows only. Streaming deltas that reconcile into the
 same row count once; reasoning, plans, tools, permissions, and other activity
 rows do not increment the badge.
 
+### Convention: History installation preserves rendered state
+
+`PreparedTimeline::prepare` normalizes the complete authoritative prefix and
+builds conversation turns off the UI thread. The UI installs the prepared model
+behind the existing session/generation fence and reuses unchanged turn `Rc`s.
+A background refresh must not clear every Markdown entity, measured height, or
+scroll handle. Same-sequence revisions invalidate only changed row projections;
+the retained text entity receives the corrected source on its next render.
+
+The request owns `TimelineLoadUpdates`; a view holds only its weak reference.
+Live appends and same-sequence updates received during the read are replayed on
+the fetched prefix. Repeated gap notifications must not cancel an active full
+read. A non-live replacement invalidates the read and starts a fresh one;
+cancellation releases the update buffer. A gap remaining after replay schedules
+another authoritative read. Authority and pending-request reconciliation remain
+unchanged.
+
+Returning to a cached session keeps its last measured geometry. Release its
+layout-signature/shrink guard so the next intrinsic measurement can correct it,
+but do not re-estimate a streaming turn merely because it became visible again.
+`timeline_loading.rs` tests cover unchanged turn identity, changed answers,
+concurrent appends/revisions, and request cancellation.
+
 ### Convention: Sending a message returns the timeline to the new turn
 
 Sending is an explicit instruction to look at the turn that was sent, so it
@@ -292,7 +315,7 @@ and the non-shrinking card container.
 
 ### Convention: Streaming Markdown height ownership
 
-`MarkdownView` parses streaming input in the background, so the authoritative
+`TextViewState` parses streaming input in the background, so the authoritative
 row body can be newer than the document currently laid out on screen. During the
 append-only Agent-message fast path, keep the virtual turn at its current extent
 and preserve any pending intrinsic measurement. This applies equally to a
@@ -320,7 +343,7 @@ the new structure is laid out, prepaint owns its next extent and bottom-follow
 scrolls against that measured extent once.
 
 ```rust
-// Wrong: the virtual row expands before MarkdownView renders the new document,
+// Wrong: the virtual row expands before TextView renders the new document,
 // then contracts to the old prepaint measurement and visibly bounces.
 virtual_height += estimate_height(delta);
 
@@ -335,33 +358,21 @@ measured_height = previous_measured_height.max(measured_height); // same streami
 measured_height = settle_streaming_shrink(measured_height, candidate, now); // settled shrink wins
 ```
 
-The same ownership rule applies inside `MarkdownVirtualFlow`. A long streaming
-document is reparsed as each accepted snapshot arrives, but replacing the
-document must not reset every top-level block from a measured height back to its
-estimate. Carry the virtual layout width and the previous block measurements
-across an append-only source update: reuse a block with the same stable `NodeId`
-and reuse the final block when its kind, start offset, and old source are a
-prefix of the new source. Keep a per-block measured flag so an already measured
-block can grow but cannot shrink while `MarkdownViewOptions::streaming` is true;
-after streaming ends, the normal measurement path may shrink it to the final
-intrinsic height. Streaming Agent and Thought documents enter block
-virtualization before the large-document threshold once they have at least 8
-top-level blocks and 8 KiB of source, so short structured answers keep the full
-renderer while long answers do not switch rendering modes only after substantial
-content is already laid out.
+The retained `TextViewState` owns block layout and selection. The timeline's
+`update_timeline_text(state, previous, source, streaming, cx)` uses `push_str`
+when the source extends its previous prefix; edits and corrections use
+`set_text`. Replacing the whole document on each delta discards the component's
+incremental parse/layout path. Streaming text uses the shared quick-fade token;
+history uses zero stream fade. Changing the streaming flag updates the motion
+policy even when the source pointer is unchanged. Do not add a second Markdown
+renderer or a parallel block-height cache in the app.
 
 ```rust
-// Wrong: every background parse throws away the visible block geometry.
-self.virtual_block_sizes = estimate_all_blocks(&document);
-
-// Correct: stable prefix and the continuing tail keep their current extent;
-// prepaint measures the new source and grows it when the rendered block grows.
-restore_append_only_virtual_layout(previous_layout);
-height = if streaming && block_was_measured {
-    previous_height.max(measured_height)
+if let Some(delta) = source.strip_prefix(previous) {
+    state.push_str(delta, cx);
 } else {
-    measured_height
-};
+    state.set_text(source, cx);
+}
 ```
 
 Regression coverage must assert that the streaming fast path neither clears
@@ -375,10 +386,9 @@ extent, a document that keeps changing never settles one, a confirmed and
 settled shorter measurement reclaims the extent, the settle window only applies
 while the preserve policy owns the turn, and a queued candidate is dropped by
 every measurement invalidation path.
-For long Markdown, also assert that an append-only document update preserves
-the measured prefix and continuing tail, that repeated streaming measurements
-are monotonic, and that the final non-streaming measurement can converge
-downward.
+The Markdown regression uses a retained component entity: append Chinese text
+and Emoji, verify the existing selection survives, then replace the source and
+verify the corrected rendered text. The component owns block-level tests.
 
 ### Convention: A pane resize is a reflow, not an invalidation
 
@@ -410,9 +420,8 @@ measure the slack away. A content-box change that does invalidate the
 measurements takes the process unit heights with it.
 
 The first-layout estimator reads the box it will paint into rather than a fixed
-column count, exactly as `MarkdownVirtualFlow` derives its wrapped columns from
-its own width. It answers for the rows that have never reported an intrinsic
-height — everything below the viewport, and the whole table for the frame a
+column count, following the text view's actual content width. It answers for the
+rows that have never reported an intrinsic height — everything below the viewport, and the whole table for the frame a
 projection is adopted in — so a fixed count over-estimates a narrow timeline and
 under-counts a wide one, and every resize turns that into rows sized against the
 wrong wrapping. The memoized estimate keys on the derived column count, and the

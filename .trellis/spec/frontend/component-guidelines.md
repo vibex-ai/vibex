@@ -619,6 +619,32 @@ Render Agent activity through provider-neutral cards:
 Cards that can grow large must be collapsible. Tool, diff, terminal, and plan
 cards should support compact summaries for mobile.
 
+Desktop process activity uses compact disclosure rows. Commands show the
+command, files show the operation and filename with diff counts, plans show
+completed/total steps, and activity groups summarize their event categories.
+Successful rows need no repeated completion badge; running, failure and pending
+approval remain explicit. Commentary uses the muted text presentation and the
+final answer uses the normal foreground. A finished answer with no process rows
+has no empty process-duration header. Command approval actions remain reachable
+outside the command's collapsed details.
+
+Disclosure headers use the component `Button` for focus and keyboard behavior.
+`timeline_disclosure_progress` uses the framework spring and theme control token,
+keyed by session and row; it honors reduced motion and reverses from the current
+value. `TimelineDisclosure` lays out settled open content normally on the first
+frame; only an active transition uses retained height plus clipping. History
+must not pass through a zero-height measurement frame or replay an entry effect.
+
+Windowed process runs place consecutive visible units after the preceding
+unit's current measured bottom (`timeline_process_measured_origin`). A pinned
+offscreen unit keeps its own cached origin. Clip the run while the total extent
+catches up, invalidate nested heights on disclosure changes, and wake an idle
+view when a deferred turn measurement differs from its virtual extent. Active
+disclosure motion may shrink immediately; the streaming text shrink guard must
+not hold a manually closing tool open. Cached unit heights bypass body-based
+estimation. GPUI layout regressions cover repeated open/close without overlap,
+pinned units, first-frame history height, reversal, and settled content resize.
+
 A reasoning card is the one card that is read while it is still arriving, so its
 body is drawn as a *window* while the Agent is still thinking rather than as a
 block that grows with the thought. The body keeps its natural height and is

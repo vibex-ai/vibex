@@ -15,6 +15,31 @@ use gpui_base::text::TextViewStyle;
 use gpui_component::ActiveTheme as _;
 
 pub use gpui_base::text::{RangeHighlight, RenderedText, TextView, TextViewState};
+
+/// Preserve the measured prefix and selection while an answer grows. A full
+/// replacement is reserved for corrections, edits, or a different document.
+pub(crate) fn update_timeline_text(
+    state: &mut TextViewState,
+    previous: &str,
+    source: &str,
+    streaming: bool,
+    cx: &mut gpui::Context<TextViewState>,
+) {
+    state.set_motion(timeline_text_motion(streaming));
+    if let Some(delta) = source.strip_prefix(previous) {
+        state.push_str(delta, cx);
+    } else {
+        state.set_text(source, cx);
+    }
+}
+
+pub(crate) fn timeline_text_motion(streaming: bool) -> gpui_base::text::TextViewMotion {
+    gpui_base::text::TextViewMotion::default().with_stream_fade(if streaming {
+        crate::motion::FADE_QUICK.total()
+    } else {
+        std::time::Duration::ZERO
+    })
+}
 pub use vibex_ui::markdown::{
     MarkdownResource, base_path_for_file, escape_markdown_literal, plain_text,
     resolve_workspace_path, resources, utf8_prefix,
@@ -111,4 +136,38 @@ fn themed_text_view_style(theme: &gpui_component::Theme) -> TextViewStyle {
             ..Default::default()
         })
         .with_dark(theme.is_dark())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, TestAppContext};
+
+    #[gpui::test]
+    fn streaming_append_keeps_selection_and_accepts_unicode_and_corrections(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let initial = "**已有段落**\n\n";
+        let state =
+            cx.update(|cx| cx.new(|cx| TextViewState::markdown(initial, cx).selectable(true)));
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.select_all(cx));
+        let appended = "**已有段落**\n\n下一段 🦀";
+        state.update(cx, |state, cx| {
+            update_timeline_text(state, initial, appended, true, cx)
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.rendered_text().as_str().contains("下一段 🦀"));
+            assert!(state.selected_text().contains("已有段落"));
+        });
+        state.update(cx, |state, cx| {
+            update_timeline_text(state, appended, "修订后的内容", false, cx)
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.rendered_text().as_str().trim(), "修订后的内容")
+        });
+    }
 }
