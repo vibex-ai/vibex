@@ -78,8 +78,11 @@ agent acts on and what the user sees cannot diverge.
    run unbounded.
 
 4. **Input coordinates are viewport CSS pixels and never include the scroll
-   offset.** The panel scales by `frame pixels ÷ drawn size` only. Adding
-   `scrollOffsetX/Y` makes every click and highlight drift.
+   offset.** The panel scales by the frame metadata's `deviceWidth/Height`
+   divided by drawn size, then divides by `pageScaleFactor`. Encoded image
+   dimensions can differ because of display density or downsampling and are
+   only a fallback when metadata is unavailable. Adding `scrollOffsetX/Y`
+   makes every click and highlight drift.
 
 5. **Refs are generation-scoped.** `r{generation}-{index}` is invalid after any
    observation, navigation or rerender in the same tab. A stale ref is refused
@@ -158,6 +161,71 @@ agent acts on and what the user sees cannot diverge.
    `launch_with_port` removes the file before spawning and refuses a file older
    than the launch, because "the file exists" is not the same statement as "this
    browser wrote it".
+
+## Scenario: Viewport and frame sizing
+
+### 1. Scope / Trigger
+
+Changing browser-panel layout, display scaling, resize scheduling, screencast
+resolution, or pointer-coordinate conversion.
+
+### 2. Signatures
+
+`BrowserSurface::schedule_viewport(width: f32, height: f32, scale_factor: f32, cx)`
+forwards the measured page area through `BrowserTransport::set_viewport` to
+`BrowserService::set_viewport(tab_id, width: u32, height: u32, device_scale_factor: f64)`.
+
+### 3. Contracts
+
+- Viewport width and height are **CSS pixels**, measured from the frame area
+  after browser chrome has taken its space. Send the complete logical size;
+  never multiply it by display scale or clamp it to an encoder budget.
+- The runtime applies display density once when choosing the physical
+  `Page.startScreencast` budget. Its `maxWidth` and `maxHeight` are bounded by
+  `MAX_ENCODE_WIDTH = 2560` and `MAX_ENCODE_HEIGHT = 1600`. Chrome fits the whole
+  viewport inside these bounds while preserving its aspect ratio.
+- `img` defaults to `Contain` even with `w_full().h_full()`. The browser uses
+  `ObjectFit::Fill` so encoder rounding and the previous frame during the resize
+  debounce cannot leave margins. Correct viewport sizing preserves page
+  proportions once the resized frame arrives.
+- Resize requests are debounced for 160 ms. Cache a request only when a
+  transport and tab exist; attaching a tab or cancelling its pending resize
+  clears the cached request so the next layout sends the current size.
+- Pointer conversion uses the matching frame's metadata, independent of the
+  encoded resolution; the whole painted frame remains its input region.
+
+### 4. Validation & Error Matrix
+
+- A zero viewport dimension becomes one pixel in the service.
+- A non-finite or non-positive display scale becomes 1; otherwise the service
+  bounds it to `[0.25, 8]`.
+- Positive metadata dimensions take precedence over encoded dimensions for
+  input. Without either size, no pointer coordinate is sent.
+
+### 5. Good/Base/Bad Cases
+
+- Base: a `960 × 640` page at 1x keeps that layout and frame size.
+- Good: a `900 × 2000` page keeps its layout while the frame fits within
+  `2560 × 1600`; a HiDPI panel uses the same CSS layout at greater density.
+- Bad: truncating the page height to 1600 changes its aspect ratio, then
+  `Contain` leaves margins and clicks calculated from the whole panel drift.
+
+### 6. Tests Required
+
+- `browser_surface::tests` checks measured frame bounds against transported
+  logical dimensions at tall, wide, fractional-DPI and 2x sizes, late attach,
+  and the real surface's pointer mapping with several encoded resolutions.
+- `crates/browser/tests/viewport.rs` checks the page's actual
+  `innerWidth/innerHeight/devicePixelRatio`, matching frame metadata, bounded
+  encoded dimensions, and preserved aspect ratio against the system browser.
+
+### 7. Wrong vs Correct
+
+Wrong: pass `min(logical_size * display_scale, encoder_limit)` as the page's
+viewport and calculate clicks from JPEG/PNG dimensions.
+
+Correct: pass logical dimensions and display scale separately; bound the
+screencast encoder and use frame metadata for input.
 
 ## Security rules
 

@@ -111,9 +111,6 @@ fn relative_time(at_ms: i64, now_ms: i64) -> String {
 /// Resizing the window fires continuously; `Emulation.setDeviceMetricsOverride`
 /// re-lays-out the page, so it must not run per frame.
 const VIEWPORT_DEBOUNCE: Duration = Duration::from_millis(160);
-/// Longest frame edge the panel will ask the browser to encode.
-const MAX_ENCODE_WIDTH: u32 = 2560;
-const MAX_ENCODE_HEIGHT: u32 = 1600;
 /// Diameter of the Agent's play/pause control.
 const AGENT_CONTROL_SIZE: f32 = 58.0;
 /// Distance the control keeps from the frame's corner.
@@ -194,7 +191,8 @@ pub struct BrowserSurface {
     frame_bounds: Option<Bounds<Pixels>>,
     /// Encoded pixel size of the current frame.
     frame_pixel_size: (f32, f32),
-    last_applied_viewport: Option<(u32, u32, u32)>,
+    /// The latest debounced request, in logical pixels. Cleared when cancelled.
+    requested_viewport: Option<(u32, u32, u32)>,
     viewport_task: Option<Task<()>>,
     frame_task: Option<Task<()>>,
     /// The stop-screencast call a deactivation sent. It is cancelled when the
@@ -340,7 +338,7 @@ impl BrowserSurface {
             frame_metadata: BrowserFrameMetadata::default(),
             frame_bounds: None,
             frame_pixel_size: (0.0, 0.0),
-            last_applied_viewport: None,
+            requested_viewport: None,
             viewport_task: None,
             frame_task: None,
             stop_task: None,
@@ -399,6 +397,8 @@ impl BrowserSurface {
         self.transport = Some(transport);
         self.session_id = Some(session_id);
         self.tab_id = Some(tab_id);
+        self.viewport_task = None;
+        self.requested_viewport = None;
         self.phase = SurfacePhase::Connecting;
         self.message = None;
         if self.active {
@@ -569,6 +569,7 @@ impl BrowserSurface {
         } else {
             self.frame_task = None;
             self.viewport_task = None;
+            self.requested_viewport = None;
             let transport = self.transport.clone();
             let tab_id = self.tab_id.clone();
             if let (Some(transport), Some(tab_id)) = (transport, tab_id) {
@@ -908,20 +909,21 @@ impl BrowserSurface {
     ) {
         let logical_width = width.max(1.0).round() as u32;
         let logical_height = height.max(1.0).round() as u32;
-        let physical_width = ((logical_width as f32) * scale_factor).round() as u32;
-        let physical_height = ((logical_height as f32) * scale_factor).round() as u32;
+        // CDP lays out the page in CSS pixels. The encoder's physical-pixel
+        // budget belongs to the runtime; clipping either viewport dimension
+        // here changes its aspect ratio on tall, wide and HiDPI panels.
         let key = (
-            physical_width.min(MAX_ENCODE_WIDTH),
-            physical_height.min(MAX_ENCODE_HEIGHT),
+            logical_width,
+            logical_height,
             (scale_factor * 1000.0) as u32,
         );
-        if self.last_applied_viewport == Some(key) {
+        if self.requested_viewport == Some(key) {
             return;
         }
-        self.last_applied_viewport = Some(key);
         let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
             return;
         };
+        self.requested_viewport = Some(key);
         self.viewport_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(VIEWPORT_DEBOUNCE).await;
             if let Err(error) = transport
@@ -936,16 +938,19 @@ impl BrowserSurface {
     /// Converts a panel-space point into viewport CSS pixels.
     fn to_viewport_point(&self, position: Point<Pixels>) -> Option<(f64, f64)> {
         let bounds = self.frame_bounds?;
-        let (device_width, device_height) = if self.frame_pixel_size.0 > 0.0 {
-            self.frame_pixel_size
-        } else if self.frame_metadata.device_width > 0.0 {
-            (
-                self.frame_metadata.device_width as f32,
-                self.frame_metadata.device_height as f32,
-            )
-        } else {
-            return None;
-        };
+        // Encoded frames may be downsampled or rendered at a higher DPI. Their
+        // pixel dimensions are not the page's input coordinate system.
+        let (device_width, device_height) =
+            if self.frame_metadata.device_width > 0.0 && self.frame_metadata.device_height > 0.0 {
+                (
+                    self.frame_metadata.device_width as f32,
+                    self.frame_metadata.device_height as f32,
+                )
+            } else if self.frame_pixel_size.0 > 0.0 {
+                self.frame_pixel_size
+            } else {
+                return None;
+            };
         let display_width = f32::from(bounds.size.width).max(1.0);
         let display_height = f32::from(bounds.size.height).max(1.0);
         let local_x = f32::from(position.x - bounds.origin.x);
@@ -1989,9 +1994,15 @@ impl BrowserSurface {
             .size_full()
             .overflow_hidden()
             .when_some(image, |this, image| {
-                // The frame is already sized to the panel by the runtime's
-                // viewport override, so it is stretched rather than letterboxed.
-                this.child(img(image).w_full().h_full())
+                // The viewport follows this panel's aspect ratio. Fill also
+                // covers encoder rounding and the old frame during the resize
+                // debounce, so the painted area stays aligned with input.
+                this.child(
+                    img(image)
+                        .w_full()
+                        .h_full()
+                        .object_fit(gpui::ObjectFit::Fill),
+                )
             })
             .when(!has_frame || stalled, |this| {
                 this.child(
@@ -4426,6 +4437,97 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn viewport_follows_the_frame_bounds_at_every_display_scale(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport::default());
+        let viewports = transport.viewports.clone();
+        let window = cx.add_window(|window, cx| {
+            let mut surface = BrowserSurface::new("viewport".to_string(), window, cx);
+            surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+            surface
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+
+        for (width, height, scale) in [
+            (900.0, 2100.0, 1.0),
+            (3100.0, 900.0, 1.0),
+            (800.0, 1300.0, 2.0),
+            (1000.0, 1900.0, 1.5),
+        ] {
+            cx.simulate_window_resize(window.into(), size(px(width), px(height)));
+            cx.simulate_scale_factor_change(scale);
+            cx.run_until_parked();
+            cx.executor().advance_clock(VIEWPORT_DEBOUNCE);
+            cx.run_until_parked();
+            let bounds = surface
+                .read_with(&cx, |surface, _| surface.frame_bounds)
+                .expect("the page area is laid out");
+            assert_eq!(
+                viewports.lock().unwrap().last().copied(),
+                Some((
+                    f32::from(bounds.size.width).round() as u32,
+                    f32::from(bounds.size.height).round() as u32,
+                    scale as f64,
+                )),
+                "the page must receive the whole logical viewport on a {width}x{height} display at {scale}x"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn attaching_after_layout_still_sends_the_viewport(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            BrowserSurface::new("restored-viewport".to_string(), window, cx)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        cx.run_until_parked();
+        let transport = Arc::new(RecordingTransport::default());
+        let viewports = transport.viewports.clone();
+        surface.update(&mut cx, |surface, cx| {
+            surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(VIEWPORT_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(viewports.lock().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn pointer_coordinates_follow_metadata_instead_of_encoded_resolution(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            BrowserSurface::new("pointer-viewport".to_string(), window, cx)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, _| {
+            surface.frame_bounds = Some(Bounds::new(
+                Point::new(px(10.0), px(20.0)),
+                size(px(800.0), px(1200.0)),
+            ));
+            surface.frame_metadata = BrowserFrameMetadata {
+                device_width: 800.0,
+                device_height: 1200.0,
+                scroll_offset_y: 900.0,
+                ..Default::default()
+            };
+            for frame_size in [(1600.0, 2400.0), (1067.0, 1600.0), (400.0, 600.0)] {
+                surface.frame_pixel_size = frame_size;
+                assert_eq!(
+                    surface.to_viewport_point(Point::new(px(610.0), px(920.0))),
+                    Some((600.0, 900.0)),
+                    "encoder resolution {frame_size:?} must not move a click"
+                );
+            }
+        });
+    }
+
     // The toolbar's arrows are the same navigation as the picker's side buttons.
     #[gpui::test]
     fn the_toolbar_arrows_reach_the_runtime(cx: &mut gpui::TestAppContext) {
@@ -4461,6 +4563,7 @@ mod tests {
     /// here instead of silently doing nothing in the panel.
     struct RecordingTransport {
         inputs: Arc<std::sync::Mutex<Vec<String>>>,
+        viewports: Arc<std::sync::Mutex<Vec<(u32, u32, f64)>>>,
         snapshot: Arc<std::sync::Mutex<Option<vibex_core::BrowserSessionSnapshot>>>,
         /// The ledger the panel reads when the activity list is opened.
         ledger: Arc<std::sync::Mutex<Vec<vibex_core::BrowserActionRecord>>>,
@@ -4490,6 +4593,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 inputs: Arc::new(std::sync::Mutex::new(Vec::new())),
+                viewports: Arc::new(std::sync::Mutex::new(Vec::new())),
                 snapshot: Arc::new(std::sync::Mutex::new(None)),
                 ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
                 element_source: Arc::new(std::sync::Mutex::new(None)),
@@ -4646,11 +4750,17 @@ mod tests {
         fn set_viewport(
             &self,
             _tab_id: &BrowserTabId,
-            _width: u32,
-            _height: u32,
-            _device_scale_factor: f64,
+            width: u32,
+            height: u32,
+            device_scale_factor: f64,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.viewports
+                    .lock()
+                    .unwrap()
+                    .push((width, height, device_scale_factor));
+                Ok(())
+            })
         }
         fn dispatch_input(
             &self,

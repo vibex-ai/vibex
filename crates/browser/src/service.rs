@@ -56,6 +56,9 @@ pub const BROWSER_IDLE_SWEEP: Duration = Duration::from_secs(30);
 /// Default viewport when the panel has not reported its size yet.
 pub const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
+/// Physical-pixel bounds for encoded frames, never for the page's CSS viewport.
+const MAX_ENCODE_WIDTH: u32 = 2560;
+const MAX_ENCODE_HEIGHT: u32 = 1600;
 /// JPEG quality for the standard screencast mode.
 pub const SCREENCAST_JPEG_QUALITY: i64 = 80;
 /// Short timeout for commands whose failure is not worth waiting on.
@@ -176,7 +179,7 @@ pub enum BrowserInput {
     /// Committed IME or paste text. Composition is drawn client-side and only
     /// the committed string is sent to the page.
     InsertText { text: String },
-    /// Panel resize; drives `Emulation.setDeviceMetricsOverride`.
+    /// Panel resize in CSS pixels; drives `Emulation.setDeviceMetricsOverride`.
     Resize {
         width: u32,
         height: u32,
@@ -1159,7 +1162,10 @@ impl BrowserService {
         }
     }
 
-    /// Applies a new viewport. Debounced by the caller.
+    /// Applies a new viewport in CSS pixels. Debounced by the caller.
+    ///
+    /// Display density only controls raster resolution. Encoder limits must
+    /// never shrink the layout viewport or change its aspect ratio.
     pub async fn set_viewport(
         &self,
         tab_id: &BrowserTabId,
@@ -1763,9 +1769,9 @@ impl BrowserService {
         // Stopping first is harmless when nothing is running and makes the call
         // idempotent.
         let _ = cdp(session, "Page.stopScreencast", json!({}), SHORT_TIMEOUT_MS).await;
-        // The encoder budget is the panel's *physical* size: the emulated
-        // viewport is logical pixels, so a 2x display would otherwise cap the
-        // stream at half the resolution it is shown at.
+        // Bound only the encoded frame. Chrome fits the whole viewport inside
+        // maxWidth/maxHeight while preserving its aspect ratio; applying these
+        // limits to device metrics instead changes the page's layout.
         let (width, height, quality) = {
             let state = self.inner.state.lock().await;
             state
@@ -1773,10 +1779,11 @@ impl BrowserService {
                 .values()
                 .find(|tab| tab.session_id == session.session_id)
                 .map(|tab| {
-                    let scale = tab.viewport.2.clamp(1.0, 4.0);
+                    let scale = tab.viewport.2;
                     (
-                        ((tab.viewport.0 as f64 * scale).round() as u32).max(1),
-                        ((tab.viewport.1 as f64 * scale).round() as u32).max(1),
+                        ((tab.viewport.0 as f64 * scale).round() as u32).clamp(1, MAX_ENCODE_WIDTH),
+                        ((tab.viewport.1 as f64 * scale).round() as u32)
+                            .clamp(1, MAX_ENCODE_HEIGHT),
                         tab.frame_quality,
                     )
                 })
