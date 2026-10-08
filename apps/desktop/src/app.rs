@@ -46619,7 +46619,8 @@ impl VibexWorkbench {
                 if reasoning_display_mode == ReasoningDisplayMode::LatestAtBottom
                     && let Some(reasoning) = turn.live_status.as_deref()
                 {
-                    response = response.child(self.render_live_reasoning(turn, reasoning, cx));
+                    response =
+                        response.child(self.render_live_reasoning(turn, reasoning, window, cx));
                 } else {
                     let pending_label = if turn.pending_permission {
                         strings.agent_waiting_confirmation.to_string()
@@ -47781,7 +47782,7 @@ impl VibexWorkbench {
                 answer_metadata.take(),
                 cx,
             ),
-            TimelineRowKind::Reasoning => self.render_thought_process_row(row, cx),
+            TimelineRowKind::Reasoning => self.render_thought_process_row(row, window, cx),
             TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => {
                 self.render_plan_activity(row, turn_live, window, cx)
             }
@@ -49458,6 +49459,32 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Where a reasoning row's body reveal is, and the state its click answers.
+    ///
+    /// A reasoning row travels on the same spring a tool card's detail does, so
+    /// the header can answer the click in the frame it lands while the body is
+    /// still opening or closing. The channel is keyed by the row rather than by
+    /// the click, which is what leaves an interrupted reveal to carry on from
+    /// where it was instead of restarting.
+    fn reasoning_reveal(
+        &mut self,
+        row_id: &str,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ReasoningReveal {
+        let id = format!("reasoning-body:{row_id}");
+        let progress = self.timeline_disclosure_progress(&id, open, window, cx);
+        // A body in flight is the shape the row is being measured as, and the
+        // streaming hold would otherwise freeze the run's extent at the first
+        // frame of the travel and paint the rest of it as slack under the row.
+        // Releasing the hold for the frame is the same answer a click gives.
+        if let Some(height) = self.timeline_process_unit_heights.get_mut(row_id) {
+            height.layout_invalidated |= progress > 0.0 && progress < 1.0;
+        }
+        ReasoningReveal::new(id, open, progress)
+    }
+
     /// Open or close the recorded answers under a settled elicitation row.
     ///
     /// Shares [`Self::timeline_command_expansion`] with the other timeline
@@ -49544,31 +49571,41 @@ impl VibexWorkbench {
     /// producing it and the reader chose [`ReasoningExpansionMode::Window`];
     /// `None` renders every row the thought has, which is what a settled
     /// thought always gets.
+    ///
+    /// `reveal` carries the spring the body below the first line travels on, so
+    /// the row opens and closes exactly as a tool card does: the header answers
+    /// the click at once, and the body takes the height the spring holds.
     fn render_expanded_reasoning_layout(
         &mut self,
         row_id: String,
         turn_id: Option<String>,
         first_line: AnyElement,
-        remaining: Option<AnyElement>,
-        window: Option<ReasoningWindow>,
+        body: ReasoningBody,
+        reveal: ReasoningReveal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tooltip = self.strings().agent_collapse_process;
+        let tooltip = if reveal.open {
+            self.strings().agent_collapse_process
+        } else {
+            self.strings().agent_expand_process
+        };
+        let open = reveal.open;
         let toggle_id = row_id.clone();
         render_reasoning_first_line_layout(
             cx.theme().muted_foreground,
             first_line,
-            remaining,
-            window,
+            body.remaining,
+            body.window,
+            reveal,
             cx,
         )
         .id(row_id)
         .cursor_pointer()
         .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
         .on_click(cx.listener(move |this, _, _, cx| {
-            // The body is on screen, so the click closes it — however it came to
-            // be open.
-            this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), true, cx)
+            // The click answers the state the reader asked for, not the spring:
+            // a body still travelling back reopens instead of ignoring it.
+            this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), open, cx)
         }))
         .into_any_element()
     }
@@ -49600,13 +49637,15 @@ impl VibexWorkbench {
         &mut self,
         turn: &TimelineConversationTurn,
         body: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row_id = format!("reasoning-live:{}", turn.id);
         let expanded = self.reasoning_row_open(&row_id, true);
+        let reveal = self.reasoning_reveal(&row_id, expanded, window, cx);
         let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
-        if expanded {
+        if expanded || reveal.draws_body() {
             let (source, _) = self.timeline_live_reasoning_source(&turn_id, body);
             let (first_line_source, remaining_source) = reasoning_source_parts(source.as_ref());
             let first_line = self.reasoning_first_line_text(None, first_line_source, cx);
@@ -49631,8 +49670,8 @@ impl VibexWorkbench {
                 row_id,
                 Some(turn_id),
                 first_line,
-                remaining,
-                window,
+                ReasoningBody { remaining, window },
+                reveal,
                 cx,
             );
         }
@@ -49674,14 +49713,22 @@ impl VibexWorkbench {
         container.into_any_element()
     }
 
-    fn render_reasoning_row(&mut self, row: &TimelineRow, cx: &mut Context<Self>) -> AnyElement {
+    fn render_reasoning_row(
+        &mut self,
+        row: &TimelineRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if row.body.trim().is_empty() {
             return div().id(row.id.clone()).into_any_element();
         }
         let row_id = row.id.clone();
         let turn_id = row.turn_id.clone();
         let expanded = self.reasoning_row_open(&row_id, row.streaming);
-        if expanded {
+        let reveal = self.reasoning_reveal(&row_id, expanded, window, cx);
+        // A body still travelling back keeps the expanded shape on screen, the
+        // same way a closing tool card keeps its detail until the spring lands.
+        if expanded || reveal.draws_body() {
             let search_highlight =
                 self.session_search_highlight_for_rows(std::slice::from_ref(row));
             let (markdown_source, _) = self.timeline_markdown_source(row);
@@ -49706,7 +49753,12 @@ impl VibexWorkbench {
                 .into_any_element()
             });
             return self.render_expanded_reasoning_layout(
-                row_id, turn_id, first_line, remaining, window, cx,
+                row_id,
+                turn_id,
+                first_line,
+                ReasoningBody { remaining, window },
+                reveal,
+                cx,
             );
         }
         let summary = timeline_reasoning_summary_cached_at(
@@ -49766,10 +49818,11 @@ impl VibexWorkbench {
     fn render_thought_process_row(
         &mut self,
         row: &TimelineRow,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if row.kind == TimelineRowKind::Reasoning {
-            return self.render_reasoning_row(row, cx);
+            return self.render_reasoning_row(row, window, cx);
         }
         // Plans retain the compact muted markdown presentation used by the
         // existing process timeline.
@@ -49819,7 +49872,7 @@ impl VibexWorkbench {
         }) {
             self.render_process_activity_entry(row, None, turn_live, window, cx)
         } else {
-            self.render_thought_process_row(row, cx)
+            self.render_thought_process_row(row, window, cx)
         }
     }
 
@@ -57595,6 +57648,52 @@ fn reasoning_window_fold_marker(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// The body an expanded reasoning row draws under its first line.
+///
+/// The two halves travel together: a body is only ever windowed when there is
+/// one to window, and the reveal has nothing to size without it.
+struct ReasoningBody {
+    /// Everything after the first line, already rendered. `None` for a thought
+    /// that is a single line.
+    remaining: Option<AnyElement>,
+    /// The window the body is held to while the Agent is still producing it.
+    window: Option<ReasoningWindow>,
+}
+
+/// How far an expanded reasoning row has revealed the body under its first
+/// line, and the state that header answers to while it moves.
+///
+/// A reasoning row travels on the same spring a tool card's detail does, and it
+/// keeps the same split: the header follows the reader's answer at once — the
+/// chevron turns and the click flips with `open` — while the body's height is
+/// `progress`, the spring the disclosure element sizes the reveal with. Holding
+/// the two apart is what lets a closing body stay on screen for the length of
+/// its travel instead of vanishing in one frame.
+struct ReasoningReveal {
+    /// Element id of the body's disclosure, stable across the travel.
+    id: String,
+    /// The state the reader asked for, which the chevron and the click follow.
+    open: bool,
+    /// The spring's position: `1.0` fully revealed, `0.0` fully closed.
+    progress: f32,
+}
+
+impl ReasoningReveal {
+    fn new(id: String, open: bool, progress: f32) -> Self {
+        Self {
+            id,
+            open,
+            progress: progress.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Whether the body has height left to draw. A reveal that has landed at
+    /// zero draws the header alone, exactly as the closed row does.
+    fn draws_body(&self) -> bool {
+        self.progress > 0.0
+    }
+}
+
 /// Pure layout for the expanded reasoning row: a brain icon beside the first
 /// line (with a collapse chevron), and any remaining lines under a thin
 /// connector. Interaction handlers are attached by the caller.
@@ -57602,12 +57701,14 @@ fn reasoning_window_fold_marker(cx: &App) -> AnyElement {
 /// The connector is the height bar of the body it stands beside: it stretches
 /// to whatever the remaining content takes, so a body held to
 /// [`ReasoningWindow`] draws a bar exactly as tall as the window the reader is
-/// watching instead of as tall as the whole thought.
+/// watching instead of as tall as the whole thought. The whole second row rides
+/// inside `reveal`, so the bar grows and shrinks with the body it belongs to.
 fn render_reasoning_first_line_layout(
     icon_color: Hsla,
     first_line: AnyElement,
     remaining: Option<AnyElement>,
     window: Option<ReasoningWindow>,
+    reveal: ReasoningReveal,
     cx: &App,
 ) -> gpui::Div {
     let connector_color = icon_color.opacity(0.46);
@@ -57636,10 +57737,20 @@ fn render_reasoning_first_line_layout(
                 .items_center()
                 .gap_1()
                 .child(first_line)
-                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).flex_none()),
+                .child(
+                    Icon::new(if reveal.open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(14.0))
+                    .flex_none(),
+                ),
         );
     let mut content = v_flex().min_w_0().flex_1().child(first_line_row);
-    if let Some(remaining) = remaining {
+    if let Some(remaining) = remaining
+        && reveal.draws_body()
+    {
         // A windowed body is a column of its own so the fold marker can sit
         // above the box without being clipped with the rows it announces; a
         // body with no window stays the single element it has always been.
@@ -57655,7 +57766,9 @@ fn render_reasoning_first_line_layout(
             }
             None => remaining,
         };
-        content = content.child(
+        content = content.child(timeline_disclosure_body(
+            reveal.id,
+            reveal.progress,
             h_flex()
                 .w_full()
                 .min_w_0()
@@ -57668,8 +57781,9 @@ fn render_reasoning_first_line_layout(
                         .items_center()
                         .child(div().w(px(1.0)).flex_1().bg(connector_color)),
                 )
-                .child(body),
-        );
+                .child(body)
+                .into_any_element(),
+        ));
     }
 
     h_flex().w_full().min_w_0().items_stretch().child(content)
@@ -91455,6 +91569,7 @@ mod tests {
                         first_line,
                         remaining,
                         None,
+                        ReasoningReveal::new("reasoning-probe".into(), true, 1.0),
                         cx,
                     )),
             )

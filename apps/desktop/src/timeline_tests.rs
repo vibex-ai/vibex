@@ -298,6 +298,7 @@ impl Render for ReasoningTimelineProbe {
                                     height: REASONING_WINDOW_HEIGHT,
                                     fold: true,
                                 }),
+                                ReasoningReveal::new("reasoning".into(), true, 1.0),
                                 cx,
                             )
                         } else {
@@ -862,5 +863,80 @@ fn disclosures_measure_history_immediately_and_reverse_without_empty_frames(
             let _ = window.draw(cx);
         });
         assert_eq!(measured.get(), expected);
+    }
+}
+
+struct ReasoningRevealProbe {
+    progress: f32,
+    observed: Rc<Cell<f32>>,
+}
+
+impl Render for ReasoningRevealProbe {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let observed = self.observed.clone();
+        v_flex().w(px(400.0)).child(
+            div()
+                .w_full()
+                .on_prepaint(move |bounds, _, _| {
+                    observed.set(f32::from(bounds.size.height));
+                })
+                .child(render_reasoning_first_line_layout(
+                    cx.theme().muted_foreground,
+                    div().h(px(HEADER_HEIGHT)).into_any_element(),
+                    Some(div().h(px(BODY_HEIGHT)).flex_none().into_any_element()),
+                    None,
+                    ReasoningReveal::new(
+                        "reasoning-reveal-probe".into(),
+                        self.progress > 0.0,
+                        self.progress,
+                    ),
+                    cx,
+                )),
+        )
+    }
+}
+
+/// The header an expanded reasoning row keeps whatever the reveal is doing.
+const HEADER_HEIGHT: f32 = 20.0;
+/// The body the reveal is expected to hold back until the spring reaches it.
+const BODY_HEIGHT: f32 = 200.0;
+
+#[gpui::test]
+fn a_reasoning_body_reveals_on_the_same_spring_a_tool_detail_does(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let observed = Rc::new(Cell::new(0.0));
+    let measured = observed.clone();
+    let (view, cx) = cx.add_window_view(|_, _| ReasoningRevealProbe {
+        progress: 1.0,
+        observed,
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert_eq!(
+        measured.get(),
+        HEADER_HEIGHT + BODY_HEIGHT,
+        "an open thought reserves its real height on the first paint"
+    );
+    // The header is the row's own line and never travels; everything under it
+    // is the body, so the reveal's share of the row is exactly the spring.
+    for (progress, expected) in [
+        (0.5, HEADER_HEIGHT + BODY_HEIGHT * 0.5),
+        (0.25, HEADER_HEIGHT + BODY_HEIGHT * 0.25),
+        (1.0, HEADER_HEIGHT + BODY_HEIGHT),
+        // The click that closes a row retargets the spring; the body keeps the
+        // height it had on the frame the state flipped, so the collapse is
+        // drawn instead of snapping away.
+        (0.75, HEADER_HEIGHT + BODY_HEIGHT * 0.75),
+        (0.0, HEADER_HEIGHT),
+    ] {
+        view.update(cx, |view, cx| {
+            view.progress = progress;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(measured.get(), expected, "reveal at {progress}");
     }
 }
