@@ -23,6 +23,7 @@
 //! onboarding what to do first, in order, until it is done
 //! composer  the edit buffer, completion triggers and history
 //! search    transcript search: regex with smart case
+//! scramble  the character transition a line wears when its text changes
 //! transcript block cache, incremental layout, viewport-only rendering
 //! turn      the running turn's phase, tool count and pace, read from the projection
 //! view      page shells, overlays, the key bar
@@ -54,6 +55,7 @@ pub mod reduce;
 pub mod run;
 pub mod runtime_picker;
 pub mod runtime_prefs;
+pub mod scramble;
 pub mod search;
 pub mod sessions;
 pub mod settings;

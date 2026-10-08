@@ -1,17 +1,20 @@
 //! What the interface remembers about itself between runs.
 //!
-//! The settings surface offers a theme, an appearance, an icon set, a language
-//! and a default workspace, and the command palette leads with the commands the
-//! reader reached for last. None of that is the runtime's to keep, so it is
-//! written beside the session-list arrangement and the switcher's memory under
-//! the same home: a reader who wants the interface to forget clears one
-//! directory.
+//! The settings surface offers a theme, an appearance, an icon set, the landing
+//! logo and its two effects, a language and a default workspace, and the
+//! command palette leads with the commands the reader reached for last. None of
+//! that is the runtime's to keep, so it is written beside the session-list
+//! arrangement and the switcher's memory under the same home: a reader who
+//! wants the interface to forget clears one directory.
 //!
 //! Every stored value is an optional string rather than an enum lifted from the
-//! crate that owns it. The file is hand-editable and has to survive a value
-//! this build does not know: an unknown theme id, icon set, appearance or
-//! language loads as "no choice" and the caller's own default answers, so a
-//! file written by a newer build is not an error in an older one.
+//! crate that owns it, and every two-state value is an optional boolean that is
+//! absent until the reader moves the row. The file is hand-editable and has to
+//! survive a value this build does not know: an unknown theme id, icon set,
+//! appearance or language loads as "no choice" and the caller's own default
+//! answers, so a file written by a newer build is not an error in an older one —
+//! and a field an older build never wrote is the shipped behaviour rather than
+//! the off state.
 
 use std::path::Path;
 
@@ -20,6 +23,7 @@ use vibex_desktop_model::ThemeSelection;
 use vibex_ui::GpuiThemeMode;
 
 use crate::locale::Locale;
+use crate::logo::MarkStyle;
 use crate::theme::GlyphMode;
 
 /// How many palette commands the file keeps.
@@ -45,6 +49,20 @@ pub struct InterfacePreferences {
     /// `unicode` or `ascii`, when the reader chose an icon set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<String>,
+    /// `classic` or `glitch`, when the reader chose a landing mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<String>,
+    /// Whether the mark animates while the page waits.
+    ///
+    /// Absent is not "off": it means the reader never moved the row, so the
+    /// shipped default answers — which is why the two effects below are stored
+    /// as the state they were left in rather than as the one that differs from
+    /// the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<bool>,
+    /// Whether a line scrambles when the text it shows changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transitions: Option<bool>,
     /// The BCP-47 tag of the chosen language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
@@ -108,6 +126,21 @@ impl InterfacePreferences {
         }
     }
 
+    /// The remembered landing mark, when it is one this build knows.
+    pub fn mark(&self) -> Option<MarkStyle> {
+        self.mark.as_deref().and_then(MarkStyle::from_id)
+    }
+
+    /// Whether the mark animates, or the shipped default when unchosen.
+    pub fn motion(&self) -> bool {
+        self.motion.unwrap_or(true)
+    }
+
+    /// Whether a changing line scrambles, or the shipped default when unchosen.
+    pub fn transitions(&self) -> bool {
+        self.transitions.unwrap_or(true)
+    }
+
     /// The remembered language, when it is one this build ships.
     pub fn locale(&self) -> Option<Locale> {
         match self.locale.as_deref() {
@@ -150,6 +183,9 @@ mod tests {
             },
             mode: Some("light".to_string()),
             icons: Some("ascii".to_string()),
+            mark: Some("glitch".to_string()),
+            motion: Some(false),
+            transitions: Some(false),
             locale: Some("zh-CN".to_string()),
             workspace: Some("/tmp/vibex-workspace".to_string()),
             recent_commands: vec!["open_settings".to_string()],
@@ -160,6 +196,9 @@ mod tests {
         assert_eq!(loaded, preferences);
         assert_eq!(loaded.mode(), Some(GpuiThemeMode::Light));
         assert_eq!(loaded.glyphs(), Some(GlyphMode::Ascii));
+        assert_eq!(loaded.mark(), Some(MarkStyle::Glitch));
+        assert!(!loaded.motion());
+        assert!(!loaded.transitions());
         assert_eq!(loaded.locale(), Some(Locale::ZhCn));
     }
 
@@ -199,6 +238,7 @@ mod tests {
             r#"{
               "mode": "system",
               "icons": "emoji",
+              "mark": "plaid",
               "locale": "fr-FR",
               "themes": { "dark": "future-dark" }
             }"#,
@@ -208,7 +248,12 @@ mod tests {
         let loaded = InterfacePreferences::load(Some(&path));
         assert_eq!(loaded.mode(), None);
         assert_eq!(loaded.glyphs(), None);
+        assert_eq!(loaded.mark(), None);
         assert_eq!(loaded.locale(), None);
+        // A build that never wrote the two effects leaves them at the shipped
+        // default rather than reading "absent" as "off".
+        assert!(loaded.motion());
+        assert!(loaded.transitions());
         // An unknown theme id is kept as written: resolution, not loading, is
         // what decides whether a palette exists.
         assert_eq!(loaded.themes.dark(), Some("future-dark"));

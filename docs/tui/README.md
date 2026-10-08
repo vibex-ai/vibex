@@ -557,11 +557,37 @@ that has chosen nothing names — and creates with — the catalogue's first
 available entry.
 
 The mark is drawn from characters — block glyphs where the terminal has them,
-two rows of ASCII where it does not — and a light sweeps across it while the
-page waits. It is the client's only animation that is not a turn's spinner, it
-is a greeting rather than a heartbeat — one pass, then the mark rests — and it
-stops the moment the reader leaves. A prompt left open therefore costs no
-frames, which is the idle contract the PTY layer measures.
+two rows of ASCII where it does not — and it moves while the page waits. Two
+drawings ship, and the **Logo** row in the settings chooses between them:
+
+- **Classic**, the shipped mark: solid letters with a soft light crossing them
+  once per loop. The letters never change while the light passes — a mark
+  redrawn as the band went would read as loading rather than as waiting — and
+  the light spends headroom the resting gradient keeps for it.
+- **Glitch**, the same wordmark with a corroded fill, torn in bursts: rows
+  thrown out of register, the body of a stroke eaten into noise for a few
+  frames, and then the whole mark again for the long stretch after. The edges of
+  every letter survive the tear, so the word stays readable while it falls
+  apart. Unlike the light, the tear is carried by the characters themselves, so
+  it still moves on a terminal with `NO_COLOR`.
+
+Either way it is a greeting rather than a heartbeat — a pass or a burst, then
+the mark rests — and it stops the moment the reader leaves. A prompt left open
+therefore costs no frames, which is the idle contract the PTY layer measures.
+The **Motion** row switches the mark's animation off outright, and the mark is
+then drawn at rest rather than left on whichever frame the clock stopped on.
+
+A line whose text changes — the Agent and model, or the workspace — is not
+swapped under the reader's eye: it arrives, cell by cell, out of a scatter of
+noise. The part of the line that did not change holds still, so picking a
+directory one level down scrambles the folder that changed and leaves the path
+that led there alone, and the text resolves from the left the way it is read.
+The effect is driven by the frame that draws the page rather than by the
+gesture that changed it, so every path into a new Agent or workspace gets it,
+and a change made while the Agent setup picker is still open waits for the
+reader to close it rather than playing behind the overlay. The **Text
+transitions** row switches it off; a reader who does either is remembered in
+`~/.vibex/tui-interface.json` with the rest of the look.
 
 `Enter` puts the message in the transcript immediately. The runtime owns the
 timeline, so its own copy of the reader's message is a round trip away — and a
@@ -645,7 +671,8 @@ cost, price or currency in the data model, so the page does not invent one.
 ### Settings
 
 Theme and its dark/light mode (20 shipped themes), language (`en`, `zh-CN`,
-`zh-TW`), icon set, the default workspace for new sessions, and the
+`zh-TW`), icon set, the landing logo and its two effects, the default workspace
+for new sessions, and the
 key-binding file. The page is one surface with four modes rather than four screens:
 
 | Mode | Entered by | What it does |
@@ -658,7 +685,8 @@ key-binding file. The page is one surface with four modes rather than four scree
 A reset asks first and then restores the shipped default.
 
 Every value the page changes is remembered for the next run: the appearance,
-the theme, the icon set, the language and the default workspace are written to
+the theme, the icon set, the logo and its two effects, the language and the
+default workspace are written to
 `~/.vibex/tui-interface.json`, beside the arrangement and the key file. The
 theme is kept per appearance — a light palette and a dark one are two choices,
 so switching to light and back finds the dark one where it was. The command
@@ -796,8 +824,9 @@ Every one of these has a defined behaviour rather than a broken screen:
 | stdout is not a TTY | no raw mode; a clear message and a non-zero exit |
 | terminal below 60×16 | the bands around the conversation are given back; the transcript and the composer stay, and the frame is never refused |
 | in-process diagnostics | diverted to a spill file, named on exit; never drawn into a frame |
-| `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal |
-| non-UTF-8 locale | ASCII borders and markers |
+| `NO_COLOR` | glyphs and indentation carry the structure; colour is never the only signal. The classic mark holds still — a light with no colour is two identical frames — while the glitch mark still tears, because its movement is in the characters |
+| non-UTF-8 locale | ASCII borders and markers, and a two-row ASCII mark for both logo styles |
+| narrow terminal | a mark that cannot be drawn whole is not drawn at all; the lines under it name the product instead |
 | sixteen colours only | the page keeps the terminal's own background; the palette carries ink, accents and rules, and no plane is painted |
 | no keyboard protocol | `Shift+Enter` arrives as `Enter`; `Ctrl+J` breaks the line, and the help panel lists it |
 | disconnected | a banner, mutations disabled, the last known state marked stale |
@@ -822,7 +851,14 @@ cargo run -p vibex-tui --example preview -- 150 44 --ansi    # real SGR codes
 cargo run -p vibex-tui --example preview -- 150 44 --no-color
 cargo run -p vibex-tui --example preview -- 120 34 --settings
 cargo run -p vibex-tui --example preview -- 120 34 --welcome
+cargo run -p vibex-tui --example preview -- 100 30 --new
+cargo run -p vibex-tui --example preview -- 100 30 --new --glitch --phase 2
 ```
+
+`--new` draws the composing page, and `--glitch` swaps the mark it opens on for
+the torn one. `--phase` holds the animation clock on one frame, which is the
+only way to review a burst or a light that is only on screen for a tenth of a
+second.
 
 ## Testing
 

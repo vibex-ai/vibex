@@ -381,10 +381,10 @@ fn the_landing_mark_loops_without_repainting_between_passes() {
         assert!(app.is_animating(), "the loop's clock stopped");
         assert_eq!(
             app.advance_transcript_animation(),
-            vibex_tui::logo::moving(lands_on),
+            vibex_tui::logo::moving(vibex_tui::logo::MarkStyle::Classic, lands_on),
             "the tick landing on phase {lands_on} asked for the wrong thing"
         );
-        if vibex_tui::logo::moving(lands_on) {
+        if vibex_tui::logo::moving(vibex_tui::logo::MarkStyle::Classic, lands_on) {
             drew += 1;
         } else {
             quiet += 1;
@@ -2564,6 +2564,71 @@ fn the_settings_chooser_previews_and_escape_puts_the_value_back() {
 }
 
 #[test]
+fn the_landing_effects_are_rows_the_settings_page_offers() {
+    use vibex_tui::logo::MarkStyle;
+    use vibex_tui::settings::{SettingKind, SettingRow, definition};
+    // The mark is a closed set of drawings and the two effects are two-state
+    // rows: `Enter` on a toggle flips it in place rather than opening a chooser
+    // for two values.
+    assert_eq!(definition(SettingRow::Mark).kind, SettingKind::Choice);
+    assert_eq!(definition(SettingRow::Motion).kind, SettingKind::Toggle);
+    assert_eq!(
+        definition(SettingRow::Transitions).kind,
+        SettingKind::Toggle
+    );
+
+    let mut app = settings_app(120, 40);
+    let rows = app.visible_settings();
+    for row in [
+        SettingRow::Mark,
+        SettingRow::Motion,
+        SettingRow::Transitions,
+    ] {
+        assert!(rows.contains(&row), "{row:?} is not on the settings page");
+    }
+    let screen = text(&render(&mut app, 120, 40));
+    for word in ["Logo", "Motion", "Text transitions"] {
+        assert!(screen.contains(word), "{word} is not drawn:\n{screen}");
+    }
+
+    // Both effects ship on and the mark ships classic, and the row says so.
+    assert_eq!(app.setting_value(SettingRow::Motion), "On");
+    assert_eq!(app.setting_value(SettingRow::Transitions), "On");
+    assert_eq!(app.setting_value(SettingRow::Mark), "Classic");
+
+    // `Enter` on the motion row flips it where it stands, and the row that
+    // appears is the other value rather than a chooser.
+    select_setting(&mut app, SettingRow::Motion);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert!(app.settings.view.is_browse());
+    assert!(!app.settings.motion);
+    assert_eq!(app.setting_value(SettingRow::Motion), "Off");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Off"),
+        "the flipped row is not drawn:\n{screen}"
+    );
+
+    // The mark opens its chooser like every other choice, and the value it
+    // takes is the one the page draws.
+    select_setting(&mut app, SettingRow::Mark);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert!(matches!(
+        app.settings.view,
+        vibex_tui::app::SettingsMode::Picking { .. }
+    ));
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Classic") && screen.contains("Glitch"),
+        "the mark's values are not listed:\n{screen}"
+    );
+    app.step_setting_pick(1);
+    assert_eq!(app.settings.mark, MarkStyle::Glitch);
+    app.perform(vibex_tui::action::Intent::Back);
+    assert_eq!(app.settings.mark, MarkStyle::Classic, "Esc kept a preview");
+}
+
+#[test]
 fn the_settings_editor_commits_a_workspace_path() {
     use vibex_tui::app::SettingsMode;
     use vibex_tui::settings::SettingRow;
@@ -4401,12 +4466,12 @@ fn the_mark_moves_only_where_it_is_drawn() {
         },
     );
     // The lights cross the word, so two phases of the pass cannot agree.
-    let first = vibex_tui::logo::rows(&theme, 0, 80, true);
-    let later = vibex_tui::logo::rows(&theme, 20, 80, true);
+    let first = vibex_tui::logo::rows(&theme, vibex_tui::logo::MarkStyle::Classic, 0, 80, true);
+    let later = vibex_tui::logo::rows(&theme, vibex_tui::logo::MarkStyle::Classic, 20, 80, true);
     assert_ne!(text_of(&first), text_of(&later), "the light does not move");
     // The letters are the same in every frame: a pass that redrew them would
     // make a page that is waiting look like a page that is loading.
-    let waxing = vibex_tui::logo::rows(&theme, 3, 80, true);
+    let waxing = vibex_tui::logo::rows(&theme, vibex_tui::logo::MarkStyle::Classic, 3, 80, true);
     assert_eq!(
         waxing
             .iter()
@@ -4422,19 +4487,32 @@ fn the_mark_moves_only_where_it_is_drawn() {
     // untouched client sits on for the rest of the session.
     let resting = text_of(&vibex_tui::logo::rows(
         &theme,
+        vibex_tui::logo::MarkStyle::Classic,
         vibex_tui::logo::SWEEP_FRAMES,
         80,
         true,
     ));
     assert_eq!(
         resting,
-        text_of(&vibex_tui::logo::rows(&theme, 997, 80, true))
+        text_of(&vibex_tui::logo::rows(
+            &theme,
+            vibex_tui::logo::MarkStyle::Classic,
+            997,
+            80,
+            true
+        ))
     );
     // A page that is not waiting draws that same resting mark, and never a
     // frame of the animation.
     assert_eq!(
         resting,
-        text_of(&vibex_tui::logo::rows(&theme, 0, 80, false))
+        text_of(&vibex_tui::logo::rows(
+            &theme,
+            vibex_tui::logo::MarkStyle::Classic,
+            0,
+            80,
+            false
+        ))
     );
 
     // A page that waits animates; every other page still holds still. The
@@ -4452,6 +4530,247 @@ fn the_mark_moves_only_where_it_is_drawn() {
     app.perform(Intent::Back);
     assert!(!app.chrome_animating());
     assert!(!app.advance_transcript_animation());
+}
+
+#[test]
+fn the_page_draws_the_mark_the_reader_chose() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::settings::SettingRow;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+
+    // The shipped mark: solid blocks, and a light that moves in colour rather
+    // than in characters.
+    let classic = text(&render(&mut app, 100, 30));
+    assert!(
+        classic.contains("███"),
+        "the classic mark is missing:\n{classic}"
+    );
+    assert!(
+        !classic.contains('▒'),
+        "the classic mark wore the torn art:\n{classic}"
+    );
+
+    // The other style is the same word in a corroded fill, and its frames move
+    // rather than its colour: at rest it is whole, and a frame of a burst is
+    // not.
+    assert!(app.apply_setting_value(SettingRow::Mark, "glitch"));
+    let torn = text(&render(&mut app, 100, 30));
+    assert!(
+        torn.contains('▓') && torn.contains('▒'),
+        "no corroded fill:\n{torn}"
+    );
+    assert!(
+        torn.lines()
+            .any(|line| line.contains("██╗") || line.contains("▓█╗")),
+        "the torn mark is not the wordmark:\n{torn}"
+    );
+
+    app.animation_phase = 0;
+    let burst = text(&render(&mut app, 100, 30));
+    app.animation_phase = vibex_tui::logo::GLITCH_BURST_FRAMES;
+    let resting = text(&render(&mut app, 100, 30));
+    assert_ne!(burst, resting, "the tear drew the resting mark");
+
+    // The choice is a setting like any other: it survives a restart, and it is
+    // the row the page reads rather than a copy of it.
+    assert_eq!(app.interface_preferences().mark.as_deref(), Some("glitch"));
+    assert!(!app.apply_setting_value(SettingRow::Mark, "plaid"));
+    assert!(app.apply_setting_value(SettingRow::Mark, "classic"));
+    assert!(text(&render(&mut app, 100, 30)).contains("███"));
+}
+
+#[test]
+fn the_mark_holds_still_when_motion_is_switched_off() {
+    use vibex_tui::settings::SettingRow;
+    let mut app = app(100, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    assert!(app.mark_animates(), "the page that waits does not breathe");
+
+    assert!(app.apply_setting_value(SettingRow::Motion, "off"));
+    assert!(!app.mark_animates());
+    // Nothing else is moving either, so the client stops asking for frames:
+    // that is the whole point of the row.
+    assert!(!app.chrome_animating());
+    assert!(!app.is_animating());
+
+    // The mark it stops on is the resting mark, not the frame the clock
+    // happened to be on when the reader turned the row off.
+    app.animation_phase = 0;
+    let stopped = text(&render(&mut app, 100, 30));
+    app.animation_phase = vibex_tui::logo::SWEEP_FRAMES;
+    assert_eq!(stopped, text(&render(&mut app, 100, 30)));
+
+    // And the clock starts again: the mark keeps its loop whether or not the
+    // frame the clock lands on happens to draw something.
+    assert!(app.apply_setting_value(SettingRow::Motion, "on"));
+    assert!(app.is_animating());
+    app.animation_phase = 0;
+    assert!(app.chrome_animating());
+}
+
+#[test]
+fn a_changed_line_arrives_in_characters_rather_than_being_swapped() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::settings::SettingRow;
+    let mut app = app(110, 30);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.perform(Intent::NewSession);
+    // The first frame records what the page shows: a page that has just been
+    // opened has nothing to carry.
+    let _ = render(&mut app, 110, 30);
+    assert!(!app.transitions.running(app.animation_phase()));
+
+    // `Ctrl+W` picks a directory — the frame that draws the new one is the
+    // first frame of the transition, so the reader never sees the text swapped
+    // under them.
+    app.workspace_path = Some("/home/peatboy/vibex-dev".to_string());
+    let arriving = text(&render(&mut app, 110, 30));
+    assert!(
+        app.transitions.running(app.animation_phase()),
+        "the changed line was swapped rather than carried"
+    );
+    assert!(
+        !workspace_row(&arriving).contains("/home/peatboy/vibex-dev"),
+        "the new directory was already on screen:\n{arriving}"
+    );
+    // The composer's own line did not change, so it is left alone.
+    assert!(
+        arriving.contains("Unavailable"),
+        "the Agent line moved:\n{arriving}"
+    );
+
+    // The transition is carried across frames rather than being over by the
+    // second look: the frame that notes the line is still the same text is the
+    // second frame of the transition, not the last one.
+    for _ in 0..(vibex_tui::scramble::FRAMES / 2) {
+        app.advance_transcript_animation();
+    }
+    let midway = text(&render(&mut app, 110, 30));
+    assert!(
+        app.transitions.running(app.animation_phase()),
+        "the transition was over before it had run"
+    );
+    assert!(
+        workspace_row(&midway).contains("Workspace /home/peatboy/v"),
+        "the part that had arrived was lost:\n{midway}"
+    );
+    assert!(
+        !workspace_row(&midway).contains("/home/peatboy/vibex-dev"),
+        "the line arrived all at once:\n{midway}"
+    );
+
+    // It settles on the text it was carrying, and the clock stops.
+    for _ in 0..vibex_tui::scramble::FRAMES {
+        app.advance_transcript_animation();
+    }
+    let settled = text(&render(&mut app, 110, 30));
+    assert!(
+        workspace_row(&settled).contains("/home/peatboy/vibex-dev"),
+        "the line never arrived:\n{settled}"
+    );
+    assert!(!app.transitions.running(app.animation_phase()));
+
+    // A page with the effect switched off draws the new text at once, and the
+    // reader who turned it off does not get one last scramble for their
+    // trouble.
+    assert!(app.apply_setting_value(SettingRow::Transitions, "off"));
+    app.workspace_path = Some("/home/peatboy/vibex-dev/apps".to_string());
+    let plain = text(&render(&mut app, 110, 30));
+    assert!(
+        workspace_row(&plain).contains("/home/peatboy/vibex-dev/apps"),
+        "\n{plain}"
+    );
+    // Nothing was carried, so nothing is holding the clock on the reader's
+    // behalf: the only thing on this page that may still ask for frames is the
+    // mark's own loop.
+    assert!(!app.transitions.running(app.animation_phase()));
+}
+
+/// The composing page's workspace row, which is the line `Ctrl+W` changes.
+///
+/// Found by its label rather than by its row number: the page is centred in the
+/// band, so how far down it starts depends on the terminal's height.
+fn workspace_row(screen: &str) -> String {
+    screen
+        .lines()
+        .find(|line| line.contains("Workspace"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn the_agent_and_the_composer_line_carry_a_new_runtime_together() {
+    use vibex_tui::action::Intent;
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bai".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![
+            option("claude", "claude-sonnet"),
+            option("deepseek", "deepseek-v4.1-flash"),
+        ],
+    });
+    app.perform(Intent::NewSession);
+    let _ = render(&mut app, 120, 40);
+    let before = text(&render(&mut app, 120, 40));
+    assert!(before.contains("claude · claude-sonnet"), "\n{before}");
+
+    // `Ctrl+G`, then the second Agent. The page's row and the composer's line
+    // are the same answer written twice, so both carry the change — and the
+    // picker is closed, which is the moment the reader can see them.
+    app.show_runtime_picker();
+    pick_entry(&mut app, 1);
+    app.perform(Intent::ConfirmOverlay);
+    app.overlay = None;
+    let arriving = text(&render(&mut app, 120, 40));
+    assert!(
+        app.transitions.running(app.animation_phase()),
+        "the new Agent was swapped rather than carried"
+    );
+    assert!(
+        !arriving.contains("deepseek · deepseek-v4.1-flash"),
+        "the new runtime was already on screen:\n{arriving}"
+    );
+    // Both surfaces are mid-transition: no row on the frame names the new
+    // runtime whole, on the page or on the composer's own line.
+    let naming = |screen: &str| {
+        screen
+            .lines()
+            .filter(|line| line.contains("deepseek"))
+            .count()
+    };
+    assert_eq!(
+        naming(&arriving),
+        0,
+        "a surface kept the whole name:\n{arriving}"
+    );
+
+    for _ in 0..vibex_tui::scramble::FRAMES {
+        app.advance_transcript_animation();
+    }
+    let settled = text(&render(&mut app, 120, 40));
+    assert!(
+        naming(&settled) >= 2,
+        "the runtime is not named on both surfaces:\n{settled}"
+    );
 }
 
 /// The mark with its styling: the light changes, and so does the mark it draws.

@@ -916,6 +916,12 @@ pub struct App {
     pub activity: Option<String>,
     /// Monotonic clock driving every animation.
     pub animation_phase: u32,
+    /// The character transitions the composing page's lines are wearing.
+    ///
+    /// Driven by the frame that draws the page rather than by the gestures that
+    /// change it, so every path into a new Agent or a new workspace gets the
+    /// same effect — see [`crate::scramble`].
+    pub transitions: crate::scramble::Transitions,
     /// What the composer's prefix says the draft will do.
     pub composer_mode: ComposerMode,
 }
@@ -1359,6 +1365,9 @@ impl App {
                 mode: options.mode,
                 locale: options.locale,
                 glyphs: capability.glyphs,
+                mark: options.remembered.mark().unwrap_or_default(),
+                motion: options.remembered.motion(),
+                transitions: options.remembered.transitions(),
                 selected: 0,
                 view: SettingsMode::Browse,
                 filter: String::new(),
@@ -1432,6 +1441,7 @@ impl App {
             turn_readout: crate::turn::TurnReadout::default(),
             activity: None,
             animation_phase: 0,
+            transitions: crate::scramble::Transitions::default(),
             composer_mode: ComposerMode::Normal,
         };
         // The client opens where a session is written, not on the list of
@@ -1972,6 +1982,64 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Note the lines the composing page is about to draw.
+    ///
+    /// Called by the frame that draws the page, because the text is the only
+    /// honest answer to "did this line change": every path into a new Agent or
+    /// a new workspace — the switcher, the catalogue arriving late — gets the
+    /// transition without any of them knowing it exists.
+    ///
+    /// A page that is not on screen is not observed at all, and one an overlay
+    /// is covering is left alone rather than recorded: a change the reader
+    /// cannot see waits until they can, instead of playing to an empty room and
+    /// being over by the time the page is back.
+    pub fn observe_landing_text(&mut self) {
+        if self.overlay.is_some() {
+            return;
+        }
+        if self.page != Page::NewSession {
+            self.transitions.cancel();
+            return;
+        }
+        let (agent, model) = self.composer_runtime_labels();
+        let workspace = self.new_session_workspace();
+        self.transitions.observe(
+            &agent,
+            &model,
+            &workspace,
+            self.animation_phase,
+            self.settings.transitions,
+        );
+    }
+
+    /// The Agent and model the page is on, with any transition applied.
+    ///
+    /// Two parts rather than one line because that is how the surfaces under
+    /// the page draw them: the Agent and the model are separate spans with
+    /// separate emphasis, and the transition carries each of them rather than a
+    /// flattened run that would lose the difference.
+    pub fn drawn_runtime_parts(&self) -> (String, String) {
+        let (agent, model) = self.composer_runtime_labels();
+        let phase = self.animation_phase;
+        (
+            self.transitions
+                .drawn(crate::scramble::Slot::Runtime, 0, &agent, phase),
+            self.transitions
+                .drawn(crate::scramble::Slot::Runtime, 1, &model, phase),
+        )
+    }
+
+    /// The workspace a session created now would open in, mid-transition.
+    pub fn drawn_new_session_workspace(&self) -> String {
+        let workspace = self.new_session_workspace();
+        self.transitions.drawn(
+            crate::scramble::Slot::Workspace,
+            0,
+            &workspace,
+            self.animation_phase,
+        )
+    }
+
     /// The Agent and model the picker's run options are editing.
     ///
     /// The picker's own selection rather than the page's: choosing a model and
@@ -2220,6 +2288,9 @@ impl App {
                 }
                 .to_string(),
             ),
+            mark: Some(self.settings.mark.id().to_string()),
+            motion: Some(self.settings.motion),
+            transitions: Some(self.settings.transitions),
             locale: Some(self.settings.locale.tag().to_string()),
             workspace: self.preferred_workspace.clone(),
             recent_commands: self.recent_commands.clone(),
@@ -3154,23 +3225,26 @@ impl App {
         self.page_owns_session() && self.transcript.is_animating()
     }
 
-    /// Whether the landing mark has a light crossing it right now.
+    /// Whether the landing mark has something to draw right now.
     ///
     /// The light comes round again for as long as the page waits, so this is
-    /// true for one pass of the loop and false between passes. It is the
-    /// question the tick period asks: there is nothing to draw quickly while
-    /// the mark sits between lights.
+    /// true for one pass of the loop and false between passes; a burst of the
+    /// tear is true for its own frames and false for the still stretch. It is
+    /// the question the tick period asks: there is nothing to draw quickly
+    /// while the mark sits between passes.
     fn landing_mark_moves(&self) -> bool {
-        self.landing_mark_loops() && crate::logo::moving(self.animation_phase)
+        self.mark_animates() && crate::logo::moving(self.settings.mark, self.animation_phase)
     }
 
-    /// Whether the landing mark is looping at all.
+    /// Whether the landing mark is animating at all.
     ///
     /// The page waits for the reader, so its light will come round again: the
     /// clock has to keep running even in the quiet stretch between passes, or
-    /// there would be no next pass.
-    fn landing_mark_loops(&self) -> bool {
-        self.composing_page_shines()
+    /// there would be no next pass. The reader can stop it outright, and a mark
+    /// that is not animating is drawn at rest rather than left on whichever
+    /// frame the clock happened to stop on.
+    pub fn mark_animates(&self) -> bool {
+        self.composing_page_shines() && self.settings.motion
     }
 
     /// Whether the landing mark is between passes, with nothing else moving.
@@ -3182,8 +3256,9 @@ impl App {
     /// would be a greeting charged to the reader's battery. So the clock runs
     /// on the slow tick between passes and the client holds still.
     fn landing_mark_waits(&self) -> bool {
-        self.landing_mark_loops()
+        self.mark_animates()
             && !self.landing_mark_moves()
+            && !self.transitions.running(self.animation_phase)
             && !self.transcript_animating()
             && !self.turn_reads_running()
             && self.page_approval_count() == 0
@@ -3196,7 +3271,9 @@ impl App {
     /// Everything else holds still, which is what keeps an idle session — and
     /// the prompt the client opens on, between passes — at zero frames.
     pub fn chrome_animating(&self) -> bool {
-        self.transcript_animating() || self.landing_mark_moves()
+        self.transcript_animating()
+            || self.landing_mark_moves()
+            || self.transitions.running(self.animation_phase)
     }
 
     /// Step the running indicator. Returns whether a repaint is due.
@@ -3210,6 +3287,10 @@ impl App {
             return false;
         }
         self.animation_phase = self.animation_phase.wrapping_add(1);
+        // A transition that has drawn its last frame is dropped rather than
+        // kept: it is the difference between a clock that stops when the page
+        // settles and one that ticks for the rest of the session.
+        self.transitions.prune(self.animation_phase);
         !self.landing_mark_waits()
     }
 
@@ -3296,7 +3377,8 @@ impl App {
             || self.turn_reads_running()
             || self.page_approval_count() > 0
             || self.page_elicitation_count() > 0
-            || self.landing_mark_loops()
+            || self.mark_animates()
+            || self.transitions.running(self.animation_phase)
     }
 
     /// The approvals the page in front of the reader is waiting on.
@@ -5535,6 +5617,9 @@ mod tests {
         assert!(app.apply_setting_value(SettingRow::Mode, "light"));
         assert!(app.apply_setting_value(SettingRow::Theme, light));
         assert!(app.apply_setting_value(SettingRow::Icons, "ascii"));
+        assert!(app.apply_setting_value(SettingRow::Mark, "glitch"));
+        assert!(app.apply_setting_value(SettingRow::Motion, "off"));
+        assert!(app.apply_setting_value(SettingRow::Transitions, "off"));
         assert!(app.apply_setting_value(SettingRow::Language, "zh-TW"));
         assert!(app.apply_setting_value(SettingRow::Workspace, "/tmp/vibex-default-ws"));
 
@@ -5543,6 +5628,9 @@ mod tests {
         let remembered = crate::interface_prefs::InterfacePreferences::load(Some(&path));
         assert_eq!(remembered.mode(), Some(vibex_ui::GpuiThemeMode::Light));
         assert_eq!(remembered.glyphs(), Some(crate::theme::GlyphMode::Ascii));
+        assert_eq!(remembered.mark(), Some(crate::logo::MarkStyle::Glitch));
+        assert!(!remembered.motion());
+        assert!(!remembered.transitions());
         assert_eq!(remembered.locale(), Some(Locale::ZhTw));
         assert_eq!(
             theme_slot(&remembered.themes, vibex_ui::GpuiThemeMode::Light),
@@ -5571,6 +5659,9 @@ mod tests {
         );
         assert_eq!(reloaded.settings.locale, Locale::ZhTw);
         assert_eq!(reloaded.theme.id, light);
+        assert_eq!(reloaded.settings.mark, crate::logo::MarkStyle::Glitch);
+        assert!(!reloaded.settings.motion);
+        assert!(!reloaded.settings.transitions);
         assert_eq!(
             reloaded.workspace_path.as_deref(),
             Some("/tmp/vibex-default-ws")

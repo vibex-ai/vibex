@@ -511,6 +511,10 @@ pub fn block_detail_text(
 /// screen rather than the top third of it.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.regions.begin_frame();
+    // What the page is about to draw is what says whether a line changed, so
+    // the transition is begun here — before the first frame that shows the new
+    // text, rather than a tick after it.
+    app.observe_landing_text();
     let area = frame.area();
     app.shell = crate::app::shell_for_columns(area.width);
     let theme = app.theme.clone();
@@ -3070,17 +3074,20 @@ fn render_new_session(
         empty_state(frame, area, theme, strings.session_new());
         return;
     }
-    let lit = app.composing_page_shines();
-    let mark = crate::logo::rows(theme, app.animation_phase(), area.width, lit);
+    let style = app.settings.mark;
+    let lit = app.mark_animates();
+    let mark = crate::logo::rows(theme, style, app.animation_phase(), area.width, lit);
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Room for the mark, a blank row and the lines under it, or the mark is
     // dropped and the words speak for themselves.
     let mark_fits = !mark.is_empty() && area.height as usize >= mark.len() + 7;
     if mark_fits {
         lines.push(Line::from(""));
-        let indent = usize::from(area.width)
-            .saturating_sub(crate::logo::width(theme.glyphs(), area.width))
-            / 2;
+        let indent = usize::from(area.width).saturating_sub(crate::logo::width(
+            style,
+            theme.glyphs(),
+            area.width,
+        )) / 2;
         lines.extend(mark.into_iter().map(|line| {
             let mut spans = vec![Span::raw(" ".repeat(indent))];
             spans.extend(line.spans);
@@ -3101,8 +3108,10 @@ fn render_new_session(
     lines.push(Line::from(""));
 
     // What the message will be sent through, and where. Both are answers the
-    // reader needs before writing, and both are one key away from changing.
-    let (agent, model) = app.composer_runtime_labels();
+    // reader needs before writing, and both are one key away from changing —
+    // which is what the transition is for: the line the reader just changed
+    // arrives as itself rather than being swapped out under their eyes.
+    let (agent, model) = app.drawn_runtime_parts();
     let runtime = if model.is_empty() {
         agent
     } else {
@@ -3121,7 +3130,7 @@ fn render_new_session(
     lines.push(setting_row(
         area.width,
         strings.session_workspace_label(),
-        &app.new_session_workspace(),
+        &app.drawn_new_session_workspace(),
         theme,
         Some(strings.workspace_switch_hint()),
     ));
@@ -3713,7 +3722,7 @@ fn render_composer_info(
     if area.height == 0 {
         return;
     }
-    let (agent, model) = app.composer_runtime_labels();
+    let (agent, model) = app.drawn_runtime_parts();
     let mut left = vec![Span::styled(agent, theme.muted())];
     if !model.is_empty() {
         left.push(Span::styled(format!(" · {model}"), theme.base()));

@@ -17,6 +17,7 @@ use vibex_desktop_model::ThemeSelection;
 
 use crate::app::App;
 use crate::locale::{Locale, Strings};
+use crate::logo::MarkStyle;
 use crate::theme::GlyphMode;
 
 /// The theme id held by the slot for one appearance.
@@ -49,6 +50,9 @@ pub enum SettingRow {
     Mode,
     Theme,
     Icons,
+    Mark,
+    Motion,
+    Transitions,
     Language,
     Keys,
     Workspace,
@@ -118,6 +122,21 @@ pub const SETTINGS: &[SettingDef] = &[
     },
     SettingDef {
         row: SettingRow::Icons,
+        section: SettingsSection::Appearance,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::Mark,
+        section: SettingsSection::Appearance,
+        kind: SettingKind::Choice,
+    },
+    SettingDef {
+        row: SettingRow::Motion,
+        section: SettingsSection::Appearance,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::Transitions,
         section: SettingsSection::Appearance,
         kind: SettingKind::Toggle,
     },
@@ -203,6 +222,12 @@ pub struct SettingsState {
     pub mode: vibex_ui::GpuiThemeMode,
     pub locale: Locale,
     pub glyphs: GlyphMode,
+    /// The character art the landing mark is drawn with.
+    pub mark: MarkStyle,
+    /// Whether the mark's own animation runs while the page waits.
+    pub motion: bool,
+    /// Whether a line scrambles when the text it shows changes.
+    pub transitions: bool,
     /// Index into the visible rows.
     pub selected: usize,
     pub view: SettingsMode,
@@ -267,6 +292,9 @@ impl App {
             SettingRow::Mode => strings.settings_mode(),
             SettingRow::Theme => strings.settings_theme(),
             SettingRow::Icons => strings.settings_icons(),
+            SettingRow::Mark => strings.settings_mark(),
+            SettingRow::Motion => strings.settings_motion(),
+            SettingRow::Transitions => strings.settings_transitions(),
             SettingRow::Language => strings.settings_language(),
             SettingRow::Keys => strings.settings_keys(),
             SettingRow::Workspace => strings.session_workspace(),
@@ -282,6 +310,9 @@ impl App {
             SettingRow::Mode => strings.settings_mode_hint(),
             SettingRow::Theme => strings.settings_theme_hint(),
             SettingRow::Icons => strings.settings_icons_hint(),
+            SettingRow::Mark => strings.settings_mark_hint(),
+            SettingRow::Motion => strings.settings_motion_hint(),
+            SettingRow::Transitions => strings.settings_transitions_hint(),
             SettingRow::Language => strings.settings_language_hint(),
             SettingRow::Keys => strings.settings_keys_hint(),
             SettingRow::Workspace => strings.settings_workspace_hint(),
@@ -303,6 +334,12 @@ impl App {
                 GlyphMode::Unicode => self.strings.settings_icons_unicode().to_string(),
                 GlyphMode::Ascii => self.strings.settings_icons_ascii().to_string(),
             },
+            SettingRow::Mark => match self.settings.mark {
+                MarkStyle::Classic => self.strings.settings_mark_classic().to_string(),
+                MarkStyle::Glitch => self.strings.settings_mark_glitch().to_string(),
+            },
+            SettingRow::Motion => self.toggle_label(self.settings.motion),
+            SettingRow::Transitions => self.toggle_label(self.settings.transitions),
             SettingRow::Language => self.settings.locale.tag().to_string(),
             SettingRow::Keys => format!(
                 "{} · {}",
@@ -369,6 +406,18 @@ impl App {
                         },
                 })
                 .collect(),
+            SettingRow::Mark => MarkStyle::ALL
+                .into_iter()
+                .map(|style| SettingChoice {
+                    value: style.id().to_string(),
+                    label: match style {
+                        MarkStyle::Classic => self.strings.settings_mark_classic().to_string(),
+                        MarkStyle::Glitch => self.strings.settings_mark_glitch().to_string(),
+                    },
+                    current: style == self.settings.mark,
+                })
+                .collect(),
+            SettingRow::Motion | SettingRow::Transitions => self.toggle_choices(row),
             SettingRow::Language => [Locale::En, Locale::ZhCn, Locale::ZhTw]
                 .into_iter()
                 .map(|locale| SettingChoice {
@@ -391,9 +440,52 @@ impl App {
                 vibex_ui::theme_catalog::default_theme_id(self.settings.mode).to_string()
             }
             SettingRow::Icons => "unicode".to_string(),
+            SettingRow::Mark => MarkStyle::default().id().to_string(),
+            // Motion and the text transition are the shipped behaviour: a
+            // reset puts them back on, which is what a reader who never opened
+            // this page already has.
+            SettingRow::Motion | SettingRow::Transitions => "on".to_string(),
             SettingRow::Language => Locale::En.tag().to_string(),
             SettingRow::Workspace => String::new(),
             _ => self.setting_value(row),
+        }
+    }
+
+    /// The two labels a toggle row shows.
+    fn toggle_label(&self, on: bool) -> String {
+        if on {
+            self.strings.settings_on().to_string()
+        } else {
+            self.strings.settings_off().to_string()
+        }
+    }
+
+    /// The two values a toggle row offers.
+    ///
+    /// A toggle is a choice with two values rather than a kind of its own: the
+    /// picker, the key that steps it and the reset all read the same list, so
+    /// they cannot disagree about what the other state is called.
+    fn toggle_choices(&self, row: SettingRow) -> Vec<SettingChoice> {
+        let current = match row {
+            SettingRow::Motion => self.settings.motion,
+            _ => self.settings.transitions,
+        };
+        [("on", true), ("off", false)]
+            .into_iter()
+            .map(|(value, on)| SettingChoice {
+                value: value.to_string(),
+                label: self.toggle_label(on),
+                current: on == current,
+            })
+            .collect()
+    }
+
+    /// The state a toggle value names, or `None` when it names neither.
+    pub(crate) fn toggle_value(value: &str) -> Option<bool> {
+        match value {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
         }
     }
 
@@ -448,6 +540,43 @@ impl App {
                 }
                 self.settings.glyphs = glyphs;
                 self.rebuild_appearance();
+                true
+            }
+            SettingRow::Mark => {
+                let Some(mark) = MarkStyle::from_id(value) else {
+                    return false;
+                };
+                if mark == self.settings.mark {
+                    return false;
+                }
+                self.settings.mark = mark;
+                true
+            }
+            SettingRow::Motion => {
+                let Some(on) = Self::toggle_value(value) else {
+                    return false;
+                };
+                if on == self.settings.motion {
+                    return false;
+                }
+                self.settings.motion = on;
+                true
+            }
+            SettingRow::Transitions => {
+                let Some(on) = Self::toggle_value(value) else {
+                    return false;
+                };
+                if on == self.settings.transitions {
+                    return false;
+                }
+                self.settings.transitions = on;
+                // A transition in flight is a promise the effect will keep
+                // drawing: switching the effect off mid-line stops it where it
+                // is, and the line it was carrying is drawn as the text it
+                // already is.
+                if !on {
+                    self.transitions.cancel();
+                }
                 true
             }
             SettingRow::Language => {
@@ -539,6 +668,11 @@ impl App {
     }
 
     /// Open the chooser for `row`, remembering the value to restore.
+    ///
+    /// What is remembered is the row's *value*, not the words it is displayed
+    /// as: `Esc` puts the old choice back by applying it, and a row whose value
+    /// is a label — the appearance row says "Dark", the value is `dark` — would
+    /// otherwise restore a spelling nothing reads and quietly keep the preview.
     pub fn begin_setting_pick(&mut self, row: SettingRow) -> bool {
         let choices = self.setting_choices(row);
         if choices.is_empty() {
@@ -548,7 +682,10 @@ impl App {
             .iter()
             .position(|choice| choice.current)
             .unwrap_or(0);
-        let original = self.setting_value(row);
+        let original = choices
+            .get(selected)
+            .map(|choice| choice.value.clone())
+            .unwrap_or_else(|| self.setting_value(row));
         self.settings.view = SettingsMode::Picking {
             row,
             selected,

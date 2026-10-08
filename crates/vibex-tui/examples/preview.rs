@@ -11,6 +11,8 @@
 //! cargo run -p vibex-tui --example preview -- 140 44 --no-color
 //! cargo run -p vibex-tui --example preview -- 120 34 --settings
 //! cargo run -p vibex-tui --example preview -- 100 30 --thinking --phase 4
+//! cargo run -p vibex-tui --example preview -- 100 30 --new
+//! cargo run -p vibex-tui --example preview -- 100 30 --new --glitch --phase 2
 //! ```
 //!
 //! `--thinking` adds a thought that is still arriving, so the live window and
@@ -38,6 +40,8 @@ fn main() {
     let mut ansi = false;
     let mut welcome = false;
     let mut settings = false;
+    let mut new_session = false;
+    let mut glitch = false;
     let mut thinking = false;
     let mut phase = 0u32;
     let mut numbers = Vec::new();
@@ -50,6 +54,10 @@ fn main() {
             "--ansi" => ansi = true,
             "--welcome" => welcome = true,
             "--settings" => settings = true,
+            // The page a new session opens on, whose mark is the whole point of
+            // the two `--glitch`/`--phase` flags beside it.
+            "--new" => new_session = true,
+            "--glitch" => glitch = true,
             // A running thought, to review the live window and its rail.
             "--thinking" => thinking = true,
             "--phase" => {
@@ -109,6 +117,12 @@ fn main() {
         app.perform(vibex_tui::action::Intent::OpenSettings);
         app.set_selection(vibex_tui::keymap::Scope::Settings, 1);
     }
+    if new_session {
+        app.perform(vibex_tui::action::Intent::NewSession);
+    }
+    if glitch {
+        app.settings.mark = vibex_tui::logo::MarkStyle::Glitch;
+    }
     let blocks = sample_session();
     if !welcome {
         let mut blocks = blocks;
@@ -117,9 +131,11 @@ fn main() {
         }
         app.transcript.set_blocks(blocks);
     }
-    if thinking {
+    if thinking || glitch {
         // The view hands the transcript the app's own clock, so a frozen frame
-        // is a matter of stopping the clock rather than setting it twice.
+        // is a matter of stopping the clock rather than setting it twice. The
+        // mark is read at a chosen frame for the same reason: a burst is only
+        // reviewable if it can be held still.
         app.animation_phase = phase;
     }
     // A live turn, so the rail and the turn line render rather than the idle

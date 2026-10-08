@@ -738,6 +738,28 @@ strings! {
         "内置 20 套配色；移动光标即预览。",
         "內建 20 套配色；移動游標即預覽。"
     },
+    settings_mark => { "Logo", "字符画", "字符畫" },
+    settings_mark_hint => {
+        "The art a new session's page opens on",
+        "新建会话页面上的字符画",
+        "新增工作階段頁面上的字符畫"
+    },
+    settings_mark_classic => { "Classic", "经典", "經典" },
+    settings_mark_glitch => { "Glitch", "故障", "故障" },
+    settings_motion => { "Motion", "动效", "動效" },
+    settings_motion_hint => {
+        "Animate the mark while the page waits; off holds it still",
+        "页面等待时为字符画添加动效；关闭则保持静止",
+        "頁面等待時為字符畫加上動效；關閉則保持靜止"
+    },
+    settings_transitions => { "Text transitions", "文字切换特效", "文字切換特效" },
+    settings_transitions_hint => {
+        "Scramble a line when the text it shows changes",
+        "文本变化时以字符特效切换",
+        "文字變更時以字元特效切換"
+    },
+    settings_on => { "On", "开", "開" },
+    settings_off => { "Off", "关", "關" },
     settings_icons_hint => {
         "Unicode chrome, or ASCII for a terminal without font fallback.",
         "Unicode 界面符号；无字体回退的终端可用 ASCII。",
