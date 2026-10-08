@@ -16,6 +16,9 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+#[path = "message_schedule.rs"]
+mod message_schedule;
+use message_schedule::{MessageSchedule, MessageScheduleTarget};
 #[path = "timeline_activity.rs"]
 mod timeline_activity;
 #[path = "timeline_disclosure.rs"]
@@ -963,12 +966,15 @@ struct ComposerDraft {
     attachments: Vec<InlineComposerAttachment>,
     command_entry: Option<AgentCommandEntry>,
     attachment_serial: u64,
+    schedule: Option<MessageSchedule>,
 }
 
 impl ComposerDraft {
     /// Whether the draft has nothing left to send.
     fn is_empty(&self) -> bool {
-        self.content.text().trim().is_empty() && self.attachments.is_empty()
+        self.content.text().trim().is_empty()
+            && self.attachments.is_empty()
+            && self.schedule.is_none()
     }
 
     /// Drops attachments whose marker the reader deleted from the text.
@@ -1172,6 +1178,7 @@ struct ComposerQueueMessage {
     text: String,
     attachments: Vec<MessageAttachment>,
     command_invocation: Option<ComposerCommandInvocation>,
+    scheduled_at_ms: Option<i64>,
 }
 
 impl ComposerQueueMessage {
@@ -1194,6 +1201,7 @@ enum ComposerQueueInterruptBehavior {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerQueueDispatchBehavior {
     Automatic,
+    Scheduled,
     ForceNext,
     AfterInterrupt,
     AfterCompletion,
@@ -6043,7 +6051,9 @@ fn promote_composer_queue_message(
     message_id: u64,
 ) -> Option<VibexSessionId> {
     let source_index = queue.iter().position(|message| message.id == message_id)?;
-    let message = queue.remove(source_index);
+    let mut message = queue.remove(source_index);
+    // Promoting a message is the explicit send-now action.
+    message.scheduled_at_ms = None;
     let session_id = message.session_id.clone();
     let insert_at = queue
         .iter()
@@ -6077,6 +6087,10 @@ fn composer_queue_session_blocks_dispatch(
     session_state: Option<AgentSessionState>,
 ) -> bool {
     let session_blocks = match behavior {
+        ComposerQueueDispatchBehavior::Scheduled => !matches!(
+            session_state,
+            Some(AgentSessionState::Idle | AgentSessionState::Error)
+        ),
         ComposerQueueDispatchBehavior::AfterInterrupt => false,
         ComposerQueueDispatchBehavior::AfterCompletion => {
             matches!(session_state, Some(AgentSessionState::NeedsInput))
@@ -6146,6 +6160,7 @@ fn composer_queue_message_delivery(behavior: ComposerQueueDispatchBehavior) -> U
     match behavior {
         ComposerQueueDispatchBehavior::AfterInterrupt => UserMessageDelivery::Resend,
         ComposerQueueDispatchBehavior::Automatic
+        | ComposerQueueDispatchBehavior::Scheduled
         | ComposerQueueDispatchBehavior::ForceNext
         | ComposerQueueDispatchBehavior::AfterCompletion
         | ComposerQueueDispatchBehavior::ExplicitSend => UserMessageDelivery::Prompt,
@@ -6849,6 +6864,7 @@ struct SubmittedNewSessionDraft {
     raw_text: String,
     attachments: Vec<InlineComposerAttachment>,
     command_entry: Option<AgentCommandEntry>,
+    schedule: Option<MessageSchedule>,
 }
 
 struct NewSessionFailure {
@@ -7418,6 +7434,9 @@ pub struct VibexWorkbench {
     composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
     new_session_command_entry: Option<AgentCommandEntry>,
+    new_session_schedule: Option<MessageSchedule>,
+    message_schedule_dialog_target: Option<MessageScheduleTarget>,
+    message_schedule_task: Option<Task<()>>,
     composer_queue: Vec<ComposerQueueMessage>,
     composer_queue_serial: u64,
     composer_queue_manual_session_ids: BTreeSet<String>,
@@ -8353,6 +8372,9 @@ impl VibexWorkbench {
             composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
             new_session_command_entry: None,
+            new_session_schedule: None,
+            message_schedule_dialog_target: None,
+            message_schedule_task: None,
             composer_queue: Vec::new(),
             composer_queue_serial: 0,
             composer_queue_manual_session_ids: BTreeSet::new(),
@@ -16113,6 +16135,7 @@ impl VibexWorkbench {
             attachments: self.composer_attachments.clone(),
             command_entry: self.composer_command_entry.clone(),
             attachment_serial: self.composer_attachment_serial,
+            schedule: self.composer_message_schedule(),
         };
         self.composer_drafts.save(session_id.as_str(), draft);
     }
@@ -21305,8 +21328,14 @@ impl VibexWorkbench {
             .composer_queue
             .iter()
             .any(|queued| queued.session_id == session_id);
-        if session_running || queue_paused || queue_has_messages {
+        if message.scheduled_at_ms.is_some()
+            || session_running
+            || queue_paused
+            || queue_has_messages
+        {
             self.composer_queue.push(message);
+            self.start_message_schedule_timer(window, cx);
+            self.publish_sidebar_invalidation();
             cx.notify();
             if !session_running && !queue_paused {
                 // The user sent from the composer while the session is idle, so
@@ -21358,6 +21387,18 @@ impl VibexWorkbench {
         if text.trim().is_empty() && attachments.is_empty() {
             return None;
         }
+        let scheduled_at_ms = match self
+            .composer_message_schedule()
+            .map(|schedule| schedule.deadline(unix_timestamp_ms()))
+            .transpose()
+        {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                self.agent_error = Some(error.into());
+                cx.notify();
+                return None;
+            }
+        };
         self.sync_composer_command_entry(ComposerTarget::Session, cx);
         let allow_manual_provider_slash = runtime
             .agent()
@@ -21386,6 +21427,7 @@ impl VibexWorkbench {
             text,
             attachments,
             command_invocation,
+            scheduled_at_ms,
         };
         // Clear the captured draft before queueing or dispatch so completion can
         // never erase text the user typed for a later message.
@@ -21422,6 +21464,18 @@ impl VibexWorkbench {
         if text.trim().is_empty() && attachments.is_empty() {
             return None;
         }
+        let scheduled_at_ms = match self
+            .composer_message_schedule()
+            .map(|schedule| schedule.deadline(unix_timestamp_ms()))
+            .transpose()
+        {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                self.agent_error = Some(error.into());
+                cx.notify();
+                return None;
+            }
+        };
         self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
         let message = ComposerQueueMessage {
             id: self.composer_queue_serial,
@@ -21430,6 +21484,7 @@ impl VibexWorkbench {
             text,
             attachments,
             command_invocation: None,
+            scheduled_at_ms,
         };
         composer_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_attachments.clear();
@@ -21584,11 +21639,15 @@ impl VibexWorkbench {
             session_state,
             cached_turn_status.map(|status| status.ended_normally),
         );
-        if composer_queue_session_blocks_dispatch(
-            behavior,
-            self.session_turn_pending(&session_id),
-            session_state,
-        ) || waits_for_continuation
+        if message
+            .scheduled_at_ms
+            .is_some_and(|at_ms| at_ms > unix_timestamp_ms())
+            || composer_queue_session_blocks_dispatch(
+                behavior,
+                self.session_turn_pending(&session_id),
+                session_state,
+            )
+            || waits_for_continuation
         {
             let insert_at = self
                 .composer_queue
@@ -21596,6 +21655,7 @@ impl VibexWorkbench {
                 .position(|queued| queued.session_id == session_id)
                 .unwrap_or(self.composer_queue.len());
             self.composer_queue.insert(insert_at, message);
+            self.start_message_schedule_timer(window, cx);
             if waits_for_continuation && cached_turn_status.is_none() {
                 // An unobserved revision is not proof of a normal completion:
                 // probe it so a later frame can release the queue once the
@@ -21847,6 +21907,29 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let now_ms = unix_timestamp_ms();
+        let Some(index) = message_schedule::next_message_index(
+            &self.composer_queue,
+            session_id,
+            behavior,
+            composer_queue_dispatch_enabled(
+                &self.composer_queue_manual_session_ids,
+                session_id,
+                behavior,
+            ),
+            now_ms,
+            |id| self.queue_message_is_being_edited(id),
+        ) else {
+            return false;
+        };
+        // A schedule is an explicit instruction to send at a future time. It
+        // remains automatic even in Manual queue mode, but never interrupts a
+        // running turn or resumes a queue the user explicitly paused.
+        let behavior = if self.composer_queue[index].scheduled_at_ms.is_some() {
+            ComposerQueueDispatchBehavior::Scheduled
+        } else {
+            behavior
+        };
         let session = self
             .sessions
             .iter()
@@ -21860,11 +21943,7 @@ impl VibexWorkbench {
             session_state,
             cached_turn_status.map(|status| status.ended_normally),
         );
-        if !composer_queue_dispatch_enabled(
-            &self.composer_queue_manual_session_ids,
-            session_id,
-            behavior,
-        ) || self.agent_action_pending
+        if self.agent_action_pending
             || composer_queue_session_blocks_dispatch(
                 behavior,
                 self.session_turn_pending(session_id),
@@ -21883,14 +21962,8 @@ impl VibexWorkbench {
             }
             return false;
         }
-        let Some(index) = self
-            .composer_queue
-            .iter()
-            .position(|message| &message.session_id == session_id)
-        else {
-            return false;
-        };
         let message = self.composer_queue.remove(index);
+        self.publish_sidebar_invalidation();
         self.dispatch_composer_message(message, behavior, window, cx);
         true
     }
@@ -22070,14 +22143,24 @@ impl VibexWorkbench {
         message.text = text;
         message.attachments = attachments;
         message.command_invocation = None;
+        let session_id = message.session_id.clone();
         self.composer_queue_editing_id = None;
         self.composer_queue_edit_attachments.clear();
         self.composer_queue_edit_geometry.input_bounds = None;
+        self.mark_composer_queue_for_recheck(&session_id);
         cx.notify();
     }
 
     fn cancel_composer_queue_edit(&mut self, cx: &mut Context<Self>) {
-        self.composer_queue_editing_id = None;
+        if let Some(message_id) = self.composer_queue_editing_id.take()
+            && let Some(session_id) = self
+                .composer_queue
+                .iter()
+                .find(|message| message.id == message_id)
+                .map(|message| message.session_id.clone())
+        {
+            self.mark_composer_queue_for_recheck(&session_id);
+        }
         self.composer_queue_edit_attachments.clear();
         self.composer_queue_edit_geometry.input_bounds = None;
         cx.notify();
@@ -22239,6 +22322,7 @@ impl VibexWorkbench {
         };
         let session_id = self.composer_queue[index].session_id.clone();
         self.composer_queue.remove(index);
+        self.publish_sidebar_invalidation();
         if self.composer_queue_editing_id == Some(message_id) {
             self.composer_queue_editing_id = None;
             self.composer_queue_edit_attachments.clear();
@@ -22277,7 +22361,9 @@ impl VibexWorkbench {
     }
 
     fn move_composer_queue_message_to_front(&mut self, message_id: u64) -> Option<VibexSessionId> {
-        promote_composer_queue_message(&mut self.composer_queue, message_id)
+        let session_id = promote_composer_queue_message(&mut self.composer_queue, message_id);
+        self.publish_sidebar_invalidation();
+        session_id
     }
 
     fn resume_composer_queue(
@@ -22354,6 +22440,7 @@ impl VibexWorkbench {
         let editing_id = self.composer_queue_editing_id;
         self.composer_queue
             .retain(|message| message.session_id != session_id);
+        self.publish_sidebar_invalidation();
         if editing_id.is_some_and(|message_id| {
             !self
                 .composer_queue
@@ -26278,6 +26365,7 @@ impl VibexWorkbench {
         if initialize_draft {
             self.new_session_attachments.clear();
             self.new_session_command_entry = None;
+            self.new_session_schedule = None;
             let preferred_agent = self
                 .selected_runtime_selection()
                 .map(|selection| selection.agent_id)
@@ -26336,6 +26424,7 @@ impl VibexWorkbench {
     fn clear_new_session_message_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_session_attachments.clear();
         self.new_session_command_entry = None;
+        self.new_session_schedule = None;
         self.new_session_input
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
@@ -26454,6 +26543,7 @@ impl VibexWorkbench {
         self.reconcile_sidebar_state();
 
         if active && !self.new_session_open {
+            self.new_session_schedule = draft.schedule;
             self.restore_new_session_message_draft(
                 draft.raw_text,
                 draft.attachments,
@@ -27172,10 +27262,23 @@ impl VibexWorkbench {
             None
         };
         let raw_text = self.new_session_input.read(cx).value().to_string();
+        let scheduled_at_ms = match self
+            .new_session_schedule
+            .map(|schedule| schedule.deadline(unix_timestamp_ms()))
+            .transpose()
+        {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                self.new_session_error = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
         let draft = SubmittedNewSessionDraft {
             raw_text: raw_text.clone(),
             attachments: self.new_session_attachments.clone(),
             command_entry: self.new_session_command_entry.clone(),
+            schedule: self.new_session_schedule,
         };
         let (text, attachments) = self.new_session_draft_payload(cx);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
@@ -27209,8 +27312,9 @@ impl VibexWorkbench {
             allow_manual_provider_slash,
         );
         let title = session_title_from_first_message(&text);
-        let has_initial_message = !text.trim().is_empty() || !attachments.is_empty();
-        let deferred_creation = command_invocation.is_none();
+        let has_initial_message =
+            scheduled_at_ms.is_none() && (!text.trim().is_empty() || !attachments.is_empty());
+        let deferred_creation = scheduled_at_ms.is_some() || command_invocation.is_none();
         let optimistic_submitted_at_ms = unix_timestamp_ms();
         let optimistic_session_id = VibexSessionId::new();
         let (initial_turn_interrupt_tx, mut initial_turn_interrupt_rx) = watch::channel(false);
@@ -27280,6 +27384,20 @@ impl VibexWorkbench {
             initial_turn_interrupt_tx,
             cx,
         );
+        if let Some(at_ms) = scheduled_at_ms {
+            self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
+            self.composer_queue.push(ComposerQueueMessage {
+                id: self.composer_queue_serial,
+                session_id: optimistic_session_id.clone(),
+                desired_runtime: selection.clone(),
+                text: text.clone(),
+                attachments: attachments.clone(),
+                command_invocation: command_invocation.clone(),
+                scheduled_at_ms: Some(at_ms),
+            });
+            self.start_message_schedule_timer(window, cx);
+            self.publish_sidebar_invalidation();
+        }
         let pending_session_id = optimistic_session_id.clone();
         let backend = self.backend.clone();
         let (created_tx, mut created_rx) = mpsc::unbounded_channel();
@@ -27580,7 +27698,7 @@ impl VibexWorkbench {
                     })
                     .is_some_and(|interrupt| *interrupt.borrow());
                 this.release_initial_turn_interrupt_lock(initial_turn_interrupted);
-                if let Some(session_id) = created_session_id.as_ref() {
+                if has_initial_message && let Some(session_id) = created_session_id.as_ref() {
                     this.set_session_turn_pending(session_id, false);
                 }
                 match outcome {
@@ -39635,9 +39753,19 @@ impl VibexWorkbench {
             && self
                 .unread_agent_completion_session_ids
                 .contains(session.id.as_str());
-        let state_label = (display_state != AgentSessionState::Error)
-            .then(|| sidebar_session_state_label(display_state, strings))
-            .flatten();
+        let scheduled_at_ms = matches!(
+            display_state,
+            AgentSessionState::Idle | AgentSessionState::Error
+        )
+        .then(|| self.next_scheduled_message_at(&session.id))
+        .flatten();
+        let state_label = if scheduled_at_ms.is_some() {
+            None
+        } else {
+            (display_state != AgentSessionState::Error)
+                .then(|| sidebar_session_state_label(display_state, strings))
+                .flatten()
+        };
         // The compact mark every row shows for the session's own state: a
         // spinner while the Agent works, the attention glyph while it is parked
         // on the user, a dot for the states a dot can carry. A pinned row keeps
@@ -39649,6 +39777,8 @@ impl VibexWorkbench {
                 strings.sidebar_needs_input,
                 cx,
             ))
+        } else if let Some(at_ms) = scheduled_at_ms {
+            Some(self.render_scheduled_session_indicator(&session.id, at_ms, cx))
         } else if !has_unread_completion
             && !session_has_error
             && display_state != AgentSessionState::Idle
@@ -39662,7 +39792,7 @@ impl VibexWorkbench {
             None
         };
         let time_label = format_sidebar_session_time(
-            session.last_message_at_ms,
+            scheduled_at_ms.unwrap_or(session.last_message_at_ms),
             self.resolved_locale(),
             strings,
         );
@@ -43163,7 +43293,7 @@ impl VibexWorkbench {
                                         h_flex()
                                             .min_h(px(112.0))
                                             .min_w_0()
-                                            .items_end()
+                                            .items_start()
                                             .gap_2()
                                             .p_4()
                                             .pb_2()
@@ -43340,7 +43470,15 @@ impl VibexWorkbench {
                                                             )),
                                                     )
                                             )
+                                            .child(self.render_message_schedule_button(
+                                                MessageScheduleTarget::NewSession,
+                                                !creation_pending,
+                                                cx,
+                                            ))
                                     )
+                            .when_some(self.new_session_schedule, |this, schedule| {
+                                this.child(self.render_message_schedule_draft_hint(schedule, cx))
+                            })
                             .child(
                                 v_flex()
                                     .min_w_0()
@@ -43406,7 +43544,9 @@ impl VibexWorkbench {
                                                                 .size(px(40.0))
                                                                 .rounded(px(20.0))
                                                                 .icon(IconName::ArrowUp)
-                                                                .tooltip(strings.new_session_create)
+                                                                .tooltip(if self.new_session_schedule.is_some() {
+                                                                    locale::text("Schedule message", "定时发送", "定時傳送")
+                                                                } else { strings.new_session_create })
                                                                 .loading(creation_pending)
                                                                 .disabled(!can_create)
                                                                 .on_click(cx.listener(
@@ -43906,7 +44046,9 @@ impl VibexWorkbench {
                 });
             })
             .when(turns.is_empty(), |this| {
-                this.child(if self.agent_loading {
+                this.child(if let Some(at_ms) = live_session_id.as_ref().and_then(|id| self.next_scheduled_message_at(id)) {
+                    self.render_scheduled_empty_timeline(at_ms, cx)
+                } else if self.agent_loading {
                     skeleton_conversation(content_max_width, strings, cx)
                 } else {
                     EmptyState::new()
@@ -53382,12 +53524,26 @@ impl VibexWorkbench {
                     .flex_1()
                     .items_center()
                     .gap_2()
-                    .child(self.render_composer_queue_inline_content(
-                        message_id,
-                        &message.text,
-                        &message.attachments,
-                        cx,
-                    ))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .py_1()
+                            .child(self.render_composer_queue_inline_content(
+                                message_id,
+                                &message.text,
+                                &message.attachments,
+                                cx,
+                            ))
+                            .when_some(message.scheduled_at_ms, |this, at_ms| {
+                                this.child(self.render_scheduled_queue_status(
+                                    at_ms,
+                                    &session_id,
+                                    cx,
+                                ))
+                            }),
+                    )
                     .when(attachment_count > 0, |this| {
                         this.child(
                             div()
@@ -53430,6 +53586,11 @@ impl VibexWorkbench {
                             locale::text("Steer the running turn", "引导当前运行", "引導目前執行"),
                         ))
                     })
+                    .child(self.render_message_schedule_button(
+                        MessageScheduleTarget::Queued(message_id),
+                        !self.agent_action_pending,
+                        cx,
+                    ))
                     .child(button_with_aria_label(
                         Button::new(format!("send-composer-queue-{message_id}"))
                             .xsmall()
@@ -53806,7 +53967,11 @@ impl VibexWorkbench {
                 .size(px(32.0))
                 .rounded(px(16.0))
                 .icon(IconName::ArrowUp)
-                .tooltip(locale::text("Send message", "发送消息", "傳送訊息"))
+                .tooltip(if self.composer_message_schedule().is_some() {
+                    locale::text("Schedule message", "定时发送", "定時傳送")
+                } else {
+                    locale::text("Send message", "发送消息", "傳送訊息")
+                })
                 .loading(self.agent_action_pending || self.agent_turn_pending)
                 .disabled(!can_send || !enabled)
                 .on_click(cx.listener(|this, _, window, cx| this.submit_composer(window, cx)))
@@ -54295,9 +54460,19 @@ impl VibexWorkbench {
                                                         cx.notify();
                                                     })),
                                             )
+                                            .when_some(self.view_session_id.clone(), |this, session_id| {
+                                                this.child(self.render_message_schedule_button(
+                                                    MessageScheduleTarget::Session(session_id),
+                                                    enabled,
+                                                    cx,
+                                                ))
+                                            })
                                             .child(self.render_composer_terminal_menu(cx)),
                                     ),
                             )
+                            .when_some(self.composer_message_schedule(), |this, schedule| {
+                                this.child(self.render_message_schedule_draft_hint(schedule, cx))
+                            })
                             .child(
                                 h_flex()
                                     .w_full()
@@ -79320,6 +79495,7 @@ mod tests {
             attachments: Vec::new(),
             command_entry: None,
             attachment_serial: 0,
+            schedule: None,
         };
         let mut drafts = ComposerDraftStore::default();
         drafts.save("session-one", draft("first draft"));
@@ -79373,6 +79549,7 @@ mod tests {
                 attachments: Vec::new(),
                 command_entry: None,
                 attachment_serial: 0,
+                schedule: None,
             },
         );
 
@@ -79405,6 +79582,7 @@ mod tests {
                 attachments: vec![attachment.clone()],
                 command_entry: None,
                 attachment_serial: 3,
+                schedule: None,
             },
         );
         let saved = drafts.get("session-one").unwrap();
@@ -79420,6 +79598,7 @@ mod tests {
                 attachments: vec![attachment],
                 command_entry: None,
                 attachment_serial: 3,
+                schedule: None,
             },
         );
         assert!(drafts.get("session-one").unwrap().attachments.is_empty());
@@ -79432,6 +79611,7 @@ mod tests {
                 attachments: Vec::new(),
                 command_entry: None,
                 attachment_serial: 3,
+                schedule: None,
             },
         );
         assert!(drafts.get("session-one").is_none());
@@ -82861,7 +83041,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("composer submission should remain inspectable");
         assert!(submit.contains("if self.agent_action_pending && !session_running"));
-        assert!(submit.contains("if session_running || queue_paused || queue_has_messages"));
+        let normalized_submit = submit.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_submit.contains(
+            "if message.scheduled_at_ms.is_some() || session_running || queue_paused || queue_has_messages"
+        ));
         assert!(submit.contains("self.composer_queue.push(message);"));
         assert!(submit.contains("self.set_session_turn_pending(&session_id, true);"));
         assert!(submit.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
@@ -83068,6 +83251,7 @@ mod tests {
             text: format!("message {id}"),
             attachments: Vec::new(),
             command_invocation: None,
+            scheduled_at_ms: None,
         };
         let mut queue = vec![
             queued(1, "session_queue_a"),

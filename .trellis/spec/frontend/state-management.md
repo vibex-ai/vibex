@@ -502,11 +502,11 @@ textarea it owns goes with it — a draft kept only in that textarea disappears
 even though the session is still in the sidebar. Save on every edit (and on the
 way out of a session) and restore it when the session's textarea is built again.
 
-Remove empty drafts, consume the active draft when it is sent, and delete stored
-drafts with their sessions. Regression coverage must switch between at least two
-sessions with different unsent text, assert that each Composer shows only its own
-draft, and assert that returning to the first session restores its original
-content.
+Remove empty drafts with no schedule, consume the active draft when it is sent,
+and delete stored drafts with their sessions. Regression coverage must switch
+between at least two sessions with different unsent text, assert that each
+Composer shows only its own draft, and assert that returning to the first
+session restores its original content.
 
 Editing the latest sent user message must use the same inline attachment marker
 model as the Composer. Reconstruct persisted attachment offsets into marker-backed
@@ -560,6 +560,71 @@ pending Agent indicator renders. Do not write this presentation state back to
 the session cache. Show the continue banner for an `Idle` or `Error` session
 only after authoritative timeline reconciliation confirms that the latest
 conversational segment does not end in an explicit final Agent message.
+
+## Scenario: Scheduled Composer Messages
+
+### 1. Scope / Trigger
+
+Desktop scheduling extends the existing unsent composer queue in
+`apps/desktop/src/message_schedule.rs`; it does not create timeline turns early.
+
+### 2. Signatures
+
+`ComposerDraft.schedule: Option<MessageSchedule>` holds `At(i64)` Unix
+milliseconds or `After(u64)` seconds. On submission, resolve it once into
+`ComposerQueueMessage.scheduled_at_ms: Option<i64>`.
+
+### 3. Contracts
+
+- Drafts and queued messages remain in memory and require Vibex to stay open.
+  Never persist prompt text or attachments in UI-state preferences.
+- A scheduled new-session submission creates the session with deferred runtime
+  materialization and no initial prompt or optimistic user item. Keep its
+  message in the queue until dispatch; show a countdown on its empty timeline.
+- One workbench timer checks every session, including background sessions.
+  `Scheduled` dispatch requires an authoritative `Idle`/`Error` snapshot and
+  no local pending turn, action lock, explicit queue pause, or active message
+  edit. The ordinary submission path alone owns delivery and timeline creation.
+- Future deadlines do not block ready queue entries. Due schedules remain
+  automatic in Manual queue mode, but never interrupt a running turn. Ending
+  a queue edit or closing its scheduling dialog re-arms queue evaluation.
+- Reordering preserves deadlines; an explicit per-message send clears the
+  deadline. Sidebar clocks are a presentation of queued schedules, never a new
+  `AgentSessionState`, and running/needs-input indicators retain priority.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Absolute deadline has elapsed before submission | Keep the draft and show an error |
+| Local date/time is ambiguous or nonexistent | Reject rather than choose a timezone offset |
+| Countdown is outside 1 second–365 days, overflows, or has minutes/seconds outside 0–59 | Keep the picker open with an inline error |
+| Session is running, initializing, closed, archived, or unavailable | Retain the scheduled message without dispatch |
+| Session creation fails before a record exists | Remove the pending queue entry and restore the active new-session draft including its schedule |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a due message waits for the current turn, then sends once through the
+  existing queue path, even after the user switches sessions.
+- Base: unscheduled messages keep their Auto/Manual behavior.
+- Bad: render a scheduled prompt on the timeline at submission, or make queue
+  resume send a future deadline early.
+
+### 6. Tests Required
+
+`message_schedule_tests.rs` covers deadline boundaries, countdown validation,
+session isolation, active-turn admission, edits, reordering/send-now, draft
+consumption, and real dialog keyboard/pointer interaction including invalid
+input, confirmation, dismissal, and removing a schedule.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: restart a queued countdown each time the timer polls.
+let due = MessageSchedule::After(seconds).deadline(now_ms)?;
+// Correct: compare the deadline captured when the user submitted the message.
+let due = message.scheduled_at_ms.is_some_and(|at_ms| at_ms <= now_ms);
+```
 
 ## Scenario: Live Reasoning As Turn Progress
 
