@@ -672,8 +672,12 @@ the shared timeline sweep and spread. `activity_turn_is_live` checks the owning
 session and rejects finished or superseded turns; `timeline_activity::is_running`
 also requires an unfinished operation without failure or pending approval.
 Never animate from `row.streaming` alone: interrupted rows can retain that flag.
-Reduced motion keeps a static label and status indicator. Search highlighting
-takes precedence over the target's shimmer so a live result remains readable.
+Shimmer is the running cue for tool rows and group summaries; do not add a
+trailing loading spinner. Failed activities use danger-colored text and
+activity icons, without a trailing failure badge. Reduced motion keeps the
+label static, while its accessible label still conveys the running state.
+Search highlighting takes precedence over the target's shimmer so a live
+result remains readable.
 UI tests verify hover colors and painted surfaces, narrow-width disclosure
 geometry, and that settled or reduced-motion text requests no further frames.
 

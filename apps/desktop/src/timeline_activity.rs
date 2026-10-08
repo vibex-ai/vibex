@@ -334,12 +334,6 @@ pub(super) fn header(
                 )
                 .child(target)
                 .children(statistics)
-                .when(running, |this| {
-                    this.child(div().flex_none().child(Spinner::new().xsmall()))
-                })
-                .when(activity.failed, |this| {
-                    this.child(Icon::new(IconName::CircleX).size_3p5().flex_none())
-                })
                 .when_some(open, |this, open| {
                     this.child(
                         div()
@@ -413,10 +407,7 @@ pub(super) fn summary_header(
                     "summary-shimmer",
                     &label,
                     running,
-                )))
-                .when(running, |this| {
-                    this.child(div().flex_none().child(Spinner::new().xsmall()))
-                }),
+                ))),
         )
 }
 
