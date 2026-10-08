@@ -390,6 +390,33 @@ The Markdown regression uses a retained component entity: append Chinese text
 and Emoji, verify the existing selection survives, then replace the source and
 verify the corrected rendered text. The component owns block-level tests.
 
+### Convention: Reasoning disclosures retain measured geometry
+
+A reasoning toggle changes one disclosure. Keep the turn's measured extent and
+the process units' measured heights as layout seeds; do not clear the whole turn
+or rebuild it from text estimates. `SessionView::set_reasoning_expanded` marks
+only the changed unit's layout as invalidated, so its next intrinsic measurement
+can shrink even while streaming. Other units, including offscreen history, keep
+their heights. Discard pending turn measurements from before the click and clear
+the turn's layout fingerprint and shrink candidate, while preserving its height.
+
+A windowed process run reserves its previous total for the frame that measures
+the changed unit. An unchanged turn measurement during this reflow is therefore
+provisional: `measured_timeline_layout_signature` leaves the streaming shrink
+guard released until the turn reports its new extent. Re-arming it on the old
+reservation delays a manual collapse and leaves empty space below the content.
+
+Bottom follow must resolve before the virtual list snapshots its scroll offset.
+Set an offset at the negative sum of the current row heights and let the list
+clamp it to the new viewport during prepaint. The base handle's deferred
+`scroll_to_bottom` runs after that snapshot, so the scrollbar moves immediately
+while rows paint at the old position for a frame. Do not replace this with
+`scroll_to_item`: a conversation turn can exceed the viewport. GPUI regressions
+record every prepaint, since inspecting only a later frame hides this mismatch.
+Cover repeated reasoning open/close in flow and windowed process runs, window
+and full reasoning modes, bottom follow, and reading history; offsets must never
+reverse through an estimated intermediate extent.
+
 ### Convention: A pane resize is a reflow, not an invalidation
 
 Use the rendered row's effective content width to decide whether a reflow is

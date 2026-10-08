@@ -3730,6 +3730,41 @@ impl SessionView {
         }
     }
 
+    fn scroll_timeline_to_latest(&self) {
+        if !self.timeline_row_sizes.is_empty() {
+            // VirtualList clamps this offset to its freshly laid-out viewport
+            // before placing rows. The base handle's deferred scroll_to_bottom
+            // runs after the list snapshots its offset, painting one frame at
+            // the old position while the scrollbar already shows the new one.
+            let content_height = self
+                .timeline_row_sizes
+                .iter()
+                .map(|row| row.height)
+                .sum::<Pixels>();
+            self.timeline_scroll
+                .set_offset(point(px(0.0), -content_height));
+        }
+    }
+
+    fn set_reasoning_expanded(&mut self, row_id: String, turn_id: Option<&str>, expanded: bool) {
+        // A click changes one disclosure, not the contents of the turn. Keep
+        // measured geometry as the seed for prepaint, including offscreen
+        // process units: replacing it with estimates moves unrelated history.
+        if let Some(height) = self.timeline_process_unit_heights.get_mut(&row_id) {
+            height.layout_invalidated = true;
+        }
+        self.reasoning_expansion.insert(row_id, expanded);
+        if let Some(turn_id) = turn_id {
+            self.timeline_measured_turn_layout_signatures
+                .remove(turn_id);
+            self.timeline_turn_layout_signature_cache.remove(turn_id);
+            self.timeline_streaming_shrink_candidates.remove(turn_id);
+            self.timeline_estimated_turn_heights.remove(turn_id);
+            self.timeline_pending_turn_heights
+                .retain(|_, (pending_turn_id, _)| pending_turn_id != turn_id);
+        }
+    }
+
     /// Forgets every derived projection so the next render rebuilds it from
     /// `timeline`. Used when a view adopts a new authoritative timeline.
     fn invalidate_render_caches(&mut self) {
@@ -5075,6 +5110,24 @@ fn stable_streaming_timeline_height_for_layout(
             current_layout_signature,
         ),
     )
+}
+
+fn measured_timeline_layout_signature(
+    previous_height: Option<f32>,
+    measured_height: f32,
+    previous_signature: Option<u64>,
+    signature: Option<u64>,
+) -> Option<u64> {
+    // A windowed process run can still reserve its old extent in the frame
+    // that measures a changed disclosure. Keep the shrink guard released until
+    // the turn reports the new extent, including after nested measurement.
+    if previous_signature.is_none()
+        && previous_height.is_some_and(|height| (height - measured_height).abs() < 1.0)
+    {
+        None
+    } else {
+        signature
+    }
 }
 
 /// A repeatable smaller intrinsic measurement observed while the streaming
@@ -19754,7 +19807,12 @@ impl VibexWorkbench {
         } else {
             self.timeline_streaming_shrink_candidates.remove(&turn_id);
         }
-        if let Some(layout_signature) = layout_signature {
+        if let Some(layout_signature) = measured_timeline_layout_signature(
+            previous_height,
+            measured_height,
+            previous_layout_signature,
+            layout_signature,
+        ) {
             self.timeline_measured_turn_layout_signatures
                 .insert(turn_id.clone(), layout_signature);
         } else {
@@ -20232,13 +20290,6 @@ impl VibexWorkbench {
     fn pending_permission_alert_signature(&self) -> Option<String> {
         let pending = self.timeline.pending_permission_ids();
         (!pending.is_empty()).then(|| pending.into_iter().collect::<Vec<_>>().join("|"))
-    }
-
-    fn scroll_timeline_to_latest(&self) {
-        if !self.timeline_row_sizes.is_empty() {
-            // The base handle resolves the bottom from the freshly computed extent during layout.
-            self.timeline_scroll.base_handle().scroll_to_bottom();
-        }
     }
 
     fn clear_suggestions(&mut self) {
@@ -49232,11 +49283,16 @@ impl VibexWorkbench {
         open: bool,
         cx: &mut Context<Self>,
     ) {
-        self.reasoning_expansion.insert(row_id, !open);
-        if let Some(turn_id) = turn_id {
-            self.invalidate_timeline_turn_measurement(&turn_id);
+        self.capture_timeline_scroll_anchor();
+        self.set_reasoning_expanded(row_id, turn_id.as_deref(), !open);
+        if let Some(turn_id) = turn_id
+            && let Some(session_id) = self.timeline.session_id.clone()
+            && let Some(pending) = self
+                .pending_timeline_turn_measurements
+                .get_mut(session_id.as_str())
+        {
+            pending.retain(|_, (id, _)| id != &turn_id);
         }
-        self.rebuild_timeline_sizes();
         cx.notify();
     }
 
@@ -58231,6 +58287,9 @@ struct TimelineProcessUnitHeight {
     revision: i64,
     /// Layout width the unit was measured in, while one is known.
     layout_width: Option<f32>,
+    /// The retained extent precedes an explicit disclosure change. Its next
+    /// measurement may shrink even while the row is streaming.
+    layout_invalidated: bool,
     /// The measured height.
     height: f32,
 }
@@ -58278,6 +58337,7 @@ fn settle_timeline_process_unit_height(
     TimelineProcessUnitHeight {
         revision,
         layout_width,
+        layout_invalidated: false,
         height: stable_process_unit_height(cached, measured, streaming, layout_width),
     }
 }
@@ -58294,7 +58354,9 @@ fn settle_timeline_process_unit_height(
 /// made a narrower pane's height permanent: each squeeze re-measured the units
 /// on screen into more lines, and once the pane came back the smaller
 /// measurement was refused, so the run kept reserving the taller wrapping for
-/// the rest of the session. A reflow is accepted even mid-stream.
+/// the rest of the session. A reflow is accepted even mid-stream. An explicit
+/// disclosure change also releases the hold for its next measurement while
+/// retaining the previous extent as the layout seed.
 fn stable_process_unit_height(
     current: Option<TimelineProcessUnitHeight>,
     measured: f32,
@@ -58302,6 +58364,7 @@ fn stable_process_unit_height(
     layout_width: Option<f32>,
 ) -> f32 {
     match current {
+        Some(current) if current.layout_invalidated => measured,
         Some(current) if !same_timeline_layout_width(current.layout_width, layout_width) => {
             measured
         }
@@ -80437,19 +80500,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_bottom_follow_uses_the_latest_layout_extent() {
-        let source = include_str!("app.rs");
-        let method = source
-            .split_once("    fn scroll_timeline_to_latest(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn clear_suggestions("))
-            .map(|(body, _)| body)
-            .expect("timeline bottom follow should remain inspectable");
-
-        assert!(method.contains("self.timeline_scroll.base_handle().scroll_to_bottom();"));
-        assert!(!method.contains("scroll_to_item"));
-    }
-
-    #[test]
     fn timeline_height_measurements_are_batched_before_the_next_render() {
         let source = include_str!("app.rs");
         let recorder = source
@@ -91124,6 +91174,7 @@ mod tests {
         TimelineProcessUnitHeight {
             revision: 7,
             layout_width: Some(layout_width),
+            layout_invalidated: false,
             height,
         }
     }
