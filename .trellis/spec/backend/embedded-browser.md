@@ -82,7 +82,9 @@ agent acts on and what the user sees cannot diverge.
    divided by drawn size, then divides by `pageScaleFactor`. Encoded image
    dimensions can differ because of display density or downsampling and are
    only a fallback when metadata is unavailable. Adding `scrollOffsetX/Y`
-   makes every click and highlight drift.
+   makes every click and highlight drift. `dispatch_input` converts pointer
+   positions from CSS pixels into the scaled host view once, at the CDP edge;
+   wheel deltas remain CSS pixels.
 
 5. **Refs are generation-scoped.** `r{generation}-{index}` is invalid after any
    observation, navigation or rerender in the same tab. A stale ref is refused
@@ -180,11 +182,19 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
 - Viewport width and height are **CSS pixels**, measured from the frame area
   after browser chrome has taken its space. Send the complete logical size;
   never multiply it by display scale or clamp it to an encoder budget.
-- `viewport_metrics` sets both the CSS device metrics and an explicit CDP
-  `viewport` covering that whole area, with `x = y = 0` and `scale = 1`.
-  Chrome applies `deviceScaleFactor` to this viewport itself, accounting for
-  the browser host's density. Setting only `deviceScaleFactor` changes page
+- Record the browser host's `window.devicePixelRatio` before applying device
+  emulation. Keep this native density in the tab record; page-opened tabs
+  inherit it from their opener.
+- `apply_viewport` sets CSS device metrics with the panel's `deviceScaleFactor`,
+  `scale = panel density / host density`, and `dontSetVisibleSize = true`.
+  Then `Emulation.setVisibleSize` sizes the host surface to
+  `round(CSS size * scale)`. The host's native density turns that surface into
+  the required physical pixels. Setting only `deviceScaleFactor` changes page
   metrics but leaves the headless compositor too small for HiDPI capture.
+- Never keep an emulation `viewport` override for a live page: it is a
+  document-space capture clip. On repaint, its root transform cancels document
+  scrolling and shifts content, including fixed elements, inside the tab.
+  Ordinary emulation `scale` preserves the scrolling viewport.
 - Apply these metrics when preparing a tab, including the default size and
   page-opened tabs that inherit their opener's viewport. A first resize matching
   the cached default must not leave Chrome at its unrelated startup size.
@@ -201,17 +211,23 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
   transport and tab exist; attaching a tab or cancelling its pending resize
   clears the cached request so the next layout sends the current size.
 - The runtime publishes the tab's logical CSS viewport as metadata
-  `device_width/height`. Raw CDP `deviceWidth/Height` describe the enlarged
-  compositor surface after the explicit viewport override, while input and DOM
-  geometry still use CSS pixels. Passing those raw dimensions through scales
-  clicks and highlights by the DPI again. Preserve `page_scale_factor` and use
-  the normalized metadata for input over the whole painted frame.
+  `device_width/height`. Raw CDP `deviceWidth/Height` describe the scaled
+  compositor surface, while public input and DOM geometry use CSS pixels.
+  Passing those raw dimensions through scales clicks and highlights by the
+  DPI again. Preserve `page_scale_factor` and use the normalized metadata for
+  input over the whole painted frame.
+- `dispatch_input` multiplies pointer `x/y` by `panel density / host density`
+  before sending CDP mouse events. Human and Agent input share this conversion;
+  callers must not apply it themselves. Wheel deltas already have CSS units
+  and must not be scaled with the pointer position.
 
 ### 4. Validation & Error Matrix
 
 - A zero viewport dimension becomes one pixel in the service.
 - A non-finite or non-positive display scale becomes 1; otherwise the service
   bounds it to `[0.25, 8]`.
+- An unavailable, non-finite, or non-positive native host density returns
+  `browser_display_scale_unavailable` rather than guessing a capture scale.
 - Integer compositor/encoder rounding may differ by one physical pixel;
   it must not reduce the pixel density or crop page content.
 - Positive metadata dimensions take precedence over encoded dimensions for
@@ -222,11 +238,15 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
 - Base: a `960 × 640` page at 1x keeps that layout and frame size.
 - Good: a `900 × 2000` page at 1x produces a `900 × 2000` frame; an
   `800 × 1200` page at 2x keeps its CSS layout and produces `1600 × 2400`.
+- Good: scrolling to `(200, 300)` moves document content left and up by those
+  CSS offsets while fixed corners remain in place, including after repaint.
 - Bad: truncating the page height to 1600 changes its aspect ratio, then
   `Contain` leaves margins and clicks calculated from the whole panel drift.
 - Also bad: moving the 1600-pixel cap to the encoder makes the page fill the
   panel but downscales its detail before enlarging it again. Raising only the
   encoder budget still leaves HiDPI blurry if the compositor stays at 1x.
+- Also bad: an explicit document-space `viewport` produces a sharp initial
+  frame, then leaves blank space above the page after scrolling and repainting.
 
 ### 6. Tests Required
 
@@ -239,10 +259,18 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
   mouse coordinates against the system browser in both JPEG and PNG modes.
   Include the initial default size, density-only changes, fractional density,
   portrait/landscape 4K frames, and a browser host running at 2x.
+- Exercise real wheel events in both axes and return to the origin. Require
+  a main-thread repaint after scrolling, using a scroll listener that recolors
+  a fixed marker. Verify fixed corners, document content, scroll metadata,
+  retained pixel detail, and pointer positions together; also check Agent
+  clicks that resolve a DOM box through the shared input path.
 - Wait for a complete resized frame; a previous layout can still be encoding
   when the CDP resize finishes. Upper bounds and aspect ratio alone are not
   clarity checks: the earlier test accepted `720 × 1600` for a `900 × 2000`
   panel and accepted 1x captures on a 2x display.
+- The first compositor frame after a wheel event can look correct before a
+  main-thread repaint exposes capture drift. Checking only that first frame
+  misses the scrolling regression.
 
 ### 7. Wrong vs Correct
 
@@ -250,8 +278,9 @@ Wrong: pass `min(logical_size * display_scale, encoder_limit)` as the page's
 viewport and calculate clicks from JPEG/PNG dimensions.
 
 Correct: preserve CSS layout, size the compositor and encoder for the display's
-physical pixels, and publish logical metadata for input. Verify retained pixel
-detail as well as full coverage.
+physical pixels without a document-space capture clip, and publish logical
+metadata for input. Convert pointer positions only at the CDP edge. Verify
+retained pixel detail and full coverage after resizing, scrolling, and repainting.
 
 ## Security rules
 

@@ -304,6 +304,8 @@ pub(crate) struct TabRecord {
     pub(crate) file_chooser_pending: bool,
     pub(crate) file_chooser_backend_node: Option<i64>,
     pub(crate) viewport: (u32, u32, f64),
+    /// The browser host's density before the tab's device emulation is applied.
+    pub(crate) host_device_scale_factor: f64,
     /// Navigation history position, kept for the panel's back/forward buttons.
     pub(crate) can_go_back: bool,
     pub(crate) can_go_forward: bool,
@@ -1177,7 +1179,7 @@ impl BrowserService {
         } else {
             1.0
         };
-        let (session, screencast_active) = {
+        let (session, screencast_active, host_device_scale_factor) = {
             let mut state = self.inner.state.lock().await;
             let connection = state
                 .process
@@ -1195,13 +1197,13 @@ impl BrowserService {
             (
                 CdpSession::new(connection, tab.session_id.clone(), tab.target_id.clone()),
                 screencast_active,
+                tab.host_device_scale_factor,
             )
         };
-        cdp(
+        apply_viewport(
             &session,
-            "Emulation.setDeviceMetricsOverride",
-            viewport_metrics(width, height, device_scale_factor),
-            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+            (width, height, device_scale_factor),
+            host_device_scale_factor,
         )
         .await?;
         if screencast_active {
@@ -1223,7 +1225,7 @@ impl BrowserService {
     pub async fn dispatch_input(
         &self,
         tab_id: &BrowserTabId,
-        input: BrowserInput,
+        mut input: BrowserInput,
     ) -> BrowserResult<()> {
         if let BrowserInput::Resize {
             width,
@@ -1236,14 +1238,14 @@ impl BrowserService {
                 .await;
         }
         let now = unix_timestamp_ms();
-        let session = {
+        let (session, input_scale) = {
             let mut state = self.inner.state.lock().await;
             let connection = state
                 .process
                 .as_ref()
                 .map(BrowserProcess::connection)
                 .ok_or_else(browser_not_running)?;
-            let (session_id, target_id) = {
+            let (session_id, target_id, input_scale) = {
                 let tab = state.tabs.get_mut(tab_id).ok_or_else(|| {
                     BrowserError::validation(
                         "browser_tab_not_found",
@@ -1251,11 +1253,31 @@ impl BrowserService {
                     )
                 })?;
                 tab.last_activity_at_ms = now;
-                (tab.session_id.clone(), tab.target_id.clone())
+                (
+                    tab.session_id.clone(),
+                    tab.target_id.clone(),
+                    tab.viewport.2 / tab.host_device_scale_factor,
+                )
             };
             state.last_activity_ms = now;
-            CdpSession::new(connection, session_id, target_id)
+            (
+                CdpSession::new(connection, session_id, target_id),
+                input_scale,
+            )
         };
+        // CDP mouse positions address the scaled host view. Public inputs and
+        // DOM geometry remain CSS pixels. Wheel deltas already have CSS units
+        // and must not be scaled along with the pointer's location.
+        match &mut input {
+            BrowserInput::MouseMove { x, y, .. }
+            | BrowserInput::MouseDown { x, y, .. }
+            | BrowserInput::MouseUp { x, y, .. }
+            | BrowserInput::Wheel { x, y, .. } => {
+                *x *= input_scale;
+                *y *= input_scale;
+            }
+            _ => {}
+        }
         let (method, params) = input_to_cdp(input);
         cdp(&session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
         Ok(())
@@ -1869,7 +1891,8 @@ impl BrowserService {
             download_behavior(downloads.enabled, &downloads.dir)
         };
         let viewport = (DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT, 1.0);
-        prepare_tab_session(&session, downloads, viewport).await?;
+        let host_device_scale_factor = read_host_device_scale_factor(&session).await?;
+        prepare_tab_session(&session, downloads, viewport, host_device_scale_factor).await?;
 
         let now = unix_timestamp_ms();
         let tab_id = BrowserTabId::new();
@@ -1911,6 +1934,7 @@ impl BrowserService {
             file_chooser_pending: false,
             file_chooser_backend_node: None,
             viewport,
+            host_device_scale_factor,
             can_go_back: false,
             can_go_forward: false,
         };
@@ -2520,26 +2544,63 @@ pub(crate) async fn cdp(
         .await
 }
 
-/// Keeps CSS layout and the compositor's physical viewport in sync.
+/// Read before device emulation changes what the page reports as its density.
+async fn read_host_device_scale_factor(session: &CdpSession) -> BrowserResult<f64> {
+    let result = cdp(
+        session,
+        "Runtime.evaluate",
+        json!({ "expression": "window.devicePixelRatio", "returnByValue": true }),
+        BROWSER_CDP_COMMAND_TIMEOUT_MS,
+    )
+    .await?;
+    result
+        .pointer("/result/value")
+        .and_then(Value::as_f64)
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .ok_or_else(|| {
+            BrowserError::cdp(
+                "browser_display_scale_unavailable",
+                "the browser did not report its native display scale",
+            )
+        })
+}
+
+/// Scale the live viewport without pinning capture to a document-space clip.
 ///
-/// `deviceScaleFactor` alone changes page metrics without enlarging the
-/// headless compositor surface. An explicit viewport makes Chrome apply that
-/// density to the surface too; `scale` stays at 1 because CDP includes the
-/// device scale factor when sizing this viewport.
-fn viewport_metrics(width: u32, height: u32, device_scale_factor: f64) -> Value {
-    json!({
-        "width": width,
-        "height": height,
-        "deviceScaleFactor": device_scale_factor,
-        "mobile": false,
-        "viewport": {
-            "x": 0,
-            "y": 0,
+/// CDP's `viewport` override cancels document scrolling and translates fixed
+/// content when the page repaints. Use ordinary emulation scale instead, with
+/// a separately sized compositor surface so HiDPI still gets native pixels.
+async fn apply_viewport(
+    session: &CdpSession,
+    (width, height, device_scale_factor): (u32, u32, f64),
+    host_device_scale_factor: f64,
+) -> BrowserResult<()> {
+    let scale = device_scale_factor / host_device_scale_factor;
+    cdp(
+        session,
+        "Emulation.setDeviceMetricsOverride",
+        json!({
             "width": width,
             "height": height,
-            "scale": 1,
-        },
-    })
+            "deviceScaleFactor": device_scale_factor,
+            "mobile": false,
+            "scale": scale,
+            "dontSetVisibleSize": true,
+        }),
+        BROWSER_CDP_COMMAND_TIMEOUT_MS,
+    )
+    .await?;
+    cdp(
+        session,
+        "Emulation.setVisibleSize",
+        json!({
+            "width": ((width as f64 * scale).round() as u32).max(1),
+            "height": ((height as f64 * scale).round() as u32).max(1),
+        }),
+        BROWSER_CDP_COMMAND_TIMEOUT_MS,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// The `Browser.setDownloadBehavior` params for a download policy.
@@ -2570,16 +2631,11 @@ async fn prepare_tab_session(
     session: &CdpSession,
     downloads: Value,
     viewport: (u32, u32, f64),
+    host_device_scale_factor: f64,
 ) -> BrowserResult<()> {
     for (method, params) in [
         ("Page.enable", json!({})),
         ("Runtime.enable", json!({})),
-        // Apply the initial size too: a panel matching the default viewport
-        // will correctly skip an otherwise redundant resize request.
-        (
-            "Emulation.setDeviceMetricsOverride",
-            viewport_metrics(viewport.0, viewport.1, viewport.2),
-        ),
         ("Log.enable", json!({})),
         ("Network.enable", json!({})),
         ("DOM.enable", json!({})),
@@ -2618,7 +2674,9 @@ async fn prepare_tab_session(
     ] {
         cdp(session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
     }
-    Ok(())
+    // Apply the initial size too: a panel matching the default viewport skips
+    // an otherwise redundant resize request.
+    apply_viewport(session, viewport, host_device_scale_factor).await
 }
 
 /// The CDP `buttons` bitmask for one button name.
@@ -3173,7 +3231,7 @@ async fn adopt_discovered_target(
 
     // The opener decides which panel session the tab belongs to and how large
     // it is drawn: the popup takes the opener's place in the same panel.
-    let (session_id, viewport) = {
+    let (session_id, viewport, host_device_scale_factor) = {
         let state = inner.state.lock().await;
         let opener = opener_id
             .as_deref()
@@ -3196,7 +3254,11 @@ async fn adopt_discovered_target(
             DEFAULT_VIEWPORT_HEIGHT,
             1.0,
         ));
-        (session_id, viewport)
+        (
+            session_id,
+            viewport,
+            opener.map(|tab| tab.host_device_scale_factor),
+        )
     };
     let Some(session_id) = session_id else {
         return;
@@ -3225,7 +3287,16 @@ async fn adopt_discovered_target(
         let downloads = inner.downloads.lock().await;
         download_behavior(downloads.enabled, &downloads.dir)
     };
-    let _ = prepare_tab_session(&session, downloads, viewport).await;
+    let host_device_scale_factor = match host_device_scale_factor {
+        Some(scale) => scale,
+        None => {
+            let Ok(scale) = read_host_device_scale_factor(&session).await else {
+                return;
+            };
+            scale
+        }
+    };
+    let _ = prepare_tab_session(&session, downloads, viewport, host_device_scale_factor).await;
 
     let now = unix_timestamp_ms();
     let tab_id = BrowserTabId::new();
@@ -3267,6 +3338,7 @@ async fn adopt_discovered_target(
         file_chooser_pending: false,
         file_chooser_backend_node: None,
         viewport,
+        host_device_scale_factor,
         can_go_back: false,
         can_go_forward: false,
     };
@@ -3787,10 +3859,9 @@ async fn handle_screencast_frame(inner: &Arc<BrowserInner>, cdp_session_id: &str
             .get("pageScaleFactor")
             .and_then(Value::as_f64)
             .unwrap_or(1.0),
-        // The explicit emulation viewport enlarges the compositor surface,
-        // which is what Chrome reports as deviceWidth/deviceHeight. Input and
-        // DOM geometry still use the tab's CSS viewport. Publish that logical
-        // size so clients do not scale clicks and highlights by the DPI again.
+        // Chrome reports the scaled compositor surface as deviceWidth/Height.
+        // Clients and DOM geometry use the logical CSS viewport; conversion
+        // into the host view belongs to dispatch_input, once, at the CDP edge.
         device_width: tab.viewport.0 as f64,
         device_height: tab.viewport.1 as f64,
         scroll_offset_x: metadata
