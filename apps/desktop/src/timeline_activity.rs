@@ -207,7 +207,7 @@ fn single_line(value: &str) -> String {
 
 /// A summary may already start with its action. Remove only a matching verb;
 /// command text and unfamiliar summaries retain their complete visible value.
-fn activity_target(summary: &str, icon: ProcessActivityIcon) -> &str {
+pub(super) fn activity_target(summary: &str, icon: ProcessActivityIcon) -> &str {
     let summary = summary.trim();
     let Some((verb, target)) = summary.split_once(char::is_whitespace) else {
         return summary;
@@ -523,39 +523,28 @@ fn rail_line(cx: &App) -> Div {
     )
 }
 
-pub(super) fn detail(id: String, label: &str, value: &str, cx: &App) -> AnyElement {
-    let copy_value = value.to_string();
-    v_flex()
+pub(super) fn detail(
+    id: String,
+    label: &str,
+    value: &str,
+    copy_value: &str,
+    cx: &App,
+) -> AnyElement {
+    let copy_value = copy_value.to_string();
+    let copy_label = locale::text("Copy {label}", "复制{label}", "複製{label}")
+        .replace("{label}", &label.to_lowercase());
+    h_flex()
+        .debug_selector(|| format!("activity-detail:{id}"))
         .min_w_0()
         .w_full()
-        .gap_1()
-        .child(
-            h_flex()
-                .min_w_0()
-                .gap_2()
-                .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label.to_string()),
-                )
-                .child(
-                    Button::new(format!("copy:{id}"))
-                        .xsmall()
-                        .ghost()
-                        .icon(IconName::Copy)
-                        .tooltip(locale::text("Copy", "复制", "複製"))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_value.clone()))
-                        }),
-                ),
-        )
+        .items_start()
+        .gap_2()
         .child(
             div()
-                .id(id)
+                .id(id.clone())
+                .debug_selector(|| format!("activity-detail-text:{id}"))
                 .min_w_0()
-                .w_full()
+                .flex_1()
                 .max_h_40()
                 .overflow_y_scrollbar()
                 .scroll_gutter()
@@ -564,7 +553,19 @@ pub(super) fn detail(id: String, label: &str, value: &str, cx: &App) -> AnyEleme
                 .text_size(cx.theme().mono_font_size)
                 .line_height(relative(1.5))
                 .text_color(cx.theme().muted_foreground)
-                .child(value.to_string()),
+                .child(value.trim_end_matches(['\n', '\r']).to_string()),
+        )
+        .child(
+            Button::new(format!("copy:{id}"))
+                .xsmall()
+                .ghost()
+                .flex_none()
+                .icon(IconName::Copy)
+                .accessibility_label(copy_label.clone())
+                .tooltip(copy_label)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_value.clone()))
+                }),
         )
         .into_any_element()
 }

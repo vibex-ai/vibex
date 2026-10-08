@@ -159,10 +159,13 @@ fn activity_details_prefer_the_complete_bounded_invocation() {
     });
     let projection = tool_card_projection(&row_for(&payload), Some(&payload));
     assert_eq!(projection.activity.target, "src/main.rs");
-    let ToolCardDetailBlock::Mono { value, .. } = &projection.details[0] else {
+    let ToolCardDetailBlock::Invocation { value, raw } = &projection.details[0] else {
         panic!("invocation detail")
     };
-    assert_eq!(value, invocation);
+    assert!(value.starts_with("src/main.rs\n"));
+    assert!(value.contains("offset: 10"));
+    assert!(value.contains("limit: 40"));
+    assert_eq!(raw, invocation);
 
     let mut empty = payload;
     let TimelinePayload::ToolCall(tool) = &mut empty else {
@@ -176,6 +179,85 @@ fn activity_details_prefer_the_complete_bounded_invocation() {
             .is_empty(),
         "a call remains inspectable before output arrives"
     );
+}
+
+#[test]
+fn activity_read_details_show_the_full_target_and_decoded_output() {
+    let text = "fn main() {\n    run();\n}\n";
+    let extension = vibex_core::AgentEventRawExtension::new(
+        Vec::new(),
+        None,
+        Some(
+            vibex_core::AgentEventRawOutput::new(
+                vibex_core::AgentEventRawOutputMode::Snapshot,
+                serde_json::json!({"formatted_output": text, "exit_code": 0}).to_string(),
+            )
+            .0,
+        ),
+        vec![vibex_core::AgentEventLocation::new("/workspace/src/main.rs", None, None).0],
+        BTreeMap::new(),
+        false,
+    );
+    let payload = TimelinePayload::ToolCall(ToolCallPayload {
+        tool_call_id: "read-1".into(),
+        tool_name: "read_file".into(),
+        status: ToolCallStatus::Completed,
+        summary: "Read main.rs".into(),
+        input_summary: None,
+        output_summary: Some("short result".into()),
+        raw_extension: Some(extension),
+    });
+    let projection = tool_card_projection(&row_for(&payload), Some(&payload));
+    assert_eq!(projection.details.len(), 2);
+    assert_eq!(
+        projection.details[0],
+        ToolCardDetailBlock::Invocation {
+            value: "/workspace/src/main.rs".into(),
+            raw: "/workspace/src/main.rs".into(),
+        }
+    );
+    let ToolCardDetailBlock::Mono { value, .. } = &projection.details[1] else {
+        panic!("read result")
+    };
+    assert_eq!(value, text);
+}
+
+#[test]
+fn activity_commands_use_captured_output_and_only_estimate_visible_metadata() {
+    let mut payload = command("cargo check");
+    let TimelinePayload::Command(command) = &mut payload else {
+        unreachable!()
+    };
+    command.cwd = Some("/workspace".into());
+    command.output_summary = Some("terminal output".into());
+    command.raw_extension = Some(vibex_core::AgentEventRawExtension::new(
+        Vec::new(),
+        None,
+        Some(
+            vibex_core::AgentEventRawOutput::new(
+                vibex_core::AgentEventRawOutputMode::Snapshot,
+                "checking\nfinished\n",
+            )
+            .0,
+        ),
+        Vec::new(),
+        BTreeMap::new(),
+        false,
+    ));
+    let projection = tool_card_projection(&row_for(&payload), Some(&payload));
+    let ToolCardDetailBlock::Terminal { output, .. } = &projection.details[0] else {
+        panic!("command result")
+    };
+    assert_eq!(output.as_deref(), Some("checking\nfinished\n"));
+    let block = &projection.details[0];
+    let height = block.estimated_activity_height(80, 16.0, 14.0, Some("/workspace"));
+    assert!(block.estimated_activity_height(80, 16.0, 14.0, None) > height);
+    let mut failed = block.clone();
+    let ToolCardDetailBlock::Terminal { exit_code, .. } = &mut failed else {
+        unreachable!()
+    };
+    *exit_code = Some(1);
+    assert!(failed.estimated_activity_height(80, 16.0, 14.0, Some("/workspace")) > height);
 }
 
 #[test]
@@ -244,20 +326,23 @@ fn activity_detail_estimates_follow_zoom_and_bound_long_output() {
         value,
     };
     let short = section("first line\nsecond line".into());
-    let normal = short.estimated_activity_height(80, 16.0, 14.0);
+    let normal = short.estimated_activity_height(80, 16.0, 14.0, None);
     assert_eq!(
-        short.estimated_activity_height(80, 32.0, 28.0),
+        short.estimated_activity_height(80, 32.0, 28.0, None),
         normal * 2.0,
         "interface zoom must scale the header, spacing and text together"
     );
-    assert!(short.estimated_activity_height(80, 16.0, 18.0) > normal);
-    assert!(short.estimated_activity_height(80, 20.0, 14.0) > normal);
+    assert!(short.estimated_activity_height(80, 16.0, 18.0, None) > normal);
+    assert!(short.estimated_activity_height(80, 20.0, 14.0, None) >= normal);
 
     let long = section("output line\n".repeat(100));
     let longer = section("output line\n".repeat(1000));
     for rem in [12.0, 16.0, 20.0] {
-        let height = long.estimated_activity_height(80, rem, 14.0);
-        assert_eq!(height, longer.estimated_activity_height(80, rem, 14.0));
+        let height = long.estimated_activity_height(80, rem, 14.0, None);
+        assert_eq!(
+            height,
+            longer.estimated_activity_height(80, rem, 14.0, None)
+        );
         assert!(
             height < rem * 12.0,
             "large output stays inside a bounded body"
@@ -403,6 +488,7 @@ impl Render for ActivityProbe {
                     "test-output".into(),
                     "Output",
                     "first line\n    indented line\nlast line",
+                    "first line\n    indented line\nlast line",
                     cx,
                 ))
                 .into_any_element()
@@ -518,19 +604,31 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
         });
         assert!(view.read_with(cx, |view, _| view.expanded));
         let body = cx.debug_bounds("activity-body").unwrap();
+        let text = cx.debug_bounds("activity-detail-text:test-output").unwrap();
+        assert_eq!(body.top(), text.top(), "details start with their content");
+        assert_eq!(
+            body.size.height, text.size.height,
+            "copy shares the content row"
+        );
         let header = cx.debug_bounds("first-header").unwrap();
         assert_eq!(body.left(), header.left());
         assert_eq!(header.left() - closed.left(), px(rem * 2.0));
         assert!(body.bottom() <= cx.debug_bounds("second-row").unwrap().top());
         assert!(body.right() <= closed.right());
         assert_eq!(
-            cx.debug_bounds("activity-rail-after:first")
-                .unwrap()
-                .bottom(),
-            cx.debug_bounds("activity-rail-before:second")
-                .unwrap()
-                .top(),
-            "the rail connects consecutive rows through expanded content"
+            (f32::from(
+                cx.debug_bounds("activity-rail-after:first")
+                    .unwrap()
+                    .bottom()
+            ) * scale)
+                .round(),
+            (f32::from(
+                cx.debug_bounds("activity-rail-before:second")
+                    .unwrap()
+                    .top()
+            ) * scale)
+                .round(),
+            "the rail connects consecutive rows at the same device pixel"
         );
         cx.update(|window, cx| {
             window.blur(cx);

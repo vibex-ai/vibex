@@ -22,6 +22,8 @@ mod timeline_activity;
 mod timeline_disclosure;
 #[path = "timeline_loading.rs"]
 mod timeline_loading;
+#[path = "timeline_tool_detail.rs"]
+mod timeline_tool_detail;
 use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     AvailableSpace, Bounds, BoxShadow, ClickEvent, ClipboardEntry, ClipboardItem, Context,
@@ -48257,7 +48259,11 @@ impl VibexWorkbench {
                 let terminal_block = ToolCardDetailBlock::Terminal {
                     command: command.command.clone(),
                     cwd: None,
-                    output: command.output_summary.clone(),
+                    output: timeline_tool_detail::output(
+                        command.raw_extension.as_ref(),
+                        command.output_summary.as_deref(),
+                        command.exit_code,
+                    ),
                     exit_code: command.exit_code,
                     failed: command.status == vibex_core::CommandStatus::Failed,
                     in_progress: command.status == vibex_core::CommandStatus::Started,
@@ -48316,7 +48322,7 @@ impl VibexWorkbench {
                         self.ui_state.appearance.window_scale_percent,
                     ));
                     let activity_chars_per_line = ((self.estimated_timeline_content_width()
-                        - 2.0 * rem_size)
+                        - 3.75 * rem_size)
                         / (mono_font_size * 0.6))
                         .floor()
                         .max(1.0) as usize;
@@ -48329,6 +48335,8 @@ impl VibexWorkbench {
                             activity_chars_per_line,
                             rem_size,
                             mono_font_size,
+                            self.view_session()
+                                .map(|session| session.workspace_root.as_str()),
                         );
                     }
                     if row.file_path.is_some()
@@ -49964,14 +49972,16 @@ impl VibexWorkbench {
                     })),
             );
         if progress > 0.0 {
+            let projection = self.tool_card_projection_cached(row);
+            let output = projection.details.first().and_then(|block| match block {
+                ToolCardDetailBlock::Terminal { output, .. } => output.as_deref(),
+                _ => None,
+            });
             let detail = self.render_terminal_detail_card(
                 format!("command-detail:{}", row.id),
                 &command.command,
                 command.cwd.as_deref(),
-                command
-                    .output_summary
-                    .as_deref()
-                    .filter(|_| !waiting_for_confirmation),
+                output.filter(|_| !waiting_for_confirmation),
                 command.exit_code,
                 failed,
                 in_progress && !waiting_for_confirmation,
@@ -50675,54 +50685,70 @@ impl VibexWorkbench {
                         format!("activity:{row_id}:{index}:{name}"),
                         label,
                         value,
+                        value,
                         cx,
                     )
                 };
                 match block {
+                    ToolCardDetailBlock::Invocation { value, raw } => timeline_activity::detail(
+                        format!("activity:{row_id}:{index}:input"),
+                        locale::text("Input", "输入", "輸入"),
+                        value,
+                        raw,
+                        cx,
+                    ),
                     ToolCardDetailBlock::Terminal {
                         command,
                         cwd,
                         output,
                         exit_code,
                         failed,
-                        in_progress,
-                    } => v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .child(section(
-                            "command",
-                            locale::text("Command", "命令", "命令"),
-                            command,
-                        ))
-                        .children(output.iter().map(|value| {
-                            section("output", locale::text("Output", "输出", "輸出"), value)
-                        }))
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .flex_wrap()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .children(
-                                    cwd.iter()
-                                        .map(|path| div().min_w_0().truncate().child(path.clone())),
+                        ..
+                    } => {
+                        let cwd = timeline_tool_detail::command_cwd(
+                            cwd.as_deref(),
+                            self.view_session()
+                                .map(|session| session.workspace_root.as_str()),
+                        );
+                        let exit_code = exit_code.filter(|code| *code != 0);
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .child(section(
+                                "command",
+                                locale::text("Command", "命令", "命令"),
+                                command,
+                            ))
+                            .children(output.iter().map(|value| {
+                                section("output", locale::text("Output", "输出", "輸出"), value)
+                            }))
+                            .when(cwd.is_some() || exit_code.is_some(), |this| {
+                                this.child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .children(cwd.map(|path| {
+                                            div().min_w_0().truncate().child(path.to_string())
+                                        }))
+                                        .children(exit_code.map(|code| {
+                                            div()
+                                                .flex_none()
+                                                .when(*failed, |this| {
+                                                    this.text_color(cx.theme().danger)
+                                                })
+                                                .child(format!(
+                                                    "{} {code}",
+                                                    locale::text("Exit", "退出码", "結束代碼")
+                                                ))
+                                        })),
                                 )
-                                .children(exit_code.map(|code| {
-                                    div()
-                                        .flex_none()
-                                        .when(*failed, |this| this.text_color(cx.theme().danger))
-                                        .child(format!(
-                                            "{} {code}",
-                                            locale::text("Exit", "退出码", "結束代碼")
-                                        ))
-                                }))
-                                .when(*in_progress, |this| {
-                                    this.child(locale::text("Running", "运行中", "執行中"))
-                                }),
-                        )
-                        .into_any_element(),
+                            })
+                            .into_any_element()
+                    }
                     ToolCardDetailBlock::Search { query, result, .. } => v_flex()
                         .w_full()
                         .min_w_0()
@@ -50775,6 +50801,11 @@ impl VibexWorkbench {
             .iter()
             .enumerate()
             .map(|(index, block)| match block {
+                ToolCardDetailBlock::Invocation { value, .. } => self.render_process_detail(
+                    locale::text("Input", "输入", "輸入").to_string(),
+                    value.clone(),
+                    cx,
+                ),
                 ToolCardDetailBlock::Terminal {
                     command,
                     cwd,
@@ -56440,12 +56471,12 @@ struct ToolCardProjection {
     details: Vec<ToolCardDetailBlock>,
 }
 
-/// Typed expanded-content block for a tool/activity card. Each tool kind
-/// projects its own block sequence instead of a flat "label: value" dump, so
-/// command output reads like a terminal card, searches read like a query
-/// field, and structured input renders as labeled sections.
+/// Typed expanded content shared by compact activity rows and enhanced cards.
+/// Arguments and results retain their own copy and presentation semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolCardDetailBlock {
+    /// Readable arguments with the exact invocation retained for copying.
+    Invocation { value: String, raw: String },
     /// Terminal-style execution card: prompt line, captured output body, and
     /// a cwd / exit footer.
     Terminal {
@@ -56468,8 +56499,7 @@ enum ToolCardDetailBlock {
         path: String,
         summary: Option<String>,
     },
-    /// Bounded monospace body under an uppercase label (structured tool
-    /// input/output echoes).
+    /// Bounded monospace result. Its label names the copy action in compact rows.
     Mono { label: String, value: String },
     /// Status-keyed rows, one line each (todo/plan step lists).
     Rows { rows: Vec<(String, String)> },
@@ -56487,21 +56517,34 @@ impl ToolCardDetailBlock {
         chars_per_line: usize,
         rem_size: f32,
         mono_font_size: f32,
+        workspace_root: Option<&str>,
     ) -> f32 {
         let section = |value: &str| {
-            1.75 * rem_size
-                + (estimated_wrapped_lines(value, chars_per_line) as f32 * mono_font_size * 1.5)
-                    .min(10.0 * rem_size)
+            (estimated_wrapped_lines(value.trim_end_matches(['\n', '\r']), chars_per_line) as f32
+                * mono_font_size
+                * 1.5)
+                .min(10.0 * rem_size)
+                .max(1.25 * rem_size)
         };
         match self {
             Self::Terminal {
-                command, output, ..
+                command,
+                cwd,
+                output,
+                exit_code,
+                ..
             } => {
                 section(command)
                     + output
                         .as_deref()
                         .map_or(0.0, |output| section(output) + 0.5 * rem_size)
-                    + 1.75 * rem_size
+                    + if timeline_tool_detail::command_cwd(cwd.as_deref(), workspace_root).is_some()
+                        || exit_code.is_some_and(|code| code != 0)
+                    {
+                        1.75 * rem_size
+                    } else {
+                        0.0
+                    }
             }
             Self::Search { query, result, .. } => {
                 section(query)
@@ -56515,7 +56558,9 @@ impl ToolCardDetailBlock {
                         .as_deref()
                         .map_or(0.0, |summary| section(summary) + 0.5 * rem_size)
             }
-            Self::Mono { value, .. } | Self::Text { value, .. } => section(value),
+            Self::Invocation { value, .. }
+            | Self::Mono { value, .. }
+            | Self::Text { value, .. } => section(value),
             Self::Rows { rows } => rows
                 .iter()
                 .map(|(_, value)| {
@@ -56527,6 +56572,7 @@ impl ToolCardDetailBlock {
 
     fn approximate_bytes(&self) -> usize {
         match self {
+            Self::Invocation { value, raw } => value.len().saturating_add(raw.len()),
             Self::Terminal {
                 command,
                 cwd,
@@ -56589,7 +56635,9 @@ impl ToolCardDetailBlock {
                 }
                 height
             }
-            Self::Mono { value, .. } => 24.0 + estimated_pre_block_height(value),
+            Self::Invocation { value, .. } | Self::Mono { value, .. } => {
+                24.0 + estimated_pre_block_height(value)
+            }
             Self::Rows { rows } => 24.0 + rows.len() as f32 * 24.0,
             Self::Text { value, .. } => {
                 (estimated_wrapped_lines(value, chars_per_line) as f32) * 20.0 + 16.0
@@ -57464,37 +57512,17 @@ fn tool_card_projection(
     let details = match payload {
         Some(Payload::ToolCall(tool)) => {
             let mut details = Vec::new();
-            let projected_input = tool
-                .raw_extension
-                .as_ref()
-                .and_then(|extension| extension.raw_input.as_ref())
-                .filter(|input| !input.is_empty())
-                .or_else(|| {
-                    tool.input_summary
-                        .as_ref()
-                        .filter(|summary| !summary.is_empty())
-                });
-            if let Some(input) = projected_input {
-                details.push(ToolCardDetailBlock::Mono {
-                    label: locale::text("Input", "输入", "輸入").to_string(),
-                    value: input.clone(),
-                });
+            if let Some((value, raw)) = timeline_tool_detail::invocation(tool, activity.icon()) {
+                details.push(ToolCardDetailBlock::Invocation { value, raw });
             }
-            let projected_output = tool
-                .raw_extension
-                .as_ref()
-                .and_then(|extension| extension.raw_output.as_ref())
-                .map(|output| &output.text)
-                .filter(|output| !output.is_empty())
-                .or_else(|| {
-                    tool.output_summary
-                        .as_ref()
-                        .filter(|summary| !summary.is_empty())
-                });
-            if let Some(output) = projected_output {
+            if let Some(output) = timeline_tool_detail::output(
+                tool.raw_extension.as_ref(),
+                tool.output_summary.as_deref(),
+                None,
+            ) {
                 details.push(ToolCardDetailBlock::Mono {
                     label: locale::text("Output", "输出", "輸出").to_string(),
-                    value: output.clone(),
+                    value: output,
                 });
             }
             if details.is_empty()
@@ -57519,14 +57547,27 @@ fn tool_card_projection(
         }
         Some(Payload::FileOperation(operation)) => vec![ToolCardDetailBlock::File {
             path: operation.path.clone(),
-            summary: Some(operation.summary.clone()).filter(|summary| !summary.is_empty()),
+            summary: timeline_tool_detail::output(
+                operation.raw_extension.as_ref(),
+                Some(&operation.summary),
+                None,
+            )
+            .filter(|summary| {
+                operation
+                    .raw_extension
+                    .as_ref()
+                    .is_some_and(|extension| extension.raw_output.is_some())
+                    || timeline_activity::activity_target(summary, activity.icon())
+                        != operation.path
+            }),
         }],
         Some(Payload::WebSearch(search)) => vec![ToolCardDetailBlock::Search {
             query: search.query.clone(),
-            result: search
-                .result_summary
-                .clone()
-                .filter(|result| !result.is_empty()),
+            result: timeline_tool_detail::output(
+                search.raw_extension.as_ref(),
+                search.result_summary.as_deref(),
+                None,
+            ),
             failed: activity.is_failed(),
         }],
         Some(Payload::TodoUpdate(todo)) => vec![ToolCardDetailBlock::Rows {
@@ -57577,10 +57618,11 @@ fn tool_card_projection(
         Some(Payload::Command(command)) => vec![ToolCardDetailBlock::Terminal {
             command: command.command.clone(),
             cwd: command.cwd.clone().filter(|cwd| !cwd.is_empty()),
-            output: command
-                .output_summary
-                .clone()
-                .filter(|output| !output.is_empty()),
+            output: timeline_tool_detail::output(
+                command.raw_extension.as_ref(),
+                command.output_summary.as_deref(),
+                command.exit_code,
+            ),
             exit_code: command.exit_code,
             failed: activity.is_failed(),
             in_progress: command.status == vibex_core::CommandStatus::Started,
@@ -73065,7 +73107,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_payload_projects_labeled_input_and_output_blocks() {
+    fn tool_call_payload_projects_readable_arguments_and_output() {
         let row = projection_test_row(TimelineRowKind::ToolCall);
         let payload = vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
             tool_call_id: "call:1".to_string(),
@@ -73080,9 +73122,9 @@ mod tests {
         assert_eq!(
             projection.details,
             vec![
-                ToolCardDetailBlock::Mono {
-                    label: locale::text("Input", "输入", "輸入").to_string(),
-                    value: "{\"path\": \"app.rs\"}".to_string(),
+                ToolCardDetailBlock::Invocation {
+                    value: "app.rs".to_string(),
+                    raw: "{\"path\": \"app.rs\"}".to_string(),
                 },
                 ToolCardDetailBlock::Mono {
                     label: locale::text("Output", "输出", "輸出").to_string(),

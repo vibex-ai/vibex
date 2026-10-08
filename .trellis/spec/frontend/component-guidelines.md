@@ -644,15 +644,28 @@ the host platform. Use
 `assets::file_icon` with `file_icon_descriptor` so timeline badges and file trees
 share their file-type shapes and theme colors.
 Collapsed labels normalize whitespace to one line; expanded details retain the
-original invocation, indentation, and result. Prefer the bounded input/output
-in `AgentEventRawExtension` over an abbreviated summary. Calls without output
-must still disclose their input or tool identity. Tool projections include the
+original invocation, indentation, and result. `timeline_tool_detail` prepares
+readable arguments and results inside the cached projection. Known arguments
+lead with their command, path, or query and retain every additional field;
+`ToolCardDetailBlock::Invocation` keeps the original input for copying. Prefer
+bounded `AgentEventRawExtension` output over an abbreviated summary, including
+for enhanced command cards. A terminal attachment summary is not captured
+output, and an empty output snapshot must not restore an older summary.
+Recognized result envelopes expose their text with real line breaks and retain
+nonzero exit codes. Unknown fields or non-text content keep the full JSON;
+partial JSON remains verbatim. Calls without input use a known file location or
+invocation summary, and calls without output must still disclose their input
+or tool identity. Tool projections include the
 resolved locale in their cache validity so language changes refresh labels
 without waiting for a new tool event.
 
 Activity rows share one icon column and a stretching connector rail. Their
-headers and expanded details start at the same text column; detail sections
-use bounded monospace bodies and explicit copy actions. Use the module's
+headers and expanded details start at the same text column. Bounded monospace
+bodies start with content; copy buttons share that row and name the copied
+field through their tooltip and accessible label. Omit repeated section
+headings, successful exit codes, and the current workspace's command directory;
+keep a different working directory and failing exit code visible. Height
+estimates follow the visible content and metadata. Use the module's
 relative header metrics (`ROW_HEIGHT_REM`, `SUMMARY_HEIGHT_REM`) for layout and
 first-height estimates. Window rem or code-font changes invalidate nested unit
 measurements as well as turn heights, so cached geometry cannot outlive its
