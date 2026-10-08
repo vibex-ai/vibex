@@ -55985,6 +55985,7 @@ struct TurnFileChangeAccumulator {
     old_text: Option<String>,
     new_text: Option<String>,
     has_text_snapshot: bool,
+    empty_baseline_line_count: Option<usize>,
     patch_added_lines: usize,
     patch_removed_lines: usize,
     has_patch_counts: bool,
@@ -56045,6 +56046,21 @@ fn agent_turn_file_changes(
             if file.old_text.is_none() {
                 file.old_text.clone_from(&operation.old_text);
             }
+            if file.old_text.as_deref() == Some("") {
+                // Every remaining line is an addition against an empty baseline,
+                // including edits compacted to patches when history is stored.
+                if operation.operation == FileOperationKind::Delete {
+                    file.empty_baseline_line_count = Some(0);
+                } else if let Some(new_text) = operation.new_text.as_deref() {
+                    file.empty_baseline_line_count = Some(new_text.lines().count());
+                } else if let (Some(line_count), Some(preview)) =
+                    (&mut file.empty_baseline_line_count, patch_preview.as_ref())
+                {
+                    *line_count = line_count
+                        .saturating_add(preview.added_lines)
+                        .saturating_sub(preview.removed_lines);
+                }
+            }
             if let Some(new_text) = operation.new_text.as_ref() {
                 file.new_text = Some(new_text.clone());
             } else if operation.operation == FileOperationKind::Delete
@@ -56067,13 +56083,32 @@ fn agent_turn_file_changes(
         if operation.operation == FileOperationKind::Delete && operation.old_text.is_some() {
             new_text = Some(String::new());
         }
+        // A write without old contents establishes an empty baseline. Keeping
+        // None here would let a later edit replace it with the created file.
+        let old_text = operation
+            .old_text
+            .clone()
+            .or_else(|| (operation.operation == FileOperationKind::Write).then(String::new));
+        let empty_baseline_line_count = (old_text.as_deref() == Some(""))
+            .then(|| {
+                new_text
+                    .as_deref()
+                    .map(|text| text.lines().count())
+                    .or_else(|| {
+                        patch_preview.as_ref().map(|preview| {
+                            preview.added_lines.saturating_sub(preview.removed_lines)
+                        })
+                    })
+            })
+            .flatten();
         indices.insert(key, files.len());
         files.push(TurnFileChangeAccumulator {
             display_path,
             actionable_path,
-            old_text: operation.old_text.clone(),
+            old_text,
             new_text,
             has_text_snapshot: operation.old_text.is_some() || operation.new_text.is_some(),
+            empty_baseline_line_count,
             patch_added_lines: patch_preview
                 .as_ref()
                 .map_or(0, |preview| preview.added_lines),
@@ -56088,7 +56123,11 @@ fn agent_turn_file_changes(
         files: files
             .into_iter()
             .map(|file| {
-                let (added_lines, removed_lines) = if file.has_text_snapshot {
+                let (added_lines, removed_lines) = if let Some(line_count) =
+                    file.empty_baseline_line_count
+                {
+                    (line_count, 0)
+                } else if file.has_text_snapshot {
                     let preview =
                         agent_file_diff_preview(file.old_text.as_deref(), file.new_text.as_deref());
                     (preview.added_lines, preview.removed_lines)
@@ -56104,7 +56143,9 @@ fn agent_turn_file_changes(
                     review_staged: false,
                     added_lines,
                     removed_lines,
-                    has_line_counts: file.has_text_snapshot || file.has_patch_counts,
+                    has_line_counts: file.empty_baseline_line_count.is_some()
+                        || file.has_text_snapshot
+                        || file.has_patch_counts,
                 }
             })
             .collect(),
@@ -90344,6 +90385,147 @@ mod tests {
         assert_eq!(summary.files[0].removed_lines, expected.removed_lines);
         assert_eq!(summary.files[1].added_lines, 2);
         assert_eq!(summary.files[1].removed_lines, 0);
+    }
+
+    #[test]
+    fn turn_file_changes_preserve_created_file_baselines() {
+        let initial = (0..183)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+        let edited = initial
+            .lines()
+            .skip(1)
+            .map(|line| format!("{line}\n"))
+            .chain((0..7).map(|index| format!("replacement {index}\n")))
+            .collect::<String>();
+        let create = FileOperationPayload {
+            operation: FileOperationKind::Write,
+            path: "src/new.rs".into(),
+            summary: "Create file".into(),
+            old_text: None,
+            new_text: Some(initial.clone()),
+            patch: None,
+            raw_extension: None,
+        };
+        let edit = FileOperationPayload {
+            operation: FileOperationKind::Edit,
+            summary: "Edit new file".into(),
+            old_text: Some(initial),
+            new_text: Some(edited),
+            ..create.clone()
+        };
+        let preview = agent_file_operation_diff_preview(&edit);
+        assert_eq!((preview.added_lines, preview.removed_lines), (7, 1));
+
+        for creation_format in 0..3 {
+            for patch_edit in [false, true] {
+                let mut create = create.clone();
+                if creation_format > 0 {
+                    create.old_text = Some(String::new());
+                }
+                if creation_format == 2 {
+                    create.patch = Some(create.generated_patch().expect("creation patch"));
+                    create.old_text = None;
+                    create.new_text = None;
+                }
+                let mut edit = edit.clone();
+                if patch_edit {
+                    edit.patch = Some(edit.generated_patch().expect("edit patch"));
+                    edit.old_text = None;
+                    edit.new_text = None;
+                }
+                let (items, turn) = completed_turn_with_file_operations(vec![create, edit]);
+                let summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
+
+                assert_eq!(summary.files.len(), 1);
+                assert_eq!(
+                    turn_file_changes_line_counts(&summary),
+                    Some((189, 0)),
+                    "creation format {creation_format}, patch edit {patch_edit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turn_file_changes_keep_empty_baselines_through_mixed_edits() {
+        let create = FileOperationPayload {
+            operation: FileOperationKind::Write,
+            path: "src/new.rs".into(),
+            summary: "Create file".into(),
+            old_text: None,
+            new_text: Some("first\nsecond\nthird\n".into()),
+            patch: None,
+            raw_extension: None,
+        };
+        let first_edit = FileOperationPayload {
+            operation: FileOperationKind::Edit,
+            old_text: create.new_text.clone(),
+            new_text: Some("first\nchanged\nthird\nfourth\n".into()),
+            ..create.clone()
+        };
+        let second_edit = FileOperationPayload {
+            old_text: first_edit.new_text.clone(),
+            new_text: Some("first\nchanged\nthird\nfourth\nfifth\n".into()),
+            ..first_edit.clone()
+        };
+
+        for patch_mask in 0..4 {
+            let mut operations = vec![create.clone(), first_edit.clone(), second_edit.clone()];
+            for (index, operation) in operations.iter_mut().skip(1).enumerate() {
+                if patch_mask & (1 << index) != 0 {
+                    operation.patch = Some(operation.generated_patch().expect("edit patch"));
+                    operation.old_text = None;
+                    operation.new_text = None;
+                }
+            }
+            let (items, turn) = completed_turn_with_file_operations(operations);
+            let summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
+
+            assert_eq!(
+                turn_file_changes_line_counts(&summary),
+                Some((5, 0)),
+                "patch mask {patch_mask}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_file_changes_cancel_created_files_when_deleted() {
+        let create = FileOperationPayload {
+            operation: FileOperationKind::Write,
+            path: "src/new.rs".into(),
+            summary: "Create file".into(),
+            old_text: None,
+            new_text: Some("temporary\n".into()),
+            patch: None,
+            raw_extension: None,
+        };
+        let delete = FileOperationPayload {
+            operation: FileOperationKind::Delete,
+            old_text: create.new_text.clone(),
+            new_text: Some(String::new()),
+            ..create.clone()
+        };
+
+        for deletion_format in 0..3 {
+            let mut delete = delete.clone();
+            if deletion_format == 1 {
+                delete.patch = Some(delete.generated_patch().expect("deletion patch"));
+            }
+            if deletion_format > 0 {
+                delete.old_text = None;
+                delete.new_text = None;
+            }
+            let (items, turn) = completed_turn_with_file_operations(vec![create.clone(), delete]);
+            let summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
+
+            assert_eq!(
+                turn_file_changes_line_counts(&summary),
+                Some((0, 0)),
+                "deletion format {deletion_format}"
+            );
+        }
     }
 
     #[test]

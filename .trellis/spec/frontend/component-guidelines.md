@@ -694,6 +694,19 @@ group summary muted and mark failures on their own rows. Successful rows need
 no repeated completion badge; running, failure and pending approval remain
 explicit, including a running indication on a collapsed group.
 
+`agent_turn_file_changes` shares file counts between the generation status and
+the turn's file summary. With file snapshots, compare the first baseline with
+the latest contents; individual operation counts can include intermediate work.
+For a first `FileOperationKind::Write` with no `old_text`, retain an explicit
+empty baseline instead of filling it from a later edit. Against a known empty
+baseline, every remaining line is added and no line is removed. A full snapshot
+replaces the current line count; a compact `UnifiedDiffV1` patch adjusts it by
+additions minus deletions; deletion resets it to zero. This preserves creation
+counts when persisted history mixes snapshots and patches. Keep existing-file
+baselines and the Git fallback for unavailable counts. Regression tests cover
+new-file edits, mixed snapshot/patch sequences, and create-then-delete: creating
+183 lines and editing `+7/-1` yields `+189/-0` for that file.
+
 Running tool labels and group summaries use the component `ShimmerText` with
 the shared timeline sweep and spread. `activity_turn_is_live` checks the owning
 session and rejects finished or superseded turns; `timeline_activity::is_running`
