@@ -15146,16 +15146,22 @@ impl VibexWorkbench {
         // somewhere else must not keep claiming them.
         self.session_group_tab_removal_active = false;
         let primary = SidebarOrganizationItem::Session(drag.session_id.as_str().to_string());
-        if !self.sidebar_move_selected_items.contains(&primary) {
-            if self.sidebar_row_is_move_selected(&primary) {
-                // The row is painted as part of the selection, so the drag has
-                // to keep the rest of it: adding the row is what the user sees.
-                self.sidebar_move_selected_items.insert(primary.clone());
-                self.sidebar_move_selection_anchor = Some(primary.clone());
-                cx.notify();
-            } else {
-                self.update_sidebar_move_selection(primary.clone(), false, false, cx);
-            }
+        // A drag carries the rows the sidebar paints as part of the selection,
+        // so a drag that starts on one of them keeps the rest of it. A drag that
+        // starts anywhere else carries that row alone (`sidebar_drag_items`) and
+        // leaves the selection untouched: the pointer only has to slip past the
+        // drag threshold for the click the user meant to become a drag, and a
+        // one-row selection written here would leave the session that is still
+        // open wearing a second selected wash next to the row that was pressed.
+        if !self.sidebar_move_selected_items.contains(&primary)
+            && self.sidebar_row_is_move_selected(&primary)
+        {
+            // The current session's row is painted like a move-selected row
+            // without being in the set, so the row itself has to join it: the
+            // drag carries exactly the rows the user sees highlighted.
+            self.sidebar_move_selected_items.insert(primary.clone());
+            self.sidebar_move_selection_anchor = Some(primary.clone());
+            cx.notify();
         }
         let groups = self.sidebar_workspace_groups("");
         let moving = drag
@@ -15369,6 +15375,27 @@ impl VibexWorkbench {
             .sidebar_session_drag_state
             .take()
             .expect("validated sidebar session drag state above");
+        // GPUI turns a press into a drag as soon as the pointer slips past its
+        // drag threshold, and the click that would have selected the row never
+        // arrives afterwards. A drag that carried the row it started on alone,
+        // engaged no target and released on that same row was that click, so it
+        // is finished here: otherwise the row the user pressed stays unselected.
+        // A drag carrying a multi-selection is never finished as a click — a
+        // slip on one of its rows must not tear the selection apart.
+        let incidental_click = state.session_ids.len() == 1
+            && state
+                .session_ids
+                .first()
+                .is_some_and(|id| id.as_str() == state.session_id.as_str())
+            && direct_target.is_none()
+            && landed_on == Some(state.session_id.as_str())
+            && state.preview_ids == state.original_ids
+            && self.sidebar_organization_drop_target.is_none()
+            && self.sidebar_organization_root_drop_target.is_none();
+        if incidental_click {
+            self.select_session(state.session_id.clone(), cx);
+            return;
+        }
         let moving = state
             .session_ids
             .iter()
@@ -15464,15 +15491,18 @@ impl VibexWorkbench {
     ///
     /// The drag payload is captured when the row renders, so it can be older
     /// than the selection on screen; the drop is the moment that matters. Every
-    /// selected session of the primary's project belongs to this drag, and
-    /// `start_sidebar_session_drag` narrows the selection to the row the drag
-    /// began on when that row was not part of it — so this cannot widen a drag
-    /// the user did not make.
+    /// selected session of the primary's project belongs to this drag, and the
+    /// primary has to be one of the rows the sidebar paints as selected —
+    /// otherwise the drag carries the row it started on alone, and a selection
+    /// the user made elsewhere can never follow a row it never covered.
     fn dragged_group_session_ids(&self, payload_ids: &[String]) -> Vec<String> {
         let Some(primary) = payload_ids.first() else {
             return Vec::new();
         };
         let primary_item = SidebarOrganizationItem::Session(primary.clone());
+        if !self.sidebar_row_is_move_selected(&primary_item) {
+            return payload_ids.to_vec();
+        }
         let mut ids = payload_ids.to_vec();
         for selected in self.sidebar_move_selection_items() {
             let SidebarOrganizationItem::Session(session_id) = &selected else {
@@ -89312,8 +89342,14 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn finish_sidebar_session_drag("))
             .map(|(body, _)| body)
             .expect("session drag setup should remain inspectable");
-        assert!(drag_start.contains("if self.sidebar_row_is_move_selected(&primary) {"));
+        assert!(drag_start.contains("&& self.sidebar_row_is_move_selected(&primary)"));
         assert!(drag_start.contains("self.sidebar_move_selected_items.insert(primary.clone());"));
+        // A drag that starts on a row outside the selection carries that row
+        // alone, so it must not write a selection of its own: the pointer only
+        // has to slip past the drag threshold for the click the user meant to
+        // become a drag, and the row it started on would then wear a second
+        // selected wash next to the session that is still open.
+        assert!(!drag_start.contains("update_sidebar_move_selection("));
 
         let session_row = source
             .split_once("    fn render_sidebar_session(")
@@ -89335,6 +89371,46 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group drop resolution should remain inspectable");
         assert!(group_drop.contains("for selected in self.sidebar_move_selection_items() {"));
+        // Only a drag that started on a painted row may widen to the selection:
+        // a drag on any other row carries that row alone.
+        assert!(group_drop.contains("if !self.sidebar_row_is_move_selected(&primary_item) {"));
+        assert!(group_drop.contains("return payload_ids.to_vec();"));
+    }
+
+    /// A pointer that slips past the drag threshold while the user is clicking
+    /// used to leave a one-row selection behind that no longer matched the open
+    /// session, so two rows wore the same selected wash. The slip is the click
+    /// it replaced now, and it never writes a selection of its own.
+    #[test]
+    fn a_slipped_press_finishes_as_the_click_it_replaced() {
+        let source = include_str!("app.rs");
+        let drag_start = source
+            .split_once("    fn start_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_sidebar_session_drag("))
+            .map(|(body, _)| body)
+            .expect("session drag setup should remain inspectable");
+        assert!(!drag_start.contains("update_sidebar_move_selection("));
+
+        let finish = source
+            .split_once("    fn finish_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Applies the group half"))
+            .map(|(body, _)| body)
+            .expect("session drag finish should remain inspectable");
+        assert!(finish.contains("let incidental_click = state.session_ids.len() == 1"));
+        assert!(finish.contains("&& landed_on == Some(state.session_id.as_str())"));
+        assert!(finish.contains("&& state.preview_ids == state.original_ids"));
+        assert!(finish.contains("&& self.sidebar_organization_drop_target.is_none()"));
+        assert!(finish.contains("&& self.sidebar_organization_root_drop_target.is_none()"));
+        assert!(finish.contains("self.select_session(state.session_id.clone(), cx);"));
+        // The click is finished before the drop, so a slip never reaches the
+        // reorder or the group half of a drop.
+        let click = finish
+            .find("self.select_session(state.session_id.clone(), cx);")
+            .expect("the slip branch should finish the click");
+        let moving = finish
+            .find("let moving = state")
+            .expect("the drop should still resolve the rows it moves");
+        assert!(click < moving);
     }
 
     /// A drop changes the group for every session the user selected, not just
