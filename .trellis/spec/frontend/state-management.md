@@ -392,6 +392,17 @@ verify the corrected rendered text. The component owns block-level tests.
 
 ### Convention: A pane resize is a reflow, not an invalidation
 
+Use the rendered row's effective content width to decide whether a reflow is
+needed. `timeline_content_width(pane_width, content_max_width, list_inset)`
+subtracts the list's rem-scaled horizontal inset and applies the session's
+content cap. The estimator uses the same result. When opening or closing a
+sidebar leaves both pane widths above that cap, only horizontal centering
+changes: keep the size table and layout fingerprints. Re-estimating unseen
+turns against the uncapped pane changes their heights and moves visible history
+even though its text has not wrapped. GPUI layout tests must compare row Y
+coordinates and scroll extents through both directions of the width change,
+at the top, within history, and at the bottom, including non-default rem sizes.
+
 Every height the timeline virtualizes was measured against the content box its
 row was laid out in, so a pane width change re-wraps all of them. Rebuilding the
 row table from the estimator on that event is what makes a resize flicker: the

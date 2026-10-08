@@ -2765,6 +2765,21 @@ fn session_content_max_width(mode: SessionContentWidthMode) -> Option<f32> {
     }
 }
 
+/// The row's content box after the list's rem-scaled inset and session cap.
+/// Pane resizing above the cap changes centering, but cannot change wrapping.
+fn timeline_content_width(
+    pane_width: Option<f32>,
+    content_max_width: Option<f32>,
+    list_inset: f32,
+) -> f32 {
+    pane_width
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .map(|width| (width - list_inset * 2.0).max(1.0))
+        .or(content_max_width)
+        .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH)
+        .min(content_max_width.unwrap_or(f32::INFINITY))
+}
+
 /// The definite width a user message body may wrap at, in pixels.
 ///
 /// The pill hugs its content, so taffy resolves its height from an intrinsic
@@ -18918,9 +18933,14 @@ impl VibexWorkbench {
             return;
         }
         let width = width.round();
-        let previous = self.timeline_layout_width;
+        let previous = self.estimated_timeline_content_width();
         self.timeline_layout_width = Some(width);
-        if !timeline_layout_width_changed(previous, Some(width)) {
+        // A sidebar toggle can move the pane without changing its capped
+        // content box. Keep the row table and reading position in that case.
+        if !timeline_layout_width_changed(
+            Some(previous),
+            Some(self.estimated_timeline_content_width()),
+        ) {
             return;
         }
         self.retarget_timeline_layout_width();
@@ -48003,15 +48023,14 @@ impl VibexWorkbench {
 
     /// The content box the first-layout estimator sizes its rows against.
     ///
-    /// The last width a pane measured, or the configured content cap before the
-    /// first prepaint reports one. The list's own `px_4` comes off the pane, so
-    /// a row's text box is the pane less that padding.
+    /// The last pane width minus the list's `px_4`, limited by the same session
+    /// cap as the rendered row. Before the first prepaint, use the content cap.
     fn estimated_timeline_content_width(&self) -> f32 {
-        self.timeline_layout_width
-            .filter(|width| width.is_finite() && *width > 0.0)
-            .map(|width| (width - AGENT_TIMELINE_LIST_PADDING_X_PX * 2.0).max(1.0))
-            .or_else(|| session_content_max_width(self.ui_state.session.content_width))
-            .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH)
+        timeline_content_width(
+            self.timeline_layout_width,
+            session_content_max_width(self.ui_state.session.content_width),
+            self.timeline_list_padding_top_px,
+        )
     }
 
     /// Wrapped columns the first-layout estimator may assume for a row body.
@@ -91253,7 +91272,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the estimator's content box should remain inspectable");
         assert!(content_width.contains("self.timeline_layout_width"));
-        assert!(content_width.contains("AGENT_TIMELINE_LIST_PADDING_X_PX"));
+        assert!(content_width.contains("timeline_content_width("));
+        assert!(content_width.contains("self.timeline_list_padding_top_px"));
         assert!(content_width.contains("session_content_max_width("));
 
         let row = source
