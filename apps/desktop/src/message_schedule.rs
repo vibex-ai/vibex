@@ -3,14 +3,22 @@
 
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone as _};
+use gpui::InteractiveElement as _;
 use gpui_component::{
-    date_picker::{DatePicker, DatePickerEvent, DatePickerState},
-    dialog::DialogButtonProps,
-    time_field::{HourCycle, TimePrecision},
+    calendar::{Calendar, CalendarEvent, CalendarState, Date},
+    input::Enter as InputEnter,
+    popover::Popover,
+    time_field::{HourCycle, TimeField, TimeFieldEvent, TimeFieldState, TimePrecision},
 };
 
 const MAX_COUNTDOWN_SECONDS: u64 = 365 * 24 * 60 * 60;
 const CLOCK_ICON: &str = "icons/vibex/clock.svg";
+/// The inline calendar's day grid is seven `size_7` cells (1.75rem each) with
+/// six `gap_0p5` gaps (0.125rem), so 13rem is exactly as wide as the calendar
+/// and every other row in the panel shares that one spine. Rem units, not
+/// pixels: the grid is built from the same scale and has to keep matching it
+/// when the interface font size changes.
+const MESSAGE_SCHEDULE_PANEL_REM: f32 = 13.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MessageSchedule {
@@ -134,9 +142,36 @@ pub(super) fn next_message_index(
     })
 }
 
-struct MessageSchedulePicker {
+/// The schedule editor one Composer target is currently editing.
+///
+/// The popover owns the surface; this owns the values, so switching modes or
+/// re-rendering the surface never rebuilds the calendar or the countdown
+/// fields the reader is typing into.
+pub(super) struct MessageScheduleEditor {
+    target: MessageScheduleTarget,
+    view: Entity<MessageScheduleEditorView>,
+}
+
+impl MessageScheduleEditor {
+    fn new(
+        target: MessageScheduleTarget,
+        initial: Option<MessageSchedule>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let view = cx.new(|cx| MessageScheduleEditorView::new(initial, window, cx));
+        Self { target, view }
+    }
+
+    pub(super) fn target(&self) -> &MessageScheduleTarget {
+        &self.target
+    }
+}
+
+struct MessageScheduleEditorView {
     countdown: bool,
-    date_time: Entity<DatePickerState>,
+    calendar: Entity<CalendarState>,
+    time_field: Entity<TimeFieldState>,
     hours: Entity<InputState>,
     minutes: Entity<InputState>,
     seconds: Entity<InputState>,
@@ -144,87 +179,25 @@ struct MessageSchedulePicker {
     _subscriptions: Vec<Subscription>,
 }
 
-impl MessageSchedulePicker {
-    fn open(
-        initial: Option<MessageSchedule>,
-        clearable: bool,
-        on_apply: impl Fn(Option<MessageSchedule>, &mut Window, &mut App) -> bool + 'static,
-        on_close: impl Fn(&mut App) + 'static,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Entity<Self> {
-        let picker = cx.new(|cx| Self::new(initial, window, cx));
-        let dialog_picker = picker.clone();
-        let on_apply = Rc::new(on_apply);
-        let on_close = Rc::new(on_close);
-        window.open_dialog(cx, move |dialog, _, _| {
-            let submit_picker = dialog_picker.clone();
-            let submit = on_apply.clone();
-            let clear = on_apply.clone();
-            let clear_close = on_close.clone();
-            let close = on_close.clone();
-            dialog
-                .title(locale::text("Schedule message", "定时发送", "定時傳送"))
-                .child(dialog_picker.clone())
-                .when(initial.is_some() && clearable, |dialog| {
-                    dialog.child(
-                        Button::new("clear-message-schedule")
-                            .debug_selector(|| "clear-message-schedule".into())
-                            .ghost()
-                            .small()
-                            .label(locale::text("Remove schedule", "取消定时", "取消定時"))
-                            .on_click(move |_, window, cx| {
-                                if clear(None, window, cx) {
-                                    window.close_dialog(cx);
-                                    clear_close(cx);
-                                }
-                            }),
-                    )
-                })
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(locale::text("Set schedule", "设置定时", "設定定時"))
-                        .cancel_text(locale::text("Cancel", "取消", "取消"))
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    let Some(schedule) = submit_picker.update(cx, |picker, cx| picker.validate(cx))
-                    else {
-                        return false;
-                    };
-                    submit(Some(schedule), window, cx)
-                })
-                .on_close(move |_, _, cx| close(cx))
-        });
-        let focus_picker = picker.clone();
-        window.on_next_frame(move |window, cx| {
-            focus_picker.update(cx, |picker, cx| {
-                if picker.countdown {
-                    picker.minutes.update(cx, |input, cx| {
-                        input.set_selected_range(0..input.value().len(), cx);
-                        input.focus(window, cx);
-                    });
-                } else {
-                    window.focus(&picker.date_time.focus_handle(cx), cx);
-                }
-            });
-        });
-        picker
-    }
-
+impl MessageScheduleEditorView {
     fn new(initial: Option<MessageSchedule>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let at_ms = match initial {
             Some(MessageSchedule::At(at_ms)) => at_ms,
             _ => unix_timestamp_ms() + 5 * 60 * 1_000,
         };
-        let date_time = cx.new(|cx| {
-            let mut state = DatePickerState::new(window, cx)
-                .date_format("%Y-%m-%d")
-                .time_precision(TimePrecision::Second)
+        let local = chrono::DateTime::from_timestamp_millis(at_ms)
+            .map(|time| time.with_timezone(&Local).naive_local())
+            .unwrap_or_else(|| Local::now().naive_local());
+        let calendar = cx.new(|cx| {
+            let mut state = CalendarState::new(window, cx);
+            state.set_date(Date::Single(Some(local.date())), window, cx);
+            state
+        });
+        let time_field = cx.new(|cx| {
+            let mut state = TimeFieldState::new(window, cx)
+                .precision(TimePrecision::Second)
                 .hour_cycle(HourCycle::H23);
-            if let Some(time) = chrono::DateTime::from_timestamp_millis(at_ms) {
-                state.set_date_time(time.with_timezone(&Local).naive_local(), window, cx);
-            }
+            state.set_time(local.time(), window, cx);
             state
         });
         let duration = match initial {
@@ -237,13 +210,16 @@ impl MessageSchedulePicker {
             .new(|cx| InputState::new(window, cx).default_value((duration / 60 % 60).to_string()));
         let seconds =
             cx.new(|cx| InputState::new(window, cx).default_value((duration % 60).to_string()));
-        let mut subscriptions =
-            vec![
-                cx.subscribe(&date_time, |this, _, _: &DatePickerEvent, cx| {
-                    this.error = None;
-                    cx.notify();
-                }),
-            ];
+        let mut subscriptions = vec![
+            cx.subscribe(&calendar, |this, _, _: &CalendarEvent, cx| {
+                this.error = None;
+                cx.notify();
+            }),
+            cx.subscribe(&time_field, |this, _, _: &TimeFieldEvent, cx| {
+                this.error = None;
+                cx.notify();
+            }),
+        ];
         for input in [&hours, &minutes, &seconds] {
             subscriptions.push(cx.subscribe(input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -254,13 +230,39 @@ impl MessageSchedulePicker {
         }
         Self {
             countdown: matches!(initial, Some(MessageSchedule::After(_))),
-            date_time,
+            calendar,
+            time_field,
             hours,
             minutes,
             seconds,
             error: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Puts the keyboard where the edit usually starts: the countdown's
+    /// minutes, or the time of an absolute deadline whose date is normally
+    /// already right.
+    fn focus_initial(&self, window: &mut Window, cx: &mut App) {
+        if self.countdown {
+            self.minutes.update(cx, |input, cx| {
+                input.set_selected_range(0..input.value().len(), cx);
+                input.focus(window, cx);
+            });
+        } else {
+            window.focus(&self.time_field.read(cx).focus_handle(cx), cx);
+        }
+    }
+
+    fn selected_deadline(&self, cx: &App) -> Result<i64, &'static str> {
+        let date = self.calendar.read(cx).date().start().ok_or_else(|| {
+            locale::text(
+                "Choose a date and time.",
+                "请选择日期和时间。",
+                "請選擇日期和時間。",
+            )
+        })?;
+        local_deadline(NaiveDateTime::new(date, self.time_field.read(cx).time()))
     }
 
     fn validate(&mut self, cx: &mut Context<Self>) -> Option<MessageSchedule> {
@@ -272,19 +274,7 @@ impl MessageSchedulePicker {
             )
             .map(MessageSchedule::After)
         } else {
-            self.date_time
-                .read(cx)
-                .date_time()
-                .start()
-                .ok_or_else(|| {
-                    locale::text(
-                        "Choose a date and time.",
-                        "请选择日期和时间。",
-                        "請選擇日期和時間。",
-                    )
-                })
-                .and_then(local_deadline)
-                .map(MessageSchedule::At)
+            self.selected_deadline(cx).map(MessageSchedule::At)
         };
         match schedule.and_then(|schedule| schedule.deadline(unix_timestamp_ms()).map(|_| schedule))
         {
@@ -301,13 +291,13 @@ impl MessageSchedulePicker {
     }
 }
 
-impl Render for MessageSchedulePicker {
+impl Render for MessageScheduleEditorView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .id("message-schedule-picker")
+            .id("message-schedule-editor")
             .w_full()
             .min_w_0()
-            .gap_4()
+            .gap_3()
             .child(
                 TabBar::new("message-schedule-mode")
                     .segmented()
@@ -350,17 +340,36 @@ impl Render for MessageSchedulePicker {
                     )
                     .into_any_element()
             } else {
+                // The calendar is rendered inline rather than as the date
+                // picker's own dropdown: one anchored surface per decision, and
+                // no second overlay layered over this popover.
                 v_flex()
                     .w_full()
-                    .gap_1()
-                    .child(div().text_sm().child(locale::text(
-                        "Local date and time", "本地日期和时间", "本機日期和時間",
-                    )))
+                    .gap_2()
                     .child(
-                        DatePicker::new(&self.date_time)
-                            .cleanable(false)
+                        Calendar::new(&self.calendar)
                             .small()
-                            .w_full(),
+                            .w_full()
+                            .border_0()
+                            .rounded_none()
+                            .p_0(),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .pt_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(locale::text("Time", "时间", "時間")),
+                            )
+                            .child(TimeField::new(&self.time_field).small()),
                     )
                     .into_any_element()
             })
@@ -368,6 +377,7 @@ impl Render for MessageSchedulePicker {
                 this.child(
                     div()
                         .id("message-schedule-error")
+                        .debug_selector(|| "message-schedule-error".into())
                         .role(Role::Alert)
                         .aria_label(error)
                         .text_sm()
@@ -386,6 +396,99 @@ impl Render for MessageSchedulePicker {
                     )),
             )
     }
+}
+
+/// Applies a schedule to the target the panel belongs to. The workbench reports
+/// whether it accepted the value, which is what lets the surface close.
+type MessageScheduleApply = Rc<dyn Fn(Option<MessageSchedule>, &mut Window, &mut App) -> bool>;
+/// Closes the popover the panel is rendered in.
+type MessageScheduleDismiss = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// One schedule editor plus the two decisions it offers.
+///
+/// Confirming validates the editor and applies the result; clearing voids the
+/// schedule the panel is showing and keeps the message. Both close the surface
+/// only after the workbench accepted the value.
+fn render_message_schedule_panel(
+    view: Entity<MessageScheduleEditorView>,
+    clearable: bool,
+    apply: MessageScheduleApply,
+    dismiss: MessageScheduleDismiss,
+) -> AnyElement {
+    let confirm_view = view.clone();
+    let confirm = apply.clone();
+    let confirm_dismiss = dismiss.clone();
+    let clear_view = view.clone();
+    let clear = apply;
+    let clear_dismiss = dismiss.clone();
+    let enter_view = view.clone();
+    let enter = confirm.clone();
+    let enter_dismiss = confirm_dismiss.clone();
+    v_flex()
+        .id("message-schedule-panel")
+        .w(gpui::rems(MESSAGE_SCHEDULE_PANEL_REM))
+        .gap_3()
+        .child(view)
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .when(clearable, |this| {
+                    this.child(
+                        Button::new("clear-message-schedule")
+                            .debug_selector(|| "clear-message-schedule".into())
+                            .small()
+                            .ghost()
+                            .label(locale::text("Clear schedule", "清除定时", "清除定時"))
+                            .on_click(move |_, window, cx| {
+                                // Clearing voids the timer and keeps the
+                                // message: a queued one falls back to the
+                                // ordinary queue, a draft keeps its text.
+                                clear_view.update(cx, |view, cx| {
+                                    view.error = None;
+                                    cx.notify();
+                                });
+                                if clear(None, window, cx) {
+                                    clear_dismiss(window, cx);
+                                }
+                            }),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    Button::new("confirm-message-schedule")
+                        .debug_selector(|| "confirm-message-schedule".into())
+                        .small()
+                        .primary()
+                        .label(locale::text("Confirm", "确认", "確認"))
+                        .on_click(move |_, window, cx| {
+                            let Some(schedule) =
+                                confirm_view.update(cx, |view, cx| view.validate(cx))
+                            else {
+                                return;
+                            };
+                            if confirm(Some(schedule), window, cx) {
+                                confirm_dismiss(window, cx);
+                            }
+                        }),
+                ),
+        )
+        .on_action(move |_: &InputEnter, window, cx| {
+            // Enter commits the panel, the way the dialog this replaced did.
+            // A single-line `Input` propagates the `input::Enter` action it
+            // answered instead of inserting a newline, so this handler sits on
+            // the focused field's own path and stops the action before the
+            // Composer's own Enter handling can see it.
+            cx.stop_propagation();
+            let Some(schedule) = enter_view.update(cx, |view, cx| view.validate(cx)) else {
+                return;
+            };
+            if enter(Some(schedule), window, cx) {
+                enter_dismiss(window, cx);
+            }
+        })
+        .into_any_element()
 }
 
 impl VibexWorkbench {
@@ -443,8 +546,10 @@ impl VibexWorkbench {
                 self.composer_drafts.save(id.as_str(), draft);
             }
             MessageScheduleTarget::Queued(id) => {
-                // The picker validated the value. An absolute deadline that
-                // elapsed during confirmation stays due instead of being cleared.
+                // The editor validated the value. An absolute deadline that
+                // elapsed during confirmation stays due instead of being
+                // cleared, and clearing hands the message back to the ordinary
+                // queue instead of deleting what the reader wrote.
                 let at_ms = schedule.map(|schedule| match schedule {
                     MessageSchedule::At(at_ms) => at_ms,
                     MessageSchedule::After(seconds) => {
@@ -467,50 +572,67 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    pub(super) fn open_message_schedule(
+    /// Mounts the schedule editor for `target`.
+    ///
+    /// Called from the popover's own open transition, so the surface the reader
+    /// is looking at and the values it edits are created together.
+    fn open_message_schedule_editor(
         &mut self,
         target: MessageScheduleTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.has_active_dialog(cx) {
+        if self
+            .message_schedule_editor
+            .as_ref()
+            .is_some_and(|editor| editor.target() == &target)
+        {
             return;
         }
         let initial = self.schedule_for_target(&target);
-        self.message_schedule_dialog_target = Some(target.clone());
-        let submit_workbench = cx.weak_entity();
-        let close_workbench = cx.weak_entity();
-        MessageSchedulePicker::open(
-            initial,
-            !matches!(&target, MessageScheduleTarget::Queued(_)),
-            move |schedule, window, cx| {
-                submit_workbench
-                    .update(cx, |this, cx| {
-                        this.apply_message_schedule(&target, schedule, window, cx);
-                    })
-                    .is_ok()
-            },
-            move |cx| {
-                let _ = close_workbench.update(cx, |this, cx| {
-                    if let Some(MessageScheduleTarget::Queued(id)) =
-                        this.message_schedule_dialog_target.take()
-                        && let Some(session_id) = this
-                            .composer_queue
-                            .iter()
-                            .find(|message| message.id == id)
-                            .map(|message| message.session_id.clone())
-                    {
-                        this.mark_composer_queue_for_recheck(&session_id);
-                    }
-                    cx.notify();
-                });
-            },
-            window,
-            cx,
-        );
+        let editor = MessageScheduleEditor::new(target, initial, window, cx);
+        let view = editor.view.clone();
+        window.on_next_frame(move |window, cx| {
+            view.update(cx, |view, cx| view.focus_initial(window, cx));
+        });
+        self.message_schedule_editor = Some(editor);
         cx.notify();
     }
 
+    /// Releases the editor the popover was showing. Dismissal is not a decision:
+    /// the value the target already holds is left untouched.
+    fn close_message_schedule_editor(
+        &mut self,
+        target: &MessageScheduleTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.message_schedule_editor.take() else {
+            return;
+        };
+        if editor.target() != target {
+            self.message_schedule_editor = Some(editor);
+            return;
+        }
+        // A queued message stops waiting out the edit, so the queue can move on
+        // without another click.
+        if let MessageScheduleTarget::Queued(id) = target
+            && let Some(session_id) = self
+                .composer_queue
+                .iter()
+                .find(|message| message.id == *id)
+                .map(|message| message.session_id.clone())
+        {
+            self.mark_composer_queue_for_recheck(&session_id);
+        }
+        cx.notify();
+    }
+
+    /// The clock button and the popover that carries its schedule editor.
+    ///
+    /// The surface is the smallest one that fits the decision: it opens next to
+    /// the control the reader pressed, leaves the conversation and the Composer
+    /// usable, and closes on Escape or a click elsewhere without applying
+    /// anything.
     pub(super) fn render_message_schedule_button(
         &self,
         target: MessageScheduleTarget,
@@ -528,24 +650,59 @@ impl VibexWorkbench {
             || label.to_string(),
             |schedule| format!("{label} {}", schedule.summary()),
         );
-        button_with_aria_label(
-            Button::new(id)
+        let trigger = button_with_aria_label(
+            Button::new(id.clone())
                 .small()
                 .ghost()
                 .compact()
                 .icon(sidebar_icon(CLOCK_ICON))
-                .selected(
-                    schedule.is_some()
-                        || self.message_schedule_dialog_target.as_ref() == Some(&target),
-                )
+                // Open is the popover's own state, and a target that carries a
+                // schedule stays marked while its panel is closed.
+                .selected(schedule.is_some())
                 .tooltip(tooltip)
-                .disabled(!enabled)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_message_schedule(target.clone(), window, cx)
-                })),
+                .disabled(!enabled),
             label,
-        )
-        .into_any_element()
+        );
+        let open_target = target.clone();
+        let submit_workbench = cx.weak_entity();
+        let apply: MessageScheduleApply = Rc::new(move |schedule, window, cx| {
+            submit_workbench
+                .update(cx, |this, cx| {
+                    this.apply_message_schedule(&open_target, schedule, window, cx);
+                })
+                .is_ok()
+        });
+        let clearable = schedule.is_some();
+        let editor = self
+            .message_schedule_editor
+            .as_ref()
+            .filter(|editor| editor.target() == &target)
+            .map(|editor| editor.view.clone());
+        let content_target = target.clone();
+        let content_apply = apply.clone();
+        Popover::new(id)
+            .anchor(Anchor::BottomRight)
+            .offset(px(8.0))
+            .overlay_closable(true)
+            .trigger(trigger)
+            .on_open_change(cx.listener(move |this, open: &bool, window, cx| {
+                if *open {
+                    this.open_message_schedule_editor(content_target.clone(), window, cx);
+                } else {
+                    this.close_message_schedule_editor(&content_target, cx);
+                }
+            }))
+            .content(move |_state, _window, cx| {
+                let Some(view) = editor.clone() else {
+                    return div().into_any_element();
+                };
+                let state = cx.entity();
+                let dismiss: MessageScheduleDismiss = Rc::new(move |window, cx| {
+                    state.update(cx, |state, cx| state.dismiss(window, cx));
+                });
+                render_message_schedule_panel(view, clearable, content_apply.clone(), dismiss)
+            })
+            .into_any_element()
     }
 
     pub(super) fn next_scheduled_message_at(&self, session_id: &VibexSessionId) -> Option<i64> {
@@ -589,7 +746,10 @@ impl VibexWorkbench {
                 .session_views
                 .values()
                 .any(|view| view.composer_queue_editing_id == Some(id))
-            || self.message_schedule_dialog_target == Some(MessageScheduleTarget::Queued(id))
+            || self
+                .message_schedule_editor
+                .as_ref()
+                .is_some_and(|editor| editor.target() == &MessageScheduleTarget::Queued(id))
     }
 
     pub(super) fn start_message_schedule_timer(
@@ -610,6 +770,10 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
+                    // The handle is released in the same update that finds
+                    // nothing left to wait for, so the field never points at a
+                    // task that has already decided to stop: a schedule armed
+                    // later either joins a running timer or starts one.
                     let keep_running = entity
                         .update_in(cx, |this, window, cx| {
                             this.dispatch_due_messages(unix_timestamp_ms(), window, cx);
@@ -619,6 +783,8 @@ impl VibexWorkbench {
                                 .any(|message| message.scheduled_at_ms.is_some());
                             if pending {
                                 cx.notify();
+                            } else {
+                                this.message_schedule_task = None;
                             }
                             pending
                         })
@@ -627,7 +793,6 @@ impl VibexWorkbench {
                         break;
                     }
                 }
-                let _ = entity.update_in(cx, |this, _, _| this.message_schedule_task = None);
             },
         ));
     }

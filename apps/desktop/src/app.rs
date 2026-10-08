@@ -18,7 +18,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[path = "message_schedule.rs"]
 mod message_schedule;
-use message_schedule::{MessageSchedule, MessageScheduleTarget};
+use message_schedule::{MessageSchedule, MessageScheduleEditor, MessageScheduleTarget};
 #[path = "timeline_activity.rs"]
 mod timeline_activity;
 #[path = "timeline_disclosure.rs"]
@@ -6164,9 +6164,20 @@ fn composer_queue_session_blocks_dispatch(
     session_state: Option<AgentSessionState>,
 ) -> bool {
     let session_blocks = match behavior {
-        ComposerQueueDispatchBehavior::Scheduled => !matches!(
+        // A schedule is a promise about a moment in time, so only a turn that
+        // is actually occupying the Agent — or a session that can no longer
+        // take work — may hold it back. `Initializing` and an unknown snapshot
+        // are not work in progress: a deferred new session waits in exactly
+        // that state until its first message is submitted, and treating it as
+        // busy stranded the very message that would start it.
+        ComposerQueueDispatchBehavior::Scheduled => matches!(
             session_state,
-            Some(AgentSessionState::Idle | AgentSessionState::Error)
+            Some(
+                AgentSessionState::Running
+                    | AgentSessionState::NeedsInput
+                    | AgentSessionState::Closed
+                    | AgentSessionState::Archived
+            )
         ),
         ComposerQueueDispatchBehavior::AfterInterrupt => false,
         ComposerQueueDispatchBehavior::AfterCompletion => {
@@ -7512,7 +7523,10 @@ pub struct VibexWorkbench {
     runtime_choice_menu_open: Option<String>,
     new_session_command_entry: Option<AgentCommandEntry>,
     new_session_schedule: Option<MessageSchedule>,
-    message_schedule_dialog_target: Option<MessageScheduleTarget>,
+    /// The schedule popover currently mounted for one Composer target. The
+    /// editor lives here, not in the popover's element state, so the picker's
+    /// calendar and countdown inputs survive the surface's own re-renders.
+    message_schedule_editor: Option<MessageScheduleEditor>,
     message_schedule_task: Option<Task<()>>,
     composer_queue: Vec<ComposerQueueMessage>,
     composer_queue_serial: u64,
@@ -8450,7 +8464,7 @@ impl VibexWorkbench {
             runtime_choice_menu_open: None,
             new_session_command_entry: None,
             new_session_schedule: None,
-            message_schedule_dialog_target: None,
+            message_schedule_editor: None,
             message_schedule_task: None,
             composer_queue: Vec::new(),
             composer_queue_serial: 0,

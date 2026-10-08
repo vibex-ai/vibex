@@ -130,7 +130,7 @@ fn deadlines_do_not_block_ready_messages_or_leak_between_sessions() {
 }
 
 #[test]
-fn due_messages_wait_for_editing_and_for_running_or_initializing_sessions() {
+fn due_messages_wait_for_editing_and_for_a_busy_or_finished_session() {
     let session = VibexSessionId::new();
     let queue = vec![queued(1, &session, Some(1_000))];
     assert_eq!(
@@ -155,26 +155,41 @@ fn due_messages_wait_for_editing_and_for_running_or_initializing_sessions() {
         ),
         Some(0)
     );
+    // A deferred new session reports `Initializing` — and a session the desktop
+    // has not loaded yet reports nothing — until its first message is
+    // submitted. Neither is work in progress, so neither may strand the
+    // schedule that would start it.
     for state in [
         None,
         Some(AgentSessionState::Initializing),
+        Some(AgentSessionState::Idle),
+        Some(AgentSessionState::Error),
+    ] {
+        assert!(
+            !composer_queue_session_blocks_dispatch(
+                ComposerQueueDispatchBehavior::Scheduled,
+                false,
+                state
+            ),
+            "{state:?}"
+        );
+    }
+    for state in [
         Some(AgentSessionState::Running),
         Some(AgentSessionState::NeedsInput),
         Some(AgentSessionState::Closed),
         Some(AgentSessionState::Archived),
     ] {
-        assert!(composer_queue_session_blocks_dispatch(
-            ComposerQueueDispatchBehavior::Scheduled,
-            false,
-            state
-        ));
+        assert!(
+            composer_queue_session_blocks_dispatch(
+                ComposerQueueDispatchBehavior::Scheduled,
+                false,
+                state
+            ),
+            "{state:?}"
+        );
     }
     for state in [AgentSessionState::Idle, AgentSessionState::Error] {
-        assert!(!composer_queue_session_blocks_dispatch(
-            ComposerQueueDispatchBehavior::Scheduled,
-            false,
-            Some(state)
-        ));
         assert!(composer_queue_session_blocks_dispatch(
             ComposerQueueDispatchBehavior::Scheduled,
             true,
@@ -225,36 +240,62 @@ fn empty_scheduled_drafts_survive_switches_and_are_consumed_with_the_message() {
     assert!(drafts.get("second").is_none());
 }
 
-struct ScheduleDialogHost {
+/// Stands in for the Composer's clock button: one trigger, one popover, one
+/// editor created with it — the wiring `render_message_schedule_button`
+/// installs around the shared panel.
+struct SchedulePopoverHost {
     results: Rc<RefCell<Vec<Option<MessageSchedule>>>>,
     closed: Rc<Cell<usize>>,
-    picker: Option<Entity<MessageSchedulePicker>>,
+    /// Whether the target already carries a schedule, which is what the clear
+    /// action needs to be about.
+    clearable: Rc<Cell<bool>>,
+    editor: Option<MessageScheduleEditor>,
 }
 
-impl Render for ScheduleDialogHost {
+impl Render for SchedulePopoverHost {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(
-            div().debug_selector(|| "open-schedule".into()).child(
+        let editor = self.editor.as_ref().map(|editor| editor.view.clone());
+        let clearable = self.clearable.get();
+        let applied = self.results.clone();
+        let apply: MessageScheduleApply = Rc::new(move |schedule, _, _| {
+            applied.borrow_mut().push(schedule);
+            true
+        });
+        Popover::new("schedule-popover")
+            .trigger(
                 Button::new("open-schedule")
-                    .label("Schedule…")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let results = this.results.clone();
-                        let closed = this.closed.clone();
-                        this.picker = Some(MessageSchedulePicker::open(
-                            Some(MessageSchedule::After(60)),
-                            true,
-                            move |schedule, _, _| {
-                                results.borrow_mut().push(schedule);
-                                true
-                            },
-                            move |_| closed.set(closed.get() + 1),
-                            window,
-                            cx,
-                        ));
-                        cx.notify();
-                    })),
-            ),
-        )
+                    .debug_selector(|| "open-schedule".into())
+                    .label("Schedule…"),
+            )
+            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                if *open {
+                    this.editor = Some(MessageScheduleEditor::new(
+                        MessageScheduleTarget::NewSession,
+                        Some(MessageSchedule::After(60)),
+                        window,
+                        cx,
+                    ));
+                    let view = this.editor.as_ref().unwrap().view.clone();
+                    window.on_next_frame(move |window, cx| {
+                        view.update(cx, |view, cx| view.focus_initial(window, cx));
+                    });
+                    cx.notify();
+                } else if this.editor.take().is_some() {
+                    this.closed.set(this.closed.get() + 1);
+                    cx.notify();
+                }
+            }))
+            .content(move |_state, _window, cx| {
+                let Some(view) = editor.clone() else {
+                    return div().into_any_element();
+                };
+                let state = cx.entity();
+                let dismiss: MessageScheduleDismiss = Rc::new(move |window, cx| {
+                    state.update(cx, |state, cx| state.dismiss(window, cx));
+                });
+                render_message_schedule_panel(view, clearable, apply.clone(), dismiss)
+            })
+            .into_any_element()
     }
 }
 
@@ -270,65 +311,81 @@ fn draw_frames(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
-fn schedule_dialog_keeps_invalid_input_and_confirms_once_from_the_keyboard(
-    cx: &mut TestAppContext,
-) {
+fn schedule_popover_keeps_invalid_input_and_confirms_from_the_keyboard(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
         cx.set_reduce_motion(true);
     });
     let results = Rc::new(RefCell::new(Vec::new()));
     let closed = Rc::new(Cell::new(0));
+    let clearable = Rc::new(Cell::new(false));
     let mut host = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
-        let view = cx.new(|_| ScheduleDialogHost {
+        let view = cx.new(|_| SchedulePopoverHost {
             results: results.clone(),
             closed: closed.clone(),
-            picker: None,
+            clearable: clearable.clone(),
+            editor: None,
         });
         host = Some(view.clone());
         Root::new(view, window, cx)
     });
     let host = host.unwrap();
+    let editor = |host: &Entity<SchedulePopoverHost>, cx: &VisualTestContext| {
+        host.read_with(cx, |host, _| {
+            host.editor
+                .as_ref()
+                .expect("the popover owns an editor while it is open")
+                .view
+                .clone()
+        })
+    };
     draw_frames(cx);
     let trigger = cx.debug_bounds("open-schedule").unwrap();
     cx.simulate_click(trigger.center(), Modifiers::none());
     draw_frames(cx);
-    let picker = host.read_with(cx, |host, _| host.picker.clone().unwrap());
-    // The dialog focuses and selects the minutes field after it mounts.
+    // The editor mounts with the surface and focuses the minutes field.
+    let view = editor(&host, cx);
     cx.update(|window, cx| {
-        assert!(picker.read(cx).minutes.focus_handle(cx).is_focused(window));
+        assert!(view.read(cx).minutes.focus_handle(cx).is_focused(window));
     });
     cx.simulate_input("0");
-    picker.read_with(cx, |picker, cx| {
-        assert_eq!(picker.minutes.read(cx).value().as_ref(), "0");
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.minutes.read(cx).value().as_ref(), "0");
     });
+    // A zero countdown is rejected in place: the surface stays open and keeps
+    // what was typed.
     cx.simulate_keystrokes("enter");
     draw_frames(cx);
     assert!(results.borrow().is_empty());
     assert_eq!(closed.get(), 0);
-    picker.read_with(cx, |picker, cx| {
-        assert!(picker.error.is_some());
-        assert_eq!(picker.minutes.read(cx).value().as_ref(), "0");
+    assert!(cx.debug_bounds("message-schedule-error").is_some());
+    view.read_with(cx, |view, cx| {
+        assert!(view.error.is_some());
+        assert_eq!(view.minutes.read(cx).value().as_ref(), "0");
     });
     cx.simulate_keystrokes("secondary-a");
     cx.simulate_input("2");
     cx.simulate_keystrokes("enter");
     draw_frames(cx);
     assert_eq!(*results.borrow(), vec![Some(MessageSchedule::After(120))]);
-    assert_eq!(closed.get(), 1);
+    assert_eq!(closed.get(), 1, "confirming closes the popover");
+    assert!(host.read_with(cx, |host, _| host.editor.is_none()));
 
+    // A draft without a schedule offers nothing to clear; switching modes and
+    // dismissing changes nothing.
     cx.simulate_click(trigger.center(), Modifiers::none());
     draw_frames(cx);
     let date_tab = cx.debug_bounds("schedule-date-mode").unwrap();
     cx.simulate_click(date_tab.center(), Modifiers::none());
     draw_frames(cx);
-    let picker = host.read_with(cx, |host, _| host.picker.clone().unwrap());
-    assert!(!picker.read_with(cx, |picker, _| picker.countdown));
+    let view = editor(&host, cx);
+    assert!(!view.read_with(cx, |view, _| view.countdown));
+    assert!(cx.debug_bounds("clear-message-schedule").is_none());
     let countdown_tab = cx.debug_bounds("schedule-countdown-mode").unwrap();
     cx.simulate_click(countdown_tab.center(), Modifiers::none());
     draw_frames(cx);
-    assert!(picker.read_with(cx, |picker, _| picker.countdown));
+    assert!(view.read_with(cx, |view, _| view.countdown));
     cx.simulate_keystrokes("escape");
     draw_frames(cx);
     assert_eq!(
@@ -338,6 +395,8 @@ fn schedule_dialog_keeps_invalid_input_and_confirms_once_from_the_keyboard(
     );
     assert_eq!(closed.get(), 2);
 
+    // With a schedule in place, clearing voids it and keeps the message.
+    clearable.set(true);
     cx.simulate_click(trigger.center(), Modifiers::none());
     draw_frames(cx);
     let clear = cx.debug_bounds("clear-message-schedule").unwrap();
@@ -347,9 +406,70 @@ fn schedule_dialog_keeps_invalid_input_and_confirms_once_from_the_keyboard(
         *results.borrow(),
         vec![Some(MessageSchedule::After(120)), None]
     );
+    assert_eq!(closed.get(), 3);
+
+    // The panel's own button confirms as well, and the countdown the editor
+    // opens with is the one it submits.
+    cx.simulate_click(trigger.center(), Modifiers::none());
+    draw_frames(cx);
+    let confirm = cx.debug_bounds("confirm-message-schedule").unwrap();
+    cx.simulate_click(confirm.center(), Modifiers::none());
+    draw_frames(cx);
     assert_eq!(
-        closed.get(),
-        3,
-        "removing a schedule releases the dialog target"
+        *results.borrow(),
+        vec![
+            Some(MessageSchedule::After(120)),
+            None,
+            Some(MessageSchedule::After(60))
+        ]
+    );
+    assert_eq!(closed.get(), 4);
+}
+
+/// The schedule surface is the smallest one that fits the decision: a popover
+/// anchored to the clock button, not the modal dialog it replaced. The panel
+/// takes the inline calendar's own width — seven `size_7` day columns and their
+/// `gap_0p5` gaps add up to 13rem — so the tabs, the time row and the footer
+/// share one spine at every interface font size.
+#[test]
+fn the_schedule_surface_is_a_popover_sized_to_its_calendar() {
+    let source = include_str!("message_schedule.rs");
+    assert!(
+        !source.contains(".open_dialog("),
+        "the schedule editor must not own a modal surface"
+    );
+    assert!(source.contains("Popover::new(id)"));
+    assert!(source.contains("const MESSAGE_SCHEDULE_PANEL_REM: f32 = 13.0;"));
+    assert!(source.contains(".w(gpui::rems(MESSAGE_SCHEDULE_PANEL_REM))"));
+    assert!(
+        !source.contains("MESSAGE_SCHEDULE_CALENDAR_WIDTH"),
+        "a second width literal would drift from the day grid it is meant to match"
+    );
+}
+
+/// The schedule timer releases its own handle in the update that finds nothing
+/// left to wait for, so the workbench never carries a handle to a task that has
+/// already decided to stop.
+#[test]
+fn the_schedule_timer_releases_its_handle_where_it_stops() {
+    let source = include_str!("message_schedule.rs");
+    let timer = source
+        .split_once("    pub(super) fn start_message_schedule_timer(")
+        .and_then(|(_, tail)| tail.split_once("\n    fn dispatch_due_messages("))
+        .map(|(body, _)| body)
+        .expect("the schedule timer should remain inspectable");
+    let pending = timer
+        .find("let pending = this")
+        .expect("the timer should decide from the schedules still waiting");
+    let release = timer
+        .find("this.message_schedule_task = None;")
+        .expect("the timer should release its handle");
+    assert!(
+        pending < release,
+        "the handle is released in the same update that finds nothing pending"
+    );
+    assert!(
+        !timer.contains("|this, _, _| this.message_schedule_task = None"),
+        "a second update outside the loop describes a decision already made"
     );
 }

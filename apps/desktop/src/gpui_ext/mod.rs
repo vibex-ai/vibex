@@ -9,7 +9,7 @@ use gpui::{
     MouseButton, ParentElement as _, Pixels, RenderOnce, SharedString, StatefulInteractiveElement,
     Styled, Window, WindowAppearance, div, px,
 };
-use gpui_base::{SelectableText, TextSelectionHandle};
+use gpui_base::{Selectable, SelectableText, TextSelectionHandle};
 use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -20,8 +20,14 @@ use vibex_desktop_runtime::validate_external_open_url;
 
 use crate::platform::open_external_url;
 
+/// An icon button that carries an accessible name.
+///
+/// GPUI attaches `aria_label` in the stateful layer, which `Button` does not
+/// implement, so a button that shows only an icon is wrapped here. The wrapper
+/// forwards the interactivity a trigger needs — including its selected state,
+/// which is what tells a Popover the panel it owns is open.
 #[derive(IntoElement)]
-struct AccessibleButton(Button);
+pub struct AccessibleButton(Button);
 
 impl InteractiveElement for AccessibleButton {
     fn interactivity(&mut self) -> &mut Interactivity {
@@ -31,13 +37,33 @@ impl InteractiveElement for AccessibleButton {
 
 impl StatefulInteractiveElement for AccessibleButton {}
 
+impl Selectable for AccessibleButton {
+    fn selected(mut self, selected: bool) -> Self {
+        self.0 = self.0.selected(selected);
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.0.is_selected()
+    }
+
+    fn open(mut self, open: bool) -> Self {
+        self.0 = self.0.open(open);
+        self
+    }
+
+    fn is_open(&self) -> bool {
+        self.0.is_open()
+    }
+}
+
 impl RenderOnce for AccessibleButton {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         self.0
     }
 }
 
-pub fn button_with_aria_label(button: Button, label: impl Into<SharedString>) -> impl IntoElement {
+pub fn button_with_aria_label(button: Button, label: impl Into<SharedString>) -> AccessibleButton {
     AccessibleButton(button).aria_label(label)
 }
 
