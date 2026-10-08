@@ -34,7 +34,13 @@ vibex-terminal-ui = { path = "../../crates/vibex-terminal-ui" }
 vibex-ui = { path = "../../crates/vibex-ui" }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245" }
+# `gpui-pre-mobile` must build against the `gpui-pre` 0.3.8 that gpui-kit 0.7.1
+# pins, and Cargo cannot hold two exact pins in the same 0.3 range. Upstream's
+# tip (9075e3a) still requires `=0.3.7`, so the pin names the revision that
+# carries the bump: upstream 9075e3a plus the four version strings and one
+# `RequestFrameOptions` literal that gained `..Default::default()`. Move the pin
+# back to `longbridge/gpui-mobile` once upstream publishes 0.3.8.
+gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/Bombatomica64/gpui-mobile", rev = "133337130c08ebc2db0622549b9fb1137b46638f" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # `gpui-pre-mobile` links `android-activity`'s NativeActivity glue into the

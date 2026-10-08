@@ -73,8 +73,8 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
   assert(manifest.includes('crate-type = ["cdylib", "staticlib", "rlib"]'), "native_mobile_crate_types_invalid");
   assert(manifest.includes('gpui-mobile = { package = "gpui-pre-mobile"'), "mobile_gpui_pre_mobile_dependency_missing");
-  assert(manifest.includes("longbridge/gpui-mobile"), "mobile_gpui_pre_mobile_source_missing");
-  assert(manifest.includes('rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245"'), "mobile_gpui_pre_mobile_revision_missing");
+  assert(manifest.includes("Bombatomica64/gpui-mobile"), "mobile_gpui_pre_mobile_source_missing");
+  assert(manifest.includes('rev = "133337130c08ebc2db0622549b9fb1137b46638f"'), "mobile_gpui_pre_mobile_revision_missing");
   assert(!manifest.includes("vendor/zed"), "mobile_vendor_zed_dependency_present");
   assert(manifest.includes('rustls-platform-verifier = "0.7"'), "android_tls_platform_verifier_dependency_missing");
   assert(workspace.includes('webpki-root-certs = "1"'), "android_webpki_root_workspace_dependency_missing");
