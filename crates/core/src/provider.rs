@@ -2842,8 +2842,7 @@ pub struct AdapterDiagnostic {
 mod tests {
     use super::{
         AgentModelProviderDraftFetchModelsRequest, ProviderConfiguredModel, ProviderKind,
-        ProviderModelWireApi, ProviderProfile, ProviderProfileStatus,
-        ProviderReasoningEffortLevel,
+        ProviderModelWireApi, ProviderProfile, ProviderProfileStatus, ProviderReasoningEffortLevel,
     };
 
     /// The typed key has to travel (the endpoint is asked with it) but must never
