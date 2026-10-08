@@ -569,6 +569,9 @@ const AGENT_TIMELINE_IDLE_POLL_THRESHOLD: u16 = 4;
 const AGENT_TIMELINE_IDLE_POLL_MAX_MS: u64 = 2_000;
 const AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH: f32 = 18.0;
 const AGENT_TURN_PREVIEW_RAIL_WIDTH: f32 = 35.2;
+/// Gap the pinned rail leaves between its lines and the content column that
+/// follows them.
+const AGENT_TURN_PREVIEW_RAIL_CONTENT_GAP_PX: f32 = 8.0;
 const AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT: f32 = 12.0;
 const AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS: usize = 180;
 const AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES: usize = 8 * 1024;
@@ -592,7 +595,13 @@ const AGENT_PERMISSION_REVEAL_AIM: f32 = 0.0;
 /// window's rem size. The list's `py_4` resolves to one rem.
 const AGENT_TIMELINE_LIST_PADDING_TOP_PX: f32 = 16.0;
 /// Horizontal padding of the virtual timeline list (`px_4`), on each side.
+/// Every session content column keeps it, whatever cap the session sets, so a
+/// full-width session is inset too rather than painted edge to edge.
 const AGENT_TIMELINE_LIST_PADDING_X_PX: f32 = 16.0;
+/// The narrowest content column that still keeps the session gutters. A pane
+/// under this hands the inset back to the content, and a rail-enabled session
+/// reveals its rail on hover instead of pinning it.
+const AGENT_SESSION_CONTENT_MIN_WIDTH_PX: f32 = 360.0;
 /// Share of a timeline row a user message column occupies.
 const USER_MESSAGE_COLUMN_WIDTH_RATIO: f32 = 0.78;
 /// The pill's horizontal padding (`px(14)`) plus its 1px library border.
@@ -2776,6 +2785,67 @@ fn session_content_max_width(mode: SessionContentWidthMode) -> Option<f32> {
     }
 }
 
+/// The horizontal insets one session surface keeps between its content columns
+/// and the pane edges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SessionContentInsets {
+    /// Inset from each pane edge. Both sides match, so the content column stays
+    /// centered in its pane whichever cap the session sets, and the rail lives
+    /// inside the left one.
+    horizontal: f32,
+    /// Whether the turn preview rail fits inside the left inset and therefore
+    /// stays visible instead of revealing itself on hover.
+    rail_pinned: bool,
+}
+
+/// Resolves the session content insets for a pane.
+///
+/// A rail-enabled session reserves the rail's lane in both insets: the rail
+/// takes the left one, and the content column stays centered instead of drifting
+/// right. Both insets are given back — the rail with them, which then reveals on
+/// hover from the pane edge — as soon as the content column would fall under
+/// [`AGENT_SESSION_CONTENT_MIN_WIDTH_PX`], and the base inset follows when even
+/// that does not fit. A full-width session is inset exactly like a capped one,
+/// which is what keeps every content width mode off the pane edge.
+fn session_content_insets(
+    pane_width: Option<f32>,
+    inset: f32,
+    rail_enabled: bool,
+) -> SessionContentInsets {
+    let inset = if inset.is_finite() && inset > 0.0 {
+        inset
+    } else {
+        AGENT_TIMELINE_LIST_PADDING_X_PX
+    };
+    let rail_inset =
+        (AGENT_TURN_PREVIEW_RAIL_WIDTH + AGENT_TURN_PREVIEW_RAIL_CONTENT_GAP_PX).max(inset);
+    let Some(pane_width) = pane_width.filter(|width| width.is_finite() && *width > 0.0) else {
+        // Before the first layout reports the pane, assume the comfortable case:
+        // the first paint then matches the one after it instead of flashing an
+        // edge-to-edge column.
+        return SessionContentInsets {
+            horizontal: if rail_enabled { rail_inset } else { inset },
+            rail_pinned: rail_enabled,
+        };
+    };
+    if rail_enabled && pane_width >= rail_inset * 2.0 + AGENT_SESSION_CONTENT_MIN_WIDTH_PX {
+        SessionContentInsets {
+            horizontal: rail_inset,
+            rail_pinned: true,
+        }
+    } else if pane_width >= inset * 2.0 + AGENT_SESSION_CONTENT_MIN_WIDTH_PX {
+        SessionContentInsets {
+            horizontal: inset,
+            rail_pinned: false,
+        }
+    } else {
+        SessionContentInsets {
+            horizontal: 0.0,
+            rail_pinned: false,
+        }
+    }
+}
+
 /// The row's content box after the list's rem-scaled inset and session cap.
 /// Pane resizing above the cap changes centering, but cannot change wrapping.
 fn timeline_content_width(
@@ -2801,15 +2871,22 @@ fn timeline_content_width(
 /// and the painted wrap at one width, which is what the cap guarantees: the
 /// body's width is `min(max-content, cap)` in every pass.
 ///
+/// The row sits inside `inset` on each side, so the cap has to be taken from the
+/// same content box the row is painted in — see
+/// [`session_content_insets`].
+///
 /// `None` means the width is unknown — the timeline has not reported its first
 /// layout yet, or the child-agent panel owns its own width — and the body stays
 /// unconstrained, exactly as it was before the cap existed.
-fn user_message_body_max_width(timeline_width: f32, content_max_width: Option<f32>) -> Option<f32> {
+fn user_message_body_max_width(
+    timeline_width: f32,
+    content_max_width: Option<f32>,
+    inset: f32,
+) -> Option<f32> {
     if !timeline_width.is_finite() || timeline_width <= 0.0 {
         return None;
     }
-    let row_width = (timeline_width - AGENT_TIMELINE_LIST_PADDING_X_PX * 2.0)
-        .min(content_max_width.unwrap_or(f32::INFINITY));
+    let row_width = (timeline_width - inset * 2.0).min(content_max_width.unwrap_or(f32::INFINITY));
     // One pixel of slack keeps the cap inside the content box once taffy
     // rounds the fractional percentage widths on the way down.
     let body_width =
@@ -43628,9 +43705,17 @@ impl VibexWorkbench {
         }
     }
 
+    /// Renders the conversation turn preview rail.
+    ///
+    /// `pinned` means the pane's left gutter is wide enough to hold the rail:
+    /// the rail then stays on screen as a reading aid, and only its preview
+    /// card still answers the pointer. Without that gutter the rail falls back
+    /// to revealing itself from the pane edge, which is the only place left for
+    /// it.
     fn render_agent_turn_preview_rail(
         &mut self,
         turns: &[Rc<TimelineConversationTurn>],
+        pinned: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let locale = self.resolved_locale();
@@ -43656,11 +43741,12 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhTw => "空訊息",
         };
 
-        // The rail only mounts its list while hovered, so building a preview card
-        // per turn on every frame would scale the frame cost with conversation
-        // length for something that is not on screen. Continuation turns never
-        // open a slot: the rail numbers only the user turns that own them.
-        let rail_entries = if self.turn_preview_rail_visible {
+        // The rail only builds its entries while it is on screen, so a revealed
+        // one does not scale the frame cost with conversation length before the
+        // pointer reaches it. Continuation turns never open a slot: the rail
+        // numbers only the user turns that own them.
+        let rail_revealed = pinned || self.turn_preview_rail_visible;
+        let rail_entries = if rail_revealed {
             agent_turn_preview_rail_entries(turns)
         } else {
             Vec::new()
@@ -43869,7 +43955,9 @@ impl VibexWorkbench {
             .justify_center()
             .gap_0()
             .children(items);
-        let list = if reduced_motion {
+        // A pinned rail is a standing surface, not a reveal: it is on screen
+        // from the first frame, so only the hover-revealed one animates in.
+        let list = if reduced_motion || pinned {
             list.into_any_element()
         } else {
             Transition::new(AGENT_TURN_PREVIEW_RAIL_TRANSITION_DURATION)
@@ -43899,21 +43987,26 @@ impl VibexWorkbench {
                     this.handle_turn_preview_rail_hover(*hovered, cx)
                 }),
             )
-            .child(
-                div()
-                    .id("agent-turn-preview-edge-trigger")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left_0()
-                    .w(px(AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH))
-                    .on_hover(cx.listener(|this, hovered, _, cx| {
-                        if *hovered {
-                            this.show_turn_preview_rail(cx);
-                        }
-                    })),
-            )
-            .when(self.turn_preview_rail_visible, |this| {
+            // The edge trigger is the hover reveal's own affordance. A pinned
+            // rail is already up, so the strip would only add a dead hover
+            // target over the content's gutter.
+            .when(!pinned, |this| {
+                this.child(
+                    div()
+                        .id("agent-turn-preview-edge-trigger")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH))
+                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                            if *hovered {
+                                this.show_turn_preview_rail(cx);
+                            }
+                        })),
+                )
+            })
+            .when(rail_revealed, |this| {
                 this.child(
                     div()
                         .absolute()
@@ -43987,6 +44080,10 @@ impl VibexWorkbench {
         let rendered_row_sizes = row_sizes.clone();
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        // The same insets keep the timeline, the composer and the banners
+        // between them on one spine: the pane's gutter, widened on both sides
+        // when the preview rail is pinned inside the left one.
+        let content_insets = self.session_content_insets();
         // The live view owns the session, not the selection: a group pane
         // renders another session's runtime controls while the selection still
         // names the focused pane.
@@ -44012,7 +44109,9 @@ impl VibexWorkbench {
             && turns
                 .iter()
                 .any(|turn| agent_turn_preview_rail_numbers_turn(turn)))
-        .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
+        .then(|| {
+            self.render_agent_turn_preview_rail(turns.as_slice(), content_insets.rail_pinned, cx)
+        });
         let timeline_layout_entity = cx.weak_entity();
         // Prepaint runs after the whole element tree is built, so by then the
         // borrowed view may already belong to another pane. Carry the measured
@@ -44208,7 +44307,7 @@ impl VibexWorkbench {
                             )
                             .size_full()
                             .track_scroll(&self.timeline_scroll)
-                            .px_4()
+                            .px(px(content_insets.horizontal))
                             .py_4()
                             .gap_0(),
                         )
@@ -44323,7 +44422,7 @@ impl VibexWorkbench {
                                 .w_full()
                                 .flex_none()
                                 .justify_center()
-                                .px_4()
+                                .px(px(content_insets.horizontal))
                                 .pt_2()
                                 .child(
                                     h_flex()
@@ -44513,12 +44612,14 @@ impl VibexWorkbench {
         let show_cancel = state.pending_switch_id.is_some();
         let can_reset = state.desired != state.effective;
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        // The banner shares the content spine with the timeline it sits above.
+        let content_insets = self.session_content_insets();
 
         h_flex()
             .w_full()
             .flex_none()
             .justify_center()
-            .px_4()
+            .px(px(content_insets.horizontal))
             .pt_2()
             .child(
                 h_flex()
@@ -45371,6 +45472,7 @@ impl VibexWorkbench {
             .composer_terminal_height
             .clamp(min_terminal_height, max_terminal_height);
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        let content_insets = self.session_content_insets();
         let resize_handle = if self.composer_terminal_expanded {
             None
         } else {
@@ -45386,7 +45488,7 @@ impl VibexWorkbench {
             })
             .items_center()
             .bg(cx.theme().background)
-            .px_4()
+            .px(px(content_insets.horizontal))
             .py_2()
             .when_some(resize_handle, |this, handle| this.child(handle))
             .child(
@@ -48229,15 +48331,29 @@ impl VibexWorkbench {
             .map(|item| item.timestamp_ms)
     }
 
+    /// The horizontal insets this view's session content keeps from the pane
+    /// edges.
+    ///
+    /// The pane width comes from the surface's own prepaint, so the timeline
+    /// list, the composer and every content column between them resolve their
+    /// inset from one measurement instead of each guessing its own.
+    fn session_content_insets(&self) -> SessionContentInsets {
+        session_content_insets(
+            self.timeline_layout_width,
+            self.timeline_list_padding_top_px,
+            self.ui_state.session.turn_preview_rail,
+        )
+    }
+
     /// The content box the first-layout estimator sizes its rows against.
     ///
-    /// The last pane width minus the list's `px_4`, limited by the same session
+    /// The last pane width minus the session inset, limited by the same session
     /// cap as the rendered row. Before the first prepaint, use the content cap.
     fn estimated_timeline_content_width(&self) -> f32 {
         timeline_content_width(
             self.timeline_layout_width,
             session_content_max_width(self.ui_state.session.content_width),
-            self.timeline_list_padding_top_px,
+            self.session_content_insets().horizontal,
         )
     }
 
@@ -49254,6 +49370,7 @@ impl VibexWorkbench {
         user_message_body_max_width(
             self.timeline_layout_width?,
             session_content_max_width(self.ui_state.session.content_width),
+            self.session_content_insets().horizontal,
         )
     }
 
@@ -53869,6 +53986,8 @@ impl VibexWorkbench {
         let compact_runtime_controls =
             composer_runtime_controls_are_compact(self.last_visibility.layout.viewport_width);
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        // The composer shares the content spine with the timeline above it.
+        let content_insets = self.session_content_insets();
         let is_dark = cx.theme().is_dark();
         let composer_background = composer_surface_background(is_dark);
         let composer_collaboration = self.render_composer_collaboration(cx);
@@ -54040,7 +54159,7 @@ impl VibexWorkbench {
             .when(self.composer_expanded, |this| this.flex_1().min_h_0())
             .gap_2()
             .items_center()
-            .px_4()
+            .px(px(content_insets.horizontal))
             .py_2()
             .when(self.composer_expanded, |this| this.pt_4())
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -87156,7 +87275,7 @@ mod tests {
         assert!(renderer.contains("icons/vibex/file-code.svg"));
         assert!(renderer.contains("AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT"));
         assert!(renderer.contains("format!(\"+{remaining_file_count}\")"));
-        assert!(renderer.contains("if self.turn_preview_rail_visible"));
+        assert!(renderer.contains("let rail_revealed = pinned || self.turn_preview_rail_visible;"));
         assert!(renderer.contains("let items = rail_entries"));
         assert!(renderer.contains(".max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))"));
         assert!(renderer.contains(".justify_center()"));
@@ -89761,7 +89880,11 @@ mod tests {
         for body in bodies {
             for list_width in [1013.0_f32, 1400.0] {
                 for content_max_width in [None, Some(AGENT_CONTENT_NARROW_MAX_WIDTH)] {
-                    let body_max_width = user_message_body_max_width(list_width, content_max_width);
+                    let body_max_width = user_message_body_max_width(
+                        list_width,
+                        content_max_width,
+                        AGENT_TIMELINE_LIST_PADDING_X_PX,
+                    );
                     let measured_column = Rc::new(Cell::new((0.0, 0.0, 0.0)));
                     let measured_reference = Rc::new(Cell::new(0.0));
                     let column_slot = measured_column.clone();
@@ -89811,7 +89934,8 @@ mod tests {
         let list_width = 1013.0;
         let column =
             (list_width - AGENT_TIMELINE_LIST_PADDING_X_PX * 2.0) * USER_MESSAGE_COLUMN_WIDTH_RATIO;
-        let cap = user_message_body_max_width(list_width, None).expect("timeline width is known");
+        let cap = user_message_body_max_width(list_width, None, AGENT_TIMELINE_LIST_PADDING_X_PX)
+            .expect("timeline width is known");
         assert!(
             cap <= column - USER_MESSAGE_PILL_HORIZONTAL_INSET_PX,
             "cap {cap} must stay inside the pill's content box"
@@ -89819,17 +89943,82 @@ mod tests {
         assert!(cap > 0.0);
 
         // A bounded content width caps the row before the column does.
-        let narrow = user_message_body_max_width(list_width, Some(AGENT_CONTENT_NARROW_MAX_WIDTH))
-            .expect("narrow content width still yields a cap");
+        let narrow = user_message_body_max_width(
+            list_width,
+            Some(AGENT_CONTENT_NARROW_MAX_WIDTH),
+            AGENT_TIMELINE_LIST_PADDING_X_PX,
+        )
+        .expect("narrow content width still yields a cap");
         assert!(narrow < cap);
 
         // No timeline width means no cap: the first frame and the child-agent
         // panel keep the body unconstrained rather than guessing a width.
-        assert_eq!(user_message_body_max_width(0.0, None), None);
-        assert_eq!(user_message_body_max_width(f32::NAN, None), None);
         assert_eq!(
-            user_message_body_max_width(USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX, None),
+            user_message_body_max_width(0.0, None, AGENT_TIMELINE_LIST_PADDING_X_PX),
             None
+        );
+        assert_eq!(
+            user_message_body_max_width(f32::NAN, None, AGENT_TIMELINE_LIST_PADDING_X_PX),
+            None
+        );
+        assert_eq!(
+            user_message_body_max_width(
+                USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX,
+                None,
+                AGENT_TIMELINE_LIST_PADDING_X_PX
+            ),
+            None
+        );
+    }
+
+    /// The session gutters answer to the pane, not to the content cap: every
+    /// width mode keeps them, and only a pane too narrow for the minimum column
+    /// gives them back. A rail-enabled pane pins the preview rail inside the
+    /// left gutter whenever that lane fits, and falls back to the hover reveal
+    /// when it does not.
+    #[test]
+    fn session_content_insets_keep_the_gutters_and_pin_the_rail_only_when_it_fits() {
+        let inset = AGENT_TIMELINE_LIST_PADDING_X_PX;
+        let rail_inset = AGENT_TURN_PREVIEW_RAIL_WIDTH + AGENT_TURN_PREVIEW_RAIL_CONTENT_GAP_PX;
+        let rail_floor = rail_inset * 2.0 + AGENT_SESSION_CONTENT_MIN_WIDTH_PX;
+
+        // A pane wide enough for the rail lane pins the rail inside the left
+        // gutter, and mirrors that gutter on the right so the column stays
+        // centered.
+        let wide = session_content_insets(Some(rail_floor), inset, true);
+        assert_eq!(wide.horizontal, rail_inset);
+        assert!(wide.rail_pinned);
+
+        // One pixel under the rail lane the gutter narrows to the list's own
+        // padding and the rail reveals itself on hover instead.
+        let narrow = session_content_insets(Some(rail_floor - 1.0), inset, true);
+        assert_eq!(narrow.horizontal, inset);
+        assert!(!narrow.rail_pinned);
+
+        // Without the rail the gutter is always the list's own padding.
+        let plain = session_content_insets(Some(rail_floor), inset, false);
+        assert_eq!(plain.horizontal, inset);
+        assert!(!plain.rail_pinned);
+
+        // Under the minimum column the gutter is given back entirely.
+        let tight = session_content_insets(
+            Some(inset * 2.0 + AGENT_SESSION_CONTENT_MIN_WIDTH_PX - 1.0),
+            inset,
+            false,
+        );
+        assert_eq!(tight.horizontal, 0.0);
+        assert!(!tight.rail_pinned);
+
+        // Before the pane reports a width, the first paint assumes the
+        // comfortable case rather than flashing an edge-to-edge column.
+        let unmeasured = session_content_insets(None, inset, true);
+        assert_eq!(unmeasured.horizontal, rail_inset);
+        assert!(unmeasured.rail_pinned);
+
+        // A degenerate inset falls back to the list's own padding.
+        assert_eq!(
+            session_content_insets(Some(rail_floor), f32::NAN, false).horizontal,
+            inset
         );
     }
 
@@ -91922,7 +92111,7 @@ mod tests {
             .expect("the estimator's content box should remain inspectable");
         assert!(content_width.contains("self.timeline_layout_width"));
         assert!(content_width.contains("timeline_content_width("));
-        assert!(content_width.contains("self.timeline_list_padding_top_px"));
+        assert!(content_width.contains("self.session_content_insets().horizontal"));
         assert!(content_width.contains("session_content_max_width("));
 
         let row = source
