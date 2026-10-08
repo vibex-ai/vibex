@@ -1342,6 +1342,14 @@ shape.
 - Large file/screenshot transfer is chunked.
 - Git status/diff can handle large repositories without blocking UI.
 - Provider raw logs are bounded by retention.
+- `NativeBackend::mutate_sidebar_organization` skips session queries for
+  `SetFolderCollapsed`, `SetProjectCollapsed`, `SetWorkspaceCollapsed`, and
+  `SetGroupCollapsed`. These operations only change UI-state flags; listing
+  sessions also computes timeline recency, making each fold pay for history it
+  never uses. Keep revision checks, folder/group validation, atomic persistence,
+  and the post-save snapshot reread. The sidebar backend regression must prove
+  folds persist with session storage unavailable while session mutations still
+  require the authoritative membership lookup.
 
 ## Anti-Patterns
 

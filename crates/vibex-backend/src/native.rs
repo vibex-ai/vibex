@@ -916,7 +916,16 @@ impl SidebarBackend for NativeBackend {
                     "the sidebar changed since this client rendered it",
                 ));
             }
-            let sessions = runtime.agent().list_sessions(false).await?;
+            // Folding only changes UI-state flags. Listing sessions also
+            // scans their timelines for recency, so it must not delay a fold
+            // just to build membership maps the mutation never reads.
+            let sessions = match &mutation {
+                RemoteSidebarOrganizationMutation::SetFolderCollapsed { .. }
+                | RemoteSidebarOrganizationMutation::SetProjectCollapsed { .. }
+                | RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed { .. }
+                | RemoteSidebarOrganizationMutation::SetGroupCollapsed { .. } => Vec::new(),
+                _ => runtime.agent().list_sessions(false).await?,
+            };
             let session_projects = sessions
                 .iter()
                 .map(|session| {
