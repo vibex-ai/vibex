@@ -623,8 +623,8 @@ Desktop process activity uses compact disclosure rows, projected by
 `timeline_activity::Activity` from the row and its latest typed payload. The
 action and target are separate: commands show their invocation, files show a
 basename badge and available diff counts, and plans show completed/total steps.
-Keep the original file path in the tooltip, accessible label, details, and
-operation identity; equal basenames must not merge distinct files. File labels
+Keep the original file path in the accessible label, details, and operation
+identity; equal basenames must not merge distinct files. File labels
 handle both path separators and decode file URI basenames independently of
 the host platform. Use
 `assets::file_icon` with `file_icon_descriptor` so timeline badges and file trees
@@ -645,7 +645,9 @@ measurements as well as turn heights, so cached geometry cannot outlive its
 type scale.
 
 Tool headers use regular-weight, muted text at rest. Their hover feedback
-brightens text and icons without painting a row background. Use
+brightens text and icons without painting a row background or showing a tooltip.
+Enhanced command and file-operation headers also omit hover tooltips; keep full
+invocations and paths in accessible labels and expanded details. Use
 `ButtonCustomVariant::new(cx).foreground(color)` for transparent rest, hover,
 and pressed surfaces, and keyed child elements with `group_hover` for the text
 and icon changes. Do not override the Button's own hover slot. The row owns the

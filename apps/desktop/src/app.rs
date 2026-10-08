@@ -49950,7 +49950,7 @@ impl VibexWorkbench {
                     } else {
                         cx.theme().muted_foreground
                     })
-                    .tooltip(title)
+                    .accessibility_label(title)
                     .child(header)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.capture_timeline_scroll_anchor();
@@ -50083,7 +50083,6 @@ impl VibexWorkbench {
             statistics,
             cx,
         )
-        .tooltip(operation.path.clone())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.capture_timeline_scroll_anchor();
             if let Some(turn_id) = turn_id.as_deref() {

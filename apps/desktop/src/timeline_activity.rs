@@ -316,7 +316,6 @@ pub(super) fn header(
         .justify_start()
         .text_color(color)
         .accessibility_label(status_label(activity.label(), running, activity.failed))
-        .tooltip(activity.label())
         .when_some(open, |this, open| this.toggled(open))
         .child(
             h_flex()
