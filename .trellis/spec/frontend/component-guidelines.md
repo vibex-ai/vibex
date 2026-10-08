@@ -619,14 +619,47 @@ Render Agent activity through provider-neutral cards:
 Cards that can grow large must be collapsible. Tool, diff, terminal, and plan
 cards should support compact summaries for mobile.
 
-Desktop process activity uses compact disclosure rows. Commands show the
-command, files show the operation and filename with diff counts, plans show
-completed/total steps, and activity groups summarize their event categories.
-Successful rows need no repeated completion badge; running, failure and pending
-approval remain explicit. Commentary uses the muted text presentation and the
-final answer uses the normal foreground. A finished answer with no process rows
-has no empty process-duration header. Command approval actions remain reachable
-outside the command's collapsed details.
+Desktop process activity uses compact disclosure rows, projected by
+`timeline_activity::Activity` from the row and its latest typed payload. The
+action and target are separate: commands show their invocation, files show a
+path badge and available diff counts, and plans show completed/total steps.
+Collapsed labels normalize whitespace to one line; expanded details retain the
+original invocation, indentation, and result. Prefer the bounded input/output
+in `AgentEventRawExtension` over an abbreviated summary. Calls without output
+must still disclose their input or tool identity. Tool projections include the
+resolved locale in their cache validity so language changes refresh labels
+without waiting for a new tool event.
+
+Activity rows share one icon column and a stretching connector rail. Their
+headers and expanded details start at the same text column; detail sections
+use bounded monospace bodies and explicit copy actions. Use the module's
+relative header metrics (`ROW_HEIGHT_REM`, `SUMMARY_HEIGHT_REM`) for layout and
+first-height estimates. Window rem or code-font changes invalidate nested unit
+measurements as well as turn heights, so cached geometry cannot outlive its
+type scale.
+
+`ActivitySummary` counts semantic operations and failures from typed status.
+Repeated changes to the same explicitly known file path count once; unknown
+paths remain separate operations. Generic plan tools such as `update_plan`
+belong to planning, even though their name contains an editing verb. Keep the
+group summary muted and mark failures on their own rows. Successful rows need
+no repeated completion badge; running, failure and pending approval remain
+explicit, including a running indication on a collapsed group.
+
+`timeline_activity::group_open(turn, group, explicit)` gives the reader's
+choice precedence. Otherwise, an unfinished turn without a conclusion opens
+its trailing activity group and any earlier group containing an active
+operation; settled groups collapse when commentary follows or the turn ends.
+File-operation detail preferences choose the renderer inside the group rather
+than splitting the activity run. Enhanced command cards retain their separate
+approval surface. The effective group expansion is part of the measured-unit
+revision: an automatic collapse must release the old height even when the
+tool's sequence has not advanced.
+
+Commentary uses the muted text presentation and the final answer uses the
+normal foreground. A finished answer with no process rows has no empty
+process-duration header. Command approval actions remain reachable outside the
+command's collapsed details.
 
 Disclosure headers use the component `Button` for focus and keyboard behavior.
 `timeline_disclosure_progress` uses the framework spring and theme control token,
@@ -644,6 +677,9 @@ disclosure motion may shrink immediately; the streaming text shrink guard must
 not hold a manually closing tool open. Cached unit heights bypass body-based
 estimation. GPUI layout regressions cover repeated open/close without overlap,
 pinned units, first-frame history height, reversal, and settled content resize.
+Activity tests additionally cover semantic counts, exact invocation details,
+automatic versus explicit disclosure state, and pointer/keyboard operation with
+aligned columns at narrow widths and multiple rem sizes.
 
 A reasoning card is the one card that is read while it is still arriving, so its
 body is drawn as a *window* while the Agent is still thinking rather than as a

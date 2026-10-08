@@ -16,6 +16,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+#[path = "timeline_activity.rs"]
+mod timeline_activity;
 #[path = "timeline_disclosure.rs"]
 mod timeline_disclosure;
 #[path = "timeline_loading.rs"]
@@ -4172,13 +4174,13 @@ fn timeline_conversation_turn_resident_bytes(turn: &TimelineConversationTurn) ->
 fn timeline_process_activity_groups_for_display(
     turn: &TimelineConversationTurn,
     enhanced_command_display: bool,
-    enhanced_file_operation_display: bool,
 ) -> &[TimelineProcessActivityGroup] {
-    match (enhanced_command_display, enhanced_file_operation_display) {
-        (true, true) => &turn.process_activity_groups,
-        (false, true) => &turn.process_activity_groups_with_commands,
-        (true, false) => &turn.process_activity_groups_with_file_operations,
-        (false, false) => &turn.process_activity_groups_with_commands_and_file_operations,
+    // File details choose their renderer inside the group; they do not break
+    // the surrounding activity run. Enhanced commands retain their approval card.
+    if enhanced_command_display {
+        &turn.process_activity_groups_with_file_operations
+    } else {
+        &turn.process_activity_groups_with_commands_and_file_operations
     }
 }
 
@@ -19167,7 +19169,6 @@ impl VibexWorkbench {
             for group in timeline_process_activity_groups_for_display(
                 &turn,
                 self.ui_state.session.enhanced_command_execution_display,
-                self.ui_state.session.enhanced_file_operation_display,
             ) {
                 self.timeline_process_unit_heights.remove(&group.id);
             }
@@ -19242,6 +19243,9 @@ impl VibexWorkbench {
         process_expansion: Option<bool>,
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.timeline_list_padding_top_px
+            .to_bits()
+            .hash(&mut hasher);
         let file_changes_present = self
             .timeline_turn_file_changes
             .get(&turn.id)
@@ -19318,6 +19322,9 @@ impl VibexWorkbench {
         process_expansion: Option<bool>,
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.timeline_list_padding_top_px
+            .to_bits()
+            .hash(&mut hasher);
         let process_expanded = timeline_turn_process_expanded(turn, process_expansion);
         let conclusion_visible = timeline_turn_conclusion_row(turn).is_some();
         let file_changes_present = self
@@ -19428,10 +19435,12 @@ impl VibexWorkbench {
                     group.id.hash(&mut hasher);
                     group.start_row.hash(&mut hasher);
                     group.end_row.hash(&mut hasher);
-                    self.timeline_command_expansion
-                        .get(&group.id)
-                        .copied()
-                        .hash(&mut hasher);
+                    timeline_activity::group_open(
+                        turn,
+                        group,
+                        self.timeline_command_expansion.get(&group.id).copied(),
+                    )
+                    .hash(&mut hasher);
                 }
             };
             hash_groups(&turn.process_activity_groups);
@@ -19451,6 +19460,9 @@ impl VibexWorkbench {
         process_expansion: Option<bool>,
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.timeline_list_padding_top_px
+            .to_bits()
+            .hash(&mut hasher);
         turn.complete.hash(&mut hasher);
         turn.superseded.hash(&mut hasher);
         process_expansion.hash(&mut hasher);
@@ -32499,10 +32511,7 @@ impl VibexWorkbench {
             200,
         );
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
-        self.timeline_measured_turn_heights.clear();
-        self.timeline_measured_turn_layout_signatures.clear();
-        self.timeline_pending_turn_heights.clear();
-        self.timeline_estimated_turn_heights.clear();
+        self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
         cx.notify();
@@ -32576,10 +32585,7 @@ impl VibexWorkbench {
             self.ui_state.appearance.window_scale_percent,
         );
         apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
-        self.timeline_measured_turn_heights.clear();
-        self.timeline_measured_turn_layout_signatures.clear();
-        self.timeline_pending_turn_heights.clear();
-        self.timeline_estimated_turn_heights.clear();
+        self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
         cx.notify();
@@ -32599,10 +32605,7 @@ impl VibexWorkbench {
             self.ui_state.appearance.window_scale_percent,
         );
         apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
-        self.timeline_measured_turn_heights.clear();
-        self.timeline_measured_turn_layout_signatures.clear();
-        self.timeline_pending_turn_heights.clear();
-        self.timeline_estimated_turn_heights.clear();
+        self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         let code_family = self
             .ui_state
@@ -43739,8 +43742,12 @@ impl VibexWorkbench {
         self.flush_deferred_timeline_turn_heights(cx);
         self.apply_pending_timeline_row_heights();
         self.timeline_disclosure_animating = false;
-        // The virtual list pads itself with `py_4`; the scroll anchor needs the
-        // same rem-based top inset to map offsets to rows.
+        // The list inset and activity columns share the window's rem scale.
+        // Resolved heights from another scale cannot seed this layout.
+        if self.timeline_list_padding_top_px != f32::from(window.rem_size()) {
+            self.capture_timeline_scroll_anchor();
+            self.invalidate_timeline_layout_measurements();
+        }
         self.timeline_list_padding_top_px = f32::from(window.rem_size());
         let selected = self.selected_session().cloned();
         let mut turns = self.conversation_turns_cached();
@@ -47796,13 +47803,14 @@ impl VibexWorkbench {
         )
     }
 
-    /// Tool/command card projection for a row, memoized per row revision.
+    /// Tool/command card projection, memoized per row revision and locale.
     ///
     /// Building one clones the payload strings (command output, tool summaries),
     /// and an expanded turn renders hundreds of these rows on every frame.
     fn tool_card_projection_cached(&mut self, row: &TimelineRow) -> Rc<ToolCardProjection> {
         if let Some((sequence, projection)) = self.timeline_tool_card_projections.get(&row.id)
             && *sequence == row.last_sequence
+            && projection.locale == locale::current_locale()
         {
             return projection.clone();
         }
@@ -48011,6 +48019,8 @@ impl VibexWorkbench {
     // not depend on this approximation.
     fn estimated_timeline_row_height_projected(&self, row: &TimelineRow, conclusion: bool) -> f32 {
         let chars_per_line = self.estimated_timeline_chars_per_line();
+        let rem_size = self.timeline_list_padding_top_px;
+        let activity_row_height = timeline_activity::ROW_HEIGHT_REM * rem_size;
         // A user bubble hugs the row's 78% column, so its text wraps sooner.
         let bubble_chars_per_line = ((chars_per_line as f32) * USER_MESSAGE_COLUMN_WIDTH_RATIO)
             .floor()
@@ -48061,28 +48071,6 @@ impl VibexWorkbench {
                 } else {
                     28.0
                 }
-            }
-            TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => {
-                if !self
-                    .timeline_command_expansion
-                    .get(&row.id)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    return 28.0;
-                }
-                let steps = match payload {
-                    Some(TimelinePayload::Plan(plan)) => plan.steps.as_slice(),
-                    Some(TimelinePayload::TodoUpdate(todo)) => todo.items.as_slice(),
-                    _ => &[],
-                };
-                44.0 + steps
-                    .iter()
-                    .map(|step| {
-                        estimated_wrapped_lines(&step.title, detail_chars_per_line) as f32 * 20.0
-                            + 8.0
-                    })
-                    .sum::<f32>()
             }
             TimelineRowKind::Error => {
                 let text = if row.body.is_empty() {
@@ -48201,21 +48189,19 @@ impl VibexWorkbench {
                 height
             }
             TimelineRowKind::FileOperation
-                if self.ui_state.session.enhanced_file_operation_display =>
+                if self.ui_state.session.enhanced_file_operation_display
+                    && matches!(payload, Some(TimelinePayload::FileOperation(operation)) if file_operation_has_diff(operation)) =>
             {
-                let Some(vibex_core::TimelinePayload::FileOperation(_)) = payload else {
-                    return 40.0;
-                };
-                let expanded = self
+                if self
                     .timeline_command_expansion
                     .get(&row.id)
                     .copied()
-                    .unwrap_or(false);
-                if !expanded {
-                    return 40.0;
+                    .unwrap_or(false)
+                {
+                    activity_row_height + 320.0
+                } else {
+                    activity_row_height
                 }
-                // Visible turns replace this conservative first layout with their measured height.
-                360.0
             }
             TimelineRowKind::ImageGeneration => {
                 let Some(vibex_core::TimelinePayload::ImageGeneration(_)) = payload else {
@@ -48233,9 +48219,11 @@ impl VibexWorkbench {
             | TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::Collaboration
+            | TimelineRowKind::Plan
+            | TimelineRowKind::TodoUpdate
             | TimelineRowKind::Retry => {
                 let projection = tool_card_projection(row, payload);
-                let mut height = 24.0;
+                let mut height = activity_row_height;
                 let expanded = !projection.details.is_empty()
                     && self
                         .timeline_command_expansion
@@ -48243,15 +48231,31 @@ impl VibexWorkbench {
                         .copied()
                         .unwrap_or(false);
                 if expanded {
-                    height += 8.0;
+                    let mono_font_size = f32::from(theme::scaled_font_size(
+                        self.ui_state.appearance.code_font.size,
+                        self.ui_state.appearance.window_scale_percent,
+                    ));
+                    let activity_chars_per_line = ((self.estimated_timeline_content_width()
+                        - 2.0 * rem_size)
+                        / (mono_font_size * 0.6))
+                        .floor()
+                        .max(1.0) as usize;
+                    height += rem_size * 0.5;
                     for (index, block) in projection.details.iter().enumerate() {
                         if index > 0 {
-                            height += 8.0;
+                            height += rem_size * 0.5;
                         }
-                        height += block.estimated_height(chars_per_line);
+                        height += block.estimated_activity_height(
+                            activity_chars_per_line,
+                            rem_size,
+                            mono_font_size,
+                        );
                     }
-                    if row.file_path.is_some() {
-                        height += 28.0 + 8.0;
+                    if row.file_path.is_some()
+                        && !(row.kind == TimelineRowKind::FileOperation
+                            && self.ui_state.session.enhanced_file_operation_display)
+                    {
+                        height += rem_size * 2.0;
                     }
                 }
                 height
@@ -48314,24 +48318,21 @@ impl VibexWorkbench {
         turn: &TimelineConversationTurn,
         group: &TimelineProcessActivityGroup,
     ) -> f32 {
-        let mut height = 24.0;
-        let expanded = self
-            .timeline_command_expansion
-            .get(&group.id)
-            .copied()
-            .unwrap_or(false);
-        if !expanded || group.end_row > turn.process_rows.len() {
+        let mut height = timeline_activity::SUMMARY_HEIGHT_REM * self.timeline_list_padding_top_px;
+        let expanded = timeline_activity::group_open(
+            turn,
+            group,
+            self.timeline_command_expansion.get(&group.id).copied(),
+        );
+        let Some(rows) = turn
+            .process_rows
+            .get(group.start_row..group.end_row)
+            .filter(|_| expanded)
+        else {
             return height;
-        }
-
-        height += 8.0;
-        for (index, row) in turn.process_rows[group.start_row..group.end_row]
-            .iter()
-            .enumerate()
-        {
-            if index > 0 {
-                height += 8.0;
-            }
+        };
+        height += self.timeline_list_padding_top_px * 0.25;
+        for row in rows {
             height += self.estimated_timeline_row_height_projected(row, false);
         }
         height
@@ -48354,11 +48355,8 @@ impl VibexWorkbench {
     fn timeline_process_units(&self, turn: &TimelineConversationTurn) -> Vec<TimelineProcessUnit> {
         let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
         let pairs_commands = enhanced_command_display && !self.rendering_child_agent_timeline();
-        let process_activity_groups = timeline_process_activity_groups_for_display(
-            turn,
-            enhanced_command_display,
-            self.ui_state.session.enhanced_file_operation_display,
-        );
+        let process_activity_groups =
+            timeline_process_activity_groups_for_display(turn, enhanced_command_display);
         let mut units = Vec::new();
         let mut row_index = 0;
         let mut group_index = 0;
@@ -48416,14 +48414,23 @@ impl VibexWorkbench {
                     .map(|row| row.last_sequence)
                     .max()
                     .unwrap_or_default();
+                // A group's default disclosure may change without a tool delta
+                // when commentary or a final answer arrives after it.
+                let revision = last_sequence.saturating_mul(2).saturating_add(i64::from(
+                    timeline_activity::group_open(
+                        turn,
+                        group,
+                        self.timeline_command_expansion.get(&group.id).copied(),
+                    ),
+                ));
                 units.push(TimelineProcessUnit {
                     rows: group.start_row..group.end_row,
                     id: group.id.clone(),
-                    revision: last_sequence,
+                    revision,
                     streaming: false,
                     estimated_height: cached_timeline_process_unit_height(
                         self.timeline_process_unit_heights.get(&group.id),
-                        last_sequence,
+                        revision,
                         false,
                     )
                     .unwrap_or_else(|| self.estimated_process_activity_group_height(turn, group)),
@@ -48567,7 +48574,7 @@ impl VibexWorkbench {
                 self.render_command_execution_card(&rows[0], rows.get(1), window, cx)
             }
             TimelineProcessUnitKind::Group(group) => {
-                self.render_process_activity_group(group, rows, window, cx)
+                self.render_process_activity_group(turn, group, rows, window, cx)
             }
             TimelineProcessUnitKind::Row => {
                 self.render_timeline_row(&rows[0], false, None, None, window, cx)
@@ -49557,155 +49564,58 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some((title, steps)) = self
-            .timeline_row_latest_item(row)
-            .and_then(|item| match &item.payload {
-                TimelinePayload::Plan(plan) => Some((plan.title.clone(), plan.steps.clone())),
-                TimelinePayload::TodoUpdate(todo) => Some((todo.title.clone(), todo.items.clone())),
-                _ => None,
-            })
-        else {
-            return self.render_thought_process_row(row, cx);
-        };
-        let completed = steps
-            .iter()
-            .filter(|step| step.status == PlanStepStatus::Completed)
-            .count();
-        let expanded = self
-            .timeline_command_expansion
-            .get(&row.id)
-            .copied()
-            .unwrap_or(false);
-        let progress = self.timeline_disclosure_progress(&row.id, expanded, window, cx);
-        let toggle_id = row.id.clone();
-        let turn_id = row.turn_id.clone();
-        let title = if title.is_empty() {
-            locale::text("Plan", "计划", "計畫").to_string()
+        if self.timeline_row_latest_item(row).is_some_and(|item| {
+            matches!(
+                item.payload,
+                TimelinePayload::Plan(_) | TimelinePayload::TodoUpdate(_)
+            )
+        }) {
+            self.render_process_activity_entry(row, None, window, cx)
         } else {
-            title
-        };
-        let mut card = v_flex()
-            .id(row.id.clone())
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .child(
-                Button::new(format!("plan-header:{}", row.id))
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .justify_start()
-                    .icon(process_activity_icon(ProcessActivityIcon::Todo))
-                    .accessibility_label(title.clone())
-                    .tooltip(title.clone())
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .gap_2()
-                            .child(div().min_w_0().flex_1().truncate().child(title))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{completed}/{}", steps.len())),
-                            )
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size_3p5(),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.capture_timeline_scroll_anchor();
-                        if let Some(turn_id) = turn_id.as_deref() {
-                            this.invalidate_timeline_turn_measurement(turn_id);
-                        }
-                        this.timeline_command_expansion
-                            .insert(toggle_id.clone(), !expanded);
-                        cx.notify();
-                    })),
-            );
-        if progress > 0.0 {
-            let block = ToolCardDetailBlock::Rows {
-                rows: steps
-                    .into_iter()
-                    .map(|step| (plan_step_status_text(step.status).to_string(), step.title))
-                    .collect(),
-            };
-            let details = self.render_tool_detail_blocks(&[block], &row.id, cx);
-            card = card.child(timeline_disclosure_body(
-                format!("plan-body:{}", row.id),
-                progress,
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .pl_6()
-                    .py_2()
-                    .gap_1()
-                    .children(details)
-                    .into_any_element(),
-            ));
+            self.render_thought_process_row(row, cx)
         }
-        card.into_any_element()
     }
 
     fn render_process_activity_group(
         &mut self,
+        turn: &TimelineConversationTurn,
         group: &TimelineProcessActivityGroup,
         rows: &[TimelineRow],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(latest_row) = rows.last() else {
-            return Empty.into_any_element();
-        };
-        let expanded = self
-            .timeline_command_expansion
-            .get(&group.id)
-            .copied()
-            .unwrap_or(false);
+        let expanded = timeline_activity::group_open(
+            turn,
+            group,
+            self.timeline_command_expansion.get(&group.id).copied(),
+        );
         let progress = self.timeline_disclosure_progress(&group.id, expanded, window, cx);
         let group_id = group.id.clone();
-        let turn_id = latest_row.turn_id.clone();
-        let failed = rows.iter().any(|row| row.failed);
-        let mut title = timeline_activity_summary(rows);
-        if failed {
-            title.push_str(locale::text(" · Failed", " · 失败", " · 失敗"));
+        let turn_id = turn.id.clone();
+        let mut summary = timeline_activity::ActivitySummary::default();
+        for row in rows {
+            let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
+            summary.record(&timeline_activity::Activity::project(row, payload), &row.id);
         }
-        let header = Button::new(format!("activity-summary:{}", group.id))
-            .small()
-            .ghost()
-            .w_full()
-            .justify_start()
-            .icon(if expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            })
-            .label(title)
-            .text_color(if failed {
-                cx.theme().danger
-            } else {
-                cx.theme().muted_foreground
-            })
-            .tooltip(if expanded {
-                self.strings().agent_collapse_process
-            } else {
-                self.strings().agent_expand_process
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.capture_timeline_scroll_anchor();
-                if let Some(turn_id) = turn_id.as_deref() {
-                    this.invalidate_timeline_turn_measurement(turn_id);
-                }
-                this.timeline_command_expansion
-                    .insert(group_id.clone(), !expanded);
-                cx.notify();
-            }));
+        let header = timeline_activity::summary_header(
+            format!("activity-summary:{}", group.id),
+            summary.label(),
+            expanded,
+            !timeline_turn_finished(turn) && rows.iter().any(|row| row.streaming),
+            cx,
+        )
+        .tooltip(if expanded {
+            self.strings().agent_collapse_process
+        } else {
+            self.strings().agent_expand_process
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.capture_timeline_scroll_anchor();
+            this.invalidate_timeline_turn_measurement(&turn_id);
+            this.timeline_command_expansion
+                .insert(group_id.clone(), !expanded);
+            cx.notify();
+        }));
         let mut body = v_flex()
             .id(group.id.clone())
             .w_full()
@@ -49715,7 +49625,17 @@ impl VibexWorkbench {
         if progress > 0.0 {
             let children = rows
                 .iter()
-                .map(|row| self.render_process_activity_line(row, window, cx))
+                .enumerate()
+                .map(|(index, row)| {
+                    let continues = Some(index + 1 < rows.len());
+                    if row.kind == TimelineRowKind::FileOperation
+                        && self.ui_state.session.enhanced_file_operation_display
+                    {
+                        self.render_file_operation_entry(row, continues, window, cx)
+                    } else {
+                        self.render_process_activity_entry(row, continues, window, cx)
+                    }
+                })
                 .collect::<Vec<_>>();
             body = body.child(timeline_disclosure_body(
                 format!("activity-body:{}", group.id),
@@ -49724,12 +49644,7 @@ impl VibexWorkbench {
                     .w_full()
                     .min_w_0()
                     .flex_none()
-                    .ml_3()
-                    .pl_3()
-                    .py_1()
-                    .gap_1()
-                    .border_l_1()
-                    .border_color(cx.theme().border)
+                    .py_0p5()
                     .children(children)
                     .into_any_element(),
             ));
@@ -49743,9 +49658,16 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if row.kind == TimelineRowKind::TodoUpdate {
-            return self.render_plan_activity(row, window, cx);
-        }
+        self.render_process_activity_entry(row, None, window, cx)
+    }
+
+    fn render_process_activity_entry(
+        &mut self,
+        row: &TimelineRow,
+        continues: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let projection = self.tool_card_projection_cached(row);
         let has_details = !projection.details.is_empty();
         let expanded = has_details
@@ -49757,89 +49679,42 @@ impl VibexWorkbench {
         let progress = self.timeline_disclosure_progress(&row.id, expanded, window, cx);
         let toggle_id = row.id.clone();
         let turn_id = row.turn_id.clone();
-        let color = if projection.failed {
-            cx.theme().danger
-        } else {
-            cx.theme().muted_foreground
-        };
-        let header = h_flex()
-            .w_full()
-            .min_w_0()
-            .gap_2()
-            .child(
-                process_activity_icon(projection.icon)
-                    .size_3p5()
-                    .flex_none()
-                    .text_color(color),
+        let target = self
+            .session_search_highlighted_row_text(
+                row,
+                timeline_activity::target(&projection.activity).to_string(),
+                cx,
             )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_sm()
-                    .text_color(color)
-                    .child(self.session_search_highlighted_row_text(
-                        row,
-                        projection.title.clone(),
-                        cx,
-                    )),
-            )
-            .when(row.streaming, |this| this.child(Spinner::new().xsmall()))
-            .when(projection.failed, |this| {
-                this.child(
-                    Icon::new(IconName::CircleX)
-                        .size_3p5()
-                        .text_color(cx.theme().danger),
-                )
-            })
-            .when(has_details, |this| {
-                this.child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size_3p5()
-                    .text_color(cx.theme().muted_foreground),
-                )
-            });
-        let header = if has_details {
-            Button::new(format!("activity:{}", row.id))
-                .small()
-                .ghost()
-                .w_full()
-                .justify_start()
-                .tooltip(projection.title.clone())
-                .child(header)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.capture_timeline_scroll_anchor();
-                    if let Some(turn_id) = turn_id.as_deref() {
-                        this.invalidate_timeline_turn_measurement(turn_id);
-                    }
-                    this.timeline_command_expansion
-                        .insert(toggle_id.clone(), !expanded);
-                    cx.notify();
-                }))
-                .into_any_element()
-        } else {
-            header.py_1().into_any_element()
-        };
-        let mut content = v_flex()
-            .id(row.id.clone())
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .child(header);
-        if progress > 0.0 {
+            .into_any_element();
+        let header = timeline_activity::header(
+            format!("activity:{}", row.id),
+            &projection.activity,
+            row.streaming,
+            has_details.then_some(expanded),
+            target,
+            None,
+            cx,
+        )
+        .tab_stop(has_details)
+        .when(has_details, |this| {
+            this.on_click(cx.listener(move |this, _, _, cx| {
+                this.capture_timeline_scroll_anchor();
+                if let Some(turn_id) = turn_id.as_deref() {
+                    this.invalidate_timeline_turn_measurement(turn_id);
+                }
+                this.timeline_command_expansion
+                    .insert(toggle_id.clone(), !expanded);
+                cx.notify();
+            }))
+        });
+        let detail = if progress > 0.0 {
             let mut detail = v_flex()
                 .w_full()
                 .min_w_0()
                 .flex_none()
-                .pl_6()
-                .py_2()
+                .pb_2()
                 .gap_2()
-                .children(self.render_tool_detail_blocks(&projection.details, &row.id, cx));
+                .children(self.render_activity_detail_blocks(&projection.details, &row.id, cx));
             if let Some(path) = row.file_path.clone() {
                 detail = detail.child(
                     Button::new(format!("open-agent-file-operation:{}", row.id))
@@ -49857,13 +49732,23 @@ impl VibexWorkbench {
                         })),
                 );
             }
-            content = content.child(timeline_disclosure_body(
+            Some(timeline_disclosure_body(
                 format!("activity-detail:{}", row.id),
                 progress,
                 detail.into_any_element(),
-            ));
-        }
-        content.into_any_element()
+            ))
+        } else {
+            None
+        };
+        timeline_activity::row(
+            &row.id,
+            projection.activity.icon(),
+            projection.activity.is_failed(),
+            continues,
+            header.into_any_element(),
+            detail,
+            cx,
+        )
     }
 
     fn render_command_execution_card(
@@ -50014,6 +49899,16 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.render_file_operation_entry(row, None, window, cx)
+    }
+
+    fn render_file_operation_entry(
+        &mut self,
+        row: &TimelineRow,
+        continues: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(operation) =
             self.timeline_row_latest_item(row)
                 .and_then(|item| match &item.payload {
@@ -50021,17 +49916,17 @@ impl VibexWorkbench {
                     _ => None,
                 })
         else {
-            return self.render_process_activity_line(row, window, cx);
+            return self.render_process_activity_entry(row, continues, window, cx);
         };
-        let has_diff = file_operation_has_diff(&operation);
-        let expanded = has_diff
-            && self
-                .timeline_command_expansion
-                .get(&row.id)
-                .copied()
-                .unwrap_or(false);
+        let projection = self.tool_card_projection_cached(row);
+        let expanded = self
+            .timeline_command_expansion
+            .get(&row.id)
+            .copied()
+            .unwrap_or(false);
         let progress = self.timeline_disclosure_progress(&row.id, expanded, window, cx);
-        let preview = has_diff.then(|| self.agent_file_diff_preview_cached(row, &operation));
+        let preview = file_operation_has_diff(&operation)
+            .then(|| self.agent_file_diff_preview_cached(row, &operation));
         let toggle_id = row.id.clone();
         let turn_id = row.turn_id.clone();
         let open_path = agent_file_operation_preview_path(
@@ -50039,28 +49934,14 @@ impl VibexWorkbench {
             self.view_session()
                 .map(|session| session.workspace_root.as_str()),
         );
-        let title = format!(
-            "{} {}",
-            file_operation_verb(operation.operation),
-            agent_turn_preview_file_name(&operation.path)
-        );
-        let header = h_flex()
-            .min_w_0()
-            .flex_1()
-            .gap_2()
-            .child(
-                Icon::default()
-                    .path("icons/vibex/file-text.svg")
-                    .size_3p5()
-                    .flex_none(),
-            )
-            .child(div().min_w_0().flex_1().truncate().child(title.clone()))
-            .when_some(preview.as_ref(), |this, preview| {
-                this.when(preview.added_lines > 0, |this| {
+        let statistics = preview.as_ref().map(|preview| {
+            h_flex()
+                .flex_none()
+                .gap_2()
+                .text_xs()
+                .when(preview.added_lines > 0, |this| {
                     this.child(
                         div()
-                            .flex_none()
-                            .text_xs()
                             .text_color(cx.theme().success)
                             .child(format!("+{}", preview.added_lines)),
                     )
@@ -50068,91 +49949,92 @@ impl VibexWorkbench {
                 .when(preview.removed_lines > 0, |this| {
                     this.child(
                         div()
-                            .flex_none()
-                            .text_xs()
                             .text_color(cx.theme().danger)
                             .child(format!("−{}", preview.removed_lines)),
                     )
                 })
-            })
-            .when(has_diff, |this| {
-                this.child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size_3p5(),
-                )
-            });
-        let header = if has_diff {
-            Button::new(format!("file-card-header:{}", row.id))
-                .small()
-                .ghost()
-                .min_w_0()
-                .flex_1()
-                .justify_start()
-                .tooltip(operation.path.clone())
-                .child(header)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.capture_timeline_scroll_anchor();
-                    if let Some(turn_id) = turn_id.as_deref() {
-                        this.invalidate_timeline_turn_measurement(turn_id);
-                    }
-                    this.timeline_command_expansion
-                        .insert(toggle_id.clone(), !expanded);
-                    cx.notify();
-                }))
                 .into_any_element()
-        } else {
-            header.py_1().px_2().into_any_element()
-        };
-        let mut card =
-            v_flex()
-                .id(row.id.clone())
-                .w_full()
-                .min_w_0()
-                .flex_none()
-                .overflow_hidden()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(h_flex().w_full().min_w_0().child(header).when_some(
-                    open_path,
-                    |this, path| {
-                        this.child(
-                            Button::new(format!("open-agent-file-card:{}", row.id))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::FolderOpen)
-                                .tooltip(locale::text(
-                                    "Open file in Editor",
-                                    "在编辑器中打开文件",
-                                    "在編輯器中開啟檔案",
-                                ))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_code_file(path.clone(), window, cx)
-                                })),
-                        )
-                    },
-                ));
-        if progress > 0.0
-            && let Some(preview) = preview
-        {
-            let scroll = self.agent_file_diff_scroll_handle(&row.id);
-            let detail = self.render_agent_file_diff_preview(&preview, &scroll, cx);
-            card = card.child(timeline_disclosure_body(
+        });
+        let target = self
+            .session_search_highlighted_row_text(
+                row,
+                timeline_activity::target(&projection.activity).to_string(),
+                cx,
+            )
+            .into_any_element();
+        let header = timeline_activity::header(
+            format!("file-card-header:{}", row.id),
+            &projection.activity,
+            row.streaming,
+            Some(expanded),
+            target,
+            statistics,
+            cx,
+        )
+        .tooltip(operation.path.clone())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.capture_timeline_scroll_anchor();
+            if let Some(turn_id) = turn_id.as_deref() {
+                this.invalidate_timeline_turn_measurement(turn_id);
+            }
+            this.timeline_command_expansion
+                .insert(toggle_id.clone(), !expanded);
+            cx.notify();
+        }));
+        let header = h_flex()
+            .w_full()
+            .min_w_0()
+            .child(div().flex_1().min_w_0().child(header))
+            .when_some(open_path, |this, path| {
+                this.child(
+                    Button::new(format!("open-agent-file-card:{}", row.id))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::FolderOpen)
+                        .tooltip(locale::text(
+                            "Open file in Editor",
+                            "在编辑器中打开文件",
+                            "在編輯器中開啟檔案",
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_code_file(path.clone(), window, cx)
+                        })),
+                )
+            })
+            .into_any_element();
+        let detail = if progress > 0.0 {
+            let detail = if let Some(preview) = preview {
+                let scroll = self.agent_file_diff_scroll_handle(&row.id);
+                self.render_agent_file_diff_preview(&preview, &scroll, cx)
+            } else {
+                v_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .children(self.render_activity_detail_blocks(&projection.details, &row.id, cx))
+                    .into_any_element()
+            };
+            Some(timeline_disclosure_body(
                 format!("file-body:{}", row.id),
                 progress,
                 div()
                     .w_full()
                     .min_w_0()
-                    .pl_6()
-                    .py_2()
+                    .pb_2()
                     .child(detail)
                     .into_any_element(),
-            ));
-        }
-        card.into_any_element()
+            ))
+        } else {
+            None
+        };
+        timeline_activity::row(
+            &row.id,
+            projection.activity.icon(),
+            projection.activity.is_failed(),
+            continues,
+            header,
+            detail,
+            cx,
+        )
     }
 
     fn render_agent_file_diff_preview(
@@ -50661,6 +50543,110 @@ impl VibexWorkbench {
             )
             .child(self.render_process_detail_value(value, cx))
             .into_any_element()
+    }
+
+    /// Compact details stay on the activity's text column. Each bounded body
+    /// retains the full invocation or result and offers an explicit copy action.
+    fn render_activity_detail_blocks(
+        &self,
+        blocks: &[ToolCardDetailBlock],
+        row_id: &str,
+        cx: &App,
+    ) -> Vec<AnyElement> {
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| {
+                let section = |name: &str, label: &str, value: &str| {
+                    timeline_activity::detail(
+                        format!("activity:{row_id}:{index}:{name}"),
+                        label,
+                        value,
+                        cx,
+                    )
+                };
+                match block {
+                    ToolCardDetailBlock::Terminal {
+                        command,
+                        cwd,
+                        output,
+                        exit_code,
+                        failed,
+                        in_progress,
+                    } => v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(section(
+                            "command",
+                            locale::text("Command", "命令", "命令"),
+                            command,
+                        ))
+                        .children(output.iter().map(|value| {
+                            section("output", locale::text("Output", "输出", "輸出"), value)
+                        }))
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .flex_wrap()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .children(
+                                    cwd.iter()
+                                        .map(|path| div().min_w_0().truncate().child(path.clone())),
+                                )
+                                .children(exit_code.map(|code| {
+                                    div()
+                                        .flex_none()
+                                        .when(*failed, |this| this.text_color(cx.theme().danger))
+                                        .child(format!(
+                                            "{} {code}",
+                                            locale::text("Exit", "退出码", "結束代碼")
+                                        ))
+                                }))
+                                .when(*in_progress, |this| {
+                                    this.child(locale::text("Running", "运行中", "執行中"))
+                                }),
+                        )
+                        .into_any_element(),
+                    ToolCardDetailBlock::Search { query, result, .. } => v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(section(
+                            "query",
+                            locale::text("Query", "查询", "查詢"),
+                            query,
+                        ))
+                        .children(result.iter().map(|value| {
+                            section("result", locale::text("Results", "结果", "結果"), value)
+                        }))
+                        .into_any_element(),
+                    ToolCardDetailBlock::File { path, summary } => v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(section("path", locale::text("Path", "路径", "路徑"), path))
+                        .children(summary.iter().map(|value| {
+                            section("summary", locale::text("Summary", "摘要", "摘要"), value)
+                        }))
+                        .into_any_element(),
+                    ToolCardDetailBlock::Mono { label, value }
+                    | ToolCardDetailBlock::Text { label, value, .. } => {
+                        section("value", label, value)
+                    }
+                    ToolCardDetailBlock::Rows { .. } => v_flex()
+                        .min_w_0()
+                        .children(self.render_tool_detail_blocks(
+                            std::slice::from_ref(block),
+                            row_id,
+                            cx,
+                        ))
+                        .into_any_element(),
+                }
+            })
+            .collect()
     }
 
     /// Expanded tool-activity content, projected into typed blocks so each
@@ -56322,38 +56308,10 @@ fn timeline_disclosure_body(id: String, progress: f32, body: AnyElement) -> AnyE
     .into_any_element()
 }
 
-fn timeline_activity_summary(rows: &[TimelineRow]) -> String {
-    let mut counts = [0_usize; 5];
-    for row in rows {
-        counts[match row.kind {
-            TimelineRowKind::Command => 0,
-            TimelineRowKind::FileOperation => 1,
-            TimelineRowKind::WebSearch => 2,
-            TimelineRowKind::Collaboration => 3,
-            _ => 4,
-        }] += 1;
-    }
-    let labels = [
-        locale::text("commands", "条命令", "條命令"),
-        locale::text("file operations", "项文件操作", "項檔案操作"),
-        locale::text("searches", "次搜索", "次搜尋"),
-        locale::text("agent tasks", "项协作", "項協作"),
-        locale::text("tool calls", "次工具调用", "次工具呼叫"),
-    ];
-    counts
-        .into_iter()
-        .zip(labels)
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, label)| format!("{count} {label}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
 struct ToolCardProjection {
-    title: String,
+    locale: locale::ResolvedLocale,
+    activity: timeline_activity::Activity,
     details: Vec<ToolCardDetailBlock>,
-    failed: bool,
-    icon: ProcessActivityIcon,
 }
 
 /// Typed expanded-content block for a tool/activity card. Each tool kind
@@ -56398,6 +56356,49 @@ enum ToolCardDetailBlock {
 }
 
 impl ToolCardDetailBlock {
+    fn estimated_activity_height(
+        &self,
+        chars_per_line: usize,
+        rem_size: f32,
+        mono_font_size: f32,
+    ) -> f32 {
+        let section = |value: &str| {
+            1.75 * rem_size
+                + (estimated_wrapped_lines(value, chars_per_line) as f32 * mono_font_size * 1.5)
+                    .min(10.0 * rem_size)
+        };
+        match self {
+            Self::Terminal {
+                command, output, ..
+            } => {
+                section(command)
+                    + output
+                        .as_deref()
+                        .map_or(0.0, |output| section(output) + 0.5 * rem_size)
+                    + 1.75 * rem_size
+            }
+            Self::Search { query, result, .. } => {
+                section(query)
+                    + result
+                        .as_deref()
+                        .map_or(0.0, |result| section(result) + 0.5 * rem_size)
+            }
+            Self::File { path, summary } => {
+                section(path)
+                    + summary
+                        .as_deref()
+                        .map_or(0.0, |summary| section(summary) + 0.5 * rem_size)
+            }
+            Self::Mono { value, .. } | Self::Text { value, .. } => section(value),
+            Self::Rows { rows } => rows
+                .iter()
+                .map(|(_, value)| {
+                    (estimated_wrapped_lines(value, chars_per_line) as f32 * 1.25 + 0.25) * rem_size
+                })
+                .sum::<f32>(),
+        }
+    }
+
     fn approximate_bytes(&self) -> usize {
         match self {
             Self::Terminal {
@@ -56473,7 +56474,7 @@ impl ToolCardDetailBlock {
 
 impl ToolCardProjection {
     fn approximate_bytes(&self) -> usize {
-        self.title.len()
+        self.activity.approximate_bytes()
             + self
                 .details
                 .iter()
@@ -56531,7 +56532,9 @@ fn semantic_tool_activity_icon(value: &str) -> Option<ProcessActivityIcon> {
             .any(|term| candidates.contains(&term))
     };
 
-    if has_any(&[
+    if has_any(&["todo", "todos", "plan", "checklist"]) {
+        Some(ProcessActivityIcon::Todo)
+    } else if has_any(&[
         "command",
         "execute",
         "exec",
@@ -56576,8 +56579,6 @@ fn semantic_tool_activity_icon(value: &str) -> Option<ProcessActivityIcon> {
         "loaded",
     ]) {
         Some(ProcessActivityIcon::FileRead)
-    } else if has_any(&["todo", "plan", "checklist"]) {
-        Some(ProcessActivityIcon::Todo)
     } else if has_any(&["agent", "collaboration", "delegate", "task"]) {
         Some(ProcessActivityIcon::Collaboration)
     } else if has_any(&["image", "picture", "photo"]) {
@@ -56621,17 +56622,6 @@ fn plan_step_status_text(status: vibex_core::PlanStepStatus) -> &'static str {
         vibex_core::PlanStepStatus::Running => "running",
         vibex_core::PlanStepStatus::Completed => "completed",
         vibex_core::PlanStepStatus::Failed => "failed",
-    }
-}
-
-fn file_operation_verb(operation: vibex_core::FileOperationKind) -> &'static str {
-    // Tauri parity: `formatFileOperation`.
-    match operation {
-        vibex_core::FileOperationKind::Read => "Reading",
-        vibex_core::FileOperationKind::Write => "Writing",
-        vibex_core::FileOperationKind::Edit => "Editing",
-        vibex_core::FileOperationKind::Delete => "Deleting",
-        vibex_core::FileOperationKind::Move => "Moving",
     }
 }
 
@@ -57340,24 +57330,19 @@ fn tool_card_projection(
     payload: Option<&vibex_core::TimelinePayload>,
 ) -> ToolCardProjection {
     use vibex_core::TimelinePayload as Payload;
-    use vibex_core::ToolCallStatus as Status;
-    match payload {
+    let activity = timeline_activity::Activity::project(row, payload);
+    let details = match payload {
         Some(Payload::ToolCall(tool)) => {
-            let title = if tool.summary.is_empty() {
-                tool.tool_name.clone()
-            } else {
-                tool.summary.clone()
-            };
             let mut details = Vec::new();
             let projected_input = tool
-                .input_summary
+                .raw_extension
                 .as_ref()
-                .filter(|summary| !summary.is_empty())
+                .and_then(|extension| extension.raw_input.as_ref())
+                .filter(|input| !input.is_empty())
                 .or_else(|| {
-                    tool.raw_extension
+                    tool.input_summary
                         .as_ref()
-                        .and_then(|extension| extension.raw_input.as_ref())
-                        .filter(|input| !input.is_empty())
+                        .filter(|summary| !summary.is_empty())
                 });
             if let Some(input) = projected_input {
                 details.push(ToolCardDetailBlock::Mono {
@@ -57366,15 +57351,15 @@ fn tool_card_projection(
                 });
             }
             let projected_output = tool
-                .output_summary
+                .raw_extension
                 .as_ref()
-                .filter(|summary| !summary.is_empty())
+                .and_then(|extension| extension.raw_output.as_ref())
+                .map(|output| &output.text)
+                .filter(|output| !output.is_empty())
                 .or_else(|| {
-                    tool.raw_extension
+                    tool.output_summary
                         .as_ref()
-                        .and_then(|extension| extension.raw_output.as_ref())
-                        .map(|output| &output.text)
-                        .filter(|output| !output.is_empty())
+                        .filter(|summary| !summary.is_empty())
                 });
             if let Some(output) = projected_output {
                 details.push(ToolCardDetailBlock::Mono {
@@ -57385,70 +57370,59 @@ fn tool_card_projection(
             if details.is_empty()
                 && let Some(extension) = tool.raw_extension.as_ref().filter(|e| !e.meta.is_empty())
             {
-                let rows = extension
-                    .meta
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                details.push(ToolCardDetailBlock::Rows { rows });
+                details.push(ToolCardDetailBlock::Rows {
+                    rows: extension
+                        .meta
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                });
             }
-            ToolCardProjection {
-                title,
-                details,
-                failed: tool.status == Status::Failed,
-                icon: generic_tool_activity_icon(&tool.tool_name, &tool.summary),
+            if details.is_empty() {
+                details.push(ToolCardDetailBlock::Text {
+                    label: locale::text("Tool", "工具", "工具").to_string(),
+                    value: tool.tool_name.clone(),
+                    accent: false,
+                });
             }
+            details
         }
-        Some(Payload::FileOperation(operation)) => ToolCardProjection {
-            title: format!(
-                "{} {}",
-                file_operation_verb(operation.operation),
-                operation.path
-            ),
-            details: vec![ToolCardDetailBlock::File {
-                path: operation.path.clone(),
-                summary: Some(operation.summary.clone()).filter(|summary| !summary.is_empty()),
-            }],
-            failed: false,
-            icon: match operation.operation {
-                vibex_core::FileOperationKind::Read => ProcessActivityIcon::FileRead,
-                vibex_core::FileOperationKind::Write => ProcessActivityIcon::FileCreate,
-                vibex_core::FileOperationKind::Edit | vibex_core::FileOperationKind::Move => {
-                    ProcessActivityIcon::FileEdit
-                }
-                vibex_core::FileOperationKind::Delete => ProcessActivityIcon::FileDelete,
-            },
-        },
-        Some(Payload::WebSearch(search)) => ToolCardProjection {
-            title: search.query.clone(),
-            details: vec![ToolCardDetailBlock::Search {
-                query: search.query.clone(),
-                result: search
-                    .result_summary
-                    .clone()
-                    .filter(|result| !result.is_empty()),
-                failed: search.status == Status::Failed,
-            }],
-            failed: search.status == Status::Failed,
-            icon: ProcessActivityIcon::Search,
-        },
-        Some(Payload::TodoUpdate(todo)) => ToolCardProjection {
-            title: todo.title.clone(),
-            details: vec![ToolCardDetailBlock::Rows {
-                rows: todo
-                    .items
-                    .iter()
-                    .map(|item| {
-                        (
-                            plan_step_status_text(item.status).to_string(),
-                            item.title.clone(),
-                        )
-                    })
-                    .collect(),
-            }],
-            failed: false,
-            icon: ProcessActivityIcon::Todo,
-        },
+        Some(Payload::FileOperation(operation)) => vec![ToolCardDetailBlock::File {
+            path: operation.path.clone(),
+            summary: Some(operation.summary.clone()).filter(|summary| !summary.is_empty()),
+        }],
+        Some(Payload::WebSearch(search)) => vec![ToolCardDetailBlock::Search {
+            query: search.query.clone(),
+            result: search
+                .result_summary
+                .clone()
+                .filter(|result| !result.is_empty()),
+            failed: activity.is_failed(),
+        }],
+        Some(Payload::TodoUpdate(todo)) => vec![ToolCardDetailBlock::Rows {
+            rows: todo
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        plan_step_status_text(item.status).to_string(),
+                        item.title.clone(),
+                    )
+                })
+                .collect(),
+        }],
+        Some(Payload::Plan(plan)) => vec![ToolCardDetailBlock::Rows {
+            rows: plan
+                .steps
+                .iter()
+                .map(|item| {
+                    (
+                        plan_step_status_text(item.status).to_string(),
+                        item.title.clone(),
+                    )
+                })
+                .collect(),
+        }],
         Some(Payload::Collaboration(collaboration)) => {
             let mut details = Vec::new();
             if let Some(agent) = collaboration.agent_label.as_ref().filter(|s| !s.is_empty()) {
@@ -57468,39 +57442,19 @@ fn tool_card_projection(
                 value: collaboration.summary.clone(),
                 accent: false,
             });
-            ToolCardProjection {
-                title: if collaboration.summary.is_empty() {
-                    collaboration.action.clone()
-                } else {
-                    collaboration.summary.clone()
-                },
-                details,
-                failed: collaboration.status == Status::Failed,
-                icon: ProcessActivityIcon::Collaboration,
-            }
+            details
         }
-        Some(Payload::Command(command)) => {
-            let mut details = Vec::new();
-            if !command.command.is_empty() {
-                details.push(ToolCardDetailBlock::Terminal {
-                    command: command.command.clone(),
-                    cwd: command.cwd.clone().filter(|cwd| !cwd.is_empty()),
-                    output: command
-                        .output_summary
-                        .clone()
-                        .filter(|output| !output.is_empty()),
-                    exit_code: command.exit_code,
-                    failed: command.status == vibex_core::CommandStatus::Failed,
-                    in_progress: command.status == vibex_core::CommandStatus::Started,
-                });
-            }
-            ToolCardProjection {
-                title: command.command.clone(),
-                details,
-                failed: command.status == vibex_core::CommandStatus::Failed,
-                icon: ProcessActivityIcon::Command,
-            }
-        }
+        Some(Payload::Command(command)) => vec![ToolCardDetailBlock::Terminal {
+            command: command.command.clone(),
+            cwd: command.cwd.clone().filter(|cwd| !cwd.is_empty()),
+            output: command
+                .output_summary
+                .clone()
+                .filter(|output| !output.is_empty()),
+            exit_code: command.exit_code,
+            failed: activity.is_failed(),
+            in_progress: command.status == vibex_core::CommandStatus::Started,
+        }],
         Some(Payload::ImageGeneration(image)) => {
             let mut details = Vec::new();
             if let Some(mime) = image.mime_type.as_ref().filter(|s| !s.is_empty()) {
@@ -57521,16 +57475,10 @@ fn tool_card_projection(
                 value: image.summary.clone(),
                 accent: false,
             });
-            ToolCardProjection {
-                title: locale::text("Image generation", "图像生成", "圖像生成").to_string(),
-                details,
-                failed: image.status == Status::Failed,
-                icon: ProcessActivityIcon::Image,
-            }
+            details
         }
-        _ => ToolCardProjection {
-            title: row.title.clone(),
-            details: if row.body.is_empty() {
+        _ => {
+            if row.body.is_empty() {
                 Vec::new()
             } else {
                 vec![ToolCardDetailBlock::Text {
@@ -57538,19 +57486,13 @@ fn tool_card_projection(
                     value: row.body.clone(),
                     accent: false,
                 }]
-            },
-            failed: row.failed,
-            icon: match row.kind {
-                TimelineRowKind::Command => ProcessActivityIcon::Command,
-                TimelineRowKind::WebSearch => ProcessActivityIcon::Search,
-                TimelineRowKind::FileOperation => ProcessActivityIcon::FileRead,
-                TimelineRowKind::TodoUpdate => ProcessActivityIcon::Todo,
-                TimelineRowKind::Collaboration => ProcessActivityIcon::Collaboration,
-                TimelineRowKind::ImageGeneration => ProcessActivityIcon::Image,
-                TimelineRowKind::Retry => ProcessActivityIcon::Retry,
-                _ => ProcessActivityIcon::Generic,
-            },
-        },
+            }
+        }
+    };
+    ToolCardProjection {
+        locale: locale::current_locale(),
+        activity,
+        details,
     }
 }
 /// Characters per line a content box `width` pixels wide fits.
@@ -72940,6 +72882,12 @@ mod tests {
             generic_tool_activity_icon("apply_patch", "Updated app.rs"),
             ProcessActivityIcon::FileEdit
         );
+        for tool_name in ["update_plan", "todo_update", "TodoWrite", "write_todos"] {
+            assert_eq!(
+                generic_tool_activity_icon(tool_name, "Updated implementation steps"),
+                ProcessActivityIcon::Todo
+            );
+        }
         assert_eq!(
             generic_tool_activity_icon("mcp", "Called external integration"),
             ProcessActivityIcon::Integration
@@ -86421,29 +86369,6 @@ mod tests {
         assert!(row_renderer.contains("render_command_execution_card(row, None, window, cx)"));
         assert!(
             row_renderer.contains("TimelineRowKind::Command => self.render_process_activity_line")
-        );
-    }
-
-    #[test]
-    fn file_operation_display_preference_switches_between_cards_and_tool_activity_groups() {
-        let source = include_str!("app.rs");
-        let process_rows = source
-            .split_once("    fn timeline_process_units(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_process_run_layout("))
-            .map(|(body, _)| body)
-            .expect("timeline process unit walk should remain inspectable");
-        assert!(process_rows.contains("enhanced_file_operation_display"));
-        assert!(process_rows.contains("timeline_process_activity_groups_for_display"));
-
-        let row_renderer = source
-            .split_once("    fn render_timeline_row(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
-            .map(|(body, _)| body)
-            .expect("timeline row rendering should remain inspectable");
-        assert!(row_renderer.contains("render_file_operation_card(row, window, cx)"));
-        assert!(
-            row_renderer
-                .contains("TimelineRowKind::FileOperation => self.render_process_activity_line")
         );
     }
 
