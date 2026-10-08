@@ -597,6 +597,20 @@ as does anything typed by hand and never picked from the menu. Do not paint a
 tint behind typed `/`, `@` or `$` text to imitate a chip: two visuals for one
 idea is what the atomic token replaced.
 
+### Session activity indicators
+
+Live thinking labels and sidebar session/workspace states share
+`activity_indicator::ActivityIndicator`, a seven-cell V with a soft highlight
+that travels along the strokes and reverses smoothly. Use `new(id)` beside a
+timeline label and `compact()` in sidebar status lanes. IDs stay scoped to the
+owning turn or row; `Animation::repeat_synced` keeps mounted marks in phase.
+The fixed rem-sized canvas changes only cell brightness, preserving adjacent
+text and row geometry. Keep the frame budget bounded, and render a fully
+visible static V for reduced motion or the opt-in inactive-window pause.
+Only live turns show the timeline mark. Sidebar marks retain the theme's
+running and auto-continue colors; waiting, error, and completion states keep
+their distinct status symbols.
+
 ## Timeline Cards
 
 Render Agent activity through provider-neutral cards:

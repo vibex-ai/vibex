@@ -185,6 +185,7 @@ use crate::actions::{
     ToggleSidebar, UndoImageEdit,
 };
 
+use crate::activity_indicator::ActivityIndicator;
 use crate::appearance_theme;
 use crate::assets::{agent_brand_asset, agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
@@ -57436,7 +57437,11 @@ fn render_agent_thinking_indicator(
     h_flex()
         .min_w_0()
         .justify_start()
+        .gap_2()
         .py_1()
+        .when(live, |this| {
+            this.child(ActivityIndicator::new(format!("agent-activity-{turn_id}")))
+        })
         .child(
             div()
                 .id(element_id)
@@ -61161,9 +61166,9 @@ fn sidebar_workspace_status(
 /// is the most actionable thing among my sessions" — so they draw it the same
 /// way.
 ///
-/// `auto_continue_enabled` recolors only the running ring, the same way a
-/// session row's spinner turns green when that session continues on its own.
-/// The other states keep their own colors: the ring is the one mark that says
+/// `auto_continue_enabled` recolors only the activity mark, the same way a
+/// session row's mark turns green when that session continues on its own.
+/// The other states keep their own colors: this is the one mark that says
 /// "still working", so it is also the one mark that can say "and it will keep
 /// going by itself".
 fn sidebar_aggregate_status_indicator(
@@ -61172,14 +61177,13 @@ fn sidebar_aggregate_status_indicator(
     cx: &App,
 ) -> AnyElement {
     match status {
-        SidebarWorkspaceStatus::Running => Spinner::status_indicator()
-            .icon(Icon::new(IconName::LoaderCircle))
+        SidebarWorkspaceStatus::Running => ActivityIndicator::new("workspace-activity")
+            .compact()
             .color(if auto_continue_enabled {
                 cx.theme().success
             } else {
                 cx.theme().primary
             })
-            .xsmall()
             .into_any_element(),
         SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
         SidebarWorkspaceStatus::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
@@ -61196,15 +61200,16 @@ fn sidebar_session_status_indicator(
     cx: &App,
 ) -> AnyElement {
     match state {
-        AgentSessionState::Running | AgentSessionState::Initializing => Spinner::status_indicator()
-            .icon(Icon::new(IconName::LoaderCircle))
-            .color(if auto_continue_enabled {
-                cx.theme().success
-            } else {
-                cx.theme().primary
-            })
-            .xsmall()
-            .into_any_element(),
+        AgentSessionState::Running | AgentSessionState::Initializing => {
+            ActivityIndicator::new("session-activity")
+                .compact()
+                .color(if auto_continue_enabled {
+                    cx.theme().success
+                } else {
+                    cx.theme().primary
+                })
+                .into_any_element()
+        }
         AgentSessionState::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
         AgentSessionState::Error => sidebar_status_dot(cx.theme().danger),
         AgentSessionState::Archived | AgentSessionState::Closed => {
