@@ -65812,91 +65812,73 @@ impl FoundationSettings {
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
         let border = theme::semantic_color("border", is_dark);
         let sidebar_accent = theme::semantic_color("sidebar-accent", is_dark);
-        let sections = [
+        // Groups own their members, so a section can only change groups by
+        // moving between these lists. Ordering by a `split_off` index instead
+        // let a section drift into a group whose label did not describe it.
+        let sections: [(&str, &[(SettingsSection, IconName)]); 3] = [
             (
-                SettingsSection::General,
-                strings.general,
-                IconName::Settings2,
+                locale::text("BASICS", "通用", "通用"),
+                &[
+                    (SettingsSection::General, IconName::Settings2),
+                    (SettingsSection::Appearance, IconName::Palette),
+                    (SettingsSection::Shortcuts, IconName::CaseSensitive),
+                ],
             ),
             (
-                SettingsSection::Appearance,
-                strings.appearance,
-                IconName::Palette,
+                locale::text("WORKSPACE", "工作区", "工作區"),
+                &[
+                    (SettingsSection::Workbench, IconName::LayoutDashboard),
+                    (SettingsSection::Session, IconName::Bot),
+                    (SettingsSection::Terminal, IconName::SquareTerminal),
+                    (SettingsSection::Browser, IconName::Globe),
+                    (SettingsSection::Computer, IconName::Bot),
+                ],
             ),
             (
-                SettingsSection::Workbench,
-                locale::text("Workbench", "工作台", "工作台"),
-                IconName::LayoutDashboard,
-            ),
-            (
-                SettingsSection::Session,
-                strings.session_settings,
-                IconName::Bot,
-            ),
-            (
-                SettingsSection::Terminal,
-                locale::text("Terminal", "终端", "終端機"),
-                IconName::SquareTerminal,
-            ),
-            (
-                SettingsSection::Browser,
-                locale::text("Browser", "浏览器", "瀏覽器"),
-                IconName::Globe,
-            ),
-            (
-                SettingsSection::Computer,
-                locale::text("Computer use", "电脑操作", "電腦操作"),
-                IconName::Bot,
-            ),
-            (
-                SettingsSection::Shortcuts,
-                locale::text("Shortcuts", "快捷键", "快速鍵"),
-                IconName::CaseSensitive,
-            ),
-            (
-                SettingsSection::Data,
-                locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
-                IconName::HardDrive,
-            ),
-            (
-                SettingsSection::Developer,
-                locale::text("Developer", "开发者", "開發者"),
-                IconName::Cpu,
-            ),
-            (
-                SettingsSection::About,
-                locale::text("About", "关于", "關於"),
-                IconName::Info,
+                locale::text("SYSTEM", "系统", "系統"),
+                &[
+                    (SettingsSection::Data, IconName::HardDrive),
+                    (SettingsSection::Developer, IconName::Cpu),
+                    (SettingsSection::About, IconName::Info),
+                ],
             ),
         ];
-        let mut buttons = sections
+        let groups = sections
             .into_iter()
-            .map(|(section, label, icon)| {
-                let active = self.active_section == section;
-                let icon = Icon::new(icon)
-                    .size(px(16.0))
-                    .mr(px(2.0))
-                    .text_color(if active { foreground } else { muted_foreground });
-                Button::new(SharedString::from(format!("settings-{section:?}")))
-                    .small()
-                    .ghost()
-                    .h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))
-                    .px_3()
-                    .rounded(px(6.0))
-                    .selected(active)
-                    .text_color(if active { foreground } else { muted_foreground })
-                    .when(active, |this| this.bg(sidebar_accent.opacity(0.34)))
-                    .when(wide, |this| this.w_full())
-                    .when(!wide, |this| this.min_w(px(112.0)).flex_1())
-                    .icon(icon)
-                    .label(label)
-                    .child(div().flex_1())
-                    .tooltip(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.activate_settings_section(section, cx);
-                        cx.notify();
-                    }))
-                    .into_any_element()
+            .map(|(label, entries)| {
+                let buttons = entries
+                    .iter()
+                    .map(|(section, icon)| {
+                        let section = *section;
+                        let label = settings_section_label(section);
+                        let active = self.active_section == section;
+                        let icon = Icon::new(icon.clone())
+                            .size(px(16.0))
+                            .mr(px(2.0))
+                            .text_color(if active { foreground } else { muted_foreground });
+                        Button::new(SharedString::from(format!("settings-{section:?}")))
+                            .small()
+                            .ghost()
+                            .h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))
+                            .px_3()
+                            .rounded(px(6.0))
+                            .selected(active)
+                            .text_color(if active { foreground } else { muted_foreground })
+                            .when(active, |this| this.bg(sidebar_accent.opacity(0.34)))
+                            .when(wide, |this| this.w_full())
+                            .when(!wide, |this| this.min_w(px(112.0)).flex_1())
+                            .icon(icon)
+                            .label(label)
+                            .child(div().flex_1())
+                            .tooltip(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.activate_settings_section(section, cx);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+                (label, buttons)
             })
             .collect::<Vec<_>>();
         let search = div()
@@ -65925,13 +65907,17 @@ impl FoundationSettings {
                 .child(search)
                 .when_some(search_results, |this, results| this.child(results))
                 .when(!has_search_results, |this| {
-                    this.child(div().flex().flex_wrap().gap_1().children(buttons))
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .children(groups.into_iter().flat_map(|(_, buttons)| buttons)),
+                    )
                 })
                 .into_any_element();
         }
 
-        let support = buttons.split_off(6);
-        let workflow = buttons.split_off(2);
         let group_label = |label| {
             div()
                 .px_2()
@@ -65941,26 +65927,15 @@ impl FoundationSettings {
                 .text_color(muted_foreground.opacity(0.72))
                 .child(label)
         };
-        let navigation_groups = v_flex()
-            .gap_2()
-            .child(
-                v_flex()
-                    .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
-                    .child(group_label(locale::text("VIBEX", "偏好设置", "偏好設定")))
-                    .children(buttons),
-            )
-            .child(
-                v_flex()
-                    .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
-                    .child(group_label(locale::text("WORKSPACE", "工作流", "工作流程")))
-                    .children(workflow),
-            )
-            .child(
-                v_flex()
-                    .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
-                    .child(group_label(locale::text("SUPPORT", "支持", "支援")))
-                    .children(support),
-            );
+        let navigation_groups =
+            v_flex()
+                .gap_2()
+                .children(groups.into_iter().map(|(label, buttons)| {
+                    v_flex()
+                        .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
+                        .child(group_label(label))
+                        .children(buttons)
+                }));
 
         v_flex()
             .w(px(SETTINGS_NAVIGATION_WIDTH))
@@ -85805,17 +85780,44 @@ mod tests {
         assert!(navigation.contains("IconName::SquareTerminal"));
         assert!(navigation.contains("IconName::HardDrive"));
         assert!(navigation.contains("let has_search_results = search_results.is_some()"));
-        assert!(navigation.contains("let navigation_groups = v_flex()"));
+        assert!(navigation.contains("let navigation_groups ="));
+        assert!(navigation.contains(".children(groups.into_iter().map("));
+        assert!(navigation.contains("groups.into_iter().flat_map("));
         assert!(navigation.contains(".when(!has_search_results"));
-        assert!(navigation.contains("\"偏好设置\""));
-        assert!(navigation.contains("\"工作流\""));
-        assert!(navigation.contains("\"支持\""));
+        // A group carries its own members, so no index can silently hand a
+        // section to a group whose label does not describe it.
+        assert!(!navigation.contains("split_off("));
+        assert!(navigation.contains("locale::text(\"BASICS\", \"通用\", \"通用\")"));
+        assert!(navigation.contains("locale::text(\"WORKSPACE\", \"工作区\", \"工作區\")"));
+        assert!(navigation.contains("locale::text(\"SYSTEM\", \"系统\", \"系統\")"));
+        // Basics, then the workspace surfaces, then system and about.
+        let order = [
+            "SettingsSection::General",
+            "SettingsSection::Appearance",
+            "SettingsSection::Shortcuts",
+            "SettingsSection::Workbench",
+            "SettingsSection::Session",
+            "SettingsSection::Terminal",
+            "SettingsSection::Browser",
+            "SettingsSection::Computer",
+            "SettingsSection::Data",
+            "SettingsSection::Developer",
+            "SettingsSection::About",
+        ];
+        let mut cursor = 0;
+        for section in order {
+            let offset = navigation[cursor..]
+                .find(section)
+                .unwrap_or_else(|| panic!("{section} should follow the previous group member"));
+            cursor += offset + section.len();
+        }
         assert!(navigation.contains(".px_2()"));
         assert!(navigation.contains(".text_color(muted_foreground.opacity(0.72))"));
         assert!(navigation.contains(".gap(px(SETTINGS_NAVIGATION_SECTION_GAP))"));
         assert!(navigation.contains(".mt_1()"));
         assert!(navigation.contains(".mb_1()"));
-        assert!(navigation.contains("let icon = Icon::new(icon)"));
+        assert!(navigation.contains("let label = settings_section_label(section)"));
+        assert!(navigation.contains("let icon = Icon::new(icon.clone())"));
         assert!(navigation.contains(".mr(px(2.0))"));
         assert!(navigation.contains(".child(div().flex_1())"));
         assert!(navigation.contains(".w_full()"));
@@ -86273,7 +86275,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("settings navigation should remain inspectable");
         assert!(navigation.contains("SettingsSection::Session"));
-        assert!(navigation.contains("strings.session_settings"));
+        // The navigation names every entry from the shared section labels, so
+        // the Session page keeps the name the search results and page headers
+        // already use.
+        assert!(navigation.contains("settings_section_label(section)"));
 
         let appearance = source
             .split_once("    fn render_appearance_page(")
