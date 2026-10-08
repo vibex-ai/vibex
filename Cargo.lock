@@ -10207,6 +10207,7 @@ dependencies = [
  "libc",
  "markdown",
  "pdfium-render",
+ "percent-encoding",
  "qrcode",
  "resvg 0.46.0",
  "rfd",

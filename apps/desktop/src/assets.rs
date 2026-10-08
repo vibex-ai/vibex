@@ -8,9 +8,10 @@ use gpui::{
     AnyElement, App, Asset, AssetSource, Hsla, ImageCacheError, IntoElement, Pixels, RenderImage,
     Result as GpuiResult, SharedString, Styled as _, Window, img,
 };
-use gpui_component::{Icon, IconName};
+use gpui_component::{ActiveTheme as _, Icon, IconName};
 use gpui_kit_assets::Assets as ComponentAssets;
 use sha2::{Digest, Sha256};
+use vibex_desktop_model::FileIconKind;
 
 const INTER_PACKAGE_ROOT: &str = "../../../node_modules/.pnpm/@fontsource-variable+inter@5.2.8/node_modules/@fontsource-variable/inter";
 const INTER_LATIN: &[u8] = include_bytes!(concat!(
@@ -2176,12 +2177,67 @@ fn themed_icon(icon: Icon, color: Option<Hsla>) -> AnyElement {
     }
 }
 
-pub(crate) fn file_tree_asset_icon(path: &'static str, size: Pixels, color: Hsla) -> AnyElement {
-    Icon::default()
-        .path(path)
-        .size(size)
-        .text_color(color)
-        .into_any_element()
+/// File identity uses the same shape and type color in trees and inline labels.
+/// The caller owns size and emphasis within its surface.
+pub(crate) fn file_icon(kind: FileIconKind, cx: &App) -> Icon {
+    let token = match kind {
+        FileIconKind::Archive => "right-rail-file-icon-archive",
+        FileIconKind::Audio => "right-rail-file-icon-audio",
+        FileIconKind::Code | FileIconKind::Java | FileIconKind::Rust | FileIconKind::TypeScript => {
+            "right-rail-file-icon-code"
+        }
+        FileIconKind::Config => "right-rail-file-icon-config",
+        FileIconKind::Database | FileIconKind::Spreadsheet => "right-rail-file-icon-data",
+        FileIconKind::Directory => "right-rail-file-icon-directory",
+        FileIconKind::Font => "right-rail-file-icon-font",
+        FileIconKind::Image | FileIconKind::Svg => "right-rail-file-icon-image",
+        FileIconKind::Json => "right-rail-file-icon-json",
+        FileIconKind::Lock => "right-rail-file-icon-lock",
+        FileIconKind::Markdown => "right-rail-file-icon-markdown",
+        FileIconKind::Markup => "right-rail-file-icon-markup",
+        FileIconKind::JavaScript | FileIconKind::Script => "right-rail-file-icon-script",
+        FileIconKind::Secret => "right-rail-file-icon-secret",
+        FileIconKind::Style => "right-rail-file-icon-style",
+        FileIconKind::Symlink => "right-rail-file-icon-symlink",
+        FileIconKind::Video => "right-rail-file-icon-video",
+        FileIconKind::Pdf
+        | FileIconKind::Office
+        | FileIconKind::Text
+        | FileIconKind::File
+        | FileIconKind::Other => "right-rail-file-icon-text",
+    };
+    let icon = match kind {
+        FileIconKind::Directory => Icon::new(IconName::Folder),
+        FileIconKind::Code
+        | FileIconKind::Rust
+        | FileIconKind::TypeScript
+        | FileIconKind::JavaScript => Icon::default().path("icons/vibex/file-code.svg"),
+        FileIconKind::Java => Icon::default().path("icons/vibex/coffee.svg"),
+        FileIconKind::Script => Icon::default().path("icons/vibex/file-terminal.svg"),
+        FileIconKind::Json => Icon::default().path("icons/vibex/file-braces.svg"),
+        FileIconKind::Markdown => Icon::default().path("icons/vibex/book-open-text.svg"),
+        FileIconKind::Image => Icon::default().path("icons/vibex/image.svg"),
+        FileIconKind::Svg | FileIconKind::Markup => {
+            Icon::default().path("icons/vibex/code-xml.svg")
+        }
+        FileIconKind::Archive => Icon::default().path("icons/vibex/file-archive.svg"),
+        FileIconKind::Database => Icon::default().path("icons/vibex/database.svg"),
+        FileIconKind::Spreadsheet => Icon::default().path("icons/vibex/file-spreadsheet.svg"),
+        FileIconKind::Style => Icon::default().path("icons/vibex/hash.svg"),
+        FileIconKind::Audio => Icon::default().path("icons/vibex/audio-lines.svg"),
+        FileIconKind::Video => Icon::default().path("icons/vibex/file-video-camera.svg"),
+        FileIconKind::Symlink => Icon::default().path("icons/vibex/file-symlink.svg"),
+        FileIconKind::Config => Icon::default().path("icons/vibex/file-cog.svg"),
+        FileIconKind::Lock => Icon::default().path("icons/vibex/file-lock.svg"),
+        FileIconKind::Secret => Icon::default().path("icons/vibex/file-key.svg"),
+        FileIconKind::Font => Icon::default().path("icons/vibex/file-type.svg"),
+        FileIconKind::Pdf
+        | FileIconKind::Office
+        | FileIconKind::Text
+        | FileIconKind::File
+        | FileIconKind::Other => Icon::default().path("icons/vibex/file-text.svg"),
+    };
+    icon.text_color(crate::theme::semantic_color(token, cx.theme().is_dark()))
 }
 
 impl AssetSource for VibexAssets {

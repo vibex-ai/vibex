@@ -10,6 +10,7 @@ pub(super) const ROW_HEIGHT_REM: f32 = 2.25;
 pub(super) const SUMMARY_HEIGHT_REM: f32 = 1.75;
 const ICON_SIZE_REM: f32 = 0.875;
 const RAIL_ICON_GAP_REM: f32 = 0.125;
+const HOVER_GROUP: &str = "timeline-activity";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Activity {
@@ -155,7 +156,7 @@ impl Activity {
         };
         Self {
             action,
-            target: single_line(&target),
+            target: single_line(&path.as_deref().map_or(target, agent_file_display_name)),
             path,
             icon,
             failed,
@@ -169,9 +170,13 @@ impl Activity {
         self.failed
     }
     pub(super) fn label(&self) -> String {
-        format!("{} {}", self.action, self.target)
-            .trim_end()
-            .to_string()
+        format!(
+            "{} {}",
+            self.action,
+            self.path.as_deref().unwrap_or(&self.target)
+        )
+        .trim_end()
+        .to_string()
     }
     pub(super) fn approximate_bytes(&self) -> usize {
         self.target.len() + self.path.as_ref().map_or(0, String::len)
@@ -246,40 +251,63 @@ pub(super) fn group_open(
     })
 }
 
+pub(super) fn is_running(row: &TimelineRow, turn_live: bool) -> bool {
+    turn_live && row.streaming && !row.failed && !row.pending_permission
+}
+
 /// The same button geometry is used by tool, file and plan disclosures.
 pub(super) fn header(
     id: String,
     activity: &Activity,
     running: bool,
     open: Option<bool>,
-    target: AnyElement,
+    highlighted_target: Option<AnyElement>,
     statistics: Option<AnyElement>,
     cx: &App,
 ) -> Button {
+    let running = running && !activity.failed;
     let color = if activity.failed {
         cx.theme().danger
     } else {
-        cx.theme().muted_foreground
+        resting_color(cx)
     };
+    let hover_color = if activity.failed {
+        cx.theme().danger
+    } else {
+        cx.theme().foreground
+    };
+    let target = highlighted_target
+        .unwrap_or_else(|| activity_text("target-shimmer", &activity.target, running));
     let target = h_flex()
+        .id("target")
+        .debug_selector(|| format!("activity-target:{id}"))
         .min_w_0()
         .gap_1()
+        .text_color(color)
+        .group_hover(HOVER_GROUP, |style| style.text_color(hover_color))
         .when(activity.path.is_some(), |this| {
-            this.rounded_md()
-                .bg(cx.theme().muted.opacity(0.55))
+            let kind = vibex_desktop_model::file_icon_descriptor(
+                &activity.target,
+                vibex_core::FileEntryKind::File,
+            )
+            .kind;
+            this.rounded(cx.theme().radius * 0.5)
+                .bg(cx.theme().muted.opacity(0.35))
                 .px_1p5()
                 .py_0p5()
                 .child(
-                    Icon::default()
-                        .path("icons/vibex/file-text.svg")
-                        .size_3p5()
-                        .flex_none(),
+                    div()
+                        .id("file-icon")
+                        .flex_none()
+                        .opacity(0.75)
+                        .group_hover(HOVER_GROUP, |style| style.opacity(1.0))
+                        .child(crate::assets::file_icon(kind, cx).size_3p5()),
                 )
         })
         .child(div().min_w_0().truncate().child(target));
-    Button::new(id)
+    Button::new(id.clone())
         .small()
-        .ghost()
+        .custom(ButtonCustomVariant::new(cx).foreground(color))
         .compact()
         .w_full()
         .min_w_0()
@@ -296,8 +324,16 @@ pub(super) fn header(
                 .min_w_0()
                 .gap_2()
                 .text_xs()
-                .child(div().flex_none().child(activity.action))
-                .child(h_flex().min_w_0().flex_1().child(target))
+                .font_normal()
+                .child(
+                    div()
+                        .id("action")
+                        .flex_none()
+                        .text_color(color)
+                        .group_hover(HOVER_GROUP, |style| style.text_color(hover_color))
+                        .child(activity_text("action-shimmer", activity.action, running)),
+                )
+                .child(target)
                 .children(statistics)
                 .when(running, |this| {
                     this.child(div().flex_none().child(Spinner::new().xsmall()))
@@ -307,13 +343,23 @@ pub(super) fn header(
                 })
                 .when_some(open, |this, open| {
                     this.child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size_3()
-                        .flex_none(),
+                        div()
+                            .id("disclosure")
+                            .debug_selector(|| format!("activity-disclosure:{id}"))
+                            .flex_none()
+                            .text_color(color)
+                            .opacity(if open { 1.0 } else { 0.7 })
+                            .group_hover(HOVER_GROUP, |style| {
+                                style.text_color(hover_color).opacity(1.0)
+                            })
+                            .child(
+                                Icon::new(if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size_3(),
+                            ),
                     )
                 }),
         )
@@ -330,24 +376,30 @@ pub(super) fn summary_header(
     running: bool,
     cx: &App,
 ) -> Button {
+    let color = resting_color(cx);
     Button::new(id)
+        .group(HOVER_GROUP)
         .small()
-        .ghost()
+        .custom(ButtonCustomVariant::new(cx).foreground(color))
         .compact()
         .w_full()
         .min_w_0()
         .h(gpui::rems(SUMMARY_HEIGHT_REM))
         .px_0()
         .justify_start()
-        .text_color(cx.theme().muted_foreground)
+        .text_color(color)
         .accessibility_label(status_label(label.clone(), running, false))
         .toggled(open)
         .child(
             h_flex()
+                .id("summary")
                 .min_w_0()
                 .w_full()
                 .gap_1()
                 .text_xs()
+                .font_normal()
+                .text_color(color)
+                .group_hover(HOVER_GROUP, |style| style.text_color(cx.theme().foreground))
                 .child(
                     div().w_7().flex_none().flex().justify_center().child(
                         Icon::new(if open {
@@ -358,11 +410,36 @@ pub(super) fn summary_header(
                         .size_3p5(),
                     ),
                 )
-                .child(div().min_w_0().flex_1().truncate().child(label))
+                .child(div().min_w_0().flex_1().truncate().child(activity_text(
+                    "summary-shimmer",
+                    &label,
+                    running,
+                )))
                 .when(running, |this| {
                     this.child(div().flex_none().child(Spinner::new().xsmall()))
                 }),
         )
+}
+
+fn activity_text(id: &'static str, text: &str, running: bool) -> AnyElement {
+    if running {
+        ShimmerText::new(text.to_string())
+            .id(id)
+            .duration(TIMELINE_SHIMMER_SWEEP)
+            .spread(TIMELINE_SHIMMER_SPREAD)
+            .into_any_element()
+    } else {
+        StyledText::new(text.to_string()).into_any_element()
+    }
+}
+
+fn resting_color(cx: &App) -> Hsla {
+    let theme = cx.theme();
+    if theme.is_dark() {
+        theme.muted_foreground.opacity(0.94)
+    } else {
+        theme.muted_foreground.blend(theme.foreground.opacity(0.20))
+    }
 }
 
 fn status_label(label: String, running: bool, failed: bool) -> String {
@@ -411,6 +488,7 @@ pub(super) fn row(
         })
         .child(
             div()
+                .id("rail-icon")
                 .debug_selector(|| format!("activity-rail-icon:{id}"))
                 .absolute()
                 .top(gpui::rems(icon_top))
@@ -418,18 +496,23 @@ pub(super) fn row(
                 .w_full()
                 .flex()
                 .justify_center()
-                .child(
-                    process_activity_icon(icon)
-                        .size(gpui::rems(ICON_SIZE_REM))
-                        .text_color(if failed {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().muted_foreground
-                        }),
-                ),
+                .text_color(if failed {
+                    cx.theme().danger
+                } else {
+                    resting_color(cx)
+                })
+                .group_hover(HOVER_GROUP, |style| {
+                    style.text_color(if failed {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().foreground
+                    })
+                })
+                .child(process_activity_icon(icon).size(gpui::rems(ICON_SIZE_REM))),
         );
     h_flex()
         .id(id.to_string())
+        .group(HOVER_GROUP)
         .w_full()
         .min_w_0()
         .flex_none()
@@ -442,12 +525,12 @@ pub(super) fn row(
 
 fn rail_line(cx: &App) -> Div {
     // Only the separator is a physical hairline; its column and endpoints zoom.
-    div()
-        .absolute()
-        .w_full()
-        .flex()
-        .justify_center()
-        .child(div().w(px(1.0)).h_full().bg(cx.theme().border))
+    div().absolute().w_full().flex().justify_center().child(
+        div()
+            .w(px(1.0))
+            .h_full()
+            .bg(cx.theme().border.opacity(0.55)),
+    )
 }
 
 pub(super) fn detail(id: String, label: &str, value: &str, cx: &App) -> AnyElement {

@@ -622,7 +622,13 @@ cards should support compact summaries for mobile.
 Desktop process activity uses compact disclosure rows, projected by
 `timeline_activity::Activity` from the row and its latest typed payload. The
 action and target are separate: commands show their invocation, files show a
-path badge and available diff counts, and plans show completed/total steps.
+basename badge and available diff counts, and plans show completed/total steps.
+Keep the original file path in the tooltip, accessible label, details, and
+operation identity; equal basenames must not merge distinct files. File labels
+handle both path separators and decode file URI basenames independently of
+the host platform. Use
+`assets::file_icon` with `file_icon_descriptor` so timeline badges and file trees
+share their file-type shapes and theme colors.
 Collapsed labels normalize whitespace to one line; expanded details retain the
 original invocation, indentation, and result. Prefer the bounded input/output
 in `AgentEventRawExtension` over an abbreviated summary. Calls without output
@@ -638,6 +644,19 @@ first-height estimates. Window rem or code-font changes invalidate nested unit
 measurements as well as turn heights, so cached geometry cannot outlive its
 type scale.
 
+Tool headers use regular-weight, muted text at rest. Their hover feedback
+brightens text and icons without painting a row background. Use
+`ButtonCustomVariant::new(cx).foreground(color)` for transparent rest, hover,
+and pressed surfaces, and keyed child elements with `group_hover` for the text
+and icon changes. Do not override the Button's own hover slot. The row owns the
+hover group; neighboring rows must remain unchanged. Failure colors, keyboard
+focus rings, and the full-width click target remain visible and functional.
+The disclosure chevron follows the content in a nonshrinking slot; long targets
+truncate before the chevron or status indicators.
+Keep muted text above the contrast floor on both the timeline and its file
+badges, including tinted dark and light themes; reducing opacity uniformly can
+make an otherwise readable theme fail on the badge surface.
+
 `ActivitySummary` counts semantic operations and failures from typed status.
 Repeated changes to the same explicitly known file path count once; unknown
 paths remain separate operations. Generic plan tools such as `update_plan`
@@ -645,6 +664,16 @@ belong to planning, even though their name contains an editing verb. Keep the
 group summary muted and mark failures on their own rows. Successful rows need
 no repeated completion badge; running, failure and pending approval remain
 explicit, including a running indication on a collapsed group.
+
+Running tool labels and group summaries use the component `ShimmerText` with
+the shared timeline sweep and spread. `activity_turn_is_live` checks the owning
+session and rejects finished or superseded turns; `timeline_activity::is_running`
+also requires an unfinished operation without failure or pending approval.
+Never animate from `row.streaming` alone: interrupted rows can retain that flag.
+Reduced motion keeps a static label and status indicator. Search highlighting
+takes precedence over the target's shimmer so a live result remains readable.
+UI tests verify hover colors and painted surfaces, narrow-width disclosure
+geometry, and that settled or reduced-motion text requests no further frames.
 
 `timeline_activity::group_open(turn, group, explicit)` gives the reader's
 choice precedence. Otherwise, an unfinished turn without a conclusion opens
@@ -656,8 +685,9 @@ approval surface. The effective group expansion is part of the measured-unit
 revision: an automatic collapse must release the old height even when the
 tool's sequence has not advanced.
 
-Commentary uses the muted text presentation and the final answer uses the
-normal foreground. A finished answer with no process rows has no empty
+Commentary and final answers use the normal body foreground. Reasoning retains
+its muted text presentation so progress explanations read above tool metadata.
+A finished answer with no process rows has no empty
 process-duration header. Command approval actions remain reachable outside the
 command's collapsed details.
 

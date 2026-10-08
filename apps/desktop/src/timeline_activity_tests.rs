@@ -1,5 +1,6 @@
 use super::*;
 use gpui::{KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext};
+use std::cell::Cell;
 use vibex_core::{
     AgentMessagePayload, CommandPayload, CommandStatus, FileOperationPayload, ToolCallPayload,
     ToolCallStatus,
@@ -86,7 +87,55 @@ fn activity_labels_are_single_line_without_changing_the_invocation() {
     let file = file(FileOperationKind::Read, "src/a directory/main.rs");
     let activity = Activity::project(&row_for(&file), Some(&file));
     assert_eq!(activity.path.as_deref(), Some("src/a directory/main.rs"));
-    assert_eq!(activity.target, "src/a directory/main.rs");
+    assert_eq!(activity.target, "main.rs");
+    assert!(activity.label().ends_with("src/a directory/main.rs"));
+}
+
+#[test]
+fn activity_file_labels_keep_their_names_and_complete_paths() {
+    for (path, name) in [
+        ("src/a directory/main.rs", "main.rs"),
+        (r"C:\work\资料\main.rs", "main.rs"),
+        (r"\\server\share\README.md", "README.md"),
+        (
+            "file:///workspace/notes%20and%20plans/%E6%A3%80%E6%9F%A5.md",
+            "检查.md",
+        ),
+        (
+            "file:///C:/workspace/notes%20and%20plans.md",
+            "notes and plans.md",
+        ),
+        (
+            "file://server/share/notes%20and%20plans.md",
+            "notes and plans.md",
+        ),
+        (
+            "file:///workspace/review+notes%23next.md",
+            "review+notes#next.md",
+        ),
+        ("config/.env.local", ".env.local"),
+        ("src/nested/", "nested"),
+        ("/", "/"),
+    ] {
+        let payload = file(FileOperationKind::Read, path);
+        let activity = Activity::project(&row_for(&payload), Some(&payload));
+        assert_eq!(activity.target, name);
+        assert_eq!(activity.path.as_deref(), Some(path));
+        assert!(activity.label().ends_with(path));
+    }
+
+    let mut summary = ActivitySummary::default();
+    for path in ["src/main.rs", "tests/main.rs"] {
+        let payload = file(FileOperationKind::Edit, path);
+        let activity = Activity::project(&row_for(&payload), Some(&payload));
+        assert_eq!(activity.target, "main.rs");
+        summary.record(&activity, path);
+    }
+    assert_eq!(
+        summary.edits.len(),
+        2,
+        "short labels must not merge distinct files"
+    );
 }
 
 #[test]
@@ -268,6 +317,32 @@ fn activity_groups_follow_execution_until_the_reader_overrides_them() {
     assert!(group_open(&turn, &group, Some(true)));
 }
 
+#[test]
+fn activity_running_state_requires_an_active_turn_and_operation() {
+    let mut payload = command("cargo check");
+    let TimelinePayload::Command(invocation) = &mut payload else {
+        unreachable!()
+    };
+    invocation.status = CommandStatus::Started;
+    invocation.exit_code = None;
+    let mut row = row_for(&payload);
+    assert!(is_running(&row, true));
+    assert!(
+        !is_running(&row, false),
+        "interrupted rows cannot keep animating"
+    );
+    row.pending_permission = true;
+    assert!(!is_running(&row, true));
+    row.pending_permission = false;
+    row.failed = true;
+    assert!(!is_running(&row, true));
+    assert!(!is_running(&row_for(&command("cargo check")), true));
+    assert_eq!(
+        generic_tool_activity_icon("", "Interact with subagent reviewer"),
+        ProcessActivityIcon::Collaboration
+    );
+}
+
 struct ActivityProbe {
     activity: Activity,
     expanded: bool,
@@ -275,6 +350,7 @@ struct ActivityProbe {
     running: bool,
     rem: f32,
     width: f32,
+    target_color: Option<Rc<Cell<Hsla>>>,
 }
 
 fn press(cx: &mut VisualTestContext, key: &str) {
@@ -293,12 +369,24 @@ fn press(cx: &mut VisualTestContext, key: &str) {
 impl Render for ActivityProbe {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.rem));
+        let target = self.target_color.clone().map(|color| {
+            div()
+                .child(self.activity.target.clone())
+                .child(
+                    gpui::canvas(
+                        move |_, window, _| color.set(window.text_style().color),
+                        |_, _, _, _| {},
+                    )
+                    .size(px(0.0)),
+                )
+                .into_any_element()
+        });
         let first = header(
             "first-header".into(),
             &self.activity,
             self.running,
             Some(self.expanded),
-            div().child(self.activity.target.clone()).into_any_element(),
+            target,
             None,
             cx,
         )
@@ -322,7 +410,7 @@ impl Render for ActivityProbe {
         let first = row(
             "first",
             self.activity.icon(),
-            false,
+            self.activity.failed,
             Some(true),
             div()
                 .debug_selector(|| "first-header".into())
@@ -341,7 +429,7 @@ impl Render for ActivityProbe {
                 &self.activity,
                 false,
                 Some(false),
-                div().child("src/next.rs").into_any_element(),
+                None,
                 None,
                 cx,
             )
@@ -381,7 +469,7 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
     });
     let payload = file(
         FileOperationKind::Read,
-        "src/a-long-directory-name/another-long-directory/main.rs",
+        "src/a-long-directory-name/a-very-long-component-name-that-must-stay-inside-the-activity-header.rs",
     );
     let activity = Activity::project(&row_for(&payload), Some(&payload));
     let view = cx.new(|_| ActivityProbe {
@@ -391,6 +479,7 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
         running: true,
         rem: 16.0,
         width: 400.0,
+        target_color: None,
     });
     let (_, cx) =
         cx.add_window_view(|window, cx| gpui_component::Root::new(view.clone(), window, cx));
@@ -414,6 +503,10 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
             px(rem * SUMMARY_HEIGHT_REM)
         );
         let trigger = cx.debug_bounds("first-header").unwrap();
+        let target = cx.debug_bounds("activity-target:first-header").unwrap();
+        let disclosure = cx.debug_bounds("activity-disclosure:first-header").unwrap();
+        assert!(target.right() <= disclosure.left());
+        assert!(disclosure.right() <= trigger.right());
         let icon = cx.debug_bounds("activity-rail-icon:first").unwrap();
         assert!(
             (icon.center().y - trigger.center().y).abs() * scale < px(1.0),
@@ -473,6 +566,139 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
         assert!(
             view.read_with(cx, |view, _| view.expanded),
             "copying details must not toggle their disclosure"
+        );
+    }
+}
+
+#[gpui::test]
+fn activity_hover_brightens_text_without_painting_a_row_background(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let payload = file(FileOperationKind::Read, "src/main.rs");
+    let color = Rc::new(Cell::new(gpui::transparent_black()));
+    let view = cx.new(|_| ActivityProbe {
+        activity: Activity::project(&row_for(&payload), Some(&payload)),
+        expanded: false,
+        group_expanded: true,
+        running: false,
+        rem: 16.0,
+        width: 400.0,
+        target_color: Some(color.clone()),
+    });
+    let (_, cx) =
+        cx.add_window_view(|window, cx| gpui_component::Root::new(view.clone(), window, cx));
+    let surfaces = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .painted_quads()
+                .into_iter()
+                .map(|quad| (quad.bounds, quad.background))
+                .collect::<Vec<_>>()
+        })
+    };
+    for mode in [
+        gpui_component::ThemeMode::Dark,
+        gpui_component::ThemeMode::Light,
+    ] {
+        cx.update(|window, cx| {
+            gpui_component::Theme::change(mode, Some(window), cx);
+            window.simulate_mouse_move(point(px(600.0), px(300.0)), cx);
+            let _ = window.draw(cx);
+        });
+        let (rest, hover, danger) =
+            cx.update(|_, cx| (resting_color(cx), cx.theme().foreground, cx.theme().danger));
+        assert_eq!(color.get(), rest);
+        assert_ne!(rest, hover);
+        let before = surfaces(cx);
+        let header = cx.debug_bounds("first-header").unwrap();
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(header.center(), cx);
+            let _ = window.draw(cx);
+        });
+        assert_eq!(color.get(), hover);
+        assert_eq!(
+            surfaces(cx),
+            before,
+            "hover changes glyphs, never the row surface"
+        );
+        let second = cx.debug_bounds("second-row").unwrap();
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(second.center(), cx);
+            let _ = window.draw(cx);
+        });
+        assert_eq!(color.get(), rest, "hover does not brighten adjacent rows");
+        let summary = cx.debug_bounds("summary").unwrap();
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(summary.center(), cx);
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            surfaces(cx),
+            before,
+            "the group summary also stays transparent"
+        );
+
+        view.update(cx, |view, cx| {
+            view.activity.failed = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(header.center(), cx);
+            let _ = window.draw(cx);
+        });
+        assert_eq!(color.get(), danger, "hover preserves failure emphasis");
+        view.update(cx, |view, cx| {
+            view.activity.failed = false;
+            cx.notify();
+        });
+    }
+}
+
+struct ActivityTextProbe {
+    running: bool,
+}
+
+impl Render for ActivityTextProbe {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "activity-text".into())
+            .w_64()
+            .text_xs()
+            .text_color(resting_color(cx))
+            .child(activity_text(
+                "tool-target",
+                "cargo check --locked",
+                self.running,
+            ))
+    }
+}
+
+#[gpui::test]
+fn activity_shimmer_stops_when_settled_or_motion_is_reduced(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|_| ActivityTextProbe { running: false });
+    let (_, cx) =
+        cx.add_window_view(|window, cx| gpui_component::Root::new(view.clone(), window, cx));
+    let mut height = None;
+    for (running, reduced) in [(false, false), (true, false), (false, false), (true, true)] {
+        cx.update(|_, cx| cx.set_reduce_motion(reduced));
+        view.update(cx, |view, cx| {
+            view.running = running;
+            cx.notify();
+        });
+        let frames = cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            let _ = window.draw(cx);
+            window.simulate_next_frame(cx)
+        });
+        assert_eq!(frames > 0, running && !reduced);
+        let current = cx.debug_bounds("activity-text").unwrap().size.height;
+        assert_eq!(
+            *height.get_or_insert(current),
+            current,
+            "shimmer cannot change row geometry"
         );
     }
 }

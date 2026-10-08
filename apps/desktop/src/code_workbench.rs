@@ -89,9 +89,7 @@ use vibex_terminal::TerminalManager;
 
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
-use crate::assets::{
-    BUNDLED_SANS_FAMILY, agent_brand_icon, file_tree_asset_icon, open_tool_brand_icon,
-};
+use crate::assets::{BUNDLED_SANS_FAMILY, agent_brand_icon, file_icon, open_tool_brand_icon};
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
@@ -16681,75 +16679,16 @@ fn file_tree_icon_sized<T>(
     size: gpui::Pixels,
     cx: &Context<T>,
 ) -> AnyElement {
-    let token = match kind {
-        FileIconKind::Archive => "right-rail-file-icon-archive",
-        FileIconKind::Audio => "right-rail-file-icon-audio",
-        FileIconKind::Code | FileIconKind::Java | FileIconKind::Rust | FileIconKind::TypeScript => {
-            "right-rail-file-icon-code"
-        }
-        FileIconKind::Config => "right-rail-file-icon-config",
-        FileIconKind::Database | FileIconKind::Spreadsheet => "right-rail-file-icon-data",
-        FileIconKind::Directory => "right-rail-file-icon-directory",
-        FileIconKind::Font => "right-rail-file-icon-font",
-        FileIconKind::Image | FileIconKind::Svg => "right-rail-file-icon-image",
-        FileIconKind::Json => "right-rail-file-icon-json",
-        FileIconKind::Lock => "right-rail-file-icon-lock",
-        FileIconKind::Markdown => "right-rail-file-icon-markdown",
-        FileIconKind::Markup => "right-rail-file-icon-markup",
-        FileIconKind::JavaScript | FileIconKind::Script => "right-rail-file-icon-script",
-        FileIconKind::Secret => "right-rail-file-icon-secret",
-        FileIconKind::Style => "right-rail-file-icon-style",
-        FileIconKind::Symlink => "right-rail-file-icon-symlink",
-        FileIconKind::Video => "right-rail-file-icon-video",
-        FileIconKind::Pdf
-        | FileIconKind::Office
-        | FileIconKind::Text
-        | FileIconKind::File
-        | FileIconKind::Other => "right-rail-file-icon-text",
-    };
-    let mut color = crate::theme::semantic_color(token, cx.theme().is_dark());
-    if ignored {
-        color = color.opacity(0.35);
-    }
-    match kind {
-        FileIconKind::Directory => Icon::new(IconName::Folder)
-            .small()
-            .text_color(color)
-            .into_any_element(),
-        FileIconKind::Code | FileIconKind::Rust | FileIconKind::TypeScript => {
-            file_tree_asset_icon("icons/vibex/file-code.svg", size, color)
-        }
-        FileIconKind::Java => file_tree_asset_icon("icons/vibex/coffee.svg", size, color),
-        FileIconKind::JavaScript => file_tree_asset_icon("icons/vibex/file-code.svg", size, color),
-        FileIconKind::Script => file_tree_asset_icon("icons/vibex/file-terminal.svg", size, color),
-        FileIconKind::Json => file_tree_asset_icon("icons/vibex/file-braces.svg", size, color),
-        FileIconKind::Markdown => {
-            file_tree_asset_icon("icons/vibex/book-open-text.svg", size, color)
-        }
-        FileIconKind::Image => file_tree_asset_icon("icons/vibex/image.svg", size, color),
-        FileIconKind::Svg => file_tree_asset_icon("icons/vibex/code-xml.svg", size, color),
-        FileIconKind::Archive => file_tree_asset_icon("icons/vibex/file-archive.svg", size, color),
-        FileIconKind::Database => file_tree_asset_icon("icons/vibex/database.svg", size, color),
-        FileIconKind::Spreadsheet => {
-            file_tree_asset_icon("icons/vibex/file-spreadsheet.svg", size, color)
-        }
-        FileIconKind::Style => file_tree_asset_icon("icons/vibex/hash.svg", size, color),
-        FileIconKind::Markup => file_tree_asset_icon("icons/vibex/code-xml.svg", size, color),
-        FileIconKind::Audio => file_tree_asset_icon("icons/vibex/audio-lines.svg", size, color),
-        FileIconKind::Video => {
-            file_tree_asset_icon("icons/vibex/file-video-camera.svg", size, color)
-        }
-        FileIconKind::Symlink => file_tree_asset_icon("icons/vibex/file-symlink.svg", size, color),
-        FileIconKind::Config => file_tree_asset_icon("icons/vibex/file-cog.svg", size, color),
-        FileIconKind::Lock => file_tree_asset_icon("icons/vibex/file-lock.svg", size, color),
-        FileIconKind::Secret => file_tree_asset_icon("icons/vibex/file-key.svg", size, color),
-        FileIconKind::Font => file_tree_asset_icon("icons/vibex/file-type.svg", size, color),
-        FileIconKind::Pdf
-        | FileIconKind::Office
-        | FileIconKind::Text
-        | FileIconKind::File
-        | FileIconKind::Other => file_tree_asset_icon("icons/vibex/file-text.svg", size, color),
-    }
+    file_icon(kind, cx)
+        .map(|icon| {
+            if kind == FileIconKind::Directory {
+                icon.small()
+            } else {
+                icon.size(size)
+            }
+        })
+        .when(ignored, |icon| icon.opacity(0.35))
+        .into_any_element()
 }
 
 fn file_tree_text_color(row: &FileExplorerRow, cx: &Context<CodeRightRail>) -> Hsla {

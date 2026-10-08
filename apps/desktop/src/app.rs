@@ -534,14 +534,10 @@ const SHIMMER_SCAN_PASSES: f32 = 10.0;
 /// visually identical while cutting the repaints by more than half on a 75Hz
 /// panel.
 const REPEATING_ANIMATION_MAX_FPS: f32 = 30.0;
-/// One complete sweep of the collapsed thinking label's shimmer. The
-/// hand-rolled indicator ran ten passes through a twelve-second loop, so keep
-/// the same pace now that the kit's `ShimmerText` measures one sweep per
-/// duration.
-const AGENT_THINKING_SHIMMER_SWEEP: Duration = Duration::from_millis(1_200);
-/// Highlight half-width as a fraction of the label width, matching the scan
-/// radius the hand-rolled indicator used.
-const AGENT_THINKING_SHIMMER_SPREAD: f32 = 0.42;
+/// One complete sweep of a live timeline label, shared by thought and tool rows.
+const TIMELINE_SHIMMER_SWEEP: Duration = Duration::from_millis(1_200);
+/// Highlight half-width as a fraction of the label width.
+const TIMELINE_SHIMMER_SPREAD: f32 = 0.42;
 const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 /// Projection caches below are sized per expanded turn, not per screen: an
 /// expanded turn renders every one of its rows on every frame, so a table that
@@ -43514,7 +43510,7 @@ impl VibexWorkbench {
                                     div()
                                         .min_w_0()
                                         .text_ellipsis()
-                                        .child(agent_turn_preview_file_name(path).to_string()),
+                                        .child(agent_file_display_name(path)),
                                 )
                                 .into_any_element()
                         })
@@ -46380,7 +46376,7 @@ impl VibexWorkbench {
                     .flatten();
                 response = response.child(self.render_timeline_row(
                     conclusion_row,
-                    true,
+                    turn,
                     content_before_actions,
                     answer_metadata,
                     window,
@@ -47523,12 +47519,17 @@ impl VibexWorkbench {
     fn render_timeline_row(
         &mut self,
         row: &TimelineRow,
-        conversation_conclusion: bool,
+        turn: &TimelineConversationTurn,
         content_before_actions: Option<AnyElement>,
         answer_metadata: Option<AnyElement>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let conversation_conclusion = turn
+            .conclusion_row
+            .as_ref()
+            .is_some_and(|conclusion| conclusion.id == row.id);
+        let turn_live = self.activity_turn_is_live(turn);
         if let Some(delegation) = timeline_row_delegation(row, &self.active_timeline().items) {
             let surface_id = if self.rendering_child_agent_timeline() {
                 "child-agent-full"
@@ -47555,7 +47556,7 @@ impl VibexWorkbench {
             ),
             TimelineRowKind::Reasoning => self.render_thought_process_row(row, cx),
             TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => {
-                self.render_plan_activity(row, window, cx)
+                self.render_plan_activity(row, turn_live, window, cx)
             }
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest if self.rendering_child_agent_timeline() => {
@@ -47573,21 +47574,29 @@ impl VibexWorkbench {
                 if !self.rendering_child_agent_timeline()
                     && self.ui_state.session.enhanced_command_execution_display =>
             {
-                self.render_command_execution_card(row, None, window, cx)
+                self.render_command_execution_card(row, None, turn_live, window, cx)
             }
-            TimelineRowKind::Command => self.render_process_activity_line(row, window, cx),
+            TimelineRowKind::Command => {
+                self.render_process_activity_line(row, turn_live, window, cx)
+            }
             TimelineRowKind::FileOperation
                 if !self.rendering_child_agent_timeline()
                     && self.ui_state.session.enhanced_file_operation_display =>
             {
-                self.render_file_operation_card(row, window, cx)
+                self.render_file_operation_card(row, turn_live, window, cx)
             }
-            TimelineRowKind::FileOperation => self.render_process_activity_line(row, window, cx),
-            TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, window, cx),
+            TimelineRowKind::FileOperation => {
+                self.render_process_activity_line(row, turn_live, window, cx)
+            }
+            TimelineRowKind::ImageGeneration => {
+                self.render_image_generation_card(row, turn_live, window, cx)
+            }
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::Collaboration
-            | TimelineRowKind::Retry => self.render_process_activity_line(row, window, cx),
+            | TimelineRowKind::Retry => {
+                self.render_process_activity_line(row, turn_live, window, cx)
+            }
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
             | TimelineRowKind::PermissionResolution
@@ -48570,14 +48579,18 @@ impl VibexWorkbench {
     ) -> AnyElement {
         let rows = &turn.process_rows[unit.rows.clone()];
         let element = match &unit.kind {
-            TimelineProcessUnitKind::CommandPair => {
-                self.render_command_execution_card(&rows[0], rows.get(1), window, cx)
-            }
+            TimelineProcessUnitKind::CommandPair => self.render_command_execution_card(
+                &rows[0],
+                rows.get(1),
+                self.activity_turn_is_live(turn),
+                window,
+                cx,
+            ),
             TimelineProcessUnitKind::Group(group) => {
                 self.render_process_activity_group(turn, group, rows, window, cx)
             }
             TimelineProcessUnitKind::Row => {
-                self.render_timeline_row(&rows[0], false, None, None, window, cx)
+                self.render_timeline_row(&rows[0], turn, None, None, window, cx)
             }
         };
         self.highlight_session_search_rows(rows, element, cx)
@@ -49031,11 +49044,7 @@ impl VibexWorkbench {
         let markdown_entity = cx.weak_entity();
         let markdown_view = markdown_text_view(
             &markdown_state,
-            if conversation_conclusion {
-                MarkdownPresentation::Agent
-            } else {
-                MarkdownPresentation::Thought
-            },
+            MarkdownPresentation::Agent,
             cx,
             move |url, _, window, cx| {
                 let _ = markdown_entity
@@ -49561,6 +49570,7 @@ impl VibexWorkbench {
     fn render_plan_activity(
         &mut self,
         row: &TimelineRow,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -49570,10 +49580,24 @@ impl VibexWorkbench {
                 TimelinePayload::Plan(_) | TimelinePayload::TodoUpdate(_)
             )
         }) {
-            self.render_process_activity_entry(row, None, window, cx)
+            self.render_process_activity_entry(row, None, turn_live, window, cx)
         } else {
             self.render_thought_process_row(row, cx)
         }
+    }
+
+    fn activity_turn_is_live(&self, turn: &TimelineConversationTurn) -> bool {
+        if timeline_turn_finished(turn) {
+            return false;
+        }
+        if let Some(session_id) = self.child_agent_render_session.as_ref() {
+            return self
+                .child_agent_timelines
+                .get(session_id.as_str())
+                .and_then(|state| state.session.as_ref())
+                .is_some_and(|session| agent_turn_is_active(false, Some(session.state)));
+        }
+        self.borrowed_session_turn_is_live()
     }
 
     fn render_process_activity_group(
@@ -49584,6 +49608,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let turn_live = self.activity_turn_is_live(turn);
         let expanded = timeline_activity::group_open(
             turn,
             group,
@@ -49601,7 +49626,8 @@ impl VibexWorkbench {
             format!("activity-summary:{}", group.id),
             summary.label(),
             expanded,
-            !timeline_turn_finished(turn) && rows.iter().any(|row| row.streaming),
+            rows.iter()
+                .any(|row| timeline_activity::is_running(row, turn_live)),
             cx,
         )
         .tooltip(if expanded {
@@ -49631,9 +49657,9 @@ impl VibexWorkbench {
                     if row.kind == TimelineRowKind::FileOperation
                         && self.ui_state.session.enhanced_file_operation_display
                     {
-                        self.render_file_operation_entry(row, continues, window, cx)
+                        self.render_file_operation_entry(row, continues, turn_live, window, cx)
                     } else {
-                        self.render_process_activity_entry(row, continues, window, cx)
+                        self.render_process_activity_entry(row, continues, turn_live, window, cx)
                     }
                 })
                 .collect::<Vec<_>>();
@@ -49655,16 +49681,18 @@ impl VibexWorkbench {
     fn render_process_activity_line(
         &mut self,
         row: &TimelineRow,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.render_process_activity_entry(row, None, window, cx)
+        self.render_process_activity_entry(row, None, turn_live, window, cx)
     }
 
     fn render_process_activity_entry(
         &mut self,
         row: &TimelineRow,
         continues: Option<bool>,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -49680,16 +49708,19 @@ impl VibexWorkbench {
         let toggle_id = row.id.clone();
         let turn_id = row.turn_id.clone();
         let target = self
-            .session_search_highlighted_row_text(
-                row,
-                timeline_activity::target(&projection.activity).to_string(),
-                cx,
-            )
-            .into_any_element();
+            .session_search_highlight_for_rows(std::slice::from_ref(row))
+            .map(|highlight| {
+                session_search_highlighted_text(
+                    timeline_activity::target(&projection.activity).to_string(),
+                    &highlight.query,
+                    session_search_keyword_highlight(highlight.active, cx),
+                )
+                .into_any_element()
+            });
         let header = timeline_activity::header(
             format!("activity:{}", row.id),
             &projection.activity,
-            row.streaming,
+            timeline_activity::is_running(row, turn_live),
             has_details.then_some(expanded),
             target,
             None,
@@ -49755,6 +49786,7 @@ impl VibexWorkbench {
         &mut self,
         row: &TimelineRow,
         permission_row: Option<&TimelineRow>,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -49765,7 +49797,7 @@ impl VibexWorkbench {
                     _ => None,
                 })
         else {
-            return self.render_process_activity_line(row, window, cx);
+            return self.render_process_activity_line(row, turn_live, window, cx);
         };
         let expanded = self
             .timeline_command_expansion
@@ -49896,16 +49928,18 @@ impl VibexWorkbench {
     fn render_file_operation_card(
         &mut self,
         row: &TimelineRow,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.render_file_operation_entry(row, None, window, cx)
+        self.render_file_operation_entry(row, None, turn_live, window, cx)
     }
 
     fn render_file_operation_entry(
         &mut self,
         row: &TimelineRow,
         continues: Option<bool>,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -49916,7 +49950,7 @@ impl VibexWorkbench {
                     _ => None,
                 })
         else {
-            return self.render_process_activity_entry(row, continues, window, cx);
+            return self.render_process_activity_entry(row, continues, turn_live, window, cx);
         };
         let projection = self.tool_card_projection_cached(row);
         let expanded = self
@@ -49956,16 +49990,19 @@ impl VibexWorkbench {
                 .into_any_element()
         });
         let target = self
-            .session_search_highlighted_row_text(
-                row,
-                timeline_activity::target(&projection.activity).to_string(),
-                cx,
-            )
-            .into_any_element();
+            .session_search_highlight_for_rows(std::slice::from_ref(row))
+            .map(|highlight| {
+                session_search_highlighted_text(
+                    timeline_activity::target(&projection.activity).to_string(),
+                    &highlight.query,
+                    session_search_keyword_highlight(highlight.active, cx),
+                )
+                .into_any_element()
+            });
         let header = timeline_activity::header(
             format!("file-card-header:{}", row.id),
             &projection.activity,
-            row.streaming,
+            timeline_activity::is_running(row, turn_live),
             Some(expanded),
             target,
             statistics,
@@ -50159,6 +50196,7 @@ impl VibexWorkbench {
     fn render_image_generation_card(
         &mut self,
         row: &TimelineRow,
+        turn_live: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -50169,7 +50207,7 @@ impl VibexWorkbench {
                 _ => None,
             })
         else {
-            return self.render_process_activity_line(row, window, cx);
+            return self.render_process_activity_line(row, turn_live, window, cx);
         };
         let workspace_root = self
             .selected_session_id
@@ -55686,12 +55724,25 @@ fn agent_turn_preview_content(
     }
 }
 
-fn agent_turn_preview_file_name(path: &str) -> &str {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
+fn agent_file_display_name(path: &str) -> String {
+    if let Ok(url) = url::Url::parse(path)
+        && url.scheme() == "file"
+    {
+        return url
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+            .map(|name| {
+                percent_encoding::percent_decode_str(name)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| path.to_string());
+    }
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|name| !name.is_empty())
         .unwrap_or(path)
+        .to_string()
 }
 
 /// Whether a conversation turn owns a numbered slot in the session preview
@@ -56505,7 +56556,7 @@ fn process_activity_icon(kind: ProcessActivityIcon) -> Icon {
         ProcessActivityIcon::Command => Icon::new(IconName::SquareTerminal),
         ProcessActivityIcon::Search => Icon::new(IconName::Search),
         ProcessActivityIcon::Directory => Icon::new(IconName::Folder),
-        ProcessActivityIcon::FileRead => Icon::new(IconName::BookOpen),
+        ProcessActivityIcon::FileRead => Icon::default().path("icons/vibex/file-text.svg"),
         ProcessActivityIcon::FileEdit => Icon::default().path("icons/vibex/pencil.svg"),
         ProcessActivityIcon::FileCreate => Icon::default().path("icons/vibex/file-plus.svg"),
         ProcessActivityIcon::FileDelete => Icon::default().path("icons/vibex/trash-2.svg"),
@@ -56579,7 +56630,7 @@ fn semantic_tool_activity_icon(value: &str) -> Option<ProcessActivityIcon> {
         "loaded",
     ]) {
         Some(ProcessActivityIcon::FileRead)
-    } else if has_any(&["agent", "collaboration", "delegate", "task"]) {
+    } else if has_any(&["agent", "subagent", "collaboration", "delegate", "task"]) {
         Some(ProcessActivityIcon::Collaboration)
     } else if has_any(&["image", "picture", "photo"]) {
         Some(ProcessActivityIcon::Image)
@@ -57297,8 +57348,8 @@ fn render_agent_thinking_indicator(
         ShimmerText::new(label)
             .id(animation_id)
             .text_color(cx.theme().muted_foreground)
-            .duration(AGENT_THINKING_SHIMMER_SWEEP)
-            .spread(AGENT_THINKING_SHIMMER_SPREAD)
+            .duration(TIMELINE_SHIMMER_SWEEP)
+            .spread(TIMELINE_SHIMMER_SPREAD)
             .into_any_element()
     } else {
         div()
@@ -72825,8 +72876,8 @@ mod tests {
 
         assert!(renderer.contains("ShimmerText::new(label)"));
         assert!(renderer.contains("truncate_agent_thinking_label(label)"));
-        assert!(renderer.contains("AGENT_THINKING_SHIMMER_SWEEP"));
-        assert!(renderer.contains("AGENT_THINKING_SHIMMER_SPREAD"));
+        assert!(renderer.contains("TIMELINE_SHIMMER_SWEEP"));
+        assert!(renderer.contains("TIMELINE_SHIMMER_SPREAD"));
         assert!(!renderer.contains("ScrollHandle"));
         assert!(!renderer.contains("set_offset"));
         assert!(!renderer.contains("overflow_x_scroll"));
@@ -86366,10 +86417,13 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
             .map(|(body, _)| body)
             .expect("timeline row rendering should remain inspectable");
-        assert!(row_renderer.contains("render_command_execution_card(row, None, window, cx)"));
         assert!(
-            row_renderer.contains("TimelineRowKind::Command => self.render_process_activity_line")
+            row_renderer
+                .contains("render_command_execution_card(row, None, turn_live, window, cx)")
         );
+        assert!(row_renderer.contains(
+            "TimelineRowKind::Command => {\n                self.render_process_activity_line"
+        ));
     }
 
     #[test]
@@ -86554,7 +86608,7 @@ mod tests {
             ["crates/relay_smoke.rs", "src/lib.rs", "src/runtime.rs"]
         );
         assert_eq!(
-            agent_turn_preview_file_name(&preview.file_paths[0]),
+            agent_file_display_name(&preview.file_paths[0]),
             "relay_smoke.rs"
         );
     }
