@@ -414,7 +414,9 @@ impl fmt::Debug for BrowserObservation {
 pub struct BrowserFrameMetadata {
     pub offset_top: f64,
     pub page_scale_factor: f64,
+    /// Logical viewport width before page scale, independent of capture density.
     pub device_width: f64,
+    /// Logical viewport height before page scale, independent of capture density.
     pub device_height: f64,
     pub scroll_offset_x: f64,
     pub scroll_offset_y: f64,

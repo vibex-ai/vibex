@@ -180,10 +180,19 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
 - Viewport width and height are **CSS pixels**, measured from the frame area
   after browser chrome has taken its space. Send the complete logical size;
   never multiply it by display scale or clamp it to an encoder budget.
-- The runtime applies display density once when choosing the physical
-  `Page.startScreencast` budget. Its `maxWidth` and `maxHeight` are bounded by
-  `MAX_ENCODE_WIDTH = 2560` and `MAX_ENCODE_HEIGHT = 1600`. Chrome fits the whole
-  viewport inside these bounds while preserving its aspect ratio.
+- `viewport_metrics` sets both the CSS device metrics and an explicit CDP
+  `viewport` covering that whole area, with `x = y = 0` and `scale = 1`.
+  Chrome applies `deviceScaleFactor` to this viewport itself, accounting for
+  the browser host's density. Setting only `deviceScaleFactor` changes page
+  metrics but leaves the headless compositor too small for HiDPI capture.
+- Apply these metrics when preparing a tab, including the default size and
+  page-opened tabs that inherit their opener's viewport. A first resize matching
+  the cached default must not leave Chrome at its unrelated startup size.
+- The `Page.startScreencast` `maxWidth` and `maxHeight` follow
+  `round(CSS size * display density)`, without fixed width/height caps. Both
+  JPEG and PNG preserve that physical resolution; the quality choice controls
+  compression. The encoded-payload limit (`BROWSER_MAX_FRAME_BYTES`) and
+  latest-value delivery remain separate bounds on transport and buffering.
 - `img` defaults to `Contain` even with `w_full().h_full()`. The browser uses
   `ObjectFit::Fill` so encoder rounding and the previous frame during the resize
   debounce cannot leave margins. Correct viewport sizing preserves page
@@ -191,24 +200,33 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
 - Resize requests are debounced for 160 ms. Cache a request only when a
   transport and tab exist; attaching a tab or cancelling its pending resize
   clears the cached request so the next layout sends the current size.
-- Pointer conversion uses the matching frame's metadata, independent of the
-  encoded resolution; the whole painted frame remains its input region.
+- The runtime publishes the tab's logical CSS viewport as metadata
+  `device_width/height`. Raw CDP `deviceWidth/Height` describe the enlarged
+  compositor surface after the explicit viewport override, while input and DOM
+  geometry still use CSS pixels. Passing those raw dimensions through scales
+  clicks and highlights by the DPI again. Preserve `page_scale_factor` and use
+  the normalized metadata for input over the whole painted frame.
 
 ### 4. Validation & Error Matrix
 
 - A zero viewport dimension becomes one pixel in the service.
 - A non-finite or non-positive display scale becomes 1; otherwise the service
   bounds it to `[0.25, 8]`.
+- Integer compositor/encoder rounding may differ by one physical pixel;
+  it must not reduce the pixel density or crop page content.
 - Positive metadata dimensions take precedence over encoded dimensions for
   input. Without either size, no pointer coordinate is sent.
 
 ### 5. Good/Base/Bad Cases
 
 - Base: a `960 × 640` page at 1x keeps that layout and frame size.
-- Good: a `900 × 2000` page keeps its layout while the frame fits within
-  `2560 × 1600`; a HiDPI panel uses the same CSS layout at greater density.
+- Good: a `900 × 2000` page at 1x produces a `900 × 2000` frame; an
+  `800 × 1200` page at 2x keeps its CSS layout and produces `1600 × 2400`.
 - Bad: truncating the page height to 1600 changes its aspect ratio, then
   `Contain` leaves margins and clicks calculated from the whole panel drift.
+- Also bad: moving the 1600-pixel cap to the encoder makes the page fill the
+  panel but downscales its detail before enlarging it again. Raising only the
+  encoder budget still leaves HiDPI blurry if the compositor stays at 1x.
 
 ### 6. Tests Required
 
@@ -216,16 +234,24 @@ forwards the measured page area through `BrowserTransport::set_viewport` to
   logical dimensions at tall, wide, fractional-DPI and 2x sizes, late attach,
   and the real surface's pointer mapping with several encoded resolutions.
 - `crates/browser/tests/viewport.rs` checks the page's actual
-  `innerWidth/innerHeight/devicePixelRatio`, matching frame metadata, bounded
-  encoded dimensions, and preserved aspect ratio against the system browser.
+  `innerWidth/innerHeight/devicePixelRatio`, normalized frame metadata, physical
+  encoded dimensions, visible corners, single-pixel contrast at 2x, and actual
+  mouse coordinates against the system browser in both JPEG and PNG modes.
+  Include the initial default size, density-only changes, fractional density,
+  portrait/landscape 4K frames, and a browser host running at 2x.
+- Wait for a complete resized frame; a previous layout can still be encoding
+  when the CDP resize finishes. Upper bounds and aspect ratio alone are not
+  clarity checks: the earlier test accepted `720 × 1600` for a `900 × 2000`
+  panel and accepted 1x captures on a 2x display.
 
 ### 7. Wrong vs Correct
 
 Wrong: pass `min(logical_size * display_scale, encoder_limit)` as the page's
 viewport and calculate clicks from JPEG/PNG dimensions.
 
-Correct: pass logical dimensions and display scale separately; bound the
-screencast encoder and use frame metadata for input.
+Correct: preserve CSS layout, size the compositor and encoder for the display's
+physical pixels, and publish logical metadata for input. Verify retained pixel
+detail as well as full coverage.
 
 ## Security rules
 
