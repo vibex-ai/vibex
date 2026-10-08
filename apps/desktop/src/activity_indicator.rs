@@ -1,9 +1,9 @@
-//! A compact V-shaped activity mark shared by live session surfaces.
+//! A compact V-shaped activity mark for live timeline labels.
 //!
 //! One clock moves a soft highlight down one stroke and up the other, then
 //! back again. The turnarounds ease to rest, including at the loop boundary.
 //! Cells are painted inside a fixed, rem-sized slot so motion never reflows
-//! the adjacent label or status lane.
+//! the adjacent label.
 
 use std::f32::consts::{PI, TAU};
 use std::time::Duration;
@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 
-use crate::{motion, spinner::STATUS_INDICATOR_MAX_FPS};
+use crate::motion;
 
 const CYCLE: Duration = Duration::from_millis(2100);
 const MAX_FPS: f32 = 30.0;
@@ -34,40 +34,18 @@ const CELLS: [(f32, f32); 7] = [
 #[derive(IntoElement)]
 pub(crate) struct ActivityIndicator {
     id: ElementId,
-    compact: bool,
-    color: Option<Hsla>,
 }
 
 impl ActivityIndicator {
     pub(crate) fn new(id: impl Into<ElementId>) -> Self {
-        Self {
-            id: id.into(),
-            compact: false,
-            color: None,
-        }
-    }
-
-    /// Use the sidebar's smaller status slot and lower animation frame budget.
-    pub(crate) fn compact(mut self) -> Self {
-        self.compact = true;
-        self
-    }
-
-    pub(crate) fn color(mut self, color: Hsla) -> Self {
-        self.color = Some(color);
-        self
+        Self { id: id.into() }
     }
 }
 
 impl RenderOnce for ActivityIndicator {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let color = self.color.unwrap_or(cx.theme().foreground);
-        let slot = if self.compact {
-            div().size_3()
-        } else {
-            div().size_4()
-        }
-        .flex_none();
+        let color = cx.theme().foreground;
+        let slot = div().size_4().flex_none();
 
         if motion::reduced_motion(cx) || motion::pauses_while_inactive(!window.is_window_active()) {
             return slot.child(mark(color, None)).into_any_element();
@@ -75,13 +53,7 @@ impl RenderOnce for ActivityIndicator {
 
         slot.with_animation(
             self.id,
-            Animation::new(CYCLE)
-                .repeat_synced()
-                .with_max_fps(if self.compact {
-                    STATUS_INDICATOR_MAX_FPS
-                } else {
-                    MAX_FPS
-                }),
+            Animation::new(CYCLE).repeat_synced().with_max_fps(MAX_FPS),
             move |this, phase| this.child(mark(color, Some(phase))),
         )
         .into_any_element()
