@@ -568,6 +568,16 @@ let popover = Popover::new(id).anchor(anchor).trigger(trigger).child(panel)
     .offset(px(RUNTIME_MENU_TRIGGER_GAP));
 ```
 
+A popover whose panel stays mounted through an exit animation must start that
+timeline only while the panel is actually up. The runtime cascades hold the
+panel in the tree with `open(menu_open || closing.is_some())`, and
+`motion::menu_out` begins at full opacity, so a close started for a menu that
+was never opened mounts the panel *inside* its own exit: choosing a run option
+from a sibling dropdown flashed the whole Agent/provider panel beside its
+trigger before fading it out. Guard the shared close helper on the panel's own
+open flag rather than trusting every caller to check first, and cover both
+surfaces with a source-inspection test.
+
 ### Composer References Are Atomic Tokens
 
 A reference the user picks from the suggestion menu — `/command`, `@file`,

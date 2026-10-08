@@ -27775,7 +27775,18 @@ impl VibexWorkbench {
     /// the state is cleared by [`Self::finish_runtime_menu_close`]. A second
     /// call while the exit is already running is a no-op, so a stray
     /// `on_open_change(false)` cannot restart the timeline.
+    ///
+    /// Only a menu that is up has an exit to play. Both cascades hold their
+    /// panel in the tree with `open(menu_open || closing.is_some())`, so
+    /// starting the timeline for a menu that was never opened mounts the panel
+    /// for the first time *inside* its own exit — and `menu_out` starts at full
+    /// opacity. Choosing a run option from a sibling dropdown used to take that
+    /// path, which flashed the whole Agent/provider panel beside its trigger
+    /// before fading it out.
     fn begin_runtime_menu_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.new_session_runtime_menu_open && !self.composer_runtime_menu_open {
+            return;
+        }
         if self.runtime_menu_closing_since.is_some() {
             return;
         }
@@ -83930,6 +83941,61 @@ mod tests {
             assert!(
                 opening.contains("self.clear_runtime_provider_search(window, cx);"),
                 "reopening the {surface} popover must start from an empty search"
+            );
+        }
+    }
+
+    /// A menu that is not up has no exit to play.
+    ///
+    /// `runtime_menu_closing_since` is what holds the closing panel in the tree
+    /// — both cascades open on `menu_open || closing.is_some()` — and
+    /// `menu_out` starts at full opacity, so a timeline started for a menu that
+    /// was never opened mounts the panel *inside* its own exit: picking a run
+    /// option from a sibling dropdown (mode, thinking depth) called
+    /// `choose_runtime_selection` with the Agent/provider menu closed and
+    /// flashed the whole panel beside its trigger.
+    #[test]
+    fn the_runtime_menu_exit_timeline_only_plays_for_a_mounted_panel() {
+        let source = include_str!("app.rs");
+        let begin = source
+            .split_once("    fn begin_runtime_menu_close(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Unmount the popover once the exit timeline has elapsed.")
+            })
+            .map(|(body, _)| body)
+            .expect("the runtime menu exit should remain inspectable");
+        let guard = begin
+            .find("if !self.new_session_runtime_menu_open && !self.composer_runtime_menu_open {")
+            .expect("the exit must refuse to start while neither menu is up");
+        let timeline = begin
+            .find("self.runtime_menu_closing_since = Some(Instant::now());")
+            .expect("a mounted panel must still play the exit timeline");
+        assert!(
+            guard < timeline,
+            "the panel has to be up before the exit timeline starts"
+        );
+
+        // Both surface entry points still close the menu they were opened from.
+        for (name, opener, closer) in [
+            (
+                "composer",
+                "    fn choose_runtime_selection(",
+                "\n    fn initialize_uninitialized_session_runtime(",
+            ),
+            (
+                "new-session",
+                "    fn choose_new_session_runtime(",
+                "\n    fn set_runtime_feature_value(",
+            ),
+        ] {
+            let choose = source
+                .split_once(opener)
+                .and_then(|(_, tail)| tail.split_once(closer))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("the {name} chooser should remain inspectable"));
+            assert!(
+                choose.contains("self.begin_runtime_menu_close(window, cx);"),
+                "choosing from the {name} cascade must still fade its own panel out"
             );
         }
     }
