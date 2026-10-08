@@ -161,6 +161,12 @@ pub const CODE_WORKBENCH_INITIAL_DIFF_ROWS: usize = 500;
 
 struct GitMutationNotification;
 
+/// Replace-by-id marker for the workbench's failure hints.
+///
+/// One id for every failure the workbench reports keeps the newest reason on
+/// screen instead of stacking a queue of them.
+struct WorkbenchErrorNotification;
+
 fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
         GitMutationKind::Pull => Some(locale::text("Pull completed", "拉取已完成", "拉取已完成")),
@@ -199,14 +205,20 @@ fn push_git_mutation_result_notice(kind: GitMutationKind, window: &mut Window, c
     );
 }
 
+/// Pushes the action-specific failure hint for `kind`.
+///
+/// Returns whether a hint was pushed. A kind with no label of its own — a
+/// commit, an amend — has nothing action-specific to say, and the caller falls
+/// back to the workbench's general failure hint instead of stacking a second
+/// hint that repeats the first.
 fn push_git_mutation_failure_notice(
     kind: GitMutationKind,
     error: &str,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> bool {
     let Some(label) = git_mutation_failure_label(kind) else {
-        return;
+        return false;
     };
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
     hint_layer::push(
@@ -221,6 +233,30 @@ fn push_git_mutation_failure_notice(
         .on_click(|_, _, _| {}),
         cx,
     );
+    true
+}
+
+/// Delivers the action-specific failure hint of a Git mutation to its window.
+///
+/// The task that reports the failure runs without a window, so the notice goes
+/// back through the handle the mutation captured. `false` means nothing
+/// action-specific was said — the window is gone, or the kind has no label of
+/// its own — and the caller reports the failure through the workbench's general
+/// failure hint instead of stacking a second copy of the same message.
+fn push_git_mutation_failure_hint(
+    notification_window: Option<AnyWindowHandle>,
+    kind: GitMutationKind,
+    error: &str,
+    cx: &mut Context<CodeWorkbench>,
+) -> bool {
+    let Some(window_handle) = notification_window else {
+        return false;
+    };
+    let error = error.to_string();
+    cx.update_window(window_handle, |_, window, cx| {
+        push_git_mutation_failure_notice(kind, &error, window, cx)
+    })
+    .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -834,7 +870,6 @@ struct CodeRightRailRevision {
     mode: RightRailMode,
     amend_commit: bool,
     selected_git_path: Option<String>,
-    error: Option<String>,
     note: Option<String>,
 }
 
@@ -918,7 +953,6 @@ impl CodeRightRailGitProjection {
 struct CodeRightRailProjection {
     revision: CodeRightRailRevision,
     mode: RightRailMode,
-    error: Option<String>,
     note: Option<String>,
     files: CodeRightRailFileProjection,
     git: CodeRightRailGitProjection,
@@ -1293,7 +1327,14 @@ pub struct CodeWorkbench {
     pub(crate) commit_message: Entity<TextareaState>,
     pub(crate) amend_commit: bool,
     commit_reset_window: Option<AnyWindowHandle>,
-    pub(crate) error: Option<String>,
+    /// The failure the workbench still owes the hint layer.
+    ///
+    /// There is no fixed error band to fill: a failure this workbench reports is
+    /// a top-centered light hint like every other result it produces. Most
+    /// producers run where only `cx` is available, so the message waits here
+    /// until [`Self::present_pending_error`] takes it during a paint that has
+    /// the window `hint_layer::push` needs.
+    pending_error: Option<String>,
     pub(crate) note: Option<String>,
     tree_loading: bool,
     status_loading: bool,
@@ -1473,7 +1514,7 @@ impl CodeWorkbench {
             commit_message,
             amend_commit: false,
             commit_reset_window: None,
-            error: None,
+            pending_error: None,
             note: None,
             tree_loading: false,
             status_loading: false,
@@ -1757,6 +1798,35 @@ impl CodeWorkbench {
         self.preview_panel_fullscreen
     }
 
+    /// Hands the failure the workbench is holding to the window's hint layer.
+    ///
+    /// The workbench reports a failure the same way it reports any other
+    /// result: as a top-centered light hint. Nothing paints a fixed error band,
+    /// and a message that is superseded by a newer failure is dropped rather
+    /// than queued. The pending slot is taken here because the producers are
+    /// mostly tasks that have no `Window`, and `window.defer` keeps the push out
+    /// of the update that raised it.
+    fn present_pending_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.pending_error.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Error,
+                    locale::localize_error_message(&error),
+                    cx,
+                )
+                .id::<WorkbenchErrorNotification>()
+                .autohide(true)
+                .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
+
     fn right_rail_revision(&self) -> CodeRightRailRevision {
         CodeRightRailRevision {
             file_tree: self.file_tree.presentation_revision(),
@@ -1783,7 +1853,6 @@ impl CodeWorkbench {
             mode: self.right_rail_mode,
             amend_commit: self.amend_commit,
             selected_git_path: self.selected_git_path.clone(),
-            error: self.error.clone(),
             note: self.note.clone(),
         }
     }
@@ -1801,7 +1870,6 @@ impl CodeWorkbench {
         CodeRightRailProjection {
             revision,
             mode: self.right_rail_mode,
-            error: self.error.clone(),
             note: self.note.clone(),
             files: CodeRightRailFileProjection {
                 workspace_available: self.workspace.is_some(),
@@ -2551,7 +2619,7 @@ impl CodeWorkbench {
                 root,
                 state_owner,
             });
-            self.error = Some(
+            self.pending_error = Some(
                 "Workspace switch is waiting because one or more editor buffers are dirty"
                     .to_string(),
             );
@@ -2833,7 +2901,6 @@ impl CodeWorkbench {
             .to_string();
         self.file_tree.set_root_name(root_name);
         self.git.reset_workspace(workspace_id);
-        self.error = None;
         self.note = Some("Workspace files and Git state are loading".to_string());
         let restored_expanded_paths = adopted_panel
             .as_ref()
@@ -3551,7 +3618,6 @@ impl CodeWorkbench {
         if path.is_empty() {
             self.tree_loading = true;
         }
-        self.error = None;
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { backend.file().file_tree(request).await });
         let task_path = path.clone();
@@ -3581,12 +3647,12 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.file_tree.fail_load(ticket, &task_path, &error.code);
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
                         this.file_tree
                             .fail_load(ticket, &task_path, "file_tree_task_failed");
-                        this.error = Some(format!("file tree task failed: {error}"));
+                        this.pending_error = Some(format!("file tree task failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -3719,9 +3785,11 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.git.fail_query(&ticket, &error.code);
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
-                    Err(error) => this.error = Some(format!("Git status task failed: {error}")),
+                    Err(error) => {
+                        this.pending_error = Some(format!("Git status task failed: {error}"))
+                    }
                 }
                 cx.notify();
             });
@@ -3799,10 +3867,11 @@ impl CodeWorkbench {
                 match outcome {
                     Ok(Ok(snapshot)) => this.apply_worktree_lifecycle_snapshot(snapshot),
                     Ok(Err(error)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
-                        this.error = Some(format!("Worktree lifecycle task failed: {error}"));
+                        this.pending_error =
+                            Some(format!("Worktree lifecycle task failed: {error}"));
                     }
                 }
                 if reload {
@@ -3820,7 +3889,7 @@ impl CodeWorkbench {
             .git
             .supports(BackendOperation::GitWorktreeLifecycleMutate)
         {
-            self.error = Some("worktree_lifecycle_mutation_unsupported".to_string());
+            self.pending_error = Some("worktree_lifecycle_mutation_unsupported".to_string());
             return None;
         }
         Some(backend)
@@ -3869,7 +3938,8 @@ impl CodeWorkbench {
         Fut: Future<Output = Result<GitWorktreeOperationRecord, BackendError>> + Send + 'static,
     {
         if self.lifecycle_action_pending {
-            self.error = Some("Another Worktree lifecycle action is already running".to_string());
+            self.pending_error =
+                Some("Another Worktree lifecycle action is already running".to_string());
             cx.notify();
             return;
         }
@@ -3886,7 +3956,6 @@ impl CodeWorkbench {
         };
         self.lifecycle_action_pending = true;
         self.set_lifecycle_confirmation(None);
-        self.error = None;
         self.note = Some("Worktree lifecycle action is running".to_string());
         let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -3913,13 +3982,14 @@ impl CodeWorkbench {
                             },
                         );
                         this.note = None;
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                         this.load_worktree_lifecycle(cx);
                     }
                     Err(error) => {
                         this.set_lifecycle_confirmation(retry_confirmation.clone());
                         this.note = None;
-                        this.error = Some(format!("Worktree lifecycle task failed: {error}"));
+                        this.pending_error =
+                            Some(format!("Worktree lifecycle task failed: {error}"));
                         this.load_worktree_lifecycle(cx);
                     }
                 }
@@ -3956,7 +4026,6 @@ impl CodeWorkbench {
         };
         self.lifecycle_action_pending = true;
         self.set_lifecycle_confirmation(None);
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -3970,10 +4039,11 @@ impl CodeWorkbench {
                         this.set_lifecycle_confirmation(Some(build(value)));
                     }
                     Ok(Err(error)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
-                        this.error = Some(format!("Worktree lifecycle task failed: {error}"));
+                        this.pending_error =
+                            Some(format!("Worktree lifecycle task failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -4021,7 +4091,6 @@ impl CodeWorkbench {
                 .unwrap_or_default(),
         };
         self.lifecycle_action_pending = true;
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .git()
@@ -4042,10 +4111,11 @@ impl CodeWorkbench {
                         this.request_parent_lifecycle_refresh(cx);
                     }
                     Ok(Err(error)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
-                        this.error = Some(format!("Worktree readiness task failed: {error}"));
+                        this.pending_error =
+                            Some(format!("Worktree readiness task failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -4242,7 +4312,7 @@ impl CodeWorkbench {
             WorktreeLifecycleConfirmation::Merge { plan, strategy } => {
                 if !plan.preflight.allowed {
                     self.set_lifecycle_confirmation(Some(confirmation));
-                    self.error = Some("worktree_preflight_blocked".to_string());
+                    self.pending_error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
                 }
@@ -4269,7 +4339,7 @@ impl CodeWorkbench {
             WorktreeLifecycleConfirmation::Archive { request, preflight } => {
                 if !preflight.allowed {
                     self.set_lifecycle_confirmation(Some(confirmation));
-                    self.error = Some("worktree_preflight_blocked".to_string());
+                    self.pending_error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
                 }
@@ -4287,7 +4357,7 @@ impl CodeWorkbench {
             WorktreeLifecycleConfirmation::Restore { request, preflight } => {
                 if !preflight.allowed {
                     self.set_lifecycle_confirmation(Some(confirmation));
-                    self.error = Some("worktree_preflight_blocked".to_string());
+                    self.pending_error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
                 }
@@ -4305,7 +4375,7 @@ impl CodeWorkbench {
             WorktreeLifecycleConfirmation::Discard { request, preflight } => {
                 if !preflight.allowed {
                     self.set_lifecycle_confirmation(Some(confirmation));
-                    self.error = Some("worktree_preflight_blocked".to_string());
+                    self.pending_error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
                 }
@@ -4576,9 +4646,11 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.git.fail_query(&ticket, &error.code);
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
-                    Err(error) => this.error = Some(format!("Git history task failed: {error}")),
+                    Err(error) => {
+                        this.pending_error = Some(format!("Git history task failed: {error}"))
+                    }
                 }
                 cx.notify();
             });
@@ -4894,7 +4966,7 @@ impl CodeWorkbench {
             return false;
         };
         let Some(transport) = self.terminal_transport.clone() else {
-            self.error = Some(
+            self.pending_error = Some(
                 "Terminals are unavailable because this workbench has no terminal transport for the current runtime"
                     .into(),
             );
@@ -4907,7 +4979,7 @@ impl CodeWorkbench {
             .find(|terminal| &terminal.id == terminal_id)
             .cloned();
         let Some(session) = session else {
-            self.error = Some("Terminal session is no longer available".into());
+            self.pending_error = Some("Terminal session is no longer available".into());
             return false;
         };
         self.terminal_surfaces.insert(
@@ -5573,7 +5645,7 @@ impl CodeWorkbench {
         cx: &mut Context<Self>,
     ) {
         let Some(transport) = self.browser_transport.clone() else {
-            self.error = Some(
+            self.pending_error = Some(
                 locale::text(
                     "The embedded browser needs a connected runtime.",
                     "内嵌浏览器需要已连接的 runtime。",
@@ -5589,7 +5661,7 @@ impl CodeWorkbench {
             .as_ref()
             .map(|workspace| workspace.id.clone())
         else {
-            self.error = Some(
+            self.pending_error = Some(
                 locale::text(
                     "Select a workspace before opening the browser.",
                     "请先选择工作区再打开浏览器。",
@@ -5634,7 +5706,7 @@ impl CodeWorkbench {
                 Ok(session_id) => session_id,
                 Err(error) => {
                     let _ = this.update(cx, |workbench, cx| {
-                        workbench.error = Some(error.message);
+                        workbench.pending_error = Some(error.message);
                         cx.notify();
                     });
                     return;
@@ -5702,7 +5774,7 @@ impl CodeWorkbench {
         &mut self,
         error: &crate::browser_transport::BrowserTransportError,
     ) {
-        self.error = Some(error.message.clone());
+        self.pending_error = Some(error.message.clone());
     }
 
     fn open_pdf(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -5941,7 +6013,7 @@ impl CodeWorkbench {
             .and_then(|validated| open_external_url(&validated.url));
         match outcome {
             Ok(()) => self.note = Some("Opened link in the system browser".into()),
-            Err(error) => self.error = Some(format!("{}: {}", error.code, error.message)),
+            Err(error) => self.pending_error = Some(format!("{}: {}", error.code, error.message)),
         }
         cx.notify();
     }
@@ -6459,7 +6531,7 @@ impl CodeWorkbench {
                         && let Some(this) = entity.upgrade()
                     {
                         this.update(cx, |this, cx| {
-                            this.error = Some(format!(
+                            this.pending_error = Some(format!(
                                 "Terminal close failed: {}: {}",
                                 error.code, error.message
                             ));
@@ -6631,7 +6703,7 @@ impl CodeWorkbench {
     /// actually queued, so autosave can tell a started save from a refused one.
     pub(crate) fn save_editor(&mut self, path: String, cx: &mut Context<Self>) -> bool {
         if is_local_external_path(&path) {
-            self.error = Some(
+            self.pending_error = Some(
                 locale::text(
                     "Files outside the project are read-only previews",
                     "项目外文件仅支持只读预览",
@@ -6647,7 +6719,8 @@ impl CodeWorkbench {
             return false;
         };
         let Some(ticket) = self.editors.begin_save(&path) else {
-            self.error = Some("The editor is not ready to save or has an external conflict".into());
+            self.pending_error =
+                Some("The editor is not ready to save or has an external conflict".into());
             cx.notify();
             return false;
         };
@@ -6680,11 +6753,11 @@ impl CodeWorkbench {
                         if error.code == "file_external_revision_changed" {
                             buffer.external = EditorExternalState::VerificationRequired;
                         }
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
                         buffer.fail_save(request_id, "file_save_task_failed");
-                        this.error = Some(format!("file save task failed: {error}"));
+                        this.pending_error = Some(format!("file save task failed: {error}"));
                     }
                 }
                 // An autosave only closes the gap it was scheduled for: edits
@@ -6810,7 +6883,7 @@ impl CodeWorkbench {
         };
         let line_count = editor_input.read(cx).text().lines_len().max(1);
         let Some((line, column)) = parse_goto_line_query(&query, line_count) else {
-            self.error = Some(format!("Go to line: '{query}' is not a line in this file"));
+            self.pending_error = Some(format!("Go to line: '{query}' is not a line in this file"));
             cx.notify();
             return;
         };
@@ -6867,7 +6940,7 @@ impl CodeWorkbench {
                 self.close_preview_panel_if_empty(cx);
             }
             PreviewCloseDisposition::Pinned => {
-                self.error = Some("Unpin the tab before closing it".into())
+                self.pending_error = Some("Unpin the tab before closing it".into())
             }
             PreviewCloseDisposition::Protected => {
                 // With autosave on, the pending edit is already on its way to
@@ -6883,7 +6956,8 @@ impl CodeWorkbench {
                         .is_some_and(|path| self.autosave_before_close(path, cx))
                 };
                 if !queued {
-                    self.error = Some("Save or discard the dirty editor before closing it".into());
+                    self.pending_error =
+                        Some("Save or discard the dirty editor before closing it".into());
                 }
             }
             PreviewCloseDisposition::Missing => {}
@@ -6921,7 +6995,7 @@ impl CodeWorkbench {
                 PreviewCloseDisposition::Pinned | PreviewCloseDisposition::Protected
             )
         }) {
-            self.error = Some("Pinned or dirty tabs were kept open".into());
+            self.pending_error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
         self.sync_browser_surface_activity(cx);
@@ -6942,7 +7016,7 @@ impl CodeWorkbench {
                 PreviewCloseDisposition::Pinned | PreviewCloseDisposition::Protected
             )
         }) {
-            self.error = Some("Pinned or dirty tabs were kept open".into());
+            self.pending_error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
         self.sync_browser_surface_activity(cx);
@@ -6986,7 +7060,7 @@ impl CodeWorkbench {
             }
         }
         if kept_protected {
-            self.error = Some("Pinned or dirty tabs were kept open".into());
+            self.pending_error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
         self.sync_browser_surface_activity(cx);
@@ -7382,7 +7456,7 @@ impl CodeWorkbench {
         A: FnOnce(&mut Self, &mut Context<Self>) + 'static,
     {
         if self.file_mutation_pending {
-            self.error = Some("Another file mutation is already running".into());
+            self.pending_error = Some("Another file mutation is already running".into());
             cx.notify();
             return;
         }
@@ -7395,7 +7469,6 @@ impl CodeWorkbench {
             target_path: destination,
         });
         self.file_mutation_pending = true;
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { operation().await });
         self.mutation_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -7414,10 +7487,10 @@ impl CodeWorkbench {
                         this.persist_editor_recovery(cx);
                     }
                     Ok(Err(error)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
-                        this.error = Some(format!("file mutation task failed: {error}"));
+                        this.pending_error = Some(format!("file mutation task failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -7451,13 +7524,16 @@ impl CodeWorkbench {
                         Ok(Ok(absolute)) => match reveal_path_in_file_manager(&absolute) {
                             Ok(()) => this.note = Some(format!("Revealed {task_path}")),
                             Err(error) => {
-                                this.error = Some(format!("{}: {}", error.code, error.message))
+                                this.pending_error =
+                                    Some(format!("{}: {}", error.code, error.message))
                             }
                         },
                         Ok(Err(error)) => {
-                            this.error = Some(format!("{}: {}", error.code, error.message))
+                            this.pending_error = Some(format!("{}: {}", error.code, error.message))
                         }
-                        Err(_) => this.error = Some(format!("Revealing {task_path} failed")),
+                        Err(_) => {
+                            this.pending_error = Some(format!("Revealing {task_path} failed"))
+                        }
                     }
                     cx.notify();
                 });
@@ -7503,7 +7579,7 @@ impl CodeWorkbench {
                     match outcome {
                         Ok(()) => this.note = Some(format!("Opened {task_path}")),
                         Err(error) => {
-                            this.error = Some(format!("{}: {}", error.code, error.message))
+                            this.pending_error = Some(format!("{}: {}", error.code, error.message))
                         }
                     }
                     cx.notify();
@@ -7534,7 +7610,7 @@ impl CodeWorkbench {
         else {
             let this = cx.entity();
             this.update(cx, |this, cx| {
-                this.error = Some("Select a workspace before opening a file".into());
+                this.pending_error = Some("Select a workspace before opening a file".into());
                 cx.notify();
             });
             return None;
@@ -7758,7 +7834,7 @@ impl CodeWorkbench {
             return;
         };
         if paths.is_empty() {
-            self.error = Some("Select one or more changes first".into());
+            self.pending_error = Some("Select one or more changes first".into());
             cx.notify();
             return;
         }
@@ -7790,13 +7866,13 @@ impl CodeWorkbench {
         };
         let message = self.commit_message.read(cx).value().trim().to_string();
         if message.is_empty() {
-            self.error = Some("Commit message is required.".into());
+            self.pending_error = Some("Commit message is required.".into());
             cx.notify();
             return;
         }
         let paths = self.git.selected_change_paths();
         if paths.is_empty() {
-            self.error = Some("Select one or more changes first".into());
+            self.pending_error = Some("Select one or more changes first".into());
             cx.notify();
             return;
         }
@@ -7881,13 +7957,12 @@ impl CodeWorkbench {
         };
         let reset_commit_form =
             matches!(scope.kind, GitMutationKind::Commit | GitMutationKind::Amend);
-        self.error = None;
         self.note = None;
         if !self.git.begin_mutation(scope.clone()) {
             if reset_commit_form {
                 self.commit_reset_window = None;
             }
-            self.error = Some("Another Git mutation is already running".into());
+            self.pending_error = Some("Another Git mutation is already running".into());
             cx.notify();
             return;
         }
@@ -7960,18 +8035,14 @@ impl CodeWorkbench {
                         }
                         this.git.fail_mutation(&operation_id, &error.code);
                         let message = format!("{}: {}", error.code, error.message);
-                        if let Some(window_handle) = notification_window {
-                            let message = message.clone();
-                            let _ = cx.update_window(window_handle, |_, window, cx| {
-                                push_git_mutation_failure_notice(
-                                    mutation_kind,
-                                    &message,
-                                    window,
-                                    cx,
-                                );
-                            });
+                        if !push_git_mutation_failure_hint(
+                            notification_window,
+                            mutation_kind,
+                            &message,
+                            cx,
+                        ) {
+                            this.pending_error = Some(message);
                         }
-                        this.error = Some(message);
                     }
                     Err(error) => {
                         if reset_commit_form {
@@ -7980,18 +8051,14 @@ impl CodeWorkbench {
                         this.git
                             .fail_mutation(&operation_id, "git_mutation_task_failed");
                         let message = format!("Git mutation task failed: {error}");
-                        if let Some(window_handle) = notification_window {
-                            let message = message.clone();
-                            let _ = cx.update_window(window_handle, |_, window, cx| {
-                                push_git_mutation_failure_notice(
-                                    mutation_kind,
-                                    &message,
-                                    window,
-                                    cx,
-                                );
-                            });
+                        if !push_git_mutation_failure_hint(
+                            notification_window,
+                            mutation_kind,
+                            &message,
+                            cx,
+                        ) {
+                            this.pending_error = Some(message);
                         }
-                        this.error = Some(message);
                     }
                 }
                 this.persist(cx);
@@ -10956,6 +11023,7 @@ impl Render for CodeWorkbench {
             let _ = window.drop_image(image);
         }
         self.schedule_restore_hydration(window, cx);
+        self.present_pending_error(window, cx);
         if !cx.has_active_drag() {
             self.preview_tab_drop_target = None;
             self.preview_pane_drop_target = None;
@@ -16364,7 +16432,6 @@ impl Render for CodeRightRail {
             self.render_count = self.render_count.saturating_add(1);
         }
         let mode = self.projection.mode;
-        let error = self.projection.error.clone();
         let note = self.projection.note.clone();
         v_flex()
             .id("code-workbench-right-rail")
@@ -16411,18 +16478,6 @@ impl Render for CodeRightRail {
                             ),
                     ),
             )
-            .when_some(error, |this, error| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_2()
-                        .bg(cx.theme().danger.opacity(0.1))
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(locale::localize_error_message(&error)),
-                )
-            })
             .when(mode != RightRailMode::Git, |this| {
                 this.when_some(note, |this, note| {
                     this.child(
@@ -20714,6 +20769,95 @@ mod tests {
         });
         let after_relevant = right_rail.read_with(cx, |right_rail, _| right_rail.render_count);
         assert!(after_relevant > after_unrelated);
+    }
+
+    /// The workbench reports a failure the way it reports any other result: a
+    /// top-centered light hint on the window's hint layer. Nothing paints a
+    /// fixed error band, and a newer failure replaces the one on screen.
+    #[gpui::test]
+    fn workbench_failures_are_light_hints_instead_of_a_rail_band(cx: &mut gpui::TestAppContext) {
+        fn draw(cx: &mut gpui::VisualTestContext) {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        fn mounted_hints(cx: &mut gpui::VisualTestContext) -> usize {
+            cx.update(|window, cx| {
+                hint_layer::list(window, cx)
+                    .expect("the fixture window mounts the hint layer")
+                    .read(cx)
+                    .notifications()
+                    .len()
+            })
+        }
+
+        let (workbench, cx) = fixture_workbench_with_root(cx);
+        draw(cx);
+        assert_eq!(mounted_hints(cx), 0);
+
+        workbench.update(cx, |workbench, cx| {
+            workbench.pending_error = Some("Terminal session is no longer available".to_string());
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            workbench.read_with(cx, |workbench, _| workbench.pending_error.clone()),
+            None,
+            "the paint takes the pending failure and hands it to the hint layer"
+        );
+        assert_eq!(
+            mounted_hints(cx),
+            1,
+            "a failure is a hint, not a band printed at the top of the rail"
+        );
+
+        workbench.update(cx, |workbench, cx| {
+            workbench.pending_error = Some("Another file mutation is already running".to_string());
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            mounted_hints(cx),
+            1,
+            "a newer failure replaces the previous hint instead of stacking"
+        );
+    }
+
+    /// The source contract behind the test above: the rail renderer has no error
+    /// band left to fill, and the workbench's paint is what presents a failure.
+    #[test]
+    fn the_rail_renderer_has_no_fixed_error_band() {
+        let source = include_str!("code_workbench.rs");
+        let rail_renderer = source
+            .split_once("impl Render for CodeRightRail {")
+            .and_then(|(_, tail)| tail.split_once("pub struct CodeWorkbenchFixture {"))
+            .map(|(renderer, _)| renderer)
+            .expect("the right rail renderer should remain inspectable");
+        assert!(!rail_renderer.contains("localize_error_message"));
+        assert!(!rail_renderer.contains("self.projection.error"));
+
+        let workbench_renderer = source
+            .split_once("impl Render for CodeWorkbench {")
+            .and_then(|(_, tail)| tail.split_once("impl PreviewWindowHost {"))
+            .map(|(renderer, _)| renderer)
+            .expect("the workbench renderer should remain inspectable");
+        assert!(workbench_renderer.contains("self.present_pending_error(window, cx);"));
+        assert!(!workbench_renderer.contains(".when_some(self.pending_error"));
+
+        let presenter = source
+            .split_once("    fn present_pending_error(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(presenter, _)| presenter)
+            .expect("the failure presenter should remain inspectable");
+        assert!(presenter.contains("self.pending_error.take()"));
+        assert!(presenter.contains("hint_notification("));
+        assert!(presenter.contains("NotificationType::Error"));
+        assert!(presenter.contains("locale::localize_error_message(&error)"));
+        assert!(presenter.contains(".id::<WorkbenchErrorNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("Anchor::TopCenter"));
     }
 
     /// The fixture already binds an editor for `README.md`, so typing into that
