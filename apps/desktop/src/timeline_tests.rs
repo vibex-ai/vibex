@@ -1,5 +1,335 @@
 use super::*;
-use gpui::{Modifiers, TestAppContext};
+use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+struct LiveTimelineProbe {
+    workbench: Entity<VibexWorkbench>,
+}
+
+impl Render for LiveTimelineProbe {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let timeline = self.workbench.update(cx, |workbench, cx| {
+            workbench.render_agent_workbench_for(false, window, cx)
+        });
+        div().w(px(600.0)).h(px(400.0)).child(timeline)
+    }
+}
+
+fn live_timeline_item(sequence: i64, payload: TimelinePayload) -> TimelineItem {
+    TimelineItem {
+        id: TimelineItemId::parse(format!("timeline_layout-{sequence}")).unwrap(),
+        session_id: VibexSessionId::parse("session_layout").unwrap(),
+        sequence,
+        timestamp_ms: sequence,
+        source: if matches!(payload, TimelinePayload::UserMessage(_)) {
+            TimelineSource::User
+        } else {
+            TimelineSource::Agent
+        },
+        kind: payload.kind(),
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload,
+    }
+}
+
+fn progress_tool(sequence: i64, tool: usize) -> TimelineItem {
+    live_timeline_item(
+        sequence,
+        TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+            tool_call_id: format!("tool-{tool}"),
+            tool_name: "exec_command".into(),
+            status: vibex_core::ToolCallStatus::Progress,
+            summary: "Running command".into(),
+            input_summary: Some("cargo check --locked".into()),
+            output_summary: Some("Checking workspace".into()),
+            raw_extension: None,
+        }),
+    )
+}
+
+fn live_tool_timeline(
+    cx: &mut TestAppContext,
+    windowed: bool,
+) -> (Entity<VibexWorkbench>, &mut VisualTestContext) {
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let workbench = cx.new(|cx| {
+            // Exercise the production timeline without booting a runtime or
+            // reading the developer's persisted UI preferences.
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.reasoning_display_mode = if windowed {
+                ReasoningDisplayMode::Timeline
+            } else {
+                ReasoningDisplayMode::LatestAtBottom
+            };
+            ui_state.session.enhanced_command_execution_display = false;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            workbench
+                .pending_agent_turn_session_ids
+                .insert(session_id.to_string());
+            let mut items = vec![live_timeline_item(
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Check the workspace".into(),
+                    ..Default::default()
+                }),
+            )];
+            for tool in 0..24 {
+                if windowed {
+                    items.push(live_timeline_item(
+                        items.len() as i64 + 1,
+                        TimelinePayload::Reasoning(vibex_core::ReasoningPayload {
+                            text: format!("Check package {tool}"),
+                            is_final: true,
+                        }),
+                    ));
+                }
+                items.push(progress_tool(items.len() as i64 + 1, tool));
+            }
+            workbench.timeline.replace_authoritative(session_id, items);
+            workbench.rebuild_timeline_sizes();
+            workbench.request_timeline_scroll_to_latest();
+            workbench
+        });
+        LiveTimelineProbe { workbench }
+    });
+    (view.read_with(cx, |view, _| view.workbench.clone()), cx)
+}
+
+fn draw_live_timeline_frames(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &mut VisualTestContext,
+    count: usize,
+) -> Vec<(Pixels, Pixels)> {
+    (0..count)
+        .map(|_| {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            workbench.read_with(cx, |workbench, _| {
+                (
+                    workbench.timeline_row_sizes[0].height,
+                    workbench.timeline_scroll.offset().y,
+                )
+            })
+        })
+        .collect()
+}
+
+fn apply_live_timeline_item(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &mut VisualTestContext,
+    item: TimelineItem,
+) {
+    workbench.update(cx, |workbench, cx| {
+        let session_id = item.session_id.clone();
+        let sequence = item.sequence;
+        assert!(
+            workbench
+                .apply_timeline_events_to_borrowed_view(
+                    &session_id,
+                    vec![TimelineLiveEvent {
+                        session_id: session_id.clone(),
+                        sequence,
+                        item
+                    }],
+                    cx,
+                )
+                .0
+        );
+    });
+}
+
+#[gpui::test]
+fn tool_progress_preserves_the_measured_timeline_extent(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for windowed in [false, true] {
+        let (workbench, cx) = live_tool_timeline(cx, windowed);
+        for following in [true, false] {
+            if !following {
+                workbench.update(cx, |workbench, _| {
+                    workbench.timeline_follow.set_following_bottom(false);
+                    let offset = workbench.timeline_scroll.offset();
+                    workbench
+                        .timeline_scroll
+                        .set_offset(point(offset.x, offset.y / 2.0));
+                });
+            }
+            let frames = draw_live_timeline_frames(&workbench, cx, 16);
+            let before = *frames.last().unwrap();
+            assert!(frames[12..].iter().all(|frame| *frame == before));
+            workbench.read_with(cx, |workbench, _| {
+                assert_eq!(
+                    !workbench.timeline_process_unit_heights.is_empty(),
+                    windowed
+                );
+            });
+            let end = workbench.read_with(cx, |workbench, _| {
+                workbench.timeline.authoritative_end_sequence.unwrap()
+            });
+            for sequence in end + 1..=end + 4 {
+                apply_live_timeline_item(&workbench, cx, progress_tool(sequence, 23));
+                let frames = draw_live_timeline_frames(&workbench, cx, 4);
+                assert!(
+                    frames.iter().all(|frame| *frame == before),
+                    "tool progress must not scroll unchanged content (windowed={windowed}, following={following}): {before:?} -> {frames:?}"
+                );
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn tool_revisions_preserve_the_measured_timeline_extent(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for windowed in [false, true] {
+        let (workbench, cx) = live_tool_timeline(cx, windowed);
+        let before = *draw_live_timeline_frames(&workbench, cx, 16)
+            .last()
+            .unwrap();
+        let sequence = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline.authoritative_end_sequence.unwrap()
+        });
+        let mut revised = progress_tool(sequence, 23);
+        let TimelinePayload::ToolCall(tool) = &mut revised.payload else {
+            unreachable!();
+        };
+        tool.output_summary = Some("Checking workspace crates".into());
+        apply_live_timeline_item(&workbench, cx, revised);
+        let frames = draw_live_timeline_frames(&workbench, cx, 8);
+        assert!(
+            frames.iter().all(|frame| *frame == before),
+            "a tool revision must not re-estimate unchanged geometry (windowed={windowed}): {before:?} -> {frames:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn refreshed_tool_history_preserves_the_measured_timeline_extent(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for windowed in [false, true] {
+        let (workbench, cx) = live_tool_timeline(cx, windowed);
+        let before = *draw_live_timeline_frames(&workbench, cx, 16)
+            .last()
+            .unwrap();
+        let (updates, mut items, mode) = workbench.update(cx, |workbench, _| {
+            (
+                workbench.begin_timeline_load(),
+                workbench.timeline.items.to_vec(),
+                workbench.ui_state.session.reasoning_display_mode,
+            )
+        });
+        let item = items.last_mut().unwrap();
+        let TimelinePayload::ToolCall(tool) = &mut item.payload else {
+            unreachable!();
+        };
+        tool.output_summary = Some("Checking workspace crates".into());
+        let prepared = runtime
+            .block_on(timeline_loading::PreparedTimeline::prepare(
+                item.session_id.clone(),
+                items,
+                None,
+                true,
+                mode,
+            ))
+            .unwrap();
+        workbench.update(cx, |workbench, _| {
+            assert!(workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut()));
+            workbench.rebuild_timeline_sizes();
+        });
+        let frames = draw_live_timeline_frames(&workbench, cx, 8);
+        assert!(
+            frames.iter().all(|frame| *frame == before),
+            "history refresh must retain measured geometry (windowed={windowed}): {before:?} -> {frames:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn new_tool_content_grows_the_timeline_without_reversing_follow(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for windowed in [false, true] {
+        let (workbench, cx) = live_tool_timeline(cx, windowed);
+        let before = *draw_live_timeline_frames(&workbench, cx, 16)
+            .last()
+            .unwrap();
+        let sequence = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline.authoritative_end_sequence.unwrap() + 1
+        });
+        apply_live_timeline_item(&workbench, cx, progress_tool(sequence, 24));
+        let mut frames = vec![before];
+        frames.extend(draw_live_timeline_frames(&workbench, cx, 8));
+        assert!(
+            frames.last().unwrap().0 > before.0,
+            "new content must acquire its full height"
+        );
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[1].0 >= pair[0].0 && pair[1].1 <= pair[0].1),
+            "new content must not reverse bottom follow (windowed={windowed}): {frames:?}"
+        );
+        workbench.read_with(cx, |workbench, _| {
+            assert_eq!(
+                workbench.timeline_scroll.offset().y,
+                -workbench.timeline_scroll.max_offset().y
+            );
+        });
+    }
+}
+
+#[gpui::test]
+fn tool_progress_stays_stable_after_returning_to_a_cached_session(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let before = *draw_live_timeline_frames(&workbench, cx, 16)
+        .last()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let other_session = VibexSessionId::parse("session_other").unwrap();
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(other_session.clone());
+        workbench.borrow_session_view(&other_session);
+        workbench
+            .timeline
+            .replace_authoritative(other_session, Vec::new());
+    });
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(session_id.clone());
+        assert!(workbench.borrow_session_view(&session_id));
+        workbench.refresh_borrowed_view_geometry();
+    });
+    let restored = draw_live_timeline_frames(&workbench, cx, 4);
+    assert!(
+        restored.iter().all(|frame| *frame == before),
+        "restored geometry: {restored:?}"
+    );
+    let sequence = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.authoritative_end_sequence.unwrap() + 1
+    });
+    apply_live_timeline_item(&workbench, cx, progress_tool(sequence, 23));
+    let frames = draw_live_timeline_frames(&workbench, cx, 4);
+    assert!(
+        frames.iter().all(|frame| *frame == before),
+        "progress after restoring: {frames:?}"
+    );
+}
 
 struct TimelinePaintFrame {
     row_bounds: Bounds<Pixels>,

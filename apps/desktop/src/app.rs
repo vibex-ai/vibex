@@ -7710,7 +7710,7 @@ impl VibexWorkbench {
             }
             config
         });
-        let (config, mut ui_state, ui_writer, persistence_note) = match config {
+        let (config, ui_state, persistence_note) = match config {
             Ok(config) => {
                 // Before the persisted selection is applied, so a saved user
                 // theme resolves on the first frame.
@@ -7722,12 +7722,11 @@ impl VibexWorkbench {
                             "Corrupt UI state was detected; recovery is waiting for the runtime lock"
                                 .to_string()
                         });
-                        (Some(config), load.state, None, note)
+                        (Some(config), load.state, note)
                     }
                     Err(error) => (
                         Some(config),
                         DesktopUiStateV1::default(),
-                        None,
                         Some(format!("UI state load failed: {}", error.stable_code())),
                     ),
                 }
@@ -7735,10 +7734,19 @@ impl VibexWorkbench {
             Err(error) => (
                 None,
                 DesktopUiStateV1::default(),
-                None,
                 Some(format!("Preview configuration failed: {}", error.code)),
             ),
         };
+        Self::with_initial_state(config, ui_state, persistence_note, window, cx)
+    }
+
+    fn with_initial_state(
+        config: Option<DesktopRuntimeConfig>,
+        mut ui_state: DesktopUiStateV1,
+        persistence_note: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         apply_layout_memory_preference(&mut ui_state);
         normalize_empty_preview_visibility(&mut ui_state);
         if let Some(config) = config.as_ref() {
@@ -8231,7 +8239,7 @@ impl VibexWorkbench {
             runtime_note: None,
             runtime_registry_error: None,
             ui_state,
-            ui_writer,
+            ui_writer: None,
             persistence_note,
             settings_operation_notice: None,
             appearance_reload_pending: false,
@@ -19228,38 +19236,26 @@ impl VibexWorkbench {
         if self.timeline_row_sizes.len() != turns.len() {
             return self.rebuild_timeline_sizes();
         }
-        if self.streaming_row_state.is_some() {
-            let Some(current_height) = self
-                .timeline_row_sizes
-                .last()
-                .map(|row_size| f32::from(row_size.height))
-            else {
-                return self.rebuild_timeline_sizes();
-            };
-            let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
-            let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
-            self.timeline_estimated_turn_heights
-                .insert(turn.id.clone(), (signature, current_height));
-            return false;
+        let Some(current_height) = self
+            .timeline_row_sizes
+            .last()
+            .map(|row_size| f32::from(row_size.height))
+        else {
+            return self.rebuild_timeline_sizes();
+        };
+        // Progress events often update an existing tool without changing its
+        // visible geometry. Replacing the measured turn with an estimate on
+        // each event makes bottom-follow alternate between the two extents.
+        // Keep its geometry until prepaint measures the updated content, just
+        // as the text-stream path does. New turns still start with estimates.
+        if self.streaming_row_state.is_none() {
+            self.remeasure_timeline_turn(&turn.id);
         }
-        self.invalidate_timeline_turn_measurement(&turn.id);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
         let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
-        let height = self.estimated_timeline_turn_height_projected(&turn, process_expansion);
         self.timeline_estimated_turn_heights
-            .insert(turn.id.clone(), (signature, height));
-        let content_width = session_content_max_width(self.ui_state.session.content_width)
-            .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
-        let row_size = size(px(content_width), px(height));
-        let row_sizes = Rc::make_mut(&mut self.timeline_row_sizes);
-        let Some(previous) = row_sizes.last_mut() else {
-            return false;
-        };
-        if *previous == row_size {
-            return false;
-        }
-        *previous = row_size;
-        true
+            .insert(turn.id.clone(), (signature, current_height));
+        false
     }
 
     fn preserve_last_timeline_size_after_text_append(
@@ -19290,7 +19286,7 @@ impl VibexWorkbench {
         // reconciling the streaming row. Keep the current virtual extent for
         // this frame, but let the new rendered structure establish its next
         // intrinsic measurement without an estimated-height detour.
-        self.invalidate_timeline_turn_measurement(&turn.id);
+        self.remeasure_timeline_turn(&turn.id);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
         let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
         self.timeline_estimated_turn_heights
@@ -19389,6 +19385,41 @@ impl VibexWorkbench {
                 self.timeline_process_unit_heights.remove(&group.id);
             }
         }
+        self.timeline_measured_turn_heights.remove(turn_id);
+        self.clear_timeline_turn_layout(turn_id);
+    }
+
+    /// Keep the last rendered geometry as the seed for a content update.
+    /// Nested process runs must retain it too: their reserved total is the
+    /// outer turn's intrinsic height, so re-estimating a unit would reintroduce
+    /// the same scroll jump one level below the turn.
+    fn remeasure_timeline_turn(&mut self, turn_id: &str) {
+        if let Some(turn) = self
+            .conversation_turns_cache
+            .iter()
+            .rev()
+            .find(|turn| turn.id == turn_id)
+            .cloned()
+        {
+            for row in &turn.process_rows {
+                if let Some(height) = self.timeline_process_unit_heights.get_mut(&row.id) {
+                    height.layout_invalidated = true;
+                }
+            }
+            for group in timeline_process_activity_groups_for_display(
+                &turn,
+                self.ui_state.session.enhanced_command_execution_display,
+            ) {
+                if let Some(height) = self.timeline_process_unit_heights.get_mut(&group.id) {
+                    height.layout_invalidated = true;
+                }
+            }
+        }
+        self.clear_timeline_turn_layout(turn_id);
+    }
+
+    /// Release stale layout guards and measurements queued before an update.
+    fn clear_timeline_turn_layout(&mut self, turn_id: &str) {
         if let Some(session_id) = self.timeline.session_id.clone()
             && let Some(pending) = self
                 .pending_timeline_turn_measurements
@@ -19396,7 +19427,6 @@ impl VibexWorkbench {
         {
             pending.retain(|_, (id, _)| id != turn_id);
         }
-        self.timeline_measured_turn_heights.remove(turn_id);
         self.timeline_measured_turn_layout_signatures
             .remove(turn_id);
         self.timeline_streaming_shrink_candidates.remove(turn_id);
@@ -58837,8 +58867,8 @@ struct TimelineProcessUnitHeight {
     revision: i64,
     /// Layout width the unit was measured in, while one is known.
     layout_width: Option<f32>,
-    /// The retained extent precedes an explicit disclosure change. Its next
-    /// measurement may shrink even while the row is streaming.
+    /// The retained extent precedes a content or disclosure change. It remains
+    /// a layout seed across revisions, and its next measurement may shrink.
     layout_invalidated: bool,
     /// The measured height.
     height: f32,
@@ -58846,19 +58876,18 @@ struct TimelineProcessUnitHeight {
 
 /// The height a run may lay one of its units out at.
 ///
-/// The last height measured for the unit's content answers, and only a
-/// measurement whose content is gone (a new revision on a unit that already
-/// settled) is refused. Whether the height still describes the *current* box is
-/// the settle rule's business, not this lookup's: a height from the previous
-/// box is still a rendering of the same document, and the estimate it would be
-/// replaced with only knows the text.
+/// A content or disclosure update can retain the last measurement as a seed
+/// across revisions until prepaint measures the new content. Streaming units
+/// do the same while their text parses. Whether the height still describes the
+/// current box is the settle rule's business: a prior measurement describes
+/// rendered content, while its replacement estimate would only know the text.
 fn cached_timeline_process_unit_height(
     cached: Option<&TimelineProcessUnitHeight>,
     revision: i64,
     streaming: bool,
 ) -> Option<f32> {
     let cached = cached?;
-    (cached.revision == revision || streaming).then_some(cached.height)
+    (cached.revision == revision || streaming || cached.layout_invalidated).then_some(cached.height)
 }
 
 /// Whether two measurements describe the same content box.
@@ -81093,24 +81122,8 @@ mod tests {
     }
 
     #[test]
-    fn appended_structured_timeline_cards_refresh_and_preserve_their_height() {
+    fn structured_timeline_cards_do_not_shrink_in_a_virtual_turn() {
         let source = include_str!("app.rs");
-        let live_batch = source
-            .split_once("    fn apply_live_timeline_batch(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn apply_desktop_event("))
-            .map(|(body, _)| body)
-            .expect("timeline event batching should remain inspectable");
-        assert!(live_batch.contains("self.refresh_last_timeline_size()"));
-
-        let refresh = source
-            .split_once("    fn refresh_last_timeline_size(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    fn refresh_last_timeline_size_incrementally(")
-            })
-            .map(|(body, _)| body)
-            .expect("last-turn height refresh should remain inspectable");
-        assert!(refresh.contains("let turns = self.conversation_turns_cached();"));
-        assert!(refresh.contains("self.invalidate_timeline_turn_measurement(&turn.id);"));
 
         for (renderer, next_renderer) in [
             (

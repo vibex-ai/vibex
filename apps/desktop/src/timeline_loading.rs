@@ -135,7 +135,7 @@ impl VibexWorkbench {
             let previous = self.conversation_turns_cache.clone();
             self.invalidate_changed_timeline_content(&previous, &turns);
             for id in changed_turns {
-                self.invalidate_timeline_turn_measurement(&id);
+                self.remeasure_timeline_turn(&id);
                 self.timeline_estimated_turn_heights.remove(&id);
             }
             prepared.timeline.revision = self.timeline.revision.wrapping_add(1);
@@ -164,18 +164,28 @@ impl VibexWorkbench {
 
     /// A same-sequence tool update can replace its output without changing a
     /// projection cache key. Evict only changed row projections; retained text
-    /// entities apply the new source incrementally on their next render.
+    /// entities apply the new source incrementally on their next render. Keep
+    /// measured geometry until that render instead of replacing it with estimates.
     pub(super) fn invalidate_changed_timeline_content(
         &mut self,
         previous: &[Rc<TimelineConversationTurn>],
         incoming: &[Rc<TimelineConversationTurn>],
     ) {
-        for id in changed_timeline_row_ids(previous, incoming) {
-            self.timeline_markdown_sources.remove(&id);
-            self.timeline_reasoning_summaries.remove(&id);
-            self.timeline_tool_card_projections.remove(&id);
-            self.timeline_file_diff_previews.remove(&id);
-            self.timeline_process_unit_heights.remove(&id);
+        let incoming_rows = timeline_rows_by_id(incoming);
+        for (id, row) in timeline_rows_by_id(previous) {
+            let new = incoming_rows.get(id);
+            if new.is_some_and(|new| *new == row) {
+                continue;
+            }
+            self.timeline_markdown_sources.remove(id);
+            self.timeline_reasoning_summaries.remove(id);
+            self.timeline_tool_card_projections.remove(id);
+            self.timeline_file_diff_previews.remove(id);
+            if new.is_none() {
+                self.timeline_process_unit_heights.remove(id);
+            } else if let Some(height) = self.timeline_process_unit_heights.get_mut(id) {
+                height.layout_invalidated = true;
+            }
         }
         let incoming: BTreeMap<_, _> = incoming
             .iter()
@@ -189,35 +199,27 @@ impl VibexWorkbench {
                 self.timeline_turn_file_changes.remove(&turn.id);
                 self.timeline_markdown_sources
                     .remove(&format!("reasoning-live:{}", turn.id));
-                self.invalidate_timeline_turn_measurement(&turn.id);
+                if incoming.contains_key(turn.id.as_str()) {
+                    self.remeasure_timeline_turn(&turn.id);
+                } else {
+                    self.invalidate_timeline_turn_measurement(&turn.id);
+                }
                 self.timeline_estimated_turn_heights.remove(&turn.id);
             }
         }
     }
 }
 
-fn changed_timeline_row_ids(
-    previous: &[Rc<TimelineConversationTurn>],
-    incoming: &[Rc<TimelineConversationTurn>],
-) -> Vec<String> {
-    fn rows(turns: &[Rc<TimelineConversationTurn>]) -> BTreeMap<&str, &TimelineRow> {
-        turns
-            .iter()
-            .flat_map(|turn| {
-                turn.user_row
-                    .iter()
-                    .chain(&turn.process_rows)
-                    .chain(turn.conclusion_row.iter())
-            })
-            .map(|row| (row.id.as_str(), row))
-            .collect()
-    }
-    let previous = rows(previous);
-    let incoming = rows(incoming);
-    previous
-        .into_iter()
-        .filter(|(id, row)| incoming.get(id).is_none_or(|new| *new != *row))
-        .map(|(id, _)| id.to_owned())
+fn timeline_rows_by_id(turns: &[Rc<TimelineConversationTurn>]) -> BTreeMap<&str, &TimelineRow> {
+    turns
+        .iter()
+        .flat_map(|turn| {
+            turn.user_row
+                .iter()
+                .chain(&turn.process_rows)
+                .chain(turn.conclusion_row.iter())
+        })
+        .map(|row| (row.id.as_str(), row))
         .collect()
 }
 

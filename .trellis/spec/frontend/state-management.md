@@ -300,18 +300,49 @@ distance-to-bottom value does not prove that the content is scrollable. A
 timeline that fits in its viewport stays in follow mode and shows no bottom
 control when the user moves the wheel.
 
+### Convention: Tool progress retains measured timeline geometry
+
 Timeline virtualization caches are presentation state, not authoritative
-content. When a non-stream event appends structured content to the latest
-projected turn, rebuild that projection before sizing, invalidate the turn's
-previous measured height, and recompute its estimated row size. Reusing a
-measurement from the turn's earlier structure can clip newly added command,
-file-operation, image-generation, collaboration, or permission cards. Structured
-timeline cards whose outer containers clip overflow must also opt out of flex
-shrinking until intrinsic measurement converges. This applies to standalone
-permission cards and permission footers embedded in command cards. Compound
-command/permission rows must be estimated and measured as one rendered element.
-Regression coverage for this path must assert both last-turn height invalidation
-and the non-shrinking card container.
+content. Refresh the turn projection when structured events arrive, but retain
+an existing turn's virtual height until prepaint measures its new content.
+Tool progress often changes no visible geometry; replacing a measured height
+with an estimate on every event makes bottom-follow alternate between those
+two extents. Estimates bootstrap new turns and unmeasured process units.
+
+`refresh_last_timeline_size` and `preserve_last_timeline_size_after_text_append`
+use `remeasure_timeline_turn` to retain the outer measurement and mark nested
+process-unit heights as provisional across revisions. Clear layout signatures,
+streaming shrink guards, and queued measurements from the previous content so
+the next intrinsic measurement can grow or shrink. A windowed process run must
+retain its unit heights too: their reserved total determines the outer turn's
+height, so re-estimating them recreates the same jump inside the turn.
+
+The same rule applies to same-sequence revisions and prepared history refreshes.
+`invalidate_changed_timeline_content` evicts changed source/card projections but
+retains geometry for rows and turns still present; deleted rows and turns release
+their measurements. Retaining geometry must never retain stale rendered content.
+
+```rust
+// A progress update keeps geometry until its new content is measured.
+self.remeasure_timeline_turn(&turn.id);
+self.timeline_estimated_turn_heights
+    .insert(turn.id.clone(), (signature, current_height));
+// Do not replace current_height with an estimate of the newer source.
+```
+
+Structured cards whose outer containers clip overflow must opt out of flex
+shrinking so retained virtual heights do not clip newly added command,
+file-operation, image-generation, collaboration, or permission content. This
+includes standalone permission cards and permission footers in command cards;
+compound command/permission rows are estimated and measured as one element.
+
+Regression tests must exercise the production event and rendering paths and
+check height and scroll offset after every frame. Repeated progress must preserve
+both bottom-follow and history-reading positions. Same-sequence revisions,
+history refreshes, and cached-session restoration must preserve unchanged
+geometry in ordinary and windowed process runs. New content must acquire its full
+intrinsic height without reversing bottom-follow. Retain the non-shrinking
+card-container checks as a separate contract.
 
 ### Convention: Streaming Markdown height ownership
 
@@ -337,10 +368,10 @@ window whenever the measured height changes, so a still growing document keeps
 the extent its streaming content already earned and no reparse wobble becomes a
 scroll jump.
 A text-only event that changes presentation structure, such as commentary moving
-to the conclusion or the final message reconciling the stream, keeps the current
-virtual extent for that frame but invalidates the old intrinsic measurement. Once
-the new structure is laid out, prepaint owns its next extent and bottom-follow
-scrolls against that measured extent once.
+to the conclusion or the final message reconciling the stream, keeps the measured
+geometry but releases the old layout and shrink guards. Once the new structure
+is laid out, prepaint owns its next extent and bottom-follow scrolls against that
+measured extent once.
 
 ```rust
 // Wrong: the virtual row expands before TextView renders the new document,
@@ -379,8 +410,8 @@ Regression coverage must assert that the streaming fast path neither clears
 pending turn heights nor invalidates a measured height, and does not mutate the
 virtual row-size vector. Cover both conclusion and process-history Agent text,
 the non-shrinking same-row measurement rule, and the text-only structural
-transition path that bypasses estimated height. Non-text structured events
-continue to use the full invalidation contract above.
+transition path that bypasses estimated height. Non-text structured events also
+retain measured geometry until prepaint reports their new extent, as above.
 Cover the shrink release too: a one-frame shorter measurement keeps the held
 extent, a document that keeps changing never settles one, a confirmed and
 settled shorter measurement reclaims the extent, the settle window only applies
@@ -459,11 +490,11 @@ measurements takes the process unit heights with it.
 
 The first-layout estimator reads the box it will paint into rather than a fixed
 column count, following the text view's actual content width. It answers for the
-rows that have never reported an intrinsic height — everything below the viewport, and the whole table for the frame a
-projection is adopted in — so a fixed count over-estimates a narrow timeline and
-under-counts a wide one, and every resize turns that into rows sized against the
-wrong wrapping. The memoized estimate keys on the derived column count, and the
-tool-card detail blocks estimate against the same box.
+rows that have never reported an intrinsic height, including unseen rows below
+the viewport and a newly loaded timeline, so a fixed count over-estimates a
+narrow timeline and under-counts a wide one, and every resize turns that into
+rows sized against the wrong wrapping. The memoized estimate keys on the derived
+column count, and the tool-card detail blocks estimate against the same box.
 
 ```rust
 // Wrong: a resize drops what the rows already measured and re-guesses them.
