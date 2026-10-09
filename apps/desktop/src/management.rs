@@ -1261,31 +1261,22 @@ impl ManagementCenter {
                 "圖描述（選填）",
             ))
         });
+        // Both Prompt fields stay empty: the examples that used to be seeded
+        // as values are placeholders now, so nothing a user did not type can
+        // be mistaken for content or saved by accident.
         let prompt_name = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(management_locale_text(
-                    "Review command",
-                    "检查命令",
-                    "檢查命令",
-                ))
-                .placeholder(management_locale_text(
-                    "Prompt name",
-                    "提示词名称",
-                    "提示詞名稱",
-                ))
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "e.g. Review command",
+                "例如 检查命令",
+                "例如 檢查命令",
+            ))
         });
         let prompt_body = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(management_locale_text(
-                    "Review this workspace.",
-                    "检查此工作区。",
-                    "檢查此工作區。",
-                ))
-                .placeholder(management_locale_text(
-                    "Prompt body",
-                    "提示词内容",
-                    "提示詞內容",
-                ))
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "e.g. Review this workspace",
+                "例如 检查此工作区",
+                "例如 檢查此工作區",
+            ))
         });
         let hook_name = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1950,11 +1941,15 @@ impl ManagementCenter {
             ),
             (
                 &self.prompt_name,
-                ("Prompt name", "提示词名称", "提示詞名稱"),
+                ("e.g. Review command", "例如 检查命令", "例如 檢查命令"),
             ),
             (
                 &self.prompt_body,
-                ("Prompt body", "提示词内容", "提示詞內容"),
+                (
+                    "e.g. Review this workspace",
+                    "例如 检查此工作区",
+                    "例如 檢查此工作區",
+                ),
             ),
             (&self.hook_name, ("Hook name", "Hook 名称", "Hook 名稱")),
             (
