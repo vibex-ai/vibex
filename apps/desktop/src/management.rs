@@ -4862,11 +4862,31 @@ impl ManagementCenter {
         };
         if changed {
             self.navigation.mark_dirty(ManagementSection::Agents, true);
-            if self.profile_model_selection.as_deref() == Some(row.id.as_str()) {
-                self.sync_profile_model_editor(window, cx);
-            }
+        }
+        // The pane follows the Model it names whenever that Model is the row
+        // this click answered, so its fields are the only copy of the
+        // declaration the click just created or released.
+        if self.profile_model_selection.as_deref() == Some(row.id.as_str()) {
+            self.sync_profile_model_editor(window, cx);
         }
         cx.notify();
+    }
+
+    /// Offers or releases the Model one picker row names.
+    ///
+    /// The row is the checkbox, so its click toggles the declaration and then
+    /// points the settings pane at the row: the pane would otherwise keep
+    /// describing whichever Model was opened last while the header named this
+    /// one.
+    fn toggle_profile_candidate_row(
+        &mut self,
+        row: &ProfileCandidateRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.profile_model_selection = Some(row.id.clone());
+        let selected = !row.is_configured();
+        self.select_profile_candidate(row, selected, window, cx);
     }
 
     /// The picker's rows: what the endpoint advertised, plus every configured
@@ -12817,10 +12837,10 @@ impl ManagementCenter {
     /// the Model, the body that opens its settings, and the delete command that
     /// takes it back out of the draft.
     ///
-    /// Checking a Model and inspecting it are different intentions, so the
-    /// checkbox answers only itself. The row around it is the settings target,
-    /// which means a click anywhere on the strip opens the Model instead of only
-    /// the width of its name.
+    /// The row is the checkbox, so a click anywhere on the strip offers or
+    /// releases the Model instead of asking for a second click in the settings
+    /// pane. That pane still follows the click, because the row it names is the
+    /// one whose declaration the click just created or released.
     fn render_profile_candidate_row(
         &self,
         row: &ProfileCandidateRow,
@@ -12844,7 +12864,7 @@ impl ManagementCenter {
         let meta = meta.join(" · ");
         let title = row.display_name.clone().unwrap_or_else(|| row.id.clone());
         let toggled = row.clone();
-        let selected_id = row.id.clone();
+        let clicked = row.clone();
         let deleted_id = row.id.clone();
         let row_id = row.id.clone();
         let debug_id = row.id.clone();
@@ -12885,11 +12905,12 @@ impl ManagementCenter {
             })
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_profile_model(selected_id.clone(), window, cx);
+                this.toggle_profile_candidate_row(&clicked, window, cx);
             }))
             .child(
-                // The checkbox keeps its own answer: a click on it checks the
-                // Model instead of also opening its settings.
+                // The checkbox answers the same question the row does, so it
+                // takes the click itself instead of letting the row toggle the
+                // Model a second time.
                 div()
                     .id(SharedString::from(format!(
                         "provider-candidate-check-{}",
@@ -26728,9 +26749,10 @@ mod tests {
         assert!(row.size.width > px(0.0) && row.size.height > px(0.0));
     }
 
-    /// The whole row is the settings target, not just the width of the name.
+    /// The whole row is the checkbox, so one click offers the Model instead of
+    /// opening a pane that asks for a second one.
     #[gpui::test]
-    fn clicking_the_edge_of_a_picker_row_still_opens_that_model(cx: &mut gpui::TestAppContext) {
+    fn clicking_the_edge_of_a_picker_row_offers_that_model(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (center, cx) = cx.add_window_view(ManagementCenter::new);
         center.update(cx, |center, _| {
@@ -26769,14 +26791,49 @@ mod tests {
         );
         cx.run_until_parked();
         assert_eq!(
-            center.read_with(cx, |center, _| center.profile_model_selection.clone()),
-            Some("gpt-5-mini".to_string()),
-            "a click on the row opens the Model it names"
+            center.read_with(cx, |center, _| center.profile_configured_models.len()),
+            2,
+            "a click on the row is a click on its checkbox"
         );
+        assert!(
+            center.read_with(cx, |center, _| center
+                .profile_configured_models
+                .iter()
+                .any(|model| model.id == "gpt-5-mini")),
+            "the row the click names is the Model it offers"
+        );
+        // The pane follows the click, so the settings it shows are the ones the
+        // declaration just created, never the previous Model's.
+        assert_eq!(
+            center.read_with(cx, |center, _| center.profile_model_selection.clone()),
+            Some("gpt-5-mini".to_string())
+        );
+        assert_eq!(
+            center.read_with(cx, |center, cx| center
+                .profile_model_edit_id
+                .read(cx)
+                .value()
+                .to_string()),
+            "gpt-5-mini"
+        );
+
+        // Clicking the same row again releases it, because the row is a toggle
+        // rather than a command that only ever adds.
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let row = cx
+            .debug_bounds("provider-candidate-row-gpt-5-mini")
+            .expect("the released row must stay listed");
+        cx.simulate_click(
+            gpui::point(row.origin.x + px(2.0), row.center().y),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
         assert_eq!(
             center.read_with(cx, |center, _| center.profile_configured_models.len()),
             1,
-            "opening a row is not the same intention as checking it"
+            "a second click on the row releases the Model it offered"
         );
     }
 
