@@ -87632,25 +87632,16 @@ mod tests {
         assert_eq!(timeline_visible_row_range(rows, 0.0, 16.0, 150.0), 0..2);
         // Scrolled into the middle: the turn under the top edge and the one
         // under the bottom edge are both in view.
-        assert_eq!(
-            timeline_visible_row_range(rows, -110.0, 16.0, 240.0),
-            0..4
-        );
+        assert_eq!(timeline_visible_row_range(rows, -110.0, 16.0, 240.0), 0..4);
         // A turn that only starts at the bottom edge is not on screen: the
         // viewport ends exactly on its first row, so it stays dark while the
         // turn above it stays lit.
-        assert_eq!(
-            timeline_visible_row_range(rows, -116.0, 16.0, 120.0),
-            1..2
-        );
+        assert_eq!(timeline_visible_row_range(rows, -116.0, 16.0, 120.0), 1..2);
         // Every edge case the pane can actually report before it has laid out,
         // or with no conversation to show, lights nothing rather than guessing.
         assert_eq!(timeline_visible_row_range(rows, 0.0, 16.0, 0.0), 0..0);
         assert_eq!(timeline_visible_row_range([], 0.0, 16.0, 400.0), 0..0);
-        assert_eq!(
-            timeline_visible_row_range(rows, 0.0, 16.0, f32::NAN),
-            0..0
-        );
+        assert_eq!(timeline_visible_row_range(rows, 0.0, 16.0, f32::NAN), 0..0);
     }
 
     #[test]
