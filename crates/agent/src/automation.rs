@@ -442,6 +442,13 @@ impl<'a> AutomationGraphRunner<'a> {
                 reasoning_effort: runtime.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                // An automation run is a stored policy firing, not a person
+                // typing; it must not read as human input in the transcript.
+                provenance: vibex_core::MessageProvenance::SystemContinuation {
+                    policy_id: "automation".to_string(),
+                    trigger_event_id: run.id.as_str().to_string(),
+                },
             })
             .await
         {

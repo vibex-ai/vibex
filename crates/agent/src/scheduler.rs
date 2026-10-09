@@ -248,6 +248,11 @@ impl<'a> ScheduledTaskRunner<'a> {
                 reasoning_effort: runtime.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::SystemContinuation {
+                    policy_id: "scheduled_task".to_string(),
+                    trigger_event_id: run.id.as_str().to_string(),
+                },
             })
             .await
         {

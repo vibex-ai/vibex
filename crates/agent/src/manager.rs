@@ -18,11 +18,13 @@ use vibex_core::{
     AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
     AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
     CancelAgentDelegationRequest, ContinueAgentTurnRequest, CreateAgentDelegationRequest,
-    CreateAgentSessionRequest, ElicitationRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    CreateAgentSessionRequest, DelegationExecution, DelegationResultRef, DelegationRuntimeSummary,
+    DelegationTaskEventKind, DelegationTaskPhase, ElicitationRequest, ExecutionOutcome,
+    ExecutionResultRange, ExecutionUsageState, FetchTimelineRequest, ForkAgentSessionRequest,
     GoalChangeKind, GoalPayload, GoalSnapshot, LocalHistoryImportResult, LocalHistoryScanResult,
     LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget, McpServer,
-    McpServerSecretReference, McpServerTransportKind, MessageAttachment, MessageSubmissionId,
-    PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
+    McpServerSecretReference, McpServerTransportKind, MessageAttachment, MessageProvenance,
+    MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
     ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
     ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
@@ -32,8 +34,9 @@ use vibex_core::{
     SteerAgentMessageResult, SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload,
     TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
     TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
-    UsageExecutionId, UserMessageDelivery, UserMessagePayload, VibexError, VibexResult,
-    VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
+    UsageExecutionId, UserMessageDelivery, UserMessagePayload, VibexError, VibexExecutionId,
+    VibexOperationId, VibexResult, VibexSessionId, VibexUseRef, VibexUseResourceKind,
+    VibexUseToolHost, WorkspaceId, agent_id_for_provider_kind,
     agent_session_turn_requires_continuation, builtin_agent_definitions,
     latest_timeline_turn_ended_normally, normalize_agent_session_title, turn_startup_notice,
     unix_timestamp_ms,
@@ -44,8 +47,10 @@ use vibex_db::{
     AgentDelegationReservation, AgentSessionRuntimeRepository, DbConnection, ElicitationRepository,
     LocalHistoryImportRepository, LocalHistoryImportWrite, McpServerRepository,
     MessageSubmissionRepository, PermissionRepository, PromptRepository, ProviderProfileRepository,
-    RuntimeBindingRepository, RuntimeSwitchRepository, SessionRepository, SkillRepository,
-    TimelineAppend, TimelineRepository, WorkspaceRepository, apply_migrations, open_database,
+    RuntimeBindingRepository, RuntimeSwitchRepository, SessionOwnershipRepository,
+    SessionRepository, SkillRepository, TimelineAppend, TimelineRepository,
+    VibexUseEventRepository, VibexUseExecutionRepository, WorkspaceRepository, apply_migrations,
+    open_database, transition_delegation,
 };
 
 use crate::adapter::{
@@ -64,6 +69,13 @@ use crate::state_machine::validate_transition;
 const CONTINUE_AGENT_TURN_PROMPT: &str = "Continue from where you stopped. Review the conversation context, avoid repeating completed work, and proceed with the remaining task.";
 const CONTINUE_TURN_TIMELINE_WINDOW: u32 = 500;
 const MAX_AGENT_DELEGATION_DEPTH: u32 = 2;
+
+/// How many finished tasks one startup pass re-announces.
+///
+/// The pass is about a crash window, not about history: a bounded walk keeps a
+/// long-lived installation from spending its start-up on old rows, and the next
+/// start continues where this one stopped.
+const TERMINAL_EVENT_RECONCILE_LIMIT: usize = 200;
 const MAX_ACTIVE_AGENT_DELEGATIONS: u32 = 8;
 const MAX_AGENT_DELEGATION_TASK_CHARS: usize = 16 * 1024;
 const MAX_AGENT_DELEGATION_TITLE_CHARS: usize = 160;
@@ -88,6 +100,12 @@ pub struct AgentManager {
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
     delegation_tool: OnceLock<AgentDelegationToolConfig>,
+    /// The Vibex-use domain service this process installed.
+    ///
+    /// The broker holds only a weak handle: the service is owned by the runtime
+    /// composition root, and a runtime that goes away must not keep its
+    /// database alive through the Agent manager.
+    vibex_use_host: OnceLock<Weak<dyn VibexUseToolHost>>,
     browser_mcp_tool: OnceLock<BrowserMcpToolConfig>,
     /// The installed computer-use MCP launch configuration.
     ///
@@ -135,6 +153,28 @@ pub struct AgentDelegationToolConfig {
     pub command: PathBuf,
     pub broker_endpoint: String,
     pub capability_token: String,
+    /// Runtime authority every reference issued through this sidecar belongs
+    /// to. A paired client must never resolve a foreign authority's references
+    /// against its own runtime.
+    pub authority: String,
+    /// Delivery activation revision the sidecar was launched under. Every call
+    /// is re-validated against the live revision so a revoked activation stops
+    /// working without waiting for the Agent to restart.
+    pub activation_revision: u64,
+}
+
+/// Durable identity of one freshly started delegated task.
+///
+/// The service needs all four references at once: the task is what the Agent
+/// polls, the session is where the work happens, and the submission/execution
+/// pair is what makes a later message or a reconciliation land on the same
+/// record instead of starting a parallel one.
+#[derive(Debug, Clone)]
+pub struct DelegationStartOutcome {
+    pub delegation: AgentDelegation,
+    pub child_session_id: VibexSessionId,
+    pub submission_id: MessageSubmissionId,
+    pub execution_id: VibexExecutionId,
 }
 
 /// Per-desktop-process launch metadata for the built-in browser MCP server.
@@ -273,6 +313,16 @@ struct AgentTurnRequest {
     /// Recorded on the user timeline item this turn opens. Internal prompts
     /// (commands, continuations) stay ordinary prompts.
     delivery: UserMessageDelivery,
+    /// Authority-composed instructions handed to the provider *in addition to*
+    /// the user's text: declared context windows and collaborator routing.
+    ///
+    /// It opens the prompt but never becomes the user's message, the session
+    /// title or a search hit — a prompt the product shows as the user's own
+    /// words has to be exactly the words the user wrote.
+    prompt_context: Option<String>,
+    /// Who the authority says authored this message. It is recorded on the user
+    /// timeline item, so a delegated instruction never reads as the user's own.
+    provenance: vibex_core::MessageProvenance,
 }
 
 impl From<SendAgentMessageRequest> for AgentTurnRequest {
@@ -285,6 +335,8 @@ impl From<SendAgentMessageRequest> for AgentTurnRequest {
             reasoning_effort: request.reasoning_effort,
             correlation_id: request.correlation_id,
             delivery: request.delivery,
+            prompt_context: request.prompt_context,
+            provenance: request.provenance,
         }
     }
 }
@@ -293,6 +345,24 @@ impl From<SendAgentMessageRequest> for AgentTurnRequest {
 struct ResolvedAgent {
     agent_id: AgentId,
     provider_kind: ProviderKind,
+}
+
+/// Stable event id for one terminal fact of one task.
+///
+/// The id is what makes "re-announce the result after a restart" safe: the same
+/// fact produces the same id, so the outbox deduplicates instead of delivering
+/// a second copy to a consumer that already read it.
+fn terminal_event_id(delegation_id: &AgentDelegationId, kind: DelegationTaskEventKind) -> String {
+    // The id validator only requires the `event_` prefix, so the terminal
+    // identity is the task plus the fact rather than a fresh UUID.
+    let derived = format!(
+        "event_terminal_{}_{}",
+        kind.as_str(),
+        delegation_id.as_str()
+    );
+    vibex_core::EventId::parse(derived.clone())
+        .map(|id| id.into_string())
+        .unwrap_or(derived)
 }
 
 #[derive(Debug)]
@@ -447,6 +517,7 @@ impl AgentManager {
             message_submission: OnceLock::new(),
             usage_telemetry: OnceLock::new(),
             delegation_tool: OnceLock::new(),
+            vibex_use_host: OnceLock::new(),
             browser_mcp_tool: OnceLock::new(),
             computer_mcp_tool: StdMutex::new(None),
             agent_tool_preferences: StdMutex::new(vibex_core::AgentToolPreferences::default()),
@@ -535,6 +606,12 @@ impl AgentManager {
         self.publish_timeline_item(item)
     }
 
+    /// The durable message-submission coordinator, once the runtime composed
+    /// one. `None` means this manager cannot accept durable sends at all.
+    pub fn message_submission_coordinator(&self) -> Option<Arc<MessageSubmissionCoordinator>> {
+        self.message_submission.get().and_then(Weak::upgrade)
+    }
+
     pub fn install_message_submission_coordinator(
         &self,
         coordinator: &Arc<MessageSubmissionCoordinator>,
@@ -587,6 +664,39 @@ impl AgentManager {
                 "Agent usage telemetry sender is already installed",
             )
         })
+    }
+
+    /// Installs the Vibex-use domain service behind the delegation broker.
+    ///
+    /// It is optional: a runtime that only serves the historical three tools
+    /// keeps working, and `tools/list` then reports exactly those three.
+    pub fn install_vibex_use_host(&self, host: &Arc<dyn VibexUseToolHost>) -> VibexResult<()> {
+        self.vibex_use_host.set(Arc::downgrade(host)).map_err(|_| {
+            VibexError::conflict(
+                "vibex_use_host_already_installed",
+                "the Vibex-use service is already installed",
+            )
+        })
+    }
+
+    pub fn vibex_use_host(&self) -> Option<Arc<dyn VibexUseToolHost>> {
+        self.vibex_use_host.get().and_then(Weak::upgrade)
+    }
+
+    /// Authority every reference the broker hands out belongs to.
+    pub fn vibex_use_authority(&self) -> String {
+        self.delegation_tool
+            .get()
+            .map(|tool| tool.authority.clone())
+            .unwrap_or_else(|| "local".to_string())
+    }
+
+    /// Activation revision the installed sidecar was launched under.
+    pub fn vibex_use_activation_revision(&self) -> u64 {
+        self.delegation_tool
+            .get()
+            .map(|tool| tool.activation_revision)
+            .unwrap_or(1)
     }
 
     pub fn install_delegation_tool(&self, config: AgentDelegationToolConfig) -> VibexResult<()> {
@@ -773,6 +883,14 @@ impl AgentManager {
                     (
                         "VIBEX_AGENT_DELEGATION_PARENT_SESSION".to_string(),
                         session_id.as_str().to_string(),
+                    ),
+                    (
+                        crate::delegation::AGENT_DELEGATION_AUTHORITY_ENV.to_string(),
+                        tool.authority.clone(),
+                    ),
+                    (
+                        crate::delegation::AGENT_DELEGATION_ACTIVATION_ENV.to_string(),
+                        tool.activation_revision.to_string(),
                     ),
                 ],
                 url: None,
@@ -1377,11 +1495,34 @@ impl AgentManager {
     /// returned delegation is durable before the provider is contacted, so a
     /// retry with the same idempotency key returns the original child instead
     /// of creating a second session.
+    /// Starts one delegated task and returns everything the caller needs to
+    /// observe it.
+    ///
+    /// The order matters and is the contract:
+    ///
+    /// 1. The task row is reserved in one transaction, with its idempotency
+    ///    key, root session, budget check and payload fingerprint. A retry
+    ///    therefore returns the original task instead of starting a second one.
+    /// 2. Only then does anything touch a provider. The child session is
+    ///    created, the ownership edge and the parent timeline card are written,
+    ///    the first message is durably enqueued, and the execution row links the
+    ///    two. No database transaction is ever held across an ACP await.
+    /// 3. The watcher is spawned last, so a child that finishes before this call
+    ///    returns still settles into a row that already exists.
     pub async fn create_agent_delegation(
         self: &Arc<Self>,
-        mut request: CreateAgentDelegationRequest,
+        request: CreateAgentDelegationRequest,
     ) -> VibexResult<AgentDelegation> {
+        Ok(self.create_task_delegation(request).await?.delegation)
+    }
+
+    /// Starts one delegated task and reports its full durable identity.
+    pub async fn create_task_delegation(
+        self: &Arc<Self>,
+        mut request: CreateAgentDelegationRequest,
+    ) -> VibexResult<DelegationStartOutcome> {
         validate_delegation_request(&mut request)?;
+        let fingerprint = request.payload_fingerprint();
 
         let (parent, selection, delegation) = {
             let mut conn = self.open_migrated()?;
@@ -1398,10 +1539,10 @@ impl AgentManager {
                     "a closed Agent session cannot delegate work",
                 ));
             }
-            let depth = AgentDelegationRepository::ancestor_depth(&conn, &parent.id)?;
+            let depth = SessionOwnershipRepository::ancestor_depth(&conn, &parent.id)?;
             if depth >= MAX_AGENT_DELEGATION_DEPTH {
                 return Err(VibexError::conflict(
-                    "agent_delegation_depth_exceeded",
+                    "delegation_depth_exceeded",
                     "Agent delegation nesting depth is limited",
                 ));
             }
@@ -1410,7 +1551,21 @@ impl AgentManager {
                 &parent.id,
                 &request.idempotency_key,
             )? {
-                return Ok(existing);
+                // A retry of the same request returns the original task. A
+                // different request under the same key is a conflict, not a
+                // silent reuse of somebody else's work.
+                if let Some(existing_fingerprint) = existing.payload_fingerprint.as_deref()
+                    && existing_fingerprint != fingerprint
+                {
+                    return Err(VibexError::conflict(
+                        "idempotency_payload_conflict",
+                        "this idempotency key was already used for a different request",
+                    )
+                    .with_diagnostic("delegationId", existing.id.as_str()));
+                }
+                if let Some(outcome) = self.resume_delegation_outcome(&conn, existing)? {
+                    return Ok(outcome);
+                }
             }
             let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(
                 &conn, &parent.id,
@@ -1439,46 +1594,68 @@ impl AgentManager {
             })?;
             let selection =
                 self.resolve_delegation_runtime(&conn, &parent, &inherited_runtime, &request)?;
+            let root_session_id =
+                SessionOwnershipRepository::root_of(&conn, &parent.id).unwrap_or(parent.id.clone());
             let now = unix_timestamp_ms();
-            let delegation = AgentDelegation {
-                id: AgentDelegationId::new(),
-                parent_session_id: parent.id.clone(),
-                parent_timeline_item_id: None,
-                child_session_id: None,
-                idempotency_key: request.idempotency_key.clone(),
-                title: request
+            let status = AgentDelegationStatus::Starting;
+            let mut delegation = AgentDelegation::single_turn_legacy(
+                parent.id.clone(),
+                request.idempotency_key.clone(),
+                request
                     .title
                     .clone()
                     .unwrap_or_else(|| "Delegated task".to_string()),
-                task_summary: bounded_text(&request.task, MAX_AGENT_DELEGATION_SUMMARY_CHARS),
-                requested_agent_id: request.agent_id.clone(),
-                effective_agent_id: Some(selection.agent_id.clone()),
-                // Reserving this row atomically claims its child-session
-                // creation slot. Retried requests return this starting row.
-                status: AgentDelegationStatus::Starting,
-                result_summary: None,
-                error_code: None,
-                created_at_ms: now,
-                updated_at_ms: now,
-                started_at_ms: Some(now),
-                completed_at_ms: None,
-            };
+                bounded_text(&request.task, MAX_AGENT_DELEGATION_SUMMARY_CHARS),
+                Some(selection.agent_id.clone()),
+                status,
+                now,
+            );
+            delegation.requested_agent_id = request.agent_id.clone();
+            delegation.completion_policy = request.completion_policy;
+            delegation.phase = DelegationTaskPhase::Starting;
+            delegation.ownership_kind = request.ownership_kind;
+            delegation.root_session_id = Some(root_session_id.clone());
+            delegation.follows_task_id = request.follows_task_id.clone();
+            delegation.context_refs = request.context_refs.clone();
+            delegation.acceptance_criteria = request.acceptance_criteria.clone();
+            delegation.payload_fingerprint = Some(fingerprint.clone());
+            delegation.requested_runtime = Some(delegation_runtime_summary(&selection));
+            // Reserving this row atomically claims its child-session creation
+            // slot. A retried request returns this starting row.
             match AgentDelegationRepository::reserve_or_get(
                 &mut conn,
                 &delegation,
                 MAX_ACTIVE_AGENT_DELEGATIONS,
             )? {
-                AgentDelegationReservation::Existing(existing) => return Ok(existing),
-                AgentDelegationReservation::Claimed(persisted) => (parent, selection, persisted),
+                AgentDelegationReservation::Existing(existing) => {
+                    if let Some(outcome) = self.resume_delegation_outcome(&conn, existing)? {
+                        return Ok(outcome);
+                    }
+                    return Err(VibexError::conflict(
+                        "agent_delegation_in_progress",
+                        "this delegation is still starting in another request",
+                    ));
+                }
+                AgentDelegationReservation::Claimed(persisted) => {
+                    if let Some(follows) = request.follows_task_id.as_ref() {
+                        AgentDelegationRepository::get(&conn, follows)?.ok_or_else(|| {
+                            VibexError::validation(
+                                "delegation_follows_task_not_found",
+                                "the task this one continues was not found",
+                            )
+                        })?;
+                    }
+                    (parent, selection, persisted)
+                }
             }
         };
 
         let lifecycle_lock = self.delegation_lifecycle_lock(&delegation.id)?;
         let lifecycle_guard = lifecycle_lock.lock().await;
         let current = self.get_agent_delegation(&delegation.parent_session_id, &delegation.id)?;
-        if current.child_session_id.is_some() || current.status != AgentDelegationStatus::Starting {
+        if current.child_session_id.is_some() || current.phase != DelegationTaskPhase::Starting {
             drop(lifecycle_guard);
-            return Ok(current);
+            return self.delegation_start_outcome(current);
         }
         let coordinator = match self.message_submission.get().and_then(Weak::upgrade) {
             Some(coordinator) => coordinator,
@@ -1533,22 +1710,58 @@ impl AgentManager {
             }
         };
 
+        // Transaction boundary: linking the child session and recording whose
+        // child it is happen together, because an ownership edge without a
+        // child (or the reverse) is what makes a tree node unreachable. The
+        // parent timeline card is written afterwards on purpose — it is a
+        // projection that `reconcile_agent_delegations` rebuilds, so it must
+        // never be the reason a started task is rolled back.
         let delegation = {
             let mut conn = self.open_migrated()?;
-            let Some(delegation) = AgentDelegationRepository::attach_claimed_child_session(
-                &conn,
-                &delegation.id,
-                &child.id,
-                &selection.agent_id,
-            )?
-            else {
+            let linked = {
+                let tx = conn.transaction().map_err(|error| {
+                    VibexError::storage(
+                        "agent_delegation_attach_transaction_failed",
+                        "failed to start the delegation attach transaction",
+                    )
+                    .with_diagnostic("error", error.to_string())
+                })?;
+                let linked = AgentDelegationRepository::attach_claimed_child_session(
+                    &tx,
+                    &delegation.id,
+                    &child.id,
+                    &selection.agent_id,
+                )?;
+                if linked.is_some() {
+                    // The ownership edge is the single answer to "whose child
+                    // is this" for the tree, the depth check and the cascade
+                    // delete.
+                    SessionOwnershipRepository::upsert(
+                        &tx,
+                        &child.id,
+                        &delegation.parent_session_id,
+                        Some(&delegation.id),
+                    )?;
+                }
+                tx.commit().map_err(|error| {
+                    VibexError::storage(
+                        "agent_delegation_attach_commit_failed",
+                        "failed to commit the delegation attach transaction",
+                    )
+                    .with_diagnostic("error", error.to_string())
+                })?;
+                linked
+            };
+            let Some(delegation) = linked else {
                 // The lifecycle lock normally rules this out. If durable state
                 // changed outside this process, remove the unlinked child rather
                 // than leaving an orphaned internal child session.
                 drop(conn);
                 let _ = self.delete_session(&child.id).await;
                 drop(lifecycle_guard);
-                return self.get_agent_delegation(&delegation.parent_session_id, &delegation.id);
+                return self
+                    .get_agent_delegation(&delegation.parent_session_id, &delegation.id)
+                    .and_then(|delegation| self.delegation_start_outcome(delegation));
             };
             let item = self.append_delegation_timeline(
                 &mut conn,
@@ -1573,11 +1786,13 @@ impl AgentManager {
             session_id: child.id.clone(),
             message_idempotency_key: format!("delegation:{}", delegation.id.as_str()),
             desired_runtime: selection.clone(),
-            text: request.task,
+            text: request.task.clone(),
             attachments: Vec::new(),
             reasoning_effort: selection.reasoning_effort.clone(),
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         }) {
             Ok(id) => id,
             Err(error) => {
@@ -1590,17 +1805,167 @@ impl AgentManager {
                 return Err(error);
             }
         };
+
+        let execution = {
+            let conn = self.open_migrated()?;
+            let execution = DelegationExecution {
+                id: VibexExecutionId::new(),
+                execution_ref: VibexUseRef::new(VibexUseResourceKind::Execution, ""),
+                task_ref: Some(VibexUseRef::task(&delegation.id)),
+                session_ref: VibexUseRef::session(&child.id),
+                submission_id: submission_id.clone(),
+                input_idempotency_key: format!("delegation:{}", delegation.id.as_str()),
+                provenance: MessageProvenance::DelegatedInput {
+                    actor_session_ref: VibexUseRef::session(&delegation.parent_session_id),
+                    task_ref: Some(VibexUseRef::task(&delegation.id)),
+                    operation_ref: VibexUseRef::operation(&vibex_core::VibexOperationId::new()),
+                },
+                start_sequence: None,
+                end_sequence: None,
+                runtime_selection_revision: 0,
+                outcome: ExecutionOutcome::Queued,
+                error_code: None,
+                stop_reason: None,
+                summary: None,
+                result_ranges: Vec::new(),
+                artifact_refs: Vec::new(),
+                usage: ExecutionUsageState::Unknown,
+                truncated: false,
+                blocked_on: None,
+                created_at_ms: unix_timestamp_ms(),
+                updated_at_ms: unix_timestamp_ms(),
+                finished_at_ms: None,
+            };
+            let execution = DelegationExecution {
+                execution_ref: VibexUseRef::execution(&execution.id),
+                ..execution
+            };
+            let (stored, _) = VibexUseExecutionRepository::insert_or_get(&conn, &execution)?;
+            conn.execute(
+                "UPDATE agent_delegations SET current_execution_id = ?2 WHERE delegation_id = ?1",
+                rusqlite::params![delegation.id.as_str(), stored.id.as_str()],
+            )
+            .map_err(|error| {
+                VibexError::storage(
+                    "agent_delegation_execution_update_failed",
+                    "failed to link the current execution to an Agent delegation",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+            stored
+        };
         drop(lifecycle_guard);
 
         let manager = self.clone();
         let watch_delegation_id = delegation.id.clone();
         let watch_child_id = child.id.clone();
+        let watch_execution_id = execution.id.clone();
         tokio::spawn(async move {
             manager
-                .watch_agent_delegation(watch_delegation_id, watch_child_id, submission_id)
+                .watch_agent_delegation(
+                    watch_delegation_id,
+                    watch_child_id,
+                    submission_id,
+                    watch_execution_id,
+                )
                 .await;
         });
-        Ok(delegation)
+        self.delegation_start_outcome(
+            AgentDelegationRepository::get(&self.open_migrated()?, &delegation.id)?.ok_or_else(
+                || {
+                    VibexError::storage(
+                        "agent_delegation_missing_after_start",
+                        "Agent delegation disappeared while starting",
+                    )
+                },
+            )?,
+        )
+    }
+
+    /// Rebuilds the durable identity of a task whose child already exists.
+    ///
+    /// It is what makes a retried `delegate` return the original session,
+    /// submission and execution instead of starting a second one, and it is
+    /// also the recovery entry point after a restart.
+    fn resume_delegation_outcome(
+        &self,
+        conn: &DbConnection,
+        delegation: AgentDelegation,
+    ) -> VibexResult<Option<DelegationStartOutcome>> {
+        let Some(child_session_id) = delegation.child_session_id.clone() else {
+            return Ok(None);
+        };
+        let message_idempotency_key = format!("delegation:{}", delegation.id.as_str());
+        let Some(submission) = MessageSubmissionRepository::get_by_key(
+            conn,
+            &child_session_id,
+            &message_idempotency_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let execution = VibexUseExecutionRepository::get_by_input(
+            conn,
+            Some(&child_session_id),
+            &message_idempotency_key,
+        )?
+        .or(Some(DelegationExecution {
+            id: delegation.current_execution_id.clone().unwrap_or_default(),
+            execution_ref: VibexUseRef::new(VibexUseResourceKind::Execution, ""),
+            task_ref: Some(VibexUseRef::task(&delegation.id)),
+            session_ref: VibexUseRef::session(&child_session_id),
+            submission_id: submission.submission_id.clone(),
+            input_idempotency_key: message_idempotency_key.clone(),
+            provenance: MessageProvenance::DelegatedInput {
+                actor_session_ref: VibexUseRef::session(&delegation.parent_session_id),
+                task_ref: Some(VibexUseRef::task(&delegation.id)),
+                operation_ref: VibexUseRef::operation(&vibex_core::VibexOperationId::new()),
+            },
+            start_sequence: None,
+            end_sequence: None,
+            runtime_selection_revision: 0,
+            outcome: ExecutionOutcome::Queued,
+            error_code: None,
+            stop_reason: None,
+            summary: None,
+            result_ranges: Vec::new(),
+            artifact_refs: Vec::new(),
+            usage: ExecutionUsageState::Unknown,
+            truncated: false,
+            blocked_on: None,
+            created_at_ms: delegation.created_at_ms,
+            updated_at_ms: delegation.updated_at_ms,
+            finished_at_ms: None,
+        }))
+        .map(|execution| DelegationExecution {
+            execution_ref: VibexUseRef::execution(&execution.id),
+            ..execution
+        });
+        let Some(execution) = execution else {
+            return Ok(None);
+        };
+        Ok(Some(DelegationStartOutcome {
+            delegation,
+            child_session_id,
+            submission_id: submission.submission_id,
+            execution_id: execution.id,
+        }))
+    }
+
+    /// Resolves the durable identity of a task for a caller that already holds
+    /// the row.
+    fn delegation_start_outcome(
+        &self,
+        delegation: AgentDelegation,
+    ) -> VibexResult<DelegationStartOutcome> {
+        let conn = self.open_migrated()?;
+        if let Some(outcome) = self.resume_delegation_outcome(&conn, delegation.clone())? {
+            return Ok(outcome);
+        }
+        Err(VibexError::conflict(
+            "agent_delegation_in_progress",
+            "this delegation has not finished starting",
+        ))
     }
 
     pub fn get_agent_delegation(
@@ -1630,6 +1995,15 @@ impl AgentManager {
     /// has restarted. The child turn itself remains owned by the durable
     /// message-submission coordinator; this only re-establishes the parent
     /// status/timeline projection.
+    /// Restores observation of durable child tasks after the desktop runtime
+    /// has restarted. The child turn itself remains owned by the durable
+    /// message-submission coordinator; this only re-establishes the parent
+    /// status/timeline projection.
+    ///
+    /// Recovery is driven by the operation/execution records rather than by a
+    /// session state guess, because "the session is idle" cannot tell whether
+    /// the last prompt was dispatched, is still queued, or crossed the dispatch
+    /// edge before the process died.
     pub fn reconcile_agent_delegations(self: &Arc<Self>) -> VibexResult<usize> {
         let delegations = {
             let conn = self.open_migrated()?;
@@ -1665,16 +2039,126 @@ impl AgentManager {
                 )?;
                 continue;
             };
+            let execution_id = {
+                let conn = self.open_migrated()?;
+                let execution = VibexUseExecutionRepository::get_by_input(
+                    &conn,
+                    Some(&child_session_id),
+                    &message_idempotency_key,
+                )?;
+                match execution {
+                    Some(execution) if execution.is_settled() => execution.id,
+                    Some(execution) => execution.id,
+                    None => {
+                        // A durable submission with no execution link is the
+                        // crash window between enqueue and the link write. The
+                        // record is rebuilt rather than abandoned, because the
+                        // message may still be delivered by the coordinator.
+                        let now = unix_timestamp_ms();
+                        let execution = DelegationExecution {
+                            id: VibexExecutionId::new(),
+                            execution_ref: VibexUseRef::new(VibexUseResourceKind::Execution, ""),
+                            task_ref: Some(VibexUseRef::task(&delegation.id)),
+                            session_ref: VibexUseRef::session(&child_session_id),
+                            submission_id: submission_id.clone(),
+                            input_idempotency_key: message_idempotency_key.clone(),
+                            provenance: MessageProvenance::DelegatedInput {
+                                actor_session_ref: VibexUseRef::session(
+                                    &delegation.parent_session_id,
+                                ),
+                                task_ref: Some(VibexUseRef::task(&delegation.id)),
+                                operation_ref: VibexUseRef::operation(&VibexOperationId::new()),
+                            },
+                            start_sequence: None,
+                            end_sequence: None,
+                            runtime_selection_revision: 0,
+                            outcome: ExecutionOutcome::Queued,
+                            error_code: None,
+                            stop_reason: None,
+                            summary: None,
+                            result_ranges: Vec::new(),
+                            artifact_refs: Vec::new(),
+                            usage: ExecutionUsageState::Unknown,
+                            truncated: false,
+                            blocked_on: None,
+                            created_at_ms: now,
+                            updated_at_ms: now,
+                            finished_at_ms: None,
+                        };
+                        let execution = DelegationExecution {
+                            execution_ref: VibexUseRef::execution(&execution.id),
+                            ..execution
+                        };
+                        let (stored, _) =
+                            VibexUseExecutionRepository::insert_or_get(&conn, &execution)?;
+                        stored.id
+                    }
+                }
+            };
             let manager = self.clone();
             let delegation_id = delegation.id.clone();
             tokio::spawn(async move {
                 manager
-                    .watch_agent_delegation(delegation_id, child_session_id, submission_id)
+                    .watch_agent_delegation(
+                        delegation_id,
+                        child_session_id,
+                        submission_id,
+                        execution_id,
+                    )
                     .await;
             });
             resumed += 1;
         }
+        self.reconcile_terminal_delegation_events()?;
         Ok(resumed)
+    }
+
+    /// Re-announces the terminal facts of finished tasks.
+    ///
+    /// A task that reached its end just before a crash wrote the row but may
+    /// never have written the event that tells the parent. The event id is
+    /// derived from the task and the fact, so appending it again either creates
+    /// the missing record or resolves to the one already there — a consumer
+    /// that read it before is not handed a duplicate.
+    fn reconcile_terminal_delegation_events(&self) -> VibexResult<usize> {
+        let finished = {
+            let conn = self.open_migrated()?;
+            let mut tasks = AgentDelegationRepository::list_by_phase(
+                &conn,
+                &[
+                    DelegationTaskPhase::Completed,
+                    DelegationTaskPhase::Failed,
+                    DelegationTaskPhase::Cancelled,
+                ],
+            )?;
+            tasks.truncate(TERMINAL_EVENT_RECONCILE_LIMIT);
+            tasks
+        };
+        let mut announced = 0;
+        for delegation in finished {
+            let kind = match delegation.phase() {
+                DelegationTaskPhase::Completed => DelegationTaskEventKind::TaskFinished,
+                DelegationTaskPhase::Cancelled => DelegationTaskEventKind::TaskCancelled,
+                DelegationTaskPhase::Failed => DelegationTaskEventKind::TaskFinished,
+                _ => continue,
+            };
+            let event_id = terminal_event_id(&delegation.id, kind);
+            let already_recorded = {
+                let conn = self.open_migrated()?;
+                VibexUseEventRepository::get(&conn, &event_id)?.is_some()
+            };
+            if already_recorded {
+                continue;
+            }
+            let payload = serde_json::json!({
+                "taskRef": VibexUseRef::task(&delegation.id).as_uri(),
+                "phase": delegation.phase().as_str(),
+                "recovered": true,
+            });
+            let _ = self.append_task_event(&delegation, kind, payload);
+            announced += 1;
+        }
+        Ok(announced)
     }
 
     pub async fn cancel_agent_delegation(
@@ -1685,18 +2169,175 @@ impl AgentManager {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let delegation =
             self.get_agent_delegation(&request.parent_session_id, &request.delegation_id)?;
-        if delegation.is_terminal() {
+        if delegation.phase().is_terminal() {
             return Ok(delegation);
         }
-        if let Some(child_session_id) = delegation.child_session_id.as_ref() {
-            self.interrupt(child_session_id).await?;
+        // The fence comes first. Accepting the cancellation durably is what
+        // stops a task that is still spawning from queueing more work; the slow
+        // interrupt happens after the fence, never before it.
+        let fenced = {
+            let conn = self.open_migrated()?;
+            vibex_db::request_delegation_cancellation(&conn, &delegation.id)?
+        };
+        let fenced = fenced.unwrap_or(delegation);
+        let _ = self.append_task_event(
+            &fenced,
+            DelegationTaskEventKind::TaskCancelRequested,
+            serde_json::json!({ "taskRef": VibexUseRef::task(&fenced.id).as_uri() }),
+        );
+        if let Some(child_session_id) = fenced.child_session_id.as_ref() {
+            // A provider that cannot confirm the stop leaves the task in
+            // `cancelling`; reporting `cancelled` without evidence would be a
+            // claim this layer cannot make.
+            let interrupted = self.interrupt(child_session_id).await;
+            let phase = if interrupted.is_ok() {
+                DelegationTaskPhase::Cancelled
+            } else {
+                DelegationTaskPhase::Cancelling
+            };
+            let error_code = interrupted.as_ref().err().map(|error| error.code.clone());
+            let cancelled = {
+                let conn = self.open_migrated()?;
+                transition_delegation(
+                    &conn,
+                    &fenced.id,
+                    phase,
+                    Some("Task cancelled"),
+                    error_code.as_deref(),
+                )?
+            };
+            if let Some(cancelled) = cancelled {
+                let _ = self.settle_current_execution(
+                    &cancelled,
+                    ExecutionOutcome::Cancelled,
+                    Some("cancelled"),
+                    Some("Task cancelled"),
+                );
+                let _ = self.append_task_event(
+                    &cancelled,
+                    DelegationTaskEventKind::TaskCancelled,
+                    serde_json::json!({ "taskRef": VibexUseRef::task(&cancelled.id).as_uri() }),
+                );
+                return Ok(cancelled);
+            }
         }
-        self.update_agent_delegation_status(
-            &delegation.id,
+        let cancelled = self.update_agent_delegation_status(
+            &fenced.id,
             AgentDelegationStatus::Cancelled,
             Some("Task cancelled"),
             None,
-        )
+        )?;
+        let _ = self.settle_current_execution(
+            &cancelled,
+            ExecutionOutcome::Cancelled,
+            Some("cancelled"),
+            Some("Task cancelled"),
+        );
+        Ok(cancelled)
+    }
+
+    /// Settles the execution a task is currently waiting on.
+    ///
+    /// A result window is fixed once. A later turn in the same child session
+    /// must never move an earlier task's window, which is what makes reading an
+    /// old result stable.
+    fn settle_current_execution(
+        &self,
+        delegation: &AgentDelegation,
+        outcome: ExecutionOutcome,
+        stop_reason: Option<&str>,
+        summary: Option<&str>,
+    ) -> VibexResult<Option<DelegationExecution>> {
+        let Some(execution_id) = delegation.current_execution_id.clone() else {
+            return Ok(None);
+        };
+        let conn = self.open_migrated()?;
+        let execution = VibexUseExecutionRepository::get(&conn, &execution_id)?;
+        let Some(execution) = execution else {
+            return Ok(None);
+        };
+        if execution.is_settled() {
+            return Ok(Some(execution));
+        }
+        let submission = MessageSubmissionRepository::get(&conn, &execution.submission_id)?;
+        let (start_sequence, end_sequence) = submission
+            .as_ref()
+            .map(|record| (record.result_first_sequence, record.result_last_sequence))
+            .unwrap_or((None, None));
+        let started = start_sequence.or(execution.start_sequence);
+        let ended = end_sequence.or(execution.end_sequence);
+        let ranges = match (started, ended) {
+            (Some(start), Some(end)) if end >= start => vec![ExecutionResultRange {
+                start_sequence: start,
+                end_sequence: end,
+            }],
+            _ => Vec::new(),
+        };
+        let bounded = summary.map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS));
+        let settled = VibexUseExecutionRepository::settle(
+            &conn,
+            &execution.id,
+            outcome,
+            stop_reason,
+            bounded.as_deref(),
+            &ranges,
+            &[],
+            ExecutionUsageState::Unknown,
+            false,
+            ended,
+            unix_timestamp_ms(),
+        )?;
+        if let Some(settled) = settled.as_ref() {
+            let result = DelegationResultRef {
+                execution_ref: settled.execution_ref.clone(),
+                session_ref: settled.session_ref.clone(),
+                outcome: settled.outcome,
+                stop_reason: settled.stop_reason.clone(),
+                summary: settled.summary.clone(),
+                result_ranges: settled.result_ranges.clone(),
+                artifact_refs: settled.artifact_refs.clone(),
+                usage: settled.usage,
+                truncated: settled.truncated,
+            };
+            let _ = vibex_db::append_delegation_result_ref(&conn, &delegation.id, &result)?;
+        }
+        Ok(settled)
+    }
+
+    /// Appends one durable task event for the caller's inbox.
+    fn append_task_event(
+        &self,
+        delegation: &AgentDelegation,
+        kind: DelegationTaskEventKind,
+        payload: serde_json::Value,
+    ) -> VibexResult<()> {
+        let conn = self.open_migrated()?;
+        let root = delegation
+            .root_session_id
+            .clone()
+            .unwrap_or_else(|| delegation.parent_session_id.clone());
+        // Terminal facts get a deterministic id so recovery can re-announce one
+        // without minting a second event for the same thing. Progress events
+        // describe a moment and stay unique.
+        let event_id = match kind {
+            DelegationTaskEventKind::TaskFinished
+            | DelegationTaskEventKind::TaskCancelled
+            | DelegationTaskEventKind::TaskResultAvailable => {
+                terminal_event_id(&delegation.id, kind)
+            }
+            _ => vibex_core::EventId::new().into_string(),
+        };
+        VibexUseEventRepository::append(
+            &conn,
+            &event_id,
+            Some(&root),
+            kind,
+            Some(&delegation.id),
+            delegation.child_session_id.as_ref(),
+            delegation.revision,
+            &payload,
+        )?;
+        Ok(())
     }
 
     fn resolve_delegation_runtime(
@@ -1862,11 +2503,19 @@ impl AgentManager {
         Ok(updated)
     }
 
+    /// Observes one child task until it settles.
+    ///
+    /// The watcher never decides a task's phase from a bare session snapshot
+    /// alone. The submission is the first fact: until it is durable the task is
+    /// still starting, and only after it is dispatched does the child session
+    /// state say anything about the round. That is what keeps a task from being
+    /// reported complete while its first prompt is still queued.
     async fn watch_agent_delegation(
         self: Arc<Self>,
         delegation_id: AgentDelegationId,
         child_session_id: VibexSessionId,
         submission_id: MessageSubmissionId,
+        execution_id: VibexExecutionId,
     ) {
         let _ = self.update_agent_delegation_status(
             &delegation_id,
@@ -1885,19 +2534,72 @@ impl AgentManager {
         };
         let mut events = self.subscribe();
         if let Err(error) = coordinator.wait_for_submission(&submission_id).await {
-            let status = if error.code.contains("cancel") {
-                AgentDelegationStatus::Cancelled
+            let ambiguous = error.code.contains("ambiguous")
+                || error.code.contains("prompt_dispatch_ambiguous");
+            let (status, outcome) = if ambiguous {
+                (AgentDelegationStatus::Failed, ExecutionOutcome::Ambiguous)
+            } else if error.code.contains("cancel") {
+                (
+                    AgentDelegationStatus::Cancelled,
+                    ExecutionOutcome::Cancelled,
+                )
             } else {
-                AgentDelegationStatus::Failed
+                (AgentDelegationStatus::Failed, ExecutionOutcome::Failed)
             };
+            if ambiguous {
+                // The prompt may have reached the provider. Retrying would
+                // duplicate the work, so the execution is recorded as unknown
+                // and the reader is handed the timeline instead.
+                let _ = self.update_agent_delegation_status(
+                    &delegation_id,
+                    status,
+                    Some(&error.message),
+                    Some("message_submission_prompt_dispatch_ambiguous"),
+                );
+                let _ = self.settle_execution_by_id(
+                    &execution_id,
+                    outcome,
+                    Some("prompt_dispatch_ambiguous"),
+                    Some(&error.message),
+                );
+                return;
+            }
             let _ = self.update_agent_delegation_status(
                 &delegation_id,
                 status,
                 Some(&error.message),
                 Some(&error.code),
             );
+            let _ = self.settle_execution_by_id(
+                &execution_id,
+                outcome,
+                Some(&error.code),
+                Some(&error.message),
+            );
             return;
         }
+        {
+            let conn = match self.open_migrated() {
+                Ok(conn) => conn,
+                Err(_) => return,
+            };
+            let submission = MessageSubmissionRepository::get(&conn, &submission_id)
+                .ok()
+                .flatten();
+            if let Some(start) = submission.and_then(|record| record.result_first_sequence) {
+                let _ = VibexUseExecutionRepository::mark_started(&conn, &execution_id, start);
+            }
+        }
+        if let Ok(Some(delegation)) = self.get_agent_delegation_by_id(&delegation_id) {
+            let _ = self.append_task_event(
+                &delegation,
+                DelegationTaskEventKind::ExecutionStarted,
+                serde_json::json!({
+                    "executionRef": VibexUseRef::new(VibexUseResourceKind::Execution, execution_id.as_str()).as_uri()
+                }),
+            );
+        }
+
         loop {
             let session = match self.get_session(&child_session_id).await {
                 Ok(session) => session,
@@ -1908,11 +2610,22 @@ impl AgentManager {
                         Some(&error.message),
                         Some(&error.code),
                     );
+                    let _ = self.settle_execution_by_id(
+                        &execution_id,
+                        ExecutionOutcome::Failed,
+                        Some(&error.code),
+                        Some(&error.message),
+                    );
                     return;
                 }
             };
             match session.state {
                 AgentSessionState::NeedsInput => {
+                    // Blocking is reported independently of the phase, and the
+                    // request identity travels with it so the user can answer
+                    // the exact pending prompt in its own pane.
+                    let blocked = self.pending_blocked_on(&child_session_id);
+                    let _ = self.record_delegation_blocked_on(&delegation_id, blocked.clone());
                     let _ = self.update_agent_delegation_status(
                         &delegation_id,
                         AgentDelegationStatus::NeedsInput,
@@ -1921,6 +2634,7 @@ impl AgentManager {
                     );
                 }
                 AgentSessionState::Initializing | AgentSessionState::Running => {
+                    let _ = self.record_delegation_blocked_on(&delegation_id, None);
                     let _ = self.update_agent_delegation_status(
                         &delegation_id,
                         AgentDelegationStatus::Running,
@@ -1930,12 +2644,122 @@ impl AgentManager {
                 }
                 AgentSessionState::Idle => {
                     let summary = self.child_result_summary(&child_session_id).ok().flatten();
-                    let _ = self.update_agent_delegation_status(
-                        &delegation_id,
-                        AgentDelegationStatus::Completed,
-                        summary.as_deref().or(Some("Task completed")),
-                        None,
+                    let actions_only = summary.is_none();
+                    // Read the task before settling anything: an accepted fence
+                    // outranks a turn that happened to end on its own, and the
+                    // execution must not be recorded as a clean completion for a
+                    // task the caller was already told is stopping.
+                    let watched = match self.get_agent_delegation_by_id(&delegation_id) {
+                        Ok(Some(delegation)) => delegation,
+                        _ => return,
+                    };
+                    if watched.phase() == DelegationTaskPhase::Cancelling {
+                        let _ = self.settle_execution_by_id(
+                            &execution_id,
+                            ExecutionOutcome::Cancelled,
+                            Some("cancelled"),
+                            Some(summary.as_deref().unwrap_or("Task cancelled")),
+                        );
+                        let finished = {
+                            let Ok(conn) = self.open_migrated() else {
+                                return;
+                            };
+                            transition_delegation(
+                                &conn,
+                                &delegation_id,
+                                DelegationTaskPhase::Cancelled,
+                                Some(summary.as_deref().unwrap_or("Task cancelled")),
+                                None,
+                            )
+                        };
+                        if let Ok(Some(finished)) = finished {
+                            let _ = self.append_task_event(
+                                &finished,
+                                DelegationTaskEventKind::TaskCancelled,
+                                serde_json::json!({ "phase": "cancelled" }),
+                            );
+                            let _ = self.release_session_controller(&finished);
+                        }
+                        return;
+                    }
+                    let outcome = if actions_only {
+                        ExecutionOutcome::ActionsOnly
+                    } else {
+                        ExecutionOutcome::Completed
+                    };
+                    let _ = self.settle_execution_by_id(
+                        &execution_id,
+                        outcome,
+                        Some("end_turn"),
+                        summary.as_deref(),
                     );
+                    let delegation = match self.get_agent_delegation_by_id(&delegation_id) {
+                        Ok(Some(delegation)) => delegation,
+                        _ => return,
+                    };
+                    let phase = if delegation.completion_policy
+                        == vibex_core::DelegationCompletionPolicy::OwnerReview
+                    {
+                        // The round is over; the task is not. The owner
+                        // decides whether it is accepted or continued.
+                        DelegationTaskPhase::AwaitingReview
+                    } else {
+                        DelegationTaskPhase::Completed
+                    };
+                    let _ = self.record_delegation_blocked_on(&delegation_id, None);
+                    let finished = {
+                        let conn = match self.open_migrated() {
+                            Ok(conn) => conn,
+                            Err(_) => return,
+                        };
+                        transition_delegation(
+                            &conn,
+                            &delegation_id,
+                            phase,
+                            Some(summary.as_deref().unwrap_or("Task completed")),
+                            None,
+                        )
+                    };
+                    if let Ok(Some(finished)) = finished {
+                        // The stored phase is the authority: a fence written
+                        // between the read above and this transition leaves the
+                        // task cancelling, and the events have to say so.
+                        let stored_phase = finished.phase();
+                        let _ = self.append_task_event(
+                            &finished,
+                            DelegationTaskEventKind::TaskResultAvailable,
+                            serde_json::json!({
+                                "executionRef": VibexUseRef::new(VibexUseResourceKind::Execution, execution_id.as_str()).as_uri(),
+                                "outcome": match outcome {
+                                    ExecutionOutcome::ActionsOnly => "actions_only",
+                                    ExecutionOutcome::EmptyReply => "empty_reply",
+                                    _ => "completed",
+                                },
+                            }),
+                        );
+                        if stored_phase == DelegationTaskPhase::AwaitingReview {
+                            let _ = self.append_task_event(
+                                &finished,
+                                DelegationTaskEventKind::ExecutionFinished,
+                                serde_json::json!({
+                                    "executionRef": VibexUseRef::new(VibexUseResourceKind::Execution, execution_id.as_str()).as_uri()
+                                }),
+                            );
+                        } else if stored_phase == DelegationTaskPhase::Cancelling {
+                            let _ = self.append_task_event(
+                                &finished,
+                                DelegationTaskEventKind::TaskCancelRequested,
+                                serde_json::json!({ "taskRef": VibexUseRef::task(&finished.id).as_uri() }),
+                            );
+                        } else {
+                            let _ = self.append_task_event(
+                                &finished,
+                                DelegationTaskEventKind::TaskFinished,
+                                serde_json::json!({ "phase": "completed" }),
+                            );
+                        }
+                        let _ = self.release_session_controller(&finished);
+                    }
                     return;
                 }
                 AgentSessionState::Error => {
@@ -1945,6 +2769,12 @@ impl AgentManager {
                         Some("Child session failed"),
                         Some("child_session_failed"),
                     );
+                    let _ = self.settle_execution_by_id(
+                        &execution_id,
+                        ExecutionOutcome::Failed,
+                        Some("child_session_failed"),
+                        Some("Child session failed"),
+                    );
                     return;
                 }
                 AgentSessionState::Closed | AgentSessionState::Archived => {
@@ -1953,6 +2783,12 @@ impl AgentManager {
                         AgentDelegationStatus::Cancelled,
                         Some("Child session closed"),
                         None,
+                    );
+                    let _ = self.settle_execution_by_id(
+                        &execution_id,
+                        ExecutionOutcome::Cancelled,
+                        Some("child_session_closed"),
+                        Some("Child session closed"),
                     );
                     return;
                 }
@@ -1966,6 +2802,187 @@ impl AgentManager {
                 }
             }
         }
+    }
+
+    /// Reads one delegation without going through the parent-scoped lookup.
+    fn get_agent_delegation_by_id(
+        &self,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<Option<AgentDelegation>> {
+        let conn = self.open_migrated()?;
+        AgentDelegationRepository::get(&conn, delegation_id)
+    }
+
+    /// Records what a task is waiting for, if anything.
+    /// Records that a person, not an Agent, now drives one session.
+    ///
+    /// It only fires while an Agent task actually owns the session: an ordinary
+    /// user session has no controller to take over, and the event is emitted
+    /// once per real change instead of on every keystroke's send.
+    fn record_human_takeover(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<()> {
+        let Some(owner) = vibex_db::SessionControllerRepository::get(conn, session_id)? else {
+            return Ok(());
+        };
+        if owner.human_controlled || owner.owner_task_id.is_none() {
+            return Ok(());
+        }
+        let owner_task_id = owner.owner_task_id.clone();
+        let controller =
+            vibex_db::SessionControllerRepository::mark_human_controlled(conn, session_id)?;
+        if let Some(task_id) = owner_task_id.as_ref()
+            && let Some(task) = AgentDelegationRepository::get(conn, task_id)?
+        {
+            let _ = self.append_task_event(
+                &task,
+                DelegationTaskEventKind::ControllerChanged,
+                serde_json::json!({
+                    "controller": "human",
+                    "controllerRevision": controller.revision,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn record_delegation_blocked_on(
+        &self,
+        delegation_id: &AgentDelegationId,
+        blocked_on: Option<vibex_core::DelegationBlockedOn>,
+    ) -> VibexResult<()> {
+        let conn = self.open_migrated()?;
+        let Some(delegation) = AgentDelegationRepository::get(&conn, delegation_id)? else {
+            return Ok(());
+        };
+        if delegation.blocked_on == blocked_on {
+            return Ok(());
+        }
+        let changed = delegation.blocked_on.is_some() != blocked_on.is_some();
+        vibex_db::set_delegation_blocked_on(&conn, delegation_id, blocked_on.as_ref())?;
+        // The wait identity belongs to the execution as well as the task: a
+        // caller reading an older result needs to know which request that
+        // execution stopped on, not which one is pending now.
+        if let Some(execution_id) = delegation.current_execution_id.as_ref() {
+            let _ = vibex_db::VibexUseExecutionRepository::set_blocked_on(
+                &conn,
+                execution_id,
+                blocked_on.as_ref(),
+            );
+        }
+        if changed {
+            let kind = if blocked_on.is_some() {
+                DelegationTaskEventKind::TaskBlocked
+            } else {
+                DelegationTaskEventKind::TaskUnblocked
+            };
+            let _ = self.append_task_event(
+                &delegation,
+                kind,
+                serde_json::json!({
+                    "blockedOn": blocked_on.as_ref().map(|blocked| blocked.attention_kind()),
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads the pending request, if any, that a child session is waiting on.
+    fn pending_blocked_on(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<vibex_core::DelegationBlockedOn> {
+        let conn = self.open_migrated().ok()?;
+        if let Ok(pending) = PermissionRepository::pending_for_session(&conn, session_id)
+            && let Some(request) = pending.first()
+        {
+            return Some(vibex_core::DelegationBlockedOn::Permission {
+                request_id: request.id.as_str().to_string(),
+            });
+        }
+        if let Ok(pending) = ElicitationRepository::pending_for_session(&conn, session_id)
+            && let Some(request) = pending.first()
+        {
+            return Some(vibex_core::DelegationBlockedOn::Question {
+                request_id: request.id.as_str().to_string(),
+            });
+        }
+        None
+    }
+
+    /// Settles an execution addressed by id.
+    fn settle_execution_by_id(
+        &self,
+        execution_id: &VibexExecutionId,
+        outcome: ExecutionOutcome,
+        stop_reason: Option<&str>,
+        summary: Option<&str>,
+    ) -> VibexResult<Option<DelegationExecution>> {
+        let conn = self.open_migrated()?;
+        let Some(execution) = VibexUseExecutionRepository::get(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        if execution.is_settled() {
+            return Ok(Some(execution));
+        }
+        let submission = MessageSubmissionRepository::get(&conn, &execution.submission_id)?;
+        let (start, end) = submission
+            .as_ref()
+            .map(|record| (record.result_first_sequence, record.result_last_sequence))
+            .unwrap_or((None, None));
+        let started = start.or(execution.start_sequence);
+        let ended = end.or(execution.end_sequence);
+        let ranges = match (started, ended) {
+            (Some(start), Some(end)) if end >= start => vec![ExecutionResultRange {
+                start_sequence: start,
+                end_sequence: end,
+            }],
+            _ => Vec::new(),
+        };
+        let bounded = summary.map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS));
+        let settled = VibexUseExecutionRepository::settle(
+            &conn,
+            execution_id,
+            outcome,
+            stop_reason,
+            bounded.as_deref(),
+            &ranges,
+            &[],
+            ExecutionUsageState::Unknown,
+            false,
+            ended,
+            unix_timestamp_ms(),
+        )?;
+        if let (Some(settled), Some(task_id)) = (
+            settled.as_ref(),
+            execution.task_ref.as_ref().and_then(VibexUseRef::task_id),
+        ) {
+            let result = DelegationResultRef {
+                execution_ref: settled.execution_ref.clone(),
+                session_ref: settled.session_ref.clone(),
+                outcome: settled.outcome,
+                stop_reason: settled.stop_reason.clone(),
+                summary: settled.summary.clone(),
+                result_ranges: settled.result_ranges.clone(),
+                artifact_refs: settled.artifact_refs.clone(),
+                usage: settled.usage,
+                truncated: settled.truncated,
+            };
+            let _ = vibex_db::append_delegation_result_ref(&conn, &task_id, &result)?;
+        }
+        Ok(settled)
+    }
+
+    /// Releases the session controller a settled task was holding.
+    fn release_session_controller(&self, delegation: &AgentDelegation) -> VibexResult<()> {
+        let Some(child_session_id) = delegation.child_session_id.as_ref() else {
+            return Ok(());
+        };
+        let conn = self.open_migrated()?;
+        vibex_db::SessionControllerRepository::release(&conn, child_session_id, &delegation.id)?;
+        Ok(())
     }
 
     fn child_result_summary(
@@ -2348,6 +3365,11 @@ impl AgentManager {
                 reasoning_effort: None,
                 correlation_id: request.correlation_id,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::SystemContinuation {
+                    policy_id: "continue_turn".to_string(),
+                    trigger_event_id: String::new(),
+                },
             },
             // The continuation prompt is an internal retry instruction. It
             // must stay out of the transcript and must not update the session
@@ -2855,6 +3877,9 @@ impl AgentManager {
             reasoning_effort: request.reasoning_effort.clone(),
             correlation_id: request.correlation_id.clone(),
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            // A slash command is still the person typing it.
+            provenance: vibex_core::MessageProvenance::HumanInput,
         };
         let command_request = request.clone();
         let items = self
@@ -2937,6 +3962,8 @@ impl AgentManager {
                     reasoning_effort: request.reasoning_effort,
                     correlation_id: request.correlation_id,
                     delivery: UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -3052,6 +4079,16 @@ impl AgentManager {
             ContextBridgeTurnBehavior::PreservePending => None,
         };
         SessionRepository::claim_running_turn(&conn, &session.id, session.state)?;
+        // A person writing into a session an Agent task controls takes that
+        // session over, and the takeover is a recorded control event rather
+        // than something the next automated send silently reverses. The
+        // authority decides this from the provenance it filled in itself; a tool
+        // argument cannot claim to be the user.
+        if display.display_user_message
+            && request.provenance == vibex_core::MessageProvenance::HumanInput
+        {
+            let _ = self.record_human_takeover(&conn, &session.id);
+        }
         // Turn admission is the authoritative `idle`/`error` -> `running`
         // transition, but it appends no timeline item of its own. Publish the
         // snapshot so every client drops the pre-turn state (a failed session's
@@ -3070,6 +4107,7 @@ impl AgentManager {
                     text: request.text.clone(),
                     attachments: request.attachments.clone(),
                     delivery: request.delivery,
+                    provenance: request.provenance.clone(),
                 }),
                 request.correlation_id.as_ref(),
                 None,
@@ -3120,6 +4158,16 @@ impl AgentManager {
             .as_ref()
             .map(|bridge| bridge.provider_text(&request.text))
             .unwrap_or_else(|| request.text.clone());
+        // Authority-composed instructions open the prompt. They are provider
+        // input only: the user timeline item above was written from
+        // `request.text`, so the transcript, the auto title and search all keep
+        // exactly what the user wrote.
+        let provider_turn_text = match request.prompt_context.as_deref() {
+            Some(context) if !context.trim().is_empty() => {
+                format!("{context}\n\n{provider_turn_text}")
+            }
+            _ => provider_turn_text,
+        };
         // A bridge-carrying turn is (typically) the first prompt of a fresh
         // provider session after a runtime switch, and its text opens with the
         // internal bridge payload rather than user prose. Providers that
@@ -4016,6 +5064,7 @@ impl AgentManager {
                 text: request.text.clone(),
                 attachments: request.attachments.clone(),
                 delivery: UserMessageDelivery::Steer,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             }),
             request.correlation_id.as_ref(),
             None,
@@ -5766,6 +6815,35 @@ fn bounded_text(value: &str, limit: usize) -> String {
     text.trim().to_string()
 }
 
+/// Builds the credential-free runtime summary shown for one task.
+///
+/// Nothing here is a secret: the auth source is reported by kind, and a
+/// Provider Profile is named by id rather than by any credential material.
+fn delegation_runtime_summary(selection: &SessionRuntimeSelection) -> DelegationRuntimeSummary {
+    let (auth_kind, provider_profile_id) = match &selection.auth_source {
+        vibex_core::RuntimeAuthSource::ProviderProfile {
+            provider_profile_id,
+        } => ("provider_profile", Some(provider_profile_id.clone())),
+        vibex_core::RuntimeAuthSource::AgentAccount { .. } => ("agent_account", None),
+    };
+    let configuration_label = selection
+        .model_id()
+        .or(selection.mode_id.as_deref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "Agent default".to_string());
+    DelegationRuntimeSummary {
+        agent_id: selection.agent_id.clone(),
+        auth_kind: auth_kind.to_string(),
+        configuration_label,
+        provider_profile_id,
+        model_id: selection.model_id().map(ToString::to_string),
+        reasoning_effort: selection.reasoning_effort.clone(),
+        mode_id: selection.mode_id.clone(),
+        config_values: selection.config_values.clone(),
+        catalog_revision: 0,
+    }
+}
+
 fn delegation_tool_status(status: AgentDelegationStatus) -> vibex_core::ToolCallStatus {
     match status {
         AgentDelegationStatus::Queued | AgentDelegationStatus::Starting => {
@@ -6931,6 +8009,8 @@ mod tests {
                     reasoning_effort: None,
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -7229,6 +8309,8 @@ mod tests {
                     reasoning_effort: None,
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -7265,6 +8347,8 @@ mod tests {
                     reasoning_effort: None,
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -7401,6 +8485,8 @@ mod tests {
                     reasoning_effort: None,
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -8289,6 +9375,8 @@ mod tests {
                 reasoning_effort: selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             })
             .await
             .unwrap();
@@ -8765,6 +9853,8 @@ mod tests {
                 reasoning_effort: None,
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .unwrap();
@@ -8896,6 +9986,8 @@ mod tests {
                 reasoning_effort: None,
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .unwrap();
@@ -9020,6 +10112,8 @@ mod tests {
                 reasoning_effort: None,
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .unwrap();
@@ -9080,6 +10174,8 @@ mod tests {
                 reasoning_effort: None,
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             })
             .await
             .unwrap_err();
@@ -9250,6 +10346,8 @@ mod tests {
                 command: PathBuf::from("/tmp/vibex-desktop"),
                 broker_endpoint: "127.0.0.1:43123".to_string(),
                 capability_token: global_token.clone(),
+                authority: "authority_test".to_string(),
+                activation_revision: 1,
             })
             .unwrap();
         let session_id = VibexSessionId::new();
@@ -9414,24 +10512,15 @@ mod tests {
             AgentSessionState::Initializing,
         );
         let now = unix_timestamp_ms();
-        let delegation = AgentDelegation {
-            id: AgentDelegationId::new(),
-            parent_session_id: parent.id.clone(),
-            parent_timeline_item_id: None,
-            child_session_id: None,
-            idempotency_key: "reconcile-unlinked".to_string(),
-            title: "Interrupted child".to_string(),
-            task_summary: "A task interrupted before its child session persisted".to_string(),
-            requested_agent_id: None,
-            effective_agent_id: Some(parent.agent_id.clone()),
-            status: AgentDelegationStatus::Starting,
-            result_summary: None,
-            error_code: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-            started_at_ms: Some(now),
-            completed_at_ms: None,
-        };
+        let delegation = AgentDelegation::single_turn_legacy(
+            parent.id.clone(),
+            "reconcile-unlinked",
+            "Interrupted child",
+            "A task interrupted before its child session persisted",
+            Some(parent.agent_id.clone()),
+            AgentDelegationStatus::Starting,
+            now,
+        );
         AgentDelegationRepository::reserve_or_get(&mut conn, &delegation, 8).unwrap();
         drop(conn);
 
@@ -9640,24 +10729,15 @@ mod tests {
         idempotency_key: &str,
     ) {
         let now = unix_timestamp_ms();
-        let delegation = AgentDelegation {
-            id: AgentDelegationId::new(),
-            parent_session_id: parent.id.clone(),
-            parent_timeline_item_id: None,
-            child_session_id: None,
-            idempotency_key: idempotency_key.to_string(),
-            title: child.title.clone(),
-            task_summary: "Delegate work".to_string(),
-            requested_agent_id: None,
-            effective_agent_id: Some(parent.agent_id.clone()),
-            status: AgentDelegationStatus::Starting,
-            result_summary: None,
-            error_code: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-            started_at_ms: Some(now),
-            completed_at_ms: None,
-        };
+        let delegation = AgentDelegation::single_turn_legacy(
+            parent.id.clone(),
+            idempotency_key,
+            child.title.clone(),
+            "Delegate work",
+            Some(parent.agent_id.clone()),
+            AgentDelegationStatus::Starting,
+            now,
+        );
         AgentDelegationRepository::reserve_or_get(conn, &delegation, 8).unwrap();
         AgentDelegationRepository::attach_claimed_child_session(
             conn,

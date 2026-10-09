@@ -6128,6 +6128,8 @@ mod tests {
             reasoning_effort: None,
             correlation_id: None,
             delivery: vibex_core::UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         }
     }
 

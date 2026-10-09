@@ -572,6 +572,13 @@ pub struct SidebarUiState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_order: BTreeMap<String, Vec<String>>,
     pub pinned_session_ids: BTreeSet<String>,
+    /// Delegated-ownership branches the user closed.
+    ///
+    /// Expansion is client navigation state: it is keyed by session id (which
+    /// is already authority-scoped), it grants nothing, and losing it only
+    /// means the tree opens fully again.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub collapsed_delegated_session_ids: BTreeSet<String>,
     pub collapsed_project_ids: BTreeSet<String>,
     #[serde(default)]
     pub collapsed_workspace_ids: BTreeSet<String>,

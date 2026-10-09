@@ -13,7 +13,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use vibex_core::{
-    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot, VibexError, VibexResult,
+    GroupPresentationCommand, GroupPresentationReply, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationSnapshot, SessionGroupId, VibexError, VibexResult,
+    VibexUsePresentationCapability, VibexUseUnavailableReason,
 };
 use vibex_remote::RemoteSidebarOrganizationSource;
 
@@ -163,5 +165,163 @@ mod tests {
             .expect_err("a dropped reply is not an answer");
         assert_eq!(error.code, "remote_sidebar_organization_shell_unavailable");
         shell.await.expect("the shell task finished");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session group presentation
+// ---------------------------------------------------------------------------
+
+/// A typed display request forwarded to the Desktop shell.
+///
+/// The sidebar bridge answers "what does the tree look like". This one answers
+/// "may I show this team split across panes, and what did the client actually
+/// render" — a different question with a different lifetime, so it gets its own
+/// channel instead of overloading the organisation mutation.
+pub enum SessionGroupPresentationRequest {
+    /// The shell publishes what it can do. It is sent when the shell attaches
+    /// and whenever a window changes what it can show.
+    PublishCapability {
+        capability: Box<VibexUsePresentationCapability>,
+    },
+    /// Create or update one group, and optionally make it the visible
+    /// workspace.
+    Apply {
+        command: Box<GroupPresentationCommand>,
+        reply: oneshot::Sender<VibexResult<GroupPresentationReply>>,
+    },
+    /// Remove one group's presentation. Sessions and tasks are untouched.
+    Dissolve {
+        group_id: SessionGroupId,
+        reply: oneshot::Sender<VibexResult<bool>>,
+    },
+}
+
+/// Bridge between the runtime's presentation requests and the running shell.
+///
+/// The capability is cached rather than forwarded, because `vibex_discover`
+/// must answer without waiting for a frame to render. A shell that has never
+/// attached leaves the cached value at its "no client" default, which is the
+/// honest answer for a headless runtime.
+#[derive(Default)]
+pub struct SessionGroupPresentationBridge {
+    sender: Mutex<Option<mpsc::UnboundedSender<SessionGroupPresentationRequest>>>,
+    capability: Mutex<VibexUsePresentationCapability>,
+}
+
+fn presentation_unavailable() -> VibexError {
+    VibexError::capability(
+        "presentation_unavailable",
+        "no connected client can present a session group",
+    )
+}
+
+impl SessionGroupPresentationBridge {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Claims the bridge for a Desktop shell. A later attach replaces the
+    /// earlier one so a restarted shell takes over cleanly.
+    pub fn attach(&self) -> mpsc::UnboundedReceiver<SessionGroupPresentationRequest> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        *self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        receiver
+    }
+
+    /// Detaches without answering outstanding requests. A shell that goes away
+    /// must not keep pretending it can present.
+    pub fn detach(&self) {
+        *self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        *self
+            .capability
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = VibexUsePresentationCapability::default();
+    }
+
+    pub fn capability(&self) -> VibexUsePresentationCapability {
+        self.capability
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Records what the connected shell can do.
+    pub fn publish_capability(&self, capability: VibexUsePresentationCapability) {
+        *self
+            .capability
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = capability;
+    }
+
+    /// Whether a shell is attached right now.
+    pub fn is_attached(&self) -> bool {
+        self.sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
+    /// Applies one group command and waits for the shell's answer.
+    ///
+    /// A shell that stopped answering reports `presentation_unavailable`
+    /// rather than a success the client never confirmed.
+    pub async fn apply(
+        &self,
+        command: GroupPresentationCommand,
+    ) -> VibexResult<GroupPresentationReply> {
+        let (reply, response) = oneshot::channel();
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(presentation_unavailable)?;
+        sender
+            .send(SessionGroupPresentationRequest::Apply {
+                command: Box::new(command),
+                reply,
+            })
+            .map_err(|_| presentation_unavailable())?;
+        match tokio::time::timeout(SHELL_RESPONSE_TIMEOUT, response).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) | Err(_) => Ok(GroupPresentationReply {
+                state: vibex_core::PresentationState::Deferred,
+                revision: 0,
+                reason: Some(VibexUseUnavailableReason::NoShell),
+                message: Some(
+                    "the desktop shell did not confirm the layout; the group stays available"
+                        .to_string(),
+                ),
+                applied_layout: None,
+            }),
+        }
+    }
+
+    /// Asks the shell to drop one group's presentation.
+    pub async fn dissolve(&self, group_id: &SessionGroupId) -> VibexResult<bool> {
+        let (reply, response) = oneshot::channel();
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(presentation_unavailable)?;
+        sender
+            .send(SessionGroupPresentationRequest::Dissolve {
+                group_id: group_id.clone(),
+                reply,
+            })
+            .map_err(|_| presentation_unavailable())?;
+        match tokio::time::timeout(SHELL_RESPONSE_TIMEOUT, response).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) | Err(_) => Err(presentation_unavailable()),
+        }
     }
 }

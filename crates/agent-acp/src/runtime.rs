@@ -28037,6 +28037,8 @@ for line in sys.stdin:
                 command: std::path::PathBuf::from("/vibex-delegation-sidecar"),
                 broker_endpoint: "unix:///tmp/vibex-delegation.sock".to_string(),
                 capability_token: "test-delegation-capability-token".to_string(),
+                authority: "local".to_string(),
+                activation_revision: 1,
             })
             .unwrap();
         let conn = open_database(&fixture.fixture.db_path).unwrap();
@@ -28544,6 +28546,8 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             })
             .await
             .unwrap()
@@ -28649,6 +28653,8 @@ for line in sys.stdin:
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -30909,6 +30915,8 @@ for line in sys.stdin:
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -30984,6 +30992,8 @@ for line in sys.stdin:
                 reasoning_effort: target_selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -31089,6 +31099,8 @@ for line in sys.stdin:
             reasoning_effort: None,
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         };
 
         let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
@@ -31247,6 +31259,8 @@ for line in sys.stdin:
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -31314,6 +31328,8 @@ for line in sys.stdin:
                 reasoning_effort: selection_b.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -31399,6 +31415,8 @@ for line in sys.stdin:
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -31449,6 +31467,8 @@ for line in sys.stdin:
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -31542,6 +31562,8 @@ for line in sys.stdin:
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
                 delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .await
@@ -37441,6 +37463,8 @@ for line in sys.stdin:
                     reasoning_effort: None,
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 })
                 .await
         });

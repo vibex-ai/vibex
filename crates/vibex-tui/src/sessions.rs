@@ -940,6 +940,7 @@ mod tests {
                     text: "do the thing".to_string(),
                     attachments: Vec::new(),
                     delivery: Default::default(),
+                    provenance: vibex_core::MessageProvenance::LegacyUnknown,
                 }
             ))),
             None,

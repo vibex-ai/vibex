@@ -12,6 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use vibex_core::{
+    AppliedGroupLayout, SessionGroupLayoutPreset, VIBEX_USE_MAX_LIVE_PANES, VibexUseRef,
+};
 
 use crate::SplitDirection;
 
@@ -185,6 +188,14 @@ impl SessionGroupLayout {
         match self {
             Self::Pane { pane } => Some(pane.id.clone()),
             Self::Split { children, .. } => children.iter().find_map(Self::first_pane_id),
+        }
+    }
+
+    /// The last pane in reading order, which is where overflow tabs land.
+    pub fn last_pane_mut(&mut self) -> Option<&mut SessionGroupPane> {
+        match self {
+            Self::Pane { pane } => Some(pane),
+            Self::Split { children, .. } => children.iter_mut().rev().find_map(Self::last_pane_mut),
         }
     }
 
@@ -620,6 +631,177 @@ impl SessionGroupLayout {
     }
 }
 
+/// One pane holding exactly these sessions, with the first one on top.
+fn pane_with(pane_id: &str, session_ids: &[String]) -> SessionGroupPane {
+    let mut pane = SessionGroupPane::new(pane_id);
+    pane.session_ids = session_ids.to_vec();
+    pane.session_ids.truncate(SESSION_GROUP_MEMBER_LIMIT);
+    pane.active_session_id = pane.session_ids.first().cloned();
+    pane
+}
+
+/// Even per-mille shares for `count` children.
+fn even_sizes(count: usize) -> Vec<u16> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let share = (SESSION_GROUP_SPLIT_SCALE / count as u32) as u16;
+    let mut sizes = vec![share; count];
+    if let Some(last) = sizes.last_mut() {
+        *last = SESSION_GROUP_SPLIT_SCALE as u16 - share * (count as u16 - 1);
+    }
+    sizes
+}
+
+fn split(
+    id: &str,
+    direction: SplitDirection,
+    children: Vec<SessionGroupLayout>,
+) -> SessionGroupLayout {
+    let sizes = even_sizes(children.len());
+    SessionGroupLayout::Split {
+        id: id.to_string(),
+        direction,
+        children,
+        sizes,
+    }
+}
+
+/// One pane per session, side by side. Sessions beyond the budget become tabs
+/// on the last visible pane.
+fn columns_layout(
+    ordered: &[String],
+    live: usize,
+) -> (SessionGroupLayout, Vec<String>, Vec<String>) {
+    let live = live.max(1).min(ordered.len());
+    let visible: Vec<String> = ordered.iter().take(live).cloned().collect();
+    let tabbed: Vec<String> = ordered.iter().skip(live).cloned().collect();
+    if live == 1 {
+        let mut pane = pane_with(SESSION_GROUP_MAIN_PANE_ID, &visible);
+        pane.session_ids.extend(tabbed.iter().cloned());
+        return (SessionGroupLayout::Pane { pane }, visible, tabbed);
+    }
+    let mut children = Vec::with_capacity(live);
+    for (index, session_id) in visible.iter().enumerate() {
+        children.push(SessionGroupLayout::Pane {
+            pane: pane_with(&pane_id(index), std::slice::from_ref(session_id)),
+        });
+    }
+    if let Some(last) = children.last_mut()
+        && let SessionGroupLayout::Pane { pane } = last
+    {
+        pane.session_ids.extend(tabbed.iter().cloned());
+    }
+    (
+        split(
+            "session-group-split-columns",
+            SplitDirection::Horizontal,
+            children,
+        ),
+        visible,
+        tabbed,
+    )
+}
+
+/// A roughly square grid. The fourth cell and beyond stack as tabs.
+fn grid_layout(ordered: &[String], live: usize) -> (SessionGroupLayout, Vec<String>, Vec<String>) {
+    let live = live.max(1).min(ordered.len());
+    let visible: Vec<String> = ordered.iter().take(live).cloned().collect();
+    let tabbed: Vec<String> = ordered.iter().skip(live).cloned().collect();
+    if live <= 2 {
+        return columns_layout(ordered, live);
+    }
+    let columns = live.div_ceil(2);
+    let rows: Vec<SessionGroupLayout> = (0..2)
+        .map(|row| {
+            let cells: Vec<SessionGroupLayout> = (0..columns)
+                .filter_map(|column| {
+                    let index = row * columns + column;
+                    let session_id = visible.get(index)?;
+                    Some(SessionGroupLayout::Pane {
+                        pane: pane_with(&pane_id(index), std::slice::from_ref(session_id)),
+                    })
+                })
+                .collect();
+            if cells.len() == 1 {
+                cells.into_iter().next().unwrap_or_default()
+            } else {
+                split(
+                    &format!("session-group-split-row-{row}"),
+                    SplitDirection::Horizontal,
+                    cells,
+                )
+            }
+        })
+        .collect();
+    let mut layout = split("session-group-split-grid", SplitDirection::Vertical, rows);
+    if !tabbed.is_empty()
+        && let Some(last_pane) = layout.last_pane_mut()
+    {
+        last_pane.session_ids.extend(tabbed.iter().cloned());
+    }
+    (layout, visible, tabbed)
+}
+
+/// The lead in a stable column of its own, workers stacked beside it.
+fn lead_and_workers_layout(
+    ordered: &[String],
+    live: usize,
+) -> (SessionGroupLayout, Vec<String>, Vec<String>) {
+    let live = live.max(1).min(ordered.len());
+    if live <= 2 {
+        return columns_layout(ordered, live);
+    }
+    let visible: Vec<String> = ordered.iter().take(live).cloned().collect();
+    let tabbed: Vec<String> = ordered.iter().skip(live).cloned().collect();
+    let lead = SessionGroupLayout::Pane {
+        pane: pane_with(&pane_id(0), std::slice::from_ref(&visible[0])),
+    };
+    let workers: Vec<SessionGroupLayout> = visible
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, session_id)| SessionGroupLayout::Pane {
+            pane: pane_with(&pane_id(index), std::slice::from_ref(session_id)),
+        })
+        .collect();
+    let mut worker_column = if workers.len() == 1 {
+        workers.into_iter().next().unwrap_or_default()
+    } else {
+        split(
+            "session-group-split-workers",
+            SplitDirection::Vertical,
+            workers,
+        )
+    };
+    if !tabbed.is_empty()
+        && let SessionGroupLayout::Pane { pane } = &mut worker_column
+    {
+        pane.session_ids.extend(tabbed.iter().cloned());
+    } else if !tabbed.is_empty()
+        && let Some(pane) = worker_column.last_pane_mut()
+    {
+        pane.session_ids.extend(tabbed.iter().cloned());
+    }
+    (
+        split(
+            "session-group-split-lead",
+            SplitDirection::Horizontal,
+            vec![lead, worker_column],
+        ),
+        visible,
+        tabbed,
+    )
+}
+
+fn pane_id(index: usize) -> String {
+    if index == 0 {
+        SESSION_GROUP_MAIN_PANE_ID.to_string()
+    } else {
+        format!("{SESSION_GROUP_MAIN_PANE_ID}-{index}")
+    }
+}
+
 /// Which side of the split target the moved session lands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -732,6 +914,145 @@ impl SessionGroupUiState {
             .is_some_and(|pane_id| !pane_ids.iter().any(|id| id == pane_id))
         {
             self.maximized_pane_id = None;
+        }
+    }
+
+    /// Arranges the current members into one of the Agent-facing presets.
+    ///
+    /// A group organised by an Agent is still a group the user can rearrange
+    /// afterwards, so this replaces the pane tree once and then leaves it
+    /// alone. Sessions beyond the live-pane budget keep their place as tabs
+    /// instead of being dropped, and the returned shape is what the caller
+    /// reports back: an Agent has to know what a narrow window actually
+    /// rendered rather than what it asked for.
+    /// Reports the arrangement the group currently has, without changing it.
+    ///
+    /// Presenting an existing group uses this: the caller learns what is on
+    /// screen, and the user's own arrangement is left exactly as it was.
+    pub fn observed_layout(&self) -> AppliedGroupLayout {
+        let preset = match &self.layout {
+            SessionGroupLayout::Pane { .. } => SessionGroupLayoutPreset::Tabs,
+            SessionGroupLayout::Split { direction, .. } => match direction {
+                SplitDirection::Horizontal => SessionGroupLayoutPreset::Columns,
+                SplitDirection::Vertical => SessionGroupLayoutPreset::Grid,
+            },
+        };
+        let pane_ids = self.layout.pane_ids();
+        let mut visible = Vec::new();
+        let mut tabbed = Vec::new();
+        for pane_id in pane_ids.iter().take(VIBEX_USE_MAX_LIVE_PANES) {
+            let Some(pane) = self.layout.find_pane(pane_id) else {
+                continue;
+            };
+            let active = pane
+                .active_session_id
+                .clone()
+                .or_else(|| pane.session_ids.first().cloned());
+            if let Some(active) = active {
+                visible.push(VibexUseRef::new(
+                    vibex_core::VibexUseResourceKind::Session,
+                    active,
+                ));
+            }
+            for session_id in &pane.session_ids {
+                if Some(session_id) == pane.active_session_id.as_ref()
+                    || visible
+                        .last()
+                        .is_some_and(|reference| &reference.id == session_id)
+                {
+                    continue;
+                }
+                tabbed.push(VibexUseRef::new(
+                    vibex_core::VibexUseResourceKind::Session,
+                    session_id.clone(),
+                ));
+            }
+        }
+        AppliedGroupLayout {
+            preset,
+            visible_session_refs: visible,
+            tabbed_session_refs: tabbed,
+            live_panes: pane_ids.len().min(VIBEX_USE_MAX_LIVE_PANES),
+        }
+    }
+
+    pub fn apply_layout_preset(
+        &mut self,
+        preset: SessionGroupLayoutPreset,
+        lead_session_id: Option<&str>,
+        preferred_live_panes: Option<usize>,
+    ) -> AppliedGroupLayout {
+        let live_budget = preferred_live_panes
+            .unwrap_or(SESSION_GROUP_LIVE_PANE_LIMIT)
+            .clamp(1, SESSION_GROUP_LIVE_PANE_LIMIT)
+            .min(SESSION_GROUP_MEMBER_LIMIT);
+        let lead = lead_session_id
+            .filter(|lead| self.contains(lead))
+            .map(ToString::to_string)
+            .or_else(|| self.member_session_ids.first().cloned());
+
+        // The lead always stays visible; the rest are filled in member order.
+        let mut ordered = Vec::with_capacity(self.member_session_ids.len());
+        if let Some(lead) = lead.as_ref() {
+            ordered.push(lead.clone());
+        }
+        for session_id in &self.member_session_ids {
+            if Some(session_id) != lead.as_ref() {
+                ordered.push(session_id.clone());
+            }
+        }
+
+        let (layout, visible, tabbed) = match (preset, ordered.len()) {
+            (_, 0) => (SessionGroupLayout::default(), Vec::new(), Vec::new()),
+            (SessionGroupLayoutPreset::Single | SessionGroupLayoutPreset::Tabs, _) => {
+                let pane = pane_with(SESSION_GROUP_MAIN_PANE_ID, &ordered);
+                (
+                    SessionGroupLayout::Pane { pane },
+                    ordered.clone(),
+                    Vec::new(),
+                )
+            }
+            (SessionGroupLayoutPreset::Columns, count) => {
+                columns_layout(&ordered, count.min(live_budget))
+            }
+            (SessionGroupLayoutPreset::Grid, count) => {
+                grid_layout(&ordered, count.min(live_budget))
+            }
+            (SessionGroupLayoutPreset::LeadAndWorkers, count) => {
+                lead_and_workers_layout(&ordered, count.min(live_budget))
+            }
+        };
+
+        self.layout = layout;
+        self.maximized_pane_id = None;
+        let pane_ids = self.layout.pane_ids();
+        self.focused_pane_id = pane_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| SESSION_GROUP_MAIN_PANE_ID.to_string());
+        self.normalize();
+
+        AppliedGroupLayout {
+            preset,
+            visible_session_refs: visible
+                .iter()
+                .map(|session_id| {
+                    VibexUseRef::new(
+                        vibex_core::VibexUseResourceKind::Session,
+                        session_id.clone(),
+                    )
+                })
+                .collect(),
+            tabbed_session_refs: tabbed
+                .iter()
+                .map(|session_id| {
+                    VibexUseRef::new(
+                        vibex_core::VibexUseResourceKind::Session,
+                        session_id.clone(),
+                    )
+                })
+                .collect(),
+            live_panes: self.layout.pane_ids().len().min(VIBEX_USE_MAX_LIVE_PANES),
         }
     }
 
@@ -1521,5 +1842,94 @@ mod tests {
                 .layout
                 .reorder_pane_session(SESSION_GROUP_MAIN_PANE_ID, "c", "c", false)
         );
+    }
+
+    fn preset_group(members: &[&str]) -> SessionGroupUiState {
+        SessionGroupUiState::new(
+            "Team",
+            "project",
+            "workspace",
+            members.iter().map(|id| (*id).to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn a_single_preset_keeps_every_member_as_a_tab() {
+        let mut group = preset_group(&["lead", "worker-a", "worker-b"]);
+        let applied =
+            group.apply_layout_preset(SessionGroupLayoutPreset::Single, Some("lead"), None);
+        assert_eq!(group.layout.pane_count(), 1);
+        assert_eq!(
+            group.layout.ordered_session_ids(),
+            vec!["lead", "worker-a", "worker-b"]
+        );
+        assert_eq!(applied.visible_session_refs.len(), 3);
+        assert!(applied.tabbed_session_refs.is_empty());
+        assert_eq!(applied.preset, SessionGroupLayoutPreset::Single);
+    }
+
+    #[test]
+    fn lead_and_workers_keeps_the_lead_in_its_own_column() {
+        let mut group = preset_group(&["worker-a", "lead", "worker-b"]);
+        let applied =
+            group.apply_layout_preset(SessionGroupLayoutPreset::LeadAndWorkers, Some("lead"), None);
+        assert_eq!(group.layout.pane_count(), 3);
+        let lead_pane = group
+            .layout
+            .pane_containing_session("lead")
+            .expect("the lead keeps a pane of its own");
+        assert_eq!(
+            group
+                .layout
+                .find_pane(&lead_pane)
+                .map(|pane| pane.session_ids.clone()),
+            Some(vec!["lead".to_string()])
+        );
+        assert_eq!(applied.visible_session_refs.len(), 3);
+    }
+
+    #[test]
+    fn sessions_beyond_the_live_budget_become_tabs_instead_of_disappearing() {
+        let members = ["a", "b", "c", "d", "e", "f"];
+        let mut group = preset_group(&members);
+        let applied =
+            group.apply_layout_preset(SessionGroupLayoutPreset::Columns, Some("a"), Some(2));
+        assert_eq!(applied.visible_session_refs.len(), 2);
+        assert_eq!(applied.tabbed_session_refs.len(), 4);
+        // Every member is still reachable: overflow lands as tabs, not in a
+        // pane list that silently dropped it.
+        let placed = group.layout.ordered_session_ids();
+        for member in members {
+            assert!(placed.contains(&member.to_string()), "{member} was dropped");
+        }
+        assert!(group.layout.pane_count() <= 2);
+    }
+
+    #[test]
+    fn a_grid_preset_stays_within_the_pane_limit() {
+        let mut group = preset_group(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let applied = group.apply_layout_preset(SessionGroupLayoutPreset::Grid, None, Some(4));
+        assert!(group.layout.pane_count() <= 4);
+        assert_eq!(applied.live_panes, group.layout.pane_count());
+        assert!(!applied.visible_session_refs.is_empty());
+    }
+
+    #[test]
+    fn applying_a_preset_clears_a_maximized_pane_and_focuses_a_live_one() {
+        let mut group = preset_group(&["a", "b", "c"]);
+        group.maximized_pane_id = Some(SESSION_GROUP_MAIN_PANE_ID.to_string());
+        group.apply_layout_preset(SessionGroupLayoutPreset::Columns, Some("a"), None);
+        assert!(group.maximized_pane_id.is_none());
+        assert!(group.layout.contains_pane(&group.focused_pane_id));
+    }
+
+    #[test]
+    fn an_empty_group_keeps_a_single_pane() {
+        let mut group = preset_group(&[]);
+        let applied =
+            group.apply_layout_preset(SessionGroupLayoutPreset::LeadAndWorkers, None, None);
+        assert_eq!(group.layout.pane_count(), 1);
+        assert!(applied.visible_session_refs.is_empty());
+        assert_eq!(applied.live_panes, 1);
     }
 }

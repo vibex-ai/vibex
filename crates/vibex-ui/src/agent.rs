@@ -2457,6 +2457,8 @@ mod tests {
             correlation_id: None,
 
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         });
         controller.begin_send_message(&request).unwrap();
 
@@ -3132,6 +3134,8 @@ mod tests {
             correlation_id: Some(CorrelationId::new()),
 
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         });
         let ticket = controller.begin_send_message(&request).unwrap();
         // A same-session authoritative reload advances the view generation but
@@ -3173,6 +3177,8 @@ mod tests {
             correlation_id: None,
 
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         });
         let ticket = controller.begin_send_message(&request).unwrap();
         let other_session = VibexSessionId::new();

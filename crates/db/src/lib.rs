@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,16 +17,16 @@ use vibex_core::{
     AutomationRun, AutomationRunCreateRequest, AutomationRunId, AutomationRunListRequest,
     AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
     AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
-    CorrelationId, DeviceId, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, FileOperationPatchFormat, FileOperationPayload,
-    GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitWorktreeDiagnostic,
-    GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationRecord,
-    GitWorktreeOperationStatus, GitWorktreeReadinessRecord, GitWorktreeReconciliationState, Hook,
-    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, LocalHistoryImportRecord,
-    LocalHistoryKey, LocalHistoryMaterializedSession, LocalHistorySource, McpServer,
-    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
-    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    CorrelationId, DelegationTaskPhase, DeviceId, ElicitationRequest, ElicitationRequestStatus,
+    ElicitationResolution, ElicitationResolutionAction, FileOperationPatchFormat,
+    FileOperationPayload, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
+    GitWorktreeDiagnostic, GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
+    GitWorktreeReconciliationState, Hook, HookCreateRequest, HookId, HookInstallPreview,
+    HookInstallState, LocalHistoryImportRecord, LocalHistoryKey, LocalHistoryMaterializedSession,
+    LocalHistorySource, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
+    McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
     PromptKind, PromptStatus, PromptUsage, ProviderCapabilityProbeResult,
     ProviderHealthProbeResult, ProviderInjectionPreview, ProviderInjectionPreviewRequest,
@@ -47,8 +47,9 @@ use vibex_core::{
     ScheduledTaskStatus, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillCreateRequest,
     SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
     TimelineItemId, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
-    TurnExecutionAttribution, VibexError, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
-    WorkspaceRecord, agent_id_for_provider_kind, unix_timestamp_ms,
+    TurnExecutionAttribution, VibexError, VibexExecutionId, VibexResult, VibexSessionId,
+    WorkspaceId, WorkspaceMode, WorkspaceRecord, agent_id_for_provider_kind,
+    legacy_status_for_phase, phase_for_legacy_status, unix_timestamp_ms,
 };
 
 mod remote_v2;
@@ -59,6 +60,20 @@ mod agent_provider_probe;
 pub use agent_provider_probe::*;
 mod usage;
 pub use usage::*;
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Removes a temporary database and its write-ahead log.
+    pub(crate) fn cleanup(path: PathBuf) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+}
+mod vibex_use;
+pub use vibex_use::*;
 mod agent_auth_context;
 pub use agent_auth_context::*;
 
@@ -75,7 +90,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 61;
+pub const CURRENT_SCHEMA_VERSION: i64 = 62;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -3210,6 +3225,19 @@ impl AgentDelegationRepository {
                 "agent_delegation_reservation_commit_failed",
                 "failed to commit Agent delegation reservation",
             ))?;
+            // A retry must be the same request. Reusing one key for a
+            // different payload would silently return somebody else's task.
+            if let (Some(existing_fingerprint), Some(requested_fingerprint)) = (
+                existing.payload_fingerprint.as_deref(),
+                delegation.payload_fingerprint.as_deref(),
+            ) && existing_fingerprint != requested_fingerprint
+            {
+                return Err(VibexError::conflict(
+                    "idempotency_payload_conflict",
+                    "this idempotency key was already used for a different request",
+                )
+                .with_diagnostic("delegationId", existing.id.as_str()));
+            }
             return Ok(AgentDelegationReservation::Existing(existing));
         }
         if Self::active_count_for_parent(&tx, &delegation.parent_session_id)? >= active_limit {
@@ -3225,9 +3253,16 @@ impl AgentDelegationRepository {
                 child_session_id, idempotency_key, title, task_summary,
                 requested_agent_id, effective_agent_id, status, result_summary,
                 error_code, created_at_ms, updated_at_ms, started_at_ms,
-                completed_at_ms
+                completed_at_ms, completion_policy, task_phase, ownership_kind,
+                root_session_id, follows_task_id, revision, controller_revision,
+                current_execution_id, blocked_on_json, context_refs_json,
+                acceptance_criteria_json, requested_runtime_json, effective_runtime_json,
+                result_refs_json, cancellation_requested_at_ms, finished_at_ms,
+                payload_fingerprint
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
+                ?32, ?33)
             ",
             params![
                 delegation.id.as_str(),
@@ -3245,13 +3280,50 @@ impl AgentDelegationRepository {
                 delegation.task_summary,
                 delegation.requested_agent_id.as_ref().map(AgentId::as_str),
                 delegation.effective_agent_id.as_ref().map(AgentId::as_str),
-                enum_to_db(&delegation.status)?,
+                // The row starts in the phase the caller asked for; the
+                // compatibility status is derived from it in the same
+                // statement, so the two can never disagree.
+                enum_to_db(&legacy_status_for_phase(delegation.phase))?,
                 delegation.result_summary,
                 delegation.error_code,
                 delegation.created_at_ms,
                 delegation.updated_at_ms,
                 delegation.started_at_ms,
                 delegation.completed_at_ms,
+                enum_to_db(&delegation.completion_policy)?,
+                enum_to_db(&delegation.phase)?,
+                enum_to_db(&delegation.ownership_kind)?,
+                delegation
+                    .root_session_id
+                    .as_ref()
+                    .map(VibexSessionId::as_str),
+                delegation
+                    .follows_task_id
+                    .as_ref()
+                    .map(AgentDelegationId::as_str),
+                u64_to_sql(delegation.revision),
+                u64_to_sql(delegation.controller_revision),
+                delegation
+                    .current_execution_id
+                    .as_ref()
+                    .map(VibexExecutionId::as_str),
+                delegation.blocked_on.as_ref().map(json_to_db).transpose()?,
+                json_to_db(&delegation.context_refs)?,
+                json_to_db(&delegation.acceptance_criteria)?,
+                delegation
+                    .requested_runtime
+                    .as_ref()
+                    .map(json_to_db)
+                    .transpose()?,
+                delegation
+                    .effective_runtime
+                    .as_ref()
+                    .map(json_to_db)
+                    .transpose()?,
+                json_to_db(&delegation.result_refs)?,
+                delegation.cancellation_requested_at_ms,
+                delegation.finished_at_ms,
+                delegation.payload_fingerprint,
             ],
         )
         .map_err(storage_err(
@@ -3384,6 +3456,51 @@ impl AgentDelegationRepository {
         )
     }
 
+    /// Tasks in any of the requested phases, newest first.
+    ///
+    /// Startup recovery reads completed rows through this: a task that finished
+    /// just before a crash still has to announce its result.
+    pub fn list_by_phase(
+        conn: &Connection,
+        phases: &[DelegationTaskPhase],
+    ) -> VibexResult<Vec<AgentDelegation>> {
+        if phases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = conn
+            .prepare(&format!(
+                "{}
+                 WHERE task_phase IN ({})
+                 ORDER BY updated_at_ms DESC, delegation_id ASC",
+                agent_delegation_select_sql(""),
+                std::iter::repeat_n("?", phases.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .map_err(storage_err(
+                "agent_delegation_list_failed",
+                "failed to prepare an Agent delegation phase list",
+            ))?;
+        let values = phases
+            .iter()
+            .map(enum_to_db)
+            .collect::<VibexResult<Vec<String>>>()?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(values.iter()),
+                map_agent_delegation,
+            )
+            .map_err(storage_err(
+                "agent_delegation_list_failed",
+                "failed to list Agent delegations by phase",
+            ))?;
+        collect_rows(
+            rows,
+            "agent_delegation_decode_failed",
+            "failed to decode Agent delegation",
+        )
+    }
+
     pub fn active_count_for_parent(
         conn: &Connection,
         parent_session_id: &VibexSessionId,
@@ -3449,6 +3566,11 @@ impl AgentDelegationRepository {
 
     /// Resolves a managed child-session tree in deletion order. The root is
     /// intentionally omitted; callers delete it after every descendant.
+    ///
+    /// Both the normalized ownership edges and the historical delegation rows
+    /// are walked. The two agree after the Vibex-use migration, and walking
+    /// both means a child written by a path that predates the ownership table
+    /// is still deleted with its parent rather than orphaned.
     pub fn descendant_session_ids(
         conn: &Connection,
         parent_session_id: &VibexSessionId,
@@ -3457,70 +3579,85 @@ impl AgentDelegationRepository {
 
         let mut seen = BTreeSet::from([parent_session_id.as_str().to_string()]);
         let mut frontier = vec![parent_session_id.clone()];
-        let mut descendants = Vec::new();
+        let mut depths: Vec<(u32, VibexSessionId)> = Vec::new();
 
-        for _ in 0..MAX_TRAVERSAL_DEPTH {
+        for depth in 1..=MAX_TRAVERSAL_DEPTH {
             if frontier.is_empty() {
-                descendants.reverse();
-                return Ok(descendants);
+                break;
             }
-
             let mut next = Vec::new();
             for parent_id in frontier {
-                let child_ids = {
-                    let mut statement = conn
-                        .prepare(
-                            "
-                            SELECT child_session_id
-                            FROM agent_delegations
-                            WHERE parent_session_id = ?1
-                              AND child_session_id IS NOT NULL
-                            ORDER BY child_session_id ASC
-                            ",
-                        )
-                        .map_err(storage_err(
-                            "agent_delegation_descendant_lookup_failed",
-                            "failed to prepare Agent delegation descendant lookup",
-                        ))?;
-                    let rows = statement
-                        .query_map(params![parent_id.as_str()], |row| row.get::<_, String>(0))
-                        .map_err(storage_err(
-                            "agent_delegation_descendant_lookup_failed",
-                            "failed to list Agent delegation descendants",
-                        ))?;
-                    let mut child_ids = Vec::new();
-                    for row in rows {
-                        let child_id = row.map_err(storage_err(
-                            "agent_delegation_descendant_decode_failed",
-                            "failed to decode Agent delegation child session",
-                        ))?;
-                        child_ids.push(VibexSessionId::parse(child_id)?);
-                    }
-                    child_ids
-                };
-
-                for child_id in child_ids {
+                for child_id in Self::direct_child_session_ids(conn, &parent_id)? {
                     if !seen.insert(child_id.as_str().to_string()) {
                         return Err(VibexError::storage(
                             "agent_delegation_hierarchy_invalid",
                             "Agent delegation hierarchy contains a duplicate or cycle",
                         ));
                     }
-                    descendants.push(child_id.clone());
+                    depths.push((depth as u32, child_id.clone()));
                     next.push(child_id);
                 }
             }
             if next.is_empty() {
-                descendants.reverse();
-                return Ok(descendants);
+                break;
+            }
+            if depth == MAX_TRAVERSAL_DEPTH {
+                return Err(VibexError::storage(
+                    "agent_delegation_hierarchy_invalid",
+                    "Agent delegation hierarchy exceeds the supported depth",
+                ));
             }
             frontier = next;
         }
 
-        Err(VibexError::storage(
-            "agent_delegation_hierarchy_invalid",
-            "Agent delegation hierarchy exceeds the supported depth",
-        ))
+        // Deepest first: a child is always removed before its own parent.
+        depths.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        Ok(depths.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// Children of one session as recorded by the ownership edges plus, for
+    /// compatibility, the delegation rows that still name it as parent.
+    fn direct_child_session_ids(
+        conn: &Connection,
+        parent_session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<VibexSessionId>> {
+        let mut statement = conn
+            .prepare(
+                "
+                SELECT child_session_id FROM session_ownership_edges
+                WHERE parent_session_id = ?1
+                UNION
+                SELECT child_session_id FROM agent_delegations
+                WHERE parent_session_id = ?1 AND child_session_id IS NOT NULL
+                ORDER BY child_session_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_delegation_descendant_lookup_failed",
+                "failed to prepare Agent delegation descendant lookup",
+            ))?;
+        let rows = statement
+            .query_map(params![parent_session_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_err(
+                "agent_delegation_descendant_lookup_failed",
+                "failed to list Agent delegation descendants",
+            ))?;
+        let mut child_ids = Vec::new();
+        for row in rows {
+            let child_id = row.map_err(storage_err(
+                "agent_delegation_descendant_decode_failed",
+                "failed to decode Agent delegation child session",
+            ))?;
+            child_ids.push(VibexSessionId::parse(child_id)?);
+        }
+        Ok(child_ids)
     }
 
     pub fn attach_claimed_child_session(
@@ -3601,6 +3738,7 @@ impl AgentDelegationRepository {
                 "
                 UPDATE agent_delegations
                 SET status = ?2,
+                    task_phase = ?11,
                     result_summary = ?3,
                     error_code = ?4,
                     updated_at_ms = ?5,
@@ -3611,6 +3749,10 @@ impl AgentDelegationRepository {
                     completed_at_ms = CASE
                         WHEN ?7 = 1 THEN COALESCE(completed_at_ms, ?5)
                         ELSE completed_at_ms
+                    END,
+                    finished_at_ms = CASE
+                        WHEN ?7 = 1 THEN COALESCE(finished_at_ms, ?5)
+                        ELSE finished_at_ms
                     END
                 WHERE delegation_id = ?1
                   AND status NOT IN (?8, ?9, ?10)
@@ -3631,6 +3773,10 @@ impl AgentDelegationRepository {
                     enum_to_db(&AgentDelegationStatus::Completed)?,
                     enum_to_db(&AgentDelegationStatus::Failed)?,
                     enum_to_db(&AgentDelegationStatus::Cancelled)?,
+                    // The compatibility status and the explicit phase are two
+                    // projections of one fact, so the same statement writes
+                    // both and no second writer can move only one of them.
+                    enum_to_db(&phase_for_legacy_status(status))?,
                 ],
             )
             .map_err(storage_err(
@@ -11430,6 +11576,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_browser_origin_grants(conn, &mut applied)?;
     apply_prompt_usage_table(conn, &mut applied)?;
     apply_computer_use(conn, &mut applied)?;
+    apply_vibex_use(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -11853,6 +12000,423 @@ fn apply_agent_delegations(conn: &mut Connection, applied: &mut Vec<String>) -> 
     Ok(())
 }
 
+/// Vibex-use: the task, execution, operation, event and presentation records
+/// behind the Agent-facing session tools.
+///
+/// The migration is additive. `agent_delegations` keeps its primary key and
+/// every historical column, so a row written before this schema still reads
+/// back through the same repository; the new columns carry the explicit task
+/// phase, ownership edge and result references that the legacy three-tool
+/// contract never had. `task_phase` is backfilled from the compatibility
+/// `status` column and then maintained by the same transition helper, so the
+/// two can never disagree.
+fn apply_vibex_use(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 62;
+    const NAME: &str = "vibex_use";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start Vibex-use migration transaction",
+    ))?;
+    tx.execute_batch(
+        "
+        ALTER TABLE agent_delegations ADD COLUMN completion_policy TEXT NOT NULL DEFAULT 'single_turn_legacy';
+        ALTER TABLE agent_delegations ADD COLUMN task_phase TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN ownership_kind TEXT NOT NULL DEFAULT 'owned_child';
+        ALTER TABLE agent_delegations ADD COLUMN root_session_id TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN follows_task_id TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE agent_delegations ADD COLUMN controller_revision INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE agent_delegations ADD COLUMN current_execution_id TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN blocked_on_json TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN context_refs_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE agent_delegations ADD COLUMN acceptance_criteria_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE agent_delegations ADD COLUMN requested_runtime_json TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN effective_runtime_json TEXT NULL;
+        ALTER TABLE agent_delegations ADD COLUMN result_refs_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE agent_delegations ADD COLUMN cancellation_requested_at_ms INTEGER NULL;
+        ALTER TABLE agent_delegations ADD COLUMN finished_at_ms INTEGER NULL;
+        ALTER TABLE agent_delegations ADD COLUMN payload_fingerprint TEXT NULL;
+
+        UPDATE agent_delegations SET task_phase = CASE status
+            WHEN 'queued' THEN 'queued'
+            WHEN 'starting' THEN 'starting'
+            WHEN 'running' THEN 'active'
+            WHEN 'needs_input' THEN 'active'
+            WHEN 'completed' THEN 'completed'
+            WHEN 'failed' THEN 'failed'
+            WHEN 'cancelled' THEN 'cancelled'
+            ELSE 'queued' END
+        WHERE task_phase IS NULL;
+
+        -- A task that already reached a compatibility terminal state keeps its
+        -- historical single-turn completion policy, so migrating never turns a
+        -- finished record into one that is waiting for a new acceptance.
+        UPDATE agent_delegations SET completion_policy = 'single_turn_legacy'
+        WHERE status IN ('completed', 'failed', 'cancelled');
+
+        UPDATE agent_delegations SET finished_at_ms = COALESCE(completed_at_ms, updated_at_ms)
+        WHERE status IN ('completed', 'failed', 'cancelled') AND finished_at_ms IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_agent_delegations_root_updated
+            ON agent_delegations(root_session_id, updated_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_delegations_phase
+            ON agent_delegations(task_phase, updated_at_ms DESC);
+
+        -- One durable ownership edge per delegated child session. It is the
+        -- unique parent used by the sidebar ownership tree, the depth check and
+        -- the cascade delete; the delegation rows remain the task history.
+        CREATE TABLE IF NOT EXISTS session_ownership_edges (
+            child_session_id TEXT PRIMARY KEY
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            parent_session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            origin TEXT NOT NULL,
+            created_by_task_id TEXT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_ownership_parent
+            ON session_ownership_edges(parent_session_id, created_at_ms, child_session_id);
+
+        -- Explicit, revocable grants over sessions the caller did not create.
+        -- A user reference grants read; handing a session to another Agent to
+        -- write into needs the `controlled` scope and is granted separately.
+        CREATE TABLE IF NOT EXISTS vibex_use_session_grants (
+            grantee_session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            target_session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            scope TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(grantee_session_id, target_session_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_session_grants_target
+            ON vibex_use_session_grants(target_session_id, scope);
+
+        CREATE TABLE IF NOT EXISTS vibex_use_session_controllers (
+            session_id TEXT PRIMARY KEY
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            owner_task_id TEXT NULL,
+            owner_parent_session_id TEXT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            human_controlled INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS vibex_use_executions (
+            execution_id TEXT PRIMARY KEY,
+            task_id TEXT NULL
+                REFERENCES agent_delegations(delegation_id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            submission_id TEXT NOT NULL
+                REFERENCES agent_message_submissions(submission_id) ON DELETE CASCADE,
+            input_idempotency_key TEXT NOT NULL,
+            provenance_kind TEXT NOT NULL,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            start_sequence INTEGER NULL,
+            end_sequence INTEGER NULL,
+            runtime_selection_revision INTEGER NOT NULL DEFAULT 0,
+            outcome TEXT NOT NULL,
+            stop_reason TEXT NULL,
+            summary TEXT NULL,
+            result_ranges_json TEXT NOT NULL DEFAULT '[]',
+            artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+            usage_state TEXT NOT NULL DEFAULT 'unknown',
+            -- Stable failure code, written with the settlement that produced it.
+            error_code TEXT NULL,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            blocked_on_json TEXT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            finished_at_ms INTEGER NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_vibex_use_executions_submission
+            ON vibex_use_executions(submission_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_vibex_use_executions_input
+            ON vibex_use_executions(session_id, input_idempotency_key);
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_executions_task
+            ON vibex_use_executions(task_id, created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_executions_open
+            ON vibex_use_executions(outcome, updated_at_ms);
+
+        CREATE TABLE IF NOT EXISTS vibex_use_operations (
+            operation_id TEXT PRIMARY KEY,
+            authority TEXT NOT NULL,
+            actor_key TEXT NOT NULL,
+            tool_kind TEXT NOT NULL,
+            caller_key TEXT NOT NULL,
+            payload_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL,
+            error_code TEXT NULL,
+            error_message TEXT NULL,
+            retryable INTEGER NOT NULL DEFAULT 0,
+            resources_json TEXT NOT NULL DEFAULT '[]',
+            checkpoint_json TEXT NOT NULL DEFAULT '{}',
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_vibex_use_operations_identity
+            ON vibex_use_operations(authority, actor_key, tool_kind, caller_key);
+
+        CREATE TABLE IF NOT EXISTS vibex_use_task_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            root_session_id TEXT NULL,
+            task_id TEXT NULL,
+            session_id TEXT NULL,
+            kind TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            occurred_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_task_events_root
+            ON vibex_use_task_events(root_session_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_task_events_task
+            ON vibex_use_task_events(task_id, sequence);
+
+        CREATE TABLE IF NOT EXISTS vibex_use_event_deliveries (
+            event_id TEXT NOT NULL
+                REFERENCES vibex_use_task_events(event_id) ON DELETE CASCADE,
+            consumer_key TEXT NOT NULL,
+            delivered_at_ms INTEGER NOT NULL,
+            acknowledged_at_ms INTEGER NULL,
+            PRIMARY KEY(event_id, consumer_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_event_deliveries_consumer
+            ON vibex_use_event_deliveries(consumer_key, acknowledged_at_ms, delivered_at_ms);
+
+        -- Runtime-side record of a group an Agent asked for. The shell stays
+        -- the single writer of the live layout; this row is what makes a
+        -- retried request return the same group instead of creating another.
+        CREATE TABLE IF NOT EXISTS vibex_use_group_presentations (
+            group_id TEXT PRIMARY KEY,
+            operation_id TEXT NULL,
+            actor_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            member_session_ids_json TEXT NOT NULL DEFAULT '[]',
+            layout_json TEXT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            -- The revision the connected client reported for the layout it
+            -- actually rendered. It is a content fingerprint, compared for
+            -- equality, so it is stored beside the repository counter instead
+            -- of replacing it.
+            client_revision INTEGER NULL,
+            created_by_caller INTEGER NOT NULL DEFAULT 1,
+            state TEXT NOT NULL DEFAULT 'created',
+            applied_layout_json TEXT NULL,
+            presentation_reason TEXT NULL,
+            payload_fingerprint TEXT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_group_presentations_workspace
+            ON vibex_use_group_presentations(workspace_id, updated_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_vibex_use_group_presentations_actor
+            ON vibex_use_group_presentations(actor_key, updated_at_ms DESC);
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the Vibex-use tables",
+    ))?;
+
+    backfill_session_ownership_edges(&tx)?;
+    backfill_delegation_roots(&tx)?;
+
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the Vibex-use migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the Vibex-use migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Rebuilds the unique ownership edge of every existing delegated child.
+///
+/// A child session that two different parents both claim cannot be resolved by
+/// row order: the sidebar tree, the depth check and the cascade delete would
+/// each pick a different parent. The migration reports the affected session ids
+/// and stops instead of guessing.
+fn backfill_session_ownership_edges(tx: &rusqlite::Transaction<'_>) -> VibexResult<()> {
+    let mut statement = tx
+        .prepare(
+            "
+            SELECT child_session_id, parent_session_id, delegation_id, created_at_ms
+            FROM agent_delegations
+            WHERE child_session_id IS NOT NULL
+            ORDER BY child_session_id ASC, created_at_ms ASC, delegation_id ASC
+            ",
+        )
+        .map_err(storage_err(
+            "vibex_use_ownership_backfill_failed",
+            "failed to read delegated child sessions",
+        ))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(storage_err(
+            "vibex_use_ownership_backfill_failed",
+            "failed to read delegated child sessions",
+        ))?;
+
+    let mut edges: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for row in rows {
+        let (child, parent, task_id, created_at_ms) = row.map_err(storage_err(
+            "vibex_use_ownership_backfill_failed",
+            "failed to decode delegated child sessions",
+        ))?;
+        match edges.get(&child) {
+            Some((existing_parent, _, _)) if existing_parent != &parent => {
+                if !conflicts.contains(&child) {
+                    conflicts.push(child.clone());
+                }
+            }
+            Some(_) => {}
+            None => {
+                edges.insert(child, (parent, task_id, created_at_ms));
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(VibexError::storage(
+            "vibex_use_ownership_conflict",
+            "delegated child sessions have more than one recorded parent",
+        )
+        .with_diagnostic("childSessions", conflicts.join(",")));
+    }
+    let now = unix_timestamp_ms();
+    for (child, (parent, task_id, created_at_ms)) in edges {
+        tx.execute(
+            "
+            INSERT OR IGNORE INTO session_ownership_edges (
+                child_session_id, parent_session_id, origin, created_by_task_id,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, 'agent_delegation', ?3, ?4, ?5)
+            ",
+            params![child, parent, task_id, created_at_ms, now],
+        )
+        .map_err(storage_err(
+            "vibex_use_ownership_backfill_failed",
+            "failed to persist delegated session ownership",
+        ))?;
+    }
+    Ok(())
+}
+
+/// Records the root session of every existing task.
+///
+/// The root is the topmost session that is not itself a delegated child. It is
+/// stored rather than recomputed so a later follow-up task on the same child
+/// cannot reset the delegation depth by naming a different parent.
+fn backfill_delegation_roots(tx: &rusqlite::Transaction<'_>) -> VibexResult<()> {
+    let mut statement = tx
+        .prepare(
+            "
+            SELECT delegation_id, parent_session_id
+            FROM agent_delegations
+            WHERE root_session_id IS NULL
+            ",
+        )
+        .map_err(storage_err(
+            "vibex_use_root_backfill_failed",
+            "failed to read Agent delegations without a root session",
+        ))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage_err(
+            "vibex_use_root_backfill_failed",
+            "failed to read Agent delegations without a root session",
+        ))?;
+    let mut pending = Vec::new();
+    for row in rows {
+        pending.push(row.map_err(storage_err(
+            "vibex_use_root_backfill_failed",
+            "failed to decode Agent delegations without a root session",
+        ))?);
+    }
+    drop(statement);
+
+    for (delegation_id, parent_session_id) in pending {
+        let root = session_tree_root(tx, &parent_session_id)?;
+        tx.execute(
+            "UPDATE agent_delegations SET root_session_id = ?2 WHERE delegation_id = ?1",
+            params![delegation_id, root],
+        )
+        .map_err(storage_err(
+            "vibex_use_root_backfill_failed",
+            "failed to persist the root session of an Agent delegation",
+        ))?;
+    }
+    Ok(())
+}
+
+/// Walks to the top of the ownership tree, refusing a cycle instead of looping.
+fn session_tree_root(conn: &Connection, session_id: &str) -> VibexResult<String> {
+    const MAX_TREE_DEPTH: usize = 32;
+    let mut current = session_id.to_string();
+    let mut seen = BTreeSet::new();
+    seen.insert(current.clone());
+    for _ in 0..MAX_TREE_DEPTH {
+        let parent = conn
+            .query_row(
+                "SELECT parent_session_id FROM session_ownership_edges WHERE child_session_id = ?1",
+                params![current],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "vibex_use_root_backfill_failed",
+                "failed to walk the session ownership tree",
+            ))?;
+        match parent {
+            Some(parent) => {
+                if !seen.insert(parent.clone()) {
+                    return Err(VibexError::storage(
+                        "vibex_use_ownership_cycle",
+                        "the session ownership tree contains a cycle",
+                    )
+                    .with_diagnostic("sessionId", parent));
+                }
+                current = parent;
+            }
+            None => return Ok(current),
+        }
+    }
+    Err(VibexError::storage(
+        "vibex_use_ownership_depth_exceeded",
+        "the session ownership tree exceeds the supported depth",
+    )
+    .with_diagnostic("sessionId", session_id.to_string()))
+}
+
+///
 /// Drops the timeline index that only repeated the primary key.
 ///
 /// `agent_timeline_items` is keyed on `(session_id, sequence)`, and
@@ -12777,7 +13341,7 @@ fn append_timeline_in_transaction(
     Ok(item)
 }
 
-fn migration_applied(conn: &Connection, version: i64) -> VibexResult<bool> {
+pub(crate) fn migration_applied(conn: &Connection, version: i64) -> VibexResult<bool> {
     let value = conn
         .query_row(
             "SELECT 1 FROM schema_migrations WHERE version = ?1",
@@ -12814,14 +13378,14 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-fn storage_err(
+pub(crate) fn storage_err(
     code: &'static str,
     message: &'static str,
 ) -> impl Fn(rusqlite::Error) -> VibexError {
     move |err| VibexError::storage(code, message).with_diagnostic("error", err.to_string())
 }
 
-fn json_to_db<T: Serialize + ?Sized>(value: &T) -> VibexResult<String> {
+pub(crate) fn json_to_db<T: Serialize + ?Sized>(value: &T) -> VibexResult<String> {
     serde_json::to_string(value).map_err(|err| {
         VibexError::storage("json_encode_failed", "failed to encode JSON payload")
             .with_diagnostic("error", err.to_string())
@@ -12859,14 +13423,14 @@ fn compact_file_operation_for_storage(operation: &FileOperationPayload) -> FileO
     compacted
 }
 
-fn json_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
+pub(crate) fn json_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
     serde_json::from_str(&value).map_err(|err| {
         VibexError::storage("json_decode_failed", "failed to decode JSON payload")
             .with_diagnostic("error", err.to_string())
     })
 }
 
-fn enum_to_db<T: Serialize>(value: &T) -> VibexResult<String> {
+pub(crate) fn enum_to_db<T: Serialize>(value: &T) -> VibexResult<String> {
     match serde_json::to_value(value).map_err(|err| {
         VibexError::storage("enum_encode_failed", "failed to encode enum value")
             .with_diagnostic("error", err.to_string())
@@ -12880,34 +13444,37 @@ fn enum_to_db<T: Serialize>(value: &T) -> VibexResult<String> {
     }
 }
 
-fn enum_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
+pub(crate) fn enum_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
     serde_json::from_value(serde_json::Value::String(value)).map_err(|err| {
         VibexError::storage("enum_decode_failed", "failed to decode enum value")
             .with_diagnostic("error", err.to_string())
     })
 }
 
-fn parse_id<T>(value: String, parser: impl FnOnce(String) -> VibexResult<T>) -> VibexResult<T> {
+pub(crate) fn parse_id<T>(
+    value: String,
+    parser: impl FnOnce(String) -> VibexResult<T>,
+) -> VibexResult<T> {
     parser(value).map_err(|err| {
         VibexError::storage("id_decode_failed", "failed to decode stored id")
             .with_diagnostic("error", err.to_string())
     })
 }
 
-fn sql_decode<T>(value: VibexResult<T>) -> rusqlite::Result<T> {
+pub(crate) fn sql_decode<T>(value: VibexResult<T>) -> rusqlite::Result<T> {
     value.map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })
 }
 
-fn parse_id_sql<T>(
+pub(crate) fn parse_id_sql<T>(
     value: String,
     parser: impl FnOnce(String) -> VibexResult<T>,
 ) -> rusqlite::Result<T> {
     sql_decode(parse_id(value, parser))
 }
 
-fn parse_optional_id_sql<T>(
+pub(crate) fn parse_optional_id_sql<T>(
     value: Option<String>,
     parser: impl Fn(String) -> VibexResult<T>,
 ) -> rusqlite::Result<Option<T>> {
@@ -12916,11 +13483,30 @@ fn parse_optional_id_sql<T>(
     })
 }
 
-fn enum_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
+pub(crate) fn enum_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
     sql_decode(enum_from_db(value))
 }
 
-fn optional_enum_from_db_sql<T: DeserializeOwned>(
+/// Reads a non-negative SQLite integer as a `u64`.
+///
+/// SQLite has no unsigned integer type, so revisions and counters are stored as
+/// `INTEGER`. A negative value would mean the row was written by something that
+/// does not share this contract, which is reported as a decode failure rather
+/// than wrapped around into an enormous revision.
+pub(crate) fn u64_from_sql(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(VibexError::storage(
+                "vibex_use_counter_invalid",
+                "a stored Vibex-use counter is negative",
+            )),
+        )
+    })
+}
+
+pub(crate) fn optional_enum_from_db_sql<T: DeserializeOwned>(
     value: Option<String>,
 ) -> rusqlite::Result<Option<T>> {
     value.map(enum_from_db).transpose().map_err(|err| {
@@ -12928,11 +13514,11 @@ fn optional_enum_from_db_sql<T: DeserializeOwned>(
     })
 }
 
-fn json_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
+pub(crate) fn json_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
     sql_decode(json_from_db(value))
 }
 
-fn optional_json_from_db_sql<T: DeserializeOwned>(
+pub(crate) fn optional_json_from_db_sql<T: DeserializeOwned>(
     value: Option<String>,
 ) -> rusqlite::Result<Option<T>> {
     value.map(json_from_db).transpose().map_err(|error| {
@@ -12952,7 +13538,15 @@ fn validate_worktree_operation_token<'a>(
     Ok(value)
 }
 
-fn collect_rows<T>(
+/// Renders a revision or counter into SQLite's signed integer domain.
+///
+/// SQLite has no unsigned type; saturating is correct here because a revision
+/// that large already means "far newer than anything a caller saw".
+pub(crate) fn u64_to_sql(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+pub(crate) fn collect_rows<T>(
     rows: impl IntoIterator<Item = rusqlite::Result<T>>,
     code: &'static str,
     message: &'static str,
@@ -14179,7 +14773,12 @@ fn agent_delegation_select_sql(where_clause: &str) -> String {
             child_session_id, idempotency_key, title, task_summary,
             requested_agent_id, effective_agent_id, status, result_summary,
             error_code, created_at_ms, updated_at_ms, started_at_ms,
-            completed_at_ms
+            completed_at_ms, completion_policy, task_phase, ownership_kind,
+            root_session_id, follows_task_id, revision, controller_revision,
+            current_execution_id, blocked_on_json, context_refs_json,
+            acceptance_criteria_json, requested_runtime_json, effective_runtime_json,
+            result_refs_json, cancellation_requested_at_ms, finished_at_ms,
+            payload_fingerprint
         FROM agent_delegations
         {where_clause}
         "
@@ -14187,23 +14786,59 @@ fn agent_delegation_select_sql(where_clause: &str) -> String {
 }
 
 fn map_agent_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDelegation> {
+    let status: AgentDelegationStatus = enum_from_db_sql(row.get("status")?)?;
+    // Rows written before the phase column existed derive it from the
+    // compatibility status instead of silently defaulting to `Queued`.
+    let phase = match row.get::<_, Option<String>>("task_phase")? {
+        Some(phase) => enum_from_db_sql(phase)?,
+        None => phase_for_legacy_status(status),
+    };
     Ok(AgentDelegation {
-        id: parse_id_sql(row.get(0)?, AgentDelegationId::parse)?,
-        parent_session_id: parse_id_sql(row.get(1)?, VibexSessionId::parse)?,
-        parent_timeline_item_id: parse_optional_id_sql(row.get(2)?, TimelineItemId::parse)?,
-        child_session_id: parse_optional_id_sql(row.get(3)?, VibexSessionId::parse)?,
-        idempotency_key: row.get(4)?,
-        title: row.get(5)?,
-        task_summary: row.get(6)?,
-        requested_agent_id: parse_optional_id_sql(row.get(7)?, AgentId::parse)?,
-        effective_agent_id: parse_optional_id_sql(row.get(8)?, AgentId::parse)?,
-        status: enum_from_db_sql(row.get(9)?)?,
-        result_summary: row.get(10)?,
-        error_code: row.get(11)?,
-        created_at_ms: row.get(12)?,
-        updated_at_ms: row.get(13)?,
-        started_at_ms: row.get(14)?,
-        completed_at_ms: row.get(15)?,
+        id: parse_id_sql(row.get("delegation_id")?, AgentDelegationId::parse)?,
+        parent_session_id: parse_id_sql(row.get("parent_session_id")?, VibexSessionId::parse)?,
+        parent_timeline_item_id: parse_optional_id_sql(
+            row.get("parent_timeline_item_id")?,
+            TimelineItemId::parse,
+        )?,
+        child_session_id: parse_optional_id_sql(
+            row.get("child_session_id")?,
+            VibexSessionId::parse,
+        )?,
+        idempotency_key: row.get("idempotency_key")?,
+        title: row.get("title")?,
+        task_summary: row.get("task_summary")?,
+        requested_agent_id: parse_optional_id_sql(row.get("requested_agent_id")?, AgentId::parse)?,
+        effective_agent_id: parse_optional_id_sql(row.get("effective_agent_id")?, AgentId::parse)?,
+        status,
+        result_summary: row.get("result_summary")?,
+        error_code: row.get("error_code")?,
+        created_at_ms: row.get("created_at_ms")?,
+        updated_at_ms: row.get("updated_at_ms")?,
+        started_at_ms: row.get("started_at_ms")?,
+        completed_at_ms: row.get("completed_at_ms")?,
+        completion_policy: enum_from_db_sql(row.get("completion_policy")?)?,
+        phase,
+        ownership_kind: enum_from_db_sql(row.get("ownership_kind")?)?,
+        root_session_id: parse_optional_id_sql(row.get("root_session_id")?, VibexSessionId::parse)?,
+        follows_task_id: parse_optional_id_sql(
+            row.get("follows_task_id")?,
+            AgentDelegationId::parse,
+        )?,
+        revision: u64_from_sql(row.get("revision")?)?,
+        controller_revision: u64_from_sql(row.get("controller_revision")?)?,
+        current_execution_id: parse_optional_id_sql(
+            row.get("current_execution_id")?,
+            VibexExecutionId::parse,
+        )?,
+        blocked_on: optional_json_from_db_sql(row.get("blocked_on_json")?)?,
+        context_refs: json_from_db_sql(row.get("context_refs_json")?)?,
+        acceptance_criteria: json_from_db_sql(row.get("acceptance_criteria_json")?)?,
+        requested_runtime: optional_json_from_db_sql(row.get("requested_runtime_json")?)?,
+        effective_runtime: optional_json_from_db_sql(row.get("effective_runtime_json")?)?,
+        result_refs: json_from_db_sql(row.get("result_refs_json")?)?,
+        cancellation_requested_at_ms: row.get("cancellation_requested_at_ms")?,
+        finished_at_ms: row.get("finished_at_ms")?,
+        payload_fingerprint: row.get("payload_fingerprint")?,
     })
 }
 
@@ -14796,24 +15431,15 @@ mod tests {
             deleted_at_ms: None,
         };
         SessionRepository::insert(&conn, &parent).unwrap();
-        let delegation = AgentDelegation {
-            id: AgentDelegationId::new(),
-            parent_session_id: parent.id.clone(),
-            parent_timeline_item_id: None,
-            child_session_id: None,
-            idempotency_key: "delegate-review".to_string(),
-            title: "Review implementation".to_string(),
-            task_summary: "Review the current implementation for correctness".to_string(),
-            requested_agent_id: None,
-            effective_agent_id: Some(agent_id.clone()),
-            status: AgentDelegationStatus::Starting,
-            result_summary: None,
-            error_code: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-            started_at_ms: Some(now),
-            completed_at_ms: None,
-        };
+        let delegation = AgentDelegation::single_turn_legacy(
+            parent.id.clone(),
+            "delegate-review",
+            "Review implementation",
+            "Review the current implementation for correctness",
+            Some(agent_id.clone()),
+            AgentDelegationStatus::Starting,
+            now,
+        );
 
         let claimed = AgentDelegationRepository::reserve_or_get(&mut conn, &delegation, 1).unwrap();
         assert!(matches!(claimed, AgentDelegationReservation::Claimed(_)));
@@ -14964,24 +15590,15 @@ mod tests {
                             parent: &AgentSession,
                             child: &AgentSession,
                             idempotency_key: &str| {
-            let delegation = AgentDelegation {
-                id: AgentDelegationId::new(),
-                parent_session_id: parent.id.clone(),
-                parent_timeline_item_id: None,
-                child_session_id: None,
-                idempotency_key: idempotency_key.to_string(),
-                title: child.title.clone(),
-                task_summary: "Delegate work".to_string(),
-                requested_agent_id: None,
-                effective_agent_id: Some(agent_id.clone()),
-                status: AgentDelegationStatus::Starting,
-                result_summary: None,
-                error_code: None,
-                created_at_ms: now,
-                updated_at_ms: now,
-                started_at_ms: Some(now),
-                completed_at_ms: None,
-            };
+            let delegation = AgentDelegation::single_turn_legacy(
+                parent.id.clone(),
+                idempotency_key,
+                child.title.clone(),
+                "Delegate work",
+                Some(agent_id.clone()),
+                AgentDelegationStatus::Starting,
+                now,
+            );
             AgentDelegationRepository::reserve_or_get(conn, &delegation, 8).unwrap();
             AgentDelegationRepository::attach_claimed_child_session(
                 conn,
@@ -15228,7 +15845,8 @@ mod tests {
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
                 "60:prompt_usage",
-                "61:computer_use"
+                "61:computer_use",
+                "62:vibex_use"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -15374,6 +15992,7 @@ mod tests {
                 "59:browser_origin_grants",
                 "60:prompt_usage",
                 "61:computer_use",
+                "62:vibex_use",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -15499,7 +16118,8 @@ mod tests {
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
                 "60:prompt_usage",
-                "61:computer_use"
+                "61:computer_use",
+                "62:vibex_use"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -15663,7 +16283,8 @@ mod tests {
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
                 "60:prompt_usage",
-                "61:computer_use"
+                "61:computer_use",
+                "62:vibex_use"
             ]
         );
         assert_eq!(
@@ -15876,6 +16497,8 @@ mod tests {
                 reasoning_effort: Some("high".to_string()),
                 correlation_id: None,
                 delivery: vibex_core::UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
             },
         )
         .unwrap();
@@ -17084,7 +17707,8 @@ mod tests {
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
                 "60:prompt_usage",
-                "61:computer_use"
+                "61:computer_use",
+                "62:vibex_use"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -20008,11 +20632,12 @@ mod tests {
         );
         assert!(first.iter().any(|entry| entry == "60:prompt_usage"));
         assert!(first.iter().any(|entry| entry == "61:computer_use"));
+        assert!(first.iter().any(|entry| entry == "62:vibex_use"));
         // A second run must be a no-op: the tables already exist and the
         // migration row is already recorded.
         let second = apply_migrations(&mut conn).unwrap();
         assert!(second.is_empty(), "second run applied {second:?}");
-        assert_eq!(current_schema_version(&conn).unwrap(), 61);
+        assert_eq!(current_schema_version(&conn).unwrap(), 62);
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             CURRENT_SCHEMA_VERSION

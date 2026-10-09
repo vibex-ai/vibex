@@ -235,6 +235,14 @@ pub struct UserMessagePayload {
     pub attachments: Vec<MessageAttachment>,
     #[serde(default, skip_serializing_if = "UserMessageDelivery::is_prompt")]
     pub delivery: UserMessageDelivery,
+    /// Who actually authored this message.
+    ///
+    /// A delegated instruction reaches the provider through the same prompt as
+    /// a typed one; without this the transcript would read as if the user had
+    /// written their Agent's follow-up themselves. Old rows deserialize as
+    /// `legacy_unknown` rather than being guessed from their text.
+    #[serde(default)]
+    pub provenance: crate::MessageProvenance,
 }
 
 impl Default for UserMessagePayload {
@@ -243,6 +251,7 @@ impl Default for UserMessagePayload {
             text: String::new(),
             attachments: Vec::new(),
             delivery: UserMessageDelivery::Prompt,
+            provenance: crate::MessageProvenance::LegacyUnknown,
         }
     }
 }

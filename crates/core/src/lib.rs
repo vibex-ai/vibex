@@ -37,6 +37,7 @@ pub mod terminal;
 pub mod time;
 pub mod timeline;
 pub mod usage;
+pub mod vibex_use;
 pub mod workbench;
 pub mod workspace;
 
@@ -153,7 +154,8 @@ pub use computer::{
 };
 pub use delegation::{
     AgentDelegation, AgentDelegationStatus, CancelAgentDelegationRequest,
-    CreateAgentDelegationRequest, GetAgentDelegationRequest,
+    CreateAgentDelegationRequest, ExecutionSettlement, GetAgentDelegationRequest,
+    SessionController, legacy_status_for_phase, phase_for_legacy_status,
 };
 pub use diagnostics::{
     DIAGNOSTIC_BUNDLE_SCHEMA_VERSION, DiagnosticBundle, DiagnosticBundleMetadata,
@@ -220,8 +222,8 @@ pub use ids::{
     ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId,
     RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
     RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
-    ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
-    WorkspaceId,
+    ScheduledTaskRunId, SessionGroupId, SkillId, TerminalId, TimelineItemId, UsageExecutionId,
+    VibexExecutionId, VibexOperationId, VibexSessionId, WorkspaceId,
 };
 pub use local_history::{
     LocalHistoryImportRecord, LocalHistoryImportResult, LocalHistoryImportStatus, LocalHistoryKey,
@@ -604,6 +606,31 @@ pub use usage::{
     AgentUsageStreamAttribution, AgentUsageTimeZone, AgentUsageTokenValues, AgentUsageTrendBucket,
     AgentUsageTrendMetric, MAX_AGENT_USAGE_TOKEN_VALUE, agent_usage_counter_scope,
     agent_usage_reporting_contract,
+};
+pub use vibex_use::{
+    AppliedGroupLayout, DelegationAccepted, DelegationBlockedOn, DelegationCompletionPolicy,
+    DelegationContextRef, DelegationExecution, DelegationOwnershipKind, DelegationResultRef,
+    DelegationRuntimeSummary, DelegationTaskEvent, DelegationTaskEventKind, DelegationTaskPhase,
+    DelegationTaskView, DiscoverResponse, ExecutionOutcome, ExecutionResultRange,
+    ExecutionUsageState, GroupPresentationCommand, GroupPresentationReply, MessageAccepted,
+    MessageProvenance, PresentationActivationPolicy, PresentationOutcome, PresentationState,
+    SessionGroupLayoutIntent, SessionGroupLayoutPreset, SessionGroupScope, SessionListPage,
+    SessionReadAnchor, SessionReadCursor, SessionReadEntry, SessionReadPage, SessionReadView,
+    SessionTreeNode, TaskListPage, VIBEX_USE_DEFAULT_READ_CHARS, VIBEX_USE_DEFAULT_READ_ITEMS,
+    VIBEX_USE_IDEMPOTENCY_KEY_CHARS, VIBEX_USE_MAX_BATCH_REFS, VIBEX_USE_MAX_CONTEXT_REFS,
+    VIBEX_USE_MAX_DEPTH, VIBEX_USE_MAX_GROUP_MEMBERS, VIBEX_USE_MAX_LIVE_PANES,
+    VIBEX_USE_MAX_MENTIONS, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
+    VIBEX_USE_MAX_WAIT_MS, VIBEX_USE_MENTION_PREFIX, VIBEX_USE_REF_SCHEME,
+    VIBEX_USE_ROOT_EXECUTION_BUDGET, VIBEX_USE_SERVER_NAME, VIBEX_USE_SUMMARY_CHARS,
+    VIBEX_USE_TITLE_CHARS, VIBEX_USE_WIRE_SERVER_ID, VibexUseActor, VibexUseCapabilitySnapshot,
+    VibexUseDelivery, VibexUseGroupSummary, VibexUseMention, VibexUseMentionKind,
+    VibexUseOperation, VibexUseOperationResource, VibexUseOperationState,
+    VibexUsePresentationCapability, VibexUseRef, VibexUseResourceKind, VibexUseRuntimeOption,
+    VibexUseScope, VibexUseSessionSummary, VibexUseTool, VibexUseToolDefinition,
+    VibexUseToolFuture, VibexUseToolHost, VibexUseUnavailableReason, VibexUseWorkspaceOption,
+    WaitOutcome, WaitResponse, bounded_chars, codes as vibex_use_codes, optional_bool,
+    optional_string, parse_optional_ref, parse_ref, required_string, vibex_use_route_note,
+    vibex_use_tool_definitions,
 };
 pub use workbench::{WorkbenchPanel, WorkbenchTabKind};
 pub use workspace::{

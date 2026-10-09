@@ -1146,6 +1146,10 @@ fn restored_composer_message(entry: ComposerQueueEntry) -> Option<ComposerQueueM
             prompt_id: command.prompt_id,
         }),
         scheduled_at_ms: entry.scheduled_at_ms,
+        // The persisted queue stores text and attachments. A restored message
+        // re-derives its `@` references from the text it kept, so a reference
+        // whose mention survived a restart still routes.
+        mentions: Vec::new(),
     })
 }
 

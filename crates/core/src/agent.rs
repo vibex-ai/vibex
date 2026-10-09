@@ -533,6 +533,23 @@ pub struct SendAgentMessageRequest {
     /// composer queue's resend action, marks the message as a resend.
     #[serde(default, skip_serializing_if = "UserMessageDelivery::is_prompt")]
     pub delivery: UserMessageDelivery,
+    /// Authority-composed instructions that open the provider prompt without
+    /// becoming the user's message.
+    ///
+    /// The declared context windows of a delegation and the collaborator routes
+    /// of a composer mention both travel here. Neither is shown in the
+    /// transcript, used for the session title, or indexed by search, and
+    /// neither is an authorization credential: the service behind them
+    /// re-authorizes every reference it reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_context: Option<String>,
+    /// Who the authority considers the author of this message.
+    ///
+    /// The authority fills it; no tool argument can set it. A caller that
+    /// leaves it alone is a user-facing path, which is why the default is a
+    /// person rather than "unknown".
+    #[serde(default = "crate::MessageProvenance::human_input")]
+    pub provenance: crate::MessageProvenance,
 }
 
 /// Rewrites the latest user message of a session and re-runs its turn.
@@ -1007,6 +1024,8 @@ mod tests {
             reasoning_effort: Some("high".to_string()),
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: crate::MessageProvenance::HumanInput,
         };
 
         let json = serde_json::to_value(&request).unwrap();

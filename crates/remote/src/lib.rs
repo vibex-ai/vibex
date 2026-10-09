@@ -10813,6 +10813,8 @@ mod tests {
             reasoning_effort: None,
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         }
     }
 

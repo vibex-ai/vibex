@@ -3672,6 +3672,8 @@ impl MobileApp {
                             reasoning_effort: runtime.reasoning_effort.clone(),
                             correlation_id: None,
                             delivery: UserMessageDelivery::Prompt,
+                            prompt_context: None,
+                            provenance: vibex_core::MessageProvenance::HumanInput,
                         }))
                         .await
                         .map(|_| ()),
@@ -5509,6 +5511,8 @@ impl MobileApp {
             reasoning_effort: runtime.desired.reasoning_effort.clone(),
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         });
         let ticket = match controller.begin_send_message(&request) {
             Ok(ticket) => ticket,

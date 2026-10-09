@@ -4,6 +4,7 @@ use vibex_core::ProviderProfileId;
 
 fn queued(id: u64, session: &VibexSessionId, at_ms: Option<i64>) -> ComposerQueueMessage {
     ComposerQueueMessage {
+        mentions: Vec::new(),
         id,
         session_id: session.clone(),
         desired_runtime: SessionRuntimeSelection::provider(

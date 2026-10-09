@@ -21,6 +21,7 @@ mod sidebar_organization;
 mod storage;
 mod timeline_display_settings;
 mod usage;
+mod vibex_use;
 mod workbench;
 mod worktree;
 
@@ -87,7 +88,10 @@ pub use catalog::{
     ProviderModelRuntimeOptionKey, ProviderModelRuntimeOptionProbeResult,
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
 };
-pub use composer::{ComposerCommandSource, discover_composer_commands};
+pub use composer::{
+    COMPOSER_AGENT_REFERENCE_KEY, COMPOSER_DELEGATE_NOW_KEY, COMPOSER_SELECTION_REFERENCE_KEY,
+    COMPOSER_SESSION_REFERENCE_KEY, ComposerCommandSource, discover_composer_commands,
+};
 pub use events::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventReceiverClosed,
     DesktopEventStream, ProviderConfigChangePhase, ProviderConfigChangedEvent,
@@ -125,10 +129,14 @@ pub use remote_connectivity::{
     TailscaleRoute, TailscaleSettings, TokioProcessRunner, WebPkiDirectPublicationProbe,
     normalize_https_origin, parse_tailscale_inspection,
 };
-pub use sidebar_organization::{SidebarOrganizationBridge, SidebarOrganizationRequest};
+pub use sidebar_organization::{
+    SessionGroupPresentationBridge, SessionGroupPresentationRequest, SidebarOrganizationBridge,
+    SidebarOrganizationRequest,
+};
 pub use storage::{StorageCleanupKind, StorageCleanupReport};
 pub use timeline_display_settings::TimelineDisplaySettingsBridge;
 pub use usage::AgentUsageService;
+pub use vibex_use::{LOCAL_AUTHORITY, VibexUseService, fingerprint_of, runtime_option_ref};
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
 
 pub const STABLE_DESKTOP_APP_ID: &str = "dev.vibex.desktop";
@@ -2155,6 +2163,8 @@ pub struct DesktopRuntime {
     relay: RelayClientRuntime,
     usage: AgentUsageService,
     sidebar_organization: Arc<SidebarOrganizationBridge>,
+    session_group_presentation: Arc<SessionGroupPresentationBridge>,
+    vibex_use: Arc<VibexUseService>,
     timeline_display_settings: Arc<TimelineDisplaySettingsBridge>,
     polling: DesktopPollingPolicy,
     events: broadcast::Sender<DesktopEvent>,
@@ -2319,33 +2329,6 @@ impl DesktopRuntime {
             })?;
         let runtime_probe = acp_runtime.runtime_probe_service();
         let manager = Arc::new(manager);
-        let delegation_broker_task =
-            if let Some(command) = config.delegation_sidecar_command.clone() {
-                match start_delegation_broker(manager.clone(), command).await {
-                    Ok((tool_config, task)) => match manager.install_delegation_tool(tool_config) {
-                        Ok(()) => Some(task),
-                        Err(error) => {
-                            task.abort();
-                            tracing::warn!(
-                                target: "vibex_desktop",
-                                error_code = %error.code,
-                                "Agent delegation sidecar is unavailable"
-                            );
-                            None
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "vibex_desktop",
-                            error_code = %error.code,
-                            "Agent delegation sidecar is unavailable"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
         let db_path = manager.database_path().to_path_buf();
         let usage = AgentUsageService::new(db_path.clone())?;
         let (usage_sender, usage_receiver) = mpsc::unbounded_channel();
@@ -2447,6 +2430,26 @@ impl DesktopRuntime {
         let recovery_cell;
         let sidebar_organization = SidebarOrganizationBridge::new();
         let timeline_display_settings = TimelineDisplaySettingsBridge::new();
+        // The presentation bridge is separate from the sidebar organization
+        // bridge: one answers "what does the tree look like", the other "may I
+        // show this team split across panes, and what did the client actually
+        // render". They have different lifetimes and different authorities.
+        let session_group_presentation = SessionGroupPresentationBridge::new();
+        // Vibex-use is composed as soon as every handle it orchestrates exists:
+        // the Agent tools, the composer's collaborator list and the product's
+        // own intents all go through this one service.
+        let vibex_use = VibexUseService::new(
+            db_path.clone(),
+            LOCAL_AUTHORITY,
+            manager.clone(),
+            runtime_catalog.clone(),
+            session_group_presentation.clone(),
+            sidebar_organization.clone(),
+            1,
+        );
+        manager.install_vibex_use_host(
+            &(vibex_use.clone() as Arc<dyn vibex_core::VibexUseToolHost>),
+        )?;
         let remote_dispatcher = remote_dispatcher
             .with_runtime_option_catalog_source(runtime_catalog.clone())
             .with_agent_auth_context_source(auth_contexts.clone())
@@ -2484,6 +2487,7 @@ impl DesktopRuntime {
                     db_path: db_path.clone(),
                 },
                 providers.clone(),
+                Some(vibex_use.clone()),
             )))
             .with_recovery_source({
                 let (source, cell) = RecoverySource::new();
@@ -2502,6 +2506,43 @@ impl DesktopRuntime {
             }))
             .with_sidebar_organization_source(sidebar_organization.clone())
             .with_timeline_display_settings_source(timeline_display_settings.clone());
+        // The broker is started here, after the service it forwards to. A
+        // session that is offered the tools is therefore always a session the
+        // service can already answer for.
+        let delegation_broker_task =
+            if let Some(command) = config.delegation_sidecar_command.clone() {
+                match start_delegation_broker(
+                    manager.clone(),
+                    command,
+                    vibex_use.authority().to_string(),
+                    vibex_use.activation_revision(),
+                )
+                .await
+                {
+                    Ok((tool_config, task)) => match manager.install_delegation_tool(tool_config) {
+                        Ok(()) => Some(task),
+                        Err(error) => {
+                            task.abort();
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Agent delegation sidecar is unavailable"
+                            );
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Agent delegation sidecar is unavailable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let remote_gateway = RemoteGateway::new(
             config.remote_gateway.clone(),
             remote_dispatcher.clone(),
@@ -2605,6 +2646,8 @@ impl DesktopRuntime {
             relay,
             usage,
             sidebar_organization,
+            session_group_presentation,
+            vibex_use,
             timeline_display_settings,
             polling: DesktopPollingPolicy::default(),
             browser: browser.clone(),
@@ -2806,6 +2849,7 @@ impl DesktopRuntime {
         let runtime_selection = self.agent.runtime_selection.clone();
         let message_submission = self.agent.message_submission.clone();
         let manager = self.agent.manager.clone();
+        let vibex_use = self.vibex_use.clone();
         tasks.push(tokio::spawn(async move {
             if let Err(error) = startup_stage_async(
                 "runtime_selection_reconcile",
@@ -2835,6 +2879,22 @@ impl DesktopRuntime {
                     error_code = %error.code,
                     "Agent delegation background reconciliation failed"
                 );
+            }
+            // A prompt that crossed the dispatch boundary before the process
+            // died has no outcome to recover. It is recorded as ambiguous and
+            // never replayed, which is the only honest answer.
+            match vibex_use.recover_ambiguous_executions() {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(
+                    target: "vibex_desktop",
+                    count,
+                    "Vibex-use marked interrupted executions ambiguous"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "Vibex-use execution recovery failed"
+                ),
             }
         }));
         Ok(())
@@ -3368,6 +3428,27 @@ impl DesktopRuntime {
     /// from the state it is rendering.
     pub fn sidebar_organization_bridge(&self) -> Arc<SidebarOrganizationBridge> {
         self.sidebar_organization.clone()
+    }
+
+    /// The display bridge a shell attaches to.
+    ///
+    /// The shell is the single writer of the live layout, so it claims this
+    /// bridge and publishes what it can show; the runtime only ever asks.
+    pub fn session_group_presentation_bridge(&self) -> Arc<SessionGroupPresentationBridge> {
+        self.session_group_presentation.clone()
+    }
+
+    /// The Vibex-use domain service shared by the Agent tools and the product's
+    /// own user intents.
+    pub fn vibex_use(&self) -> Arc<VibexUseService> {
+        self.vibex_use.clone()
+    }
+
+    /// Starts serving Vibex-use tool calls for one shell.
+    pub fn start_vibex_use_presentation(
+        &self,
+    ) -> mpsc::UnboundedReceiver<SessionGroupPresentationRequest> {
+        self.session_group_presentation.attach()
     }
 
     /// Returns the live mirror consumed by the RemoteGateway.

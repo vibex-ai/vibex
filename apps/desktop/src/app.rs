@@ -60,7 +60,7 @@ use gpui_component::{
     input::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
         Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
-        InlineTokenClickEvent, Input, InputContent, InputEvent, InputState,
+        InlineTokenClickEvent, InlineTokenSpan, Input, InputContent, InputEvent, InputState,
         MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
         MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
     },
@@ -116,19 +116,22 @@ use vibex_core::{
     GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
     GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
     GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
-    GoalPhase, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
-    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId,
-    ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary, RcImportPayload,
-    RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
-    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
-    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
-    SteerAgentMessageRequest, SteerMessageOutcome, TerminalCreateRequest, TerminalId,
-    TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
-    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
-    UserMessageDelivery, UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    GoalPhase, GroupPresentationCommand, GroupPresentationReply, MessageAttachment,
+    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PlanStepStatus, PresentationActivationPolicy, PresentationState,
+    ProjectId, ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary,
+    RcImportPayload, RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId,
+    ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
+    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
+    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SessionTreeNode, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
+    SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
+    TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
+    UserMessagePayload, VIBEX_USE_MAX_MENTIONS, VibexSessionId, VibexUseMention,
+    VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode, WorkspaceRecord,
     agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
     managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
@@ -168,8 +171,8 @@ use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
     DesktopRuntimeFacade, DesktopRuntimeMode, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
-    STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport,
-    validate_external_open_url,
+    STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
+    StorageCleanupKind, StorageCleanupReport, runtime_option_ref, validate_external_open_url,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
@@ -1212,6 +1215,13 @@ struct ComposerQueueMessage {
     attachments: Vec<MessageAttachment>,
     command_invocation: Option<ComposerCommandInvocation>,
     scheduled_at_ms: Option<i64>,
+    /// The `@` references the message was written with, resolved into the
+    /// provider-only route note when it is finally sent.
+    ///
+    /// It travels with the message instead of being recomputed from the
+    /// textarea, because a queued message is sent long after the reader moved
+    /// on — and the reference identity has to survive that wait.
+    mentions: Vec<vibex_core::VibexUseMention>,
 }
 
 impl ComposerQueueMessage {
@@ -7512,6 +7522,30 @@ pub struct VibexWorkbench {
     new_session_project_trigger_bounds: Option<Bounds<Pixels>>,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
     sessions: Vec<AgentSession>,
+    /// Delegated child sessions, keyed by session id.
+    ///
+    /// `sessions` is the *root* list the sidebar draws: a delegated child is
+    /// deliberately absent from it so it is not repeated as a top-level row.
+    /// Group panes, the tab strip and the ownership tree still need the child's
+    /// metadata, and this is where that lives — a session registry entry is not
+    /// a navigation entry.
+    delegated_sessions: BTreeMap<String, AgentSession>,
+    /// Ownership-tree nodes for every delegated descendant, keyed by child id.
+    delegated_tree: BTreeMap<String, SessionTreeNode>,
+    /// Ownership-tree branches the user collapsed, mirrored into the UI state.
+    ///
+    /// Expansion is client navigation state: collapsing a branch changes what
+    /// the sidebar shows and nothing else. It never stops a task, never removes
+    /// a session from a group, and never closes an open pane. Branches start
+    /// expanded so a newly delegated child is visible without the user having
+    /// to go looking for it, and the collapsed set is persisted so a restart
+    /// does not reopen everything the reader closed.
+    delegated_collapsed_ids: BTreeSet<String>,
+    /// One stable focus handle per ownership-tree row.
+    ///
+    /// The handle has to outlive the frame that created it: a fresh handle per
+    /// paint would drop the keyboard focus the reader just put on the row.
+    delegated_row_focus: BTreeMap<String, FocusHandle>,
     optimistically_removed_session_ids: BTreeSet<String>,
     pending_session_deletion_ids: BTreeSet<String>,
     optimistically_removed_project_ids: BTreeSet<String>,
@@ -7575,6 +7609,7 @@ pub struct VibexWorkbench {
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
     sidebar_auto_archive_task: Option<Task<()>>,
     sidebar_organization_task: Option<Task<()>>,
+    session_group_presentation_task: Option<Task<()>>,
     new_session_agent_drop_target: Option<NewSessionAgentDropTarget>,
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
@@ -7961,6 +7996,8 @@ impl VibexWorkbench {
             ui_state.desktop_behavior.launch_at_login =
                 launch_at_login_enabled(&config.application_id);
         }
+        let restored_collapsed_delegated_ids =
+            ui_state.sidebar.collapsed_delegated_session_ids.clone();
         let auto_continue_default_project_ids = ui_state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let auto_continue_paused_session_ids =
@@ -8583,6 +8620,10 @@ impl VibexWorkbench {
             new_session_project_trigger_bounds: None,
             workspaces: Vec::new(),
             sessions: Vec::new(),
+            delegated_sessions: BTreeMap::new(),
+            delegated_tree: BTreeMap::new(),
+            delegated_collapsed_ids: restored_collapsed_delegated_ids,
+            delegated_row_focus: BTreeMap::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
             pending_session_deletion_ids: BTreeSet::new(),
             optimistically_removed_project_ids: BTreeSet::new(),
@@ -8622,6 +8663,7 @@ impl VibexWorkbench {
             sidebar_organization_root_drop_target: None,
             sidebar_auto_archive_task: None,
             sidebar_organization_task: None,
+            session_group_presentation_task: None,
             new_session_agent_drop_target: None,
             collapsed_project_restore: None,
             selected_session_id: selected_session_id.clone(),
@@ -9461,6 +9503,393 @@ impl VibexWorkbench {
                 }
             },
         ));
+    }
+
+    /// Claims the session-group presentation bridge for this shell.
+    ///
+    /// The shell is the single writer of the live layout, so an Agent asks here
+    /// and the answer reports what this window actually rendered — never what
+    /// the request hoped for. The capability is published first so
+    /// `vibex_discover` can answer without waiting for a frame.
+    fn start_session_group_presentation_bridge(
+        &mut self,
+        runtime: &DesktopRuntime,
+        cx: &mut Context<Self>,
+    ) {
+        let bridge = runtime.session_group_presentation_bridge();
+        bridge.publish_capability(self.presentation_capability());
+        // A group stored while no window was open is offered now. It is a
+        // presentation-only request in `when_user_returns` mode, so a client
+        // coming back does not get pulled out of the workspace it was in.
+        let recovery = runtime.vibex_use();
+        cx.spawn(async move |_entity, _cx| {
+            let _ = recovery.recover_presentations().await;
+        })
+        .detach();
+        let mut requests = runtime.start_vibex_use_presentation();
+        let bridge_for_task = bridge.clone();
+        self.session_group_presentation_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                while let Some(request) = requests.recv().await {
+                    match request {
+                        SessionGroupPresentationRequest::PublishCapability { capability } => {
+                            bridge_for_task.publish_capability(*capability);
+                        }
+                        SessionGroupPresentationRequest::Apply { command, reply } => {
+                            // A dropped reply channel means the caller went
+                            // away; the work already happened either way.
+                            if let Ok(outcome) = entity
+                                .update(cx, |this, cx| this.apply_group_presentation(&command, cx))
+                            {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                        SessionGroupPresentationRequest::Dissolve { group_id, reply } => {
+                            if let Ok(outcome) = entity.update(cx, |this, cx| {
+                                this.dissolve_presented_group(group_id.as_str(), cx)
+                            }) {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                    }
+                }
+            },
+        ));
+    }
+
+    /// What this window can actually do with a group right now.
+    fn presentation_capability(&self) -> VibexUsePresentationCapability {
+        VibexUsePresentationCapability {
+            available: true,
+            reason: None,
+            supports_layout: true,
+            supports_focus: true,
+            // Cross-Worktree groups need the right-hand column to follow the
+            // active pane's workspace, which the first version does not do.
+            supports_cross_workspace: false,
+            max_live_panes: vibex_core::VIBEX_USE_MAX_LIVE_PANES,
+            max_members: vibex_core::VIBEX_USE_MAX_GROUP_MEMBERS,
+        }
+    }
+
+    /// Registers the sessions a group command names, then creates or updates
+    /// the group and applies the requested layout.
+    ///
+    /// Registering first is what lets a delegated child — which is deliberately
+    /// absent from the root sidebar list — take a real pane instead of being
+    /// filtered out as an unknown session.
+    fn apply_group_presentation(
+        &mut self,
+        command: &GroupPresentationCommand,
+        cx: &mut Context<Self>,
+    ) -> Result<GroupPresentationReply, vibex_core::VibexError> {
+        let member_ids: Vec<String> = command
+            .member_session_refs
+            .iter()
+            .map(|reference| reference.id.clone())
+            .collect();
+        self.register_group_member_sessions(&member_ids);
+        let Some(workspace_id) = self.workspace_id_for_group_command(command) else {
+            return Err(vibex_core::VibexError::validation(
+                "presentation_workspace_unknown",
+                "the group names a workspace this window does not know",
+            ));
+        };
+        let project_id = self
+            .workspaces
+            .iter()
+            .find(|(_, workspace)| workspace.id.as_str() == workspace_id)
+            .map(|(project, _)| project.id.as_str().to_string())
+            .ok_or_else(|| {
+                vibex_core::VibexError::validation(
+                    "presentation_workspace_unknown",
+                    "the group names a workspace this window does not know",
+                )
+            })?;
+        let session_workspaces = self.sidebar_session_workspaces();
+        let session_projects = self.sidebar_session_projects();
+        let group_id = command.group_id.as_str().to_string();
+        let members: Vec<String> = member_ids
+            .iter()
+            .filter(|session_id| {
+                session_workspaces
+                    .get(session_id.as_str())
+                    .is_some_and(|workspace| workspace == &workspace_id)
+            })
+            .cloned()
+            .collect();
+        if members.is_empty() {
+            // Reporting the mismatch is better than creating an empty group
+            // that silently lost every member.
+            return Err(vibex_core::VibexError::validation(
+                "presentation_members_unavailable",
+                "none of the named sessions belong to that workspace",
+            ));
+        }
+        let exists = self
+            .ui_state
+            .sidebar
+            .organization
+            .group(&group_id)
+            .is_some();
+        // The revision the caller quoted has to be the revision of the layout
+        // this window is actually showing. A request written before the user
+        // dragged a pane apart is deferred, not applied over the new
+        // arrangement.
+        if exists && !command.presentation_only {
+            let mut revision_view = self.sidebar_organization_view();
+            sidebar_organization_revision(&mut revision_view);
+            let current = revision_view.revision;
+            if let Some(expected) = command.expected_revision
+                && expected != current
+            {
+                return Ok(GroupPresentationReply {
+                    state: PresentationState::Deferred,
+                    revision: current,
+                    reason: Some(VibexUseUnavailableReason::ForeignAuthority),
+                    message: Some(
+                        "the layout changed since the request was written; the current \
+                         arrangement was kept"
+                            .to_string(),
+                    ),
+                    applied_layout: None,
+                });
+            }
+        }
+        let applied = if command.presentation_only {
+            // Showing a group must not restate its definition. The panes keep
+            // whatever the user arranged, and the members keep whatever the
+            // user moved.
+            self.ui_state
+                .sidebar
+                .organization
+                .group_mut(&group_id)
+                .map(|group| group.observed_layout())
+        } else if exists {
+            // The group may not steal a session another group already shows.
+            // Moving a member out of a user's group is a layout edit, not
+            // something a presentation request gets to do implicitly.
+            let foreign: Vec<String> = members
+                .iter()
+                .filter(|session_id| {
+                    self.ui_state
+                        .sidebar
+                        .organization
+                        .group_of_session(session_id)
+                        .is_some_and(|owner| owner != group_id)
+                })
+                .cloned()
+                .collect();
+            if !foreign.is_empty() {
+                return Ok(GroupPresentationReply {
+                    state: PresentationState::Deferred,
+                    revision: command.expected_revision.unwrap_or_default(),
+                    reason: Some(VibexUseUnavailableReason::ForeignAuthority),
+                    message: Some(
+                        "some of those sessions already belong to another group; \
+                         the existing arrangement was kept"
+                            .to_string(),
+                    ),
+                    applied_layout: None,
+                });
+            }
+            self.ui_state
+                .sidebar
+                .organization
+                .rename_group(&group_id, &command.name);
+            self.ui_state.sidebar.organization.set_group_members(
+                &group_id,
+                members.clone(),
+                &session_workspaces,
+            );
+            self.ui_state
+                .sidebar
+                .organization
+                .group_mut(&group_id)
+                .map(|group| {
+                    group.apply_layout_preset(
+                        command.layout.preset,
+                        command
+                            .layout
+                            .lead_session_ref
+                            .as_ref()
+                            .map(|reference| reference.id.as_str()),
+                        command.layout.preferred_live_panes,
+                    )
+                })
+        } else {
+            let foreign: Vec<String> = members
+                .iter()
+                .filter(|session_id| {
+                    self.ui_state
+                        .sidebar
+                        .organization
+                        .group_of_session(session_id)
+                        .is_some()
+                })
+                .cloned()
+                .collect();
+            if !foreign.is_empty() {
+                return Ok(GroupPresentationReply {
+                    state: PresentationState::Deferred,
+                    revision: 0,
+                    reason: Some(VibexUseUnavailableReason::ForeignAuthority),
+                    message: Some(
+                        "some of those sessions already belong to another group".to_string(),
+                    ),
+                    applied_layout: None,
+                });
+            }
+            let created = self.ui_state.sidebar.organization.create_group(
+                group_id.clone(),
+                command.name.clone(),
+                &project_id,
+                &workspace_id,
+                &members,
+                &session_workspaces,
+                None,
+            );
+            if created {
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .group_mut(&group_id)
+                    .map(|group| {
+                        group.apply_layout_preset(
+                            command.layout.preset,
+                            command
+                                .layout
+                                .lead_session_ref
+                                .as_ref()
+                                .map(|reference| reference.id.as_str()),
+                            command.layout.preferred_live_panes,
+                        )
+                    })
+            } else {
+                None
+            }
+        };
+        let Some(applied) = applied else {
+            return Err(vibex_core::VibexError::validation(
+                "presentation_group_rejected",
+                "this window cannot build that group from the named sessions",
+            ));
+        };
+        let _ = session_projects;
+        // The revision is a content fingerprint of the arrangement, so the
+        // caller learns the exact revision it just produced instead of a
+        // counter this window happens to keep.
+        let mut revision_view = self.sidebar_organization_view();
+        sidebar_organization_revision(&mut revision_view);
+        let revision = revision_view.revision;
+        self.invalidate_sidebar_projection_cache();
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+
+        // Presenting is what actually switches the central column. It only
+        // happens when the user is already working in this team's workspace:
+        // an Agent must not move somebody else's window out from under them.
+        let mut state = PresentationState::Applied;
+        let mut reason = None;
+        let mut message = None;
+        if command.present {
+            let viewing_team = self
+                .selected_session_id
+                .as_ref()
+                .and_then(|session_id| session_workspaces.get(session_id.as_str()))
+                .is_some_and(|workspace| workspace == &workspace_id);
+            let may_present = viewing_team
+                || command.activation_policy == PresentationActivationPolicy::WhenUserReturns;
+            if viewing_team {
+                if let Some(lead) = applied.visible_session_refs.first()
+                    && let Ok(session_id) = VibexSessionId::parse(lead.id.clone())
+                {
+                    self.select_session(session_id, cx);
+                }
+                state = PresentationState::Presented;
+            } else if may_present {
+                state = PresentationState::Prepared;
+                message = Some(
+                    "the layout is ready; it will open the next time the user returns to this team"
+                        .to_string(),
+                );
+            } else {
+                state = PresentationState::Deferred;
+                reason = Some(VibexUseUnavailableReason::ForeignAuthority);
+                message = Some(
+                    "the user is working elsewhere; the group is laid out and can be opened on demand"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(GroupPresentationReply {
+            state,
+            revision,
+            reason,
+            message,
+            applied_layout: Some(applied),
+        })
+    }
+
+    /// Removes a group the runtime created, leaving its sessions alone.
+    fn dissolve_presented_group(
+        &mut self,
+        group_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, vibex_core::VibexError> {
+        if self.ui_state.sidebar.organization.group(group_id).is_none() {
+            return Ok(false);
+        }
+        let members = self
+            .ui_state
+            .sidebar
+            .organization
+            .group(group_id)
+            .map(|group| group.member_session_ids.clone())
+            .unwrap_or_default();
+        let removed = self.ui_state.sidebar.organization.delete_group(group_id);
+        self.release_group_session_views(&members);
+        self.invalidate_sidebar_projection_cache();
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
+        Ok(removed)
+    }
+
+    /// Makes sure the shell's own registry knows the sessions a group names.
+    fn register_group_member_sessions(&mut self, session_ids: &[String]) {
+        let missing: Vec<VibexSessionId> = session_ids
+            .iter()
+            .filter(|session_id| {
+                !self.delegated_sessions.contains_key(session_id.as_str())
+                    && !self
+                        .sessions
+                        .iter()
+                        .any(|session| session.id.as_str() == session_id.as_str())
+            })
+            .filter_map(|session_id| VibexSessionId::parse(session_id.clone()).ok())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        if let Ok(sessions) = runtime.vibex_use().group_member_registry(&missing) {
+            for session in sessions {
+                self.delegated_sessions
+                    .insert(session.id.as_str().to_string(), session);
+            }
+        }
+    }
+
+    /// The Worktree a group command targets.
+    fn workspace_id_for_group_command(&self, command: &GroupPresentationCommand) -> Option<String> {
+        let workspace_id = command.workspace_ref.id.clone();
+        self.workspaces
+            .iter()
+            .any(|(_, workspace)| workspace.id.as_str() == workspace_id)
+            .then_some(workspace_id)
     }
 
     /// The sidebar arrangement the embedded runtime's remote clients see.
@@ -10679,6 +11108,7 @@ impl VibexWorkbench {
         self.runtime = Some(runtime.clone());
         self.sync_timeline_display_settings_to_runtime();
         self.start_sidebar_organization_bridge(&runtime, cx);
+        self.start_session_group_presentation_bridge(&runtime, cx);
         let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
         self.shared_workflow = Some(AgentFileGitController::from_facade(&facade));
         self.shared_terminal = Some(TerminalWorkflowController::new(
@@ -12297,6 +12727,11 @@ impl VibexWorkbench {
                                 .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
                                 .collect();
                             this.sessions = sessions;
+                            // The delegated children are read after the root
+                            // list, from the runtime's ownership edges, so a
+                            // child that is not a navigation row still has a
+                            // registry entry and a tree node.
+                            this.refresh_delegated_sessions();
                             // The list is authoritative from here on: the
                             // restored pre-send queue can finally be told apart
                             // from messages whose session is gone. The rows also
@@ -13804,8 +14239,13 @@ impl VibexWorkbench {
     }
 
     /// Session -> owning Worktree, for validating group membership.
+    ///
+    /// Delegated children are included: they are not navigation rows, but a
+    /// group whose member is a child still has to pass the single-Worktree
+    /// check rather than being silently dropped.
     fn sidebar_session_workspaces(&self) -> BTreeMap<String, String> {
-        self.sessions
+        let mut workspaces: BTreeMap<String, String> = self
+            .sessions
             .iter()
             .map(|session| {
                 (
@@ -13813,7 +14253,464 @@ impl VibexWorkbench {
                     session.workspace_id.as_str().to_string(),
                 )
             })
-            .collect()
+            .collect();
+        for session in self.delegated_sessions.values() {
+            workspaces
+                .entry(session.id.as_str().to_string())
+                .or_insert_with(|| session.workspace_id.as_str().to_string());
+        }
+        workspaces
+    }
+
+    /// One session by id, whether it is a navigation root or a delegated child.
+    fn registered_session(&self, session_id: &str) -> Option<&AgentSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.id.as_str() == session_id)
+            .or_else(|| self.delegated_sessions.get(session_id))
+    }
+
+    /// Reloads the delegated ownership forest for the current root sessions.
+    ///
+    /// The tree is read from the runtime's ownership edges rather than from a
+    /// parent timeline card, so a child that arrived while its parent was not
+    /// on screen still appears.
+    fn refresh_delegated_sessions(&mut self) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let roots: Vec<VibexSessionId> = self
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        let Ok(nodes) = runtime.vibex_use().delegation_forest(&roots) else {
+            return;
+        };
+        let session_ids: Vec<VibexSessionId> = nodes
+            .iter()
+            .filter_map(|node| node.session_ref.session_id())
+            .collect();
+        let sessions = runtime
+            .vibex_use()
+            .group_member_registry(&session_ids)
+            .unwrap_or_default();
+        // A child that is deleted must not leave a stale tree node or a pane
+        // bound to a session the runtime no longer has.
+        let live: BTreeSet<String> = sessions
+            .iter()
+            .map(|session| session.id.as_str().to_string())
+            .collect();
+        self.delegated_sessions
+            .retain(|session_id, _| live.contains(session_id));
+        self.delegated_sessions = sessions
+            .into_iter()
+            .map(|session| (session.id.as_str().to_string(), session))
+            .collect();
+        self.delegated_tree = nodes
+            .into_iter()
+            .filter(|node| live.contains(&node.session_ref.id))
+            .map(|node| (node.session_ref.id.clone(), node))
+            .collect();
+    }
+
+    /// Opens the ancestor path of one delegated session so it is visible.
+    ///
+    /// It runs for an explicit locate — selecting a session from a result, the
+    /// search list or a pane — where the reader asked to be taken to the row.
+    /// A background delegation never calls it, so arriving work cannot pull a
+    /// branch open or steal the scroll position on its own.
+    fn reveal_delegated_session(&mut self, session_id: &str) {
+        if !self.delegated_tree.contains_key(session_id) {
+            return;
+        }
+        let mut current = self
+            .delegated_tree
+            .get(session_id)
+            .and_then(|node| node.parent_session_ref.as_ref())
+            .map(|parent| parent.id.clone());
+        let mut steps = 0;
+        while let Some(id) = current {
+            if steps > 32 {
+                break;
+            }
+            steps += 1;
+            if self.delegated_collapsed_ids.remove(&id) {
+                self.ui_state.sidebar.collapsed_delegated_session_ids =
+                    self.delegated_collapsed_ids.clone();
+                self.queue_ui_state();
+            }
+            current = self
+                .delegated_tree
+                .get(&id)
+                .and_then(|node| node.parent_session_ref.as_ref())
+                .map(|parent| parent.id.clone());
+        }
+    }
+
+    /// Toggles one ownership-tree branch without touching anything else.
+    fn toggle_delegated_branch(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if !self.delegated_collapsed_ids.remove(session_id) {
+            self.delegated_collapsed_ids.insert(session_id.to_string());
+        }
+        self.ui_state.sidebar.collapsed_delegated_session_ids =
+            self.delegated_collapsed_ids.clone();
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    /// Renders the delegated children of one session as an indented block.
+    ///
+    /// A collapsed branch still reports how much of its subtree is running or
+    /// waiting, because a pending permission request must not become invisible
+    /// just because the user closed the disclosure it sits under.
+    fn render_delegated_subtree(
+        &mut self,
+        parent_session_id: &str,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        if depth > 8 {
+            return Vec::new();
+        }
+        let children: Vec<SessionTreeNode> = self
+            .delegated_children(parent_session_id)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut elements = Vec::new();
+        for node in children {
+            // A child that is already shown as a group member is not drawn a
+            // second time under its parent: one navigation branch, one row.
+            if self.delegated_node_is_group_member(&node.session_ref.id) {
+                continue;
+            }
+            let grandchildren = self.delegated_children(&node.session_ref.id);
+            let has_children = !grandchildren.is_empty();
+            let collapsed = self.delegated_collapsed_ids.contains(&node.session_ref.id);
+            elements.push(self.render_delegated_session_row(
+                &node,
+                depth,
+                has_children,
+                collapsed,
+                cx,
+            ));
+            if has_children && !collapsed {
+                elements.extend(self.render_delegated_subtree(&node.session_ref.id, depth + 1, cx));
+            }
+        }
+        elements
+    }
+
+    /// Whether a delegated child is currently displayed inside a group row.
+    fn delegated_node_is_group_member(&self, session_id: &str) -> bool {
+        self.ui_state
+            .sidebar
+            .organization
+            .groups
+            .values()
+            .any(|group| group.contains(session_id))
+    }
+
+    /// One row of the ownership tree.
+    ///
+    /// It shows who created this session, which Agent is running it, what it is
+    /// working on and whether it needs the user — the four questions a collapsed
+    /// team otherwise hides.
+    fn render_delegated_session_row(
+        &mut self,
+        node: &SessionTreeNode,
+        depth: usize,
+        has_children: bool,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session_id = node.session_ref.id.clone();
+        let selected = self
+            .selected_session_id
+            .as_ref()
+            .is_some_and(|selected| selected.as_str() == session_id);
+        let status = delegation_node_status(node);
+        let summary = if collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
+        {
+            Some(locale::text(
+                "descendants running or waiting",
+                "后代运行或等待中",
+                "後代執行或等待中",
+            ))
+        } else {
+            None
+        };
+        let indent = SIDEBAR_FOLDER_CHILD_INDENT * (depth as f32 + 1.0);
+        let entity = cx.weak_entity();
+        let toggle_entity = entity.clone();
+        let click_session = VibexSessionId::parse(session_id.clone()).ok();
+        let toggle_session_id = session_id.clone();
+        // A row carries a stable focus handle so the tree can be walked with the
+        // keyboard: standard disclosure semantics, and focus is visible
+        // separately from selection.
+        let focus_handle = self
+            .delegated_row_focus
+            .entry(session_id.clone())
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        let key_entity = entity.clone();
+        let row = div()
+            .id(ElementId::Name(
+                format!("sidebar-delegated-{session_id}").into(),
+            ))
+            .relative()
+            .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+            .min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+            .w_full()
+            .min_w_0()
+            .pl(px(indent))
+            .rounded(px(8.0))
+            .track_focus(&focus_handle)
+            .tab_index(0)
+            .on_key_down(move |event, _, cx| {
+                let key = event.keystroke.key.as_str();
+                if !matches!(key, "left" | "right" | "up" | "down") {
+                    return;
+                }
+                cx.stop_propagation();
+                let _ = key_entity.update(cx, |this, cx| {
+                    this.delegated_tree_key(key, cx);
+                });
+            })
+            .when(selected, |this| {
+                this.border_1().border_color(cx.theme().border)
+            })
+            .when(selected, |this| {
+                this.bg(sidebar_selected_session_background(
+                    cx.theme().sidebar_accent,
+                    cx.theme().is_dark(),
+                ))
+            })
+            .map(|row| {
+                let tone = theme::hover_wash(cx.theme().is_dark());
+                row.hover(move |style| style.bg(tone))
+            })
+            .cursor_pointer()
+            .on_click({
+                let focus_handle = focus_handle.clone();
+                move |_, window, cx| {
+                    // Clicking a row puts the keyboard on it, which is what
+                    // makes the arrow keys walk the tree from there.
+                    window.focus(&focus_handle, cx);
+                    let Some(session_id) = click_session.clone() else {
+                        return;
+                    };
+                    let _ = entity.update(cx, |this, cx| {
+                        this.select_session(session_id, cx);
+                    });
+                }
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(6.0))
+                    .items_center()
+                    .child(delegated_tree_guide_line(cx))
+                    .when(has_children, |this| {
+                        let toggle_entity = toggle_entity.clone();
+                        let toggle_id = toggle_session_id.clone();
+                        this.child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("sidebar-delegated-toggle-{session_id}").into(),
+                                ))
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .aria_expanded(!collapsed)
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let _ = toggle_entity.update(cx, |this, cx| {
+                                        this.toggle_delegated_branch(&toggle_id, cx);
+                                    });
+                                })
+                                .child(sidebar_icon(if collapsed {
+                                    "icons/vibex/chevrons-right.svg"
+                                } else {
+                                    "icons/vibex/chevrons-down-up.svg"
+                                })),
+                        )
+                    })
+                    .when(!has_children, |this| this.child(div().w(px(14.0))))
+                    .child(sidebar_agent_logo(
+                        node.agent_id
+                            .as_ref()
+                            .map(AgentId::as_str)
+                            .unwrap_or("agent"),
+                        selected,
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div().truncate().text_size(px(12.0)).child(
+                                    node.task_title
+                                        .clone()
+                                        .unwrap_or_else(|| node.title.clone()),
+                                ),
+                            )
+                            .when_some(node.agent_label.clone(), |this, label| {
+                                this.child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(10.0))
+                                        .opacity(0.6)
+                                        .child(label),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .when(status.attention || node.blocked_descendants > 0, |this| {
+                                this.text_color(cx.theme().warning)
+                            })
+                            .when(!status.attention && node.blocked_descendants == 0, |this| {
+                                this.opacity(0.75)
+                            })
+                            .child(summary.unwrap_or(status.text)),
+                    ),
+            );
+        row.into_any_element()
+    }
+
+    /// The ownership tree in the order the sidebar draws it.
+    ///
+    /// Depth-first, children after their parent, skipping what a collapsed
+    /// branch hides — the same walk the renderer performs, so "the next visible
+    /// node" means the next row the reader can actually see.
+    fn delegated_visible_order(&self) -> Vec<(String, usize)> {
+        let mut ordered = Vec::new();
+        for root in &self.sessions {
+            self.push_delegated_visible(root.id.as_str(), 0, &mut ordered);
+        }
+        ordered
+    }
+
+    fn push_delegated_visible(
+        &self,
+        parent_session_id: &str,
+        depth: usize,
+        ordered: &mut Vec<(String, usize)>,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for node in self.delegated_children(parent_session_id) {
+            let session_id = node.session_ref.id.clone();
+            ordered.push((session_id.clone(), depth));
+            if !self.delegated_collapsed_ids.contains(&session_id) {
+                self.push_delegated_visible(&session_id, depth + 1, ordered);
+            }
+        }
+    }
+
+    /// Moves the ownership-tree cursor by one row.
+    fn move_delegated_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let ordered = self.delegated_visible_order();
+        if ordered.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string())
+            .and_then(|session_id| {
+                ordered
+                    .iter()
+                    .position(|(candidate, _)| candidate == &session_id)
+            });
+        let next = match (current, delta.is_negative()) {
+            (Some(index), true) => index.saturating_sub(1),
+            (Some(index), false) => (index + 1).min(ordered.len() - 1),
+            (None, true) => ordered.len() - 1,
+            (None, false) => 0,
+        };
+        if let Ok(session_id) = VibexSessionId::parse(ordered[next].0.clone()) {
+            self.select_session(session_id, cx);
+        }
+    }
+
+    /// Applies one arrow key to the ownership tree.
+    ///
+    /// The semantics are the standard disclosure-tree ones: left closes an open
+    /// branch and otherwise steps to the parent, right opens a closed branch and
+    /// otherwise steps into it, up and down walk the visible rows.
+    fn delegated_tree_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(session_id) = self
+            .selected_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string())
+        else {
+            return;
+        };
+        if !self.delegated_tree.contains_key(&session_id) {
+            return;
+        }
+        let has_children = !self.delegated_children(&session_id).is_empty();
+        let collapsed = self.delegated_collapsed_ids.contains(&session_id);
+        match key {
+            "left" => {
+                if has_children && !collapsed {
+                    self.toggle_delegated_branch(&session_id, cx);
+                } else if let Some(parent) = self
+                    .delegated_tree
+                    .get(&session_id)
+                    .and_then(|node| node.parent_session_ref.as_ref())
+                    .map(|parent| parent.id.clone())
+                    && let Ok(parent_id) = VibexSessionId::parse(parent)
+                {
+                    self.select_session(parent_id, cx);
+                }
+            }
+            "right" => {
+                if has_children && collapsed {
+                    self.toggle_delegated_branch(&session_id, cx);
+                } else if let Some(first) = self
+                    .delegated_children(&session_id)
+                    .first()
+                    .map(|node| node.session_ref.id.clone())
+                    && let Ok(child_id) = VibexSessionId::parse(first)
+                {
+                    self.select_session(child_id, cx);
+                }
+            }
+            "up" => self.move_delegated_selection(-1, cx),
+            "down" => self.move_delegated_selection(1, cx),
+            _ => {}
+        }
+    }
+
+    /// Delegated children of one session, in creation order.
+    fn delegated_children(&self, parent_session_id: &str) -> Vec<&SessionTreeNode> {
+        let mut children: Vec<&SessionTreeNode> = self
+            .delegated_tree
+            .values()
+            .filter(|node| {
+                node.parent_session_ref
+                    .as_ref()
+                    .is_some_and(|parent| parent.id == parent_session_id)
+            })
+            .collect();
+        children.sort_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| left.session_ref.id.cmp(&right.session_ref.id))
+        });
+        children
     }
 
     /// Group ids of one project, in sidebar order.
@@ -13957,6 +14854,11 @@ impl VibexWorkbench {
     fn sidebar_session_projects(&self) -> BTreeMap<String, String> {
         let mut projects = self.sidebar_session_project_scopes();
         for session in &self.sessions {
+            projects
+                .entry(session.id.as_str().to_string())
+                .or_insert_with(|| session.project_id.as_str().to_string());
+        }
+        for session in self.delegated_sessions.values() {
             projects
                 .entry(session.id.as_str().to_string())
                 .or_insert_with(|| session.project_id.as_str().to_string());
@@ -14700,6 +15602,8 @@ impl VibexWorkbench {
                         attachments: Vec::new(),
                         correlation_id: None,
                         delivery: UserMessageDelivery::Prompt,
+                        prompt_context: None,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
                     })
                     .with_idempotency_key(format!(
                         "worktree-assistance-context:{}",
@@ -17789,6 +18693,12 @@ impl VibexWorkbench {
 
     fn select_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
         self.dismiss_sidebar_for_navigation();
+        // Selecting a delegated session from anywhere — a result, search, a
+        // pane, a notification — reveals it in the ownership tree. A branch the
+        // user closed stays closed until they open it, but a branch that only
+        // happens to be closed because it was never touched must not hide the
+        // session that was just asked for.
+        self.reveal_delegated_session(session_id.as_str());
         let primary_tab_changed = self.ui_state.workbench.active_tab != "agent";
         if primary_tab_changed {
             self.sync_current_navigation_entry();
@@ -21319,6 +22229,22 @@ impl VibexWorkbench {
         };
         let range = character_offset_to_byte(&value, trigger.character_range.start)
             ..character_offset_to_byte(&value, trigger.character_range.end);
+        if let Some((agent_id, selection_ref)) = delegate_now_entry(&entry) {
+            // The direct entry does not insert anything: the draft becomes the
+            // task, minus the trigger the reader was typing. Removing the
+            // trigger first is what keeps the task text exactly what they wrote.
+            input.update(cx, |input, cx| {
+                let value = input.value().to_string();
+                let mut trimmed = String::with_capacity(value.len());
+                trimmed.push_str(&value[..range.start]);
+                trimmed.push_str(value[range.end..].trim_start());
+                input.set_value(trimmed, window, cx);
+                input.focus(window, cx);
+            });
+            self.clear_suggestions();
+            self.start_immediate_delegation(agent_id, selection_ref, window, cx);
+            return;
+        }
         input.update(cx, |input, cx| {
             replace_composer_trigger(input, &entry, range, window, cx);
             input.focus(window, cx);
@@ -21901,6 +22827,7 @@ impl VibexWorkbench {
             allow_manual_provider_slash,
         );
         self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
+        let mentions = composer_input.read(cx).tokens().to_vec();
         let message = ComposerQueueMessage {
             id: self.composer_queue_serial,
             session_id,
@@ -21909,6 +22836,7 @@ impl VibexWorkbench {
             attachments,
             command_invocation,
             scheduled_at_ms,
+            mentions: composer_mentions(&mentions),
         };
         // Clear the captured draft before queueing or dispatch so completion can
         // never erase text the user typed for a later message.
@@ -21958,6 +22886,17 @@ impl VibexWorkbench {
             }
         };
         self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
+        let mentions = composer_input.read(cx).tokens().to_vec();
+        let mentions = composer_mentions(&mentions);
+        if let Some(stale) =
+            stale_composer_mention(&mentions, self.runtime_catalog.as_deref(), |session_id| {
+                self.registered_session(session_id).is_some()
+            })
+        {
+            self.agent_error = Some(stale);
+            cx.notify();
+            return None;
+        }
         let message = ComposerQueueMessage {
             id: self.composer_queue_serial,
             session_id,
@@ -21966,6 +22905,9 @@ impl VibexWorkbench {
             attachments,
             command_invocation: None,
             scheduled_at_ms,
+            // A remote client's mentions travel the same way; the authority is
+            // what resolves them.
+            mentions,
         };
         composer_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_attachments.clear();
@@ -21983,6 +22925,140 @@ impl VibexWorkbench {
     /// Remote twin of the composer dispatch: optimistic message plus a
     /// single `send_message` RPC. Durable-submission locators and command
     /// execution stay authority-local; live updates arrive through events.
+    /// Starts a delegation straight from the composer.
+    ///
+    /// This is the user's direct entry: it does not ask the main Agent to
+    /// delegate, and it does not depend on the main Agent following a prompt.
+    /// It calls the same domain service the Agent tools call, so the task it
+    /// creates is the same kind of record, with the same scope, idempotency and
+    /// budget rules. The current session is the parent, because that is who the
+    /// user is asking from.
+    fn start_immediate_delegation(
+        &mut self,
+        agent_id: String,
+        selection_ref: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.runtime.clone() else {
+            self.agent_error = Some(
+                locale::text(
+                    "Delegation needs the local runtime",
+                    "立即委派需要本地 Runtime",
+                    "立即委派需要本地 Runtime",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(session_id) = self.view_session_id.clone() else {
+            return;
+        };
+        let composer_input = self.ensure_composer_input(window, cx);
+        let raw_text = composer_input.read(cx).value().to_string();
+        let (prompt, _) = composer_submission_payload(&raw_text, &self.composer_attachments);
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            self.agent_error = Some(
+                locale::text(
+                    "Write the task before delegating it",
+                    "请先写下要委派的任务",
+                    "請先寫下要委派的任務",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let title: String = prompt
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(vibex_core::VIBEX_USE_TITLE_CHARS)
+            .collect();
+        // The key is derived from what the user asked for, so a double-click or a
+        // retry after a lost reply resolves to the same task instead of starting
+        // a second one.
+        let idempotency_key = format!(
+            "composer-delegate:{}:{}",
+            session_id.as_str(),
+            vibex_desktop_runtime::fingerprint_of(&[
+                agent_id.as_str(),
+                selection_ref.as_str(),
+                prompt.as_str()
+            ])
+        );
+        let arguments = serde_json::json!({
+            "idempotencyKey": idempotency_key,
+            "task": {
+                "title": title,
+                "prompt": prompt,
+                "completionPolicy": "owner_review"
+            },
+            "target": { "selectionRef": selection_ref },
+            "session": { "kind": "new" }
+        });
+        let actor = vibex_core::VibexUseActor::new(
+            runtime.vibex_use().authority(),
+            session_id.clone(),
+            runtime.vibex_use().activation_revision(),
+        );
+        let service = runtime.vibex_use();
+        let host: Arc<dyn vibex_core::VibexUseToolHost> = service.clone();
+        let weak = cx.weak_entity();
+        cx.spawn_in(window, async move |_entity, cx| {
+            let outcome = host
+                .call(actor, vibex_core::VibexUseTool::Delegate, arguments)
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                match outcome {
+                    Ok(_) => {
+                        // The draft became a task; the composer is consumed.
+                        let input = this.ensure_composer_input(window, cx);
+                        input.update(cx, |input, cx| input.set_value("", window, cx));
+                        this.composer_attachments.clear();
+                        this.composer_command_entry = None;
+                        this.agent_error = None;
+                        this.clear_suggestions();
+                        this.refresh_delegated_sessions();
+                        this.reconcile_sidebar_state();
+                        this.publish_sidebar_invalidation();
+                    }
+                    Err(error) => {
+                        // The draft is left untouched: a refused delegation is
+                        // something the reader fixes, not something a send eats.
+                        this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The provider-only preamble for one composer message.
+    ///
+    /// A `@` reference is an instruction to the main Agent, not a task
+    /// assignment: the note names the target and the tool that reaches it, and
+    /// the call that follows is re-authorized on its own. It is never shown in
+    /// the timeline, never used for the session title, and never indexed.
+    fn composer_prompt_context(
+        &self,
+        mentions: &[VibexUseMention],
+        session_id: &VibexSessionId,
+    ) -> Option<String> {
+        let mut note = vibex_core::vibex_use_route_note(mentions)?;
+        if let Some(session) = self.registered_session(session_id.as_str()) {
+            note.push_str(&format!(
+                "\nWork inside this workspace and keep to the files it covers: {}",
+                session.workspace_root
+            ));
+        }
+        Some(note)
+    }
+
     fn dispatch_composer_message_remote(
         &mut self,
         message: ComposerQueueMessage,
@@ -21997,10 +23073,12 @@ impl VibexWorkbench {
             desired_runtime: selection,
             text,
             attachments,
+            mentions,
             ..
         } = message;
         self.notification_suppressed_session_ids
             .remove(session_id.as_str());
+        let prompt_context = self.composer_prompt_context(&mentions, &session_id);
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
         let idempotency_key = format!(
@@ -22040,6 +23118,9 @@ impl VibexWorkbench {
                     reasoning_effort: None,
                     correlation_id: None,
                     delivery,
+                    prompt_context,
+                    // A person typed this in the composer.
+                    provenance: vibex_core::MessageProvenance::HumanInput,
                 }))
                 .await
                 .map(|_| ());
@@ -22170,11 +23251,16 @@ impl VibexWorkbench {
             text,
             attachments,
             command_invocation,
+            mentions,
             ..
         } = message;
         self.notification_suppressed_session_ids
             .remove(session_id.as_str());
         let is_command = command_invocation.is_some();
+        // The routing note is built at the send boundary from the references
+        // the user actually picked, and it rides the prompt rather than the
+        // user's message, so the transcript keeps only their own words.
+        let prompt_context = self.composer_prompt_context(&mentions, &session_id);
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
         let idempotency_key = format!(
@@ -22254,6 +23340,8 @@ impl VibexWorkbench {
                         reasoning_effort,
                         correlation_id: None,
                         delivery,
+                        prompt_context,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
                     })
                     .await
                     .map(|_| ())
@@ -26887,6 +27975,8 @@ impl VibexWorkbench {
                                 reasoning_effort,
                                 correlation_id: None,
                                 delivery: UserMessageDelivery::Prompt,
+                                prompt_context: None,
+                                provenance: vibex_core::MessageProvenance::HumanInput,
                             },
                         }))
                         .await
@@ -28008,6 +29098,9 @@ impl VibexWorkbench {
                 attachments: attachments.clone(),
                 command_invocation: command_invocation.clone(),
                 scheduled_at_ms: Some(at_ms),
+                // This path opens a brand-new session; its document was already
+                // consumed into the message that is being dispatched.
+                mentions: Vec::new(),
             });
             self.start_message_schedule_timer(window, cx);
             self.publish_sidebar_invalidation();
@@ -28164,6 +29257,8 @@ impl VibexWorkbench {
                                 reasoning_effort: desired_runtime.reasoning_effort.clone(),
                                 correlation_id: None,
                                 delivery: UserMessageDelivery::Prompt,
+                                prompt_context: None,
+                                provenance: vibex_core::MessageProvenance::HumanInput,
                             })
                             .with_idempotency_key(format!(
                                 "gpui:new-session:message:{}",
@@ -36683,6 +37778,27 @@ impl VibexWorkbench {
                     if let Some(index) = session_indices.get(session_id.as_str()) {
                         run.push(*index);
                     }
+                    // The delegated subtree hangs off the row that created it.
+                    // The run is flushed first so the child block lands in
+                    // reading order instead of after the next unrelated band.
+                    let children = self.render_delegated_subtree(&session_id, 0, cx);
+                    if !children.is_empty() {
+                        push_sidebar_session_run(
+                            &mut elements,
+                            &mut run,
+                            &entity,
+                            groups,
+                            project_index,
+                            Some(workspace_index),
+                            &project_id,
+                            reorder_enabled,
+                            false,
+                            rename_target.as_deref(),
+                            selected_session.as_deref(),
+                            strings,
+                        );
+                        elements.extend(children);
+                    }
                 }
                 SidebarOrganizationItem::Project(_) => {}
             }
@@ -36959,7 +38075,8 @@ impl VibexWorkbench {
                                     .text_sm()
                                     .font_medium()
                                     .child(group.name.clone()),
-                            ),
+                            )
+                            .children(self.render_session_group_team_status(group, cx)),
                     )
                     .child(
                         h_flex().flex_none().gap_1().child(
@@ -36981,6 +38098,62 @@ impl VibexWorkbench {
             )
             .child(div().flex_1().min_h_0().min_w_0().child(pane_tree))
             .into_any_element()
+    }
+
+    /// The counts a team header shows: running, waiting for the user, done.
+    ///
+    /// It is built from the authoritative task phases of the group's own
+    /// members, so a pane that is merely streaming tokens does not inflate
+    /// "running" and a request waiting in a hidden tab is never invisible.
+    fn render_session_group_team_status(
+        &self,
+        group: &SessionGroupUiState,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut running = 0usize;
+        let mut waiting = 0usize;
+        let mut finished = 0usize;
+        for session_id in &group.member_session_ids {
+            let Some(node) = self.delegated_tree.get(session_id) else {
+                continue;
+            };
+            if node.blocked_on.is_some() {
+                waiting += 1;
+                continue;
+            }
+            match node.task_phase {
+                Some(vibex_core::DelegationTaskPhase::Queued)
+                | Some(vibex_core::DelegationTaskPhase::Starting)
+                | Some(vibex_core::DelegationTaskPhase::Active)
+                | Some(vibex_core::DelegationTaskPhase::Cancelling) => running += 1,
+                Some(vibex_core::DelegationTaskPhase::AwaitingReview) => finished += 1,
+                Some(vibex_core::DelegationTaskPhase::Completed)
+                | Some(vibex_core::DelegationTaskPhase::Failed)
+                | Some(vibex_core::DelegationTaskPhase::Cancelled) => finished += 1,
+                None => {}
+            }
+        }
+        let mut elements = Vec::new();
+        let chip = |count: usize, key: &str, tone: Hsla, cx: &App| -> Option<AnyElement> {
+            (count > 0).then(|| {
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(div().size(px(6.0)).rounded_full().bg(tone))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{count} {key}")),
+                    )
+                    .into_any_element()
+            })
+        };
+        elements.extend(chip(running, "running", cx.theme().success, cx));
+        elements.extend(chip(waiting, "waiting", cx.theme().warning, cx));
+        elements.extend(chip(finished, "done", cx.theme().muted_foreground, cx));
+        elements
     }
 
     /// The cached view that renders one group pane.
@@ -37115,10 +38288,7 @@ impl VibexWorkbench {
             .session_ids
             .iter()
             .filter_map(|session_id| {
-                let session = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.id.as_str() == session_id)?;
+                let session = self.registered_session(session_id)?;
                 // The tab shows the Agent the session's view runs, so a session
                 // whose runtime the user switched does not fall back to the
                 // Agent it was created with.
@@ -37595,11 +38765,7 @@ impl VibexWorkbench {
         let Ok(pane_session_id) = VibexSessionId::parse(session_id).ok().ok_or(()) else {
             return Empty.into_any_element();
         };
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.id == pane_session_id)
-        {
+        if self.registered_session(pane_session_id.as_str()).is_none() {
             return Empty.into_any_element();
         }
         // A pane renders its own session's view, full stop. Focus only decides
@@ -48122,6 +49288,23 @@ impl VibexWorkbench {
         });
         let toggle_delegation = delegation.clone();
         let title_session_id = child_session_id.clone();
+        // When the child is shown in a team split, the card's job is to take the
+        // reader to that pane — not to open a second, read-only copy of the same
+        // conversation in the right rail. Focus only moves the keyboard; the
+        // pane keeps running either way.
+        let group_pane = self
+            .ui_state
+            .sidebar
+            .organization
+            .group_of_session(child_session_id.as_str())
+            .map(str::to_string)
+            .filter(|group_id| {
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .group(group_id)
+                    .is_some_and(|group| group.member_count() > 1)
+            });
         let mut header = h_flex()
             .w_full()
             .min_w_0()
@@ -48198,8 +49381,28 @@ impl VibexWorkbench {
                     .child(format!("+{hidden_count} more...")),
             );
         }
-        details = details.child(
-            Button::new(format!("{card_id}:open"))
+        details = details.child(match group_pane {
+            Some(_) => Button::new(format!("{card_id}:locate"))
+                .small()
+                .ghost()
+                .compact()
+                .icon(sidebar_icon("icons/vibex/layers.svg"))
+                .label(locale::text(
+                    "Show in the team",
+                    "在团队中查看",
+                    "在團隊中查看",
+                ))
+                .tooltip(locale::text(
+                    "Focus this session's pane in the team split",
+                    "在团队分屏中定位这个会话的窗格",
+                    "在團隊分屏中定位這個會話的窗格",
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let session_id = title_session_id.clone();
+                    this.select_session(session_id, cx);
+                }))
+                .into_any_element(),
+            None => Button::new(format!("{card_id}:open"))
                 .small()
                 .ghost()
                 .compact()
@@ -48216,8 +49419,9 @@ impl VibexWorkbench {
                 ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.open_child_agent_timeline(title_session_id.clone(), cx)
-                })),
-        );
+                }))
+                .into_any_element(),
+        });
         h_flex()
             .id(card_id)
             .w_full()
@@ -60134,6 +61338,91 @@ fn sidebar_project_uses_detailed_hierarchy(
         })
 }
 
+/// How one node of the ownership tree reads at a glance.
+struct DelegatedNodeStatus {
+    text: &'static str,
+    /// Whether the row should draw attention (a request is waiting for the
+    /// user, or the task failed).
+    attention: bool,
+}
+
+/// Maps a task's phase and blocking onto the wording the sidebar shows.
+///
+/// The wording is deliberately the same as the delegation card's, so a child
+/// row and its parent's card never describe the same task differently.
+fn delegation_node_status(node: &SessionTreeNode) -> DelegatedNodeStatus {
+    if let Some(blocked) = node.blocked_on.as_ref() {
+        return match blocked {
+            vibex_core::DelegationBlockedOn::Permission { .. } => DelegatedNodeStatus {
+                text: locale::text("Waiting for you", "等待你授权", "等待你授權"),
+                attention: true,
+            },
+            vibex_core::DelegationBlockedOn::Question { .. } => DelegatedNodeStatus {
+                text: locale::text("Waiting for you", "等待你回答", "等待你回答"),
+                attention: true,
+            },
+            vibex_core::DelegationBlockedOn::PlanApproval { .. } => DelegatedNodeStatus {
+                text: locale::text("Waiting for you", "等待你确认", "等待你確認"),
+                attention: true,
+            },
+            vibex_core::DelegationBlockedOn::Configuration { .. }
+            | vibex_core::DelegationBlockedOn::Resource { .. } => DelegatedNodeStatus {
+                text: locale::text("Waiting", "等待中", "等待中"),
+                attention: false,
+            },
+        };
+    }
+    match node.task_phase {
+        Some(vibex_core::DelegationTaskPhase::Queued)
+        | Some(vibex_core::DelegationTaskPhase::Starting) => DelegatedNodeStatus {
+            text: locale::text("Preparing", "准备中", "準備中"),
+            attention: false,
+        },
+        Some(vibex_core::DelegationTaskPhase::Active) => DelegatedNodeStatus {
+            text: locale::text("Working", "处理中", "處理中"),
+            attention: false,
+        },
+        Some(vibex_core::DelegationTaskPhase::AwaitingReview) => DelegatedNodeStatus {
+            text: locale::text("Awaiting review", "等待审阅", "等待審閱"),
+            attention: false,
+        },
+        Some(vibex_core::DelegationTaskPhase::Cancelling) => DelegatedNodeStatus {
+            text: locale::text("Stopping", "正在停止", "正在停止"),
+            attention: false,
+        },
+        Some(vibex_core::DelegationTaskPhase::Completed) => DelegatedNodeStatus {
+            text: locale::text("Finished", "已完成", "已完成"),
+            attention: false,
+        },
+        Some(vibex_core::DelegationTaskPhase::Failed) => DelegatedNodeStatus {
+            text: locale::text("Failed", "失败", "失敗"),
+            attention: true,
+        },
+        Some(vibex_core::DelegationTaskPhase::Cancelled) => DelegatedNodeStatus {
+            text: locale::text("Cancelled", "已取消", "已取消"),
+            attention: false,
+        },
+        None => DelegatedNodeStatus {
+            text: locale::text("Idle", "空闲", "空閒"),
+            attention: false,
+        },
+    }
+}
+
+/// The thin connector that shows a delegated row belongs to the row above it.
+///
+/// It is a real element rather than padding so the line can stop at the last
+/// child of a branch instead of running past unrelated rows.
+fn delegated_tree_guide_line(cx: &App) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(6.0))
+        .h(px(SIDEBAR_SESSION_ROW_HEIGHT - 12.0))
+        .border_l_1()
+        .border_color(cx.theme().border)
+        .into_any_element()
+}
+
 fn sidebar_selected_session_background(accent: Hsla, is_dark: bool) -> Hsla {
     if is_dark {
         accent.lighten(0.24)
@@ -60500,7 +61789,90 @@ fn composer_token_for_entry(entry: &AgentCommandEntry) -> Option<InlineToken> {
     if !matches!(characters.next(), Some('/' | '@' | '$')) || characters.any(char::is_whitespace) {
         return None;
     }
-    Some(InlineToken::new(entry.id.clone(), text).with_label(entry.label.clone()))
+    // A collaborator or conversation reference carries its typed identity in the
+    // token rather than in a side table: the token survives a draft, a copy and
+    // a paste, and the send boundary reads the same reference back out.
+    let id = match composer_entry_mention(entry) {
+        Some(mention) => mention.encode(),
+        None => entry.id.clone(),
+    };
+    Some(InlineToken::new(id, text).with_label(entry.label.clone()))
+}
+
+/// The typed `@` reference behind one suggestion entry, when it has one.
+fn composer_entry_mention(entry: &AgentCommandEntry) -> Option<VibexUseMention> {
+    let metadata = |key: &str| {
+        entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == key)
+            .map(|metadata| metadata.value.as_str())
+    };
+    if let (Some(agent_id), Some(option)) = (
+        metadata(vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY),
+        metadata(vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY),
+    ) {
+        let agent_id = AgentId::parse(agent_id).ok()?;
+        let option = vibex_core::VibexUseRef::parse(option)?;
+        return Some(VibexUseMention::agent(
+            &agent_id,
+            &option,
+            Some(entry.label.as_str()),
+        ));
+    }
+    if let Some(session) = metadata(vibex_desktop_runtime::COMPOSER_SESSION_REFERENCE_KEY) {
+        let reference = vibex_core::VibexUseRef::parse(session)?;
+        let session_id = reference.session_id()?;
+        return Some(VibexUseMention::session(
+            &session_id,
+            Some(entry.label.as_str()),
+        ));
+    }
+    None
+}
+
+/// Rejects a send whose `@` references no longer resolve.
+///
+/// A suggestion is offered from one catalogue snapshot; by the time the message
+/// is sent the target may have been disabled or signed out. Sending anyway
+/// would put a route in the prompt that the Agent cannot act on, so the send
+/// stops and says which reference went stale.
+fn stale_composer_mention(
+    mentions: &[VibexUseMention],
+    catalog: Option<&SessionRuntimeOptionCatalog>,
+    known_session: impl Fn(&str) -> bool,
+) -> Option<String> {
+    for mention in mentions {
+        match mention.kind {
+            vibex_core::VibexUseMentionKind::Agent => {
+                let available = catalog.is_some_and(|catalog| {
+                    catalog.options.iter().any(|option| {
+                        runtime_option_ref(option) == mention.reference.as_uri()
+                            && option.availability
+                                == vibex_core::RuntimeOptionAvailability::Available
+                    })
+                });
+                if !available {
+                    return Some(format!(
+                        "{} is no longer available with that configuration; pick it again",
+                        mention.label.as_deref().unwrap_or("that collaborator")
+                    ));
+                }
+            }
+            vibex_core::VibexUseMentionKind::Session => {
+                let Some(session_id) = mention.reference.session_id() else {
+                    return Some("a conversation reference is no longer valid".to_string());
+                };
+                if !known_session(session_id.as_str()) {
+                    return Some(format!(
+                        "{} is no longer open; pick another conversation",
+                        mention.label.as_deref().unwrap_or("that conversation")
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The workspace path a composer token points at, when it points at a file.
@@ -60544,6 +61916,22 @@ fn replace_composer_trigger(
     input.replace_all(replacement, window, cx);
     let cursor = range.start + entry.insertion_text.len();
     input.set_selected_range(cursor..cursor, cx);
+}
+
+/// Reads the direct-delegation action out of one suggestion entry.
+fn delegate_now_entry(entry: &AgentCommandEntry) -> Option<(String, String)> {
+    let metadata = |key: &str| {
+        entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == key)
+            .map(|metadata| metadata.value.clone())
+    };
+    metadata(vibex_desktop_runtime::COMPOSER_DELEGATE_NOW_KEY)?;
+    Some((
+        metadata(vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY)?,
+        metadata(vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY)?,
+    ))
 }
 
 fn parse_slash_command_invocation(text: &str) -> Option<(String, Option<String>)> {
@@ -60710,6 +62098,33 @@ fn composer_attachment_bounds_are_visible(
     bounds.intersects(&input_bounds)
         && bounds.top() >= input_bounds.top()
         && bounds.bottom() <= input_bounds.bottom()
+}
+
+/// The `@` references one composer document carries, in reading order.
+///
+/// The token id is the typed mention itself, so a mention restored from a draft
+/// (or pasted in from another window) still names the same collaborator and the
+/// same configuration. Duplicates collapse: typing `@Codex` twice asks once.
+fn composer_mentions(tokens: &[InlineTokenSpan]) -> Vec<VibexUseMention> {
+    let mut mentions: Vec<VibexUseMention> = Vec::new();
+    for span in tokens {
+        let Some(mention) = VibexUseMention::parse(span.token().id().as_ref()) else {
+            continue;
+        };
+        if mentions.iter().any(|existing| existing == &mention) {
+            continue;
+        }
+        // A last label wins: the token carries the name the user saw, and a
+        // draft that was saved before the Agent was renamed should read with
+        // the current name.
+        let mut mention = mention;
+        mention.label = Some(span.token().label().to_string());
+        mentions.push(mention);
+        if mentions.len() >= VIBEX_USE_MAX_MENTIONS {
+            break;
+        }
+    }
+    mentions
 }
 
 fn composer_submission_payload(
@@ -84798,6 +86213,7 @@ mod tests {
             attachments: Vec::new(),
             command_invocation: None,
             scheduled_at_ms: None,
+            mentions: Vec::new(),
         };
         let mut queue = vec![
             queued(1, "session_queue_a"),

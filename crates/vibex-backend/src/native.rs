@@ -613,6 +613,7 @@ impl AgentBackend for NativeBackend {
                 &runtime.agent(),
                 &runtime.files(),
                 &runtime.providers(),
+                Some(&runtime.vibex_use()),
                 request,
             )
             .await

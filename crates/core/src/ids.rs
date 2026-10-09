@@ -135,6 +135,11 @@ vibex_id!(NativeStateHomeId, "statehome");
 vibex_id!(MessageSubmissionId, "submission");
 vibex_id!(AgentDelegationId, "delegation");
 vibex_id!(UsageExecutionId, "usage_execution");
+// Vibex-use product identities. A delegated task keeps its historical
+// `delegation_*` id; only the execution, operation and group namespaces are new.
+vibex_id!(VibexExecutionId, "execution");
+vibex_id!(VibexOperationId, "operation");
+vibex_id!(SessionGroupId, "group");
 
 impl UsageExecutionId {
     pub fn from_message_submission(submission_id: &MessageSubmissionId) -> Self {

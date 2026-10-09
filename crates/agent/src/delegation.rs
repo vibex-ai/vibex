@@ -16,8 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use vibex_core::{
     AgentDelegation, AgentDelegationId, AgentDelegationStatus, AgentId,
-    CancelAgentDelegationRequest, CreateAgentDelegationRequest, ProviderProfileId, VibexError,
-    VibexResult, VibexSessionId,
+    CancelAgentDelegationRequest, CreateAgentDelegationRequest, ErrorCategory, ProviderProfileId,
+    VibexError, VibexResult, VibexSessionId, VibexUseActor, VibexUseTool,
 };
 
 use crate::manager::{AgentDelegationToolConfig, AgentManager};
@@ -25,12 +25,21 @@ use crate::manager::{AgentDelegationToolConfig, AgentManager};
 const MAX_MCP_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_BROKER_LINE_BYTES: usize = 512 * 1024;
 pub const AGENT_DELEGATION_MCP_SERVER_ID: &str = "vibex-agent-delegation";
+/// Environment variable carrying the runtime authority that issued this
+/// sidecar's capability. A reference is only ever resolved under the authority
+/// that minted it.
+pub const AGENT_DELEGATION_AUTHORITY_ENV: &str = "VIBEX_AGENT_DELEGATION_AUTHORITY";
+/// Environment variable carrying the delivery activation revision the sidecar
+/// was launched under. A call is re-validated against the live revision.
+pub const AGENT_DELEGATION_ACTIVATION_ENV: &str = "VIBEX_AGENT_DELEGATION_ACTIVATION";
 
 /// Starts the loopback broker and returns the session-independent launch
 /// configuration consumed by `runtime_resources_for_session`.
 pub async fn start_delegation_broker(
     manager: Arc<AgentManager>,
     command: PathBuf,
+    authority: String,
+    activation_revision: u64,
 ) -> VibexResult<(AgentDelegationToolConfig, JoinHandle<()>)> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|error| {
         VibexError::process(
@@ -81,6 +90,8 @@ pub async fn start_delegation_broker(
             command,
             broker_endpoint: endpoint,
             capability_token: global_token,
+            authority,
+            activation_revision,
         },
         task,
     ))
@@ -250,6 +261,10 @@ async fn handle_broker_request(
         "delegate_to_agent" => delegate(manager, parent_session_id, request.params).await,
         "get_delegation_status" => get_status(manager, parent_session_id, request.params),
         "cancel_delegation" => cancel(manager, parent_session_id, request.params).await,
+        "list_tools" => list_tools(manager, parent_session_id),
+        method if VibexUseTool::parse(method).is_some() => {
+            vibex_use(manager, parent_session_id, method, request.params).await
+        }
         _ => Err(VibexError::validation(
             "agent_delegation_method_not_found",
             "delegation method was not found",
@@ -257,8 +272,77 @@ async fn handle_broker_request(
     };
     match result {
         Ok(value) => json!({ "ok": true, "value": value }),
-        Err(error) => broker_error(&error.code, &error.message),
+        Err(error) => broker_error_value(&error),
     }
+}
+
+/// Merges the historical tools with whatever Vibex-use can really deliver to
+/// this caller.
+///
+/// A tool that cannot succeed is omitted instead of advertised and then
+/// refused. The legacy three are always present because their behaviour does
+/// not depend on a presentation client.
+fn list_tools(
+    manager: &Arc<AgentManager>,
+    parent_session_id: VibexSessionId,
+) -> VibexResult<Value> {
+    let mut tools = delegation_tool_definitions()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(host) = manager.vibex_use_host() {
+        let actor = VibexUseActor::new(
+            manager.vibex_use_authority(),
+            parent_session_id,
+            manager.vibex_use_activation_revision(),
+        );
+        for definition in host.tool_definitions(&actor) {
+            tools.push(json!({
+                "name": definition.name,
+                "description": definition.description,
+                "inputSchema": definition.input_schema,
+            }));
+        }
+    }
+    Ok(json!({ "tools": tools }))
+}
+
+/// Forwards one Vibex-use tool call to the installed domain service.
+///
+/// The sidecar owns framing only. It derives the actor from the capability it
+/// was launched with, so a tool argument can never claim another parent
+/// session, and the service behind the host re-authorizes every reference.
+async fn vibex_use(
+    manager: &Arc<AgentManager>,
+    parent_session_id: VibexSessionId,
+    method: &str,
+    params: Value,
+) -> VibexResult<Value> {
+    let Some(tool) = VibexUseTool::parse(method) else {
+        return Err(VibexError::validation(
+            "agent_delegation_method_not_found",
+            "delegation method was not found",
+        ));
+    };
+    let Some(host) = manager.vibex_use_host() else {
+        return Err(VibexError::capability(
+            "vibex_use_unavailable",
+            "Vibex-use is not available in this runtime",
+        ));
+    };
+    let actor = VibexUseActor::new(
+        manager.vibex_use_authority(),
+        parent_session_id,
+        manager.vibex_use_activation_revision(),
+    );
+    // The arguments may be absent for a schema-less call; every tool parses its
+    // own fields and rejects what it cannot use.
+    let arguments = if params.is_object() {
+        params
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    host.call(actor, tool, arguments).await
 }
 
 async fn delegate(
@@ -291,6 +375,14 @@ async fn delegate(
         model: optional_string(object, "model"),
         reasoning_effort: optional_string(object, "reasoningEffort"),
         mode_id: optional_string(object, "modeId"),
+        // The historical bridge keeps its single-turn completion semantics and
+        // owns the session it creates.
+        completion_policy: vibex_core::DelegationCompletionPolicy::SingleTurnLegacy,
+        ownership_kind: vibex_core::DelegationOwnershipKind::OwnedChild,
+        context_refs: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        follows_task_id: None,
+        existing_session_id: None,
     };
     encode_delegation_tool_result(manager.create_agent_delegation(request).await?)
 }
@@ -320,7 +412,56 @@ async fn cancel(
 }
 
 fn broker_error(code: &str, message: &str) -> Value {
-    json!({ "ok": false, "error": { "code": code, "message": message } })
+    broker_error_value(&VibexError::new(
+        ErrorCategory::Process,
+        code.to_string(),
+        message.to_string(),
+    ))
+}
+
+/// The structured error an Agent receives.
+///
+/// It carries what the caller can act on — whether a retry is safe, what to do
+/// next, and which values were involved — instead of a bare sentence the model
+/// has to interpret. It never carries credentials, prompts or raw tool output.
+fn broker_error_value(error: &VibexError) -> Value {
+    let retryable = matches!(
+        error.category,
+        ErrorCategory::Storage | ErrorCategory::Provider | ErrorCategory::Process
+    );
+    let mut value = json!({
+        "ok": false,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "category": error.category,
+            "retryable": retryable,
+        }
+    });
+    let error_object = value
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .expect("the error object was just built");
+    if let Some(hint) = error
+        .recovery_hint
+        .as_deref()
+        .filter(|hint| !hint.is_empty())
+    {
+        error_object.insert("recoveryHint".to_string(), json!(hint));
+    }
+    if !error.diagnostics.is_empty() {
+        error_object.insert(
+            "diagnostics".to_string(),
+            Value::Array(
+                error
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| json!({ "key": diagnostic.key, "value": diagnostic.value }))
+                    .collect(),
+            ),
+        );
+    }
+    value
 }
 
 fn optional_string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -406,7 +547,9 @@ fn handle_mcp_message(endpoint: &str, token: &str, parent: &str, message: Value)
         "tools/list" => Some(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": { "tools": delegation_tool_definitions() }
+            "result": {
+                "tools": broker_tool_definitions(endpoint, token, parent)
+            }
         })),
         "tools/call" => {
             let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -419,16 +562,21 @@ fn handle_mcp_message(endpoint: &str, token: &str, parent: &str, message: Value)
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let broker_result = call_broker(endpoint, token, parent, name, arguments);
-            let (is_error, text) = match broker_result {
-                Ok(value) => (false, value.to_string()),
+            // The structured payload and the text are the same value rendered
+            // two ways, so a host that only reads text and a host that reads
+            // structuredContent cannot disagree about what happened.
+            let (is_error, structured) = match broker_result {
+                Ok(value) => (false, value),
                 Err(error) => (true, error),
             };
+            let text = structured.to_string();
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
                     "isError": is_error,
-                    "content": [{ "type": "text", "text": text }]
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": structured
                 }
             }))
         }
@@ -440,6 +588,26 @@ fn handle_mcp_message(endpoint: &str, token: &str, parent: &str, message: Value)
     }
 }
 
+/// Asks the broker for the catalogue of this activation.
+///
+/// The sidecar deliberately caches nothing: a target disabled, or a
+/// presentation client that went away, after `initialize` must change what the
+/// next `tools/list` reports instead of leaving a stale promise in place.
+fn broker_tool_definitions(endpoint: &str, token: &str, parent: &str) -> Value {
+    // A transient broker failure falls back to the historical three so a
+    // working session is never left with no tools at all; the next activation
+    // (or the next `tools/list`) picks the full catalogue back up.
+    match call_broker(endpoint, token, parent, "list_tools", json!({})) {
+        Ok(value) => value
+            .get("tools")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        Err(_) => delegation_tool_definitions(),
+    }
+}
+
+/// The historical three-tool contract, kept byte-compatible so an existing
+/// Agent session keeps working after the Vibex-use upgrade.
 fn delegation_tool_definitions() -> Value {
     json!([
         {
@@ -487,7 +655,7 @@ fn call_broker(
     parent: &str,
     method: &str,
     params: Value,
-) -> Result<Value, String> {
+) -> Result<Value, Value> {
     let mut stream = StdTcpStream::connect(endpoint).map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
@@ -510,16 +678,16 @@ fn call_broker(
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(response.get("value").cloned().unwrap_or(Value::Null))
     } else {
-        let error = response.get("error");
-        let code = error
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or("agent_delegation_request_failed");
-        let message = error
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("delegation broker request failed");
-        Err(format!("{code}: {message}"))
+        // The broker already answered with a structured error; forwarding it
+        // whole is what lets the model see retryability and the recovery action
+        // instead of re-parsing a sentence.
+        Err(response.get("error").cloned().unwrap_or_else(|| {
+            json!({
+                "code": "agent_delegation_request_failed",
+                "message": "delegation broker request failed",
+                "retryable": true,
+            })
+        }))
     }
 }
 
@@ -584,6 +752,7 @@ fn write_stdio_message(writer: &mut impl Write, message: &Value) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibex_core::VibexUseToolHost;
 
     #[test]
     fn session_tokens_are_scoped_and_stable() {
@@ -611,31 +780,93 @@ mod tests {
 
     #[test]
     fn agent_results_do_not_expose_internal_session_ids() {
-        let result = serde_json::to_value(AgentDelegationToolResult::from(AgentDelegation {
-            id: AgentDelegationId::new(),
-            parent_session_id: VibexSessionId::new(),
-            parent_timeline_item_id: None,
-            child_session_id: Some(VibexSessionId::new()),
-            idempotency_key: "test".to_string(),
-            title: "Child task".to_string(),
-            task_summary: "Inspect the project".to_string(),
-            requested_agent_id: None,
-            effective_agent_id: Some(AgentId::parse("zcode").unwrap()),
-            status: AgentDelegationStatus::Running,
-            result_summary: None,
-            error_code: None,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            started_at_ms: Some(1),
-            completed_at_ms: None,
-        }))
-        .unwrap();
+        let mut delegation = AgentDelegation::single_turn_legacy(
+            VibexSessionId::new(),
+            "test",
+            "Child task",
+            "Inspect the project",
+            Some(AgentId::parse("zcode").unwrap()),
+            AgentDelegationStatus::Running,
+            1,
+        );
+        delegation.child_session_id = Some(VibexSessionId::new());
+        let result = serde_json::to_value(AgentDelegationToolResult::from(delegation)).unwrap();
 
         assert!(result.get("delegationId").is_none());
         assert!(result.get("parentSessionId").is_none());
         assert!(result.get("childSessionId").is_none());
         assert!(result.get("id").is_some());
         assert_eq!(result["status"], "running");
+    }
+
+    /// A host that only knows one tool, used to prove the catalogue merges.
+    struct OneToolHost;
+
+    impl VibexUseToolHost for OneToolHost {
+        fn call(
+            &self,
+            _actor: VibexUseActor,
+            _tool: VibexUseTool,
+            _arguments: Value,
+        ) -> vibex_core::VibexUseToolFuture<'_> {
+            Box::pin(async { Ok(json!({ "ok": true })) })
+        }
+
+        fn tool_definitions(
+            &self,
+            _actor: &VibexUseActor,
+        ) -> Vec<vibex_core::VibexUseToolDefinition> {
+            vec![vibex_core::VibexUseToolDefinition {
+                name: "vibex_delegate".to_string(),
+                description: "Delegate work".to_string(),
+                input_schema: json!({ "type": "object" }),
+            }]
+        }
+    }
+
+    #[test]
+    fn the_broker_catalogue_merges_the_legacy_tools_with_the_installed_host() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vibex-agent-delegation-{}",
+            AgentDelegationId::new()
+        ));
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let parent = VibexSessionId::new();
+
+        // With no host installed the catalogue is exactly the historical three,
+        // so an older runtime keeps offering exactly what it can do.
+        let legacy = list_tools(&manager, parent.clone()).unwrap();
+        assert_eq!(legacy["tools"].as_array().map(Vec::len), Some(3));
+
+        let host: Arc<dyn VibexUseToolHost> = Arc::new(OneToolHost);
+        manager.install_vibex_use_host(&host).unwrap();
+        let merged = list_tools(&manager, parent).unwrap();
+        let names: Vec<&str> = merged["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 4);
+        assert!(names.contains(&"vibex_delegate"));
+        assert!(names.contains(&"delegate_to_agent"));
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_vibex_use_host_call_is_refused_not_guessed() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vibex-agent-delegation-{}",
+            AgentDelegationId::new()
+        ));
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        // No host installed: the call reports the capability gap instead of
+        // silently falling back to the legacy three-tool behaviour.
+        let error = vibex_use(&manager, VibexSessionId::new(), "vibex_delegate", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "vibex_use_unavailable");
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]

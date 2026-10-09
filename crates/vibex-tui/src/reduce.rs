@@ -3376,6 +3376,8 @@ pub mod payloads {
             attachments,
             correlation_id: None,
             delivery: vibex_core::UserMessageDelivery::Prompt,
+            prompt_context: None,
+            provenance: vibex_core::MessageProvenance::HumanInput,
         })
     }
 
