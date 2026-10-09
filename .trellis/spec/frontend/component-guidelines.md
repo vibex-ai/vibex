@@ -644,7 +644,7 @@ Cards that can grow large must be collapsible. Tool, diff, terminal, and plan
 cards should support compact summaries for mobile.
 
 Desktop process activity uses compact disclosure rows, projected by
-`timeline_activity::Activity` from the row and its latest typed payload. The
+`vibex_ui::timeline::Activity` from the row and its latest typed payload. The
 action and target are separate: commands show their invocation, files show a
 basename badge and available diff counts, and plans show completed/total steps.
 Keep the original file path in the accessible label, details, and operation
@@ -668,6 +668,10 @@ invocation summary, and calls without output must still disclose their input
 or tool identity. Tool projections include the
 resolved locale in their cache validity so language changes refresh labels
 without waiting for a new tool event.
+
+Mobile and TUI consume the same portable activity and detail projections; the
+desktop wrapper supplies its locale. Follow [Timeline Presentation](./timeline-presentation.md)
+for their disclosure, streaming, cache, and copy contracts.
 
 Activity rows share one icon column and a stretching connector rail. Their
 headers and expanded details start at the same text column. Bounded monospace

@@ -285,10 +285,14 @@ Rules that follow:
   band and the dock own the plan, and the request row already shows the outcome.
   Every density decision is mirrored in `estimate_height`, because a renderer
   and an estimator that disagree about shape make scrolling jump.
-* A run of three or more collapsed rows with the same kind, action title, turn
-  and runtime folds into its first member (`MIN_GROUP_RUN`), which reports `+N`
-  before its summary. Expanded and failed rows break the run. Opening the head
-  reveals every member; keyboard navigation skips members while folded.
+* A run of three or more collapsed activities with the same turn and runtime
+  folds into its first member (`MIN_GROUP_RUN`). Typed activities use
+  `vibex_ui::timeline::ActivitySummary` to report every action category in a
+  mixed run; legacy rows still require the same kind and title and report
+  `+N`. Expanded, failed, approval-pending, and typed running operations break
+  the run. Opening the head reveals every member; keyboard navigation skips
+  members while folded. See [Timeline Presentation](../frontend/timeline-presentation.md)
+  for shared labels, details, and cache contracts.
 * **A tool call reaches the transcript as one row.** An Agent narrates it as a
   run of timeline items — the same call id with a growing payload — and the rows
   are folded by the shared projection before the transcript sees them, so the
@@ -449,6 +453,11 @@ re-measure. A terminal that cannot blend colours draws the rail flat — the bar
 still marks the window. `set_animation_phase` is told the clock by the one
 function that draws the transcript, and a transcript with nothing streaming
 never advances it.
+
+The six-row count comes from `vibex_ui::timeline::REASONING_WINDOW_LINES`, shared
+with desktop and mobile. Keep the terminal's incremental Markdown renderer,
+fold marker, animated rail, and follow/scroll controls when aligning activity
+presentation with the GUI clients.
 
 The runtime does not close a reasoning stream: a row that once streamed keeps
 that flag for the rest of the turn. The window is therefore opened only on the

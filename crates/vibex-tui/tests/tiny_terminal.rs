@@ -57,6 +57,9 @@ fn message(id: &str) -> vibex_tui::transcript::Block {
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        activity: None,
+        details: Vec::new(),
+        group_summary: None,
     }
 }
 

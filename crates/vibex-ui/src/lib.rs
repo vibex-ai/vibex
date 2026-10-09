@@ -16,6 +16,8 @@ pub mod shell;
 pub mod terminal;
 pub mod theme_catalog;
 pub mod theme_files;
+pub mod timeline;
+pub mod tool_detail;
 pub mod workflow;
 
 pub use agent::*;

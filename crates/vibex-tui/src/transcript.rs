@@ -18,12 +18,14 @@
 //! scrolling a 10 000-block conversation does not depend on how much history
 //! sits above the viewport.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use vibex_desktop_model::TimelineRowKind;
+use vibex_ui::timeline::{Activity, ActivitySummary};
+use vibex_ui::tool_detail::{self, Detail};
 
 use crate::locale::Strings;
 use crate::markdown::render_plain;
@@ -60,7 +62,7 @@ pub const MIN_GROUP_RUN: usize = 3;
 /// tail, so the newest lines push the oldest off the top instead of adding
 /// height. One of the rows is the fold marker once the thought outgrows the
 /// window, so the block is never taller than this plus its header.
-pub const STREAMING_WINDOW_LINES: usize = 6;
+pub const STREAMING_WINDOW_LINES: usize = vibex_ui::timeline::REASONING_WINDOW_LINES;
 
 /// The mark that says older rows of a live thought are above the window.
 ///
@@ -118,6 +120,10 @@ fn eligible_for_group(block: &Block, trailing: bool) -> bool {
         && block.collapsible
         && !block.expanded
         && !block.failed
+        && !block.pending_permission
+        // Typed live operations stay visible. Legacy rows retain their run
+        // grouping, including superseded thoughts with a stale stream flag.
+        && (block.activity.is_none() || !block.streaming)
 }
 
 /// Whether `incoming` starts with older blocks than the transcript holds.
@@ -160,6 +166,12 @@ pub struct Block {
     pub conclusion: bool,
     /// How this block participates in a dense run of work items.
     pub group: GroupRole,
+    /// Desktop-derived activity identity, separate from its expandable output.
+    pub activity: Option<Activity>,
+    /// Raw bounded fields; decoding happens only when this block is rendered.
+    pub details: Vec<Detail>,
+    /// Derived from all members of a collapsed activity run.
+    pub group_summary: Option<ActivitySummary>,
 }
 
 impl Block {
@@ -178,6 +190,9 @@ impl Block {
         self.collapsible.hash(&mut hasher);
         self.file_path.hash(&mut hasher);
         self.group.hash(&mut hasher);
+        self.activity.hash(&mut hasher);
+        self.details.hash(&mut hasher);
+        self.group_summary.hash(&mut hasher);
         self.runtime_attribution.hash(&mut hasher);
         // Not content, but drawn from the block: a row whose clock moved has to
         // be laid out again, or the transcript would keep showing the hour the
@@ -409,6 +424,7 @@ impl Transcript {
             if let Some(&old_index) = existing.get(block.id.as_str()) {
                 block.expanded = self.blocks[old_index].expanded;
                 block.group = self.blocks[old_index].group;
+                block.group_summary = self.blocks[old_index].group_summary.clone();
             }
             let key = block.content_key();
             match existing.get(block.id.as_str()) {
@@ -489,10 +505,11 @@ impl Transcript {
         let previous = self
             .blocks
             .iter()
-            .map(|block| block.group)
+            .map(|block| (block.group, block.group_summary.clone()))
             .collect::<Vec<_>>();
         for block in &mut self.blocks {
             block.group = GroupRole::Solo;
+            block.group_summary = None;
         }
         let mut index = 0usize;
         while index < self.blocks.len() {
@@ -506,15 +523,19 @@ impl Transcript {
             let start = index;
             let kind = self.blocks[start].kind;
             let title = self.blocks[start].title.clone();
+            let semantic = self.blocks[start].activity.is_some();
             let turn = self.blocks[start].turn_id.clone();
-            // A run is one kind of work *by one runtime*: folding a row that
+            // A run is work by one runtime: folding a row that
             // came from somewhere else into this run would hide the only thing
             // the attribution is there to say.
             let attribution = self.blocks[start].runtime_attribution.clone();
             while index < self.blocks.len()
                 && eligible_for_group(&self.blocks[index], index + 1 == self.blocks.len())
-                && self.blocks[index].kind == kind
-                && self.blocks[index].title == title
+                && if semantic {
+                    self.blocks[index].activity.is_some()
+                } else {
+                    self.blocks[index].kind == kind && self.blocks[index].title == title
+                }
                 && self.blocks[index].turn_id == turn
                 && self.blocks[index].runtime_attribution == attribution
             {
@@ -528,12 +549,26 @@ impl Transcript {
             }
             let hidden = run - 1;
             self.blocks[start].group = GroupRole::Head { hidden };
+            if semantic {
+                let mut summary = ActivitySummary::default();
+                for block in &self.blocks[start..index] {
+                    if let Some(activity) = &block.activity {
+                        summary.record(activity, &block.id);
+                    }
+                }
+                self.blocks[start].group_summary = Some(summary);
+            }
             for member in &mut self.blocks[start + 1..index] {
                 member.group = GroupRole::Member;
             }
         }
         for (index, old) in previous.into_iter().enumerate() {
-            if old != self.blocks[index].group {
+            if old
+                != (
+                    self.blocks[index].group,
+                    self.blocks[index].group_summary.clone(),
+                )
+            {
                 self.keys[index] = self.blocks[index].content_key();
                 self.invalidate(index);
                 if index > 0 {
@@ -819,7 +854,22 @@ impl Transcript {
             TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
         ) && !block.body.is_empty();
         let header = usize::from(!headerless);
-        let body_lines = if block.body.is_empty() {
+        let body_lines = if open && !block.details.is_empty() {
+            // The captured source, not the provider's short summary, is what
+            // an expanded activity renders. Estimate without decoding offscreen
+            // JSON; escaped newlines allow for known output envelopes.
+            block
+                .details
+                .iter()
+                .map(|detail| {
+                    let source = detail.source();
+                    1 + source.matches('\n').count()
+                        + source.matches("\\n").count()
+                        + source.len() / available
+                })
+                .sum::<usize>()
+                + block.details.len().saturating_sub(1)
+        } else if block.body.is_empty() {
             0
         } else if is_live_thinking_window(block, next.is_none()) {
             // The window is capped, which is the whole point: the rows it shows
@@ -1364,7 +1414,7 @@ impl Transcript {
             .enumerate()
             .filter(|(_, block)| {
                 block.title.to_lowercase().contains(&query)
-                    || block.body.to_lowercase().contains(&query)
+                    || block_body_text(block).to_lowercase().contains(&query)
             })
             .map(|(index, _)| index)
             .collect()
@@ -1384,7 +1434,7 @@ impl Transcript {
         let mut blocks = Vec::new();
         let mut total = 0usize;
         for (index, block) in self.blocks.iter().enumerate() {
-            let hits = pattern.count(&block.title) + pattern.count(&block.body);
+            let hits = pattern.count(&block.title) + pattern.count(&block_body_text(block));
             if hits > 0 {
                 blocks.push(index);
                 total += hits;
@@ -1558,16 +1608,26 @@ fn truncate_parts(parts: Vec<(String, Style)>, width: usize) -> Vec<Span<'static
 }
 
 /// Human-readable block body used for the copy action.
-fn block_plain_text(block: &Block) -> String {
-    let mut output = String::new();
-    if !block.title.is_empty() {
-        output.push_str(&block.title);
+fn block_body_text(block: &Block) -> Cow<'_, str> {
+    if block.details.is_empty() {
+        Cow::Borrowed(&block.body)
+    } else {
+        Cow::Owned(tool_detail::text(&block.details))
     }
-    if !block.body.is_empty() {
+}
+
+/// Human-readable block identity and body used for copy and text export.
+fn block_plain_text(block: &Block) -> String {
+    let mut output = block
+        .activity
+        .as_ref()
+        .map_or_else(|| block.title.clone(), Activity::label);
+    let body = block_body_text(block);
+    if !body.is_empty() {
         if !output.is_empty() {
             output.push('\n');
         }
-        output.push_str(&block.body);
+        output.push_str(&body);
     }
     output
 }
@@ -1812,6 +1872,7 @@ pub fn is_work_item(kind: TimelineRowKind) -> bool {
             | TimelineRowKind::WebSearch
             | TimelineRowKind::Reasoning
             | TimelineRowKind::TodoUpdate
+            | TimelineRowKind::Collaboration
             | TimelineRowKind::ImageGeneration
     )
 }
@@ -1917,6 +1978,9 @@ fn shows_kind_label(kind: TimelineRowKind, title: &str, label: &str) -> bool {
 /// printing the payload turns every row into a wall of JSON, so the *action* is
 /// what the row shows.
 fn dense_summary(block: &Block) -> Option<String> {
+    if let Some(activity) = &block.activity {
+        return (!activity.target().is_empty()).then(|| activity.target().to_string());
+    }
     if block.kind == TimelineRowKind::Reasoning {
         return None;
     }
@@ -2124,13 +2188,15 @@ pub fn render_block_with_attribution(
     };
     let title_style = match block.kind {
         TimelineRowKind::UserMessage => theme.base().add_modifier(Modifier::BOLD),
+        _ if block.activity.is_some() && block.failed => theme.danger(),
+        _ if block.activity.is_some() => theme.muted(),
         _ => theme.base(),
     };
     let mut parts: Vec<(String, Style)> = Vec::new();
     if let Some((glyph, style)) = bullet(block, live, theme) {
         parts.push((format!("{glyph} "), style));
     }
-    if shows_kind_label(block.kind, &block.title, label) {
+    if block.activity.is_none() && shows_kind_label(block.kind, &block.title, label) {
         parts.push((
             format!("{label} "),
             theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
@@ -2139,7 +2205,11 @@ pub fn render_block_with_attribution(
     // A notice's title is its severity and its body is the sentence, so the
     // sentence is what the row shows — with the severity carried by colour
     // rather than by a word the reader has to skip.
-    let (heading, title_style) = if matches!(block.kind, TimelineRowKind::SystemNotice) {
+    let (heading, title_style) = if let Some(summary) = &block.group_summary {
+        (summary.label(strings.locale), theme.muted())
+    } else if let Some(activity) = &block.activity {
+        (activity.action().to_string(), title_style)
+    } else if matches!(block.kind, TimelineRowKind::SystemNotice) {
         let style = match block.title.trim() {
             "Warning" => theme.warning(),
             "Error" => theme.danger(),
@@ -2170,13 +2240,15 @@ pub fn render_block_with_attribution(
     // Its shape is independent of whether the work is still running.
     if let GroupRole::Head { hidden } = block.group
         && hidden > 0
+        && block.group_summary.is_none()
     {
         // Before the summary: a truncated row must still say how many rows it
         // stands for.
         parts.push((format!("  +{hidden}"), theme.dimmed(theme.roles.gray_dim)));
     }
     if dense
-        && !open
+        && (!open || block.activity.is_some())
+        && block.group_summary.is_none()
         && !matches!(block.kind, TimelineRowKind::SystemNotice)
         && let Some(summary) = dense_summary(block)
     {
@@ -2185,10 +2257,14 @@ pub fn render_block_with_attribution(
                 "  {}",
                 summary.split_whitespace().collect::<Vec<_>>().join(" ")
             ),
-            theme.muted(),
+            if block.activity.is_some() {
+                title_style
+            } else {
+                theme.muted()
+            },
         ));
     }
-    if dense && block.failed {
+    if dense && block.failed && block.activity.is_none() {
         parts.push((format!("  {}", strings.failed()), theme.danger()));
     }
     if block.collapsible && !block.expanded && !dense {
@@ -2197,7 +2273,12 @@ pub fn render_block_with_attribution(
             theme.dimmed(theme.roles.gray_dim),
         ));
     }
-    let body = block.body.trim_end_matches('\n');
+    let detail_body =
+        (!block.details.is_empty() && open).then(|| tool_detail::text(&block.details));
+    let body = detail_body
+        .as_deref()
+        .unwrap_or(&block.body)
+        .trim_end_matches('\n');
     // A message *is* its text: a "You" or "Agent" row above every one of them
     // spends a row of the transcript saying what the rail colour already says.
     // The reader's own message keeps a prompt mark on its first line so the two
@@ -2656,6 +2737,9 @@ mod tests {
             runtime_attribution: None,
             conclusion: false,
             group: GroupRole::Solo,
+            activity: None,
+            details: Vec::new(),
+            group_summary: None,
         }
     }
 
@@ -3825,6 +3909,9 @@ mod density_tests {
             runtime_attribution: None,
             conclusion: false,
             group: GroupRole::Solo,
+            activity: None,
+            details: Vec::new(),
+            group_summary: None,
         }
     }
 

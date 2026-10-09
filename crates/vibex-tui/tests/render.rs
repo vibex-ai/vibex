@@ -1347,6 +1347,9 @@ fn block(id: &str, turn: &str) -> vibex_tui::transcript::Block {
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        activity: None,
+        details: Vec::new(),
+        group_summary: None,
     }
 }
 
@@ -1561,6 +1564,9 @@ fn seeded_block(
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        activity: None,
+        details: Vec::new(),
+        group_summary: None,
     }
 }
 
@@ -3511,10 +3517,11 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         screen.contains("Done: the test now uses the fake clock."),
         "{screen}"
     );
-    // Different actions remain distinct; grouping must not hide a write as a read.
-    assert!(screen.contains("read_file"), "{screen}");
-    assert!(screen.contains("write_file"), "{screen}");
-    assert!(screen.contains("grep"), "{screen}");
+    // Mixed runs report each semantic category, including the changed file.
+    assert!(
+        screen.contains("Read 3 files · Changed 1 file · Searched 1 time"),
+        "{screen}"
+    );
     assert!(
         !screen.contains("Tool read_file"),
         "the kind label doubles the title:\n{screen}"
@@ -5808,10 +5815,8 @@ fn a_running_session_reads_as_rows() {
         screen.contains("▸ Thinking"),
         "the finished thought is not one row:\n{screen}"
     );
-    // A tool row names its action; the payload stays behind the fold. The run's
-    // head is the row that carries it, and the rest are counted beside it. The
-    // command shares its row with the rest of the run, so what is asserted is
-    // the head of it; the tail belongs to the expanded body.
+    // A running tool names its command and stays visible beside completed
+    // work. The raw input and output remain behind the fold.
     assert!(
         screen.contains("cd /home/peatboy/code/peatboy/vibex-dev/vibex && git diff"),
         "the tool's command is not on its row:\n{screen}"
@@ -5820,8 +5825,13 @@ fn a_running_session_reads_as_rows() {
         !screen.contains("\"command\""),
         "a raw payload is on screen:\n{screen}"
     );
-    // Three work items in a row are a run, with the rest counted.
-    assert!(screen.contains("+2"), "the run is not folded:\n{screen}");
+    assert_eq!(
+        app.transcript.blocks()[2].group,
+        vibex_tui::transcript::GroupRole::Solo,
+        "a running command must remain outside collapsed groups"
+    );
+    assert!(screen.contains("cargo test -p vibex-tui"), "{screen}");
+    assert!(screen.contains("cargo clippy -p vibex-tui"), "{screen}");
     // The runtime is named once for the run, not on every row of it — and not
     // under the reader's own message, which no runtime wrote.
     assert_eq!(
@@ -7637,6 +7647,9 @@ fn reasoning_toggle_opens_and_closes_every_member_of_a_group() {
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        activity: None,
+        details: Vec::new(),
+        group_summary: None,
     };
     app.transcript.set_blocks(
         (0..4)

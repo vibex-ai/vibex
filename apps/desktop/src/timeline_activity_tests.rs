@@ -76,7 +76,7 @@ fn activity_labels_are_single_line_without_changing_the_invocation() {
     let row = row_for(&payload);
     let projection = tool_card_projection(&row, Some(&payload));
     assert_eq!(
-        projection.activity.target,
+        projection.activity.target(),
         "printf '%s\\n' 'two words' cargo check --locked"
     );
     let ToolCardDetailBlock::Terminal { command, .. } = &projection.details[0] else {
@@ -85,9 +85,9 @@ fn activity_labels_are_single_line_without_changing_the_invocation() {
     assert_eq!(command, source);
 
     let file = file(FileOperationKind::Read, "src/a directory/main.rs");
-    let activity = Activity::project(&row_for(&file), Some(&file));
-    assert_eq!(activity.path.as_deref(), Some("src/a directory/main.rs"));
-    assert_eq!(activity.target, "main.rs");
+    let activity = project(&row_for(&file), Some(&file));
+    assert_eq!(activity.path(), Some("src/a directory/main.rs"));
+    assert_eq!(activity.target(), "main.rs");
     assert!(activity.label().ends_with("src/a directory/main.rs"));
 }
 
@@ -118,22 +118,22 @@ fn activity_file_labels_keep_their_names_and_complete_paths() {
         ("/", "/"),
     ] {
         let payload = file(FileOperationKind::Read, path);
-        let activity = Activity::project(&row_for(&payload), Some(&payload));
-        assert_eq!(activity.target, name);
-        assert_eq!(activity.path.as_deref(), Some(path));
+        let activity = project(&row_for(&payload), Some(&payload));
+        assert_eq!(activity.target(), name);
+        assert_eq!(activity.path(), Some(path));
         assert!(activity.label().ends_with(path));
     }
 
     let mut summary = ActivitySummary::default();
     for path in ["src/main.rs", "tests/main.rs"] {
         let payload = file(FileOperationKind::Edit, path);
-        let activity = Activity::project(&row_for(&payload), Some(&payload));
-        assert_eq!(activity.target, "main.rs");
+        let activity = project(&row_for(&payload), Some(&payload));
+        assert_eq!(activity.target(), "main.rs");
         summary.record(&activity, path);
     }
     assert_eq!(
-        summary.edits.len(),
-        2,
+        summary.label(vibex_ui::locale::Locale::En),
+        "Changed 2 files",
         "short labels must not merge distinct files"
     );
 }
@@ -158,7 +158,7 @@ fn activity_details_prefer_the_complete_bounded_invocation() {
         )),
     });
     let projection = tool_card_projection(&row_for(&payload), Some(&payload));
-    assert_eq!(projection.activity.target, "src/main.rs");
+    assert_eq!(projection.activity.target(), "src/main.rs");
     let ToolCardDetailBlock::Invocation { value, raw } = &projection.details[0] else {
         panic!("invocation detail")
     };
@@ -281,19 +281,16 @@ fn activity_summary_uses_tool_semantics_and_counts_each_changed_file_once() {
     .enumerate()
     {
         let row = row_for(payload);
-        summary.record(&Activity::project(&row, Some(payload)), &index.to_string());
+        summary.record(&project(&row, Some(payload)), &index.to_string());
     }
-    assert_eq!(summary.edits.len(), 1);
-    assert_eq!(summary.reads, 1);
-    assert_eq!(summary.commands, 1);
-    assert_eq!(summary.other, 0);
     assert_eq!(
-        summary.failed, 1,
-        "tool failure comes from the typed payload even when the turn succeeds"
+        summary.label(vibex_ui::locale::Locale::En),
+        "Ran 1 command · Read 1 file · Changed 1 file · 1 failed",
+        "semantic counts and typed failures survive a successful turn"
     );
     assert!(
         summary
-            .label()
+            .label(current_locale())
             .contains(&locale::text("{n} failed", "{n} 项失败", "{n} 項失敗").replace("{n}", "1"))
     );
 }
@@ -311,12 +308,16 @@ fn activity_images_preserve_the_typed_failure_and_description() {
     let projection = tool_card_projection(&row, Some(&payload));
     assert!(projection.activity.is_failed());
     assert_eq!(
-        projection.activity.target,
+        projection.activity.target(),
         "The image could not be generated"
     );
     let mut summary = ActivitySummary::default();
     summary.record(&projection.activity, &row.id);
-    assert_eq!(summary.failed, 1);
+    assert!(
+        summary
+            .label(vibex_ui::locale::Locale::En)
+            .contains("1 failed")
+    );
 }
 
 #[test]
@@ -456,7 +457,7 @@ impl Render for ActivityProbe {
         window.set_rem_size(px(self.rem));
         let target = self.target_color.clone().map(|color| {
             div()
-                .child(self.activity.target.clone())
+                .child(self.activity.target().to_string())
                 .child(
                     gpui::canvas(
                         move |_, window, _| color.set(window.text_style().color),
@@ -496,7 +497,7 @@ impl Render for ActivityProbe {
         let first = row(
             "first",
             self.activity.icon(),
-            self.activity.failed,
+            self.activity.is_failed(),
             Some(true),
             div()
                 .debug_selector(|| "first-header".into())
@@ -557,7 +558,7 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
         FileOperationKind::Read,
         "src/a-long-directory-name/a-very-long-component-name-that-must-stay-inside-the-activity-header.rs",
     );
-    let activity = Activity::project(&row_for(&payload), Some(&payload));
+    let activity = project(&row_for(&payload), Some(&payload));
     let view = cx.new(|_| ActivityProbe {
         activity,
         expanded: false,
@@ -677,7 +678,7 @@ fn activity_hover_brightens_text_without_painting_a_row_background(cx: &mut Test
     let payload = file(FileOperationKind::Read, "src/main.rs");
     let color = Rc::new(Cell::new(gpui::transparent_black()));
     let view = cx.new(|_| ActivityProbe {
-        activity: Activity::project(&row_for(&payload), Some(&payload)),
+        activity: project(&row_for(&payload), Some(&payload)),
         expanded: false,
         group_expanded: true,
         running: false,
@@ -739,7 +740,9 @@ fn activity_hover_brightens_text_without_painting_a_row_background(cx: &mut Test
         );
 
         view.update(cx, |view, cx| {
-            view.activity.failed = true;
+            let mut failed_row = row_for(&payload);
+            failed_row.failed = true;
+            view.activity = project(&failed_row, None);
             cx.notify();
         });
         cx.update(|window, cx| {
@@ -748,7 +751,7 @@ fn activity_hover_brightens_text_without_painting_a_row_background(cx: &mut Test
         });
         assert_eq!(color.get(), danger, "hover preserves failure emphasis");
         view.update(cx, |view, cx| {
-            view.activity.failed = false;
+            view.activity = project(&row_for(&payload), Some(&payload));
             cx.notify();
         });
     }

@@ -12,247 +12,20 @@ const ICON_SIZE_REM: f32 = 0.875;
 const RAIL_ICON_GAP_REM: f32 = 0.125;
 const HOVER_GROUP: &str = "timeline-activity";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Activity {
-    action: &'static str,
-    target: String,
-    path: Option<String>,
-    icon: ProcessActivityIcon,
-    failed: bool,
-}
+pub(super) use vibex_ui::timeline::{
+    Activity, ActivitySummary, activity_target, group_open, is_running,
+};
 
-impl Activity {
-    pub(super) fn project(row: &TimelineRow, payload: Option<&TimelinePayload>) -> Self {
-        use ProcessActivityIcon as Icon;
-        let (icon, action, target, path, failed) = match payload {
-            Some(TimelinePayload::ToolCall(tool)) => {
-                let icon = generic_tool_activity_icon(&tool.tool_name, &tool.summary);
-                let summary = if tool.summary.trim().is_empty() {
-                    &tool.tool_name
-                } else {
-                    &tool.summary
-                };
-                let path = matches!(
-                    icon,
-                    Icon::FileRead | Icon::FileEdit | Icon::FileCreate | Icon::FileDelete
-                )
-                .then_some(tool.raw_extension.as_ref())
-                .flatten()
-                .filter(|extension| extension.locations.len() == 1)
-                .and_then(|extension| extension.locations.first())
-                .map(|location| location.uri.clone());
-                let target = path
-                    .as_deref()
-                    .unwrap_or_else(|| activity_target(summary, icon));
-                (
-                    icon,
-                    action_label(icon),
-                    target.to_string(),
-                    path,
-                    tool.status == vibex_core::ToolCallStatus::Failed,
-                )
-            }
-            Some(TimelinePayload::Command(command)) => (
-                Icon::Command,
-                action_label(Icon::Command),
-                command.command.clone(),
-                None,
-                command.status == vibex_core::CommandStatus::Failed,
-            ),
-            Some(TimelinePayload::FileOperation(file)) => {
-                let (icon, action) = match file.operation {
-                    FileOperationKind::Read => (Icon::FileRead, action_label(Icon::FileRead)),
-                    FileOperationKind::Write => (Icon::FileCreate, action_label(Icon::FileCreate)),
-                    FileOperationKind::Edit => (Icon::FileEdit, action_label(Icon::FileEdit)),
-                    FileOperationKind::Delete => (Icon::FileDelete, action_label(Icon::FileDelete)),
-                    FileOperationKind::Move => {
-                        (Icon::FileEdit, locale::text("Move", "移动", "移動"))
-                    }
-                };
-                (
-                    icon,
-                    action,
-                    file.path.clone(),
-                    Some(file.path.clone()),
-                    false,
-                )
-            }
-            Some(TimelinePayload::WebSearch(search)) => (
-                Icon::Search,
-                action_label(Icon::Search),
-                search.query.clone(),
-                None,
-                search.status == vibex_core::ToolCallStatus::Failed,
-            ),
-            Some(TimelinePayload::TodoUpdate(plan)) => (
-                Icon::Todo,
-                action_label(Icon::Todo),
-                format!(
-                    "{}/{}",
-                    plan.items
-                        .iter()
-                        .filter(|step| step.status == PlanStepStatus::Completed)
-                        .count(),
-                    plan.items.len()
-                ),
-                None,
-                plan.items
-                    .iter()
-                    .any(|step| step.status == PlanStepStatus::Failed),
-            ),
-            Some(TimelinePayload::Plan(plan)) => (
-                Icon::Todo,
-                action_label(Icon::Todo),
-                format!(
-                    "{}/{}",
-                    plan.steps
-                        .iter()
-                        .filter(|step| step.status == PlanStepStatus::Completed)
-                        .count(),
-                    plan.steps.len()
-                ),
-                None,
-                plan.steps
-                    .iter()
-                    .any(|step| step.status == PlanStepStatus::Failed),
-            ),
-            Some(TimelinePayload::Collaboration(agent)) => (
-                Icon::Collaboration,
-                action_label(Icon::Collaboration),
-                if agent.summary.is_empty() {
-                    agent.action.clone()
-                } else {
-                    agent.summary.clone()
-                },
-                None,
-                agent.status == vibex_core::ToolCallStatus::Failed,
-            ),
-            Some(TimelinePayload::ImageGeneration(image)) => (
-                Icon::Image,
-                action_label(Icon::Image),
-                image.summary.clone(),
-                None,
-                image.status == vibex_core::ToolCallStatus::Failed,
-            ),
-            _ => {
-                let icon = match row.kind {
-                    TimelineRowKind::Command => Icon::Command,
-                    TimelineRowKind::FileOperation => Icon::FileRead,
-                    TimelineRowKind::WebSearch => Icon::Search,
-                    TimelineRowKind::TodoUpdate | TimelineRowKind::Plan => Icon::Todo,
-                    TimelineRowKind::Collaboration => Icon::Collaboration,
-                    TimelineRowKind::ImageGeneration => Icon::Image,
-                    TimelineRowKind::Retry => Icon::Retry,
-                    _ => generic_tool_activity_icon(&row.title, ""),
-                };
-                (
-                    icon,
-                    action_label(icon),
-                    row.title.clone(),
-                    row.file_path.clone(),
-                    row.failed,
-                )
-            }
-        };
-        Self {
-            action,
-            target: single_line(&path.as_deref().map_or(target, agent_file_display_name)),
-            path,
-            icon,
-            failed,
-        }
-    }
-
-    pub(super) fn icon(&self) -> ProcessActivityIcon {
-        self.icon
-    }
-    pub(super) fn is_failed(&self) -> bool {
-        self.failed
-    }
-    pub(super) fn label(&self) -> String {
-        format!(
-            "{} {}",
-            self.action,
-            self.path.as_deref().unwrap_or(&self.target)
-        )
-        .trim_end()
-        .to_string()
-    }
-    pub(super) fn approximate_bytes(&self) -> usize {
-        self.target.len() + self.path.as_ref().map_or(0, String::len)
+pub(super) fn current_locale() -> vibex_ui::locale::Locale {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => vibex_ui::locale::Locale::En,
+        locale::ResolvedLocale::ZhCn => vibex_ui::locale::Locale::ZhCn,
+        locale::ResolvedLocale::ZhTw => vibex_ui::locale::Locale::ZhTw,
     }
 }
 
-fn action_label(icon: ProcessActivityIcon) -> &'static str {
-    match icon {
-        ProcessActivityIcon::Command => locale::text("Run", "运行", "執行"),
-        ProcessActivityIcon::Search => locale::text("Search", "搜索", "搜尋"),
-        ProcessActivityIcon::Directory => locale::text("List", "列出", "列出"),
-        ProcessActivityIcon::FileRead => locale::text("Read", "读取", "讀取"),
-        ProcessActivityIcon::FileEdit => locale::text("Edit", "编辑", "編輯"),
-        ProcessActivityIcon::FileCreate => locale::text("Write", "写入", "寫入"),
-        ProcessActivityIcon::FileDelete => locale::text("Delete", "删除", "刪除"),
-        ProcessActivityIcon::Todo => locale::text("Plan", "计划", "計畫"),
-        ProcessActivityIcon::Collaboration => "Agent",
-        ProcessActivityIcon::Image => locale::text("Image", "图像", "圖像"),
-        ProcessActivityIcon::Integration => "MCP",
-        ProcessActivityIcon::Retry => locale::text("Retry", "重试", "重試"),
-        ProcessActivityIcon::Generic => locale::text("Tool", "工具", "工具"),
-    }
-}
-
-fn single_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// A summary may already start with its action. Remove only a matching verb;
-/// command text and unfamiliar summaries retain their complete visible value.
-pub(super) fn activity_target(summary: &str, icon: ProcessActivityIcon) -> &str {
-    let summary = summary.trim();
-    let Some((verb, target)) = summary.split_once(char::is_whitespace) else {
-        return summary;
-    };
-    let verbs: &[&str] = match icon {
-        ProcessActivityIcon::Command => &["run", "ran", "running", "execute", "executed"],
-        ProcessActivityIcon::Search => &["search", "searched", "searching"],
-        ProcessActivityIcon::Directory => &["list", "listed", "listing"],
-        ProcessActivityIcon::FileRead => &["read", "reading", "view", "viewed"],
-        ProcessActivityIcon::FileEdit => &["edit", "edited", "editing", "patch", "patched"],
-        ProcessActivityIcon::FileCreate => &["write", "wrote", "writing", "create", "created"],
-        ProcessActivityIcon::FileDelete => &["delete", "deleted", "remove", "removed"],
-        _ => &[],
-    };
-    if verbs
-        .iter()
-        .any(|candidate| verb.eq_ignore_ascii_case(candidate))
-    {
-        target.trim_start()
-    } else {
-        summary
-    }
-}
-
-pub(super) fn group_open(
-    turn: &TimelineConversationTurn,
-    group: &TimelineProcessActivityGroup,
-    explicit: Option<bool>,
-) -> bool {
-    explicit.unwrap_or_else(|| {
-        !timeline_turn_finished(turn)
-            && timeline_turn_conclusion_row(turn).is_none()
-            && (group.end_row == turn.process_rows.len()
-                || turn
-                    .process_rows
-                    .get(group.start_row..group.end_row)
-                    .is_some_and(|rows| {
-                        rows.iter()
-                            .any(|row| row.streaming || row.pending_permission)
-                    }))
-    })
-}
-
-pub(super) fn is_running(row: &TimelineRow, turn_live: bool) -> bool {
-    turn_live && row.streaming && !row.failed && !row.pending_permission
+pub(super) fn project(row: &TimelineRow, payload: Option<&TimelinePayload>) -> Activity {
+    Activity::project(row, payload, current_locale())
 }
 
 /// The same button geometry is used by tool, file and plan disclosures.
@@ -265,19 +38,19 @@ pub(super) fn header(
     statistics: Option<AnyElement>,
     cx: &App,
 ) -> Button {
-    let running = running && !activity.failed;
-    let color = if activity.failed {
+    let running = running && !activity.is_failed();
+    let color = if activity.is_failed() {
         cx.theme().danger
     } else {
         resting_color(cx)
     };
-    let hover_color = if activity.failed {
+    let hover_color = if activity.is_failed() {
         cx.theme().danger
     } else {
         cx.theme().foreground
     };
     let target = highlighted_target
-        .unwrap_or_else(|| activity_text("target-shimmer", &activity.target, running));
+        .unwrap_or_else(|| activity_text("target-shimmer", activity.target(), running));
     let target = h_flex()
         .id("target")
         .debug_selector(|| format!("activity-target:{id}"))
@@ -285,9 +58,9 @@ pub(super) fn header(
         .gap_1()
         .text_color(color)
         .group_hover(HOVER_GROUP, |style| style.text_color(hover_color))
-        .when(activity.path.is_some(), |this| {
+        .when(activity.path().is_some(), |this| {
             let kind = vibex_desktop_model::file_icon_descriptor(
-                &activity.target,
+                activity.target(),
                 vibex_core::FileEntryKind::File,
             )
             .kind;
@@ -315,7 +88,11 @@ pub(super) fn header(
         .px_0()
         .justify_start()
         .text_color(color)
-        .accessibility_label(status_label(activity.label(), running, activity.failed))
+        .accessibility_label(status_label(
+            activity.label(),
+            running,
+            activity.is_failed(),
+        ))
         .when_some(open, |this, open| this.toggled(open))
         .child(
             h_flex()
@@ -330,7 +107,7 @@ pub(super) fn header(
                         .flex_none()
                         .text_color(color)
                         .group_hover(HOVER_GROUP, |style| style.text_color(hover_color))
-                        .child(activity_text("action-shimmer", activity.action, running)),
+                        .child(activity_text("action-shimmer", activity.action(), running)),
                 )
                 .child(target)
                 .children(statistics)
@@ -359,7 +136,7 @@ pub(super) fn header(
 }
 
 pub(super) fn target(activity: &Activity) -> &str {
-    &activity.target
+    activity.target()
 }
 
 pub(super) fn summary_header(
@@ -568,106 +345,4 @@ pub(super) fn detail(
                 }),
         )
         .into_any_element()
-}
-
-#[derive(Default)]
-pub(super) struct ActivitySummary {
-    commands: usize,
-    reads: usize,
-    edits: BTreeSet<String>,
-    searches: usize,
-    plans: usize,
-    agents: usize,
-    other: usize,
-    failed: usize,
-}
-
-impl ActivitySummary {
-    pub(super) fn record(&mut self, activity: &Activity, row_id: &str) {
-        self.failed += usize::from(activity.failed);
-        match activity.icon {
-            ProcessActivityIcon::Command => self.commands += 1,
-            ProcessActivityIcon::FileRead => self.reads += 1,
-            ProcessActivityIcon::FileEdit
-            | ProcessActivityIcon::FileCreate
-            | ProcessActivityIcon::FileDelete => {
-                self.edits
-                    .insert(activity.path.as_deref().unwrap_or(row_id).to_string());
-            }
-            ProcessActivityIcon::Search | ProcessActivityIcon::Directory => self.searches += 1,
-            ProcessActivityIcon::Todo => self.plans += 1,
-            ProcessActivityIcon::Collaboration => self.agents += 1,
-            _ => self.other += 1,
-        }
-    }
-
-    pub(super) fn label(&self) -> String {
-        let entries = [
-            (
-                self.commands,
-                "Ran {n} command",
-                "Ran {n} commands",
-                "运行 {n} 条命令",
-                "執行 {n} 條命令",
-            ),
-            (
-                self.reads,
-                "Read {n} file",
-                "Read {n} files",
-                "读取 {n} 个文件",
-                "讀取 {n} 個檔案",
-            ),
-            (
-                self.edits.len(),
-                "Changed {n} file",
-                "Changed {n} files",
-                "修改 {n} 个文件",
-                "修改 {n} 個檔案",
-            ),
-            (
-                self.searches,
-                "Searched {n} time",
-                "Searched {n} times",
-                "搜索 {n} 次",
-                "搜尋 {n} 次",
-            ),
-            (
-                self.plans,
-                "Updated {n} plan",
-                "Updated {n} plans",
-                "更新 {n} 次计划",
-                "更新 {n} 次計畫",
-            ),
-            (
-                self.agents,
-                "Called {n} agent",
-                "Called {n} agents",
-                "调用 {n} 个 Agent",
-                "呼叫 {n} 個 Agent",
-            ),
-            (
-                self.other,
-                "Called {n} tool",
-                "Called {n} tools",
-                "调用 {n} 次工具",
-                "呼叫 {n} 次工具",
-            ),
-            (
-                self.failed,
-                "{n} failed",
-                "{n} failed",
-                "{n} 项失败",
-                "{n} 項失敗",
-            ),
-        ];
-        entries
-            .into_iter()
-            .filter(|(count, ..)| *count > 0)
-            .map(|(count, singular, plural, zh, tw)| {
-                locale::text(if count == 1 { singular } else { plural }, zh, tw)
-                    .replace("{n}", &count.to_string())
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
-    }
 }

@@ -3797,10 +3797,54 @@ impl App {
             rows.push(pending.row(self.strings));
         }
         self.projection.rows = rows.clone();
+        let items: HashMap<&str, &vibex_core::TimelineItem> = self
+            .agent
+            .state
+            .timeline
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item))
+            .collect();
+        let workspace = self
+            .agent
+            .state
+            .active_session
+            .value
+            .as_ref()
+            .map(|session| session.workspace_root.as_str());
         let blocks: Vec<Block> = rows
             .iter()
             .filter(|row| row_is_rendered(row))
-            .map(block_from_row)
+            .map(|row| {
+                let mut block = block_from_row(row);
+                if matches!(
+                    row.kind,
+                    vibex_desktop_model::TimelineRowKind::ToolCall
+                        | vibex_desktop_model::TimelineRowKind::Command
+                        | vibex_desktop_model::TimelineRowKind::FileOperation
+                        | vibex_desktop_model::TimelineRowKind::WebSearch
+                        | vibex_desktop_model::TimelineRowKind::Collaboration
+                        | vibex_desktop_model::TimelineRowKind::ImageGeneration
+                ) {
+                    let payload = row
+                        .item_ids
+                        .iter()
+                        .filter_map(|id| items.get(id.as_str()))
+                        .max_by_key(|item| item.sequence)
+                        .map(|item| &item.payload);
+                    let activity =
+                        vibex_ui::timeline::Activity::project(row, payload, self.strings.locale);
+                    block.failed = activity.is_failed();
+                    block.activity = Some(activity);
+                    block.details = vibex_ui::tool_detail::project(
+                        row,
+                        payload,
+                        workspace,
+                        self.strings.locale,
+                    );
+                }
+                block
+            })
             .collect();
         // A prepend is the only change that moves the content under the
         // viewport, and it is recognisable from the head alone: the block that
@@ -5270,11 +5314,14 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
             && (row.collapsible || crate::transcript::is_dense_row(row.kind)),
         streaming: row.streaming,
         failed: row.failed,
-        pending_permission: row.pending_permission || row.turn_pending_permission,
+        pending_permission: row.pending_permission,
         file_path: row.file_path.clone(),
         runtime_attribution: row.runtime_attribution.clone(),
         conclusion: row.conclusion,
         group: crate::transcript::GroupRole::Solo,
+        activity: None,
+        details: Vec::new(),
+        group_summary: None,
     }
 }
 

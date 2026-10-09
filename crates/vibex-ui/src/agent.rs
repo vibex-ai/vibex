@@ -350,7 +350,7 @@ impl AgentWorkflowState {
     /// The runtime's session state is the authority, and a just-accepted send
     /// counts as running while the snapshot catches up — the same rule the
     /// conversation projection applies.
-    fn turn_is_live(&self) -> bool {
+    pub fn is_turn_live(&self) -> bool {
         let pending_turn = self.pending_mutations.values().any(|kind| {
             matches!(
                 kind,
@@ -385,7 +385,7 @@ impl AgentWorkflowState {
     /// else is settled here, once, for every client that renders rows.
     pub fn transcript_rows(&self) -> Vec<vibex_desktop_model::TimelineRow> {
         let mut rows = self.timeline.rows();
-        let live = self.turn_is_live();
+        let live = self.is_turn_live();
         let last_turn = rows
             .iter()
             .filter_map(|row| row.turn_id.clone())

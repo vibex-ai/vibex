@@ -1,3 +1,6 @@
+#[path = "timeline.rs"]
+mod timeline;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -98,8 +101,7 @@ const REASONING_SUMMARY_CACHE_LIMIT: usize = 64;
 
 #[derive(Clone)]
 struct ReasoningRowSummary {
-    source_len: usize,
-    has_more: bool,
+    source_hash: u64,
     preview: String,
 }
 
@@ -5956,13 +5958,10 @@ impl MobileApp {
     }
 
     fn timeline_process_expanded(&self, turn: &TimelineConversationTurn) -> bool {
-        if !turn.complete || turn.superseded {
-            return true;
-        }
         self.expanded_process
             .get(&turn.id)
             .copied()
-            .unwrap_or(false)
+            .unwrap_or(!turn.complete || turn.superseded)
     }
 
     fn effective_timeline_display_settings(&self) -> AgentTimelineDisplaySettings {
@@ -6169,11 +6168,7 @@ impl MobileApp {
     fn toggle_timeline_row(&mut self, id: String, cx: &mut Context<Self>) {
         if self.collapsed_timeline_rows.remove(&id) {
             self.expanded_timeline_rows.insert(id);
-        } else if self.expanded_timeline_rows.remove(&id)
-            || self
-                .effective_timeline_display_settings()
-                .reasoning_expanded_by_default
-        {
+        } else if self.expanded_timeline_rows.remove(&id) {
             self.collapsed_timeline_rows.insert(id);
         } else {
             self.expanded_timeline_rows.insert(id);
@@ -9511,28 +9506,10 @@ impl MobileApp {
     ) -> impl IntoElement {
         let expanded = self.timeline_process_expanded(turn);
         let display_settings = self.effective_timeline_display_settings();
-        let turn_id = turn.id.clone();
-        let (agent_identity, _runtime_label) =
-            timeline_runtime_attribution_parts(turn.runtime_attribution.as_deref());
-        let agent_icon = agent_identity.as_deref().map(agent_icon_path);
-        let duration = format_compact_duration(
-            turn.started_at_ms,
-            (turn.complete || turn.superseded)
-                .then_some(turn.ended_at_ms)
-                .flatten(),
-        );
-        let worked_label = format!(
-            "{} {duration}",
-            locale::text("Worked for", "工作了", "工作了")
-        );
         let conclusion_row = turn
             .conclusion_row
             .as_ref()
             .filter(|row| !row.body.trim().is_empty());
-        let process_collapsible = turn.complete || turn.superseded;
-        let has_response = !turn.process_rows.is_empty()
-            || conclusion_row.is_some()
-            || !(turn.complete || turn.superseded);
         div()
             .id(format!("timeline-turn:{}", turn.id))
             .w_full()
@@ -9544,86 +9521,8 @@ impl MobileApp {
             .when_some(turn.user_row.as_ref(), |container, row| {
                 container.child(self.render_user_message_row(row, cx))
             })
-            .when(has_response, |container| {
-                container.child(
-                    div().w_full().min_w_0().flex().flex_col().gap_3().child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .pb_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .id(format!("turn-process:{}", turn.id))
-                                    .w_full()
-                                    .min_w_0()
-                                    .min_h(px(40.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .when(process_collapsible, |header| {
-                                        header
-                                            .cursor_pointer()
-                                            .active(|style| style.bg(theme::row_pressed_bg()))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.toggle_process(
-                                                        turn_id.clone(),
-                                                        expanded,
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                    })
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .flex_wrap()
-                                            .when_some(agent_icon, |left, path| {
-                                                left.child(
-                                                    svg()
-                                                        .path(path)
-                                                        .size(px(theme::ICON_SM))
-                                                        .flex_shrink_0()
-                                                        .text_color(theme::text_secondary()),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .flex_shrink_0()
-                                                    .whitespace_nowrap()
-                                                    .text_size(px(theme::FONT_CAPTION))
-                                                    .text_color(theme::text_muted())
-                                                    .child(worked_label.clone()),
-                                            ),
-                                    )
-                                    .when(process_collapsible, |header| {
-                                        header.child(
-                                            svg()
-                                                .path(if expanded {
-                                                    "icons/chevron-down.svg"
-                                                } else {
-                                                    "icons/chevron-right.svg"
-                                                })
-                                                .size(px(theme::ICON_SM))
-                                                .flex_shrink_0()
-                                                .text_color(theme::text_muted()),
-                                        )
-                                    }),
-                            ),
-                    ),
-                )
+            .when(!turn.process_rows.is_empty(), |container| {
+                container.child(self.render_turn_process_header(turn, expanded, cx))
             })
             .when(expanded && !turn.process_rows.is_empty(), |container| {
                 container.children(self.render_timeline_process_rows(turn, cx))
@@ -9638,10 +9537,9 @@ impl MobileApp {
             .when(
                 conclusion_row.is_none()
                     && !(turn.complete || turn.superseded)
-                    && !turn
-                        .process_rows
-                        .iter()
-                        .any(|row| row.kind == TimelineRowKind::Reasoning && row.streaming),
+                    && !turn.process_rows.iter().any(|row| {
+                        row.kind == TimelineRowKind::Reasoning && self.reasoning_live(row)
+                    }),
                 |container| {
                     if display_settings.reasoning_display_mode
                         == AgentTimelineReasoningDisplayMode::LatestAtBottom
@@ -9711,11 +9609,16 @@ impl MobileApp {
     }
 
     fn timeline_row_latest_payload(&self, row: &TimelineRow) -> Option<&TimelinePayload> {
-        self.controller
-            .as_ref()?
-            .state
-            .timeline
-            .items
+        let items = &self.controller.as_ref()?.state.timeline.items;
+        // Authoritative history and streamed inserts are sequence-sorted.
+        // Summarizing a long activity group must not scan the entire history
+        // again for each member.
+        if let Ok(index) = items.binary_search_by_key(&row.last_sequence, |item| item.sequence)
+            && row.item_ids.iter().any(|id| id == items[index].id.as_str())
+        {
+            return Some(&items[index].payload);
+        }
+        items
             .iter()
             .filter(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
             .max_by_key(|item| item.sequence)
@@ -9912,6 +9815,7 @@ impl MobileApp {
             });
             if let Some(group) = group {
                 elements.push(self.render_process_activity_group(
+                    turn,
                     group,
                     &turn.process_rows[group.start_row..group.end_row],
                     cx,
@@ -10067,27 +9971,34 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> Entity<markdown::MarkdownView> {
         let revision = row.last_sequence.max(0) as u64;
-        let live_row = row.id.starts_with("reasoning-live:");
         let mut views = self.timeline_markdown_views.borrow_mut();
         if let Some((view, cached_revision, cached_source)) = views.get_mut(&key) {
-            let source = if *cached_revision == revision
-                && ((!live_row && cached_source.len() == row.body.len())
-                    || (live_row && cached_source.as_ref() == row.body.as_str()))
-            {
-                cached_source.clone()
-            } else {
-                Arc::<str>::from(row.body.as_str())
-            };
+            let source =
+                if *cached_revision == revision && cached_source.as_ref() == row.body.as_str() {
+                    cached_source.clone()
+                } else {
+                    Arc::<str>::from(row.body.as_str())
+                };
             *cached_revision = revision;
             *cached_source = source.clone();
             let view = view.clone();
             drop(views);
-            view.update(cx, |view, cx| view.set_source(source, revision, cx));
+            view.update(cx, |view, cx| {
+                view.set_source(source, revision, cx);
+                view.set_muted(row.kind == TimelineRowKind::Reasoning, cx);
+            });
             return view;
         }
 
         let source = Arc::<str>::from(row.body.as_str());
-        let view = cx.new(|cx| markdown::render(source.clone(), revision, cx));
+        let view = cx.new(|cx| {
+            markdown::render(
+                source.clone(),
+                revision,
+                row.kind == TimelineRowKind::Reasoning,
+                cx,
+            )
+        });
         if views.len() >= TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT
             && let Some(evicted) = views.keys().next().cloned()
         {
@@ -10444,589 +10355,6 @@ impl MobileApp {
             .min_w_0()
             .text_color(theme::text_secondary())
             .child(self.render_markdown_view(format!("thought:{}", row.id), row, cx))
-            .into_any_element()
-    }
-
-    fn render_reasoning_row(&self, row: &TimelineRow, cx: &mut Context<Self>) -> gpui::AnyElement {
-        if row.body.trim().is_empty() {
-            return div().id(row.id.clone()).into_any_element();
-        }
-        let row_id = row.id.clone();
-        let expanded = self.reasoning_row_expanded(&row_id, row);
-        if expanded {
-            let (first_line_source, remaining_source) = reasoning_source_parts(&row.body);
-            let first_line_row = self.render_markdown_view(
-                format!("thought:{}:first-line", row.id),
-                &reasoning_first_line_row(row, first_line_source),
-                cx,
-            );
-            let remaining = remaining_source.map(|source| {
-                self.render_markdown_view(
-                    format!("thought:{}:remaining", row.id),
-                    &reasoning_remaining_row(row, source),
-                    cx,
-                )
-            });
-            let mut layout = div()
-                .id(row_id.clone())
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            svg()
-                                .path("icons/brain.svg")
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .max_w_full()
-                                .text_color(theme::text_muted())
-                                .child(first_line_row),
-                        )
-                        .child(
-                            svg()
-                                .path("icons/chevron-down.svg")
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        ),
-                );
-            if let Some(remaining) = remaining {
-                layout = layout.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .pl(px(22.0))
-                        .border_l_1()
-                        .border_color(theme::text_muted().opacity(0.46))
-                        .ml(px(7.0))
-                        .text_color(theme::text_muted())
-                        .child(remaining),
-                );
-            }
-            return layout
-                .cursor_pointer()
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.collapsed_timeline_rows.insert(row_id.clone());
-                        this.expanded_timeline_rows.remove(&row_id);
-                        this.timeline_list.remeasure();
-                        cx.notify();
-                    }),
-                )
-                .into_any_element();
-        }
-        let summary = reasoning_summary_cached(&row_id, row.last_sequence.max(0), &row.body);
-        let content: gpui::AnyElement = if row.streaming {
-            render_mobile_thinking_indicator(&row.id, &summary.preview)
-        } else {
-            div()
-                .min_w_0()
-                .flex_1()
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
-                .text_size(px(theme::FONT_CAPTION))
-                .text_color(theme::text_muted())
-                .child(summary.preview.clone())
-                .into_any_element()
-        };
-        let mut container = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_color(theme::text_muted())
-            .child(content);
-        if summary.has_more {
-            container = container
-                .child(
-                    svg()
-                        .path("icons/chevron-right.svg")
-                        .size(px(14.0))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted()),
-                )
-                .cursor_pointer()
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.expanded_timeline_rows.insert(row_id.clone());
-                        this.collapsed_timeline_rows.remove(&row_id);
-                        this.timeline_list.remeasure();
-                        cx.notify();
-                    }),
-                );
-        }
-        container.into_any_element()
-    }
-
-    fn reasoning_row_expanded(&self, row_id: &str, _row: &TimelineRow) -> bool {
-        if self.collapsed_timeline_rows.contains(row_id) {
-            return false;
-        }
-        if self.expanded_timeline_rows.contains(row_id) {
-            return true;
-        }
-        // Desktop parity: expansion defaults from the "expand reasoning by
-        // default" setting; streaming state does not force the row open.
-        self.effective_timeline_display_settings()
-            .reasoning_expanded_by_default
-    }
-
-    fn render_process_activity_group(
-        &self,
-        group: &TimelineProcessActivityGroup,
-        rows: &[TimelineRow],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let Some(latest_row) = rows.last() else {
-            return div().id(group.id.clone()).into_any_element();
-        };
-        let streaming = rows.iter().any(|row| row.streaming);
-        let expanded = streaming || self.timeline_row_expanded(&group.id);
-        let can_expand = !streaming;
-        let group_id = group.id.clone();
-        let summary = timeline_activity_summary(latest_row);
-        div()
-            .id(group.id.clone())
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .id(format!("activity-group:{}", group.id))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(can_expand, |header| {
-                        header
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_timeline_row(group_id.clone(), cx)
-                                }),
-                            )
-                    })
-                    .child(
-                        svg()
-                            .path(self.timeline_row_icon_path_for_row(latest_row))
-                            .size(px(14.0))
-                            .flex_shrink_0()
-                            .text_color(timeline_activity_icon_color(latest_row)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(if latest_row.failed {
-                                theme::accent_red()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .child(summary),
-                    )
-                    .when(can_expand, |header| {
-                        header.child(
-                            svg()
-                                .path(if expanded {
-                                    "icons/chevron-down.svg"
-                                } else {
-                                    "icons/chevron-right.svg"
-                                })
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                    }),
-            )
-            .when(expanded, |group| {
-                group.child(
-                    div()
-                        .ml_2()
-                        .border_l_1()
-                        .border_color(theme::border_subtle())
-                        .pl_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .children(
-                            rows.iter()
-                                .map(|row| self.render_process_activity_line(row, cx)),
-                        ),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_process_activity_line(
-        &self,
-        row: &TimelineRow,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let has_details = !row.body.trim().is_empty() || row.file_path.is_some();
-        let can_expand = has_details && !row.streaming;
-        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
-        let row_id = row.id.clone();
-        div()
-            .id(format!("activity:{}", row.id))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .id(format!("activity-header:{}", row.id))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(can_expand, |line| {
-                        line.cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_timeline_row(row_id.clone(), cx)
-                                }),
-                            )
-                    })
-                    .child(
-                        svg()
-                            .path(self.timeline_row_icon_path_for_row(row))
-                            .size(px(14.0))
-                            .flex_shrink_0()
-                            .text_color(timeline_activity_icon_color(row)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(if row.failed {
-                                theme::accent_red()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .child(timeline_activity_summary(row)),
-                    )
-                    .when(can_expand, |line| {
-                        line.child(
-                            svg()
-                                .path(if expanded {
-                                    "icons/chevron-down.svg"
-                                } else {
-                                    "icons/chevron-right.svg"
-                                })
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                    }),
-            )
-            .when(expanded, |line| {
-                line.child(
-                    div()
-                        .ml(px(24.0))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .when(!row.body.trim().is_empty(), |details| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Details", "详情", "詳細資料"),
-                                &row.body,
-                            ))
-                        })
-                        .when_some(row.file_path.as_ref(), |details, path| {
-                            details.child(
-                                self.render_timeline_detail(
-                                    locale::text("File", "文件", "檔案"),
-                                    path,
-                                ),
-                            )
-                        }),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_command_execution_card(
-        &self,
-        row: &TimelineRow,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let Some(TimelinePayload::Command(command)) = self.timeline_row_latest_payload(row) else {
-            return self.render_process_activity_line(row, cx);
-        };
-        let has_details = !command.command.trim().is_empty()
-            || command.cwd.is_some()
-            || command.output_summary.is_some()
-            || command.exit_code.is_some();
-        let can_expand = has_details && !row.streaming;
-        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
-        let row_id = row.id.clone();
-        let failed = command.status == vibex_core::CommandStatus::Failed;
-        let title = if command.command.trim().is_empty() {
-            locale::text("Command", "命令", "命令").to_string()
-        } else {
-            command.command.clone()
-        };
-        div()
-            .id(format!("command-card:{}", row.id))
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(if failed {
-                theme::accent_red().opacity(0.46)
-            } else {
-                theme::border_default()
-            })
-            .bg(theme::bg_card_dim())
-            .child(
-                div()
-                    .id(format!("command-card-header:{}", row.id))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(40.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(can_expand, |header| {
-                        header
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_timeline_row(row_id.clone(), cx)
-                                }),
-                            )
-                    })
-                    .child(
-                        svg()
-                            .path("icons/square-terminal.svg")
-                            .size(px(14.0))
-                            .flex_shrink_0()
-                            .text_color(if failed {
-                                theme::accent_red()
-                            } else {
-                                theme::text_muted()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .font_family("IBM Plex Sans")
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_primary())
-                            .child(title),
-                    )
-                    .when(can_expand, |header| {
-                        header.child(
-                            svg()
-                                .path(if expanded {
-                                    "icons/chevron-down.svg"
-                                } else {
-                                    "icons/chevron-right.svg"
-                                })
-                                .size(px(theme::ICON_SM))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                    })
-                    .child(timeline_status_badge(
-                        timeline_row_status_label(row),
-                        timeline_row_color(row),
-                    )),
-            )
-            .when(expanded, |card| {
-                card.child(
-                    div()
-                        .border_t_1()
-                        .border_color(theme::border_subtle())
-                        .p_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .when_some(command.cwd.as_ref(), |details, cwd| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Working directory", "工作目录", "工作目錄"),
-                                cwd,
-                            ))
-                        })
-                        .child(self.render_timeline_detail(
-                            locale::text("Command", "命令", "命令"),
-                            &format!("$ {}", command.command),
-                        ))
-                        .when_some(command.output_summary.as_ref(), |details, output| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Output", "输出", "輸出"),
-                                output,
-                            ))
-                        })
-                        .when_some(command.exit_code, |details, exit_code| {
-                            details.child(
-                                div()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(if exit_code == 0 {
-                                        theme::accent_green()
-                                    } else {
-                                        theme::accent_red()
-                                    })
-                                    .child(format!(
-                                        "{}: {exit_code}",
-                                        locale::text("Exit code", "退出码", "結束代碼")
-                                    )),
-                            )
-                        }),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_file_operation_card(
-        &self,
-        row: &TimelineRow,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let Some(TimelinePayload::FileOperation(operation)) = self.timeline_row_latest_payload(row)
-        else {
-            return self.render_process_activity_line(row, cx);
-        };
-        let patch = operation.patch.as_ref().map(|patch| patch.text.as_str());
-        let has_details = !operation.summary.trim().is_empty() || patch.is_some();
-        let can_expand = has_details && !row.streaming;
-        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
-        let row_id = row.id.clone();
-        let title = format!(
-            "{} {}",
-            file_operation_verb(operation.operation),
-            operation.path
-        );
-        div()
-            .id(format!("file-operation-card:{}", row.id))
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_default())
-            .bg(theme::bg_card_dim())
-            .child(
-                div()
-                    .id(format!("file-operation-card-header:{}", row.id))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(40.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(can_expand, |header| {
-                        header
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_timeline_row(row_id.clone(), cx)
-                                }),
-                            )
-                    })
-                    .child(
-                        svg()
-                            .path("icons/file-text.svg")
-                            .size(px(14.0))
-                            .flex_shrink_0()
-                            .text_color(theme::text_muted()),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_primary())
-                            .child(title),
-                    )
-                    .when(can_expand, |header| {
-                        header.child(
-                            svg()
-                                .path(if expanded {
-                                    "icons/chevron-down.svg"
-                                } else {
-                                    "icons/chevron-right.svg"
-                                })
-                                .size(px(theme::ICON_SM))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                    }),
-            )
-            .when(expanded, |card| {
-                card.child(
-                    div()
-                        .border_t_1()
-                        .border_color(theme::border_subtle())
-                        .p_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .when(!operation.summary.trim().is_empty(), |details| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Summary", "摘要", "摘要"),
-                                &operation.summary,
-                            ))
-                        })
-                        .when_some(patch, |details, patch| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Changes", "变更", "變更"),
-                                patch,
-                            ))
-                        }),
-                )
-            })
             .into_any_element()
     }
 
@@ -17969,13 +17297,12 @@ fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
 fn timeline_process_activity_groups_for_display(
     turn: &TimelineConversationTurn,
     enhanced_command_display: bool,
-    enhanced_file_operation_display: bool,
+    _enhanced_file_operation_display: bool,
 ) -> &[TimelineProcessActivityGroup] {
-    match (enhanced_command_display, enhanced_file_operation_display) {
-        (true, true) => &turn.process_activity_groups,
-        (false, true) => &turn.process_activity_groups_with_commands,
-        (true, false) => &turn.process_activity_groups_with_file_operations,
-        (false, false) => &turn.process_activity_groups_with_commands_and_file_operations,
+    if enhanced_command_display {
+        &turn.process_activity_groups_with_file_operations
+    } else {
+        &turn.process_activity_groups_with_commands_and_file_operations
     }
 }
 
@@ -18030,16 +17357,6 @@ fn process_title(row: &TimelineRow) -> String {
         TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage => "Message",
     })
     .to_string()
-}
-
-fn timeline_activity_summary(row: &TimelineRow) -> String {
-    if !row.title.trim().is_empty() {
-        return row.title.clone();
-    }
-    if !row.body.trim().is_empty() {
-        return timeline_row_preview(&row.body);
-    }
-    process_title(row)
 }
 
 fn timeline_row_preview(body: &str) -> String {
@@ -18160,57 +17477,26 @@ fn reasoning_preview_text(label: &str) -> String {
     truncate_agent_thinking_label(normalized.trim())
 }
 
-/// Desktop parity: `reasoning_source_parts` — split a reasoning body into the
-/// first line (shown beside the brain icon) and the remaining lines (shown
-/// under a thin connector while expanded).
-fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
-    let source = source.trim_start_matches(['\r', '\n']);
-    let Some((first_line, remaining)) = source.split_once('\n') else {
-        return (source.trim_end_matches('\r'), None);
-    };
-    let first_line = first_line.trim_end_matches('\r');
-    let remaining = remaining.trim_start_matches(['\r', '\n']);
-    (
-        first_line,
-        (!remaining.trim().is_empty()).then_some(remaining),
-    )
-}
-
-/// Synthetic single-line rows so the shared markdown view cache can render the
-/// first line and the remaining lines of an expanded reasoning row separately.
-fn reasoning_first_line_row(row: &TimelineRow, source: &str) -> TimelineRow {
-    TimelineRow {
-        id: format!("{}:first-line", row.id),
-        body: source.to_string(),
-        ..row.clone()
-    }
-}
-
-fn reasoning_remaining_row(row: &TimelineRow, source: &str) -> TimelineRow {
-    TimelineRow {
-        id: format!("{}:remaining", row.id),
-        body: source.to_string(),
-        ..row.clone()
-    }
-}
-
 /// Desktop parity: `timeline_reasoning_summary_cached_at` — collapsed
 /// reasoning rows repaint on every shimmer frame, so derive the preview from
 /// the parsed plain text once per (row, sequence, body) instead of re-running
 /// the projection in the render closure.
 fn reasoning_summary_cached(row_id: &str, sequence: i64, body: &str) -> ReasoningRowSummary {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hash);
+    let source_hash = hash.finish();
     let mut cache = REASONING_SUMMARY_CACHE.lock_or_insert();
     if let Some((cached_sequence, summary)) = cache.get(row_id)
         && *cached_sequence == sequence
-        && summary.source_len == body.len()
+        && summary.source_hash == source_hash
     {
         return summary.clone();
     }
     let plain = reasoning_plain_text(body);
     let preview = reasoning_preview_text(&plain);
     let summary = ReasoningRowSummary {
-        source_len: body.len(),
-        has_more: plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS,
+        source_hash,
         preview,
     };
     if cache.len() >= REASONING_SUMMARY_CACHE_LIMIT && !cache.contains_key(row_id) {
@@ -18494,16 +17780,6 @@ fn timeline_row_color(row: &TimelineRow) -> gpui::Hsla {
     }
 }
 
-fn timeline_activity_icon_color(row: &TimelineRow) -> Hsla {
-    // Desktop parity: process activity is single-tone; only a failed row
-    // leaves the muted foreground (for the danger tint).
-    if row.failed {
-        theme::accent_red()
-    } else {
-        theme::text_muted()
-    }
-}
-
 fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
     match kind {
         TimelineRowKind::Reasoning => "icons/brain.svg",
@@ -18563,101 +17839,9 @@ fn timeline_payload_icon_path(payload: &TimelinePayload) -> &'static str {
 }
 
 fn timeline_tool_icon_path(tool_name: &str, summary: &str) -> &'static str {
-    semantic_timeline_tool_icon_path(tool_name)
-        .or_else(|| semantic_timeline_tool_icon_path(summary))
-        .unwrap_or("icons/zap.svg")
-}
-
-fn semantic_timeline_tool_icon_path(value: &str) -> Option<&'static str> {
-    let terms = normalized_timeline_activity_terms(value);
-    let has_any = |candidates: &[&str]| {
-        terms
-            .split_whitespace()
-            .any(|term| candidates.contains(&term))
-    };
-
-    if has_any(&[
-        "command",
-        "execute",
-        "exec",
-        "shell",
-        "terminal",
-        "bash",
-        "powershell",
-        "run",
-        "ran",
-    ]) {
-        Some("icons/square-terminal.svg")
-    } else if has_any(&["search", "searched", "grep", "find", "query", "rg"]) {
-        Some("icons/search.svg")
-    } else if has_any(&[
-        "list",
-        "listed",
-        "glob",
-        "directory",
-        "directories",
-        "folder",
-        "folders",
-        "tree",
-    ]) {
-        Some("icons/folder.svg")
-    } else if has_any(&["delete", "deleted", "remove", "removed", "trash"]) {
-        Some("icons/trash-2.svg")
-    } else if has_any(&["create", "created", "write", "wrote", "add", "added", "new"]) {
-        Some("icons/file-plus.svg")
-    } else if has_any(&[
-        "edit", "edited", "patch", "patched", "replace", "replaced", "update", "updated",
-    ]) {
-        Some("icons/pencil.svg")
-    } else if has_any(&[
-        "read",
-        "view",
-        "viewed",
-        "open",
-        "opened",
-        "inspect",
-        "inspected",
-        "load",
-        "loaded",
-    ]) {
-        Some("icons/book-open.svg")
-    } else if has_any(&["todo", "plan", "checklist"]) {
-        Some("icons/list-checks.svg")
-    } else if has_any(&["agent", "collaboration", "delegate", "task"]) {
-        Some("icons/user.svg")
-    } else if has_any(&["image", "picture", "photo"]) {
-        Some("icons/image.svg")
-    } else if has_any(&["mcp", "plugin", "integration", "skill"]) {
-        Some("icons/plug-zap.svg")
-    } else {
-        None
-    }
-}
-
-fn normalized_timeline_activity_terms(value: &str) -> String {
-    let mut terms = String::with_capacity(value.len());
-    let mut previous_was_lower_or_digit = false;
-    let mut previous_was_separator = true;
-    for character in value.trim().chars() {
-        if character.is_ascii_alphanumeric() {
-            if character.is_ascii_uppercase()
-                && previous_was_lower_or_digit
-                && !previous_was_separator
-            {
-                terms.push(' ');
-            }
-            terms.push(character.to_ascii_lowercase());
-            previous_was_lower_or_digit =
-                character.is_ascii_lowercase() || character.is_ascii_digit();
-            previous_was_separator = false;
-        } else if !previous_was_separator && !terms.is_empty() {
-            terms.push(' ');
-            previous_was_lower_or_digit = false;
-            previous_was_separator = true;
-        }
-    }
-    terms.truncate(terms.trim_end().len());
-    terms
+    timeline::icon_path(vibex_ui::timeline::generic_activity_kind(
+        tool_name, summary,
+    ))
 }
 
 fn timeline_status_badge(label: String, color: gpui::Hsla) -> gpui::AnyElement {
@@ -19109,7 +18293,7 @@ mod tests {
     fn timeline_tool_icon_prefers_tool_name_over_summary() {
         assert_eq!(
             timeline_tool_icon_path("read_file", "run command"),
-            "icons/book-open.svg"
+            "icons/file-text.svg"
         );
         assert_eq!(
             timeline_tool_icon_path("custom_tool", "search files"),

@@ -3,7 +3,7 @@
 //! The clients deliberately support only the languages for which Vibex ships
 //! complete product copy.  Any other system language falls back to English.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Locale {
     En,
     ZhCn,
@@ -11,6 +11,20 @@ pub enum Locale {
 }
 
 impl Locale {
+    /// Select product copy without introducing a client-global locale dependency.
+    pub const fn text(
+        self,
+        en: &'static str,
+        zh_cn: &'static str,
+        zh_tw: &'static str,
+    ) -> &'static str {
+        match self {
+            Self::En => en,
+            Self::ZhCn => zh_cn,
+            Self::ZhTw => zh_tw,
+        }
+    }
+
     pub const fn tag(self) -> &'static str {
         match self {
             Self::En => "en",

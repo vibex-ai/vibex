@@ -50101,11 +50101,11 @@ impl VibexWorkbench {
         let mut summary = timeline_activity::ActivitySummary::default();
         for row in rows {
             let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
-            summary.record(&timeline_activity::Activity::project(row, payload), &row.id);
+            summary.record(&timeline_activity::project(row, payload), &row.id);
         }
         let header = timeline_activity::summary_header(
             format!("activity-summary:{}", group.id),
-            summary.label(),
+            summary.label(timeline_activity::current_locale()),
             expanded,
             rows.iter()
                 .any(|row| timeline_activity::is_running(row, turn_live)),
@@ -56263,24 +56263,7 @@ fn agent_turn_preview_content(
 }
 
 fn agent_file_display_name(path: &str) -> String {
-    if let Ok(url) = url::Url::parse(path)
-        && url.scheme() == "file"
-    {
-        return url
-            .path_segments()
-            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
-            .map(|name| {
-                percent_encoding::percent_decode_str(name)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| path.to_string());
-    }
-    path.trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .find(|name| !name.is_empty())
-        .unwrap_or(path)
-        .to_string()
+    vibex_ui::timeline::file_display_name(path)
 }
 
 /// Whether a conversation turn owns a numbered slot in the session preview
@@ -57130,22 +57113,9 @@ impl ToolCardProjection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessActivityIcon {
-    Command,
-    Search,
-    Directory,
-    FileRead,
-    FileEdit,
-    FileCreate,
-    FileDelete,
-    Todo,
-    Collaboration,
-    Image,
-    Integration,
-    Retry,
-    Generic,
-}
+use vibex_ui::timeline::ActivityKind as ProcessActivityIcon;
+#[cfg(test)]
+use vibex_ui::timeline::generic_activity_kind as generic_tool_activity_icon;
 
 fn process_activity_icon(kind: ProcessActivityIcon) -> Icon {
     match kind {
@@ -57163,104 +57133,6 @@ fn process_activity_icon(kind: ProcessActivityIcon) -> Icon {
         ProcessActivityIcon::Retry => Icon::default().path("icons/vibex/wifi-outlined.svg"),
         ProcessActivityIcon::Generic => Icon::default().path("icons/vibex/zap.svg"),
     }
-}
-
-fn generic_tool_activity_icon(tool_name: &str, summary: &str) -> ProcessActivityIcon {
-    semantic_tool_activity_icon(tool_name)
-        .or_else(|| semantic_tool_activity_icon(summary))
-        .unwrap_or(ProcessActivityIcon::Generic)
-}
-
-fn semantic_tool_activity_icon(value: &str) -> Option<ProcessActivityIcon> {
-    let terms = normalized_activity_terms(value);
-    let has_any = |candidates: &[&str]| {
-        terms
-            .split_whitespace()
-            .any(|term| candidates.contains(&term))
-    };
-
-    if has_any(&["todo", "todos", "plan", "checklist"]) {
-        Some(ProcessActivityIcon::Todo)
-    } else if has_any(&[
-        "command",
-        "execute",
-        "exec",
-        "shell",
-        "terminal",
-        "bash",
-        "powershell",
-        "run",
-        "ran",
-    ]) {
-        Some(ProcessActivityIcon::Command)
-    } else if has_any(&["search", "searched", "grep", "find", "query", "rg"]) {
-        Some(ProcessActivityIcon::Search)
-    } else if has_any(&[
-        "list",
-        "listed",
-        "glob",
-        "directory",
-        "directories",
-        "folder",
-        "folders",
-        "tree",
-    ]) {
-        Some(ProcessActivityIcon::Directory)
-    } else if has_any(&["delete", "deleted", "remove", "removed", "trash"]) {
-        Some(ProcessActivityIcon::FileDelete)
-    } else if has_any(&["create", "created", "write", "wrote", "add", "added", "new"]) {
-        Some(ProcessActivityIcon::FileCreate)
-    } else if has_any(&[
-        "edit", "edited", "patch", "patched", "replace", "replaced", "update", "updated",
-    ]) {
-        Some(ProcessActivityIcon::FileEdit)
-    } else if has_any(&[
-        "read",
-        "view",
-        "viewed",
-        "open",
-        "opened",
-        "inspect",
-        "inspected",
-        "load",
-        "loaded",
-    ]) {
-        Some(ProcessActivityIcon::FileRead)
-    } else if has_any(&["agent", "subagent", "collaboration", "delegate", "task"]) {
-        Some(ProcessActivityIcon::Collaboration)
-    } else if has_any(&["image", "picture", "photo"]) {
-        Some(ProcessActivityIcon::Image)
-    } else if has_any(&["mcp", "plugin", "integration", "skill"]) {
-        Some(ProcessActivityIcon::Integration)
-    } else {
-        None
-    }
-}
-
-fn normalized_activity_terms(value: &str) -> String {
-    let mut terms = String::with_capacity(value.len());
-    let mut previous_was_lower_or_digit = false;
-    let mut previous_was_separator = true;
-    for character in value.trim().chars() {
-        if character.is_ascii_alphanumeric() {
-            if character.is_ascii_uppercase()
-                && previous_was_lower_or_digit
-                && !previous_was_separator
-            {
-                terms.push(' ');
-            }
-            terms.push(character.to_ascii_lowercase());
-            previous_was_lower_or_digit =
-                character.is_ascii_lowercase() || character.is_ascii_digit();
-            previous_was_separator = false;
-        } else if !previous_was_separator && !terms.is_empty() {
-            terms.push(' ');
-            previous_was_lower_or_digit = false;
-            previous_was_separator = true;
-        }
-    }
-    terms.truncate(terms.trim_end().len());
-    terms
 }
 
 fn plan_step_status_text(status: vibex_core::PlanStepStatus) -> &'static str {
@@ -57747,7 +57619,7 @@ fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
 ///
 /// The same six the TUI's `STREAMING_WINDOW_LINES` keeps, so both clients show
 /// the same amount of a thought that is still arriving.
-const REASONING_WINDOW_LINES: f32 = 6.0;
+const REASONING_WINDOW_LINES: f32 = vibex_ui::timeline::REASONING_WINDOW_LINES as f32;
 
 /// The Markdown surface's line height, which turns the window's row count into
 /// the pixel box the timeline clips against. The view lays its body out at
@@ -58042,7 +57914,7 @@ fn tool_card_projection(
     payload: Option<&vibex_core::TimelinePayload>,
 ) -> ToolCardProjection {
     use vibex_core::TimelinePayload as Payload;
-    let activity = timeline_activity::Activity::project(row, payload);
+    let activity = timeline_activity::project(row, payload);
     let details = match payload {
         Some(Payload::ToolCall(tool)) => {
             let mut details = Vec::new();

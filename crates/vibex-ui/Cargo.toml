@@ -17,6 +17,8 @@ gpui-component = ["dep:gpui", "dep:gpui-component"]
 markdown.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
 gpui = { workspace = true, optional = true }
 gpui-component = { workspace = true, optional = true }
 vibex-core = { path = "../core" }
