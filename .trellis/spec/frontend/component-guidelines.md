@@ -628,6 +628,15 @@ aggregates keep `primary` because their sessions can have different
 auto-continue settings. Waiting, error, and completion states keep their
 distinct symbols.
 
+The running cue also reaches the session title: a sidebar row whose session is
+generating sweeps the title through `ShimmerText` at the shared timeline
+duration and spread, so the pulse in the status column and the light on the text
+read as one state in two places. The sweep is a frame driver for as long as it is
+mounted, so it takes the row's generating gate (`display_state == Running`,
+which already folds in the optimistic local dispatch) and nothing weaker — a
+parked, scheduled, initializing, or idle row keeps the plain truncated title
+with no animation. Its element ID is scoped to the row's session.
+
 ## Timeline Cards
 
 Render Agent activity through provider-neutral cards:

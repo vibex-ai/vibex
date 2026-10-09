@@ -40581,6 +40581,22 @@ impl VibexWorkbench {
             agent_id: sidebar_agent_id.as_str().to_string(),
             pinned,
         };
+        // The running cue reaches the title itself: while the Agent generates,
+        // the label runs the same sweep the timeline's thinking row does, at the
+        // shared pace and spread, and the light in the status column and the
+        // light on the text read as one state in two places. The sweep repeats
+        // for as long as it is mounted, so only a row that is actually
+        // generating takes it; every other row keeps a static title that asks
+        // for no frames.
+        let row_title: AnyElement = if session_generating {
+            ShimmerText::new(row_title)
+                .id(format!("sidebar-session-title-{session_id_string}"))
+                .duration(TIMELINE_SHIMMER_SWEEP)
+                .spread(TIMELINE_SHIMMER_SPREAD)
+                .into_any_element()
+        } else {
+            row_title.into_any_element()
+        };
         let reorder_offset = active_session_drag
             .as_ref()
             .filter(|drag| drag.flat_preview_enabled)
@@ -81135,6 +81151,42 @@ mod tests {
         assert!(sidebar_session.contains(
             "state_label.is_none()\n                                            && !has_unread_completion\n                                            && !session_has_error\n                                            && !auto_continue_paused"
         ));
+    }
+
+    /// The running cue reaches the session title: a row whose Agent is
+    /// generating sweeps the shared timeline light across its title, and every
+    /// other row keeps a static title that asks for no animation frames.
+    #[test]
+    fn sidebar_running_session_titles_shimmer_with_the_shared_timeline_sweep() {
+        let source = include_str!("app.rs");
+        let sidebar_session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_choice("))
+            .map(|(body, _)| body)
+            .expect("sidebar session renderer should remain inspectable");
+        let title = sidebar_session
+            .split_once("        let row_title: AnyElement = if session_generating {")
+            .and_then(|(_, tail)| tail.split_once("        };\n"))
+            .map(|(body, _)| body)
+            .expect("the session title should keep its own running gate");
+
+        assert!(title.contains("ShimmerText::new(row_title)"));
+        assert!(title.contains("format!(\"sidebar-session-title-{session_id_string}\")"));
+        assert!(title.contains("TIMELINE_SHIMMER_SWEEP"));
+        assert!(title.contains("TIMELINE_SHIMMER_SPREAD"));
+        // The sweep repeats for as long as it is mounted, so it takes the same
+        // gate the row's status column uses for "the Agent is working" — a
+        // parked, scheduled or idle row must not drive frames.
+        assert!(title.contains("} else {\n            row_title.into_any_element()\n"));
+        assert!(
+            sidebar_session
+                .contains("let session_generating = display_state == AgentSessionState::Running")
+        );
+        assert_eq!(
+            sidebar_session.matches(".child(row_title)").count(),
+            1,
+            "the title element is what the row's text column shows"
+        );
     }
 
     #[test]
