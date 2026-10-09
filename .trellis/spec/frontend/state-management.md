@@ -605,10 +605,27 @@ Desktop scheduling extends the existing unsent composer queue in
 milliseconds or `After(u64)` seconds. On submission, resolve it once into
 `ComposerQueueMessage.scheduled_at_ms: Option<i64>`.
 
+The pre-send queue persists through `ComposerUiState.queue:
+Vec<ComposerQueueEntry>` in the versioned desktop UI state, and rebuilds
+`ComposerQueueMessage` on launch. A stored entry is bounded: session id, runtime
+selection, text, attachments, optional command, and `scheduledAtMs`.
+
 ### 3. Contracts
 
-- Drafts and queued messages remain in memory and require Vibex to stay open.
-  Never persist prompt text or attachments in UI-state preferences.
+- The pre-send queue survives a restart because it is the reader's own
+  instruction about what to send next. Persist it with the shell state, not with
+  the session: the message has not been submitted to the authority yet, so the
+  shell that queued it owns it. Unsent *drafts* keep the older rule and stay in
+  memory — never persist their text or attachments.
+- `ComposerQueueEntry` is normalized both before it is written and after it is
+  read: bound the entry count, text, and attachments, drop entries with no
+  session or nothing left to send, renumber duplicate ids, and never let a stale
+  file grow the queue without limit.
+- A restored queue waits for the first authoritative session list before it is
+  adopted. Drop entries whose session is gone, keep the order, re-arm the
+  schedule timer, and re-evaluate each waiting session so a deadline that passed
+  while Vibex was closed still fires once — under the same admission rules as a
+  running app, so Manual queue mode still needs the reader's own send.
 - A scheduled new-session submission creates the session with deferred runtime
   materialization and no initial prompt or optimistic user item. Keep its
   message in the queue until dispatch; show a countdown on its empty timeline.
@@ -621,7 +638,17 @@ milliseconds or `After(u64)` seconds. On submission, resolve it once into
   a queue edit or closing its scheduling dialog re-arms queue evaluation.
 - Reordering preserves deadlines; an explicit per-message send clears the
   deadline. Sidebar clocks are a presentation of queued schedules, never a new
-  `AgentSessionState`, and running/needs-input indicators retain priority.
+  `AgentSessionState`. A session that is only waiting for its scheduled send
+  shows the clock and the time left in the row's status lane — including through
+  the `Initializing` state a deferred session reports — while a running turn, an
+  Agent parked on the user, or a closed session keeps its own state and
+  indicator.
+- A session that exists only to wait for its scheduled message is named after
+  that message, not after the manager's `<agent> session` placeholder. The name
+  is derived from the queue rather than remembered, so a restart restores it and
+  every authoritative snapshot keeps it. It stops being derived the moment the
+  send leaves the queue, which leaves the Agent's own rename free to land after
+  the real send. A session that already carries a name of its own keeps it.
 
 ### 4. Validation & Error Matrix
 
@@ -632,6 +659,9 @@ milliseconds or `After(u64)` seconds. On submission, resolve it once into
 | Countdown is outside 1 second–365 days, overflows, or has minutes/seconds outside 0–59 | Keep the picker open with an inline error |
 | Session is running, initializing, closed, archived, or unavailable | Retain the scheduled message without dispatch |
 | Session creation fails before a record exists | Remove the pending queue entry and restore the active new-session draft including its schedule |
+| A restored entry's session no longer exists | Drop the entry and persist the pruned queue |
+| A restored deadline passed while Vibex was closed | Fire it once, under the ordinary admission rules, instead of dropping it |
+| A stored entry has no session, nothing to send, or a duplicate id | Drop it, or renumber the id, before the queue reaches the panel |
 
 ### 5. Good / Base / Bad Cases
 
@@ -640,13 +670,20 @@ milliseconds or `After(u64)` seconds. On submission, resolve it once into
 - Base: unscheduled messages keep their Auto/Manual behavior.
 - Bad: render a scheduled prompt on the timeline at submission, or make queue
   resume send a future deadline early.
+- Bad: show the manager's `<agent> session` placeholder on a row that is only
+  waiting for its scheduled send, or keep that name after the send has landed.
 
 ### 6. Tests Required
 
 `message_schedule_tests.rs` covers deadline boundaries, countdown validation,
 session isolation, active-turn admission, edits, reordering/send-now, draft
-consumption, and real dialog keyboard/pointer interaction including invalid
-input, confirmation, dismissal, and removing a schedule.
+consumption, the row's countdown shape, the name a waiting schedule gives its
+session, and the persisted-entry round trip, plus real dialog keyboard/pointer
+interaction including invalid input, confirmation, dismissal, and removing a
+schedule. `desktop-model` covers the persisted queue's normalization, its
+bounds, and the UI-state encode/decode round trip. A source-level test asserts
+the row keeps the scheduled mark ahead of the generic state indicator and reads
+its name from the queue.
 
 ### 7. Wrong vs Correct
 
@@ -655,6 +692,15 @@ input, confirmation, dismissal, and removing a schedule.
 let due = MessageSchedule::After(seconds).deadline(now_ms)?;
 // Correct: compare the deadline captured when the user submitted the message.
 let due = message.scheduled_at_ms.is_some_and(|at_ms| at_ms <= now_ms);
+```
+
+```rust
+// Wrong: remember the name a waiting schedule gives its session in a map that a
+// restart empties, and keep applying it after the send, blocking the rename.
+titles.insert(session_id.clone(), message_text);
+// Correct: derive it from the persisted queue, and stop deriving it once the
+// message has left the queue.
+let title = scheduled_session_title(&self.composer_queue, session);
 ```
 
 ## Scenario: Live Reasoning As Turn Progress

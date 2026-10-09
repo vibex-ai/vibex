@@ -56,6 +56,111 @@ fn countdown_starts_on_submission_and_absolute_time_does_not_move() {
     assert_eq!(format_remaining(-1), "00:00:00");
 }
 
+/// The sidebar's status column is one narrow lane, so the countdown changes
+/// shape with the distance instead of growing an hour field nobody reads.
+#[test]
+fn the_row_countdown_ticks_in_seconds_and_switches_to_days() {
+    assert_eq!(format_schedule_countdown(0), "00:00:00");
+    assert_eq!(format_schedule_countdown(-5_000), "00:00:00");
+    // A deadline that has not arrived yet never reads as zero.
+    assert_eq!(format_schedule_countdown(1), "00:00:01");
+    assert_eq!(format_schedule_countdown(59_001), "00:01:00");
+    assert_eq!(format_schedule_countdown(3_661_001), "01:01:02");
+    assert_eq!(
+        format_schedule_countdown(23 * 3_600_000 + 59 * 60_000 + 59_000),
+        "23:59:59"
+    );
+    assert_eq!(format_schedule_countdown(24 * 3_600_000), "1d 00:00");
+    assert_eq!(
+        format_schedule_countdown(3 * 24 * 3_600_000 + 2 * 3_600_000 + 5 * 60_000),
+        "3d 02:05"
+    );
+}
+
+/// A session opened for a scheduled message is persisted under the manager's
+/// default `<agent> session` title, and the message is what names it instead —
+/// until the send leaves the queue, after which the Agent's own title may land.
+#[test]
+fn a_waiting_schedule_names_its_session_after_the_message() {
+    let session = |id: &VibexSessionId, title: &str| AgentSession {
+        id: id.clone(),
+        title: title.to_string(),
+        project_id: Default::default(),
+        workspace_id: Default::default(),
+        workspace_root: "/tmp/workspace".to_string(),
+        workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+        agent_id: AgentId::parse("deepseek-harness").unwrap(),
+        state: AgentSessionState::Idle,
+        safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_message_at_ms: 1,
+        archived_at_ms: None,
+        deleted_at_ms: None,
+    };
+    let session_id = VibexSessionId::new();
+    let placeholder = session(&session_id, "deepseek-harness session");
+    let mut waiting = queued(1, &session_id, Some(30_000));
+    waiting.text = "  Summarize\n the release notes  ".to_string();
+    let queue = vec![waiting];
+    assert_eq!(
+        scheduled_session_title(&queue, &placeholder),
+        Some("Summarize the release notes".to_string())
+    );
+    // The optimistic row already carries the message-derived title, so the name
+    // has to hold there too rather than only over the manager's placeholder.
+    let optimistic = session(&session_id, "Summarize the release notes");
+    assert_eq!(
+        scheduled_session_title(&queue, &optimistic),
+        Some("Summarize the release notes".to_string())
+    );
+    // An ordinary queued message names nothing.
+    let unscheduled = vec![queued(1, &session_id, None)];
+    assert_eq!(scheduled_session_title(&unscheduled, &placeholder), None);
+    // A session that already has a name of its own keeps it.
+    let named = session(&session_id, "Fix the parser bug");
+    assert_eq!(scheduled_session_title(&queue, &named), None);
+    // The earliest scheduled message is the one that opens the conversation.
+    let mut later = queued(2, &session_id, Some(60_000));
+    later.text = "Second message".to_string();
+    let mut earliest = queued(3, &session_id, Some(10_000));
+    earliest.text = "First message".to_string();
+    assert_eq!(
+        scheduled_session_title(&[later, earliest], &placeholder),
+        Some("First message".to_string())
+    );
+}
+
+/// The queue is persisted as the panel shows it, and comes back as the message
+/// the reader lined up — command, attachments and deadline included.
+#[test]
+fn the_persisted_queue_round_trips_a_scheduled_command() {
+    let session = VibexSessionId::new();
+    let mut message = queued(7, &session, Some(1_800_000_000_000));
+    message.attachments = vec![vibex_core::MessageAttachment {
+        label: "notes.md".to_string(),
+        mime_type: Some("text/markdown".to_string()),
+        uri: Some("file:///tmp/notes.md".to_string()),
+        inline_text_offset: Some(4),
+    }];
+    message.command_invocation = Some(ComposerCommandInvocation {
+        command_id: Some("command:review".to_string()),
+        trigger: AgentCommandTrigger::Slash,
+        source_kind: AgentCommandSourceKind::Prompt,
+        command_text: "/review".to_string(),
+        command_name: Some("review".to_string()),
+        arguments: Some("the release".to_string()),
+        prompt_id: Some(PromptId::parse("prompt_review").unwrap()),
+    });
+    let restored = restored_composer_message(persisted_composer_queue_entry(&message))
+        .expect("a valid entry restores");
+    assert_eq!(restored, message);
+    // An id the authority would not accept cannot address a send.
+    let mut unknown_session = persisted_composer_queue_entry(&message);
+    unknown_session.session_id = "not a session id".to_string();
+    assert!(restored_composer_message(unknown_session).is_none());
+}
+
 #[test]
 fn deadlines_do_not_block_ready_messages_or_leak_between_sessions() {
     let session = VibexSessionId::new();

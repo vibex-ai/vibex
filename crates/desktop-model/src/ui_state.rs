@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use vibex_core::{AgentId, AgentToolPreferences, SessionRuntimeSelection};
+use vibex_core::{
+    AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentToolPreferences, MessageAttachment,
+    PromptId, SessionRuntimeSelection,
+};
 
 use crate::{
     AgentSortStrategy, NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState,
@@ -22,6 +25,13 @@ pub const DEFAULT_CORRUPT_BACKUP_LIMIT: usize = 3;
 pub const RUNTIME_SELECTION_PREFERENCE_LIMIT: usize = 256;
 pub const RUNTIME_MODEL_FAVORITE_LIMIT: usize = 256;
 pub const KEYBOARD_SHORTCUT_OVERRIDE_LIMIT: usize = 64;
+/// Messages the persisted pre-send queue may hold. The queue is a handful of
+/// messages the reader lined up, not a second message history.
+pub const COMPOSER_QUEUE_LIMIT: usize = 64;
+/// Attachments one queued message may carry. Matches the Composer's own bound
+/// on an inline draft.
+pub const COMPOSER_QUEUE_ATTACHMENT_LIMIT: usize = 32;
+const COMPOSER_QUEUE_TEXT_MAX_CHARS: usize = 32_768;
 /// Starred project directories offered as quick locations by the directory
 /// picker. Small on purpose: the rail is a shortcut, not a history.
 pub const PROJECT_DIRECTORY_FAVORITE_LIMIT: usize = 12;
@@ -967,6 +977,46 @@ impl RuntimeModelFavorite {
     }
 }
 
+/// One message the Composer has queued but not sent yet.
+///
+/// The queue is the user's own instruction about what to send next — including
+/// the deadline of a scheduled message — so the shell persists it with the rest
+/// of its state. A restart restores the queue instead of dropping messages the
+/// user already committed to sending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerQueueEntry {
+    pub id: u64,
+    pub session_id: String,
+    pub desired_runtime: SessionRuntimeSelection,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub command: Option<ComposerQueueCommand>,
+    /// The local deadline of a scheduled message. `None` is an ordinary queued
+    /// message that only waits for the session to be ready.
+    #[serde(default)]
+    pub scheduled_at_ms: Option<i64>,
+}
+
+/// The command a queued message runs instead of sending its text verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerQueueCommand {
+    #[serde(default)]
+    pub command_id: Option<String>,
+    pub trigger: AgentCommandTrigger,
+    pub source_kind: AgentCommandSourceKind,
+    pub command_text: String,
+    #[serde(default)]
+    pub command_name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+    #[serde(default)]
+    pub prompt_id: Option<PromptId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ComposerUiState {
@@ -985,6 +1035,10 @@ pub struct ComposerUiState {
     pub queue_send_mode: ComposerQueueSendMode,
     #[serde(default)]
     pub message_send_key: MessageSendKey,
+    /// The pre-send queue, oldest first: messages the reader already sent to a
+    /// session that was not ready, including those waiting for a schedule.
+    #[serde(default)]
+    pub queue: Vec<ComposerQueueEntry>,
 }
 
 impl ComposerUiState {
@@ -1330,6 +1384,7 @@ impl DesktopUiStateV1 {
         self.right_rail.selected_activity_id =
             bounded_optional(self.right_rail.selected_activity_id.take(), 256);
         normalize_ids(&mut self.composer.terminal_ids, 64);
+        normalize_composer_queue(&mut self.composer.queue);
         self.terminal_preferences.shell =
             bounded_optional(self.terminal_preferences.shell.take(), 4_096);
         self.browser.normalize();
@@ -1885,6 +1940,63 @@ fn normalize_set(ids: &mut BTreeSet<String>, limit: usize) {
     *ids = values.into_iter().collect();
 }
 
+/// Normalize the persisted pre-send queue.
+///
+/// An entry without a session to send to, or with nothing left to send, is not
+/// a message the reader lined up. Ids are only local element ids, so duplicates
+/// from a hand-edited file are renumbered instead of dropped — the message
+/// matters, its serial does not.
+fn normalize_composer_queue(queue: &mut Vec<ComposerQueueEntry>) {
+    let mut normalized = std::mem::take(queue)
+        .into_iter()
+        .filter_map(|mut entry| {
+            entry.session_id = bounded_required(&entry.session_id, 256)?;
+            entry.text = entry
+                .text
+                .chars()
+                .take(COMPOSER_QUEUE_TEXT_MAX_CHARS)
+                .collect();
+            entry.attachments.truncate(COMPOSER_QUEUE_ATTACHMENT_LIMIT);
+            for attachment in &mut entry.attachments {
+                attachment.label = attachment.label.chars().take(4_096).collect();
+                attachment.mime_type = bounded_optional(attachment.mime_type.take(), 256);
+                attachment.uri = bounded_optional(attachment.uri.take(), 4_096);
+            }
+            if entry.text.trim().is_empty() && entry.attachments.is_empty() {
+                return None;
+            }
+            if entry.scheduled_at_ms.is_some_and(|at_ms| at_ms <= 0) {
+                return None;
+            }
+            if let Some(command) = entry.command.as_mut() {
+                command.command_id = bounded_optional(command.command_id.take(), 256);
+                command.command_text = bounded_required(&command.command_text, 4_096)?;
+                command.command_name = bounded_optional(command.command_name.take(), 256);
+                command.arguments = bounded_optional(command.arguments.take(), 4_096);
+            }
+            Some(entry)
+        })
+        .collect::<Vec<_>>();
+    let keep_from = normalized.len().saturating_sub(COMPOSER_QUEUE_LIMIT);
+    normalized.drain(..keep_from);
+    let mut next_id = normalized
+        .iter()
+        .map(|entry| entry.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    let mut seen = BTreeSet::new();
+    for entry in &mut normalized {
+        if entry.id == 0 || !seen.insert(entry.id) {
+            entry.id = next_id;
+            seen.insert(entry.id);
+            next_id = next_id.saturating_add(1).max(1);
+        }
+    }
+    *queue = normalized;
+}
+
 /// Normalize the multi-tab preview layouts parked for the scopes that are not
 /// on screen.
 ///
@@ -2146,6 +2258,85 @@ mod tests {
             &agent,
             &format!("model:{}", RUNTIME_MODEL_FAVORITE_LIMIT + 2)
         ));
+    }
+
+    /// The pre-send queue is shell state like any other: it has to survive a
+    /// restart with its deadlines intact, and a hand-edited or stale file must
+    /// not be able to make it unbounded.
+    #[test]
+    fn the_persisted_composer_queue_round_trips_and_stays_bounded() {
+        let session_id = format!("session_{}", "a".repeat(32));
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("claude").expect("agent id"),
+            vibex_core::ProviderProfileId::parse("provider_local_default").expect("profile id"),
+            "model:opus",
+        );
+        let entry = |id: u64, text: &str, scheduled_at_ms: Option<i64>| ComposerQueueEntry {
+            id,
+            session_id: session_id.clone(),
+            desired_runtime: selection.clone(),
+            text: text.to_string(),
+            attachments: vec![MessageAttachment {
+                label: "notes.md".to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                uri: Some("file:///tmp/notes.md".to_string()),
+                inline_text_offset: None,
+            }],
+            command: None,
+            scheduled_at_ms,
+        };
+        let mut state = DesktopUiStateV1::default();
+        state.composer.queue = vec![
+            entry(4, "send this", Some(1_800_000_000_000)),
+            entry(5, "  ", None),
+            ComposerQueueEntry {
+                session_id: String::new(),
+                ..entry(6, "no session", None)
+            },
+            // A duplicate id would collide as an element id; the message stays,
+            // its serial is renumbered.
+            entry(4, "second message", None),
+        ];
+        state.normalize().expect("state normalizes");
+        let queue = &state.composer.queue;
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].text, "send this");
+        assert_eq!(queue[0].scheduled_at_ms, Some(1_800_000_000_000));
+        assert_eq!(queue[0].attachments.len(), 1);
+        assert!(queue[1..].iter().all(|entry| entry.id != 4));
+        assert_eq!(
+            queue
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+
+        let mut overflowing = DesktopUiStateV1::default();
+        overflowing.composer.queue = (0..COMPOSER_QUEUE_LIMIT as u64 + 5)
+            .map(|id| entry(id + 1, &format!("message {id}"), None))
+            .collect();
+        overflowing.normalize().expect("state normalizes");
+        assert_eq!(overflowing.composer.queue.len(), COMPOSER_QUEUE_LIMIT);
+        // The oldest entries are the ones already sent; the tail is kept.
+        assert_eq!(
+            overflowing
+                .composer
+                .queue
+                .first()
+                .map(|entry| entry.text.as_str()),
+            Some("message 5")
+        );
+
+        // What the shell writes is what the next launch reads back, and a state
+        // file that predates the queue simply has none.
+        let encoded = serde_json::to_string(&state).expect("state encodes");
+        let decoded: DesktopUiStateV1 = serde_json::from_str(&encoded).expect("state decodes");
+        assert_eq!(decoded.composer.queue, state.composer.queue);
+        let legacy: ComposerUiState =
+            serde_json::from_str(r#"{"terminalIds":[]}"#).expect("legacy composer state decodes");
+        assert!(legacy.queue.is_empty());
     }
 
     #[test]

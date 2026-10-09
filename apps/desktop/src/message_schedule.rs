@@ -121,6 +121,31 @@ fn format_remaining(remaining_ms: i64) -> String {
     )
 }
 
+/// How long a scheduled row still waits, in the compact form the sidebar's
+/// status column can hold.
+///
+/// The seconds tick: a countdown that never moves reads as decoration, not as
+/// the deadline the row is actually waiting for. Past a day the seconds stop
+/// mattering and the days start to, so the shape changes with the distance
+/// instead of growing an unreadable hour field.
+pub(super) fn format_schedule_countdown(remaining_ms: i64) -> String {
+    let seconds = remaining_ms.max(0).saturating_add(999) / 1_000;
+    if seconds < 24 * 60 * 60 {
+        return format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3_600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+    }
+    format!(
+        "{}d {:02}:{:02}",
+        seconds / (24 * 60 * 60),
+        seconds / 3_600 % 24,
+        seconds / 60 % 60
+    )
+}
+
 pub(super) fn next_message_index(
     queue: &[ComposerQueueMessage],
     session_id: &VibexSessionId,
@@ -567,6 +592,10 @@ impl VibexWorkbench {
                 }
                 self.start_message_schedule_timer(window, cx);
                 self.publish_sidebar_invalidation();
+                // Editing the deadline changes what the row waits for, so both
+                // the name its scheduled message gives it and the persisted
+                // queue are rewritten together.
+                self.composer_queue_changed();
             }
         }
         cx.notify();
@@ -711,6 +740,144 @@ impl VibexWorkbench {
             .filter(|message| &message.session_id == session_id)
             .filter_map(|message| message.scheduled_at_ms)
             .min()
+    }
+
+    /// The name a session borrows from the scheduled message it is still
+    /// waiting to send, when the session has no name of its own yet.
+    ///
+    /// A session opened for a scheduled message exists before the message does:
+    /// the manager persists it under its default `<agent> session` title until a
+    /// message is actually submitted, so for the whole wait every authoritative
+    /// snapshot would put that placeholder on the row. The name is read from
+    /// what the reader wrote instead, and stops being read the moment the send
+    /// leaves the queue — which is exactly what leaves the Agent's own rename
+    /// free to land once the message has really been sent.
+    pub(super) fn pending_scheduled_session_title(&self, session: &AgentSession) -> Option<String> {
+        scheduled_session_title(&self.composer_queue, session)
+    }
+
+    /// Names every loaded session that is only waiting for a scheduled send.
+    ///
+    /// The sidebar reads the name straight from the queue, so this is what keeps
+    /// the rest of the shell (title bar, session menus) reading the same one.
+    pub(super) fn apply_pending_scheduled_titles(&mut self) {
+        let titles = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                self.pending_scheduled_session_title(session)
+                    .map(|title| (session.id.as_str().to_string(), title))
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (session_id, title) in titles {
+            let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id.as_str() == session_id)
+            else {
+                continue;
+            };
+            if session.title != title {
+                session.title = title;
+                changed = true;
+            }
+        }
+        if changed {
+            self.invalidate_sidebar_projection_cache();
+            self.publish_sidebar_invalidation();
+        }
+    }
+
+    /// Writes the pre-send queue into the persisted UI state.
+    ///
+    /// The queue is the reader's own instruction about what to send next, so it
+    /// is stored with the rest of the shell state: a restart restores it instead
+    /// of dropping messages that were already committed to.
+    pub(super) fn persist_composer_queue(&mut self) {
+        self.ui_state.composer.queue = self
+            .composer_queue
+            .iter()
+            .map(persisted_composer_queue_entry)
+            .collect();
+        self.queue_ui_state();
+    }
+
+    /// Everything the shell owes the reader after the queue changed: the
+    /// scheduled names its rows borrow, and the persisted copy of the queue
+    /// itself. One call per mutation keeps the panel, the sidebar and the file
+    /// telling the same story.
+    pub(super) fn composer_queue_changed(&mut self) {
+        self.apply_pending_scheduled_titles();
+        self.persist_composer_queue();
+    }
+
+    /// Loads the queue the previous session left behind.
+    ///
+    /// The entries are held until the authoritative session list arrives: only
+    /// then can a message whose session was deleted while Vibex was closed be
+    /// told apart from one whose session simply has not loaded yet.
+    pub(super) fn restore_composer_queue(&mut self, queue: Vec<ComposerQueueEntry>) {
+        self.composer_queue = queue
+            .into_iter()
+            .filter_map(restored_composer_message)
+            .collect();
+        self.composer_queue_serial = self
+            .composer_queue
+            .iter()
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(0);
+        self.composer_queue_restore_pending = !self.composer_queue.is_empty();
+    }
+
+    /// Adopts the restored queue once the session list can vouch for it.
+    ///
+    /// A restored message whose session is gone is dropped, a due or ready one
+    /// is re-evaluated on the next frame, and the schedule timer is re-armed so
+    /// a deadline that passed while Vibex was closed is still honored.
+    fn adopt_restored_composer_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_queue_restore_pending = false;
+        let known = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        self.composer_queue
+            .retain(|message| known.contains(message.session_id.as_str()));
+        let session_ids = self
+            .composer_queue
+            .iter()
+            .map(|message| message.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        for session_id in session_ids {
+            self.mark_composer_queue_for_recheck(&session_id);
+            // A message the reader lined up may have become sendable while
+            // Vibex was closed. The ordinary rules still decide: a deadline
+            // that has not arrived waits, and Manual send mode still needs the
+            // reader's own send before anything leaves the queue.
+            self.maybe_dispatch_next_composer_queue_message(
+                &session_id,
+                ComposerQueueDispatchBehavior::Automatic,
+                window,
+                cx,
+            );
+        }
+        self.start_message_schedule_timer(window, cx);
+        self.apply_pending_scheduled_titles();
+        self.persist_composer_queue();
+        cx.notify();
+    }
+
+    /// Adopts the restored queue before the frame that would render it.
+    pub(super) fn adopt_restored_composer_queue_if_ready(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_queue_restore_pending && self.sessions_loaded {
+            self.adopt_restored_composer_queue(window, cx);
+        }
     }
 
     pub(super) fn render_message_schedule_draft_hint(
@@ -890,10 +1057,14 @@ impl VibexWorkbench {
         at_ms: i64,
         cx: &App,
     ) -> AnyElement {
+        // The row itself carries the countdown, so the tooltip is where the
+        // absolute deadline stays readable: "when" and "how long" are the two
+        // questions a scheduled row is asked.
         let label = format!(
-            "{} {}",
+            "{} {} · {}",
             locale::text("Scheduled send", "定时发送", "定時傳送"),
-            format_send_time(at_ms)
+            format_send_time(at_ms),
+            format_schedule_countdown(at_ms.saturating_sub(unix_timestamp_ms()))
         );
         div()
             .id(format!("sidebar-session-scheduled-{session_id}"))
@@ -907,6 +1078,75 @@ impl VibexWorkbench {
             )
             .into_any_element()
     }
+}
+
+/// The name a session borrows from the scheduled message it is still waiting to
+/// send, when the session has no name of its own yet.
+///
+/// The earliest scheduled message names the session: it is the one that will
+/// actually open the conversation.
+fn scheduled_session_title(
+    queue: &[ComposerQueueMessage],
+    session: &AgentSession,
+) -> Option<String> {
+    let message = queue
+        .iter()
+        .filter(|message| message.session_id == session.id)
+        .filter(|message| message.scheduled_at_ms.is_some())
+        .min_by_key(|message| message.scheduled_at_ms)?;
+    let title = session_title_from_first_message(&message.display_text())?;
+    // A session that already carries a name — a manual rename, an Agent title,
+    // or an earlier message — keeps it.
+    (session.title == agent_session_fallback_title(&session.agent_id) || session.title == title)
+        .then_some(title)
+}
+
+/// The persisted shape of one queued message.
+fn persisted_composer_queue_entry(message: &ComposerQueueMessage) -> ComposerQueueEntry {
+    ComposerQueueEntry {
+        id: message.id,
+        session_id: message.session_id.as_str().to_string(),
+        desired_runtime: message.desired_runtime.clone(),
+        text: message.text.clone(),
+        attachments: message.attachments.clone(),
+        command: message
+            .command_invocation
+            .as_ref()
+            .map(|invocation| ComposerQueueCommand {
+                command_id: invocation.command_id.clone(),
+                trigger: invocation.trigger,
+                source_kind: invocation.source_kind,
+                command_text: invocation.command_text.clone(),
+                command_name: invocation.command_name.clone(),
+                arguments: invocation.arguments.clone(),
+                prompt_id: invocation.prompt_id.clone(),
+            }),
+        scheduled_at_ms: message.scheduled_at_ms,
+    }
+}
+
+/// Rebuilds a queued message from its persisted shape. A session id the
+/// authority would not accept cannot address a send, so it is dropped rather
+/// than queued against a session that cannot exist.
+fn restored_composer_message(entry: ComposerQueueEntry) -> Option<ComposerQueueMessage> {
+    let session_id = VibexSessionId::parse(&entry.session_id).ok()?;
+    Some(ComposerQueueMessage {
+        id: entry.id,
+        session_id,
+        desired_runtime: entry.desired_runtime,
+        text: entry.text,
+        attachments: entry.attachments,
+        command_invocation: entry.command.map(|command| ComposerCommandInvocation {
+            command_id: command.command_id,
+            trigger: command.trigger,
+            source_kind: command.source_kind,
+            command_text: command.command_text,
+            command_name: command.command_name,
+            arguments: command.arguments,
+            prompt_id: command.prompt_id,
+        }),
+        scheduled_at_ms: entry.scheduled_at_ms,
+    })
 }
 
 #[cfg(test)]

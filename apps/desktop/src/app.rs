@@ -135,14 +135,15 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     BrowserSearchEngine, BrowserStartPage, BrowserUiState, ComposerAttachment,
-    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger, ComputerUiState,
-    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
-    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode,
-    LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey,
-    NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
-    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
-    PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
-    ReasoningExpansionMode, RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    ComposerQueueCommand, ComposerQueueEntry, ComposerQueueSendMode, ComposerSuggestionSelection,
+    ComposerTrigger, ComputerUiState, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
+    DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState,
+    EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode, LocaleMode,
+    MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
+    NetworkProxyMode, NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket,
+    NewSessionSubmissionStage, NewSessionWorkspaceState, PreviewWindowMode,
+    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, ReasoningExpansionMode,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
     SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
     SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
@@ -7568,6 +7569,13 @@ pub struct VibexWorkbench {
     message_schedule_task: Option<Task<()>>,
     composer_queue: Vec<ComposerQueueMessage>,
     composer_queue_serial: u64,
+    /// A restored queue that has not met the authoritative session list yet. Its
+    /// entries stay untouched until then, so a session that simply has not
+    /// loaded cannot be mistaken for one that was deleted.
+    composer_queue_restore_pending: bool,
+    /// Whether the authoritative session list has been read at least once. The
+    /// restored queue waits for it before it is adopted or pruned.
+    sessions_loaded: bool,
     composer_queue_manual_session_ids: BTreeSet<String>,
     composer_queue_paused_session_ids: BTreeSet<String>,
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
@@ -8527,6 +8535,8 @@ impl VibexWorkbench {
             message_schedule_task: None,
             composer_queue: Vec::new(),
             composer_queue_serial: 0,
+            composer_queue_restore_pending: false,
+            sessions_loaded: false,
             composer_queue_manual_session_ids: BTreeSet::new(),
             composer_queue_paused_session_ids: BTreeSet::new(),
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
@@ -9537,6 +9547,13 @@ impl VibexWorkbench {
             eprintln!("vibex-fonts: {error}");
         }
         self.ui_state = state;
+        // The pre-send queue is the one part of the shell state that must be
+        // back in memory before the first frame: a message the reader already
+        // committed to sending cannot wait for a session list to be shown again.
+        // The persisted copy stays where it is until the restored queue is
+        // adopted, so a launch that never gets that far still leaves it on disk.
+        let restored_queue = self.ui_state.composer.queue.clone();
+        self.restore_composer_queue(restored_queue);
         self.sync_agent_streaming_surface_visibility();
         if let Some(config) = self.config.as_ref() {
             self.ui_state.desktop_behavior.launch_at_login =
@@ -12109,6 +12126,14 @@ impl VibexWorkbench {
                                 .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
                                 .collect();
                             this.sessions = sessions;
+                            // The list is authoritative from here on: the
+                            // restored pre-send queue can finally be told apart
+                            // from messages whose session is gone. The rows also
+                            // re-derive the names their pending scheduled sends
+                            // give them, which a listed placeholder title would
+                            // otherwise put back on every refresh.
+                            this.sessions_loaded = true;
+                            this.apply_pending_scheduled_titles();
                             if this.ui_state.workbench.active_tab == "management" {
                                 this.sync_management_agent_ordering(cx);
                             }
@@ -12690,6 +12715,15 @@ impl VibexWorkbench {
     /// — releasing there would drop the record before the fallback ever
     /// arrives, so only snapshots that update an already-known row release it.
     fn reconcile_pending_new_session_title(&mut self, mut session: AgentSession) -> AgentSession {
+        // A session waiting for its scheduled message is named after that
+        // message, not after the manager's placeholder, for as long as the send
+        // stays in the queue. The name is answered from the queue on every
+        // snapshot, so a restart — which forgets everything but the queue —
+        // restores it too.
+        if let Some(title) = self.pending_scheduled_session_title(&session) {
+            session.title = title;
+            return session;
+        }
         let is_fallback = session.title == agent_session_fallback_title(&session.agent_id);
         let known_row = self
             .sessions
@@ -21605,6 +21639,7 @@ impl VibexWorkbench {
             self.composer_queue.push(message);
             self.start_message_schedule_timer(window, cx);
             self.publish_sidebar_invalidation();
+            self.composer_queue_changed();
             cx.notify();
             if !session_running && !queue_paused {
                 // The user sent from the composer while the session is idle, so
@@ -21626,6 +21661,9 @@ impl VibexWorkbench {
             window,
             cx,
         );
+        // A dispatch that had to wait re-queues the message it was handed, so
+        // the queue is persisted after the decision, not only before it.
+        self.composer_queue_changed();
     }
 
     fn take_composer_message(
@@ -22234,6 +22272,9 @@ impl VibexWorkbench {
         let message = self.composer_queue.remove(index);
         self.publish_sidebar_invalidation();
         self.dispatch_composer_message(message, behavior, window, cx);
+        // The send left the queue, so its name no longer stands and the
+        // persisted queue must not bring the message back on the next launch.
+        self.composer_queue_changed();
         true
     }
 
@@ -22417,6 +22458,8 @@ impl VibexWorkbench {
         self.composer_queue_edit_attachments.clear();
         self.composer_queue_edit_geometry.input_bounds = None;
         self.mark_composer_queue_for_recheck(&session_id);
+        // An edited scheduled message names its session after the new text.
+        self.composer_queue_changed();
         cx.notify();
     }
 
@@ -22592,6 +22635,7 @@ impl VibexWorkbench {
         let session_id = self.composer_queue[index].session_id.clone();
         self.composer_queue.remove(index);
         self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
         if self.composer_queue_editing_id == Some(message_id) {
             self.composer_queue_editing_id = None;
             self.composer_queue_edit_attachments.clear();
@@ -22625,6 +22669,9 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         if reorder_composer_queue_message(&mut self.composer_queue, message_id, target_id, after) {
+            // The order is part of what the reader persisted: the queue is
+            // persisted in the order it is shown in.
+            self.composer_queue_changed();
             cx.notify();
         }
     }
@@ -22632,6 +22679,7 @@ impl VibexWorkbench {
     fn move_composer_queue_message_to_front(&mut self, message_id: u64) -> Option<VibexSessionId> {
         let session_id = promote_composer_queue_message(&mut self.composer_queue, message_id);
         self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
         session_id
     }
 
@@ -22710,6 +22758,7 @@ impl VibexWorkbench {
         self.composer_queue
             .retain(|message| message.session_id != session_id);
         self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
         if editing_id.is_some_and(|message_id| {
             !self
                 .composer_queue
@@ -26167,6 +26216,7 @@ impl VibexWorkbench {
                         this.set_session_turn_pending(&session_id, true);
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
+                        this.composer_queue_changed();
                         cx.notify();
                         return;
                     }
@@ -27778,6 +27828,9 @@ impl VibexWorkbench {
             });
             self.start_message_schedule_timer(window, cx);
             self.publish_sidebar_invalidation();
+            // The session was opened for this message, so the message is what
+            // names it until the send actually happens.
+            self.composer_queue_changed();
         }
         let pending_session_id = optimistic_session_id.clone();
         let backend = self.backend.clone();
@@ -29762,6 +29815,17 @@ impl VibexWorkbench {
             .retain(|session_id| !session_ids.contains(session_id));
         self.composer_drafts
             .retain(|session_id| !session_ids.contains(session_id));
+        // A message queued for a session that no longer exists has nowhere to
+        // go, and persisting it would only bring it back on the next launch.
+        if self
+            .composer_queue
+            .iter()
+            .any(|message| session_ids.contains(message.session_id.as_str()))
+        {
+            self.composer_queue
+                .retain(|message| !session_ids.contains(message.session_id.as_str()));
+            self.composer_queue_changed();
+        }
         self.pending_new_session_titles
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.pending_agent_turn_session_ids
@@ -40239,9 +40303,15 @@ impl VibexWorkbench {
             && self
                 .unread_agent_completion_session_ids
                 .contains(session.id.as_str());
+        // A pending scheduled send is the row's posture for as long as it waits.
+        // A session created for such a send reports `Initializing` until the
+        // message is actually submitted, and that transient state must not take
+        // the mark: the row is waiting on the clock, not on a runtime. The
+        // states that can still send take the mark; a running turn, an Agent
+        // parked on the user, or a closed session keeps its own.
         let scheduled_at_ms = matches!(
             display_state,
-            AgentSessionState::Idle | AgentSessionState::Error
+            AgentSessionState::Initializing | AgentSessionState::Idle | AgentSessionState::Error
         )
         .then(|| self.next_scheduled_message_at(&session.id))
         .flatten();
@@ -40277,11 +40347,26 @@ impl VibexWorkbench {
         } else {
             None
         };
-        let time_label = format_sidebar_session_time(
-            scheduled_at_ms.unwrap_or(session.last_message_at_ms),
-            self.resolved_locale(),
-            strings,
-        );
+        // A row that is waiting for a send reads as the time left to wait; the
+        // absolute deadline stays in the indicator's own tooltip, where there is
+        // room to say both.
+        let time_label = match scheduled_at_ms {
+            Some(at_ms) => message_schedule::format_schedule_countdown(
+                at_ms.saturating_sub(unix_timestamp_ms()),
+            ),
+            None => format_sidebar_session_time(
+                session.last_message_at_ms,
+                self.resolved_locale(),
+                strings,
+            ),
+        };
+        // The name of a session that exists only to wait for its scheduled
+        // message comes from that message until the send actually leaves the
+        // queue, so the manager's default `<agent> session` title never labels
+        // the wait.
+        let row_title = self
+            .pending_scheduled_session_title(session)
+            .unwrap_or_else(|| session.title.clone());
         let active_session_drag = self
             .sidebar_session_drag_state
             .clone()
@@ -40315,7 +40400,7 @@ impl VibexWorkbench {
             session_ids: drag_session_ids,
             workspace_id: session.workspace_id.as_str().to_string(),
             project_id: project_scope_id.clone(),
-            label: session.title.clone().into(),
+            label: row_title.clone().into(),
             agent_id: sidebar_agent_id.as_str().to_string(),
             pinned,
         };
@@ -40727,7 +40812,7 @@ impl VibexWorkbench {
                                         .group_hover(&hover_group, |style| {
                                             style.text_color(cx.theme().sidebar_foreground)
                                         })
-                                        .child(session.title.clone()),
+                                        .child(row_title),
                                 ),
                             ),
                     )
@@ -70146,6 +70231,10 @@ impl Render for VibexWorkbench {
                 let _ = workbench.update(cx, |this, cx| this.open_settings(window, cx));
             });
         }
+        // A restored queue waits for the authoritative session list, which the
+        // first overview refresh delivers; the frame after that is the earliest
+        // one that can tell a deleted session from an unloaded one.
+        self.adopt_restored_composer_queue_if_ready(window, cx);
         self.flush_composer_queue_dispatches_after_continuation(window, cx);
         let viewport = window.viewport_size();
         let mut visibility = WorkbenchVisibility::resolve(
@@ -79755,6 +79844,45 @@ mod tests {
         assert!(folder.contains("folder.auto_archive_after_days"));
         assert!(folder.contains("if auto_archive_after_days.is_some()"));
         assert!(folder.contains("cx.theme().success"));
+    }
+
+    /// A row waiting for a scheduled send owns its own posture: the clock while
+    /// it waits — including through the `Initializing` a session reports before
+    /// its first message — the time left as a countdown, and the message itself
+    /// as the name until the send leaves the queue.
+    #[test]
+    fn a_scheduled_row_keeps_its_clock_counts_down_and_borrows_its_name() {
+        let source = include_str!("app.rs");
+        let row = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("the session row should remain inspectable");
+
+        let posture = row
+            .split_once("let scheduled_at_ms = matches!(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| {
+                tail.split_once(".then(|| self.next_scheduled_message_at(&session.id))")
+            })
+            .map(|(body, _)| body)
+            .expect("the scheduled posture should remain inspectable");
+        assert!(posture.contains("AgentSessionState::Initializing"));
+        assert!(posture.contains("AgentSessionState::Idle"));
+        assert!(!posture.contains("AgentSessionState::Running"));
+
+        assert!(row.contains("message_schedule::format_schedule_countdown("));
+        assert!(row.contains(".pending_scheduled_session_title(session)"));
+        assert!(row.contains(".child(row_title)"));
+        // The schedule mark must be placed before the generic state indicator,
+        // or a waiting row would keep painting the spinner it replaces.
+        let mark = row
+            .find("Some(self.render_scheduled_session_indicator(&session.id, at_ms, cx))")
+            .expect("the row should render the scheduled indicator");
+        let spinner = row
+            .find("Some(sidebar_session_status_indicator(")
+            .expect("the row should render the session state indicator");
+        assert!(mark < spinner);
     }
 
     #[test]
