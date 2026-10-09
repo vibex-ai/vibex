@@ -4444,22 +4444,25 @@ where
             if inner.connection_generation.load(Ordering::Acquire) != generation {
                 break;
             }
-            match reader.next_wire().await {
+            let incoming = reader.next_wire().await;
+            if inner.connection_generation.load(Ordering::Acquire) != generation {
+                break;
+            }
+            match incoming {
                 Ok(Some(WireMessage::Text(text))) => dispatch_text(&inner, &text),
                 Ok(Some(WireMessage::Binary(bytes))) => dispatch_binary(&inner, &bytes),
                 Ok(Some(WireMessage::Closed)) => break,
                 Err(error) => {
                     if let Ok(mut state) = inner.state.lock() {
+                        state.record_error(&error);
                         if matches!(
                             error.code.as_str(),
                             "remote_device_revoked" | "relay_session_revoked"
                         ) {
-                            state.record_error(&error);
                             state.transition(RemoteConnectionState::Revoked);
                         } else if error.code == "remote_protocol_incompatible"
                             || error.code == "relay_unsupported_protocol"
                         {
-                            state.record_error(&error);
                             state.transition(RemoteConnectionState::Incompatible);
                         }
                     }

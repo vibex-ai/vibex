@@ -173,6 +173,9 @@ After implementation:
 - [ ] Tested with edge cases (null, empty, invalid)
 - [ ] Verified error handling at each boundary
 - [ ] Checked data survives round-trip
+- [ ] Exercised the first business RPC after pairing, with enough records to
+      test total serialized bytes against transport limits; a per-row limit
+      does not bound a response containing many rows
 - [ ] Checked that consumers import shared decoders / projections instead of
       casting payload fields locally
 - [ ] Checked that derived state points back to the source event identifier

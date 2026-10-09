@@ -32,6 +32,19 @@ native and WASM clients consume those Rust contracts directly.
   started. Terminal attachments include their workspace scope, and terminal
   input is generation-checked, authorized, and audited without retaining bytes.
 
+## Session Metadata And History
+
+The `agent_session` list/detail requests accept `timelineLimit: 0` to omit
+history previews. The response retains its existing `latestTimeline` page shape
+with empty items and no cursors; an omitted preview does not mean the session's
+history is empty. Missing limits default to 50, and positive values clamp to
+1..=500. Timeline/catch-up operations retain their own pagination rules.
+
+Native Backend clients request metadata without previews and fetch the selected
+session's history separately. This prevents the list from accumulating every
+session's history into a single oversized WebSocket frame. Older gateways may
+return one preview item for a zero limit; clients can ignore it.
+
 ## Pairing And Mobile Authentication
 
 - The desktop identity is generated under the runtime home and persisted with

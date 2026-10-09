@@ -806,7 +806,10 @@ impl AgentBackend for WebRemoteBackend {
             let payload = RemoteAgentRequest::ListSessions(RemoteAgentSessionListRequest {
                 auth: this.auth(),
                 include_archived: Some(include_archived),
-                timeline_limit: Some(50),
+                // The facade returns session metadata. Bundling a preview for
+                // every session can exceed the WebSocket frame budget, and
+                // timeline reads already have their own paginated operation.
+                timeline_limit: Some(0),
             });
             let value = this
                 .rpc(
@@ -832,7 +835,7 @@ impl AgentBackend for WebRemoteBackend {
             let payload = RemoteAgentRequest::GetSession(RemoteAgentSessionDetailRequest {
                 auth: this.auth(),
                 session_id,
-                timeline_limit: Some(50),
+                timeline_limit: Some(0),
             });
             let value = this
                 .rpc(

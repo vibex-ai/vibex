@@ -4313,17 +4313,10 @@ async fn dispatch_agent_request(
             let sessions = manager
                 .list_sessions(request.include_archived.unwrap_or(false))
                 .await?;
-            let timeline_limit = normalize_timeline_limit(request.timeline_limit);
             let mut summaries = Vec::with_capacity(sessions.len());
             for session in sessions {
-                let latest_timeline = manager
-                    .fetch_timeline(FetchTimelineRequest {
-                        session_id: session.id.clone(),
-                        after_sequence: None,
-                        before_sequence: None,
-                        limit: timeline_limit,
-                    })
-                    .await?;
+                let latest_timeline =
+                    session_timeline_preview(&manager, &session.id, request.timeline_limit).await?;
                 summaries.push(vibex_core::AgentSessionSummary {
                     session,
                     latest_timeline,
@@ -4343,14 +4336,8 @@ async fn dispatch_agent_request(
                 correlation_id,
             )?;
             let session = manager.get_session(&request.session_id).await?;
-            let latest_timeline = manager
-                .fetch_timeline(FetchTimelineRequest {
-                    session_id: session.id.clone(),
-                    after_sequence: None,
-                    before_sequence: None,
-                    limit: normalize_timeline_limit(request.timeline_limit),
-                })
-                .await?;
+            let latest_timeline =
+                session_timeline_preview(&manager, &session.id, request.timeline_limit).await?;
             serde_json::to_value(RemoteAgentSessionDetailResponse {
                 session,
                 latest_timeline,
@@ -7165,6 +7152,33 @@ fn remote_timeline_event(event: TimelineLiveEvent) -> VibexResult<RemoteLiveEven
     })
 }
 
+async fn session_timeline_preview(
+    manager: &AgentManager,
+    session_id: &vibex_core::VibexSessionId,
+    limit: Option<u32>,
+) -> VibexResult<vibex_core::TimelinePage> {
+    if limit == Some(0) {
+        // This is an explicitly omitted preview, not an authoritative empty
+        // history. Keep the response shape compatible with existing clients.
+        return Ok(vibex_core::TimelinePage {
+            session_id: session_id.clone(),
+            items: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: false,
+            has_newer: false,
+        });
+    }
+    manager
+        .fetch_timeline(FetchTimelineRequest {
+            session_id: session_id.clone(),
+            after_sequence: None,
+            before_sequence: None,
+            limit: normalize_timeline_limit(limit),
+        })
+        .await
+}
+
 fn normalize_timeline_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(50).clamp(1, 500)
 }
@@ -8462,6 +8476,69 @@ mod tests {
         );
         assert!(catch_up_payload.next_cursors[0].after_sequence > 0);
 
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_session_preview_limits_preserve_metadata_and_history_contracts() {
+        let (db_path, manager) = test_agent_manager("preview-limits");
+        let session = create_mock_session(&manager, "Remote previews").await;
+        append_mock_timeline(&manager, &session, "history is fetched separately");
+        let auth = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let router =
+            build_router_with_agent(RemoteServiceConfig::loopback_disabled(), manager.clone());
+
+        for (limit, expected_items) in [(None, 2), (Some(0), 0), (Some(1), 1), (Some(u32::MAX), 2)]
+        {
+            let list = post_agent(
+                router.clone(),
+                RemoteAgentRequest::ListSessions(RemoteAgentSessionListRequest {
+                    auth: auth.clone(),
+                    include_archived: Some(false),
+                    timeline_limit: limit,
+                }),
+            )
+            .await;
+            let list: RemoteAgentSessionListResponse =
+                serde_json::from_value(list.payload.unwrap()).unwrap();
+            assert_eq!(list.sessions.len(), 1);
+            assert_eq!(list.sessions[0].session.id, session.id);
+            assert_eq!(list.sessions[0].session.title, session.title);
+            assert_eq!(list.sessions[0].latest_timeline.items.len(), expected_items);
+
+            let detail = post_agent(
+                router.clone(),
+                RemoteAgentRequest::GetSession(vibex_core::RemoteAgentSessionDetailRequest {
+                    auth: auth.clone(),
+                    session_id: session.id.clone(),
+                    timeline_limit: limit,
+                }),
+            )
+            .await;
+            let detail: RemoteAgentSessionDetailResponse =
+                serde_json::from_value(detail.payload.unwrap()).unwrap();
+            assert_eq!(detail.session, list.sessions[0].session);
+            assert_eq!(detail.latest_timeline, list.sessions[0].latest_timeline);
+            if limit == Some(0) {
+                assert_eq!(detail.latest_timeline.session_id, session.id);
+                assert_eq!(detail.latest_timeline.start_sequence, None);
+                assert_eq!(detail.latest_timeline.end_sequence, None);
+            }
+        }
+
+        // Zero remains a clamped page size for actual timeline/catch-up reads;
+        // only the optional session previews interpret it as an opt-out.
+        let history = manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session.id,
+                after_sequence: None,
+                before_sequence: None,
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 1);
+        assert!(history.has_older);
         cleanup_db(db_path);
     }
 

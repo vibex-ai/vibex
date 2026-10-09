@@ -581,6 +581,8 @@ pub enum RemoteAgentOperationKind {
 pub struct RemoteAgentSessionListRequest {
     pub auth: RemoteAuthProof,
     pub include_archived: Option<bool>,
+    /// Zero skips timeline reads and returns empty preview pages. Omitted
+    /// limits default to 50; positive limits are clamped to 1..=500.
     pub timeline_limit: Option<u32>,
 }
 
@@ -595,6 +597,8 @@ pub struct RemoteAgentSessionListResponse {
 pub struct RemoteAgentSessionDetailRequest {
     pub auth: RemoteAuthProof,
     pub session_id: VibexSessionId,
+    /// Zero skips the timeline preview; fetch history through the paginated
+    /// timeline operation. Other values follow the session-list contract.
     pub timeline_limit: Option<u32>,
 }
 

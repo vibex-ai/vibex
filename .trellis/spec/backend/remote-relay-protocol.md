@@ -294,6 +294,82 @@ bounded per-connection RPC semaphore + bounded outbound queue
 create_pairing_offer request -> Gateway injects RemoteGatewayPairingRoutes
 ```
 
+## Scenario: Session Metadata Reads And Optional Timeline Previews
+
+### 1. Scope / Trigger
+
+- Trigger: changing remote session list/detail reads or diagnosing a connection
+  that pairs successfully but closes during the first session RPC.
+
+### 2. Signatures
+
+```text
+WebRemoteBackend::list_sessions / open_session
+RemoteAgentSessionListRequest.timeline_limit: Option<u32>
+RemoteAgentSessionDetailRequest.timeline_limit: Option<u32>
+session_timeline_preview(manager, session_id, limit) -> TimelinePage
+RemoteConnectionSnapshot.last_error_code / last_error_message
+```
+
+### 3. Contracts
+
+- The Backend facade returns session metadata from list/detail reads and asks
+  for `timelineLimit: 0`. It fetches the selected session's history separately
+  through the existing paginated timeline operation.
+- Zero opts out of a list/detail preview. The gateway must skip the timeline
+  query and return the existing page shape with its session id, empty items,
+  absent cursors, and false pagination flags. This explicitly omitted preview
+  is not evidence that the session has no history.
+- Omitted limits retain the legacy default of 50; positive limits remain
+  clamped to 1..=500. Actual timeline and catch-up page limits still clamp zero
+  to one. Keep authentication and session visibility checks before the preview.
+- Older gateways may clamp the opt-out to one preview item; the facade ignores
+  that preview and continues to fetch history separately.
+- Keep WebSocket size limits bounded. Loading history for every list row can
+  exceed the native transport's 16 MiB frame limit even when each page fits.
+  Increasing that limit does not remove the unnecessary transfer or decoding.
+- Preserve every socket read failure in the connection snapshot before
+  disconnect cleanup resolves pending RPCs. A replaced connection's reader must
+  not overwrite the new connection's state. Unknown mutations remain subject to
+  the existing idempotency-result query contract.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| List/detail requests a zero preview limit | Return session metadata without reading timeline payloads. |
+| List/detail omits the limit or requests a positive value | Preserve the legacy bounded preview behavior. |
+| The selected session has history after a metadata-only read | A separate timeline fetch returns the stored items and authoritative cursors. |
+| An explicitly requested response exceeds the WebSocket frame budget | Close with the underlying `remote_socket_read_failed` retained in the snapshot. |
+| The connection is replaced while an old reader is awaiting a frame | Ignore the old reader's result and preserve the current state. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: many sessions with large histories load as a small metadata list, then
+  only the selected session's requested history page crosses the connection.
+- Base: an existing client that requests previews continues receiving them.
+- Bad: attach 50 history items to every row and discard them in the facade, or
+  lose an oversized-frame error behind a generic pending-RPC disconnect result.
+
+### 6. Tests Required
+
+- `session_reads_smoke` crosses real Direct and pinned LAN sockets with histories
+  whose combined previews exceed 16 MiB. Assert list/detail success, complete
+  separately fetched history, and a usable heartbeat. An explicit oversized
+  preview request must retain its read error, then reconnect successfully.
+- `remote_session_preview_limits_preserve_metadata_and_history_contracts`
+  covers zero, omitted, positive, and excessive preview limits plus the unchanged
+  zero-limit behavior of actual timeline reads.
+- Pairing and heartbeat smoke alone do not qualify session loading; exercise
+  the first Backend session RPC with a nonempty, representative history set.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: list sessions -> bundle every history preview -> exceed frame budget
+Correct: list metadata -> select a session -> fetch its paginated history
+```
+
 ## Scenario: Authority Directory Browsing
 
 ### 1. Scope / Trigger
