@@ -355,6 +355,9 @@ pub struct AppearanceUiState {
     pub interface_font: FontSetting,
     pub code_font: FontSetting,
     pub reduced_motion: bool,
+    /// Show the optional, locally rendered boss arena on the new-session home.
+    #[serde(default = "default_show_home_arena")]
+    pub show_home_arena: bool,
     /// Whether the workbench stops animating — and stops asking for the
     /// repaints those animations drive — while its window is not active.
     ///
@@ -474,11 +477,16 @@ impl Default for AppearanceUiState {
             interface_font: FontSetting::interface_default(),
             code_font: FontSetting::code_default(),
             reduced_motion: false,
+            show_home_arena: default_show_home_arena(),
             pause_inactive_animation: false,
             high_contrast: false,
             theme_selection: ThemeSelection::default(),
         }
     }
+}
+
+fn default_show_home_arena() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3688,6 +3696,31 @@ mod tests {
         assert!(
             !decoded.appearance.pause_inactive_animation,
             "an older file must not opt into the pause"
+        );
+    }
+
+    #[test]
+    fn home_arena_defaults_for_existing_state_and_keeps_an_explicit_opt_out() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value["appearance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("showHomeArena");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(decoded.appearance.show_home_arena);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = UiStateStore::new(dir.path().join("desktop-ui-state.json"));
+        let mut state = decoded;
+        state.appearance.show_home_arena = false;
+        store.save(&state).unwrap();
+        assert!(
+            !store
+                .load_or_default(2_000)
+                .unwrap()
+                .state
+                .appearance
+                .show_home_arena
         );
     }
 

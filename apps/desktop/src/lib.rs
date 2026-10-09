@@ -4,6 +4,7 @@ pub mod actions;
 mod activity_indicator;
 pub mod app;
 pub mod appearance_theme;
+mod arena;
 pub mod assets;
 pub mod browser_surface;
 pub mod browser_transport;

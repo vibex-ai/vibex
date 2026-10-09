@@ -34098,6 +34098,12 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_show_home_arena(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.appearance.show_home_arena = enabled;
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     /// Toggle the power optimization that freezes a backgrounded workbench.
     ///
     /// The gate lives in `motion`, and it is applied directly rather than
@@ -43898,6 +43904,7 @@ impl VibexWorkbench {
         let surface_geometry_entity = cx.weak_entity();
         v_flex()
             .id("new-session-home")
+            .relative()
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -43907,6 +43914,16 @@ impl VibexWorkbench {
             .px_6()
             .pt_6()
             .pb_4()
+            .when(self.ui_state.appearance.show_home_arena, |this| {
+                this.pt(gpui::rems(crate::arena::BANNER_HEIGHT_REM)).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .child(crate::arena::banner(window, cx)),
+                )
+            })
             .child(
                 v_flex()
                     .w_full()
@@ -63712,6 +63729,24 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Appearance,
+            crate::arena::setting_title(),
+            crate::arena::setting_description(),
+            &[
+                "game",
+                "ascii",
+                "arena",
+                "unbound",
+                "home",
+                "小游戏",
+                "小遊戲",
+                "字符画",
+                "字元畫",
+                "断链",
+                "斷鏈",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
             locale::text(
                 "Pause animation when inactive",
                 "失焦时暂停动画",
@@ -66484,6 +66519,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_show_home_arena(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_show_home_arena(enabled, cx));
+        cx.notify();
+    }
+
     fn set_pause_inactive_animation(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_pause_inactive_animation(enabled, cx)
@@ -67569,6 +67611,18 @@ impl FoundationSettings {
                                 .checked(appearance.reduced_motion)
                                 .on_click(cx.listener(|this, enabled, _, cx| {
                                     this.set_reduced_motion(*enabled, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            crate::arena::setting_title(),
+                            crate::arena::setting_description(),
+                            Switch::new("show-home-arena")
+                                .small()
+                                .checked(appearance.show_home_arena)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_show_home_arena(*enabled, cx)
                                 })),
                             stacked,
                             cx,
@@ -87065,12 +87119,16 @@ mod tests {
                 let toggles = self.toggles.clone();
                 let tips = self.tips.clone();
                 div().w(px(400.0)).flex().flex_col().child(
-                    div().min_w_0().flex_none().w_full().child(computer_enabled_switch(
-                        false,
-                        self.gated,
-                        move |_, _, _| toggles.set(toggles.get() + 1),
-                        move |_, _, _| tips.set(tips.get() + 1),
-                    )),
+                    div()
+                        .min_w_0()
+                        .flex_none()
+                        .w_full()
+                        .child(computer_enabled_switch(
+                            false,
+                            self.gated,
+                            move |_, _, _| toggles.set(toggles.get() + 1),
+                            move |_, _, _| tips.set(tips.get() + 1),
+                        )),
                 )
             }
         }
