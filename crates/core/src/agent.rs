@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,121 @@ pub fn normalize_agent_session_title(value: &str) -> Option<String> {
             .take(MAX_AGENT_SESSION_TITLE_CHARS)
             .collect(),
     )
+}
+
+/// A built-in tool panel the runtime can inject into an Agent's sessions.
+///
+/// Both panels are on by default: the browser because the embedded browser is
+/// part of the workbench, computer use because its own runtime-wide switch and
+/// driver are what gate it. Per-Agent preferences therefore record the
+/// deviations from "on", not the grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBuiltinTool {
+    /// The embedded browser's MCP tools.
+    Browser,
+    /// The computer-use MCP tools, plus the CLI environment for Agents that
+    /// cannot receive MCP servers at all.
+    Computer,
+}
+
+impl AgentBuiltinTool {
+    pub const ALL: [Self; 2] = [Self::Browser, Self::Computer];
+
+    /// Whether the panel reaches an Agent the user never configured.
+    pub const fn default_enabled(self) -> bool {
+        true
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => "browser",
+            Self::Computer => "computer",
+        }
+    }
+}
+
+/// Which built-in tool panels each Agent receives.
+///
+/// Stored as the *disabled* Agents per panel so an untouched install carries
+/// two empty sets, and an Agent that appears later (a new catalog entry, a
+/// custom ACP Agent) starts from the documented default instead of inheriting
+/// whatever the last row of a persisted map happened to hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolPreferences {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    browser_disabled: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    computer_disabled: BTreeSet<String>,
+}
+
+impl AgentToolPreferences {
+    /// Whether one panel is on for one Agent.
+    pub fn enabled(&self, agent_id: &str, tool: AgentBuiltinTool) -> bool {
+        !self.disabled(agent_id, tool)
+    }
+
+    fn disabled(&self, agent_id: &str, tool: AgentBuiltinTool) -> bool {
+        match tool {
+            AgentBuiltinTool::Browser => self.browser_disabled.contains(agent_id),
+            AgentBuiltinTool::Computer => self.computer_disabled.contains(agent_id),
+        }
+    }
+
+    /// Records one Agent's answer for one panel.
+    ///
+    /// Agent ids are bounded the way every other id in the state file is;
+    /// anything longer than a plausible id is dropped rather than stored.
+    pub fn set_enabled(&mut self, agent_id: &str, tool: AgentBuiltinTool, enabled: bool) {
+        let agent_id = agent_id.trim();
+        if agent_id.is_empty() || agent_id.chars().count() > MAX_AGENT_ID_CHARS {
+            return;
+        }
+        let disabled = match tool {
+            AgentBuiltinTool::Browser => &mut self.browser_disabled,
+            AgentBuiltinTool::Computer => &mut self.computer_disabled,
+        };
+        if enabled {
+            disabled.remove(agent_id);
+        } else {
+            disabled.insert(agent_id.to_string());
+        }
+    }
+
+    /// Drops entries no longer worth carrying, so a corrupted or hand-edited
+    /// state file cannot grow without bound.
+    pub fn normalize(&mut self) {
+        normalize_agent_id_set(&mut self.browser_disabled);
+        normalize_agent_id_set(&mut self.computer_disabled);
+    }
+
+    pub fn browser_disabled(&self) -> &BTreeSet<String> {
+        &self.browser_disabled
+    }
+
+    pub fn computer_disabled(&self) -> &BTreeSet<String> {
+        &self.computer_disabled
+    }
+}
+
+/// The longest Agent id a preference may name. Agent ids are slugs; this is a
+/// guard against a corrupted file, not a catalog rule.
+const MAX_AGENT_ID_CHARS: usize = 128;
+/// The most Agents one panel's override set may name.
+const MAX_AGENT_TOOL_OVERRIDES: usize = 512;
+
+fn normalize_agent_id_set(ids: &mut BTreeSet<String>) {
+    ids.retain(|id| {
+        let trimmed = id.trim();
+        !trimmed.is_empty() && trimmed.chars().count() <= MAX_AGENT_ID_CHARS
+    });
+    while ids.len() > MAX_AGENT_TOOL_OVERRIDES {
+        let Some(last) = ids.iter().next_back().cloned() else {
+            break;
+        };
+        ids.remove(&last);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -742,6 +858,72 @@ pub struct AgentCommandExecuteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_tool_preferences_default_on_and_record_only_deviations() {
+        let mut preferences = AgentToolPreferences::default();
+        // A fresh install carries two empty sets: every Agent starts from the
+        // documented default, including one that appears after this was saved.
+        assert!(preferences.enabled("claude", AgentBuiltinTool::Browser));
+        assert!(preferences.enabled("claude", AgentBuiltinTool::Computer));
+        assert_eq!(
+            serde_json::to_value(&preferences).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            AgentBuiltinTool::ALL.map(AgentBuiltinTool::as_str),
+            ["browser", "computer"]
+        );
+
+        preferences.set_enabled("claude", AgentBuiltinTool::Browser, false);
+        assert!(!preferences.enabled("claude", AgentBuiltinTool::Browser));
+        assert!(preferences.enabled("claude", AgentBuiltinTool::Computer));
+
+        let json = serde_json::to_value(&preferences).unwrap();
+        assert_eq!(json["browserDisabled"], serde_json::json!(["claude"]));
+        assert!(json.get("computerDisabled").is_none());
+        let decoded: AgentToolPreferences = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, preferences);
+
+        // Turning it back on removes the deviation rather than storing a
+        // second, contradictory answer.
+        preferences.set_enabled("claude", AgentBuiltinTool::Browser, true);
+        assert!(preferences.browser_disabled().is_empty());
+        // An id that cannot be an Agent id is refused instead of stored.
+        preferences.set_enabled("  ", AgentBuiltinTool::Computer, false);
+        preferences.set_enabled(
+            &"x".repeat(MAX_AGENT_ID_CHARS + 1),
+            AgentBuiltinTool::Computer,
+            false,
+        );
+        assert!(preferences.computer_disabled().is_empty());
+    }
+
+    #[test]
+    fn builtin_tool_preference_normalization_drops_unusable_hand_edits() {
+        let mut decoded: AgentToolPreferences = serde_json::from_value(serde_json::json!({
+            "browserDisabled": ["claude", "", "   ", "x".repeat(MAX_AGENT_ID_CHARS + 1)],
+            "computerDisabled": ["codex"],
+        }))
+        .unwrap();
+        decoded.normalize();
+        assert_eq!(
+            decoded
+                .browser_disabled()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["claude".to_string()]
+        );
+        assert_eq!(
+            decoded
+                .computer_disabled()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["codex".to_string()]
+        );
+    }
 
     #[test]
     fn session_title_normalization_collapses_whitespace_and_bounds_unicode() {

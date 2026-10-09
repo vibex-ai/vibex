@@ -95,6 +95,13 @@ pub struct AgentManager {
     /// port every time computer use is started, so a switch turned off and on
     /// again has to reach sessions with the new address instead of a dead one.
     computer_mcp_tool: StdMutex<Option<ComputerMcpToolConfig>>,
+    /// Which built-in tool panels each Agent may receive.
+    ///
+    /// The workbench's Config Center is the only writer today, but the answer
+    /// has to live here: the descriptors are added while a session's runtime
+    /// resources are assembled, and that is where a per-Agent "off" has to be
+    /// honoured. Absent entries take [`AgentBuiltinTool::default_enabled`].
+    agent_tool_preferences: StdMutex<vibex_core::AgentToolPreferences>,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     /// One read connection shared by the paged timeline reads.
@@ -442,6 +449,7 @@ impl AgentManager {
             delegation_tool: OnceLock::new(),
             browser_mcp_tool: OnceLock::new(),
             computer_mcp_tool: StdMutex::new(None),
+            agent_tool_preferences: StdMutex::new(vibex_core::AgentToolPreferences::default()),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             timeline_reader: StdMutex::new(None),
@@ -663,6 +671,49 @@ impl AgentManager {
             .and_then(|slot| slot.clone())
     }
 
+    /// Records one Agent's answer for one built-in tool panel.
+    ///
+    /// Takes effect when the next session's runtime resources are assembled;
+    /// a session that is already running keeps the tools it started with, the
+    /// way it keeps every other launch input.
+    pub fn set_agent_tool_enabled(
+        &self,
+        agent_id: &str,
+        tool: vibex_core::AgentBuiltinTool,
+        enabled: bool,
+    ) {
+        if let Ok(mut preferences) = self.agent_tool_preferences.lock() {
+            preferences.set_enabled(agent_id, tool, enabled);
+        }
+    }
+
+    /// Whether one Agent currently receives one built-in tool panel.
+    pub fn agent_tool_enabled(&self, agent_id: &str, tool: vibex_core::AgentBuiltinTool) -> bool {
+        self.agent_tool_preferences
+            .lock()
+            .map(|preferences| preferences.enabled(agent_id, tool))
+            .unwrap_or_else(|_| tool.default_enabled())
+    }
+
+    /// Replaces every per-Agent tool answer at once.
+    ///
+    /// The Client's persisted settings are applied this way at boot, so the
+    /// runtime starts from the same list the Config Center renders instead of
+    /// from an empty map that only fills in as the reader touches rows.
+    pub fn replace_agent_tool_preferences(&self, preferences: vibex_core::AgentToolPreferences) {
+        if let Ok(mut slot) = self.agent_tool_preferences.lock() {
+            *slot = preferences;
+        }
+    }
+
+    /// The per-Agent tool answers, for a client that has to render them.
+    pub fn agent_tool_preferences(&self) -> vibex_core::AgentToolPreferences {
+        self.agent_tool_preferences
+            .lock()
+            .map(|preferences| preferences.clone())
+            .unwrap_or_default()
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.db_path
     }
@@ -697,6 +748,10 @@ impl AgentManager {
         provider_kind: ProviderKind,
     ) -> VibexResult<ProviderRuntimeResources> {
         let mut resources = self.resolve_runtime_resources_for_agent(agent_id, provider_kind)?;
+        // One snapshot for both panels: the two answers belong to the same
+        // configuration, and reading them at different moments could hand a
+        // session the browser of one edit and the computer tool of the next.
+        let tool_preferences = self.agent_tool_preferences();
         if provider_kind == ProviderKind::Acp
             && let Some(tool) = self.delegation_tool.get()
         {
@@ -725,6 +780,7 @@ impl AgentManager {
             });
         }
         if provider_kind == ProviderKind::Acp
+            && tool_preferences.enabled(agent_id.as_str(), vibex_core::AgentBuiltinTool::Browser)
             && let Some(tool) = self.browser_mcp_tool.get()
         {
             resources
@@ -735,6 +791,7 @@ impl AgentManager {
         // browser one: an Agent that cannot use it simply never lists the
         // tools, and the runtime withholds nothing from the browser path.
         if provider_kind == ProviderKind::Acp
+            && tool_preferences.enabled(agent_id.as_str(), vibex_core::AgentBuiltinTool::Computer)
             && let Some(tool) = self.computer_mcp_tool()
         {
             resources
@@ -8985,6 +9042,99 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "message_submission_coordinator_unavailable");
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn a_withheld_builtin_panel_never_reaches_that_agents_session() {
+        use vibex_core::AgentBuiltinTool;
+        let db_path = temp_db_path("agent-tool-preferences");
+        let manager = AgentManager::new(&db_path).unwrap();
+        manager
+            .install_browser_mcp_tool(BrowserMcpToolConfig {
+                command: PathBuf::from("/tmp/vibex-desktop"),
+                endpoint: "http://127.0.0.1:43211/mcp".to_string(),
+                capability_token: "cap_browser_tool_preference_secret".to_string(),
+            })
+            .unwrap();
+        manager
+            .install_computer_mcp_tool(ComputerMcpToolConfig {
+                command: PathBuf::from("/tmp/vibex-desktop"),
+                endpoint: "http://127.0.0.1:43212/mcp".to_string(),
+                capability_token: "cap_computer_tool_preference_secret".to_string(),
+            })
+            .unwrap();
+        let session_id = VibexSessionId::new();
+        let claude = AgentId::parse("claude").unwrap();
+
+        // The default is the delivered pair: an untouched preference map must
+        // not quietly withhold the built-ins from every Agent.
+        let resources = manager
+            .runtime_resources_for_session(&session_id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(
+            resources
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == vibex_core::BROWSER_MCP_SERVER_ID)
+        );
+        assert!(
+            resources
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == vibex_core::COMPUTER_MCP_SERVER_ID)
+        );
+
+        manager.set_agent_tool_enabled("claude", AgentBuiltinTool::Browser, false);
+        let resources = manager
+            .runtime_resources_for_session(&session_id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(
+            resources
+                .mcp_servers
+                .iter()
+                .all(|server| server.id != vibex_core::BROWSER_MCP_SERVER_ID),
+            "a disabled browser panel must not be advertised"
+        );
+        assert!(
+            resources
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == vibex_core::COMPUTER_MCP_SERVER_ID),
+            "the two panels are gated separately"
+        );
+
+        // The CLI road carries the same capability, so switching computer use
+        // off withholds the environment as well as the descriptor.
+        manager.set_agent_tool_enabled("pi", AgentBuiltinTool::Computer, false);
+        let pi = AgentId::parse("pi").unwrap();
+        let resources = manager
+            .runtime_resources_for_session(&session_id, &pi, ProviderKind::Acp)
+            .unwrap();
+        assert!(
+            resources
+                .env
+                .iter()
+                .all(|(key, _)| key != "VIBEX_COMPUTER_MCP_ENDPOINT")
+        );
+        assert!(
+            resources
+                .mcp_servers
+                .iter()
+                .all(|server| server.id != vibex_core::COMPUTER_MCP_SERVER_ID)
+        );
+
+        // Replacing the whole map is how a Client applies its persisted list.
+        let mut preferences = vibex_core::AgentToolPreferences::default();
+        preferences.set_enabled("claude", AgentBuiltinTool::Browser, false);
+        manager.replace_agent_tool_preferences(preferences.clone());
+        assert_eq!(manager.agent_tool_preferences(), preferences);
+        assert!(!manager.agent_tool_enabled("claude", AgentBuiltinTool::Browser));
+        assert!(
+            manager.agent_tool_enabled("pi", AgentBuiltinTool::Computer),
+            "a replaced map must not carry over the previous answer"
+        );
+
         cleanup_db(&db_path);
     }
 

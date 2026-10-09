@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use vibex_core::{AgentId, SessionRuntimeSelection};
+use vibex_core::{AgentId, AgentToolPreferences, SessionRuntimeSelection};
 
 use crate::{
     AgentSortStrategy, NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState,
@@ -1218,6 +1218,11 @@ pub struct DesktopUiStateV1 {
     pub agent_tab_order: Vec<String>,
     #[serde(default)]
     pub agent_sort_strategy: AgentSortStrategy,
+    /// Which built-in tool panels each Agent receives. The Config Center's
+    /// per-Agent icons are the only UI, and the runtime is told the same list
+    /// at boot so a persisted "off" survives a restart.
+    #[serde(default)]
+    pub agent_tools: AgentToolPreferences,
     #[serde(default)]
     pub plugin_order_migrated: bool,
     pub migration: UiStateMigration,
@@ -1247,6 +1252,7 @@ impl Default for DesktopUiStateV1 {
             terminal_tab_titles: BTreeMap::new(),
             agent_tab_order: Vec::new(),
             agent_sort_strategy: AgentSortStrategy::default(),
+            agent_tools: AgentToolPreferences::default(),
             plugin_order_migrated: false,
             migration: UiStateMigration::default(),
         }
@@ -1397,6 +1403,7 @@ impl DesktopUiStateV1 {
                 .take(2_000)
                 .collect();
         normalize_ids(&mut self.agent_tab_order, 256);
+        self.agent_tools.normalize();
         self.terminal_tab_titles = std::mem::take(&mut self.terminal_tab_titles)
             .into_iter()
             .filter_map(|(key, value)| {
@@ -2956,6 +2963,36 @@ mod tests {
         let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
 
         assert!(!decoded.desktop_behavior.close_to_tray);
+    }
+
+    #[test]
+    fn agent_tool_preferences_round_trip_and_stay_backward_compatible() {
+        let mut state = DesktopUiStateV1::default();
+        state
+            .agent_tools
+            .set_enabled("claude", vibex_core::AgentBuiltinTool::Browser, false);
+        state
+            .agent_tools
+            .set_enabled("pi", vibex_core::AgentBuiltinTool::Computer, false);
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(decoded.agent_tools, state.agent_tools);
+        assert_eq!(
+            decoded
+                .agent_tools
+                .browser_disabled()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["claude".to_string()]
+        );
+
+        // A state file written before the per-Agent tool answers existed
+        // decodes to the documented default: every panel delivered.
+        let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("agentTools");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(decoded.agent_tools, AgentToolPreferences::default());
     }
 
     #[test]

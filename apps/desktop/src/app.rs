@@ -102,23 +102,23 @@ use vibex_backend::{
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
-    AgentAuthMethodKind, AgentAuthenticationOperationId, AgentCommandDiscoverRequest,
-    AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecutionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentGoalControlRequest, AgentId,
-    AgentListRequest, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
-    AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
-    AgentTimelineReasoningDisplayMode, AgentTokenUsage, AttachRuntimeRequest,
-    BrowserCaptureQuality, CancelAgentSessionRuntimeSwitchRequest, ComputerAvailability,
-    ComputerUnavailableReason, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    DetachRuntimeRequest, ElicitationField, ElicitationFieldKind, ElicitationRequest,
-    ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind, FileOperationKind,
-    FileOperationPatchFormat, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitProjectEligibilityState, GitProjectIneligibleReason, GitStatusSummary,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalPhase,
-    MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
-    PromptId, PromptUsageRecordRequest, ProviderProfileSummary, RcImportPayload,
+    AgentAuthMethodKind, AgentAuthenticationOperationId, AgentBuiltinTool,
+    AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
+    AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
+    AgentGoalControlRequest, AgentId, AgentListRequest, AgentMessagePhase, AgentSession,
+    AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState, AgentSnapshotEntry,
+    AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, AgentTokenUsage,
+    AgentToolPreferences, AttachRuntimeRequest, BrowserCaptureQuality,
+    CancelAgentSessionRuntimeSwitchRequest, ComputerAvailability, ComputerUnavailableReason,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
+    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest,
+    FileEntryKind, FileOperationKind, FileOperationPatchFormat, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
+    GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
+    GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
+    GoalPhase, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId,
+    ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary, RcImportPayload,
     RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
     RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
@@ -8209,12 +8209,25 @@ impl VibexWorkbench {
                 }
             },
         ));
-        agent_subscriptions.push(cx.subscribe(
+        agent_subscriptions.push(cx.subscribe_in(
             &management_view,
-            |this, _, event: &ManagementEvent, cx| match event {
+            window,
+            |this, _, event: &ManagementEvent, window, cx| match event {
                 ManagementEvent::AgentRegistryChanged => this.load_agent_overview(cx),
+                ManagementEvent::AgentToolToggled {
+                    agent_id,
+                    tool,
+                    enabled,
+                } => this.set_agent_tool_enabled(agent_id.clone(), *tool, *enabled, cx),
+                ManagementEvent::OpenComputerSettings => this.open_computer_settings(window, cx),
             },
         ));
+        // The cards render the persisted answers from the first frame; the
+        // runtime learns them when the local authority is installed, and a
+        // remote seat simply has no authority to tell.
+        management_view.update(cx, |management, cx| {
+            management.set_agent_tools(ui_state.agent_tools.clone(), false, cx)
+        });
         agent_subscriptions.push(cx.observe_in(&usage_view, window, |this, usage, _, cx| {
             let next_in_flight = usage.read(cx).is_loading();
             if this.usage_refresh_in_flight == next_in_flight {
@@ -10350,6 +10363,9 @@ impl VibexWorkbench {
         self.management_view.update(cx, |management, cx| {
             management.set_backend(facade.clone(), cx)
         });
+        // A paired seat has no local manager to apply the answers to, so the
+        // cards show the feature as not set up here rather than as on.
+        self.sync_agent_tool_state(cx);
         self.backend = Some(facade);
         self.attach_remote_event_stream(backend, cx);
         self.load_agent_overview(cx);
@@ -10543,6 +10559,10 @@ impl VibexWorkbench {
         }
         self.computer_runtime = Some(runtime.computer());
         self.computer_tokio = Some(gpui_tokio::Tokio::handle(cx));
+        // The persisted per-Agent tool answers belong to this authority: a
+        // session created from here on has to see the same list the Config
+        // Center is rendering.
+        self.apply_agent_tool_preferences(cx);
         self.apply_computer_settings(cx);
         cx.notify();
     }
@@ -32776,6 +32796,9 @@ impl VibexWorkbench {
         }
         self.sync_management_agent_ordering(cx);
         self.sync_management_pairing_context(cx);
+        // The cards carry the persisted per-Agent tool answers, and the local
+        // authority may have been replaced since they were last pushed.
+        self.sync_agent_tool_state(cx);
         self.push_current_navigation_entry();
         cx.notify();
     }
@@ -33517,6 +33540,10 @@ impl VibexWorkbench {
                     wayland,
                     busy: false,
                 });
+                // The Config Center's per-Agent computer glyphs are gated on
+                // this answer, so the cards have to learn it on the same frame
+                // the settings page does.
+                this.sync_agent_tool_state(cx);
                 cx.notify();
             });
         })
@@ -33590,6 +33617,10 @@ impl VibexWorkbench {
                     wayland,
                     busy: false,
                 });
+                // The Config Center's per-Agent computer glyphs are gated on
+                // this answer, so the cards have to learn it on the same frame
+                // the settings page does.
+                this.sync_agent_tool_state(cx);
                 cx.notify();
             });
         }));
@@ -33682,6 +33713,10 @@ impl VibexWorkbench {
                     wayland,
                     busy: false,
                 });
+                // The Config Center's per-Agent computer glyphs are gated on
+                // this answer, so the cards have to learn it on the same frame
+                // the settings page does.
+                this.sync_agent_tool_state(cx);
                 cx.notify();
             });
         }));
@@ -33725,6 +33760,96 @@ impl VibexWorkbench {
         self.ui_state.computer.wayland_opt_in = value;
         self.queue_ui_state();
         self.apply_computer_settings(cx);
+    }
+
+    // ------------------------------------------------- Agent tool panels
+
+    /// Whether computer use is running well enough for a per-Agent switch to
+    /// mean anything.
+    ///
+    /// The Config Center's computer glyph is off until this is true, and its
+    /// click opens Settings rather than flipping: the runtime-wide switch and
+    /// the installed driver are what gate the feature, so a per-Agent "on"
+    /// before them would promise a capability that cannot arrive.
+    fn computer_tools_ready(&self) -> bool {
+        matches!(
+            computer_readiness(
+                self.computer_runtime.is_some(),
+                &self.computer_status().driver,
+                self.computer_status().availability.as_ref(),
+                self.computer_settings().enabled,
+            ),
+            ComputerReadiness::Ready { .. }
+        )
+    }
+
+    /// Pushes the persisted per-Agent tool answers into the Config Center.
+    fn sync_agent_tool_state(&mut self, cx: &mut Context<Self>) {
+        let tools = self.ui_state.agent_tools.clone();
+        let ready = self.computer_tools_ready();
+        self.management_view.update(cx, |management, cx| {
+            management.set_agent_tools(tools, ready, cx)
+        });
+    }
+
+    /// Stores one Agent's answer for one built-in tool panel.
+    ///
+    /// The local runtime learns the answer immediately; a session that is
+    /// already running keeps the tools it started with, which is the same rule
+    /// every other launch input follows.
+    fn set_agent_tool_enabled(
+        &mut self,
+        agent_id: String,
+        tool: AgentBuiltinTool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.ui_state
+            .agent_tools
+            .set_enabled(&agent_id, tool, enabled);
+        self.queue_ui_state();
+        if let Some(runtime) = self.runtime.clone() {
+            runtime
+                .agent()
+                .manager()
+                .set_agent_tool_enabled(&agent_id, tool, enabled);
+        }
+        self.sync_agent_tool_state(cx);
+        cx.notify();
+    }
+
+    /// Applies every persisted per-Agent tool answer to the local runtime.
+    ///
+    /// Called when an authority is installed, so a restart keeps the answers
+    /// the Config Center is rendering rather than starting from "everything
+    /// on". A remote seat has no local manager to tell; its cards still render
+    /// and persist the answers.
+    fn apply_agent_tool_preferences(&mut self, cx: &mut Context<Self>) {
+        let preferences: AgentToolPreferences = self.ui_state.agent_tools.clone();
+        if let Some(runtime) = self.runtime.clone() {
+            runtime
+                .agent()
+                .manager()
+                .replace_agent_tool_preferences(preferences);
+        }
+        self.sync_agent_tool_state(cx);
+    }
+
+    /// Opens Settings on the computer-use page.
+    ///
+    /// This is what an Agent card's computer glyph does while the feature is
+    /// not set up: the switch and the driver install live on that page, and
+    /// sending the reader there is the only click that can change the answer.
+    fn open_computer_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening is a no-op when the dialog is already up; switching the
+        // section below still moves an already-open dialog to the right page.
+        self.open_settings(window, cx);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.activate_settings_section(SettingsSection::Computer, cx);
+            settings.shortcut_note = None;
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// Stores browser preferences and applies them to the panel that is open.

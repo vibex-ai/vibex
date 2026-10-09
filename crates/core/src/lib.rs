@@ -48,14 +48,15 @@ pub use acp_catalog::{
 };
 
 pub use agent::{
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandDiscovery,
-    AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
-    AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentGoalControlRequest, AgentGoalControlResult,
-    AgentModelCapabilities, AgentModelListRequest, AgentModelListResponse, AgentModelListSource,
-    AgentNotificationIntent, AgentNotificationKind, AgentReasoningEffort, AgentSession,
-    AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AgentSessionSummary,
-    AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest,
+    AgentBuiltinTool, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
+    AgentCommandDiscovery, AgentCommandEntry, AgentCommandExecuteRequest,
+    AgentCommandExecuteResult, AgentCommandExecuteStatus, AgentCommandExecutionBehavior,
+    AgentCommandSelectionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
+    AgentGoalControlRequest, AgentGoalControlResult, AgentModelCapabilities, AgentModelListRequest,
+    AgentModelListResponse, AgentModelListSource, AgentNotificationIntent, AgentNotificationKind,
+    AgentReasoningEffort, AgentSession, AgentSessionConfigProbe, AgentSessionSafety,
+    AgentSessionState, AgentSessionSummary, AgentTimelineDisplaySettings,
+    AgentTimelineReasoningDisplayMode, AgentToolPreferences, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
     GetMessageSubmissionRequest, MAX_AGENT_SESSION_TITLE_CHARS, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN,
     MessageSubmissionState, ProviderCapabilitiesResponse, RenameAgentSessionRequest,

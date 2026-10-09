@@ -148,6 +148,13 @@ const MANAGEMENT_RESOURCE_LOADING_ROWS: usize = 4;
 /// Provider rows the detail pane stands in for while the snapshot loads.
 const MANAGEMENT_PROVIDER_LOADING_ROWS: usize = 5;
 const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
+/// The square an Agent card's built-in tool glyph occupies.
+///
+/// Small on purpose: the glyphs sit on the card footer's type scale rather
+/// than on the 40 px frame the card's own actions use.
+const MANAGEMENT_AGENT_TOOL_ICON_SIZE: f32 = 22.0;
+/// The glyph drawn inside that square.
+const MANAGEMENT_AGENT_TOOL_GLYPH_SIZE: f32 = 14.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -162,9 +169,21 @@ fn management_input_changed(event: &InputEvent) -> bool {
     matches!(event, InputEvent::Change)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManagementEvent {
     AgentRegistryChanged,
+    /// A card's built-in tool icon was clicked. The workbench owns the
+    /// persisted preference and the runtime, so the view reports the intent
+    /// instead of writing either.
+    AgentToolToggled {
+        agent_id: String,
+        tool: vibex_core::AgentBuiltinTool,
+        enabled: bool,
+    },
+    /// The computer icon was clicked before computer use was set up. The
+    /// workbench answers by opening Settings on the computer-use page, where
+    /// the switch and the driver install live.
+    OpenComputerSettings,
 }
 
 /// Which control inside the open Model editor produced a message.
@@ -895,6 +914,19 @@ pub struct ManagementCenter {
     mcp_validation: Option<(String, String, bool)>,
     skill_validation: Option<(String, String, bool)>,
     selected_agent_id: Option<String>,
+    /// Which built-in tool panels each Agent receives, as the workbench's
+    /// settings currently answer.
+    ///
+    /// Kept as the view's own copy rather than read off the runtime so the
+    /// cards render the same on a paired seat, which has no local manager to
+    /// ask; the workbench pushes the list here whenever it changes.
+    agent_tools: vibex_core::AgentToolPreferences,
+    /// Whether computer use is set up and running on this authority.
+    ///
+    /// Until it is, a per-Agent computer switch cannot mean anything — the
+    /// runtime-wide switch and the installed driver are what gate the feature —
+    /// so the icon routes to the settings page instead of flipping.
+    computer_tools_ready: bool,
     selected_provider_profile_id: Option<String>,
     agent_auth_scope: Option<(String, Option<String>)>,
     agent_auth_catalog: Option<AgentAuthCatalog>,
@@ -1704,6 +1736,8 @@ impl ManagementCenter {
             skill_validation: None,
             provider_display_order_drop_target: None,
             selected_agent_id: None,
+            agent_tools: vibex_core::AgentToolPreferences::default(),
+            computer_tools_ready: false,
             selected_provider_profile_id: None,
             agent_auth_scope: None,
             agent_auth_catalog: None,
@@ -1814,6 +1848,46 @@ impl ManagementCenter {
             self.agent_ordering = ordering;
             cx.notify();
         }
+    }
+
+    /// Adopt the workbench's per-Agent built-in tool answers.
+    ///
+    /// `computer_ready` says whether computer use is set up on the authority
+    /// this view is attached to; the cards need it because an icon that cannot
+    /// flip yet has to route to the settings page instead.
+    pub fn set_agent_tools(
+        &mut self,
+        agent_tools: vibex_core::AgentToolPreferences,
+        computer_ready: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_tools == agent_tools && self.computer_tools_ready == computer_ready {
+            return;
+        }
+        self.agent_tools = agent_tools;
+        self.computer_tools_ready = computer_ready;
+        cx.notify();
+    }
+
+    /// Flip one Agent's built-in tool panel.
+    ///
+    /// The view updates the list it renders so the glyph changes on the same
+    /// frame as the click, and reports the intent; the workbench persists it
+    /// and is the one that tells the runtime.
+    fn toggle_agent_tool(
+        &mut self,
+        agent_id: String,
+        tool: vibex_core::AgentBuiltinTool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_tools.set_enabled(&agent_id, tool, enabled);
+        cx.emit(ManagementEvent::AgentToolToggled {
+            agent_id,
+            tool,
+            enabled,
+        });
+        cx.notify();
     }
 
     pub fn set_runtime(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
@@ -10522,31 +10596,40 @@ impl ManagementCenter {
                                 ))
                             }),
                     )
-                    .child(
-                        div()
+                    .child({
+                        // One footer band: the profile count (or the status
+                        // sentence) on the left, the built-in tool glyphs on
+                        // the right. The two panels used to be a second text
+                        // line; a glyph says the same thing without costing a
+                        // line per card.
+                        let mut footer = h_flex()
                             .pl(px(40.0))
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if added && model_provider_configuration_supported {
-                                management_profile_count(profile_count)
-                            } else {
-                                status_label.to_string()
-                            }),
-                    )
-                    .when(added && enabled, |row| {
-                        // Not every Agent can call browser tools, and a tool that
-                        // is listed but never arrives is worse than no tool at
-                        // all. The row says which of the two this Agent is.
-                        let note = management_agent_browser_delivery_label(&id);
-                        row.child(
-                            div()
-                                .pl(px(40.0))
-                                .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(note),
-                        )
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if added && model_provider_configuration_supported {
+                                        management_profile_count(profile_count)
+                                    } else {
+                                        status_label.to_string()
+                                    }),
+                            );
+                        if added && enabled {
+                            footer = footer.child(management_agent_tool_icons(
+                                &id,
+                                &self.agent_tools,
+                                self.computer_tools_ready,
+                                cx,
+                            ));
+                        }
+                        footer
                     });
             agent_rows = agent_rows.child(row);
         }
@@ -23564,6 +23647,231 @@ fn management_agent_browser_delivery_label(agent_id: &str) -> String {
     }
 }
 
+/// The hover tip for an Agent card's browser-use icon.
+///
+/// An Agent that can never receive the server keeps the delivery sentence
+/// instead of a switch sentence: there is nothing to turn on, and saying so is
+/// better than offering a switch that would silently do nothing.
+fn management_agent_browser_tool_tip(agent_id: &str, enabled: bool) -> String {
+    if vibex_desktop_runtime::BrowserRuntime::delivery_for(agent_id)
+        == vibex_core::BrowserToolDelivery::Unavailable
+    {
+        return management_agent_browser_delivery_label(agent_id);
+    }
+    if enabled {
+        management_locale_text(
+            "Browser use is on for this Agent. Click to turn it off.",
+            "此 Agent 已启用浏览器工具，点击可关闭。",
+            "此 Agent 已啟用瀏覽器工具，點擊可關閉。",
+        )
+        .to_string()
+    } else {
+        management_locale_text(
+            "Browser use is off for this Agent. Click to turn it on.",
+            "此 Agent 已关闭浏览器工具，点击可启用。",
+            "此 Agent 已關閉瀏覽器工具，點擊可啟用。",
+        )
+        .to_string()
+    }
+}
+
+/// The hover tip for an Agent card's computer-use icon.
+///
+/// Three answers, in the order they can be acted on: an Agent that carries the
+/// feature itself, an Agent no MCP tool can reach, and everyone else — for whom
+/// the tip is either "not set up yet, open Settings" or the switch the click
+/// performs.
+fn management_agent_computer_tool_tip(agent_id: &str, enabled: bool, ready: bool) -> String {
+    use vibex_core::ComputerUseDelivery;
+    match vibex_desktop_runtime::ComputerRuntime::use_delivery_for(agent_id) {
+        ComputerUseDelivery::NativeAgentFeature => management_locale_text(
+            "This Agent has its own computer-use feature. Vibex does not control it.",
+            "该 Agent 自带电脑操作能力，Vibex 不会改写它的配置。",
+            "該 Agent 自帶電腦操作能力，Vibex 不會改寫它的設定。",
+        )
+        .to_string(),
+        ComputerUseDelivery::Unavailable => management_locale_text(
+            "Computer use is unavailable for this Agent — it cannot receive MCP tools.",
+            "该 Agent 无法使用电脑操作：它不接收 MCP 工具。",
+            "該 Agent 無法使用電腦操作：它不接收 MCP 工具。",
+        )
+        .to_string(),
+        ComputerUseDelivery::McpTool | ComputerUseDelivery::CliSkill => {
+            if !ready {
+                management_locale_text(
+                    "Computer use is not set up yet. Click to open Settings and enable it there.",
+                    "电脑操作尚未启用。点击打开设置，在“电脑操作”中启用并下载驱动。",
+                    "電腦操作尚未啟用。點擊開啟設定，在「電腦操作」中啟用並下載驅動。",
+                )
+                .to_string()
+            } else if enabled {
+                management_locale_text(
+                    "Computer use is on for this Agent. Click to turn it off.",
+                    "此 Agent 已启用电脑操作，点击可关闭。",
+                    "此 Agent 已啟用電腦操作，點擊可關閉。",
+                )
+                .to_string()
+            } else {
+                management_locale_text(
+                    "Computer use is off for this Agent. Click to turn it on.",
+                    "此 Agent 已关闭电脑操作，点击可启用。",
+                    "此 Agent 已關閉電腦操作，點擊可啟用。",
+                )
+                .to_string()
+            }
+        }
+    }
+}
+
+/// What clicking an Agent card's built-in tool icon does.
+enum ManagementAgentToolAction {
+    Toggle {
+        agent_id: String,
+        tool: vibex_core::AgentBuiltinTool,
+        enabled: bool,
+    },
+    /// Computer use is not set up on this authority, so the click opens
+    /// Settings on its page instead of pretending to switch anything.
+    OpenComputerSettings,
+    /// Nothing can be toggled for this Agent.
+    None,
+}
+
+/// One built-in tool glyph on an Agent card's footer.
+///
+/// A lit glyph is a panel that reaches this Agent, a muted one is a panel that
+/// does not; an Agent that can never receive the panel gets an inert glyph with
+/// the reason in its tip rather than a switch that would do nothing.
+fn management_agent_tool_icon(
+    id: String,
+    icon_path: &'static str,
+    tip: String,
+    lit: bool,
+    action: ManagementAgentToolAction,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    // An inert glyph is never lit: it reports that this Agent cannot receive
+    // the panel, so it must not read as the panel being on.
+    let inert = matches!(action, ManagementAgentToolAction::None);
+    let color = if inert {
+        cx.theme().muted_foreground.opacity(0.45)
+    } else if lit {
+        cx.theme().primary
+    } else {
+        cx.theme().muted_foreground
+    };
+    if inert {
+        let tooltip = tip.clone();
+        return div()
+            .id(SharedString::from(id))
+            .role(Role::Image)
+            .aria_label(SharedString::from(tip))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(MANAGEMENT_AGENT_TOOL_ICON_SIZE))
+            .child(
+                Icon::default()
+                    .path(icon_path)
+                    .size(px(MANAGEMENT_AGENT_TOOL_GLYPH_SIZE))
+                    .text_color(color),
+            )
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .into_any_element();
+    }
+    let aria = SharedString::from(tip.clone());
+    button_with_aria_label(
+        Button::new(SharedString::from(id))
+            .ghost()
+            .size(px(MANAGEMENT_AGENT_TOOL_ICON_SIZE))
+            .icon(
+                Icon::default()
+                    .path(icon_path)
+                    .size(px(MANAGEMENT_AGENT_TOOL_GLYPH_SIZE)),
+            )
+            .text_color(color)
+            .tooltip(SharedString::from(tip))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                match &action {
+                    ManagementAgentToolAction::Toggle {
+                        agent_id,
+                        tool,
+                        enabled,
+                    } => this.toggle_agent_tool(agent_id.clone(), *tool, *enabled, cx),
+                    ManagementAgentToolAction::OpenComputerSettings => {
+                        cx.emit(ManagementEvent::OpenComputerSettings);
+                    }
+                    ManagementAgentToolAction::None => {}
+                }
+            })),
+        aria,
+    )
+    .into_any_element()
+}
+
+/// Both built-in tool glyphs on an Agent card's footer.
+fn management_agent_tool_icons(
+    agent_id: &str,
+    tools: &vibex_core::AgentToolPreferences,
+    computer_ready: bool,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    use vibex_core::{AgentBuiltinTool, BrowserToolDelivery, ComputerUseDelivery};
+    let browser_enabled = tools.enabled(agent_id, AgentBuiltinTool::Browser);
+    let browser_action = if vibex_desktop_runtime::BrowserRuntime::delivery_for(agent_id)
+        == BrowserToolDelivery::Unavailable
+    {
+        ManagementAgentToolAction::None
+    } else {
+        ManagementAgentToolAction::Toggle {
+            agent_id: agent_id.to_string(),
+            tool: AgentBuiltinTool::Browser,
+            enabled: !browser_enabled,
+        }
+    };
+    let computer_delivery = vibex_desktop_runtime::ComputerRuntime::use_delivery_for(agent_id);
+    let computer_enabled = computer_ready && tools.enabled(agent_id, AgentBuiltinTool::Computer);
+    let computer_action = match computer_delivery {
+        ComputerUseDelivery::McpTool | ComputerUseDelivery::CliSkill => {
+            if computer_ready {
+                ManagementAgentToolAction::Toggle {
+                    agent_id: agent_id.to_string(),
+                    tool: AgentBuiltinTool::Computer,
+                    enabled: !computer_enabled,
+                }
+            } else {
+                ManagementAgentToolAction::OpenComputerSettings
+            }
+        }
+        ComputerUseDelivery::NativeAgentFeature | ComputerUseDelivery::Unavailable => {
+            ManagementAgentToolAction::None
+        }
+    };
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap_0p5()
+        .child(management_agent_tool_icon(
+            format!("management-agent-browser-tool-{agent_id}"),
+            "icons/vibex/globe.svg",
+            management_agent_browser_tool_tip(agent_id, browser_enabled),
+            browser_enabled,
+            browser_action,
+            cx,
+        ))
+        .child(management_agent_tool_icon(
+            format!("management-agent-computer-tool-{agent_id}"),
+            "icons/vibex/monitor.svg",
+            management_agent_computer_tool_tip(agent_id, computer_enabled, computer_ready),
+            computer_enabled,
+            computer_action,
+            cx,
+        ))
+        .into_any_element()
+}
+
 fn management_agent_status_label(agent: &AgentSnapshotEntry) -> &'static str {
     match agent.managed_install.status {
         vibex_core::AgentManagedInstallStatus::Installing
@@ -24435,8 +24743,8 @@ mod tests {
 
     #[test]
     fn browser_tool_delivery_copy_names_the_unreachable_agents() {
-        // The row has to say which Agents can never call the tools, because a
-        // listed tool that never arrives reads as a broken one.
+        // The hover tip has to say which Agents can never call the tools,
+        // because a listed tool that never arrives reads as a broken one.
         let reachable = management_agent_browser_delivery_label("claude");
         assert!(reachable.contains("HTTP") || reachable.contains("available"));
         // The built-ins reach an Agent whose CLI reads its own MCP file, because
@@ -24449,7 +24757,7 @@ mod tests {
             );
         }
         // An Agent that drops or rejects the field still gets nothing, and the
-        // row must say so rather than listing a tool that never arrives.
+        // tip must say so rather than listing a tool that never arrives.
         for agent in ["pi", "factory-droid"] {
             let note = management_agent_browser_delivery_label(agent);
             assert!(
@@ -24460,6 +24768,52 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn agent_tool_tips_carry_the_state_the_click_and_the_blocked_reason() {
+        // A reachable Agent's tip is the switch itself, and the two states do
+        // not read the same.
+        let on = management_agent_browser_tool_tip("claude", true);
+        let off = management_agent_browser_tool_tip("claude", false);
+        assert_ne!(on, off);
+        assert!(on.contains("on") || on.contains("已启用") || on.contains("已啟用"));
+        assert!(off.contains("off") || off.contains("已关闭") || off.contains("已關閉"));
+
+        // An Agent that can never receive the server gets the delivery
+        // sentence instead of a switch sentence.
+        let unreachable = management_agent_browser_tool_tip("pi", true);
+        assert!(
+            unreachable.contains("unavailable")
+                || unreachable.contains("不可用")
+                || unreachable.contains("無法使用"),
+            "pi should be labelled unreachable, got {unreachable}"
+        );
+
+        // Computer use before the feature is set up routes to Settings: the
+        // reset is the whole point of the tip.
+        let setup = management_agent_computer_tool_tip("claude", false, false);
+        assert!(
+            setup.contains("Settings") || setup.contains("设置") || setup.contains("設定"),
+            "the unset tip should point at Settings, got {setup}"
+        );
+        // An Agent carrying its own computer-use feature is not offered a
+        // switch Vibex cannot honour.
+        let native = management_agent_computer_tool_tip("codex", false, true);
+        assert!(
+            native.contains("own") || native.contains("自带") || native.contains("自帶"),
+            "codex should be described through its own feature, got {native}"
+        );
+        // Once set up, the same Agent gets the switch sentence.
+        let ready_on = management_agent_computer_tool_tip("claude", true, true);
+        let ready_off = management_agent_computer_tool_tip("claude", false, true);
+        assert_ne!(ready_on, ready_off);
+        assert!(
+            ready_off.contains("off")
+                || ready_off.contains("已关闭")
+                || ready_off.contains("已關閉")
+        );
+    }
+
     use vibex_desktop_model::AgentSortStrategy;
 
     #[test]
