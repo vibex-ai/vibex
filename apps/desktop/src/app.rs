@@ -21420,6 +21420,66 @@ impl VibexWorkbench {
         }
     }
 
+    /// Pastes into the queued-message editor exactly like the composer does.
+    ///
+    /// The queued message owns its own attachment list, so clipboard images,
+    /// dragged paths and Vibex message payloads are folded into markers on the
+    /// queue edit buffer instead of leaking into the composer's attachments.
+    fn capture_composer_queue_edit_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_queue_editing_id.is_none() {
+            return;
+        }
+        if self.composer_queue_edit_input.update(cx, |input, cx| {
+            EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        }) {
+            return;
+        }
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+        let mut captured = false;
+        for entry in clipboard.into_entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    captured |= self.add_composer_queue_edit_image(&image, window, cx);
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.paths() {
+                        captured |= self.add_composer_queue_edit_path(path, None, window, cx);
+                    }
+                }
+                ClipboardEntry::String(string) => {
+                    if let Some(metadata) = string.metadata_json::<VibexMessageClipboard>()
+                        && self.add_composer_queue_edit_clipboard(metadata, window, cx)
+                    {
+                        captured = true;
+                        continue;
+                    }
+                    if let Some((format, bytes)) = decode_html_data_image(&string.text) {
+                        captured |= self.add_composer_queue_edit_image(
+                            &Image::from_bytes(format, bytes),
+                            window,
+                            cx,
+                        );
+                    }
+                    if let Some(metadata) = string.metadata.as_deref()
+                        && let Some((format, bytes)) = decode_html_data_image(metadata)
+                    {
+                        captured |= self.add_composer_queue_edit_image(
+                            &Image::from_bytes(format, bytes),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+        }
+        if captured {
+            reveal_composer_cursor_after_layout(self.composer_queue_edit_input.clone(), window);
+            cx.stop_propagation();
+        }
+    }
+
     fn capture_composer_copy(
         &mut self,
         new_session: bool,
@@ -23018,6 +23078,118 @@ impl VibexWorkbench {
         });
         cx.notify();
         true
+    }
+
+    /// Adds one file attachment to the queued-message editor at the caret.
+    ///
+    /// Mirrors [`Self::add_user_message_edit_path`]: the marker joins the same
+    /// buffer the queue edit renders, so the chip overlay and backspace removal
+    /// apply without any queue-specific rendering.
+    fn add_composer_queue_edit_path(
+        &mut self,
+        path: &std::path::Path,
+        label: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.composer_queue_editing_id.is_none() {
+            return false;
+        }
+        let serial = self.composer_attachment_serial.saturating_add(1);
+        self.composer_attachment_serial = serial;
+        let label = label.unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment")
+                .to_string()
+        });
+        let marker = inline_composer_attachment_marker(serial);
+        self.composer_queue_edit_attachments
+            .push(InlineComposerAttachment {
+                attachment: ComposerAttachment {
+                    id: format!("attachment:{serial}"),
+                    label,
+                    path: Some(path.to_string_lossy().into_owned()),
+                    mime_type: attachment_mime_type(path),
+                },
+                marker: marker.clone(),
+            });
+        self.composer_queue_edit_input.update(cx, |input, cx| {
+            input.replace(inline_composer_attachment_insertion(&marker), window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
+    fn add_composer_queue_edit_image(
+        &mut self,
+        image: &Image,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.persist_composer_image(image) {
+            Ok(path) => self.add_composer_queue_edit_path(
+                &path,
+                Some(format!(
+                    "{}.{}",
+                    locale::text("Pasted image", "粘贴的图片", "貼上的圖片"),
+                    image.format().extension()
+                )),
+                window,
+                cx,
+            ),
+            Err(error) => {
+                self.agent_error = Some(format!("clipboard image capture failed: {error}"));
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn add_composer_queue_edit_clipboard(
+        &mut self,
+        clipboard: VibexMessageClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !clipboard.is_supported() || self.composer_queue_editing_id.is_none() {
+            return false;
+        }
+        let Some((insertion, attachments, serial)) = vibex_message_composer_insertion(
+            &clipboard.text,
+            &clipboard.attachments,
+            self.composer_attachment_serial,
+        ) else {
+            return false;
+        };
+        self.composer_attachment_serial = serial;
+        self.composer_queue_edit_attachments.extend(attachments);
+        self.composer_queue_edit_input.update(cx, |input, cx| {
+            input.replace(insertion, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
+    /// Routes a file drop on the editing queue row into the queue edit buffer.
+    ///
+    /// The queue panel sits inside the composer's own drop region, so without
+    /// this the drop would silently attach to the composer draft instead.
+    fn add_composer_queue_edit_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_queue_editing_id.is_none() {
+            return;
+        }
+        for path in paths.paths() {
+            self.add_composer_queue_edit_path(path, None, window, cx);
+        }
+        cx.notify();
     }
 
     fn add_composer_path(
@@ -53665,14 +53837,16 @@ impl VibexWorkbench {
             let drop_target_session_id = session_id.clone();
             let queue_edit_geometry_entity = cx.weak_entity();
             let editing = editing_id == Some(message_id);
-            let can_save_edit = editing
-                && (!self
-                    .composer_queue_edit_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .is_empty()
-                    || attachment_count > 0);
+            // The save gate reads the edited buffer, not the stored message: a
+            // pasted image alone is a saveable edit even when the queued message
+            // had no attachments, and a message whose only attachment was just
+            // removed must stop offering a save that would silently no-op.
+            let can_save_edit = editing && {
+                let raw_text = self.composer_queue_edit_input.read(cx).value().to_string();
+                let (text, attachments) =
+                    composer_submission_payload(&raw_text, &self.composer_queue_edit_attachments);
+                !text.trim().is_empty() || !attachments.is_empty()
+            };
             let content = if editing {
                 h_flex()
                     .min_w_0()
@@ -53729,6 +53903,9 @@ impl VibexWorkbench {
                                         )
                                     },
                                 ))
+                                .capture_action(cx.listener(|this, _: &InputPaste, window, cx| {
+                                    this.capture_composer_queue_edit_paste(window, cx)
+                                }))
                                 .child(
                                     Textarea::new(&self.composer_queue_edit_input)
                                         .appearance(false)
@@ -53899,6 +54076,14 @@ impl VibexWorkbench {
                     .min_h(px(COMPOSER_QUEUE_ROW_HEIGHT))
                     .when(editing, |this| {
                         this.min_h(px(COMPOSER_QUEUE_EDIT_ROW_HEIGHT))
+                    })
+                    // The queue panel lives inside the composer's own drop
+                    // region, so while a row is being edited the row claims
+                    // files for the queue edit before they reach the composer.
+                    .when(editing, |this| {
+                        this.on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                            this.add_composer_queue_edit_paths(paths, window, cx)
+                        }))
                     })
                     .items_center()
                     .gap_1()
@@ -84930,6 +85115,44 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sent-message edit submission should remain inspectable");
         assert!(submit.contains("composer_submission_payload(&raw_text, &edit.attachments)"));
+    }
+
+    #[test]
+    fn composer_queue_edit_pastes_attachments_like_the_composer() {
+        let source = include_str!("app.rs");
+        let queue = source
+            .split_once("    fn render_composer_queue(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer("))
+            .map(|(body, _)| body)
+            .expect("composer queue renderer should remain inspectable");
+        assert!(queue.contains("capture_composer_queue_edit_paste"));
+        assert!(queue.contains("add_composer_queue_edit_paths"));
+        assert!(queue.contains(
+            "composer_submission_payload(&raw_text, &self.composer_queue_edit_attachments)"
+        ));
+        assert!(!queue.contains("|| attachment_count > 0"));
+
+        let paste = source
+            .split_once("    fn capture_composer_queue_edit_paste(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn capture_composer_copy("))
+            .map(|(body, _)| body)
+            .expect("queue edit paste handler should remain inspectable");
+        assert!(paste.contains("self.composer_queue_editing_id.is_none()"));
+        assert!(paste.contains("EntityInputHandler::marked_text_range(input, window, cx)"));
+        assert!(paste.contains("ClipboardEntry::Image(image)"));
+        assert!(paste.contains("ClipboardEntry::ExternalPaths(paths)"));
+        assert!(paste.contains("add_composer_queue_edit_clipboard(metadata, window, cx)"));
+        assert!(paste.contains("decode_html_data_image(&string.text)"));
+        assert!(paste.contains("reveal_composer_cursor_after_layout"));
+
+        let path = source
+            .split_once("    fn add_composer_queue_edit_path(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn add_composer_queue_edit_image("))
+            .map(|(body, _)| body)
+            .expect("queue edit attachment insertion should remain inspectable");
+        assert!(path.contains("self.composer_queue_editing_id.is_none()"));
+        assert!(path.contains("self.composer_queue_edit_attachments"));
+        assert!(path.contains("inline_composer_attachment_insertion(&marker)"));
     }
 
     #[test]
