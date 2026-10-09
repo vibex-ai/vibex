@@ -10642,8 +10642,8 @@ impl ManagementCenter {
                             }),
                     )
                     .child({
-                        // One footer band: the profile count (or the status
-                        // sentence) on the left, the built-in tool glyphs on
+                        // One footer band: the built-in tool glyphs on the
+                        // left, the profile count (or the status sentence) on
                         // the right. The two panels used to be a second text
                         // line; a glyph says the same thing without costing a
                         // line per card.
@@ -10652,20 +10652,7 @@ impl ManagementCenter {
                             .w_full()
                             .min_w_0()
                             .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if added && model_provider_configuration_supported {
-                                        management_profile_count(profile_count)
-                                    } else {
-                                        status_label.to_string()
-                                    }),
-                            );
+                            .gap_1();
                         if added && enabled {
                             footer = footer.child(management_agent_tool_icons(
                                 &id,
@@ -10674,7 +10661,20 @@ impl ManagementCenter {
                                 cx,
                             ));
                         }
-                        footer
+                        footer.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_right()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if added && model_provider_configuration_supported {
+                                    management_profile_count(profile_count)
+                                } else {
+                                    status_label.to_string()
+                                }),
+                        )
                     });
             agent_rows = agent_rows.child(row);
         }
