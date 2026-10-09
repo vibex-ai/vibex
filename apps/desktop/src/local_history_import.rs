@@ -1175,7 +1175,7 @@ impl LocalHistoryImportDialog {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             hint_layer::push(
                 window,
-                hint_notification(NotificationType::Error, message, cx)
+                hint_notification(NotificationType::Error, message)
                     .id::<LocalHistoryImportErrorNotification>()
                     .autohide(true)
                     .on_click(|_, _, _| {}),

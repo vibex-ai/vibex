@@ -46,9 +46,9 @@ pub fn init(cx: &mut App) {
 /// The `id` a notification carries still decides replace-by-id, so a newer hint
 /// of the same kind replaces the older one instead of stacking on it.
 ///
-/// The notification is the middle argument because callers build it from `cx`
-/// (`hint_notification(..., cx)`); taking `cx` last is what keeps that one
-/// expression from borrowing it twice.
+/// `window` and `cx` are taken in the order a window callback hands them over,
+/// so the pair passes straight through from the callback that produced the
+/// hint.
 pub fn push(window: &mut Window, notification: impl Into<Notification>, cx: &mut App) {
     let layer = Root::read(window, cx).plugin::<HintLayer>().expect(
         "the hint layer is not registered on this window; call hint_layer::init before opening it",

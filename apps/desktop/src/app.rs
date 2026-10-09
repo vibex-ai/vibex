@@ -2156,14 +2156,10 @@ impl VibexWorkbench {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             hint_layer::push(
                 window,
-                hint_notification(
-                    NotificationType::Info,
-                    locale::localize_ui_message(&note),
-                    cx,
-                )
-                .id::<PersistenceNotification>()
-                .autohide(true)
-                .on_click(|_, _, _| {}),
+                hint_notification(NotificationType::Info, locale::localize_ui_message(&note))
+                    .id::<PersistenceNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
                 cx,
             );
         });
@@ -2191,13 +2187,13 @@ impl VibexWorkbench {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             let notification = match notice.tone {
                 SettingsOperationTone::Success => {
-                    hint_notification(NotificationType::Success, notice.message, cx)
+                    hint_notification(NotificationType::Success, notice.message)
                 }
                 SettingsOperationTone::Error => {
-                    hint_notification(NotificationType::Error, notice.message, cx)
+                    hint_notification(NotificationType::Error, notice.message)
                 }
                 SettingsOperationTone::Info => {
-                    hint_notification(NotificationType::Info, notice.message, cx)
+                    hint_notification(NotificationType::Info, notice.message)
                 }
             };
             hint_layer::push(
@@ -2228,14 +2224,10 @@ impl VibexWorkbench {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             hint_layer::push(
                 window,
-                hint_notification(
-                    NotificationType::Error,
-                    locale::localize_ui_message(&error),
-                    cx,
-                )
-                .id::<RuntimeRegistryNotification>()
-                .autohide(true)
-                .on_click(|_, _, _| {}),
+                hint_notification(NotificationType::Error, locale::localize_ui_message(&error))
+                    .id::<RuntimeRegistryNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
                 cx,
             );
         });
@@ -2259,7 +2251,6 @@ impl VibexWorkbench {
                 hint_notification(
                     NotificationType::Error,
                     locale::localize_error_message(&error),
-                    cx,
                 )
                 .id::<NewSessionErrorNotification>()
                 .autohide(true)
@@ -15936,7 +15927,6 @@ impl VibexWorkbench {
                 hint_notification(
                     NotificationType::Error,
                     self.strings().sidebar_group_other_worktree,
-                    cx,
                 ),
                 cx,
             );
@@ -19159,7 +19149,7 @@ impl VibexWorkbench {
             let message = SharedString::from(body.clone());
             let delivered = cx
                 .update_window(handle, move |_, window, cx| {
-                    hint_layer::push(window, hint_notification(tone, message, cx), cx);
+                    hint_layer::push(window, hint_notification(tone, message), cx);
                 })
                 .is_ok();
             if delivered {
@@ -23069,7 +23059,6 @@ impl VibexWorkbench {
                 hint_notification(
                     NotificationType::Warning,
                     ambiguous_message_submission_notice(),
-                    cx,
                 )
                 .id::<AmbiguousMessageSubmissionNotification>()
                 .autohide(true)
@@ -24710,7 +24699,7 @@ impl VibexWorkbench {
                 let _ = origin_window.update(cx, |_, window, cx| {
                     hint_layer::push(
                         window,
-                        hint_notification(NotificationType::Error, message.clone(), cx),
+                        hint_notification(NotificationType::Error, message.clone()),
                         cx,
                     );
                 });
@@ -26552,7 +26541,6 @@ impl VibexWorkbench {
                     "正在创建分叉会话...",
                     "正在建立分支會話...",
                 ),
-                cx,
             )
             .id::<ForkSessionNotification>()
             .autohide(false),
@@ -26614,7 +26602,6 @@ impl VibexWorkbench {
                                         "分叉会话已创建，正在准备运行时...",
                                         "分支會話已建立，正在準備執行環境...",
                                     ),
-                                    cx,
                                 )
                                 .id::<ForkSessionNotification>()
                                 .autohide(false),
@@ -26670,7 +26657,6 @@ impl VibexWorkbench {
                                         "分叉会话已就绪",
                                         "分支會話已就緒",
                                     ),
-                                    cx,
                                 )
                                 .id::<ForkSessionNotification>(),
                                 cx,
@@ -26703,7 +26689,7 @@ impl VibexWorkbench {
                             };
                             hint_layer::push(
                                 window,
-                                hint_notification(NotificationType::Error, message, cx)
+                                hint_notification(NotificationType::Error, message)
                                     .id::<ForkSessionNotification>()
                                     .autohide(false),
                                 cx,
@@ -26725,7 +26711,6 @@ impl VibexWorkbench {
                                         "分叉会话设置已中断",
                                         "分支會話設定已中斷",
                                     ),
-                                    cx,
                                 )
                                 .id::<ForkSessionNotification>()
                                 .autohide(false),
@@ -29155,7 +29140,6 @@ impl VibexWorkbench {
                     "正在创建分叉会话...",
                     "正在建立分支會話...",
                 ),
-                cx,
             )
             .id::<ForkSessionNotification>()
             .autohide(false),
@@ -29193,7 +29177,6 @@ impl VibexWorkbench {
                                         "分叉会话已创建，正在准备运行时...",
                                         "分支會話已建立，正在準備執行環境...",
                                     ),
-                                    cx,
                                 )
                                 .id::<ForkSessionNotification>()
                                 .autohide(false),
@@ -32300,7 +32283,6 @@ impl VibexWorkbench {
                         "项目图标存储不可用",
                         "專案圖示儲存空間無法使用",
                     ),
-                    cx,
                 ),
                 cx,
             );
@@ -32355,7 +32337,6 @@ impl VibexWorkbench {
                                             "無法使用專案圖示",
                                         )
                                     ),
-                                    cx,
                                 ),
                                 cx,
                             );
@@ -32373,7 +32354,6 @@ impl VibexWorkbench {
                                             "無法開啟專案圖示",
                                         )
                                     ),
-                                    cx,
                                 ),
                                 cx,
                             );
@@ -83099,11 +83079,11 @@ mod tests {
 
     /// A focusable surface that stands in for the caret the user was typing at
     /// while the hint layer paints over it.
-    struct SelectableHintProbe {
+    struct HintProbe {
         anchor_focus: FocusHandle,
     }
 
-    impl SelectableHintProbe {
+    impl HintProbe {
         fn new(cx: &mut Context<Self>) -> Self {
             Self {
                 anchor_focus: cx.focus_handle(),
@@ -83111,11 +83091,11 @@ mod tests {
         }
     }
 
-    impl Render for SelectableHintProbe {
+    impl Render for HintProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            v_flex().id("selectable-hint-probe").size_full().child(
+            v_flex().id("hint-probe").size_full().child(
                 div()
-                    .id("selectable-hint-focus-anchor")
+                    .id("hint-focus-anchor")
                     .track_focus(&self.anchor_focus)
                     .size_full()
                     .bg(gpui::black()),
@@ -83125,7 +83105,7 @@ mod tests {
 
     /// Pushes one hint onto a window whose root mounts the workbench's hint
     /// layer, with the probe's focusable surface holding focus behind it.
-    fn selectable_hint_window<'a>(
+    fn hint_window<'a>(
         message: &'static str,
         cx: &'a mut TestAppContext,
     ) -> (&'a mut VisualTestContext, FocusHandle) {
@@ -83137,7 +83117,7 @@ mod tests {
             // the card above the viewport, where no pointer can reach it.
             cx.set_reduce_motion(true);
         });
-        let probe = cx.update(|cx| cx.new(SelectableHintProbe::new));
+        let probe = cx.update(|cx| cx.new(HintProbe::new));
         let anchor_focus = probe.read_with(cx, |probe, _| probe.anchor_focus.clone());
         let (_, cx) = cx.add_window_view(|window, cx| Root::new(probe, window, cx));
         cx.update(|window, cx| {
@@ -83147,10 +83127,10 @@ mod tests {
             window.focus(&anchor_focus, cx);
             hint_layer::push(
                 window,
-                hint_notification(NotificationType::Error, message, cx)
+                hint_notification(NotificationType::Error, message)
                     .autohide(false)
                     // The workbench's dismissable hints carry this handler, and
-                    // it is what a drag must not trigger.
+                    // it is what a press on the copy button must not trigger.
                     .on_click(|_, _, _| {}),
                 cx,
             );
@@ -83174,106 +83154,73 @@ mod tests {
         })
     }
 
-    /// A hint's message is only worth showing if it can leave the app: the
-    /// pointer has to be able to select it, and the platform copy shortcut has
-    /// to copy the selection.
+    /// A hint's message is only worth showing if it can leave the app, and the
+    /// one gesture that does that is the copy button the hint carries.
     #[gpui::test]
-    fn a_hint_message_can_be_drag_selected_and_copied(cx: &mut TestAppContext) {
+    fn a_hint_message_is_copied_by_its_button(cx: &mut TestAppContext) {
         let message = "Could not save settings: permission denied";
-        let (cx, anchor_focus) = selectable_hint_window(message, cx);
+        let (cx, anchor_focus) = hint_window(message, cx);
         let bounds = cx
-            .debug_bounds("hint-notification-text")
-            .expect("the hint message should be laid out");
+            .debug_bounds("hint-notification-copy")
+            .expect("the hint copy button should be laid out");
 
-        // A message long enough to wrap is dragged corner to corner, so the
-        // assertion covers the whole run and not just its last line.
-        let grab = point(bounds.left() + px(2.0), bounds.top() + px(2.0));
-        let release = point(bounds.right() - px(2.0), bounds.bottom() - px(2.0));
-        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(release, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(release, MouseButton::Left, Modifiers::none());
+        cx.simulate_click(bounds.center(), Modifiers::none());
 
-        assert_eq!(
-            cx.update(gpui_base::TextSelection::selected_text),
-            message,
-            "the whole hint message should be selectable"
-        );
-        let copy_chord = if cfg!(target_os = "macos") {
-            "cmd-c"
-        } else {
-            "ctrl-c"
-        };
-        cx.simulate_keystrokes(copy_chord);
         assert_eq!(
             cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
             Some(message.to_string()),
-            "the copy shortcut should copy the selected hint"
+            "the copy button should put the whole hint message on the clipboard"
         );
 
-        // Releasing the drag is also a click, and the hint must survive it:
-        // dismissing here would take the selected text off the screen.
+        // Pressing the button is also a click on the card, which dismisses it.
+        // The hint must survive: dismissing here would take the message off the
+        // screen with nothing left to read or copy again.
         cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
         cx.run_until_parked();
         assert_eq!(
             mounted_hint_count(cx),
             1,
-            "a selection release must not dismiss the hint"
+            "copying a hint must not dismiss it"
         );
 
-        // The hint is about to unmount, and it is holding the focus the drag
-        // took so the copy shortcut could reach the selection. Closing it hands
-        // that focus back instead of leaving the window with no caret.
-        let list = cx.update(|window, cx| {
-            hint_layer::list(window, cx)
-                .expect("the hint layer should be mounted on the probe window")
-        });
-        cx.update(|window, cx| {
-            list.update(cx, |list, cx| list.clear(window, cx));
-        });
-        cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
-        cx.run_until_parked();
-        assert_eq!(mounted_hint_count(cx), 0);
+        // A button takes focus on mouse down unless the press is prevented, and
+        // this one must leave the caret where the user was typing.
         assert!(
             cx.update(|window, _| anchor_focus.is_focused(window)),
-            "closing a hint must give back the focus its selection took"
+            "copying a hint must not take the focus the user is typing at"
         );
     }
 
-    /// The guard around a selection release must not cost the hint its
-    /// click-to-dismiss behavior.
+    /// The copy button must not cost the hint its click-to-dismiss behavior.
     #[gpui::test]
-    fn a_plain_click_on_a_hint_message_still_dismisses_it(cx: &mut TestAppContext) {
-        let (cx, anchor_focus) = selectable_hint_window("Saved", cx);
+    fn a_click_on_a_hint_message_still_dismisses_it(cx: &mut TestAppContext) {
+        let (cx, anchor_focus) = hint_window("Saved", cx);
         let bounds = cx
             .debug_bounds("hint-notification-text")
             .expect("the hint message should be laid out");
 
         cx.simulate_click(bounds.center(), Modifiers::none());
 
-        assert_eq!(
-            cx.update(gpui_base::TextSelection::selected_text),
-            "",
-            "a plain click selects nothing"
-        );
         assert!(
             cx.update(|window, _| anchor_focus.is_focused(window)),
-            "a plain click must not move the focus the user is typing at"
+            "a click must not move the focus the user is typing at"
         );
         cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
         cx.run_until_parked();
         assert_eq!(
             mounted_hint_count(cx),
             0,
-            "a plain click still dismisses the hint"
+            "a click on the message still dismisses the hint"
         );
     }
 
     /// The kit paints `Notification::message` as text no selection layer can
-    /// reach, so a hint built with one of its tone constructors shows a message
-    /// the user cannot copy. Every hint in the workbench has to be built through
-    /// `hint_notification`, which carries the message as selectable content.
+    /// reach and offers no way to copy it, so a hint built with one of its tone
+    /// constructors shows a message the user cannot take out of the app. Every
+    /// hint in the workbench has to be built through `hint_notification`, which
+    /// carries the message together with the button that copies it.
     #[test]
-    fn every_light_hint_carries_selectable_text() {
+    fn every_light_hint_carries_a_copy_button() {
         // This test names the constructors it rejects, so only the production
         // region of each file is inspected.
         let production = |source: &'static str| {
@@ -83291,7 +83238,7 @@ mod tests {
                 let constructor = format!("Notification::{tone}(");
                 assert!(
                     !source.contains(&constructor),
-                    "{path} builds a hint with {constructor}; build it with hint_notification so its text can be copied"
+                    "{path} builds a hint with {constructor}; build it with hint_notification so its message can be copied"
                 );
             }
         }

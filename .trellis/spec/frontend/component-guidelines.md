@@ -253,7 +253,7 @@ struct GitMutationNotification;
 Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
 hint_layer::push(
     window,
-    hint_notification(NotificationType::Success, message, cx)
+    hint_notification(NotificationType::Success, message)
         .id::<GitMutationNotification>()
         .autohide(true)
         .on_click(|_, _, _| {}),
@@ -263,14 +263,14 @@ hint_layer::push(
 
 Rules that keep the pattern consistent:
 
-- Build every hint through `gpui_ext::hint_notification`. The kit paints
-  `Notification::message` as text no selection layer can reach, so a hint built
-  with `Notification::info` / `success` / `warning` / `error` shows a message the
-  user cannot copy — including the error text they most often need to paste
-  somewhere else. `hint_notification` carries the same message as selectable
-  content instead, and keeps tone, placement, autohide, and the replace-by-id
-  contract on the kit's component. A source contract in `app.rs` rejects the raw
-  tone constructors, so a new hint cannot regress to unselectable text.
+- Build every hint through `gpui_ext::hint_notification`. It carries the
+  message together with one icon button that copies that message whole. A hint
+  built with `Notification::info` / `success` / `warning` / `error` instead
+  shows text the kit paints as plain, unselectable, uncopyable content —
+  including the error text the user most often needs to paste somewhere else.
+  The helper keeps tone, placement, autohide, and the replace-by-id contract on
+  the kit's component, and a source contract in `app.rs` rejects the raw tone
+  constructors so a new hint cannot regress to a message with no way out.
 - Set `Theme::global_mut(cx).notification.placement = Anchor::TopCenter` before
   pushing, and give each hint family its own private zero-sized id type so
   unrelated hints do not replace each other.
@@ -288,19 +288,20 @@ Rules that keep the pattern consistent:
   the notification layer is for results, not for pointing at the control that
   needs correcting.
 
-The selectable message owns three interactions that a hint must not lose, and
-each one is covered by a test in `app.rs`:
+The copy button owns two interactions that a hint must not lose, and each one is
+covered by a test in `app.rs`:
 
-- A release that resolved a selection over the message is a copy gesture, not a
-  click, so it must not dismiss the hint and take the selected text with it. The
-  guard reads the run's own selection snapshot rather than the window selection,
-  because a selection elsewhere in the window is not this hint's gesture.
-- A plain click still dismisses the hint, and it must not move focus: a tracked
-  focus handle takes focus on mouse down unless the press is prevented, which
-  would pull the caret out of whatever the user is typing at.
-- The copy shortcut is dispatched from the focused node, so a release that left a
-  selection takes focus. Without that step the selection exists but
-  `ctrl-c`/`cmd-c` copies nothing.
+- A press on the button is also a click on the card, and the card dismisses
+  itself on any click. The press stops propagating at the button, so copying a
+  message does not take it off the screen before the user has read it.
+- A button takes focus on mouse down unless the press is prevented. The kit's
+  `Button` prevents it, and the test pins that: copying a hint must leave the
+  caret in whatever the user was typing at.
+
+The button is the hint's `action`, which the kit pairs with a disabled autohide
+because it expects an action to decide what happens next. A hint is still a
+hint, so `hint_notification` restores the kit's autohide default after setting
+the action and a caller's own `.autohide(false)` still wins.
 
 ### GPUI Post-Mutation Scroll Timing
 

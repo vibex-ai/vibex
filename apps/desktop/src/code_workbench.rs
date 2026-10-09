@@ -199,7 +199,7 @@ fn push_git_mutation_result_notice(kind: GitMutationKind, window: &mut Window, c
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
     hint_layer::push(
         window,
-        hint_notification(NotificationType::Success, message, cx)
+        hint_notification(NotificationType::Success, message)
             .id::<GitMutationNotification>()
             .autohide(true)
             .on_click(|_, _, _| {}),
@@ -228,7 +228,6 @@ fn push_git_mutation_failure_notice(
         hint_notification(
             NotificationType::Error,
             format!("{label}: {}", locale::localize_error_message(error)),
-            cx,
         )
         .id::<GitMutationNotification>()
         .autohide(true)
@@ -1936,7 +1935,6 @@ impl CodeWorkbench {
                 hint_notification(
                     NotificationType::Error,
                     locale::localize_error_message(&error),
-                    cx,
                 )
                 .id::<WorkbenchErrorNotification>()
                 .autohide(true)
@@ -5544,7 +5542,6 @@ impl CodeWorkbench {
                                     "在設定中開啟「允許下載」後，頁面才能儲存檔案。",
                                 ),
                             ),
-                            cx,
                         ),
                         cx,
                     );
@@ -5612,7 +5609,6 @@ impl CodeWorkbench {
                     ),
                     locale::text("click to open", "点击打开", "點擊開啟"),
                 ),
-                cx,
             )
             // Clicking a notification dismisses it and then runs the handler,
             // which is the whole interaction here: open the browser, or close
@@ -9759,7 +9755,6 @@ impl CodeWorkbench {
                         "请先打开浏览器面板，才能定位此行对应的元素",
                         "請先開啟瀏覽器面板，才能定位此行對應的元素",
                     ),
-                    cx,
                 ),
                 cx,
             );
@@ -9793,7 +9788,7 @@ impl CodeWorkbench {
                     // happened" is the failure this feature must not have.
                     hint_layer::push(
                         window,
-                        hint_notification(NotificationType::Info, message, cx),
+                        hint_notification(NotificationType::Info, message),
                         cx,
                     );
                 }

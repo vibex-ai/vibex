@@ -7424,7 +7424,6 @@ impl ManagementCenter {
                 hint_notification(
                     NotificationType::Error,
                     locale::localize_error_message(&error),
-                    cx,
                 )
             })
             .or_else(|| {
@@ -7432,17 +7431,12 @@ impl ManagementCenter {
                     hint_notification(
                         NotificationType::Error,
                         locale::localize_error_message(&error),
-                        cx,
                     )
                 })
             })
             .or_else(|| {
                 notice.map(|notice| {
-                    hint_notification(
-                        NotificationType::Info,
-                        locale::localize_ui_message(&notice),
-                        cx,
-                    )
+                    hint_notification(NotificationType::Info, locale::localize_ui_message(&notice))
                 })
             });
         let Some(notification) = notification else {
