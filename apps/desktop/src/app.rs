@@ -7500,6 +7500,7 @@ pub struct VibexWorkbench {
     /// Keeps each per-session composer subscription alive.
     image_editor_text_input: Entity<TextareaState>,
     new_session_input: Entity<TextareaState>,
+    home_arena: Entity<crate::arena::HomeArena>,
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
     new_session_project_search: Entity<InputState>,
@@ -8081,6 +8082,8 @@ impl VibexWorkbench {
                 .submit_on_enter(true)
                 .placeholder(initial_strings.new_session_prompt_placeholder)
         });
+        let home_arena =
+            cx.new(|cx| crate::arena::HomeArena::new(new_session_input.read(cx).focus_handle(cx)));
         let new_session_worktree_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Worktree name",
@@ -8120,6 +8123,7 @@ impl VibexWorkbench {
             .as_deref()
             .and_then(|id| VibexSessionId::parse(id).ok());
         let mut agent_subscriptions = vec![
+            cx.observe(&home_arena, |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &command_palette_input,
                 window,
@@ -8569,6 +8573,7 @@ impl VibexWorkbench {
             composer_goal_edit_input,
             image_editor_text_input,
             new_session_input,
+            home_arena,
             new_session_worktree_name_input,
             new_session_worktree_path_input,
             new_session_project_search,
@@ -12378,6 +12383,9 @@ impl VibexWorkbench {
                                     sessions_empty,
                                     this.ui_state.desktop_behavior.startup_destination,
                                 );
+                                if !this.new_session_open {
+                                    this.home_arena.update(cx, |arena, cx| arena.close(cx));
+                                }
                                 this.initial_new_session_setup_pending =
                                     this.new_session_open && !this.new_session_draft_initialized;
                             }
@@ -17835,6 +17843,7 @@ impl VibexWorkbench {
         // textarea does.
         self.remember_composer_draft(cx);
         self.clear_sidebar_move_selection();
+        self.home_arena.update(cx, |arena, cx| arena.close(cx));
         self.new_session_open = false;
         self.new_session_error = None;
         self.sync_agent_streaming_surface_visibility();
@@ -26928,6 +26937,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.home_arena.update(cx, |arena, cx| arena.close(cx));
         self.cancel_inline_user_message_edit(cx);
         self.reset_new_session_project_menu(window, cx);
         self.dismiss_sidebar_for_navigation();
@@ -31661,6 +31671,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.home_arena.update(cx, |arena, cx| arena.close(cx));
         let right_rail_activity_id = route_right_rail_activity_id(&route.right_rail);
         let selected_file_path = route.selected_file_path.clone();
         let selected_git_path = route.selected_git_path.clone();
@@ -32994,6 +33005,7 @@ impl VibexWorkbench {
     fn open_management(&mut self, cx: &mut Context<Self>) {
         let sidebar_was_open = self.sidebar_overlay_open || self.sidebar_hover_preview_open;
         self.dismiss_sidebar_for_navigation();
+        self.home_arena.update(cx, |arena, cx| arena.close(cx));
         self.new_session_open = false;
         self.new_session_error = None;
         self.clear_suggestions();
@@ -33025,6 +33037,7 @@ impl VibexWorkbench {
     fn open_usage(&mut self, session_filter: Option<VibexSessionId>, cx: &mut Context<Self>) {
         let sidebar_was_open = self.sidebar_overlay_open || self.sidebar_hover_preview_open;
         self.dismiss_sidebar_for_navigation();
+        self.home_arena.update(cx, |arena, cx| arena.close(cx));
         self.new_session_open = false;
         self.new_session_error = None;
         self.clear_suggestions();
@@ -34099,6 +34112,9 @@ impl VibexWorkbench {
     }
 
     fn set_show_home_arena(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if !enabled {
+            self.home_arena.update(cx, |arena, cx| arena.close(cx));
+        }
         self.ui_state.appearance.show_home_arena = enabled;
         self.queue_ui_state();
         cx.notify();
@@ -43902,30 +43918,7 @@ impl VibexWorkbench {
         let new_session_slogan = strings.new_session_slogan;
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
-        v_flex()
-            .id("new-session-home")
-            .relative()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .items_center()
-            .overflow_y_scrollbar()
-            .bg(cx.theme().background)
-            .px_6()
-            .pt_6()
-            .pb_4()
-            .when(self.ui_state.appearance.show_home_arena, |this| {
-                this.pt(gpui::rems(crate::arena::BANNER_HEIGHT_REM)).child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .child(crate::arena::banner(window, cx)),
-                )
-            })
-            .child(
-                v_flex()
+        let content = v_flex()
                     .w_full()
                     .max_w(px(768.0))
                     .min_w_0()
@@ -43935,6 +43928,8 @@ impl VibexWorkbench {
                     .gap_5()
                     .child(
                         v_flex()
+                            .id("new-session-intro")
+                            .occlude()
                             .w_full()
                             .min_w_0()
                             .items_center()
@@ -43963,6 +43958,8 @@ impl VibexWorkbench {
                     )
                     .child(
                         v_flex()
+                            .id("new-session-compose")
+                            .occlude()
                             .w_full()
                             .min_w_0()
                             .flex_none()
@@ -44307,8 +44304,14 @@ impl VibexWorkbench {
                     )
                     .child(workspace_controls),
             )
-            )
-            .into_any_element()
+            .into_any_element();
+        crate::arena::home_surface(
+            &self.home_arena,
+            self.ui_state.appearance.show_home_arena,
+            content,
+            window,
+            cx,
+        )
     }
 
     fn show_turn_preview_rail(&mut self, cx: &mut Context<Self>) {

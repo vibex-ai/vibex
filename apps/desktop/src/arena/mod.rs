@@ -1,7 +1,8 @@
 //! A quiet home vignette and a local, immediately playable boss arena.
 //!
-//! The preview owns no simulation or timer. A modal owns each battle, its input
-//! focus and its bounded clock; leaving the modal drops all combat state.
+//! The preview owns no simulation or timer. The home surface retains each
+//! battle, its input focus and its bounded clock until play ends or navigation
+//! leaves the home.
 
 mod combat;
 mod copy;
@@ -15,21 +16,23 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Entity, FocusHandle, Global,
-    KeyBinding, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Subscription, Task, Window, actions, div, prelude::*, relative,
-    rems,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Global, KeyBinding, KeyDownEvent, KeyUpEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Subscription, Task, Window,
+    actions, div, prelude::*, relative, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    scroll::ScrollableElement as _,
+    v_flex,
 };
 
 use crate::{locale::text, motion};
 use combat::{Arena, Controls, FOCUS_COST, Guardian, Phase, STEP, Vec2};
 
-pub(crate) const BANNER_HEIGHT_REM: f32 = 11.0;
+const BANNER_HEIGHT_REM: f32 = 12.0;
 
 pub(crate) fn setting_title() -> &'static str {
     text("Home mini-game", "首页小游戏", "首頁小遊戲")
@@ -43,7 +46,10 @@ pub(crate) fn setting_description() -> &'static str {
     )
 }
 
-actions!(unbound, [Roll, Stillness, TogglePause, Retry, Advance]);
+actions!(
+    unbound,
+    [Roll, Stillness, TogglePause, Retry, Advance, Exit]
+);
 
 struct Bindings;
 impl Global for Bindings {}
@@ -59,10 +65,92 @@ fn init(cx: &mut App) {
         KeyBinding::new("p", TogglePause, Some("Unbound")),
         KeyBinding::new("r", Retry, Some("Unbound")),
         KeyBinding::new("enter", Advance, Some("Unbound")),
+        KeyBinding::new("escape", Exit, Some("Unbound")),
     ]);
 }
 
-pub(crate) fn banner(window: &mut Window, cx: &mut App) -> AnyElement {
+pub(crate) struct HomeArena {
+    battle: Option<Entity<ArenaView>>,
+    composer_focus: FocusHandle,
+    dismissal: Option<Subscription>,
+}
+
+impl HomeArena {
+    pub(crate) fn new(composer_focus: FocusHandle) -> Self {
+        Self {
+            battle: None,
+            composer_focus,
+            dismissal: None,
+        }
+    }
+
+    fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.battle.is_some() || window.has_active_dialog(cx) {
+            return;
+        }
+        init(cx);
+        let battle = cx.new(|cx| ArenaView::new(window, cx));
+        self.dismissal =
+            Some(
+                cx.subscribe_in(&battle, window, |this, _, _: &DismissEvent, window, cx| {
+                    this.close(cx);
+                    this.composer_focus.focus(window, cx);
+                }),
+            );
+        let initial_focus = battle.downgrade();
+        self.battle = Some(battle);
+        window.on_next_frame(move |window, cx| {
+            let _ = initial_focus.update(cx, |view, cx| view.resume(window, cx));
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
+        if let Some(battle) = self.battle.take() {
+            battle.update(cx, |view, cx| view.close(cx));
+            self.dismissal = None;
+            cx.notify();
+        }
+    }
+}
+
+pub(crate) fn home_surface(
+    state: &Entity<HomeArena>,
+    enabled: bool,
+    content: impl IntoElement,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let surface = v_flex()
+        .id("new-session-home")
+        .debug_selector(|| "new-session-home".into())
+        .relative()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .bg(cx.theme().background);
+    if enabled && let Some(battle) = &state.read(cx).battle {
+        return surface.child(battle.clone()).into_any_element();
+    }
+    surface
+        .overflow_y_scrollbar()
+        .when(enabled, |this| this.child(banner(state, window, cx)))
+        .child(
+            v_flex()
+                .relative()
+                .w_full()
+                .flex_1()
+                .items_center()
+                .px_6()
+                .pt_6()
+                .pb_4()
+                .child(content),
+        )
+        .into_any_element()
+}
+
+fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyElement {
+    let state = state.downgrade();
     let art = div().size_full().overflow_hidden();
     let dialog_open = window.has_active_dialog(cx);
     let art = if dialog_open
@@ -80,10 +168,13 @@ pub(crate) fn banner(window: &mut Window, cx: &mut App) -> AnyElement {
         )
         .into_any_element()
     };
-    let label = text("Play Unbound…", "进入断链战场…", "進入斷鏈戰場…");
+    let label = text("Play Unbound", "进入断链战场", "進入斷鏈戰場");
     div()
         .id("new-session-arena")
         .debug_selector(|| "unbound-banner".into())
+        .absolute()
+        .top_0()
+        .left_0()
         .w_full()
         .h(rems(BANNER_HEIGHT_REM))
         .flex_none()
@@ -104,51 +195,20 @@ pub(crate) fn banner(window: &mut Window, cx: &mut App) -> AnyElement {
                         .child(
                             h_flex()
                                 .absolute()
-                                .bottom_3()
+                                .top_3()
                                 .right_6()
                                 .gap_2()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(copy::title())
-                                .child("↗"),
+                                .child(text("Play", "开始", "開始")),
                         ),
                 )
-                .on_click(|_, window, cx| {
-                    open(window, cx);
+                .on_click(move |_, window, cx| {
+                    let _ = state.update(cx, |state, cx| state.open(window, cx));
                 }),
         )
         .into_any_element()
-}
-
-fn open(window: &mut Window, cx: &mut App) -> Option<Entity<ArenaView>> {
-    if window.has_active_dialog(cx) {
-        return None;
-    }
-    init(cx);
-    let view = cx.new(|cx| ArenaView::new(window, cx));
-    let opened = view.clone();
-    let initial_focus = view.downgrade();
-    window.open_dialog(cx, move |dialog, window, _| {
-        let weak = view.downgrade();
-        // These are measured viewport bounds, not fixed interface dimensions.
-        dialog
-            .width(
-                (window.viewport_size().width - window.rem_size() * 3.0)
-                    .min(window.rem_size() * 76.0),
-            )
-            .margin_top(window.rem_size() * 1.5)
-            .p_0()
-            .close_button(false)
-            .overlay_closable(false)
-            .child(view.clone())
-            .on_close(move |_, _, cx| {
-                let _ = weak.update(cx, |view, cx| view.close(cx));
-            })
-    });
-    window.on_next_frame(move |window, cx| {
-        let _ = initial_focus.update(cx, |view, cx| view.resume(window, cx));
-    });
-    Some(opened)
 }
 
 struct ArenaView {
@@ -166,6 +226,8 @@ struct ArenaView {
     clock: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<DismissEvent> for ArenaView {}
 
 impl ArenaView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -227,6 +289,12 @@ impl ArenaView {
     fn close(&mut self, cx: &mut Context<Self>) {
         self.closed = true;
         self.pause(cx);
+    }
+
+    fn exit(&mut self, _: &Exit, _: &mut Window, cx: &mut Context<Self>) {
+        self.close(cx);
+        cx.emit(DismissEvent);
+        cx.stop_propagation();
     }
 
     fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -477,13 +545,17 @@ impl ArenaView {
                             )
                             .child(
                                 Button::new("unbound-close")
+                                    .debug_selector(|| "unbound-close".into())
                                     .small()
                                     .ghost()
-                                    .label(text("Close", "关闭", "關閉"))
-                                    .tooltip(text("Close (Esc)", "关闭（Esc）", "關閉（Esc）"))
+                                    .label(text("Back", "返回", "返回"))
+                                    .tooltip(text(
+                                        "Back to new session (Esc)",
+                                        "返回新建会话（Esc）",
+                                        "返回新增工作階段（Esc）",
+                                    ))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close(cx);
-                                        window.close_dialog(cx);
+                                        this.exit(&Exit, window, cx);
                                     })),
                             ),
                     ),
@@ -727,17 +799,14 @@ impl ArenaView {
 }
 
 impl Render for ArenaView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let height =
-            (window.viewport_size().height - window.rem_size() * 4.0).min(window.rem_size() * 49.0);
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let board = scene::battle(&self.arena, self.bounds.clone(), motion::reduced_motion(cx));
         v_flex()
             .id("unbound-game")
             .debug_selector(|| "unbound-game".into())
             .key_context("Unbound")
             .track_focus(&self.focus)
-            .w_full()
-            .h(height)
+            .size_full()
             .min_h_0()
             .min_w_0()
             .bg(cx.theme().background)
@@ -749,6 +818,7 @@ impl Render for ArenaView {
             .on_action(cx.listener(Self::toggle_pause))
             .on_action(cx.listener(Self::retry))
             .on_action(cx.listener(Self::advance))
+            .on_action(cx.listener(Self::exit))
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))

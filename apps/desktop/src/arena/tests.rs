@@ -1,6 +1,9 @@
 use super::*;
 use combat::ArrowState;
-use gpui::{Entity, Keystroke, Modifiers, TestAppContext, VisualTestContext, point, px, size};
+use gpui::{
+    Entity, Focusable as _, Keystroke, Modifiers, TestAppContext, VisualTestContext, point, px,
+    size,
+};
 use gpui_component::{
     Root, Theme, ThemeMode,
     input::{Input, InputState},
@@ -43,63 +46,138 @@ fn setup(cx: &mut TestAppContext) {
 
 struct Home {
     input: Entity<InputState>,
+    arena: Entity<HomeArena>,
     show_arena: bool,
+    left_home: bool,
+    _subscription: Subscription,
+}
+
+impl Home {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let arena = cx.new(|cx| HomeArena::new(input.read(cx).focus_handle(cx)));
+        let subscription = cx.observe(&arena, |_, _, cx| cx.notify());
+        Self {
+            input,
+            arena,
+            show_arena: true,
+            left_home: false,
+            _subscription: subscription,
+        }
+    }
 }
 
 impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = v_flex()
+            .w_full()
+            .max_w(rems(48.0))
+            .flex_1()
+            .justify_center()
+            .child(
+                v_flex()
+                    .id("home-content")
+                    .debug_selector(|| "home-content".into())
+                    .occlude()
+                    .h(rems(14.0))
+                    .gap_4()
+                    .child("Start a new session")
+                    .child(
+                        div()
+                            .debug_selector(|| "home-composer".into())
+                            .child(Input::new(&self.input)),
+                    ),
+            );
         v_flex()
             .size_full()
-            .when(self.show_arena, |this| this.child(banner(window, cx)))
-            .child(Input::new(&self.input))
+            .child(
+                h_flex().h_8().flex_none().child(
+                    Button::new("home-navigation")
+                        .debug_selector(|| "home-navigation".into())
+                        .label("Sessions")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.arena.update(cx, |arena, cx| arena.close(cx));
+                            this.left_home = true;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(div().flex_1().min_h_0().when(!self.left_home, |this| {
+                this.child(home_surface(
+                    &self.arena,
+                    self.show_arena,
+                    content,
+                    window,
+                    cx,
+                ))
+            }))
     }
 }
 
 #[gpui::test]
-fn banner_opens_a_real_dialog_and_escape_returns_to_the_composer(cx: &mut TestAppContext) {
+fn banner_expands_in_the_home_and_escape_preserves_the_composer(cx: &mut TestAppContext) {
     setup(cx);
     let mut home = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
-        let input = cx.new(|cx| InputState::new(window, cx));
-        let view = cx.new(|_| Home {
-            input,
-            show_arena: true,
-        });
+        let view = cx.new(|cx| Home::new(window, cx));
         home = Some(view.clone());
         Root::new(view, window, cx)
     });
     let home = home.unwrap();
     cx.update(|window, _| window.activate_window());
     draw(cx);
+    cx.update(|window, cx| {
+        home.read(cx).input.clone().update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+    });
+    cx.simulate_input("draft ");
     let banner_bounds = cx.debug_bounds("unbound-banner").unwrap();
-    cx.simulate_click(banner_bounds.center(), Modifiers::none());
+    cx.simulate_click(
+        point(
+            banner_bounds.right() - px(24.0),
+            banner_bounds.top() + px(16.0),
+        ),
+        Modifiers::none(),
+    );
     draw(cx);
-    draw(cx);
-    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-    assert!(cx.debug_bounds("unbound-battlefield").is_some());
-    press(cx, "escape");
     draw(cx);
     assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-
-    // Programmatic opening must preserve the previously focused editor too.
-    let opened = cx.update(|window, cx| {
-        let input = home.read(cx).input.clone();
-        input.update(cx, |input, cx| input.focus(window, cx));
-        open(window, cx).unwrap()
-    });
-    draw(cx);
-    draw(cx);
+    assert!(cx.debug_bounds("unbound-battlefield").is_some());
+    assert_eq!(
+        cx.debug_bounds("unbound-game"),
+        cx.debug_bounds("new-session-home")
+    );
+    assert!(cx.debug_bounds("home-composer").is_none());
+    let opened = home.read_with(cx, |home, cx| home.arena.read(cx).battle.clone().unwrap());
     assert!(cx.update(|window, cx| opened.read(cx).focus.is_focused(window)));
     key(cx, "j", true);
     assert!(opened.read_with(cx, |view, _| view.controls().shoot));
-    key(cx, "j", false);
     press(cx, "escape");
     draw(cx);
-    assert!(opened.read_with(cx, |view, _| view.closed && view.clock.is_none()));
+    assert!(opened.read_with(cx, |view, _| view.closed
+        && view.clock.is_none()
+        && view.keys.is_empty()));
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     cx.simulate_input("jwasd");
     assert_eq!(
         home.read_with(cx, |home, cx| home.input.read(cx).value().to_string()),
-        "jwasd"
+        "draft jwasd"
+    );
+
+    // The entry is also reachable from the composer by keyboard.
+    press(cx, "shift-tab");
+    press(cx, "enter");
+    draw(cx);
+    assert!(cx.debug_bounds("unbound-game").is_some());
+    let back = cx.debug_bounds("unbound-close").unwrap();
+    cx.simulate_click(back.center(), Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("home-composer").is_some());
+    cx.simulate_input("k");
+    assert_eq!(
+        home.read_with(cx, |home, cx| home.input.read(cx).value().to_string()),
+        "draft jwasdk"
     );
 
     home.update(cx, |home, cx| {
@@ -108,6 +186,98 @@ fn banner_opens_a_real_dialog_and_escape_returns_to_the_composer(cx: &mut TestAp
     });
     draw(cx);
     assert!(cx.debug_bounds("unbound-banner").is_none());
+    assert!(cx.debug_bounds("unbound-game").is_none());
+}
+
+#[gpui::test]
+fn the_preview_does_not_move_or_intercept_home_content(cx: &mut TestAppContext) {
+    setup(cx);
+    let mut home = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| Home::new(window, cx));
+        home = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let home = home.unwrap();
+    for (width, height, rem, mode) in [
+        (600.0, 360.0, 14.0, ThemeMode::Light),
+        (900.0, 500.0, 16.0, ThemeMode::Dark),
+        (1200.0, 640.0, 24.0, ThemeMode::Light),
+    ] {
+        cx.simulate_resize(size(px(width), px(height)));
+        cx.update(|window, cx| {
+            Theme::change(mode, Some(window), cx);
+            Theme::global_mut(cx).font_size = px(rem);
+            Theme::sync_base(cx);
+        });
+        home.update(cx, |home, cx| {
+            home.show_arena = false;
+            cx.notify();
+        });
+        draw(cx);
+        let without_preview = cx.debug_bounds("home-content").unwrap();
+        home.update(cx, |home, cx| {
+            home.show_arena = true;
+            cx.notify();
+        });
+        draw(cx);
+        let content = cx.debug_bounds("home-content").unwrap();
+        let preview = cx.debug_bounds("unbound-banner").unwrap();
+        assert_eq!(content, without_preview);
+        assert!(content.top() < preview.bottom());
+        let composer = cx.debug_bounds("home-composer").unwrap();
+        assert!(composer.center().y < preview.bottom());
+        cx.simulate_click(composer.center(), Modifiers::none());
+        cx.simulate_input("a");
+        draw(cx);
+        assert!(home.read_with(cx, |home, cx| home.arena.read(cx).battle.is_none()));
+        assert!(cx.debug_bounds("unbound-game").is_none());
+    }
+    assert_eq!(
+        home.read_with(cx, |home, cx| home.input.read(cx).value().to_string()),
+        "aaa"
+    );
+}
+
+#[gpui::test]
+fn leaving_home_cancels_pending_focus_and_running_combat(cx: &mut TestAppContext) {
+    setup(cx);
+    let mut home = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| Home::new(window, cx));
+        home = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let home = home.unwrap();
+    cx.update(|window, _| window.activate_window());
+    draw(cx);
+    let state = home.read_with(cx, |home, _| home.arena.clone());
+    let closed_before_focus = cx.update(|window, cx| {
+        state.update(cx, |state, cx| {
+            state.open(window, cx);
+            let battle = state.battle.clone().unwrap();
+            state.close(cx);
+            battle
+        })
+    });
+    draw(cx);
+    draw(cx);
+    assert!(closed_before_focus.read_with(cx, |view, _| view.closed && view.clock.is_none()));
+
+    cx.update(|window, cx| state.update(cx, |state, cx| state.open(window, cx)));
+    draw(cx);
+    draw(cx);
+    let battle = state.read_with(cx, |state, _| state.battle.clone().unwrap());
+    key(cx, "w", true);
+    assert!(battle.read_with(cx, |view, _| view.clock.is_some()));
+    let navigation = cx.debug_bounds("home-navigation").unwrap();
+    cx.simulate_click(navigation.center(), Modifiers::none());
+    draw(cx);
+    assert!(home.read_with(cx, |home, _| home.left_home));
+    assert!(state.read_with(cx, |state, _| state.battle.is_none()));
+    assert!(battle.read_with(cx, |view, _| view.closed
+        && view.clock.is_none()
+        && view.keys.is_empty()));
     assert!(cx.debug_bounds("unbound-game").is_none());
 }
 

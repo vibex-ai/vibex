@@ -3,8 +3,9 @@
 use std::{cell::Cell, f32::consts::TAU, rc::Rc};
 
 use gpui::{
-    AnyElement, App, Bounds, FontFeatures, Hsla, IntoElement, Pixels, Point, ShapedLine,
-    Styled as _, TextRun, Window, canvas, font, point, px,
+    AnyElement, App, Background, Bounds, FontFeatures, Hsla, IntoElement, Pixels, Point,
+    ShapedLine, Styled as _, TextRun, Window, canvas, fill, font, linear_color_stop,
+    linear_gradient, point, px,
 };
 use gpui_component::ActiveTheme as _;
 
@@ -148,10 +149,11 @@ impl Frame {
                 let hash = (column * 73 + row * 137 + column * row * 19) % 127;
                 let wave = (column as f32 * 0.095 + row as f32 * 0.19 - time * 0.4).sin();
                 let (ch, tone) = if preview {
+                    // Text-only squares keep fallback fonts from supplying bright emoji.
                     if hash < 10 && wave > 0.45 {
-                        ('▪', Tone::Stone)
+                        ('■', Tone::Stone)
                     } else {
-                        ('▫', Tone::Dust)
+                        ('□', Tone::Dust)
                     }
                 } else if row % 4 == 0 && column % 8 < 5 {
                     ('─', Tone::Dust)
@@ -418,6 +420,7 @@ fn guardian_sprite(guardian: Guardian) -> &'static [&'static str] {
 
 #[derive(Clone, Copy)]
 struct Palette {
+    background: Hsla,
     foreground: Hsla,
     muted: Hsla,
     primary: Hsla,
@@ -429,6 +432,7 @@ struct Palette {
 impl Palette {
     fn new(cx: &App) -> Self {
         Self {
+            background: cx.theme().background,
             foreground: cx.theme().foreground,
             muted: cx.theme().muted_foreground,
             primary: cx.theme().primary,
@@ -451,6 +455,16 @@ impl Palette {
             Tone::Arrow => self.foreground,
             Tone::Ghost => self.muted.opacity(0.38),
         }
+    }
+
+    fn preview_color(self, tone: Tone) -> Hsla {
+        let opacity = match tone {
+            Tone::Dust => 0.08,
+            Tone::Stone | Tone::Ghost => 0.14,
+            Tone::Rune => 0.24,
+            _ => 0.36,
+        };
+        self.background.blend(self.foreground.opacity(opacity))
     }
 }
 
@@ -486,6 +500,7 @@ impl Geometry {
 struct GridLayout {
     lines: Vec<GridRow>,
     geometry: Geometry,
+    fade: Option<Background>,
 }
 
 struct GridRow {
@@ -505,6 +520,7 @@ fn shape(
         return GridLayout {
             lines: Vec::new(),
             geometry,
+            fade: None,
         };
     }
     let palette = Palette::new(cx);
@@ -525,22 +541,19 @@ fn shape(
     );
     let font_size = geometry.unit * (window.rem_size() / probe.width().max(px(1.0)));
     let mut lines = Vec::with_capacity(frame.rows);
-    for (row, cells) in frame.cells.chunks(frame.columns).enumerate() {
+    for cells in frame.cells.chunks(frame.columns) {
         let mut text = String::with_capacity(frame.columns * 3);
         let mut columns = Vec::with_capacity(frame.columns);
-        // Fade the entire scene into the home surface, including its sprites.
-        let fade = if preview {
-            let y = row as f32 / frame.rows.max(1) as f32;
-            let ramp = ((1.0 - y) / 0.52).clamp(0.0, 1.0);
-            ramp * ramp * (3.0 - 2.0 * ramp) * 0.70
-        } else {
-            1.0
-        };
         for (column, glyph) in cells.iter().enumerate() {
             if glyph.ch == ' ' {
                 continue;
             }
-            columns.push((text.len(), column, palette.color(glyph.tone).opacity(fade)));
+            let color = if preview {
+                palette.preview_color(glyph.tone)
+            } else {
+                palette.color(glyph.tone)
+            };
+            columns.push((text.len(), column, color));
             text.push(glyph.ch);
         }
         let run = TextRun {
@@ -556,10 +569,20 @@ fn shape(
             .shape_line(text.into(), font_size, &[run], None);
         lines.push(GridRow { line, columns });
     }
-    GridLayout { lines, geometry }
+    GridLayout {
+        lines,
+        geometry,
+        fade: preview.then(|| {
+            linear_gradient(
+                180.0,
+                linear_color_stop(palette.background.opacity(0.0), 0.45),
+                linear_color_stop(palette.background, 1.0),
+            )
+        }),
+    }
 }
 
-fn paint(_: Bounds<Pixels>, layout: GridLayout, window: &mut Window, _: &mut App) {
+fn paint(bounds: Bounds<Pixels>, layout: GridLayout, window: &mut Window, _: &mut App) {
     for (row_ix, row) in layout.lines.iter().enumerate() {
         let line = &row.line;
         let top = layout.geometry.origin.y + layout.geometry.unit * (row_ix as f32 * 2.0);
@@ -597,6 +620,11 @@ fn paint(_: Bounds<Pixels>, layout: GridLayout, window: &mut Window, _: &mut App
                 }
             }
         }
+    }
+    // Composite once over the complete scene, including fallback glyphs. The
+    // fade is continuous in viewport space and reaches the surface at its edge.
+    if let Some(fade) = layout.fade {
+        window.paint_quad(fill(bounds, fade));
     }
 }
 
