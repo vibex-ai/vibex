@@ -2532,6 +2532,36 @@ fn calculate_workbench_auto_collapse(
     WorkbenchAutoCollapseState { sidebar }
 }
 
+/// The width the workbench column keeps beside the docked editor panel.
+///
+/// Full screen hands the panel the whole column on top of its own docked slot:
+/// the panel keeps its host and its right edge, so its left seam travels across
+/// the column instead — right-to-left on the way out, left-to-right on the way
+/// back in. What the sweep stops short of is what stays put beside it: the
+/// sidebar, the right rail, and the activity bar.
+fn workbench_column_width(
+    viewport_width: u32,
+    sidebar_width: Option<f32>,
+    preview_width: Option<f32>,
+    right_rail_width: Option<f32>,
+    activity_bar: bool,
+) -> f32 {
+    let reserved = sidebar_width.unwrap_or(0.0)
+        + preview_width.unwrap_or(0.0)
+        + right_rail_width.unwrap_or(0.0)
+        + if activity_bar {
+            RIGHT_ACTIVITY_BAR_WIDTH
+        } else {
+            0.0
+        };
+    (viewport_width as f32 - reserved).max(0.0)
+}
+
+/// The workbench column drawn empty: the panel's slot owns it.
+fn empty_center_content() -> AnyElement {
+    div().size_full().min_w_0().min_h_0().into_any_element()
+}
+
 fn right_rail_mode_from_activity_id(activity_id: Option<&str>) -> RightRailMode {
     match activity_id {
         Some("rail_plugin_system_git") => RightRailMode::Git,
@@ -2979,6 +3009,11 @@ struct SidebarAnimationState {
     render_child: bool,
     hide_scheduled: bool,
     hide_request: u64,
+    /// The tween's own landing. The endpoints stay apart until a timer clears
+    /// them, so `is_travelling` answers "is the pane still moving?" for a caller
+    /// that has to draw something underneath the sweep.
+    settle_scheduled: bool,
+    settle_request: u64,
 }
 
 impl SidebarAnimationState {
@@ -2993,7 +3028,14 @@ impl SidebarAnimationState {
             render_child: visible,
             hide_scheduled: false,
             hide_request: 0,
+            settle_scheduled: false,
+            settle_request: 0,
         }
+    }
+
+    /// Whether the pane is between two widths, rather than resting on one.
+    fn is_travelling(&self) -> bool {
+        self.from_value != self.target_value || self.from_opacity != self.target_opacity
     }
 
     fn needs_update(
@@ -3034,6 +3076,9 @@ impl SidebarAnimationState {
                 self.hide_request = self.hide_request.wrapping_add(1);
             }
             self.hide_scheduled = false;
+            // Landing on the spot leaves nothing for a settle to clear.
+            self.settle_scheduled = false;
+            self.settle_request = self.settle_request.wrapping_add(1);
             return None;
         }
 
@@ -3042,6 +3087,10 @@ impl SidebarAnimationState {
             self.target_value = target_value;
             self.from_opacity = self.target_opacity;
             self.target_opacity = target_opacity;
+            // A new tween travels on its own clock; the timer watching the old
+            // one is answered by the bumped request.
+            self.settle_scheduled = false;
+            self.settle_request = self.settle_request.wrapping_add(1);
         }
 
         if visible {
@@ -3068,6 +3117,30 @@ impl SidebarAnimationState {
         {
             self.render_child = false;
             self.hide_scheduled = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ask for the tween's landing once its duration has run.
+    ///
+    /// A closing pane is left to its hide timer, which already clears the
+    /// endpoints when it unmounts the child.
+    fn schedule_settle(&mut self) -> Option<u64> {
+        if self.settle_scheduled || self.hide_scheduled || !self.is_travelling() {
+            return None;
+        }
+        self.settle_scheduled = true;
+        self.settle_request = self.settle_request.wrapping_add(1);
+        Some(self.settle_request)
+    }
+
+    fn finish_settle(&mut self, request: u64) -> bool {
+        if self.settle_scheduled && self.settle_request == request {
+            self.settle_scheduled = false;
+            self.from_value = self.target_value;
+            self.from_opacity = self.target_opacity;
             true
         } else {
             false
@@ -7250,6 +7323,12 @@ pub struct VibexWorkbench {
     runtime_rename_task: Option<Task<()>>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
+    /// A full screen flip arms the docked panel's width tween, which is a sweep
+    /// rather than an open or a close: the panel keeps its slot and its right
+    /// edge, and its left seam travels across the workbench column. The shell
+    /// render that follows the flip consumes the flag, so every other width
+    /// change — a seam drag, a viewport resize — keeps snapping.
+    preview_fullscreen_sweep: bool,
     /// The window hosting the editor panel while it is popped out of
     /// the workbench. `None` means the panel is hosted inline, and the two are
     /// mutually exclusive so the workbench never draws a second panel.
@@ -8207,6 +8286,11 @@ impl VibexWorkbench {
                 CodeWorkbenchEvent::LayoutChanged { fullscreen } => {
                     if this.preview_fullscreen_active != *fullscreen {
                         this.preview_fullscreen_active = *fullscreen;
+                        // The panel is docked on both sides of the flip: full
+                        // screen widens its slot over the workbench column, so
+                        // the seam travels right-to-left on the way out and
+                        // left-to-right on the way back in.
+                        this.preview_fullscreen_sweep = true;
                         cx.notify();
                     }
                 }
@@ -8359,6 +8443,7 @@ impl VibexWorkbench {
             runtime_rename_task: None,
             code_workbench,
             preview_fullscreen_active: false,
+            preview_fullscreen_sweep: false,
             preview_window: None,
             preview_window_closing,
             _preview_window_closed_subscription: Some(preview_window_closed_subscription),
@@ -56136,12 +56221,15 @@ impl VibexWorkbench {
 
     /// Toggle animation state for a docked right panel: the same width-clip
     /// tween the sidebar uses. Width changes that are not open/close flips —
-    /// seam drags, viewport resizes — apply directly instead of tweening.
+    /// seam drags, viewport resizes — apply directly instead of tweening, while
+    /// `sweep` marks the one that is: the full screen hand-off, where the panel
+    /// keeps its slot and travels between its docked and its full width.
     fn update_docked_panel_animation(
         &mut self,
         scope: &'static str,
         open: bool,
         width: f32,
+        sweep: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SidebarAnimationState {
@@ -56151,7 +56239,7 @@ impl VibexWorkbench {
             |_, _| SidebarAnimationState::new(width, 0.0, open),
         );
         let toggling = animation_state.read(cx).render_child != open;
-        let animate = !self.ui_state.appearance.reduced_motion && toggling;
+        let animate = !self.ui_state.appearance.reduced_motion && (toggling || sweep);
         let hide_request = if animation_state
             .read(cx)
             .needs_update(width, 0.0, open, animate)
@@ -56171,6 +56259,26 @@ impl VibexWorkbench {
                         .await;
                     animation_state.update(cx, |state, cx| {
                         if state.finish_hide(hide_request) {
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        // The tween outlives the render that started it, so its landing is its
+        // own timer: readers of `is_travelling` have to know when the pane has
+        // come to rest, not only when it was last handed a new width.
+        let settle_request = animation_state.update(cx, |state, _| state.schedule_settle());
+        if let Some(settle_request) = settle_request {
+            cx.spawn({
+                let animation_state = animation_state.clone();
+                async move |_, cx| {
+                    cx.background_executor()
+                        .timer(SIDEBAR_INLINE_TRANSITION_DURATION)
+                        .await;
+                    animation_state.update(cx, |state, cx| {
+                        if state.finish_settle(settle_request) {
                             cx.notify();
                         }
                     });
@@ -56226,6 +56334,91 @@ impl VibexWorkbench {
         }
     }
 
+    /// Full screen host for a docked panel.
+    ///
+    /// The panel keeps its slot, so the slot fills whatever the columns beside
+    /// it leave and the panel stays anchored to the window's right edge. What
+    /// travels is the panel's own seam: the slot shows the column the panel has
+    /// not covered yet, with the page it is passing held at that column's own
+    /// width, so nothing but the seam moves. An expand therefore reads
+    /// right-to-left and a collapse left-to-right, whichever way the reader
+    /// flips.
+    fn render_fullscreen_side_panel(
+        scope: &'static str,
+        animation_state: SidebarAnimationState,
+        page: Option<AnyElement>,
+        panel: Option<AnyElement>,
+    ) -> AnyElement {
+        // The seam starts where the panel's docked slot begins: the whole column
+        // the panel takes when it is full screen is the slot plus that seam.
+        let seam = (animation_state.target_value - animation_state.from_value).max(0.0);
+        let travelling = animation_state.from_value != animation_state.target_value;
+        let panel_width = animation_state.target_value;
+        let seam_element = div()
+            .id(SharedString::from(format!("{scope}-fullscreen-seam")))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .overflow_hidden()
+            .when_some(panel, |this, panel| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(panel_width))
+                        .child(panel),
+                )
+            });
+        let seam_element = if travelling {
+            Transition::new(SIDEBAR_INLINE_TRANSITION_DURATION)
+                .ease(motion::EASE_OUT.easing())
+                .slide_x(px(seam), px(0.0))
+                .apply(seam_element, sidebar_animation_id(scope, animation_state))
+                .into_any_element()
+        } else {
+            seam_element.left(px(0.0)).into_any_element()
+        };
+        div()
+            .id(SharedString::from(format!("{scope}-panel-fullscreen")))
+            .relative()
+            .h_full()
+            .min_w_0()
+            .flex_1()
+            .overflow_hidden()
+            .when_some(page, |this, page| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        // The page keeps the column's own width, and only the
+                        // chrome reservation moves it down: the seam meets its
+                        // right edge exactly.
+                        .w(px(seam))
+                        .pt(px(TITLE_BAR_HEIGHT))
+                        .child(page),
+                )
+            })
+            .child(seam_element)
+            .into_any_element()
+    }
+
+    /// The workbench column's own page: the open session group, or the timeline
+    /// when no group is in front.
+    fn render_column_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some((group_id, group)) = self.active_session_group() {
+            self.render_session_group_workspace(&group_id, &group, cx)
+        } else {
+            self.ensure_timeline_view(cx)
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
+        }
+    }
+
     fn render_shell(
         &mut self,
         visibility: WorkbenchVisibility,
@@ -56257,6 +56450,35 @@ impl VibexWorkbench {
         let preview_width = self.preview_panel_width(visibility);
         let right_rail_width = self.right_rail_panel_width(visibility);
         let right_rail_content_width = docked_right_rail_content_width(right_rail_width);
+        // The column the editor panel sweeps over, and the width it takes while
+        // it is full screen: its own docked slot plus that whole column.
+        let column_width = workbench_column_width(
+            visibility.layout.viewport_width,
+            sidebar_docked.then_some(sidebar_width),
+            preview_docked.then_some(preview_width),
+            right_rail_docked.then_some(right_rail_content_width),
+            agent_open && !new_session_open,
+        );
+        let preview_dock_width = if preview_fullscreen && preview_docked {
+            column_width + preview_width
+        } else {
+            preview_width
+        };
+        let preview_sweep = std::mem::take(&mut self.preview_fullscreen_sweep);
+        // Full screen never re-hosts the panel: the docked slot widens over the
+        // column while the panel's right edge stays where it is, so the seam
+        // travels right-to-left on the way out and left-to-right on the way back.
+        let preview_animation = self.update_docked_panel_animation(
+            "preview",
+            preview_docked,
+            preview_dock_width,
+            preview_sweep,
+            window,
+            cx,
+        );
+        // While the panel is between two widths it is drawn over the page it is
+        // passing, which is why the page travels with the panel's slot.
+        let preview_travelling = preview_animation.is_travelling();
         let inline_sidebar = self.render_inline_sidebar(
             visibility,
             sidebar_docked,
@@ -56274,6 +56496,12 @@ impl VibexWorkbench {
             .min_w_0()
             .overflow_hidden()
             .child(inline_sidebar);
+        // Full screen is drawn by the panel's own slot, which fills what the
+        // columns beside it leave. The page the editor sweeps over travels with
+        // that slot, so the column keeps neither the page nor any width while
+        // the panel is over it.
+        let page_in_panel_slot = preview_fullscreen && preview_docked;
+        let mut swept_page: Option<AnyElement> = None;
         let center_content: AnyElement = if management_open {
             div()
                 .id("management-shell")
@@ -56300,11 +56528,10 @@ impl VibexWorkbench {
                 .into_any_element()
         } else if new_session_open {
             self.render_new_session_panel(strings, window, cx)
-        } else if preview_fullscreen {
-            // Full screen grows the panel over the conversation it belongs to,
-            // not over the shell: the sidebar and the right rail stay put, so
-            // the files, Git, and session context a reader came from remain one
-            // glance away instead of being covered.
+        } else if preview_fullscreen && !preview_docked {
+            // A shell that docks no panels has no slot to widen — the compact
+            // sheet draws its panel over the column — so the column hosts the
+            // full screen editor itself.
             div()
                 .size_full()
                 .min_w_0()
@@ -56315,12 +56542,13 @@ impl VibexWorkbench {
                         .cached(StyleRefinement::default().size_full()),
                 )
                 .into_any_element()
-        } else if let Some((group_id, group)) = self.active_session_group() {
-            self.render_session_group_workspace(&group_id, &group, cx)
+        } else if page_in_panel_slot && preview_travelling {
+            swept_page = Some(self.render_column_page(cx));
+            empty_center_content()
+        } else if page_in_panel_slot {
+            empty_center_content()
         } else {
-            self.ensure_timeline_view(cx)
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element()
+            self.render_column_page(cx)
         };
         shell = shell.child(
             div()
@@ -56335,6 +56563,10 @@ impl VibexWorkbench {
                 // full height so its surface reaches the window edge, and its
                 // content starts below the bar.
                 .pt(px(TITLE_BAR_HEIGHT))
+                // The panel's slot takes the whole column while it is full
+                // screen, so the column steps out of the row instead of
+                // splitting it with the slot.
+                .when(page_in_panel_slot, |this| this.flex_none().w(px(0.0)))
                 .child(
                     div()
                         .flex_1()
@@ -56343,13 +56575,6 @@ impl VibexWorkbench {
                         .overflow_hidden()
                         .child(center_content),
                 ),
-        );
-        let preview_animation = self.update_docked_panel_animation(
-            "preview",
-            preview_docked,
-            preview_width,
-            window,
-            cx,
         );
         let preview_panel = preview_animation.render_child.then(|| {
             let resize_handle = self.render_right_panel_resize_handle(
@@ -56364,8 +56589,11 @@ impl VibexWorkbench {
                 .flex_col()
                 .w_full()
                 .h_full()
-                .border_l_1()
-                .border_color(cx.theme().border)
+                // Full screen covers the column from the sidebar to the rail, so
+                // the seam it shares with the sidebar is the sidebar's own.
+                .when(!preview_fullscreen, |this| {
+                    this.border_l_1().border_color(cx.theme().border)
+                })
                 .child(
                     div()
                         .flex_1()
@@ -56383,15 +56611,21 @@ impl VibexWorkbench {
                 .child(resize_handle)
                 .into_any_element()
         });
-        shell = shell.child(Self::render_docked_side_panel(
-            "preview",
-            preview_animation,
-            preview_panel,
-        ));
+        shell = shell.child(if page_in_panel_slot {
+            Self::render_fullscreen_side_panel(
+                "preview",
+                preview_animation,
+                swept_page,
+                preview_panel,
+            )
+        } else {
+            Self::render_docked_side_panel("preview", preview_animation, preview_panel)
+        });
         let right_rail_animation = self.update_docked_panel_animation(
             "right-rail",
             right_rail_docked,
             right_rail_content_width,
+            false,
             window,
             cx,
         );
@@ -56497,8 +56731,13 @@ impl VibexWorkbench {
 /// panel entity instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PreviewPanelPlacement {
+    /// The docked slot hosts the panel — which is also how full screen is drawn:
+    /// the slot widens over the workbench column instead of handing the panel to
+    /// another host, so the panel keeps its right edge and its seam sweeps.
     docked: bool,
     overlay: bool,
+    /// The panel covers the whole workbench column. A shell that docks no panels
+    /// has no slot to widen, so there the column hosts the full screen panel.
     fullscreen: bool,
 }
 
@@ -56516,7 +56755,7 @@ fn preview_panel_placement(
     }
     let fullscreen = fullscreen_active;
     PreviewPanelPlacement {
-        docked: preview_docked && preview_visible && !fullscreen,
+        docked: preview_docked && preview_visible,
         overlay: !preview_docked && overlay_open && !fullscreen,
         fullscreen,
     }
@@ -78397,8 +78636,12 @@ mod tests {
         // The panel grows inside the workbench column, where the sidebar and
         // the rail are siblings, instead of being drawn over the whole shell.
         assert!(
-            shell.contains("} else if preview_fullscreen {"),
-            "full screen should hand the workbench column to the preview"
+            shell.contains("let page_in_panel_slot = preview_fullscreen && preview_docked;"),
+            "full screen should be drawn by the panel's own docked slot"
+        );
+        assert!(
+            shell.contains("} else if preview_fullscreen && !preview_docked {"),
+            "a shell that docks no panels should still host the panel in the column"
         );
         assert!(
             !shell.contains(".when(placement.fullscreen"),
@@ -78423,6 +78666,142 @@ mod tests {
 
         // The workbench column keeps its own chrome reservation.
         assert!(shell.contains(".pt(px(TITLE_BAR_HEIGHT))"));
+    }
+
+    /// The full screen flip is a sweep, not an open or a close: the panel keeps
+    /// its docked slot and its right edge, so its seam is the only thing that
+    /// travels. Expanding reads right-to-left, collapsing left-to-right, and the
+    /// column it passes keeps its own width underneath so nothing reflows.
+    #[test]
+    fn preview_fullscreen_sweeps_the_docked_slot_right_to_left() {
+        let source = include_str!("app.rs");
+        let shell = source
+            .split_once("    fn render_shell(")
+            .and_then(|(_, tail)| tail.split_once("\nfn preview_panel_placement("))
+            .map(|(body, _)| body)
+            .expect("shell should remain inspectable");
+        let sweep = shell
+            .split_once("        let column_width = workbench_column_width(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n        let inline_sidebar = self.render_inline_sidebar(")
+            })
+            .map(|(body, _)| body)
+            .expect("the full screen sweep should remain inspectable");
+
+        // The full screen width is the panel's docked slot plus the whole
+        // column, and the flip hands that width to the panel's own animation.
+        assert!(sweep.contains("let preview_sweep = std::mem::take("));
+        assert!(sweep.contains("column_width + preview_width"));
+        assert!(sweep.contains("preview_sweep,"));
+        assert!(
+            sweep.contains("preview_fullscreen && preview_docked"),
+            "only a docked panel has a slot to sweep"
+        );
+
+        // The column steps out of the row while the panel's slot owns it, and
+        // the page the editor passes rides with that slot.
+        assert!(shell.contains(".when(page_in_panel_slot, |this| this.flex_none().w(px(0.0)))"));
+        assert!(shell.contains("swept_page = Some(self.render_column_page(cx));"));
+        assert!(shell.contains("Self::render_fullscreen_side_panel("));
+
+        let host = source
+            .split_once("    fn render_fullscreen_side_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_column_page("))
+            .map(|(body, _)| body)
+            .expect("the full screen host should remain inspectable");
+        // The seam is an inset that sweeps to zero, and the page stays at the
+        // width the column had before the sweep started.
+        assert!(host.contains("(animation_state.target_value - animation_state.from_value)"));
+        assert!(host.contains(".slide_x(px(seam), px(0.0))"));
+        assert!(host.contains("seam_element.left(px(0.0))"));
+        assert!(host.contains(".w(px(seam))"));
+        // The panel itself is pinned at the far end's width: the seam travels
+        // over it instead of the editor reflowing on every frame.
+        assert!(host.contains("let panel_width = animation_state.target_value;"));
+        assert!(host.contains(".w(px(panel_width))"));
+    }
+
+    /// A flip has to reach the animation as a sweep even though the panel's open
+    /// state never changed, and the travel has to end on its own so the page
+    /// underneath can be dropped once the seam has landed.
+    #[test]
+    fn the_fullscreen_flip_arms_a_sweep_that_settles() {
+        let source = include_str!("app.rs");
+        let layout_changed = source
+            .split_once("CodeWorkbenchEvent::LayoutChanged { fullscreen } => {")
+            .and_then(|(_, tail)| {
+                tail.split_once("CodeWorkbenchEvent::BrowserCaptureQualityChanged(quality)")
+            })
+            .map(|(body, _)| body)
+            .expect("the full screen event should remain inspectable");
+        assert!(layout_changed.contains("this.preview_fullscreen_sweep = true;"));
+
+        let dock = source
+            .split_once("    fn update_docked_panel_animation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_docked_side_panel("))
+            .map(|(body, _)| body)
+            .expect("the dock animation should remain inspectable");
+        assert!(
+            dock.contains("toggling || sweep"),
+            "a sweep has to tween even when the open state did not change"
+        );
+        assert!(dock.contains("state.schedule_settle()"));
+        assert!(dock.contains("state.finish_settle(settle_request)"));
+    }
+
+    /// The travel is a width question, and a settled pane must not read as a
+    /// travelling one: the page under the seam is drawn from that answer.
+    #[test]
+    fn a_pane_travels_only_until_its_tween_lands() {
+        let mut state = SidebarAnimationState::new(320.0, 0.0, true);
+        assert!(!state.is_travelling());
+        assert_eq!(state.schedule_settle(), None);
+
+        state.from_value = 0.0;
+        assert!(state.is_travelling());
+        let request = state
+            .schedule_settle()
+            .expect("a travelling pane should ask for its landing");
+        assert_eq!(
+            state.schedule_settle(),
+            None,
+            "one landing per tween: a second request would only fight the first"
+        );
+        assert!(state.finish_settle(request));
+        assert_eq!(state.from_value, state.target_value);
+        assert!(!state.is_travelling());
+
+        // A tween that starts while one is still travelling answers the old
+        // timer with a request the new tween does not own.
+        state.from_value = 0.0;
+        let stale = state
+            .schedule_settle()
+            .expect("the reopened tween should ask for its own landing");
+        state.update_target(0.0, 0.0, false, true);
+        assert!(!state.finish_settle(stale));
+        assert!(state.is_travelling());
+    }
+
+    #[test]
+    fn the_fullscreen_sweep_only_takes_the_columns_beside_it() {
+        // The panel's slot plus the column it sweeps is everything between the
+        // sidebar and the rail, so the rail and the activity bar stay put.
+        assert_eq!(
+            workbench_column_width(1600, Some(280.0), Some(600.0), Some(300.0), true),
+            1600.0 - 280.0 - 600.0 - 300.0 - RIGHT_ACTIVITY_BAR_WIDTH
+        );
+        // A collapsed sidebar, a closed rail, and no activity bar each hand
+        // their width back to the column.
+        assert_eq!(
+            workbench_column_width(1600, None, Some(600.0), None, false),
+            1000.0
+        );
+        // A shell narrower than its own columns keeps a zero-width column
+        // rather than a negative one.
+        assert_eq!(
+            workbench_column_width(400, Some(280.0), Some(600.0), None, true),
+            0.0
+        );
     }
 
     #[test]
@@ -78451,8 +78830,20 @@ mod tests {
                 fullscreen: false,
             }
         );
+        // Full screen keeps the docked slot as the panel's host, so the panel
+        // never changes hands mid-sweep.
         assert_eq!(
             preview_panel_placement(false, true, false, true, true, false, true),
+            PreviewPanelPlacement {
+                docked: true,
+                overlay: false,
+                fullscreen: true,
+            }
+        );
+        // A compact shell draws no docked slot, so its full screen panel is
+        // hosted by the column instead.
+        assert_eq!(
+            preview_panel_placement(false, true, false, false, true, true, true),
             PreviewPanelPlacement {
                 docked: false,
                 overlay: false,
