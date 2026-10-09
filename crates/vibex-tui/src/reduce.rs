@@ -3400,7 +3400,7 @@ pub mod payloads {
     ) -> MutationRequest<ForkAgentSessionRequest> {
         MutationRequest::new(ForkAgentSessionRequest {
             source_session_id: session_id,
-            through_sequence: i64::MAX,
+            through_sequence: ForkAgentSessionRequest::AT_TIP,
             expected_source_end_sequence: None,
         })
     }

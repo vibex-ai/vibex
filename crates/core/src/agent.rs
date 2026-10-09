@@ -346,6 +346,17 @@ pub struct ForkAgentSessionRequest {
     pub expected_source_end_sequence: Option<i64>,
 }
 
+impl ForkAgentSessionRequest {
+    /// [`Self::through_sequence`] value that asks the authority to fork at the
+    /// source's current tip, copying the whole committed timeline.
+    ///
+    /// A session-list action has no timeline position of its own, so it sends
+    /// this sentinel instead of inventing one. The authority resolves it to the
+    /// source's end sequence in the same read it already performs, which keeps
+    /// the cut and the copied range on one snapshot.
+    pub const AT_TIP: i64 = i64::MAX;
+}
+
 /// Shared session timeline presentation preferences.  The desktop remains the
 /// authority for the inherited values; mobile may persist a local override.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

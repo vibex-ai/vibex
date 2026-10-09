@@ -1727,6 +1727,14 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - Session-row context menus reuse those captured typed targets. Pin/unpin must call
   the same persisted `SidebarState` mutation as the inline pin button; menu actions
   must not maintain a second pin projection or infer the target from selection.
+- A session-row fork follows the same target rule and forks the row's own
+  session. A list row has no timeline position to cut at, so the item sends
+  `ForkAgentSessionRequest::AT_TIP` and the authority resolves it to the
+  source's current end sequence in the same read that copies the range; only
+  the sentinel is resolved, so a caller that named a real out-of-range sequence
+  still fails. A fork opens when it exists unless the user navigated away while
+  it was being created, which is why the operation captures the selection and
+  generation at request time instead of reading the row back afterwards.
 - A session row sizes its trailing time/status column to its own content, so a
   long title ellipsizes as late as possible against the visible status. The
   hover action cluster is the only fixed-width slot, and it paints the row's

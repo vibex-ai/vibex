@@ -26513,8 +26513,14 @@ impl VibexWorkbench {
         .detach();
     }
 
+    /// Forks `source_session_id` at `through_sequence`.
+    ///
+    /// A timeline row passes its own sequence. A sidebar row has no timeline
+    /// position to point at, so its menu passes
+    /// [`ForkAgentSessionRequest::AT_TIP`] and the authority resolves the cut.
     fn fork_session_at(
         &mut self,
+        source_session_id: VibexSessionId,
         through_sequence: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -26522,12 +26528,8 @@ impl VibexWorkbench {
         if self.agent_action_pending || self.fork_session_pending || through_sequence <= 0 {
             return;
         }
-        let (Some(runtime), Some(source_session_id)) =
-            (self.runtime.clone(), self.selected_session_id.clone())
-        else {
-            if let (Some(backend), Some(source_session_id)) =
-                (self.backend.clone(), self.selected_session_id.clone())
-            {
+        let Some(runtime) = self.runtime.clone() else {
+            if let Some(backend) = self.backend.clone() {
                 self.fork_session_at_remote(
                     backend,
                     source_session_id,
@@ -26556,7 +26558,10 @@ impl VibexWorkbench {
             cx,
         );
         let generation = self.session_generation;
-        let selected_source_session_id = source_session_id.clone();
+        // Where the user was looking when the fork was asked for. A fork of a
+        // row they were not looking at still opens once it exists, as long as
+        // they have not navigated away in the meantime.
+        let selected_at_request = self.selected_session_id.clone();
         let completion_runtime = runtime.clone();
         let (created_tx, mut created_rx) = mpsc::unbounded_channel();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -26596,10 +26601,9 @@ impl VibexWorkbench {
                             this.upsert_session_snapshot(session);
                             this.reconcile_sidebar_state();
                             this.publish_sidebar_invalidation();
-                            let source_still_selected = this.session_generation == generation
-                                && this.selected_session_id.as_ref()
-                                    == Some(&selected_source_session_id);
-                            if source_still_selected {
+                            let selection_unchanged = this.session_generation == generation
+                                && this.selected_session_id == selected_at_request;
+                            if selection_unchanged {
                                 this.select_session_with_history(session_id, false, cx);
                             }
                             hint_layer::push(
@@ -40457,11 +40461,17 @@ impl VibexWorkbench {
         let context_auto_continue_id = session.id.clone();
         let context_pin_id = session.id.clone();
         let context_rename_id = session.id.clone();
+        let context_fork_id = session.id.clone();
         let context_delete_id = session.id.clone();
         let mutation_pending = self.agent_action_pending;
         let session_deletion_pending = self
             .pending_session_deletion_ids
             .contains(session.id.as_str());
+        // A fork holds the same window-wide action lock every other Agent
+        // mutation does, and a row already being deleted has nothing worth
+        // forking, so the item follows both states.
+        let fork_disabled =
+            mutation_pending || self.fork_session_pending || session_deletion_pending;
         let auto_continue_enabled = self.auto_continue_enabled(&session.id);
         let auto_continue_paused = self
             .auto_continue_paused_session_ids
@@ -40469,6 +40479,7 @@ impl VibexWorkbench {
         let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
         let auto_continue_paused_label =
             locale::text("Auto continue paused", "自动继续已暂停", "自動繼續已暫停");
+        let fork_label = locale::text("Fork session", "分叉会话", "分支會話");
         let pin_label = if pinned {
             strings.sidebar_unpin
         } else {
@@ -40831,6 +40842,8 @@ impl VibexWorkbench {
                         let pin_id = context_pin_id.clone();
                         let rename_entity = context_entity.clone();
                         let rename_id = context_rename_id.clone();
+                        let fork_entity = context_entity.clone();
+                        let fork_id = context_fork_id.clone();
                         let delete_entity = context_entity.clone();
                         let delete_id = context_delete_id.clone();
                         let mut menu = menu.item(
@@ -40945,6 +40958,21 @@ impl VibexWorkbench {
                                 .on_click(move |_, window, cx| {
                                     let _ = rename_entity.update(cx, |this, cx| {
                                         this.begin_sidebar_rename(rename_id.clone(), window, cx)
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(fork_label)
+                                .icon(sidebar_icon("icons/vibex/git-branch.svg"))
+                                .disabled(fork_disabled)
+                                .on_click(move |_, window, cx| {
+                                    let _ = fork_entity.update(cx, |this, cx| {
+                                        this.fork_session_at(
+                                            fork_id.clone(),
+                                            ForkAgentSessionRequest::AT_TIP,
+                                            window,
+                                            cx,
+                                        )
                                     });
                                 }),
                         )
@@ -50106,6 +50134,9 @@ impl VibexWorkbench {
         let locale = self.resolved_locale();
         let hover_group: SharedString = format!("timeline-conclusion-{}", row.id).into();
         let fork_sequence = row.last_sequence;
+        // A timeline row names its own cut, so it forks that sequence instead
+        // of sending the tip sentinel the sidebar row uses.
+        let fork_source_session_id = self.selected_session_id.clone();
         let fork_disabled = self.agent_action_pending
             || self.fork_session_pending
             || self.timeline.needs_authoritative_refetch;
@@ -50152,20 +50183,31 @@ impl VibexWorkbench {
                                 .into_any_element()
                         })
                     }
-                    AgentAnswerAction::Fork => Some(
-                        Button::new(format!("fork-conclusion:{}", row.id))
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .size(px(24.0))
-                            .icon(Icon::default().path("icons/vibex/git-branch.svg"))
-                            .tooltip(locale::text("Fork", "分叉会话", "分支會話"))
-                            .disabled(fork_disabled)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.fork_session_at(fork_sequence, window, cx)
-                            }))
-                            .into_any_element(),
-                    ),
+                    AgentAnswerAction::Fork => {
+                        let fork_source_session_id = fork_source_session_id.clone();
+                        Some(
+                            Button::new(format!("fork-conclusion:{}", row.id))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(24.0))
+                                .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                                .tooltip(locale::text("Fork", "分叉会话", "分支會話"))
+                                .disabled(fork_disabled)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(source_session_id) = fork_source_session_id.clone()
+                                    {
+                                        this.fork_session_at(
+                                            source_session_id,
+                                            fork_sequence,
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                }))
+                                .into_any_element(),
+                        )
+                    }
                     AgentAnswerAction::Timestamp => timestamp.map(|timestamp| {
                         div()
                             .ml_1()
@@ -77978,6 +78020,40 @@ mod tests {
             .expect("sidebar session delete menu item should remain inspectable");
         assert!(menu.contains(".disabled(session_deletion_pending)"));
         assert!(!menu.contains("mutation_pending"));
+    }
+
+    /// A sidebar row has no timeline position of its own, so its fork item asks
+    /// the authority for the tip of that row's session instead of the selected
+    /// session's cut.
+    #[test]
+    fn sidebar_session_menu_forks_its_own_row_at_the_tip() {
+        let source = include_str!("app.rs");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        let fork = session
+            .split_once("PopupMenuItem::new(fork_label)")
+            .and_then(|(_, tail)| tail.split_once("PopupMenuItem::new(strings.sidebar_delete)"))
+            .map(|(body, _)| body)
+            .expect("sidebar fork item should remain inspectable");
+
+        assert!(fork.contains(".icon(sidebar_icon(\"icons/vibex/git-branch.svg\"))"));
+        assert!(fork.contains(".disabled(fork_disabled)"));
+        assert!(fork.contains(".on_click(move |_, window, cx|"));
+        assert!(fork.contains("fork_id.clone()"));
+        assert!(fork.contains("ForkAgentSessionRequest::AT_TIP"));
+        assert!(fork.contains("this.fork_session_at("));
+        assert!(!fork.contains("self.selected_session_id"));
+
+        let context = session
+            .split_once("let context_fork_id = session.id.clone();")
+            .and_then(|(_, tail)| tail.split_once("let fork_label"))
+            .map(|(body, _)| body)
+            .expect("the fork item should target the row's own session");
+        assert!(context.contains("self.fork_session_pending"));
+        assert!(context.contains("session_deletion_pending"));
     }
 
     #[test]

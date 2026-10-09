@@ -1279,12 +1279,8 @@ impl AgentManager {
                 "Agent session changed before the fork could be created",
             ));
         }
-        if request.through_sequence > source_end_sequence {
-            return Err(VibexError::validation(
-                "session_fork_sequence_out_of_range",
-                "Agent session fork sequence exceeds the source timeline",
-            ));
-        }
+        let through_sequence =
+            resolve_fork_through_sequence(request.through_sequence, source_end_sequence)?;
 
         let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &source.id)?
             .ok_or_else(|| {
@@ -1308,10 +1304,10 @@ impl AgentManager {
                 "Agent session fork source has no effective runtime selection",
             )
         })?;
-        let source_items = if request.through_sequence == 0 {
+        let source_items = if through_sequence == 0 {
             Vec::new()
         } else {
-            TimelineRepository::fetch_range(&conn, &source.id, 1, request.through_sequence)?
+            TimelineRepository::fetch_range(&conn, &source.id, 1, through_sequence)?
         };
         let native_session_id = runtime_state
             .current_binding_id
@@ -1329,9 +1325,8 @@ impl AgentManager {
         // message at or before the requested sequence. An Agent that cannot cut
         // there refuses the fork and the fresh-session path below runs instead;
         // without a message id the request never asks for a cut at all.
-        let fork_cut = (native_session_id.is_some()
-            && request.through_sequence != source_end_sequence)
-            .then(|| fork_cut_point(&source_items, request.through_sequence))
+        let fork_cut = (native_session_id.is_some() && through_sequence != source_end_sequence)
+            .then(|| fork_cut_point(&source_items, through_sequence))
             .flatten();
         let (source_items, fork_cut_message_id) = match fork_cut {
             Some((sequence, message_id)) => (
@@ -5447,6 +5442,29 @@ fn should_coalesce_provider_event(event: &ProviderEvent) -> bool {
         }
 }
 
+/// Resolves a fork's requested cut against the source's current end sequence.
+///
+/// [`ForkAgentSessionRequest::AT_TIP`] is the session-list form of the request:
+/// the caller means "the whole session" and has no sequence of its own, so the
+/// tip the authority just read becomes the cut. Any other out-of-range
+/// sequence stays an error, because a caller that named a sequence is naming a
+/// position it believes exists.
+fn resolve_fork_through_sequence(
+    requested_sequence: i64,
+    source_end_sequence: i64,
+) -> VibexResult<i64> {
+    if requested_sequence == ForkAgentSessionRequest::AT_TIP {
+        return Ok(source_end_sequence);
+    }
+    if requested_sequence > source_end_sequence {
+        return Err(VibexError::validation(
+            "session_fork_sequence_out_of_range",
+            "Agent session fork sequence exceeds the source timeline",
+        ));
+    }
+    Ok(requested_sequence)
+}
+
 /// The last assistant segment at or before `through_sequence` that belongs to
 /// one provider message, as `(sequence, message id)`.
 ///
@@ -8082,6 +8100,30 @@ mod tests {
         assert_eq!(fork_cut_point(&anonymous, 1), None);
         let empty: Vec<TimelineItem> = Vec::new();
         assert_eq!(fork_cut_point(&empty, 4), None);
+    }
+
+    #[test]
+    fn fork_tip_sentinel_resolves_to_the_source_end_sequence() {
+        assert_eq!(
+            resolve_fork_through_sequence(ForkAgentSessionRequest::AT_TIP, 7).unwrap(),
+            7,
+            "a session-list fork forks the whole committed timeline"
+        );
+        assert_eq!(
+            resolve_fork_through_sequence(ForkAgentSessionRequest::AT_TIP, 0).unwrap(),
+            0,
+            "an empty timeline is still a complete tip fork"
+        );
+        assert_eq!(resolve_fork_through_sequence(3, 7).unwrap(), 3);
+        assert_eq!(resolve_fork_through_sequence(7, 7).unwrap(), 7);
+
+        let error = resolve_fork_through_sequence(8, 7).unwrap_err();
+        assert_eq!(error.code, "session_fork_sequence_out_of_range");
+        let error = resolve_fork_through_sequence(i64::MAX - 1, 7).unwrap_err();
+        assert_eq!(
+            error.code, "session_fork_sequence_out_of_range",
+            "only the tip sentinel is resolved, not every huge sequence"
+        );
     }
 
     #[test]
