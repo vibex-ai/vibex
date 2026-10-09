@@ -372,7 +372,14 @@ says four things:
   turning it on starts the helper and the endpoint, turning it off releases the
   desktop and stops them. The runtime is told what the user chose rather than
   the other way round, and `VIBEX_COMPUTER_USE=1` only *seeds* the switch once
-  so an administrator does not have to find it.
+  so an administrator does not have to find it. It is **disabled while an
+  install is what is missing** — no driver, a file that does not answer, or a
+  failed install — because a flip there would promise a desktop the runtime
+  cannot drive. The press is not swallowed either: it is answered with the
+  install that lifts the gate, so the reader is told what to do instead of being
+  ignored. A driver that is present keeps the switch live even when the runtime
+  refuses for another reason, since that flip reaches a named outcome rather
+  than nothing.
 - **The driver.** Its row carries the state of this machine and the two actions
   that change it: Install and Check again. Installing runs a fixed, documented
   installer for the platform, only after the button is pressed, and never from

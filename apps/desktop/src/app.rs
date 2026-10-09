@@ -335,6 +335,9 @@ struct NewSessionErrorNotification;
 enum SettingsOperationTone {
     Success,
     Error,
+    /// A tip rather than a result: the answer to a control that refused to act,
+    /// saying which action would let it act.
+    Info,
 }
 
 /// One settings operation result, announced as a light hint on the notification
@@ -361,6 +364,14 @@ impl SettingsOperationNotice {
     fn error(message: impl Into<String>) -> Self {
         Self {
             tone: SettingsOperationTone::Error,
+            message: message.into(),
+        }
+    }
+
+    /// A tip shown in answer to a control that is not available yet.
+    fn info(message: impl Into<String>) -> Self {
+        Self {
+            tone: SettingsOperationTone::Info,
             message: message.into(),
         }
     }
@@ -2184,6 +2195,9 @@ impl VibexWorkbench {
                 }
                 SettingsOperationTone::Error => {
                     hint_notification(NotificationType::Error, notice.message, cx)
+                }
+                SettingsOperationTone::Info => {
+                    hint_notification(NotificationType::Info, notice.message, cx)
                 }
             };
             hint_layer::push(
@@ -68624,6 +68638,11 @@ impl FoundationSettings {
             status.availability.as_ref(),
             settings.enabled,
         );
+        // A machine whose driver is not there yet cannot run the feature, and
+        // "Install" is the one action that changes that. The master switch is
+        // therefore disabled while that holds, and a click on it answers with
+        // the install it needs instead of a flip the runtime cannot honour.
+        let driver_gate = readiness.installs_driver();
 
         let master = setting_row(
             locale::text("Computer use", "电脑操作", "電腦操作"),
@@ -68634,15 +68653,22 @@ impl FoundationSettings {
                 "允许 Agent 读取本机屏幕并操作桌面应用，和终端、浏览器面板同属一类工具。默认关闭：打开后 Agent 会操作你真实的桌面和真实账号。",
                 "允許 Agent 讀取本機螢幕並操作桌面應用，和終端機、瀏覽器面板同屬一類工具。預設關閉：開啟後 Agent 會操作你真實的桌面和真實帳號。",
             ),
-            Switch::new("computer-enabled")
-                .small()
-                .checked(settings.enabled)
-                .on_click(cx.listener(|this, enabled, _, cx| {
+            computer_enabled_switch(
+                settings.enabled,
+                driver_gate,
+                cx.listener(|this, enabled, _, cx| {
                     let enabled = *enabled;
                     let _ = this.workbench.update(cx, |workbench, cx| {
                         workbench.set_computer_enabled(enabled, cx)
                     });
-                })),
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.notify_settings_operation(
+                        SettingsOperationNotice::info(computer_driver_gate_tip()),
+                        cx,
+                    );
+                }),
+            ),
             stacked,
             cx,
         );
@@ -71312,6 +71338,74 @@ fn computer_readiness_note(
     }
 }
 
+/// The master switch of the computer-use page, disabled while this machine has
+/// no driver.
+///
+/// A disabled kit switch swallows the click, and a control that refuses
+/// silently is the shape this page avoids: a layer above the disabled control
+/// takes the press and answers it with the install that lifts the gate. The
+/// switch itself keeps the disabled treatment, so it never promises a flip the
+/// runtime cannot honour, while the reader who tries it is told what to do
+/// instead of being ignored.
+///
+/// The two answers travel as callbacks rather than reaching into the workbench
+/// from here, so the control can be exercised — disabled, clicked, and clicked
+/// outside itself — without a settings page around it.
+fn computer_enabled_switch(
+    enabled: bool,
+    driver_gate: bool,
+    toggle: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    explain: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    // A grid rather than a relative wrapper: the stacked row hands its control
+    // column the row's whole width, so an absolutely positioned layer would
+    // cover the empty room beside the switch and answer presses there. One
+    // max-content column keeps the layer on the control's own box, and both
+    // live in the same cell so the layer sits exactly over the switch.
+    div()
+        .grid()
+        .grid_cols_max_content(1)
+        .debug_selector(|| "computer-enabled-control".to_string())
+        .child(
+            Switch::new("computer-enabled")
+                .col_start(1)
+                .row_start(1)
+                .small()
+                .checked(enabled)
+                .disabled(driver_gate)
+                .on_click(toggle),
+        )
+        // Same box, same cursor, and an answer instead of nothing.
+        .when(driver_gate, |this| {
+            this.child(
+                div()
+                    .id("computer-enabled-driver-gate-hit")
+                    .col_start(1)
+                    .row_start(1)
+                    // A grid item that shrink-wraps would collapse to nothing
+                    // and catch no press.
+                    .size_full()
+                    .cursor_not_allowed()
+                    .on_click(explain),
+            )
+        })
+        .into_any_element()
+}
+
+/// What a press on the gated computer-use switch answers with.
+///
+/// It names the row that lifts the gate rather than leaving the reader to find
+/// it: the driver row sits directly below, and "no driver", "a file that does
+/// not answer" and "not checked yet" are all answered by the buttons there.
+fn computer_driver_gate_tip() -> &'static str {
+    locale::text(
+        "Install the desktop driver first. The Desktop driver row below has Install and Check \
+         again.",
+        "请先安装桌面驱动。下方“桌面驱动”一行提供安装和重新检测。",
+        "請先安裝桌面驅動。下方「桌面驅動」一列提供安裝和重新偵測。",
+    )
+}
+
 /// The three permission states, on one line, without inventing a fourth.
 ///
 /// Nothing is probed while the feature is off, and a platform that gates none
@@ -72685,6 +72779,83 @@ mod tests {
         );
         assert!(note.contains("/opt/stale/cua-driver"), "{note}");
         assert!(!note.contains("No driver"), "{note}");
+    }
+
+    /// The master switch is disabled exactly while an install is the action
+    /// that changes the state: no driver, a file that does not answer, or a
+    /// failed install. Every other state keeps the switch live, because a flip
+    /// there reaches a named outcome — a permission prompt, a refusal, another
+    /// machine's own runtime — rather than a promise nothing can keep.
+    #[test]
+    fn the_master_switch_is_gated_only_while_an_install_is_the_missing_action() {
+        let silent = DriverState::Installed {
+            path: std::path::PathBuf::from("/opt/stale/cua-driver"),
+            version: None,
+            responsive: false,
+        };
+        for (readiness, gated) in [
+            // Never probed, not found, found but silent, installing, or failed.
+            (
+                computer_readiness(true, &DriverState::Unknown, None, false),
+                true,
+            ),
+            (
+                computer_readiness(true, &DriverState::Missing, None, false),
+                true,
+            ),
+            (computer_readiness(true, &silent, None, false), true),
+            (
+                computer_readiness(true, &DriverState::Installing, None, false),
+                true,
+            ),
+            (
+                computer_readiness(
+                    true,
+                    &DriverState::InstallFailed {
+                        detail: "the installer exited 1".to_string(),
+                    },
+                    None,
+                    false,
+                ),
+                true,
+            ),
+            // A driver that answered: the switch belongs to the reader, whether
+            // the feature is off, on, or waiting on the operating system.
+            (
+                computer_readiness(true, &installed_driver(), None, false),
+                false,
+            ),
+            (
+                computer_readiness(
+                    true,
+                    &installed_driver(),
+                    Some(&availability_with(Some(
+                        ComputerUnavailableReason::PermissionRestartRequired,
+                    ))),
+                    true,
+                ),
+                false,
+            ),
+            (
+                computer_readiness(
+                    true,
+                    &installed_driver(),
+                    Some(&availability_with(Some(
+                        ComputerUnavailableReason::NoDesktopSession,
+                    ))),
+                    true,
+                ),
+                false,
+            ),
+            // A paired runtime on another machine owns the desktop and its
+            // driver; this window has nothing local to demand first.
+            (
+                computer_readiness(false, &DriverState::Missing, None, false),
+                false,
+            ),
+        ] {
+            assert_eq!(readiness.installs_driver(), gated, "{readiness:?}");
+        }
     }
 
     #[test]
@@ -83233,6 +83404,7 @@ mod tests {
         assert!(presenter.contains("self.settings_operation_notice.take()"));
         assert!(presenter.contains("NotificationType::Success, notice.message"));
         assert!(presenter.contains("NotificationType::Error, notice.message"));
+        assert!(presenter.contains("NotificationType::Info, notice.message"));
         assert!(presenter.contains("hint_notification("));
         assert!(presenter.contains(".id::<SettingsOperationNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
@@ -86893,6 +87065,113 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.section == SettingsSection::Browser)
         );
+    }
+
+    /// A machine with no driver cannot turn computer use on, and the switch
+    /// says so instead of silently refusing: the control is disabled while a
+    /// layer above it catches the press and answers with the install that lifts
+    /// the gate. A disabled switch that swallows the click would be the same
+    /// dead end the page's readiness note exists to prevent.
+    #[test]
+    fn the_computer_switch_is_disabled_until_a_driver_can_answer() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_computer_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_browser_page("))
+            .map(|(body, _)| body)
+            .expect("the computer settings page should remain inspectable");
+        assert!(page.contains("let driver_gate = readiness.installs_driver();"));
+        assert!(page.contains("computer_enabled_switch(\n                settings.enabled,"));
+        assert!(page.contains("SettingsOperationNotice::info(computer_driver_gate_tip())"));
+        assert!(!page.contains("Switch::new(\"computer-enabled\")"));
+
+        let switch = source
+            .split_once("fn computer_enabled_switch(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// What a press on the gated computer-use switch")
+            })
+            .map(|(body, _)| body)
+            .expect("the gated switch should remain inspectable");
+        assert!(switch.contains(".disabled(driver_gate)"));
+        assert!(switch.contains(".id(\"computer-enabled-driver-gate-hit\")"));
+
+        assert!(computer_driver_gate_tip().contains("Install the desktop driver"));
+    }
+
+    /// The gated switch answers a press instead of swallowing it, and its hit
+    /// area is the control: the click never reaches the toggle, the tip fires,
+    /// and the empty room beside the switch stays inert. The row's stacked
+    /// control column is the layout that catches a wrapper stretching to the
+    /// row's width and inventing a hit area there.
+    #[gpui::test]
+    fn a_click_on_the_gated_computer_switch_answers_with_the_install_it_needs(
+        cx: &mut TestAppContext,
+    ) {
+        struct GateProbe {
+            gated: bool,
+            toggles: Rc<Cell<usize>>,
+            tips: Rc<Cell<usize>>,
+        }
+
+        impl Render for GateProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let toggles = self.toggles.clone();
+                let tips = self.tips.clone();
+                div().w(px(400.0)).flex().flex_col().child(
+                    div().min_w_0().flex_none().w_full().child(computer_enabled_switch(
+                        false,
+                        self.gated,
+                        move |_, _, _| toggles.set(toggles.get() + 1),
+                        move |_, _, _| tips.set(tips.get() + 1),
+                    )),
+                )
+            }
+        }
+
+        fn gated_window(
+            cx: &mut TestAppContext,
+            gated: bool,
+        ) -> (&mut VisualTestContext, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+            let toggles = Rc::new(Cell::new(0));
+            let tips = Rc::new(Cell::new(0));
+            let (_, cx) = cx.add_window_view({
+                let toggles = toggles.clone();
+                let tips = tips.clone();
+                move |_, _| GateProbe {
+                    gated,
+                    toggles,
+                    tips,
+                }
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            (cx, toggles, tips)
+        }
+
+        cx.update(gpui_component::init);
+
+        let (cx, toggles, tips) = gated_window(cx, true);
+        let gate = cx
+            .debug_bounds("computer-enabled-control")
+            .expect("the gated switch should be laid out");
+        let on_switch = point(gate.left() + px(10.0), gate.top() + px(8.0));
+        cx.simulate_click(on_switch, Modifiers::none());
+        assert_eq!(toggles.get(), 0, "a gated switch must not toggle");
+        assert_eq!(tips.get(), 1, "the press is answered instead of swallowed");
+
+        let beside = point(px(360.0), on_switch.y);
+        cx.simulate_click(beside, Modifiers::none());
+        assert_eq!(tips.get(), 1, "the room beside the switch stays inert");
+
+        let (cx, toggles, tips) = gated_window(cx, false);
+        let switch = cx
+            .debug_bounds("computer-enabled-control")
+            .expect("the live switch should be laid out");
+        cx.simulate_click(
+            point(switch.left() + px(10.0), switch.top() + px(8.0)),
+            Modifiers::none(),
+        );
+        assert_eq!(toggles.get(), 1, "a driver keeps the switch live");
+        assert_eq!(tips.get(), 0, "a live switch has nothing to explain");
     }
 
     #[test]
