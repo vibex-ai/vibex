@@ -44436,11 +44436,14 @@ impl VibexWorkbench {
                 // viewport shows keeps the reading emphasis instead of fading
                 // with its distance to the pointer, otherwise scrolling across
                 // a turn boundary would light one turn and dim the other the
-                // reader can see just as well.
+                // reader can see just as well. That emphasis is a reading
+                // marker rather than a second selection, so it stays well under
+                // the pointer's brightness: on screen for orientation, never
+                // competing with the slot the pointer is actually on.
                 let (line_width, line_height, line_color) = if hovered {
                     (26.4, 2.88, foreground)
                 } else if visible_slots.contains(&preview_index) {
-                    (23.2, 2.88, foreground.opacity(0.72))
+                    (23.2, 2.88, foreground.opacity(0.5))
                 } else {
                     match active_index.map(|active| active.abs_diff(preview_index)) {
                         Some(1) => (20.0, 2.24, muted_foreground.opacity(0.48)),
@@ -88432,9 +88435,12 @@ mod tests {
         assert!(renderer.contains("f32::from(self.timeline_scroll.offset().y)"));
         assert!(renderer.contains("f32::from(self.timeline_scroll.bounds().size.height)"));
         // The pointer still outranks the reading position for its own slot, and
-        // the reading position outranks the pointer's neighbourhood fade.
+        // the reading position outranks the pointer's neighbourhood fade. The
+        // reading bar is a position marker, not a second selection, so it stays
+        // at half the foreground: above the resting bars, below the pointer.
         assert!(renderer.contains("let (line_width, line_height, line_color) = if hovered {"));
         assert!(renderer.contains("} else if visible_slots.contains(&preview_index) {"));
+        assert!(renderer.contains("(23.2, 2.88, foreground.opacity(0.5))"));
         assert!(renderer.contains("let preview_card = hovered.then(|| {"));
     }
 
