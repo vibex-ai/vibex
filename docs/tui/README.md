@@ -102,11 +102,17 @@ literal. A message that scrolls out of view stays pinned above the transcript.
 Agent replies render Markdown as text arrives, including wrapped code and tables.
 
 Tool calls and reasoning use compact disclosure rows (`▸` / `▾`). Their layout
-stays the same while running and after completion. Click a row or press `e` to
-expand its details; raw payloads and reasoning paragraphs stay behind that fold.
-Three or more consecutive records of the same action can share one row with a
-`+N` count. Expanding the group reveals all members. Different actions, turns,
-runtimes and failures remain distinct, and updates preserve your expansion choices.
+stays the same while running and after completion. Click a header or press `e`
+to open it. Three or more settled activities in the same turn and runtime share
+a summary with action counts. Opening that summary reveals the individual
+headers; opening a child reveals its details. Thin vertical lines connect both
+levels. The summary remains available, and closing it also closes every child.
+Running, failed and approval-pending activities stay separately visible.
+Updates preserve your expansion choices.
+
+Reasoning can follow the latest live content at the bottom or remain in the
+timeline. Settings also control whether reasoning starts expanded and whether
+live content uses a short tail window or expands in full.
 
 **Layered surfaces.** Backgrounds step away from the canvas, so a tool body or a
 raised row reads as a distinct plane rather than as more text on the same
@@ -276,10 +282,17 @@ just typed rather than moving text out from under a cursor placed on purpose.
 
 Tools and reasoning keep the same compact rows while running and after completion.
 Tool rows show a recognized command, path or query; reasoning rows show a label.
-Click the header or press `e` to reveal the complete content. `Enter` opens the
-selected block's details. Expanded content stays open while new events arrive.
-Consecutive identical actions may group with a `+N` count; failed records always
-remain visible. Runtime attribution is available with expanded details.
+Click the header or press `e` to reveal content. `Enter` opens the selected
+block's details. Each grouped tool has its own disclosure, and opening it keeps
+the group summary in place. Runtime attribution is available with expanded
+details. Disclosures animate briefly and reverse from their current position
+when clicked again; turning off **Motion** makes changes immediate.
+
+In the default window mode, the current live thought opens a window of up to
+six rendered lines. An explicit collapse stays in effect across new content.
+When a tool follows or the turn ends, the bottom indicator disappears. Choose
+**In timeline** to retain earlier reasoning rows; settled thoughts start closed
+unless **Expand reasoning by default** is on, and open in full when requested.
 
 Agent replies stream in full. If events are missed, the client fetches authoritative
 history before resuming updates, without sending your message again.
@@ -676,8 +689,8 @@ cost, price or currency in the data model, so the page does not invent one.
 ### Settings
 
 Theme and its dark/light mode (20 shipped themes), language (`en`, `zh-CN`,
-`zh-TW`), icon set, the landing logo and its two effects, the default workspace
-for new sessions, and the
+`zh-TW`), icon set, the landing logo and its effects, timeline reasoning and
+disclosure motion, the default workspace for new sessions, and the
 key-binding file. The page is one surface with four modes rather than four screens:
 
 | Mode | Entered by | What it does |
@@ -689,9 +702,23 @@ key-binding file. The page is one surface with four modes rather than four scree
 
 A reset asks first and then restores the shipped default.
 
+The **Transcript** section has three reasoning preferences:
+
+| Setting | Default | Alternative |
+| --- | --- | --- |
+| Reasoning display | Latest at bottom | In timeline |
+| Expand reasoning by default | Off | On |
+| Reasoning expansion | Window | Full expansion |
+
+These use the desktop's presentation rules. Window mode opens the current
+live thought automatically, while a manual collapse takes precedence. Full
+expansion shows all live content when opened. Changing the display mode or the
+default expansion resets per-row reasoning choices; changing Window/Full keeps
+them.
+
 Every value the page changes is remembered for the next run: the appearance,
-the theme, the icon set, the logo and its two effects, the language and the
-default workspace are written to
+the theme, the icon set, the logo and its effects, the reasoning preferences,
+the language and the default workspace are written to
 `~/.vibex/tui-interface.json`, beside the arrangement and the key file. The
 theme is kept per appearance — a light palette and a dark one are two choices,
 so switching to light and back finds the dark one where it was. The command

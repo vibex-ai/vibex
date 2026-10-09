@@ -1368,6 +1368,9 @@ impl App {
                 mark: options.remembered.mark().unwrap_or_default(),
                 motion: options.remembered.motion(),
                 transitions: options.remembered.transitions(),
+                reasoning_display_mode: options.remembered.reasoning_display_mode(),
+                reasoning_expanded_by_default: options.remembered.reasoning_expanded_by_default(),
+                reasoning_expansion_mode: options.remembered.reasoning_expansion_mode(),
                 selected: 0,
                 view: SettingsMode::Browse,
                 filter: String::new(),
@@ -2295,6 +2298,21 @@ impl App {
             mark: Some(self.settings.mark.id().to_string()),
             motion: Some(self.settings.motion),
             transitions: Some(self.settings.transitions),
+            reasoning_display_mode: Some(
+                match self.settings.reasoning_display_mode {
+                    vibex_desktop_model::ReasoningDisplayMode::LatestAtBottom => "latest_at_bottom",
+                    vibex_desktop_model::ReasoningDisplayMode::Timeline => "timeline",
+                }
+                .to_string(),
+            ),
+            reasoning_expanded_by_default: Some(self.settings.reasoning_expanded_by_default),
+            reasoning_expansion_mode: Some(
+                match self.settings.reasoning_expansion_mode {
+                    vibex_desktop_model::ReasoningExpansionMode::Window => "window",
+                    vibex_desktop_model::ReasoningExpansionMode::Full => "full",
+                }
+                .to_string(),
+            ),
             locale: Some(self.settings.locale.tag().to_string()),
             workspace: self.preferred_workspace.clone(),
             recent_commands: self.recent_commands.clone(),
@@ -3784,10 +3802,20 @@ impl App {
     /// is anchored to the block that was under the first visible line rather
     /// than to the absolute line offset it used to sit at.
     pub fn sync_transcript(&mut self) {
+        let selected_id = self
+            .transcript
+            .block(self.selection_for(Scope::Agent))
+            .map(|block| block.id.clone());
         // `transcript_rows` rather than the state-free projection: a turn the
         // runtime has finished must stop claiming to stream, or the client
         // draws a spinner over a finished answer for the rest of the session.
         let mut rows = self.agent.state.transcript_rows();
+        self.project_reasoning(&mut rows);
+        self.transcript.set_reasoning_preferences(
+            self.settings.reasoning_expanded_by_default,
+            self.settings.reasoning_expansion_mode,
+        );
+        self.transcript.set_motion_enabled(self.settings.motion);
         self.restore_message_placeholders(&mut rows);
         // A send the runtime has not echoed yet is projected as the row it will
         // become. It goes last because that is where the echo will land, and it
@@ -3855,7 +3883,9 @@ impl App {
         let prepended = !self.scroll.follow
             && self
                 .transcript
-                .block(0)
+                .blocks()
+                .iter()
+                .find(|block| !block.group.is_head())
                 .is_some_and(|head| blocks.first().is_some_and(|first| first.id != head.id));
         let anchor = if prepended {
             self.transcript
@@ -3865,6 +3895,13 @@ impl App {
             None
         };
         let change = self.transcript.set_blocks(blocks);
+        if let Some(index) = selected_id
+            .as_deref()
+            .and_then(|id| self.transcript.index_of_block(id))
+            .and_then(|index| self.transcript.visible_block(index))
+        {
+            self.set_selection(Scope::Agent, index);
+        }
         if change.appended > 0 {
             // New content resumes following unless the user scrolled away.
             if self.scroll.follow {
@@ -3883,6 +3920,60 @@ impl App {
         // The transcript is the turn's own output, so it is also where the line
         // above the composer learns that the turn moved.
         self.sync_turn_readout();
+    }
+
+    /// Use the desktop's turn projection for reasoning placement and liveness.
+    /// Other transcript rows retain their existing TUI ordering and notices.
+    fn project_reasoning(&self, rows: &mut Vec<TimelineRow>) {
+        use vibex_desktop_model::{ReasoningDisplayMode, TimelineRowKind};
+
+        if !rows
+            .iter()
+            .any(|row| row.kind == TimelineRowKind::Reasoning)
+        {
+            return;
+        }
+        let mode = self.settings.reasoning_display_mode;
+        let turns = self
+            .agent
+            .state
+            .conversation_turns_with_reasoning_mode(mode);
+        let reasoning = turns
+            .iter()
+            .flat_map(|turn| &turn.process_rows)
+            .filter(|row| row.kind == TimelineRowKind::Reasoning)
+            .map(|row| (row.id.as_str(), row.streaming))
+            .collect::<HashMap<_, _>>();
+        let live = (mode == ReasoningDisplayMode::LatestAtBottom)
+            .then(|| turns.last())
+            .flatten()
+            .filter(|turn| !turn.complete && !turn.superseded)
+            .and_then(|turn| {
+                let body = turn.live_status.as_deref()?;
+                let mut row = rows
+                    .iter()
+                    .rev()
+                    .find(|row| {
+                        row.kind == TimelineRowKind::Reasoning
+                            && row.turn_id.as_deref() == Some(turn.id.as_str())
+                    })?
+                    .clone();
+                row.id = format!("reasoning-live:{}", turn.id);
+                row.body = body.to_string();
+                row.streaming = true;
+                Some(row)
+            });
+        rows.retain_mut(|row| {
+            if row.kind != TimelineRowKind::Reasoning {
+                return true;
+            }
+            let Some(streaming) = reasoning.get(row.id.as_str()) else {
+                return false;
+            };
+            row.streaming = *streaming && row.streaming;
+            true
+        });
+        rows.extend(live);
     }
 
     /// Put each user message's attachments back into the row it is drawn as.
@@ -4017,6 +4108,7 @@ impl App {
             return;
         };
         let height = self.viewport.1 as usize / 2;
+        self.transcript.reveal_block(block);
         let line = self.transcript.line_of_block(block);
         self.scroll.follow = false;
         self.scroll.offset = line.saturating_sub(height / 3);
@@ -5308,6 +5400,7 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
         // draws no clock rather than one reading 1970.
         timestamp_ms: (row.timestamp_ms > 0).then_some(row.timestamp_ms),
         expanded: false,
+        reasoning_window: false,
         // A dense row shows one line by shape, so it has to be openable to be
         // readable in full: the transcript is where its body lives.
         collapsible: row.kind != vibex_desktop_model::TimelineRowKind::AgentMessage
@@ -5676,6 +5769,9 @@ mod tests {
         assert!(app.apply_setting_value(SettingRow::Mark, "glitch"));
         assert!(app.apply_setting_value(SettingRow::Motion, "off"));
         assert!(app.apply_setting_value(SettingRow::Transitions, "off"));
+        assert!(app.apply_setting_value(SettingRow::ReasoningDisplay, "timeline"));
+        assert!(app.apply_setting_value(SettingRow::ReasoningExpanded, "on"));
+        assert!(app.apply_setting_value(SettingRow::ReasoningExpansion, "full"));
         assert!(app.apply_setting_value(SettingRow::Language, "zh-TW"));
         assert!(app.apply_setting_value(SettingRow::Workspace, "/tmp/vibex-default-ws"));
 
@@ -5718,6 +5814,15 @@ mod tests {
         assert_eq!(reloaded.settings.mark, crate::logo::MarkStyle::Glitch);
         assert!(!reloaded.settings.motion);
         assert!(!reloaded.settings.transitions);
+        assert_eq!(
+            reloaded.settings.reasoning_display_mode,
+            vibex_desktop_model::ReasoningDisplayMode::Timeline
+        );
+        assert!(reloaded.settings.reasoning_expanded_by_default);
+        assert_eq!(
+            reloaded.settings.reasoning_expansion_mode,
+            vibex_desktop_model::ReasoningExpansionMode::Full
+        );
         assert_eq!(
             reloaded.workspace_path.as_deref(),
             Some("/tmp/vibex-default-ws")

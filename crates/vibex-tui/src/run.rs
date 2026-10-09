@@ -248,6 +248,9 @@ fn event_loop(
         }
 
         // ---- frame --------------------------------------------------------
+        if app.page_owns_session() && app.transcript.advance_disclosures(Instant::now()) {
+            dirty = true;
+        }
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             // Every size draws the interface itself. There is no minimum: the
             // layout gives back the bands around the transcript and the
@@ -992,7 +995,7 @@ fn handle_composer_key(
                     .transcript
                     .blocks()
                     .iter()
-                    .rposition(|block| block.group != crate::transcript::GroupRole::Member)
+                    .rposition(|block| !block.group.is_hidden())
                     .unwrap_or(0);
                 app.set_selection(crate::keymap::Scope::Agent, index);
                 app.scroll.follow = false;
@@ -1277,7 +1280,9 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if let Some(index) = app.transcript.block_at_line(line)
                 && app.transcript.line_of_block(index) == line
                 && app.transcript.block(index).is_some_and(|block| {
-                    block.collapsible && crate::transcript::is_dense_row(block.kind)
+                    block.collapsible
+                        && !block.group.is_hidden()
+                        && crate::transcript::is_dense_row(block.kind)
                 })
             {
                 app.clear_text_selection();
@@ -3346,7 +3351,7 @@ mod tests {
         app.focus = Focus::Main;
         app.set_selection(crate::keymap::Scope::Agent, 0);
         app.perform(Intent::SelectNext);
-        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 3);
+        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 4);
         app.perform(Intent::SelectPrevious);
         assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 0);
         conversation_frame(&mut app, 100, 30);
@@ -3361,15 +3366,43 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
         );
+        app.transcript
+            .advance_disclosures(Instant::now() + crate::transcript::DISCLOSURE_DURATION);
         let opened = conversation_frame(&mut app, 100, 30);
-        assert!(opened.contains("contents of file 3"));
+        assert!(opened.contains("file-3.rs"), "{opened}");
+        assert!(!opened.contains("contents of file"), "{opened}");
+        app.perform(Intent::SelectNext);
+        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 1);
+        app.perform(Intent::ToggleBlockExpanded);
+        app.transcript
+            .advance_disclosures(Instant::now() + crate::transcript::DISCLOSURE_DURATION);
+        let details = conversation_frame(&mut app, 100, 30);
+        assert!(details.contains("contents of file 1"), "{details}");
+        assert!(!details.contains("contents of file 3"), "{details}");
         app.sync_transcript();
-        assert!(
-            app.transcript.blocks()[..3]
-                .iter()
-                .all(|block| block.expanded)
+        assert!(app.transcript.blocks()[0].expanded && app.transcript.blocks()[1].expanded);
+        assert!(!app.transcript.blocks()[2].expanded && !app.transcript.blocks()[3].expanded);
+        conversation_frame(&mut app, 100, 30);
+        let area = app.regions.scrollback;
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 3,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
         );
-        app.perform(Intent::ToggleAllBlocksExpanded);
+        app.transcript
+            .advance_disclosures(Instant::now() + crate::transcript::DISCLOSURE_DURATION);
+        let collapsed = conversation_frame(&mut app, 100, 30);
+        assert!(!collapsed.contains("contents of file"), "{collapsed}");
+        assert!(
+            app.transcript.blocks()[..4]
+                .iter()
+                .all(|block| !block.expanded)
+        );
         app.focus = Focus::Composer;
         handle_composer_key(
             &mut app,
@@ -3378,7 +3411,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.focus, Focus::Main);
-        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 3);
+        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 4);
     }
 
     #[test]

@@ -24,6 +24,7 @@ ComposerTicket { target, navigation_serial, runtime, text, cursor }
 App::switch_composer(target: ComposerTarget)
 App::observe_composer_text()
 App::advance_transcript_animation() -> bool // whether a repaint is due
+Transcript::advance_disclosures(Instant) -> bool // includes the final resting frame
 ```
 
 Creation reserves its `VibexSessionId` before dispatch and passes it through
@@ -82,8 +83,12 @@ without fetching a record before creation has completed.
   `timeline_status.phase == Loading`, subsequent events cannot launch another
   load. Applying the reply preserves the current page and editor target.
 - Transcript expansion is local presentation state keyed by block ID. A live
-  update or final snapshot must preserve it. Group expansion opens every member;
-  toggling all reasoning chooses a target state once before walking groups.
+  update or final snapshot must preserve it. A persistent group summary opens
+  child headers; each child's detail has its own expansion state. Closing the
+  summary closes every detail, and batch collapse moves a hidden selection to
+  the summary. Toggling all reasoning chooses a target state once before
+  walking groups. Reasoning defaults, explicit overrides, and disclosure motion
+  follow [Timeline Presentation](./timeline-presentation.md).
 - Runtime text transitions follow the current `ComposerTarget` on both
   `Page::NewSession` and `Page::Agent`. Observe workspace text only on New Session,
   where that animated row is visible. `switch_composer` clears both observed
@@ -98,6 +103,10 @@ without fetching a record before creation has completed.
   and after advancing the phase and pruning finished text transitions. A burst
   or transition ending is still a visible change; subsequent quiet ticks must
   not repaint. Text transitions settle within 750 ms at `ANIMATION_TICK` cadence.
+- Disclosure motion advances by `Instant` at frame cadence, separately from
+  chrome text transitions. `advance_disclosures` returns true on its final tick
+  so the resting frame replaces the last clipped frame; subsequent idle calls
+  return false. Disabling Motion settles all active disclosures at once.
 
 ## 4. Validation & Error Matrix
 

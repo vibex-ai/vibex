@@ -18,12 +18,16 @@
 //! scrolling a 10 000-block conversation does not depend on how much history
 //! sits above the viewport.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
-use vibex_desktop_model::TimelineRowKind;
+use vibex_desktop_model::{ReasoningExpansionMode, TimelineRowKind};
 use vibex_ui::timeline::{Activity, ActivitySummary};
 use vibex_ui::tool_detail::{self, Detail};
 
@@ -45,11 +49,33 @@ pub const STICKY_GAP_ROWS: usize = 1;
 /// How many rendered blocks stay resident. Blocks outside the window keep their
 /// measured height but drop their styled lines.
 pub const RENDER_CACHE_BLOCKS: usize = 192;
-/// Upper bound on the blocks a single transcript keeps, mirroring the shared
-/// controller's own timeline budget.
+/// Upper bound on source blocks, excluding synthetic group summaries, mirroring
+/// the shared controller's own timeline budget.
 pub const MAX_BLOCKS: usize = 20_000;
 
 const UNMEASURED: u32 = u32::MAX;
+
+/// Short enough to keep a disclosure responsive on a character grid.
+pub const DISCLOSURE_DURATION: Duration = Duration::from_millis(180);
+
+struct Disclosure {
+    from: f32,
+    target: f32,
+    progress: f32,
+    started: Instant,
+}
+
+impl Disclosure {
+    fn advance(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.started);
+        let t = (elapsed.as_secs_f32() / DISCLOSURE_DURATION.as_secs_f32()).min(1.0);
+        self.progress = self.from + (self.target - self.from) * (1.0 - (1.0 - t).powi(3));
+        if t == 1.0 {
+            self.progress = self.target;
+        }
+        t == 1.0
+    }
+}
 
 /// The shortest run of collapsed work items worth folding.
 pub const MIN_GROUP_RUN: usize = 3;
@@ -90,7 +116,10 @@ const RAIL_WAVE_ROWS: f32 = 8.0;
 /// close a reasoning stream, so a row that once streamed keeps that flag for the
 /// rest of the turn. See [`is_live_thinking_window`].
 fn is_running_thought(block: &Block) -> bool {
-    block.kind == TimelineRowKind::Reasoning && block.streaming && !block.expanded
+    block.kind == TimelineRowKind::Reasoning
+        && block.streaming
+        && block.expanded
+        && block.reasoning_window
 }
 
 /// Whether a block opens the live window onto a thought's tail.
@@ -111,14 +140,13 @@ pub fn is_live_thinking_window(block: &Block, trailing: bool) -> bool {
 
 /// Whether a block can be folded into a dense run.
 ///
-/// Only collapsed work items qualify: an expanded block is one the reader asked
-/// to see, and a message is never chrome. A live thought does not qualify
-/// either: folding it into a run would hide the window the reader is watching.
+/// Tool details stay inside their group when opened. Expanded reasoning and
+/// live thoughts stay separate so grouping cannot hide what is being read.
 fn eligible_for_group(block: &Block, trailing: bool) -> bool {
     !is_live_thinking_window(block, trailing)
         && is_work_item(block.kind)
         && block.collapsible
-        && !block.expanded
+        && (block.kind != TimelineRowKind::Reasoning || !block.expanded)
         && !block.failed
         && !block.pending_permission
         // Typed live operations stay visible. Legacy rows retain their run
@@ -132,7 +160,7 @@ fn eligible_for_group(block: &Block, trailing: bool) -> bool {
 /// which is what a prepend looks like after the diff. An empty transcript is
 /// not a prepend, and neither is a reload whose head moved to the front.
 fn prepends_existing_blocks(existing: &[Block], incoming: &[Block]) -> bool {
-    let Some(head) = existing.first() else {
+    let Some(head) = existing.iter().find(|block| !block.group.is_head()) else {
         return false;
     };
     incoming
@@ -157,6 +185,8 @@ pub struct Block {
     /// the clock on its right; nothing else draws it at all.
     pub timestamp_ms: Option<i64>,
     pub expanded: bool,
+    /// The open body follows the live tail instead of growing with the stream.
+    pub reasoning_window: bool,
     pub collapsible: bool,
     pub streaming: bool,
     pub failed: bool,
@@ -170,7 +200,7 @@ pub struct Block {
     pub activity: Option<Activity>,
     /// Raw bounded fields; decoding happens only when this block is rendered.
     pub details: Vec<Detail>,
-    /// Derived from all members of a collapsed activity run.
+    /// Derived from all members of an activity group.
     pub group_summary: Option<ActivitySummary>,
 }
 
@@ -184,6 +214,7 @@ impl Block {
         self.title.hash(&mut hasher);
         self.body.hash(&mut hasher);
         self.expanded.hash(&mut hasher);
+        self.reasoning_window.hash(&mut hasher);
         self.streaming.hash(&mut hasher);
         self.failed.hash(&mut hasher);
         self.pending_permission.hash(&mut hasher);
@@ -269,6 +300,13 @@ impl StickyHeader {
 /// The transcript model.
 pub struct Transcript {
     blocks: Vec<Block>,
+    reasoning_expanded_by_default: bool,
+    reasoning_expansion_mode: ReasoningExpansionMode,
+    reasoning_expansion: HashMap<String, bool>,
+    motion_enabled: bool,
+    disclosures: HashMap<String, Disclosure>,
+    /// Derived indices, kept outside the content key so a prepend can reuse rows.
+    parents: Vec<Option<usize>>,
     /// Per-block measured height, or [`UNMEASURED`].
     heights: Vec<u32>,
     /// Per-block content key at the time the height was measured.
@@ -325,6 +363,12 @@ impl Transcript {
     pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
+            reasoning_expanded_by_default: false,
+            reasoning_expansion_mode: ReasoningExpansionMode::Window,
+            reasoning_expansion: HashMap::new(),
+            motion_enabled: false,
+            disclosures: HashMap::new(),
+            parents: Vec::new(),
             heights: Vec::new(),
             keys: Vec::new(),
             live: std::collections::HashMap::new(),
@@ -377,6 +421,37 @@ impl Transcript {
         self.blocks.iter().position(|block| block.id == id)
     }
 
+    pub fn visible_block(&self, index: usize) -> Option<usize> {
+        let block = self.blocks.get(index)?;
+        if block.group.is_hidden() {
+            self.parents[index]
+        } else {
+            Some(index)
+        }
+    }
+
+    /// Search reveals the matching item inside its group, not the next row at
+    /// the same collapsed offset. Jumping to it settles that disclosure first.
+    pub fn reveal_block(&mut self, index: usize) {
+        if index >= self.blocks.len() {
+            return;
+        }
+        if let Some(parent) = self.parents[index] {
+            if !self.blocks[parent].expanded {
+                self.toggle_block(parent);
+            }
+            if self.disclosures.remove(&self.blocks[parent].id).is_some() {
+                self.invalidate_disclosure(parent);
+            }
+        }
+        if self.blocks[index].collapsible && !self.blocks[index].expanded {
+            self.set_block_expanded(index, true);
+        }
+        if self.disclosures.remove(&self.blocks[index].id).is_some() {
+            self.invalidate_disclosure(index);
+        }
+    }
+
     /// Total display height, measured plus estimated.
     pub fn total_height(&mut self) -> usize {
         self.ensure_layout();
@@ -389,12 +464,17 @@ impl Transcript {
     /// wholesale reload all collapse into the same diff.
     pub fn set_blocks(&mut self, blocks: Vec<Block>) -> ChangeSet {
         let mut change = ChangeSet::default();
+        // Headers are presentation nodes, never input to a second grouping pass.
+        let blocks = blocks
+            .into_iter()
+            .filter(|block| !block.group.is_head())
+            .collect::<Vec<_>>();
         // Trim when the authority's budget is exceeded. A prepend is the one
         // case where the incoming list starts with history the reader just
         // asked for, so dropping from the front would delete exactly what the
         // fetch was for; an append or a wholesale reload keeps the newest
         // blocks instead, which is the behaviour that predates the cursor.
-        let blocks = if blocks.len() > MAX_BLOCKS {
+        let mut blocks = if blocks.len() > MAX_BLOCKS {
             change.removed += blocks.len() - MAX_BLOCKS;
             if prepends_existing_blocks(&self.blocks, &blocks) {
                 let mut trimmed = blocks;
@@ -414,18 +494,44 @@ impl Transcript {
             .map(|(index, block)| (block.id.as_str(), index))
             .collect();
 
+        for block in &mut blocks {
+            if let Some(&index) = existing.get(block.id.as_str()) {
+                block.expanded = self.blocks[index].expanded;
+            }
+            block.group = GroupRole::Solo;
+            block.group_summary = None;
+        }
+        // Explicit choices outlive a temporarily absent bottom indicator, but
+        // leave with the turn/session that owns them.
+        if !self.reasoning_expansion.is_empty() {
+            let retained = blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<HashSet<_>>();
+            let turns = blocks
+                .iter()
+                .filter_map(|block| block.turn_id.as_deref())
+                .collect::<HashSet<_>>();
+            self.reasoning_expansion.retain(|id, _| {
+                retained.contains(id.as_str())
+                    || id
+                        .strip_prefix("reasoning-live:")
+                        .is_some_and(|turn| turns.contains(turn))
+            });
+        }
+        let last = blocks.len().checked_sub(1);
+        for (index, block) in blocks.iter_mut().enumerate() {
+            self.resolve_reasoning(block, Some(index) == last);
+        }
+        let blocks = self.group_blocks(blocks, &existing);
+
         let mut next_blocks = Vec::with_capacity(blocks.len());
         let mut next_heights = Vec::with_capacity(blocks.len());
         let mut next_keys = Vec::with_capacity(blocks.len());
         let mut reused_rendered: HashMap<usize, RenderedBlock> = HashMap::new();
         let mut reused_recency = Vec::new();
 
-        for (new_index, mut block) in blocks.into_iter().enumerate() {
-            if let Some(&old_index) = existing.get(block.id.as_str()) {
-                block.expanded = self.blocks[old_index].expanded;
-                block.group = self.blocks[old_index].group;
-                block.group_summary = self.blocks[old_index].group_summary.clone();
-            }
+        for (new_index, block) in blocks.into_iter().enumerate() {
             let key = block.content_key();
             match existing.get(block.id.as_str()) {
                 Some(&old_index) if self.keys.get(old_index) == Some(&key) => {
@@ -465,6 +571,8 @@ impl Transcript {
             .map(|block| block.id.as_str())
             .collect::<std::collections::HashSet<_>>();
         self.live.retain(|id, _| present.contains(id.as_str()));
+        self.disclosures
+            .retain(|id, _| present.contains(id.as_str()));
 
         // A dense row's rendering depends on its neighbours as well as on
         // itself: the gap it leaves is decided by whether the row after it is
@@ -485,97 +593,112 @@ impl Transcript {
         }
 
         self.blocks = next_blocks;
+        let mut parent = None;
+        self.parents = self
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| match block.group {
+                GroupRole::Head { .. } => {
+                    parent = Some(index);
+                    None
+                }
+                GroupRole::Member { .. } => parent,
+                GroupRole::Solo => {
+                    parent = None;
+                    None
+                }
+            })
+            .collect();
         self.heights = next_heights;
         self.keys = next_keys;
         self.rendered = reused_rendered;
         self.recency = reused_recency;
-        self.apply_grouping();
         self.layout_valid = false;
         change
     }
 
-    /// Fold long runs of collapsed work items into their first member.
-    ///
-    /// A session produces work items in bursts — ten file reads, six greps —
-    /// and showing all of them at full height buries the sentences they are
-    /// evidence for. A run of three or more collapsed items keeps its first
-    /// member and reports the rest as a count, which is the density the reader
-    /// wants by default and one keypress away from the detail.
-    fn apply_grouping(&mut self) {
-        let previous = self
-            .blocks
-            .iter()
-            .map(|block| (block.group, block.group_summary.clone()))
-            .collect::<Vec<_>>();
-        for block in &mut self.blocks {
-            block.group = GroupRole::Solo;
-            block.group_summary = None;
-        }
-        let mut index = 0usize;
-        while index < self.blocks.len() {
-            // Only the final row can be a live window: nothing follows it, so
-            // it is the thought the Agent is on rather than one it has left.
-            let trailing = index + 1 == self.blocks.len();
-            if !eligible_for_group(&self.blocks[index], trailing) {
-                index += 1;
+    /// A group has its own stable header, so opening a tool never removes the
+    /// control that closes the group. Detail expansion does not split a run.
+    fn group_blocks(&self, blocks: Vec<Block>, existing: &HashMap<&str, usize>) -> Vec<Block> {
+        let mut grouped = Vec::with_capacity(blocks.len());
+        let mut blocks = blocks.into_iter().peekable();
+        while let Some(first) = blocks.next() {
+            if !eligible_for_group(&first, blocks.len() == 0) {
+                grouped.push(first);
                 continue;
             }
-            let start = index;
-            let kind = self.blocks[start].kind;
-            let title = self.blocks[start].title.clone();
-            let semantic = self.blocks[start].activity.is_some();
-            let turn = self.blocks[start].turn_id.clone();
-            // A run is work by one runtime: folding a row that
-            // came from somewhere else into this run would hide the only thing
-            // the attribution is there to say.
-            let attribution = self.blocks[start].runtime_attribution.clone();
-            while index < self.blocks.len()
-                && eligible_for_group(&self.blocks[index], index + 1 == self.blocks.len())
-                && if semantic {
-                    self.blocks[index].activity.is_some()
-                } else {
-                    self.blocks[index].kind == kind && self.blocks[index].title == title
+            let semantic = first.activity.is_some();
+            let mut run = vec![first];
+            loop {
+                let trailing = blocks.len() == 1;
+                let Some(next) = blocks.peek() else { break };
+                if !eligible_for_group(next, trailing)
+                    || next.turn_id != run[0].turn_id
+                    || next.runtime_attribution != run[0].runtime_attribution
+                    || if semantic {
+                        next.activity.is_none()
+                    } else {
+                        next.kind != run[0].kind || next.title != run[0].title
+                    }
+                {
+                    break;
                 }
-                && self.blocks[index].turn_id == turn
-                && self.blocks[index].runtime_attribution == attribution
-            {
-                index += 1;
+                run.extend(blocks.next());
             }
-            let run = index - start;
-            // Two in a row still read as a pair; three is where a run starts to
-            // cost more rows than it earns.
-            if run < MIN_GROUP_RUN {
+            let members = run.len();
+            if members < MIN_GROUP_RUN {
+                grouped.extend(run);
                 continue;
             }
-            let hidden = run - 1;
-            self.blocks[start].group = GroupRole::Head { hidden };
+            let first = &run[0];
+            let id = format!("activity-group:{}", first.id);
+            let expanded = existing
+                .get(id.as_str())
+                .map(|&old| self.blocks[old].expanded)
+                .unwrap_or_else(|| run.iter().any(|block| block.expanded));
+            let mut head = Block {
+                id,
+                kind: first.kind,
+                title: first.title.clone(),
+                body: String::new(),
+                turn_id: first.turn_id.clone(),
+                sequence: first.sequence,
+                timestamp_ms: None,
+                expanded,
+                reasoning_window: false,
+                collapsible: true,
+                streaming: false,
+                failed: false,
+                pending_permission: false,
+                file_path: None,
+                runtime_attribution: None,
+                conclusion: false,
+                group: GroupRole::Head { members },
+                activity: None,
+                details: Vec::new(),
+                group_summary: None,
+            };
             if semantic {
                 let mut summary = ActivitySummary::default();
-                for block in &self.blocks[start..index] {
+                for block in &run {
                     if let Some(activity) = &block.activity {
                         summary.record(activity, &block.id);
                     }
                 }
-                self.blocks[start].group_summary = Some(summary);
+                head.group_summary = Some(summary);
             }
-            for member in &mut self.blocks[start + 1..index] {
-                member.group = GroupRole::Member;
-            }
-        }
-        for (index, old) in previous.into_iter().enumerate() {
-            if old
-                != (
-                    self.blocks[index].group,
-                    self.blocks[index].group_summary.clone(),
-                )
-            {
-                self.keys[index] = self.blocks[index].content_key();
-                self.invalidate(index);
-                if index > 0 {
-                    self.invalidate(index - 1);
-                }
+            let visible = head.expanded;
+            grouped.push(head);
+            for (offset, mut member) in run.into_iter().enumerate() {
+                member.group = GroupRole::Member {
+                    visible,
+                    last: offset + 1 == members,
+                };
+                grouped.push(member);
             }
         }
+        grouped
     }
 
     /// The block that opens each turn, in conversation order.
@@ -660,7 +783,123 @@ impl Transcript {
 
     /// Whether any block is currently working.
     pub fn is_animating(&self) -> bool {
-        self.blocks.iter().any(|block| block.streaming)
+        !self.disclosures.is_empty() || self.blocks.iter().any(|block| block.streaming)
+    }
+
+    pub fn set_reasoning_preferences(&mut self, expanded: bool, mode: ReasoningExpansionMode) {
+        self.reasoning_expanded_by_default = expanded;
+        self.reasoning_expansion_mode = mode;
+    }
+
+    /// Settings that change the default replace the previous per-row choices.
+    pub fn clear_reasoning_expansion(&mut self) {
+        self.reasoning_expansion.clear();
+    }
+
+    pub fn set_motion_enabled(&mut self, enabled: bool) {
+        self.motion_enabled = enabled;
+        if !enabled && !self.disclosures.is_empty() {
+            let ids = self
+                .disclosures
+                .drain()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                if let Some(index) = self.index_of_block(&id) {
+                    self.invalidate_disclosure(index);
+                }
+            }
+        }
+    }
+
+    fn begin_disclosure(&mut self, index: usize, expanded: bool) {
+        if !self.motion_enabled || !self.rendered.contains_key(&index) {
+            return;
+        }
+        let block = &self.blocks[index];
+        let from = self
+            .disclosures
+            .get(&block.id)
+            .map_or(if block.expanded { 1.0 } else { 0.0 }, |disclosure| {
+                disclosure.progress
+            });
+        let target = if expanded { 1.0 } else { 0.0 };
+        if from == target {
+            self.disclosures.remove(&block.id);
+            return;
+        }
+        self.disclosures.insert(
+            block.id.clone(),
+            Disclosure {
+                from,
+                target,
+                progress: from,
+                started: Instant::now(),
+            },
+        );
+    }
+
+    /// Advance only active disclosures. The last tick still draws the resting
+    /// frame, after which an idle transcript schedules no further repaint.
+    pub fn advance_disclosures(&mut self, now: Instant) -> bool {
+        if self.disclosures.is_empty() {
+            return false;
+        }
+        let mut finished = Vec::new();
+        for (id, disclosure) in &mut self.disclosures {
+            if disclosure.advance(now) {
+                finished.push(id.clone());
+            }
+        }
+        for id in finished {
+            self.disclosures.remove(&id);
+            if let Some(index) = self.index_of_block(&id) {
+                self.invalidate_disclosure(index);
+            }
+        }
+        self.layout_valid = false;
+        true
+    }
+
+    fn invalidate_disclosure(&mut self, index: usize) {
+        self.invalidate(index);
+        if let GroupRole::Head { members } = self.blocks[index].group {
+            for member in index + 1..(index + members + 1).min(self.blocks.len()) {
+                self.invalidate(member);
+            }
+        }
+    }
+
+    fn disclosure_progress(&self, index: usize) -> f32 {
+        let block = &self.blocks[index];
+        self.disclosures
+            .get(&block.id)
+            .map_or(if block.expanded { 1.0 } else { 0.0 }, |disclosure| {
+                disclosure.progress
+            })
+    }
+
+    fn body_is_drawn(&self, index: usize) -> bool {
+        self.blocks[index].expanded || self.disclosure_progress(index) > 0.0
+    }
+
+    fn block_is_drawn(&self, index: usize) -> bool {
+        !self.blocks[index].group.is_hidden()
+            || self.parents[index].is_some_and(|parent| self.disclosure_progress(parent) > 0.0)
+    }
+
+    fn resolve_reasoning(&self, block: &mut Block, trailing: bool) {
+        if block.kind != TimelineRowKind::Reasoning || block.group.is_head() {
+            return;
+        }
+        let live = trailing && block.streaming;
+        let window = live && self.reasoning_expansion_mode == ReasoningExpansionMode::Window;
+        block.expanded = self
+            .reasoning_expansion
+            .get(&block.id)
+            .copied()
+            .unwrap_or(self.reasoning_expanded_by_default || window);
+        block.reasoning_window = window;
     }
 
     /// Tell the transcript which width and theme it will render at.
@@ -706,7 +945,7 @@ impl Transcript {
     fn last_visible_block(&self) -> Option<usize> {
         self.blocks
             .iter()
-            .rposition(|block| block.group != GroupRole::Member)
+            .rposition(|block| !block.group.is_hidden())
     }
 
     /// Drop every measurement and rendered row.
@@ -736,27 +975,47 @@ impl Transcript {
 
     /// Toggle one block's expansion.
     pub fn toggle_block(&mut self, index: usize) -> bool {
-        let Some(block) = self.blocks.get_mut(index) else {
+        let Some(block) = self.blocks.get(index) else {
             return false;
         };
-        if !block.collapsible {
+        if !block.collapsible || block.group.is_hidden() {
             return false;
         }
         let expanded = !block.expanded;
-        let count = match block.group {
-            GroupRole::Head { hidden } => hidden + 1,
-            _ => 1,
-        };
-        for member in index..(index + count).min(self.blocks.len()) {
-            self.blocks[member].expanded = expanded;
-            self.keys[member] = self.blocks[member].content_key();
-            self.invalidate(member);
+        self.set_block_expanded(index, expanded);
+        if let GroupRole::Head { members } = self.blocks[index].group {
+            for member in index + 1..(index + members + 1).min(self.blocks.len()) {
+                // Opening reveals headers only. Closing also resets every
+                // detail, so reopening a group never dumps its old payloads.
+                if !expanded {
+                    self.set_block_expanded(member, false);
+                }
+                if let GroupRole::Member { visible, .. } = &mut self.blocks[member].group {
+                    *visible = expanded;
+                }
+                self.keys[member] = self.blocks[member].content_key();
+                self.invalidate(member);
+            }
         }
-        self.apply_grouping();
+        true
+    }
+
+    fn set_block_expanded(&mut self, index: usize, expanded: bool) {
+        if self.blocks[index].expanded != expanded {
+            self.begin_disclosure(index, expanded);
+        }
+        let block = &mut self.blocks[index];
+        block.expanded = expanded;
+        if block.kind == TimelineRowKind::Reasoning && !block.group.is_head() {
+            self.reasoning_expansion.insert(block.id.clone(), expanded);
+            block.reasoning_window =
+                block.streaming && self.reasoning_expansion_mode == ReasoningExpansionMode::Window;
+        }
+        self.keys[index] = self.blocks[index].content_key();
+        self.invalidate(index);
         if index > 0 {
             self.invalidate(index - 1);
         }
-        true
     }
 
     /// Expand or collapse every collapsible block at once.
@@ -765,16 +1024,29 @@ impl Transcript {
             if !self.blocks[index].collapsible {
                 continue;
             }
-            if self.blocks[index].expanded != expanded {
-                self.blocks[index].expanded = expanded;
-                self.keys[index] = self.blocks[index].content_key();
-                self.invalidate(index);
-                if index > 0 {
-                    self.invalidate(index - 1);
-                }
+            self.set_block_expanded(index, expanded);
+            if let GroupRole::Member { visible, .. } = &mut self.blocks[index].group {
+                *visible = expanded;
             }
+            self.keys[index] = self.blocks[index].content_key();
         }
-        self.apply_grouping();
+    }
+
+    pub fn toggle_reasoning(&mut self) {
+        let expanded = self
+            .blocks
+            .iter()
+            .any(|block| block.kind == TimelineRowKind::Reasoning && !block.expanded);
+        for index in 0..self.blocks.len() {
+            if self.blocks[index].kind != TimelineRowKind::Reasoning {
+                continue;
+            }
+            self.set_block_expanded(index, expanded);
+            if let GroupRole::Member { visible, .. } = &mut self.blocks[index].group {
+                *visible = expanded;
+            }
+            self.keys[index] = self.blocks[index].content_key();
+        }
     }
 
     /// Whether every collapsible block is currently open.
@@ -797,8 +1069,10 @@ impl Transcript {
     fn next_visible_block(&self, index: usize) -> Option<&Block> {
         self.blocks
             .iter()
+            .enumerate()
             .skip(index + 1)
-            .find(|block| block.group != GroupRole::Member)
+            .find(|(index, _)| self.block_is_drawn(*index))
+            .map(|(_, block)| block)
     }
 
     fn ensure_layout(&mut self) {
@@ -809,19 +1083,45 @@ impl Transcript {
         self.offsets.reserve(self.blocks.len() + 1);
         let mut total = 0usize;
         self.offsets.push(0);
-        for (index, height) in self.heights.iter().enumerate() {
-            let height = match *height {
-                UNMEASURED => {
-                    // A cheap estimate keeps scroll maths stable without
-                    // wrapping text the user will never see.
-                    self.estimate_height(index)
+        let mut remaining = 0usize;
+        for index in 0..self.blocks.len() {
+            let mut height = self.animated_height(index);
+            match self.blocks[index].group {
+                GroupRole::Head { members } => {
+                    let extent = (index + 1..(index + members + 1).min(self.blocks.len()))
+                        .map(|member| self.animated_height(member))
+                        .sum::<usize>();
+                    remaining = (extent as f32 * self.disclosure_progress(index)).ceil() as usize;
                 }
-                measured => measured as usize,
-            };
+                GroupRole::Member { .. } => {
+                    height = height.min(remaining);
+                    remaining -= height;
+                }
+                GroupRole::Solo => {}
+            }
             total += height;
             self.offsets.push(total);
         }
         self.layout_valid = true;
+    }
+
+    fn animated_height(&self, index: usize) -> usize {
+        if !self.block_is_drawn(index) {
+            return 0;
+        }
+        let full = match self.heights[index] {
+            UNMEASURED => self.estimate_height(index),
+            measured => measured as usize,
+        };
+        let block = &self.blocks[index];
+        if block.group.is_head() || !self.disclosures.contains_key(&block.id) {
+            return full;
+        }
+        let closed = 1
+            + gap_after(block, self.next_visible_block(index))
+            + usize::from(block.pending_permission);
+        closed.min(full)
+            + (full.saturating_sub(closed) as f32 * self.disclosure_progress(index)).ceil() as usize
     }
 
     /// Estimate the height of an unmeasured block from its title and body shape.
@@ -835,15 +1135,15 @@ impl Transcript {
             return 1;
         };
         // A folded member contributes nothing; the head reports it instead.
-        if matches!(block.group, GroupRole::Member) {
+        if !self.block_is_drawn(index) {
             return 0;
         }
         let next = self.next_visible_block(index);
-        let gap = gap_after(block, next);
+        let gap = gap_with_body(block, next, self.body_is_drawn(index));
         let available = self.width.max(8);
         let dense = is_dense_row(block.kind);
         let open = if dense {
-            block.expanded
+            self.body_is_drawn(index)
         } else {
             block.is_open()
         };
@@ -854,7 +1154,9 @@ impl Transcript {
             TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
         ) && !block.body.is_empty();
         let header = usize::from(!headerless);
-        let body_lines = if open && !block.details.is_empty() {
+        let body_lines = if block.group.is_head() {
+            0
+        } else if open && !block.details.is_empty() {
             // The captured source, not the provider's short summary, is what
             // an expanded activity renders. Estimate without decoding offscreen
             // JSON; escaped newlines allow for known output envelopes.
@@ -871,7 +1173,7 @@ impl Transcript {
                 + block.details.len().saturating_sub(1)
         } else if block.body.is_empty() {
             0
-        } else if is_live_thinking_window(block, next.is_none()) {
+        } else if block.reasoning_window && open && next.is_none() {
             // The window is capped, which is the whole point: the rows it shows
             // are the newest ones, and how many of them a thought fills is
             // markdown's business. A count of the source lines is an upper
@@ -957,9 +1259,17 @@ impl Transcript {
     }
 
     fn render_block(&mut self, index: usize, theme: &TuiTheme, strings: Strings) -> RenderedBlock {
-        let Some(block) = self.blocks.get(index).cloned() else {
+        let Some(mut block) = self.blocks.get(index).cloned() else {
             return RenderedBlock::default();
         };
+        if !self.block_is_drawn(index) {
+            return RenderedBlock::default();
+        }
+        // A closing group's children remain mounted until its reveal ends.
+        if let GroupRole::Member { visible, .. } = &mut block.group {
+            *visible = true;
+        }
+        let body_open = self.body_is_drawn(index);
         // The successor decides the separator, so a run of tool calls renders
         // as a list rather than as a stack of sections.
         let next = self.next_visible_block(index).cloned();
@@ -977,7 +1287,7 @@ impl Transcript {
         // on screen rather than to what has been thought.
         let body_shown = !block.body.is_empty()
             && (!is_dense_row(block.kind)
-                || block.expanded
+                || body_open
                 || is_live_thinking_window(&block, next.is_none()));
         if body_shown {
             self.refresh_stream(&block, theme, strings, body_width, prose);
@@ -999,7 +1309,7 @@ impl Transcript {
                     !is_dense_row(previous.kind)
                         || previous.runtime_attribution != block.runtime_attribution
                 });
-        render_block_with_attribution(
+        render_block_inner(
             &block,
             next.as_ref(),
             streamed,
@@ -1009,6 +1319,7 @@ impl Transcript {
             self.last_selected == Some(index),
             show_attribution,
             self.phase,
+            body_open,
         )
     }
 
@@ -1101,14 +1412,14 @@ impl Transcript {
                 continue;
             }
             if let Some(rendered) = self.rendered.get(&index) {
-                for line in rendered.lines.iter().skip(skip).take(take) {
-                    lines.push(line.clone());
+                for (row, line) in rendered.lines.iter().enumerate().skip(skip).take(take) {
+                    lines.push(self.disclosure_line(index, row, line.clone(), theme));
                 }
             } else {
                 // Not resident: rebuild it for this frame.
                 let rendered = self.render_block(index, theme, strings);
-                for line in rendered.lines.iter().skip(skip).take(take) {
-                    lines.push(line.clone());
+                for (row, line) in rendered.lines.iter().enumerate().skip(skip).take(take) {
+                    lines.push(self.disclosure_line(index, row, line.clone(), theme));
                 }
                 self.store_rendered(index, rendered);
             }
@@ -1118,6 +1429,31 @@ impl Transcript {
             self.stats.idle_frames += 1;
         }
         lines
+    }
+
+    fn disclosure_line(
+        &self,
+        index: usize,
+        row: usize,
+        mut line: Line<'static>,
+        theme: &TuiTheme,
+    ) -> Line<'static> {
+        let mut progress =
+            self.parents[index].map_or(1.0, |parent| self.disclosure_progress(parent));
+        if row > 0 && self.disclosures.contains_key(&self.blocks[index].id) {
+            progress *= self.disclosure_progress(index);
+        }
+        if progress < 1.0 {
+            for span in &mut line.spans {
+                let color = span
+                    .style
+                    .fg
+                    .or(line.style.fg)
+                    .unwrap_or(theme.roles.foreground);
+                span.style = span.style.fg(theme.fade(color, progress));
+            }
+        }
+        line
     }
 
     /// Materialise the visible lines with every search match inverted.
@@ -1283,37 +1619,51 @@ impl Transcript {
 
     /// Measure blocks backwards from the end until `height` lines are covered.
     fn measure_tail(&mut self, height: usize, theme: &TuiTheme, strings: Strings) {
+        if self.disclosures.is_empty() {
+            // At rest, measure the tail in one pass and rebuild prefix sums
+            // once. Only an active reveal needs partially clipped extents.
+            let mut covered = 0;
+            for index in (0..self.blocks.len()).rev() {
+                if covered >= height {
+                    break;
+                }
+                if !self.blocks[index].group.is_hidden() {
+                    covered += self.measure(index, theme, strings) as usize;
+                }
+            }
+            return;
+        }
         let mut covered = 0usize;
         let mut index = self.blocks.len();
         while index > 0 && covered < height {
             index -= 1;
-            if self.heights.get(index).copied() == Some(UNMEASURED) {
-                covered += self.measure(index, theme, strings) as usize;
-            } else {
-                covered += self.heights[index] as usize;
+            let (start, end) = self.block_range(index);
+            if start == end {
+                continue;
             }
+            if self.heights.get(index).copied() == Some(UNMEASURED) {
+                self.measure(index, theme, strings);
+            }
+            let (start, end) = self.block_range(index);
+            covered += end - start;
         }
     }
 
     fn block_range(&mut self, index: usize) -> (usize, usize) {
         self.ensure_layout();
         let start = self.offsets.get(index).copied().unwrap_or(0);
-        let height = self
-            .heights
-            .get(index)
-            .map(|value| match *value {
-                UNMEASURED => self.estimate_height(index),
-                measured => measured as usize,
-            })
-            .unwrap_or(0);
-        (start, start + height)
+        let end = self.offsets.get(index + 1).copied().unwrap_or(start);
+        (start, end)
     }
 
     /// Plain text of the whole transcript, used by copy and search.
     pub fn plain_text(&mut self) -> String {
         let mut output = String::new();
         for index in 0..self.blocks.len() {
-            if index > 0 {
+            if self.blocks[index].group.is_head() {
+                continue;
+            }
+            if !output.is_empty() {
                 output.push('\n');
             }
             output.push_str(&block_plain_text(&self.blocks[index]));
@@ -1323,7 +1673,18 @@ impl Transcript {
 
     /// Plain text of one block.
     pub fn block_text(&self, index: usize) -> Option<String> {
-        self.blocks.get(index).map(block_plain_text)
+        let block = self.blocks.get(index)?;
+        if let GroupRole::Head { members } = block.group {
+            Some(
+                self.blocks[index + 1..index + 1 + members]
+                    .iter()
+                    .map(block_plain_text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )
+        } else {
+            Some(block_plain_text(block))
+        }
     }
 
     /// The plain text of a range of display lines.
@@ -1413,8 +1774,9 @@ impl Transcript {
             .iter()
             .enumerate()
             .filter(|(_, block)| {
-                block.title.to_lowercase().contains(&query)
-                    || block_body_text(block).to_lowercase().contains(&query)
+                !block.group.is_head()
+                    && (block.title.to_lowercase().contains(&query)
+                        || block_body_text(block).to_lowercase().contains(&query))
             })
             .map(|(index, _)| index)
             .collect()
@@ -1434,6 +1796,9 @@ impl Transcript {
         let mut blocks = Vec::new();
         let mut total = 0usize;
         for (index, block) in self.blocks.iter().enumerate() {
+            if block.group.is_head() {
+                continue;
+            }
             let hits = pattern.count(&block.title) + pattern.count(&block_body_text(block));
             if hits > 0 {
                 blocks.push(index);
@@ -1714,6 +2079,8 @@ pub mod chrome {
     pub const PAD_RIGHT: usize = 1;
     /// Blank rows inserted between blocks.
     pub const GAP: usize = 1;
+    /// One connector cell and one space per disclosure level.
+    pub const NEST: usize = 2;
     /// Columns the chrome consumes in total.
     pub const TOTAL: usize = PAD_LEFT + PAD_RIGHT;
 
@@ -1820,7 +2187,25 @@ pub fn body_width_for(block: &Block, width: usize, strings: Strings) -> usize {
         .max(8)
         .saturating_sub(boxed)
         .saturating_sub(clock_columns(block, strings))
+        .saturating_sub(group_indent(block))
+        .saturating_sub(detail_indent(block))
         .max(8)
+}
+
+fn group_indent(block: &Block) -> usize {
+    if matches!(block.group, GroupRole::Member { .. }) {
+        chrome::NEST
+    } else {
+        0
+    }
+}
+
+fn detail_indent(block: &Block) -> usize {
+    if !block.group.is_head() && (is_tool_item(block.kind) || block.activity.is_some()) {
+        chrome::NEST
+    } else {
+        0
+    }
 }
 
 /// Whether a block's body is drawn on a band that fills the whole row.
@@ -1907,12 +2292,21 @@ pub enum GroupRole {
     /// Renders on its own.
     #[default]
     Solo,
-    /// Heads a collapsed run. `hidden` members follow it invisibly.
-    Head { hidden: usize },
-    /// Collapsed into the run above; contributes no rows.
-    Member,
+    /// A persistent summary control for the following members.
+    Head { members: usize },
+    /// A child header, with its own detail disclosure when the group is visible.
+    Member { visible: bool, last: bool },
 }
 
+impl GroupRole {
+    pub fn is_head(self) -> bool {
+        matches!(self, Self::Head { .. })
+    }
+
+    pub fn is_hidden(self) -> bool {
+        matches!(self, Self::Member { visible: false, .. })
+    }
+}
 /// Render one block into display lines.
 ///
 /// Every row starts with [`chrome::PAD_LEFT`] columns of margin, the first of
@@ -2083,9 +2477,15 @@ fn tool_action(body: &str) -> String {
 /// it is the last block there is, and the tail of a transcript always keeps its
 /// gap.
 pub fn gap_after(block: &Block, next: Option<&Block>) -> usize {
-    let dense_run = is_dense_row(block.kind)
-        && !block.expanded
-        && next.is_some_and(|next| is_dense_row(next.kind) && !next.expanded);
+    gap_with_body(block, next, block.expanded)
+}
+
+fn gap_with_body(block: &Block, next: Option<&Block>, body_open: bool) -> usize {
+    if block.group.is_head() {
+        return 0;
+    }
+    let dense_run =
+        is_dense_row(block.kind) && !body_open && next.is_some_and(|next| is_dense_row(next.kind));
     if dense_run { 0 } else { chrome::GAP }
 }
 
@@ -2162,30 +2562,55 @@ pub fn render_block_with_attribution(
     show_attribution: bool,
     phase: u32,
 ) -> RenderedBlock {
+    render_block_inner(
+        block,
+        next,
+        streamed,
+        theme,
+        width,
+        strings,
+        selected,
+        show_attribution,
+        phase,
+        block.expanded,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_block_inner(
+    block: &Block,
+    next: Option<&Block>,
+    streamed: Option<&crate::markdown::RenderedMarkdown>,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    selected: bool,
+    show_attribution: bool,
+    phase: u32,
+    body_open: bool,
+) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
 
-    if matches!(block.group, GroupRole::Member) {
+    if block.group.is_hidden() {
         // Folded into the run above; contributes nothing but is still counted
         // by the head's summary.
         return RenderedBlock::default();
     }
 
-    let content_width = chrome::content_width(width).max(8);
+    let content_width = chrome::content_width(width)
+        .saturating_sub(group_indent(block))
+        .max(8);
     let label = kind_label(block.kind, strings);
     let dense = is_dense_row(block.kind);
     // A running thought the reader has not opened, at the end of the session:
     // the one block whose body is drawn without an explicit expansion, inside a
     // window on its tail.
-    let live = is_live_thinking_window(block, next.is_none());
+    let live = block.reasoning_window && body_open && next.is_none();
     // `Block::is_open` means "not collapsible" as well as "the reader opened
     // it"; a dense row is showing one line because that is its shape, so only
     // an explicit expansion reveals its body.
-    let open = if dense {
-        block.expanded
-    } else {
-        block.is_open()
-    };
+    let open = if dense { body_open } else { block.is_open() };
     let title_style = match block.kind {
         TimelineRowKind::UserMessage => theme.base().add_modifier(Modifier::BOLD),
         _ if block.activity.is_some() && block.failed => theme.danger(),
@@ -2238,15 +2663,19 @@ pub fn render_block_with_attribution(
     parts.push((heading, title_style));
     // The one detail that identifies a dense row, dimmed beside its title.
     // Its shape is independent of whether the work is still running.
-    if let GroupRole::Head { hidden } = block.group
-        && hidden > 0
+    if let GroupRole::Head { members } = block.group
+        && members > 1
         && block.group_summary.is_none()
     {
         // Before the summary: a truncated row must still say how many rows it
         // stands for.
-        parts.push((format!("  +{hidden}"), theme.dimmed(theme.roles.gray_dim)));
+        parts.push((
+            format!("  +{}", members - 1),
+            theme.dimmed(theme.roles.gray_dim),
+        ));
     }
     if dense
+        && !block.group.is_head()
         && (!open || block.activity.is_some())
         && block.group_summary.is_none()
         && !matches!(block.kind, TimelineRowKind::SystemNotice)
@@ -2303,7 +2732,7 @@ pub fn render_block_with_attribution(
     // records keep the same shape until the reader expands them — except a
     // running thought, whose whole reason to be on screen is that the reader
     // watches it arrive.
-    let shows_body = !body.is_empty() && (!dense || open || live);
+    let shows_body = !block.group.is_head() && !body.is_empty() && (!dense || open || live);
     // Built before the header: a live window's rail is one cell per row of the
     // window, and the header row carries its first cell.
     let mut rendered = shows_body.then(|| {
@@ -2502,8 +2931,7 @@ pub fn render_block_with_attribution(
     }
     // The reader's own message has no runtime: they wrote it, and naming the
     // Agent under their words says the opposite of what happened.
-    let attributed =
-        show_attribution && block.kind != TimelineRowKind::UserMessage && block.expanded;
+    let attributed = show_attribution && block.kind != TimelineRowKind::UserMessage && body_open;
     if let Some(runtime) = block.runtime_attribution.as_ref().filter(|_| attributed) {
         status.push((format!("[{runtime}]"), theme.muted()));
     }
@@ -2517,9 +2945,36 @@ pub fn render_block_with_attribution(
     }
 
     // Trailing gap so blocks are separated without a rule.
-    for _ in 0..gap_after(block, next) {
+    for _ in 0..gap_with_body(block, next, body_open) {
         lines.push(row_line(Span::raw(" "), Vec::new()));
         plain.push(String::new());
+    }
+
+    // The outer line joins activity headers; the inner line owns one tool's
+    // details. Keep their cells in plain text as spaces so pointer selection
+    // stays aligned without copying structural glyphs into the clipboard.
+    let gap = gap_with_body(block, next, body_open);
+    let content_end = lines.len().saturating_sub(gap);
+    let connector = crate::glyphs::connector(crate::glyphs::GlyphTier::of(theme));
+    for (index, (line, text)) in lines.iter_mut().zip(&mut plain).enumerate() {
+        let mut prefix = Vec::new();
+        if let GroupRole::Member { last, .. } = block.group {
+            let glyph = if !last || index == 0 { connector } else { " " };
+            prefix.push(Span::styled(
+                format!("{glyph} "),
+                theme.dimmed(theme.roles.gray_dim),
+            ));
+        }
+        if index > 0 && detail_indent(block) > 0 && index < content_end {
+            prefix.push(Span::styled(
+                format!("{connector} "),
+                theme.dimmed(theme.roles.gray_dim),
+            ));
+        }
+        if !prefix.is_empty() {
+            *text = format!("{}{text}", " ".repeat(prefix.len() * chrome::NEST));
+            line.spans.splice(2..2, prefix);
+        }
     }
 
     RenderedBlock {
@@ -2729,6 +3184,7 @@ mod tests {
             sequence: 1,
             timestamp_ms: None,
             expanded: false,
+            reasoning_window: false,
             collapsible: true,
             streaming: false,
             failed: false,
@@ -3021,6 +3477,44 @@ mod tests {
     }
 
     #[test]
+    fn a_group_summary_does_not_hide_a_prepend_at_the_history_budget() {
+        let mut transcript = Transcript::new();
+        let window = (0..MAX_BLOCKS)
+            .map(|index| {
+                let mut entry = block(&format!("b{index}"), TimelineRowKind::AgentMessage, "body");
+                if index < MIN_GROUP_RUN {
+                    entry.kind = TimelineRowKind::ToolCall;
+                    entry.title = "Read".into();
+                    entry.collapsible = true;
+                }
+                entry
+            })
+            .collect();
+        transcript.set_blocks(window);
+        assert!(transcript.blocks()[0].group.is_head());
+        let mut prepended = vec![block(
+            "older",
+            TimelineRowKind::AgentMessage,
+            "older content",
+        )];
+        prepended.extend(transcript.blocks().to_vec());
+        transcript.set_blocks(prepended);
+        assert_eq!(transcript.blocks()[0].id, "older");
+        assert_eq!(
+            transcript.blocks().last().unwrap().id,
+            format!("b{}", MAX_BLOCKS - 2)
+        );
+        assert_eq!(
+            transcript
+                .blocks()
+                .iter()
+                .filter(|block| !block.group.is_head())
+                .count(),
+            MAX_BLOCKS
+        );
+    }
+
+    #[test]
     fn offscreen_blocks_are_not_rendered() {
         let mut transcript = transcript_with(500, "a fairly long body that will wrap a little");
         let strings = strings();
@@ -3254,6 +3748,8 @@ mod tests {
             "- read the cache path\n- check how a delta invalidates it\n- decide where the window lives\n- keep the newest rows\n- drop the oldest\n- mark the fold\n- draw the rail\n- animate the rail",
         );
         entry.streaming = true;
+        entry.expanded = true;
+        entry.reasoning_window = true;
         entry
     }
 
@@ -3292,6 +3788,8 @@ mod tests {
     fn a_thought_that_has_landed_folds_to_one_row() {
         let mut entry = running_thought();
         entry.streaming = false;
+        entry.expanded = false;
+        entry.reasoning_window = false;
         let rendered = render_block(&entry, &theme(), 60, strings());
         assert_eq!(rendered.height, 1 + chrome::GAP);
         assert!(
@@ -3428,10 +3926,10 @@ mod tests {
         );
         assert!(matches!(
             transcript.blocks()[0].group,
-            GroupRole::Head { hidden: 5 }
+            GroupRole::Head { members: 6 }
         ));
         for entry in &transcript.blocks()[1..] {
-            assert_eq!(entry.group, GroupRole::Member);
+            assert!(entry.group.is_hidden());
         }
         let rendered = transcript.visible_lines(ScrollState::default(), 60, &theme(), strings());
         let text = rendered
@@ -3665,7 +4163,11 @@ mod density_tests {
         transcript.set_blocks(rows.clone());
         let collapsed = transcript.visible_lines(ScrollState::default(), 40, &theme(), strings());
         assert!(collapsed.iter().any(|line| line.to_string().contains("+3")));
+        let copied = transcript.plain_text();
+        assert!(!copied.starts_with('\n'));
+        assert_eq!(copied.matches("cargo test package-0").count(), 1);
         assert!(transcript.toggle_block(0));
+        assert!(transcript.toggle_block(3));
         let mut updated = rows;
         updated[2].body.push_str("\nall tests passed");
         updated[2].streaming = false;
@@ -3901,6 +4403,7 @@ mod density_tests {
             sequence: 1,
             timestamp_ms: None,
             expanded: false,
+            reasoning_window: false,
             collapsible: true,
             streaming,
             failed: false,
@@ -3944,6 +4447,8 @@ mod density_tests {
             "first thought\nsecond thought\nlast thought",
             true,
         );
+        row.expanded = true;
+        row.reasoning_window = true;
         let running = render_block(&row, &theme(), 60, strings());
         // Running: a window on the thought, under a header that says so.
         assert!(
@@ -3959,6 +4464,8 @@ mod density_tests {
         assert_eq!(running.lines[0].spans[0].content.as_ref(), "┃");
         // Landed: one row, and the whole thought behind the fold.
         row.streaming = false;
+        row.expanded = false;
+        row.reasoning_window = false;
         let completed = render_block(&row, &theme(), 60, strings());
         assert_eq!(completed.height, 2);
         assert_eq!(
@@ -4099,6 +4606,7 @@ mod density_tests {
             .count();
         assert_eq!(named, 0, "collapsed rows repeat runtime metadata");
         transcript.toggle_block(0);
+        transcript.toggle_block(1);
         let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
         assert!(
             lines
@@ -4108,8 +4616,11 @@ mod density_tests {
 
         // A switch is worth a row: the name reappears where it changes.
         let mut blocks = transcript.blocks().to_vec();
-        blocks[2].runtime_attribution = Some("codex · gpt-5".to_string());
+        let switched = blocks.iter().position(|block| block.id == "t2").unwrap();
+        blocks[switched].runtime_attribution = Some("codex · gpt-5".to_string());
         transcript.set_blocks(blocks);
+        let switched = transcript.index_of_block("t2").unwrap();
+        transcript.toggle_block(switched);
         let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
         let text = lines
             .iter()

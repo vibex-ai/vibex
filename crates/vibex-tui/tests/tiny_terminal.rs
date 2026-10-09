@@ -49,6 +49,7 @@ fn message(id: &str) -> vibex_tui::transcript::Block {
         sequence: 1,
         timestamp_ms: None,
         expanded: false,
+        reasoning_window: false,
         collapsible: false,
         streaming: false,
         failed: false,

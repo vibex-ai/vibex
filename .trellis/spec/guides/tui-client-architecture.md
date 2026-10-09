@@ -440,34 +440,32 @@ whatever is current. Deltas are drained in batches and frames are capped at one
 per `FRAME_INTERVAL`, so a burst of tokens costs one repaint rather than one per
 token, and an unchanged frame writes nothing.
 
-**A running thought is the one body drawn without being opened, and it is drawn
-in a fixed window on its tail.** Reasoning is a dense row, so its body normally
-sits behind the fold; while the Agent is still on it, the row shows up to
-`STREAMING_WINDOW_LINES` rows of the newest content instead, with a `…` row once
-older rows have left the top — the newest line pushes the oldest off rather than
-growing the block. The window's marker column carries an animated rail, one cell
-per row and the header included, so the bar is exactly as tall as the range it
-stands for; its crest travels down on the chrome animation clock, so the window
-is dropped from the render cache when the phase moves and re-drawn without a
-re-measure. A terminal that cannot blend colours draws the rail flat — the bar
-still marks the window. `set_animation_phase` is told the clock by the one
-function that draws the transcript, and a transcript with nothing streaming
-never advances it.
+**Reasoning follows the desktop's preferences and live-turn projection.**
+The TUI defaults to Latest at bottom, default expansion off, and Window. The
+current live thought automatically opens its window unless explicitly
+collapsed; Full mode and settled reasoning use the default-expansion preference
+until the reader chooses otherwise. In timeline retains historical reasoning;
+Latest at bottom follows the current turn's live status. See
+[Timeline Presentation](../frontend/timeline-presentation.md) for the setting
+fields, state retention, and disclosure contracts.
+
+A live window shows up to `STREAMING_WINDOW_LINES` rows of newest content, with
+a `…` row once older rows have left the top. Its marker column carries an
+animated rail including the header. The rail follows the chrome animation
+clock, so a phase change invalidates rendered rows without re-measuring. A
+terminal that cannot blend colours draws the rail flat.
 
 The six-row count comes from `vibex_ui::timeline::REASONING_WINDOW_LINES`, shared
 with desktop and mobile. Keep the terminal's incremental Markdown renderer,
 fold marker, animated rail, and follow/scroll controls when aligning activity
 presentation with the GUI clients.
 
-The runtime does not close a reasoning stream: a row that once streamed keeps
-that flag for the rest of the turn. The window is therefore opened only on the
-block at the **end** of the transcript — the thought the Agent is on now — and
-folds to one row the moment any other row follows it, which is also what makes a
-tool call end the window without the provider saying so. That block is not
-eligible for a dense run either, because folding it away would hide the window
-the reader is watching. `estimate_height` bounds a live window by its own cap:
-markdown reflows the body, so the estimate is an upper bound rather than an
-equality, and an unmeasured window must never be estimated shorter than it
+Provider reasoning flags can remain stale after another activity starts. Use
+the shared conversation projection to settle superseded thoughts, and only
+window the trailing live thought. A following tool or a completed turn removes
+the non-final bottom indicator; Timeline mode keeps the settled row. An open
+thought stays outside activity groups. `estimate_height` bounds a live window
+by its own cap: an unmeasured window must never be estimated shorter than it
 draws.
 
 **The composer wraps its draft so byte offsets survive.** `wrap_text` produces
@@ -755,16 +753,20 @@ is never a column count.
   still, and that is what keeps an idle session at zero frames (the PTY
   `an_idle_interface_writes_nothing` contract).
 * **Work records have the same layout while running and after completion.**
-  `is_dense_row` always hides the body until explicit expansion. Reasoning
-  shows its label; a tool shows a recognized action, never raw JSON or XML as a
+  Tool bodies stay behind their disclosure. Reasoning uses the preferences
+  described above. A tool shows a recognized action, never raw JSON or XML as a
   fallback. Complete input followed by output can still supply the action;
   unknown or incomplete payloads remain available in details. Runtime attribution
   also lives in details. Failure stays visible and breaks grouping. Keep height
   estimates and cached neighbour gaps in sync with the rendered shape.
 * **Expansion belongs to the reader.** `Transcript::set_blocks` retains it by
-  stable block ID while content updates. Group changes invalidate measurements
-  and cached rows. The rendered group head supplies the mouse hit target;
-  clicking it and the expand key run the same intent.
+  stable block ID while content updates. A group retains its summary while
+  exposing child headers, whose details expand independently. Closing the
+  summary closes all child details. Thin connectors join both levels, and
+  reversible disclosure motion respects the Motion preference. Group changes
+  invalidate measurements and cached rows; pointer and keyboard actions share
+  the visible header's intent. Keep search, copy, and selection consistent with
+  [Timeline Presentation](../frontend/timeline-presentation.md).
 * **A stream must recover from missing events.** `App::refresh_timeline` starts
   a generation-scoped session load from sequence zero when a timeline gap is
   reported. An in-flight load prevents duplicate requests. Applying the snapshot
@@ -972,17 +974,18 @@ is never a column count.
   manual move across that boundary is refused with a message instead of
   appearing to do nothing.
 * **What the settings surface changes is persisted, per appearance where the
-  choice is.** The look, the language, the standing workspace and the palette's
-  recents live in `InterfacePreferences` and are written to
+  choice is.** The look, the language, reasoning preferences, the standing
+  workspace and the palette's recents live in `InterfacePreferences` and are written to
   `~/.vibex/tui-interface.json` (the path an `AppOptions` field, like the
   arrangement's, so a test writes nothing into a home). `apply_setting_value` is
   the only writer and the only saver, so a preview that `Esc` reverts also
   reverts what was written. The theme is two slots — light and dark — because a
   palette is authored for one appearance: switching appearances reads the other
   slot instead of overwriting it, and the row shows the *resolved* id rather
-  than a stored one that may belong to the other appearance. Every stored value
-  is an optional string, and a value this build does not know loads as no
-  choice, so a newer build's file is not an error in an older one. Resolution
+  than a stored one that may belong to the other appearance. Choice values are
+  optional strings and toggles are optional booleans. An absent or unknown
+  choice resolves to its default, so a newer build's file is not an error in an
+  older one. Resolution
   order is the composition root's option, then the environment (`VIBEX_THEME`,
   `VIBEX_TUI_ICONS`), then the file, then detection: a value named for one run
   outranks the standing one and is not written back over it, while the reader's

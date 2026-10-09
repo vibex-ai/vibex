@@ -748,9 +748,9 @@ strings! {
     settings_mark_glitch => { "Glitch", "故障", "故障" },
     settings_motion => { "Motion", "动效", "動效" },
     settings_motion_hint => {
-        "Animate the mark while the page waits; off holds it still",
-        "页面等待时为字符画添加动效；关闭则保持静止",
-        "頁面等待時為字符畫加上動效；關閉則保持靜止"
+        "Animate the logo and timeline disclosures; off shows changes immediately",
+        "为字符画和时间线折叠展开添加动效；关闭则立即显示变化",
+        "為字符畫和時間線摺疊展開加上動效；關閉則立即顯示變更"
     },
     settings_transitions => { "Text transitions", "文字切换特效", "文字切換特效" },
     settings_transitions_hint => {
@@ -760,6 +760,28 @@ strings! {
     },
     settings_on => { "On", "开", "開" },
     settings_off => { "Off", "关", "關" },
+    settings_reasoning_display => { "Reasoning display", "推理显示方式", "推理顯示方式" },
+    settings_reasoning_display_hint => {
+        "Show the latest live reasoning at the bottom, or keep reasoning in the timeline.",
+        "将最新实时推理置于底部，或保留在会话时间线中。",
+        "將最新即時推理置於底部，或保留在工作階段時間線中。"
+    },
+    settings_reasoning_latest => { "Latest at bottom", "最新推理内容置底", "最新推理內容置底" },
+    settings_reasoning_timeline => { "In timeline", "显示在时间线中", "顯示在時間線中" },
+    settings_reasoning_expanded => { "Expand reasoning by default", "默认展开推理", "預設展開推理" },
+    settings_reasoning_expanded_hint => {
+        "Open reasoning by default. Each reasoning row can still be expanded or collapsed.",
+        "默认打开推理内容；仍可逐项展开或折叠。",
+        "預設開啟推理內容；仍可逐項展開或摺疊。"
+    },
+    settings_reasoning_expansion => { "Reasoning expansion", "推理展开方式", "推理展開方式" },
+    settings_reasoning_expansion_hint => {
+        "Window follows the newest live lines; full expansion shows all reasoning as it arrives.",
+        "窗口渲染跟随最新实时内容；全量展开显示全部推理。",
+        "視窗繪製跟隨最新即時內容；完整展開顯示全部推理。"
+    },
+    settings_reasoning_window => { "Window", "窗口渲染", "視窗繪製" },
+    settings_reasoning_full => { "Full expansion", "全量展开", "完整展開" },
     settings_icons_hint => {
         "Unicode chrome, or ASCII for a terminal without font fallback.",
         "Unicode 界面符号；无字体回退的终端可用 ASCII。",

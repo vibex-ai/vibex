@@ -394,6 +394,7 @@ fn entry(id: &str, kind: TimelineRowKind, title: &str, body: &str, failed: bool)
         sequence: 1,
         timestamp_ms: sample_timestamp(kind),
         expanded: false,
+        reasoning_window: false,
         collapsible: matches!(
             kind,
             TimelineRowKind::Reasoning

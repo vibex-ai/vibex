@@ -52,6 +52,9 @@ const COMPOSING_PAGE: &str = "Agent setup";
 /// Draw one frame and return the terminal buffer, for checks that need cells
 /// rather than the text a person would read.
 fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    app.transcript.advance_disclosures(
+        std::time::Instant::now() + vibex_tui::transcript::DISCLOSURE_DURATION,
+    );
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
@@ -108,6 +111,11 @@ fn buffer_lines(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Ve
 
 /// Draw one frame and return the screen as text, one line per row.
 fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    // These assertions inspect settled layouts; disclosure motion has its own
+    // frame-by-frame coverage in the timeline suite.
+    app.transcript.advance_disclosures(
+        std::time::Instant::now() + vibex_tui::transcript::DISCLOSURE_DURATION,
+    );
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
@@ -1339,6 +1347,7 @@ fn block(id: &str, turn: &str) -> vibex_tui::transcript::Block {
         sequence: 1,
         timestamp_ms: None,
         expanded: false,
+        reasoning_window: false,
         collapsible: false,
         streaming: false,
         failed: false,
@@ -1556,6 +1565,7 @@ fn seeded_block(
         sequence: 1,
         timestamp_ms: None,
         expanded: false,
+        reasoning_window: false,
         collapsible: false,
         streaming: false,
         failed: false,
@@ -3506,7 +3516,14 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
     // Nine of the eleven items are conversation or the one notice worth
     // keeping; the plan update and the approval's resolution are the dock's
     // and the request row's business.
-    assert_eq!(app.transcript.blocks().len(), 9);
+    assert_eq!(
+        app.transcript
+            .blocks()
+            .iter()
+            .filter(|block| !block.group.is_head())
+            .count(),
+        9
+    );
     let screen = text(&render(&mut app, 110, 40));
     assert!(
         screen.contains("❯ Fix the flaky test in the runner"),
@@ -5812,8 +5829,8 @@ fn a_running_session_reads_as_rows() {
         "a thought the Agent has left behind kept its window open:\n{screen}"
     );
     assert!(
-        screen.contains("▸ Thinking"),
-        "the finished thought is not one row:\n{screen}"
+        !screen.contains("Thinking"),
+        "the bottom-only progress should leave when a tool follows:\n{screen}"
     );
     // A running tool names its command and stays visible beside completed
     // work. The raw input and output remain behind the fold.
@@ -5826,7 +5843,7 @@ fn a_running_session_reads_as_rows() {
         "a raw payload is on screen:\n{screen}"
     );
     assert_eq!(
-        app.transcript.blocks()[2].group,
+        app.transcript.blocks()[1].group,
         vibex_tui::transcript::GroupRole::Solo,
         "a running command must remain outside collapsed groups"
     );
@@ -7639,6 +7656,7 @@ fn reasoning_toggle_opens_and_closes_every_member_of_a_group() {
         sequence: 1,
         timestamp_ms: None,
         expanded: false,
+        reasoning_window: false,
         collapsible: true,
         streaming: false,
         failed: false,
@@ -7666,6 +7684,6 @@ fn reasoning_toggle_opens_and_closes_every_member_of_a_group() {
     assert!(app.transcript.blocks().iter().all(|row| !row.expanded));
     assert!(matches!(
         app.transcript.blocks()[0].group,
-        vibex_tui::transcript::GroupRole::Head { hidden: 3 }
+        vibex_tui::transcript::GroupRole::Head { members: 4 }
     ));
 }

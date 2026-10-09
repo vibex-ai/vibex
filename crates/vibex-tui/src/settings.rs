@@ -13,7 +13,7 @@
 //! commit, which is what makes "try it, `Esc` puts it back" true rather than
 //! approximately true.
 
-use vibex_desktop_model::ThemeSelection;
+use vibex_desktop_model::{ReasoningDisplayMode, ReasoningExpansionMode, ThemeSelection};
 
 use crate::app::App;
 use crate::locale::{Locale, Strings};
@@ -53,6 +53,9 @@ pub enum SettingRow {
     Mark,
     Motion,
     Transitions,
+    ReasoningDisplay,
+    ReasoningExpanded,
+    ReasoningExpansion,
     Language,
     Keys,
     Workspace,
@@ -80,13 +83,15 @@ pub enum SettingKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Appearance,
+    Timeline,
     Language,
     Interface,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 3] = [
+    pub const ALL: [SettingsSection; 4] = [
         SettingsSection::Appearance,
+        SettingsSection::Timeline,
         SettingsSection::Language,
         SettingsSection::Interface,
     ];
@@ -94,6 +99,7 @@ impl SettingsSection {
     pub fn label(self, strings: Strings) -> &'static str {
         match self {
             SettingsSection::Appearance => strings.settings_section_appearance(),
+            SettingsSection::Timeline => strings.help_category_transcript(),
             SettingsSection::Language => strings.settings_section_language(),
             SettingsSection::Interface => strings.settings_section_interface(),
         }
@@ -139,6 +145,21 @@ pub const SETTINGS: &[SettingDef] = &[
         row: SettingRow::Transitions,
         section: SettingsSection::Appearance,
         kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::ReasoningDisplay,
+        section: SettingsSection::Timeline,
+        kind: SettingKind::Choice,
+    },
+    SettingDef {
+        row: SettingRow::ReasoningExpanded,
+        section: SettingsSection::Timeline,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::ReasoningExpansion,
+        section: SettingsSection::Timeline,
+        kind: SettingKind::Choice,
     },
     SettingDef {
         row: SettingRow::Language,
@@ -228,6 +249,9 @@ pub struct SettingsState {
     pub motion: bool,
     /// Whether a line scrambles when the text it shows changes.
     pub transitions: bool,
+    pub reasoning_display_mode: ReasoningDisplayMode,
+    pub reasoning_expanded_by_default: bool,
+    pub reasoning_expansion_mode: ReasoningExpansionMode,
     /// Index into the visible rows.
     pub selected: usize,
     pub view: SettingsMode,
@@ -295,6 +319,9 @@ impl App {
             SettingRow::Mark => strings.settings_mark(),
             SettingRow::Motion => strings.settings_motion(),
             SettingRow::Transitions => strings.settings_transitions(),
+            SettingRow::ReasoningDisplay => strings.settings_reasoning_display(),
+            SettingRow::ReasoningExpanded => strings.settings_reasoning_expanded(),
+            SettingRow::ReasoningExpansion => strings.settings_reasoning_expansion(),
             SettingRow::Language => strings.settings_language(),
             SettingRow::Keys => strings.settings_keys(),
             SettingRow::Workspace => strings.session_workspace(),
@@ -313,6 +340,9 @@ impl App {
             SettingRow::Mark => strings.settings_mark_hint(),
             SettingRow::Motion => strings.settings_motion_hint(),
             SettingRow::Transitions => strings.settings_transitions_hint(),
+            SettingRow::ReasoningDisplay => strings.settings_reasoning_display_hint(),
+            SettingRow::ReasoningExpanded => strings.settings_reasoning_expanded_hint(),
+            SettingRow::ReasoningExpansion => strings.settings_reasoning_expansion_hint(),
             SettingRow::Language => strings.settings_language_hint(),
             SettingRow::Keys => strings.settings_keys_hint(),
             SettingRow::Workspace => strings.settings_workspace_hint(),
@@ -340,6 +370,19 @@ impl App {
             },
             SettingRow::Motion => self.toggle_label(self.settings.motion),
             SettingRow::Transitions => self.toggle_label(self.settings.transitions),
+            SettingRow::ReasoningDisplay => match self.settings.reasoning_display_mode {
+                ReasoningDisplayMode::LatestAtBottom => self.strings.settings_reasoning_latest(),
+                ReasoningDisplayMode::Timeline => self.strings.settings_reasoning_timeline(),
+            }
+            .to_string(),
+            SettingRow::ReasoningExpanded => {
+                self.toggle_label(self.settings.reasoning_expanded_by_default)
+            }
+            SettingRow::ReasoningExpansion => match self.settings.reasoning_expansion_mode {
+                ReasoningExpansionMode::Window => self.strings.settings_reasoning_window(),
+                ReasoningExpansionMode::Full => self.strings.settings_reasoning_full(),
+            }
+            .to_string(),
             SettingRow::Language => self.settings.locale.tag().to_string(),
             SettingRow::Keys => format!(
                 "{} · {}",
@@ -417,7 +460,47 @@ impl App {
                     current: style == self.settings.mark,
                 })
                 .collect(),
-            SettingRow::Motion | SettingRow::Transitions => self.toggle_choices(row),
+            SettingRow::Motion | SettingRow::Transitions | SettingRow::ReasoningExpanded => {
+                self.toggle_choices(row)
+            }
+            SettingRow::ReasoningDisplay => [
+                (
+                    ReasoningDisplayMode::LatestAtBottom,
+                    "latest_at_bottom",
+                    self.strings.settings_reasoning_latest(),
+                ),
+                (
+                    ReasoningDisplayMode::Timeline,
+                    "timeline",
+                    self.strings.settings_reasoning_timeline(),
+                ),
+            ]
+            .into_iter()
+            .map(|(mode, value, label)| SettingChoice {
+                value: value.to_string(),
+                label: label.to_string(),
+                current: mode == self.settings.reasoning_display_mode,
+            })
+            .collect(),
+            SettingRow::ReasoningExpansion => [
+                (
+                    ReasoningExpansionMode::Window,
+                    "window",
+                    self.strings.settings_reasoning_window(),
+                ),
+                (
+                    ReasoningExpansionMode::Full,
+                    "full",
+                    self.strings.settings_reasoning_full(),
+                ),
+            ]
+            .into_iter()
+            .map(|(mode, value, label)| SettingChoice {
+                value: value.to_string(),
+                label: label.to_string(),
+                current: mode == self.settings.reasoning_expansion_mode,
+            })
+            .collect(),
             SettingRow::Language => [Locale::En, Locale::ZhCn, Locale::ZhTw]
                 .into_iter()
                 .map(|locale| SettingChoice {
@@ -445,6 +528,9 @@ impl App {
             // reset puts them back on, which is what a reader who never opened
             // this page already has.
             SettingRow::Motion | SettingRow::Transitions => "on".to_string(),
+            SettingRow::ReasoningDisplay => "latest_at_bottom".to_string(),
+            SettingRow::ReasoningExpanded => "off".to_string(),
+            SettingRow::ReasoningExpansion => "window".to_string(),
             SettingRow::Language => Locale::En.tag().to_string(),
             SettingRow::Workspace => String::new(),
             _ => self.setting_value(row),
@@ -468,6 +554,7 @@ impl App {
     fn toggle_choices(&self, row: SettingRow) -> Vec<SettingChoice> {
         let current = match row {
             SettingRow::Motion => self.settings.motion,
+            SettingRow::ReasoningExpanded => self.settings.reasoning_expanded_by_default,
             _ => self.settings.transitions,
         };
         [("on", true), ("off", false)]
@@ -560,6 +647,7 @@ impl App {
                     return false;
                 }
                 self.settings.motion = on;
+                self.transcript.set_motion_enabled(on);
                 true
             }
             SettingRow::Transitions => {
@@ -577,6 +665,42 @@ impl App {
                 if !on {
                     self.transitions.cancel();
                 }
+                true
+            }
+            SettingRow::ReasoningDisplay => {
+                let Ok(mode) = serde_json::from_value::<ReasoningDisplayMode>(value.into()) else {
+                    return false;
+                };
+                if mode == self.settings.reasoning_display_mode {
+                    return false;
+                }
+                self.settings.reasoning_display_mode = mode;
+                self.transcript.clear_reasoning_expansion();
+                self.sync_transcript();
+                true
+            }
+            SettingRow::ReasoningExpanded => {
+                let Some(expanded) = Self::toggle_value(value) else {
+                    return false;
+                };
+                if expanded == self.settings.reasoning_expanded_by_default {
+                    return false;
+                }
+                self.settings.reasoning_expanded_by_default = expanded;
+                self.transcript.clear_reasoning_expansion();
+                self.sync_transcript();
+                true
+            }
+            SettingRow::ReasoningExpansion => {
+                let Ok(mode) = serde_json::from_value::<ReasoningExpansionMode>(value.into())
+                else {
+                    return false;
+                };
+                if mode == self.settings.reasoning_expansion_mode {
+                    return false;
+                }
+                self.settings.reasoning_expansion_mode = mode;
+                self.sync_transcript();
                 true
             }
             SettingRow::Language => {

@@ -54,6 +54,14 @@ pub fn accent_bar(tier: GlyphTier) -> &'static str {
     }
 }
 
+/// A thin connector between a disclosure's children. Always one column.
+pub fn connector(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "│",
+        GlyphTier::Legacy => "|",
+    }
+}
+
 /// Failure and close markers. One column.
 pub fn ballot_x(tier: GlyphTier) -> &'static str {
     match tier {
@@ -313,6 +321,7 @@ mod tests {
         for tier in [full(), legacy()] {
             for glyph in [
                 accent_bar(tier),
+                connector(tier),
                 ballot_x(tier),
                 check_mark(tier),
                 token_arrow(tier),

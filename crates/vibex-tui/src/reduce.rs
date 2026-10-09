@@ -565,22 +565,21 @@ impl App {
             Intent::ToggleAllBlocksExpanded => {
                 let expand = !self.transcript.all_expanded();
                 self.transcript.toggle_all(expand);
+                if let Some(index) = self
+                    .transcript
+                    .visible_block(self.selection_for(Scope::Agent))
+                {
+                    self.set_selection(Scope::Agent, index);
+                }
                 Outcome::effects(vec![])
             }
             Intent::ToggleReasoningExpanded => {
-                // Expanding a group opens its members too. Choose one target
-                // state before walking so later members are not toggled shut.
-                let expand = self.transcript.blocks().iter().any(|block| {
-                    block.kind == vibex_desktop_model::TimelineRowKind::Reasoning && !block.expanded
-                });
-                for index in 0..self.transcript.len() {
-                    let is_reasoning = self.transcript.block(index).is_some_and(|block| {
-                        block.kind == vibex_desktop_model::TimelineRowKind::Reasoning
-                            && block.expanded != expand
-                    });
-                    if is_reasoning {
-                        self.transcript.toggle_block(index);
-                    }
+                self.transcript.toggle_reasoning();
+                if let Some(index) = self
+                    .transcript
+                    .visible_block(self.selection_for(Scope::Agent))
+                {
+                    self.set_selection(Scope::Agent, index);
                 }
                 Outcome::effects(vec![])
             }
@@ -1832,7 +1831,7 @@ impl App {
             while self
                 .transcript
                 .block(next)
-                .is_some_and(|block| block.group == crate::transcript::GroupRole::Member)
+                .is_some_and(|block| block.group.is_hidden())
             {
                 let candidate = next as i64 + delta.signum();
                 if candidate < 0 || candidate >= count as i64 {

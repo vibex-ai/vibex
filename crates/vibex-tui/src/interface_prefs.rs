@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use vibex_desktop_model::ThemeSelection;
+use vibex_desktop_model::{ReasoningDisplayMode, ReasoningExpansionMode, ThemeSelection};
 use vibex_ui::GpuiThemeMode;
 
 use crate::locale::Locale;
@@ -63,6 +63,14 @@ pub struct InterfacePreferences {
     /// Whether a line scrambles when the text it shows changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitions: Option<bool>,
+    /// `latest_at_bottom` or `timeline`; independent of the desktop's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_display_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_expanded_by_default: Option<bool>,
+    /// `window` or `full` for a thought that is still arriving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_expansion_mode: Option<String>,
     /// The BCP-47 tag of the chosen language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
@@ -141,6 +149,24 @@ impl InterfacePreferences {
         self.transitions.unwrap_or(true)
     }
 
+    pub fn reasoning_display_mode(&self) -> ReasoningDisplayMode {
+        self.reasoning_display_mode
+            .as_deref()
+            .and_then(|value| serde_json::from_value(value.into()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn reasoning_expanded_by_default(&self) -> bool {
+        self.reasoning_expanded_by_default.unwrap_or(false)
+    }
+
+    pub fn reasoning_expansion_mode(&self) -> ReasoningExpansionMode {
+        self.reasoning_expansion_mode
+            .as_deref()
+            .and_then(|value| serde_json::from_value(value.into()).ok())
+            .unwrap_or_default()
+    }
+
     /// The remembered language, when it is one this build ships.
     pub fn locale(&self) -> Option<Locale> {
         match self.locale.as_deref() {
@@ -186,6 +212,9 @@ mod tests {
             mark: Some("glitch".to_string()),
             motion: Some(false),
             transitions: Some(false),
+            reasoning_display_mode: Some("timeline".to_string()),
+            reasoning_expanded_by_default: Some(true),
+            reasoning_expansion_mode: Some("full".to_string()),
             locale: Some("zh-CN".to_string()),
             workspace: Some("/tmp/vibex-workspace".to_string()),
             recent_commands: vec!["open_settings".to_string()],
@@ -199,6 +228,15 @@ mod tests {
         assert_eq!(loaded.mark(), Some(MarkStyle::Glitch));
         assert!(!loaded.motion());
         assert!(!loaded.transitions());
+        assert_eq!(
+            loaded.reasoning_display_mode(),
+            ReasoningDisplayMode::Timeline
+        );
+        assert!(loaded.reasoning_expanded_by_default());
+        assert_eq!(
+            loaded.reasoning_expansion_mode(),
+            ReasoningExpansionMode::Full
+        );
         assert_eq!(loaded.locale(), Some(Locale::ZhCn));
     }
 
@@ -239,6 +277,8 @@ mod tests {
               "mode": "system",
               "icons": "emoji",
               "mark": "plaid",
+              "reasoningDisplayMode": "future-position",
+              "reasoningExpansionMode": "future-expansion",
               "locale": "fr-FR",
               "themes": { "dark": "future-dark" }
             }"#,
@@ -254,6 +294,15 @@ mod tests {
         // default rather than reading "absent" as "off".
         assert!(loaded.motion());
         assert!(loaded.transitions());
+        assert_eq!(
+            loaded.reasoning_display_mode(),
+            ReasoningDisplayMode::LatestAtBottom
+        );
+        assert!(!loaded.reasoning_expanded_by_default());
+        assert_eq!(
+            loaded.reasoning_expansion_mode(),
+            ReasoningExpansionMode::Window
+        );
         // An unknown theme id is kept as written: resolution, not loading, is
         // what decides whether a palette exists.
         assert_eq!(loaded.themes.dark(), Some("future-dark"));
