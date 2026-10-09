@@ -1646,6 +1646,14 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   its own. Activating a preview only scrolls the virtual list to that row and
   marks the reader away from the bottom; it must not mutate timeline items, turn
   grouping, or authoritative cursor state.
+- The rail reports the reader's position as well as the pointer's. Every slot
+  whose turn the timeline viewport currently shows is lit, resolved from the
+  scroll handle the virtual list tracks plus the row-height table — the same
+  offset/padding pair the scroll anchor uses — so a viewport that straddles a
+  turn boundary lights each turn it holds at once instead of only one. The
+  hovered slot still outranks the reading emphasis for its own slot and owns the
+  preview card, and the reading emphasis outranks the pointer's neighbourhood
+  fade.
 - Session-row rename/delete controls capture the target `VibexSessionId` before
   opening their dialog and call the typed manager mutation for that id. They must
   not silently retarget the currently selected session; successful non-selected
