@@ -18,7 +18,7 @@ Primary evidence:
 | --- | --- |
 | [Directory Structure](./directory-structure.md) | Creating shells, feature modules, shared UI, or client protocol code. |
 | [Component Guidelines](./component-guidelines.md) | Building timeline cards, panels, dialogs, and mobile screens. |
-| [Home ASCII Arena](./ascii-arena.md) | Changing the home vignette, local boss combat, input lifecycle, or its appearance preference. |
+| [AI Souls Home Arena](./pixel-arena.md) | Changing the pixel guardian preview, local boss combat, input lifecycle, or its appearance preference. |
 | [Timeline Presentation](./timeline-presentation.md) | Changing shared activity labels, mobile disclosures, TUI grouping, or reasoning windows. |
 | [State Management](./state-management.md) | Deciding local UI state, remote snapshots, streaming buffers, or persisted preferences. |
 | [TUI Session State](./tui-session-state.md) | Changing TUI drafts, creation, runtime picker targets, async replies, or transcript ownership. |

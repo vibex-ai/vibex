@@ -4,8 +4,13 @@
 //! battle, its input focus and its bounded clock until play ends or navigation
 //! leaves the home.
 
+mod art;
 mod combat;
 mod copy;
+mod geometry;
+mod guardian;
+mod palette;
+mod raster;
 mod scene;
 
 use std::{
@@ -19,10 +24,11 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, DismissEvent, Entity,
     EventEmitter, FocusHandle, Global, KeyBinding, KeyDownEvent, KeyUpEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Subscription, Task, Window,
-    actions, div, prelude::*, relative, rems,
+    actions, div, prelude::*, rems,
 };
 use gpui_component::{
-    ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     scroll::ScrollableElement as _,
@@ -30,7 +36,7 @@ use gpui_component::{
 };
 
 use crate::{locale::text, motion};
-use combat::{Arena, Controls, FOCUS_COST, Guardian, Phase, STEP, Vec2};
+use combat::{Arena, Controls, Guardian, Phase, STEP, Vec2};
 
 const BANNER_HEIGHT_REM: f32 = 12.0;
 
@@ -40,16 +46,13 @@ pub(crate) fn setting_title() -> &'static str {
 
 pub(crate) fn setting_description() -> &'static str {
     text(
-        "Show the ASCII arena on the new-session home. Open it to challenge a guardian.",
-        "在新建会话首页显示字符画战场，点击即可挑战守卫。",
-        "在新增工作階段首頁顯示字元畫戰場，點擊即可挑戰守衛。",
+        "Show an idle pixel guardian on the new-session home. Open it to start a boss battle.",
+        "在新建会话首页显示待机中的像素守卫，点击即可开始 Boss 战。",
+        "在新增工作階段首頁顯示待機中的像素守衛，點擊即可開始 Boss 戰。",
     )
 }
 
-actions!(
-    unbound,
-    [Roll, Stillness, TogglePause, Retry, Advance, Exit]
-);
+actions!(unbound, [Roll, TogglePause, Retry, Advance, Exit]);
 
 struct Bindings;
 impl Global for Bindings {}
@@ -61,7 +64,6 @@ fn init(cx: &mut App) {
     cx.set_global(Bindings);
     cx.bind_keys([
         KeyBinding::new("space", Roll, Some("Unbound")),
-        KeyBinding::new("e", Stillness, Some("Unbound")),
         KeyBinding::new("p", TogglePause, Some("Unbound")),
         KeyBinding::new("r", Retry, Some("Unbound")),
         KeyBinding::new("enter", Advance, Some("Unbound")),
@@ -73,14 +75,19 @@ pub(crate) struct HomeArena {
     battle: Option<Entity<ArenaView>>,
     composer_focus: FocusHandle,
     dismissal: Option<Subscription>,
+    preview: Rc<Cell<scene::PreviewSample>>,
+    preview_seed: f32,
 }
 
 impl HomeArena {
     pub(crate) fn new(composer_focus: FocusHandle) -> Self {
+        art::prepare();
         Self {
             battle: None,
             composer_focus,
             dismissal: None,
+            preview: Rc::new(Cell::new(scene::PreviewSample::default())),
+            preview_seed: 0.0,
         }
     }
 
@@ -89,7 +96,8 @@ impl HomeArena {
             return;
         }
         init(cx);
-        let battle = cx.new(|cx| ArenaView::new(window, cx));
+        let sample = self.preview.get();
+        let battle = cx.new(|cx| ArenaView::new(sample, window, cx));
         self.dismissal =
             Some(
                 cx.subscribe_in(&battle, window, |this, _, _: &DismissEvent, window, cx| {
@@ -107,6 +115,12 @@ impl HomeArena {
 
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         if let Some(battle) = self.battle.take() {
+            self.preview_seed = battle.read(cx).arena.visual_time;
+            self.preview.set(scene::PreviewSample {
+                guardian: battle.read(cx).arena.boss.guardian,
+                time: self.preview_seed,
+                viewport: None,
+            });
             battle.update(cx, |view, cx| view.close(cx));
             self.dismissal = None;
             cx.notify();
@@ -150,25 +164,40 @@ pub(crate) fn home_surface(
 }
 
 fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyElement {
+    let measured = state.read(cx).preview.clone();
+    let sample = measured.get();
+    let seed = state.read(cx).preview_seed;
     let state = state.downgrade();
     let art = div().size_full().overflow_hidden();
     let dialog_open = window.has_active_dialog(cx);
+    let reduced_motion = motion::reduced_motion(cx);
     let art = if dialog_open
         || motion::reduced_motion(cx)
         || motion::pauses_while_inactive(!window.is_window_active())
     {
-        art.child(scene::preview(0.15)).into_any_element()
+        art.child(scene::preview(sample, measured, reduced_motion))
+            .into_any_element()
     } else {
         art.with_animation(
             "unbound-vignette",
-            Animation::new(Duration::from_secs(9))
-                .repeat_synced()
+            Animation::new(Duration::from_secs_f32(art::IDLE_PERIOD))
+                .repeat()
                 .with_max_fps(12.0),
-            |this, phase| this.child(scene::preview(phase)),
+            move |this, phase| {
+                this.child(scene::preview(
+                    scene::PreviewSample {
+                        guardian: sample.guardian,
+                        time: seed + phase * art::IDLE_PERIOD,
+                        viewport: None,
+                    },
+                    measured.clone(),
+                    false,
+                ))
+            },
         )
         .into_any_element()
     };
-    let label = text("Play Unbound", "进入断链战场", "進入斷鏈戰場");
+    let label = text("Play AI Souls", "进入 AI 之魂", "進入 AI 之魂");
     div()
         .id("new-session-arena")
         .debug_selector(|| "unbound-banner".into())
@@ -213,16 +242,18 @@ fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyEl
 
 struct ArenaView {
     arena: Arena,
+    entry: Option<scene::PreviewViewport>,
     focus: FocusHandle,
     keys: BTreeSet<String>,
     mouse_shoot: bool,
     mouse_recall: bool,
     aim: Option<Vec2>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    projection: Rc<Cell<Option<scene::Geometry>>>,
     paused: bool,
+    started: bool,
     closed: bool,
     attempt: u32,
-    defeated: BTreeSet<&'static str>,
     clock: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -230,7 +261,7 @@ struct ArenaView {
 impl EventEmitter<DismissEvent> for ArenaView {}
 
 impl ArenaView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(sample: scene::PreviewSample, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |view, _, cx| view.pause(cx));
         let activation = cx.observe_window_activation(window, |view, window, cx| {
@@ -241,17 +272,19 @@ impl ArenaView {
             }
         });
         Self {
-            arena: Arena::new(Guardian::Ember),
+            arena: Arena::new(sample.guardian, sample.time),
+            entry: sample.viewport,
             focus,
             keys: BTreeSet::new(),
             mouse_shoot: false,
             mouse_recall: false,
             aim: None,
             bounds: Rc::new(Cell::new(None)),
+            projection: Rc::new(Cell::new(None)),
             paused: true,
+            started: false,
             closed: false,
             attempt: 1,
-            defeated: BTreeSet::new(),
             clock: None,
             _subscriptions: vec![blur, activation],
         }
@@ -303,6 +336,7 @@ impl ArenaView {
         }
         self.clear_input();
         self.paused = false;
+        self.started = true;
         self.focus.focus(window, cx);
         self.start_clock(window, cx);
         cx.notify();
@@ -310,7 +344,7 @@ impl ArenaView {
 
     fn start_clock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clock = None;
-        if self.arena.phase != Phase::Battle {
+        if !self.arena.needs_tick() {
             return;
         }
         let executor = cx.background_executor().clone();
@@ -318,14 +352,14 @@ impl ArenaView {
             let mut last = Instant::now();
             let mut accumulated = 0.0;
             loop {
-                executor.timer(Duration::from_millis(33)).await;
+                executor.timer(Duration::from_millis(16)).await;
                 let now = Instant::now();
                 // A suspended or overloaded UI never advances a lethal backlog.
                 accumulated += now.duration_since(last).as_secs_f32().min(0.1);
                 last = now;
                 let keep_running = entity
                     .update_in(cx, |view, window, cx| {
-                        if view.closed || view.paused || view.arena.phase != Phase::Battle {
+                        if view.closed || view.paused || !view.arena.needs_tick() {
                             return false;
                         }
                         if !view.focus.is_focused(window) || !window.is_window_active() {
@@ -337,14 +371,11 @@ impl ArenaView {
                             view.arena.tick(controls);
                             accumulated -= STEP;
                         }
-                        if view.arena.phase == Phase::Victory {
-                            view.defeated.insert(view.arena.boss.guardian.agent());
-                            view.clear_input();
-                        } else if view.arena.phase == Phase::Defeat {
+                        if matches!(view.arena.phase, Phase::Victory | Phase::Defeat) {
                             view.clear_input();
                         }
                         cx.notify();
-                        view.arena.phase == Phase::Battle
+                        view.arena.needs_tick()
                     })
                     .unwrap_or(false);
                 if !keep_running {
@@ -355,7 +386,7 @@ impl ArenaView {
     }
 
     fn toggle_pause(&mut self, _: &TogglePause, window: &mut Window, cx: &mut Context<Self>) {
-        if self.arena.phase == Phase::Battle {
+        if matches!(self.arena.phase, Phase::Battle | Phase::Awakening) {
             if self.paused {
                 self.resume(window, cx);
             } else {
@@ -366,15 +397,17 @@ impl ArenaView {
     }
 
     fn retry(&mut self, _: &Retry, window: &mut Window, cx: &mut Context<Self>) {
-        self.arena = Arena::new(self.arena.boss.guardian);
+        self.entry = None;
+        self.arena = Arena::new(self.arena.boss.guardian, self.arena.visual_time);
         self.attempt = self.attempt.saturating_add(1);
         self.resume(window, cx);
         cx.stop_propagation();
     }
 
     fn advance(&mut self, _: &Advance, window: &mut Window, cx: &mut Context<Self>) {
-        if self.arena.phase == Phase::Victory {
-            self.arena = Arena::new(self.arena.boss.guardian.next());
+        if self.arena.phase == Phase::Victory && self.arena.outcome_ready() {
+            self.entry = None;
+            self.arena = Arena::new(self.arena.boss.guardian.next(), self.arena.visual_time);
             self.attempt = 1;
             self.resume(window, cx);
         } else if self.arena.phase == Phase::Defeat {
@@ -388,14 +421,6 @@ impl ArenaView {
     fn roll(&mut self, _: &Roll, _: &mut Window, cx: &mut Context<Self>) {
         if !self.paused {
             self.arena.roll(self.controls().movement);
-            cx.notify();
-        }
-        cx.stop_propagation();
-    }
-
-    fn stillness(&mut self, _: &Stillness, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.paused {
-            self.arena.focus();
             cx.notify();
         }
         cx.stop_propagation();
@@ -437,9 +462,9 @@ impl ArenaView {
     }
 
     fn world_position(&self, position: Point<Pixels>) -> Option<Vec2> {
-        self.bounds
+        self.projection
             .get()
-            .and_then(|bounds| scene::Geometry::battle(bounds).world(position))
+            .and_then(|geometry| geometry.world(position))
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -481,16 +506,23 @@ impl ArenaView {
         }
     }
 
+    fn select_guardian(&mut self, guardian: Guardian, window: &mut Window, cx: &mut Context<Self>) {
+        self.entry = None;
+        self.arena = Arena::new(guardian, self.arena.visual_time);
+        self.attempt = 1;
+        self.resume(window, cx);
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
         let guardian = self.arena.boss.guardian;
         let paused = self.paused;
         v_flex()
             .debug_selector(|| "unbound-header".into())
             .flex_none()
-            .gap_3()
+            .gap_2()
             .px_4()
-            .pt_4()
-            .pb_3()
+            .pt_3()
+            .pb_2()
             .child(
                 h_flex()
                     .w_full()
@@ -506,7 +538,7 @@ impl ArenaView {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!("Vibex / {}", copy::title())),
+                                    .child(copy::title()),
                             )
                             .child(div().text_base().font_semibold().child(format!(
                                 "{} · {}",
@@ -523,7 +555,11 @@ impl ArenaView {
                                     .debug_selector(|| "unbound-pause".into())
                                     .small()
                                     .ghost()
-                                    .label(if self.paused {
+                                    .disabled(!matches!(
+                                        self.arena.phase,
+                                        Phase::Awakening | Phase::Battle
+                                    ))
+                                    .label(if paused {
                                         text("Resume", "继续", "繼續")
                                     } else {
                                         text("Pause", "暂停", "暫停")
@@ -534,8 +570,6 @@ impl ArenaView {
                                         "暫停 / 繼續（P）",
                                     ))
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        // A button may take focus before its click is delivered.
-                                        // Honor the command shown before that automatic pause.
                                         if paused {
                                             this.resume(window, cx);
                                         } else {
@@ -555,72 +589,24 @@ impl ArenaView {
                                         "返回新增工作階段（Esc）",
                                     ))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.exit(&Exit, window, cx);
+                                        this.exit(&Exit, window, cx)
                                     })),
                             ),
                     ),
             )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .gap_x_4()
-                    .gap_y_2()
-                    .text_xs()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(text("Life", "生命", "生命")),
-                            )
-                            .child(
-                                div()
-                                    .font_family("Lilex")
-                                    .text_color(cx.theme().danger)
-                                    .child(format!(
-                                        "{}{}",
-                                        "◆".repeat(usize::from(self.arena.player.health)),
-                                        "◇".repeat(usize::from(3 - self.arena.player.health))
-                                    )),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(text("Focus", "专注", "專注")),
-                            )
-                            .child(
-                                div().w_16().h_1().bg(cx.theme().muted).child(
-                                    div()
-                                        .h_full()
-                                        .w(relative(self.arena.player.focus / 100.0))
-                                        .bg(cx.theme().info),
-                                ),
-                            )
-                            .child(format!("{:.0}", self.arena.player.focus)),
-                    )
-                    .child(
-                        div()
-                            .text_color(if self.arena.boss.exposed > 0.0 {
-                                cx.theme().warning
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(copy::boss_state(&self.arena)),
-                    )
-                    .child(div().text_color(cx.theme().muted_foreground).child(format!(
-                        "{} {}/{}",
-                        text("Guardians", "守卫", "守衛"),
-                        self.defeated.len(),
-                        Guardian::ALL.len()
-                    ))),
-            )
+            .child(h_flex().w_full().min_w_0().flex_wrap().gap_1().children(
+                Guardian::ALL.into_iter().map(|choice| {
+                    Button::new(format!("unbound-guardian-{}", choice.agent()))
+                        .debug_selector(move || format!("unbound-guardian-{}", choice.agent()))
+                        .xsmall()
+                        .ghost()
+                        .selected(choice == guardian)
+                        .label(choice.agent())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_guardian(choice, window, cx)
+                        }))
+                }),
+            ))
             .into_any_element()
     }
 
@@ -644,7 +630,7 @@ impl ArenaView {
                 copy::tactic(self.arena.boss.guardian),
                 text("Try again", "再战一次", "再戰一次"),
             ),
-            Phase::Battle => (
+            Phase::Awakening | Phase::Battle => (
                 text("Paused", "已暂停", "已暫停"),
                 text(
                     "Your battle will wait for you.",
@@ -702,21 +688,20 @@ impl ArenaView {
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let focused = self.arena.focus_remaining > 0.0;
         v_flex()
             .debug_selector(|| "unbound-footer".into())
             .flex_none()
             .gap_2()
             .px_4()
-            .pb_4()
-            .pt_3()
+            .pb_3()
+            .pt_2()
             .child(
                 h_flex()
                     .w_full()
                     .min_w_0()
                     .flex_wrap()
                     .gap_x_4()
-                    .gap_y_2()
+                    .gap_y_1()
                     .text_xs()
                     .child(
                         div()
@@ -725,18 +710,12 @@ impl ArenaView {
                     )
                     .child(
                         div()
-                            .text_color(if focused {
-                                cx.theme().info
+                            .text_color(if self.arena.boss.exposed > 0.0 {
+                                cx.theme().warning
                             } else {
                                 cx.theme().muted_foreground
                             })
-                            .child(if focused {
-                                text("Stillness active", "静域生效中", "靜域生效中")
-                            } else if self.arena.player.focus >= FOCUS_COST {
-                                text("E · Stillness ready", "E · 静域就绪", "E · 靜域就緒")
-                            } else {
-                                text("E · Recovering focus", "E · 专注恢复中", "E · 專注恢復中")
-                            }),
+                            .child(copy::boss_state(&self.arena)),
                     )
                     .child(div().text_color(cx.theme().muted_foreground).child(format!(
                         "{} {}",
@@ -773,26 +752,21 @@ impl ArenaView {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(text(
-                        "WASD / ↑↓←→  Move",
+                        "WASD / arrows  Move",
                         "WASD / 方向键  移动",
                         "WASD / 方向鍵  移動",
                     ))
                     .child(text(
-                        "Hold J / left mouse → release to shoot",
-                        "按住 J / 左键 → 松开射箭",
-                        "按住 J / 左鍵 → 鬆開射箭",
+                        "Hold J / left mouse, release to shoot",
+                        "按住 J / 左键蓄力，松开射箭",
+                        "按住 J / 左鍵蓄力，鬆開射箭",
                     ))
                     .child(text(
                         "Hold K / right mouse  Recall",
-                        "按住 K / 右键  召回",
-                        "按住 K / 右鍵  召回",
+                        "按住 K / 右键召回",
+                        "按住 K / 右鍵召回",
                     ))
-                    .child(text("Space  Roll", "空格  翻滚", "空格  翻滾"))
-                    .child(text(
-                        "E  Slow threats · 60 focus",
-                        "E  静域减速 · 60 专注",
-                        "E  靜域減速 · 60 專注",
-                    )),
+                    .child(text("Space  Roll", "空格  翻滚", "空格  翻滾")),
             )
             .into_any_element()
     }
@@ -800,12 +774,27 @@ impl ArenaView {
 
 impl Render for ArenaView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let board = scene::battle(&self.arena, self.bounds.clone(), motion::reduced_motion(cx));
+        let reduced_motion = motion::reduced_motion(cx);
+        let entering = self.entry.is_some() && self.arena.phase == Phase::Awakening;
+        let chrome = if entering && !reduced_motion {
+            combat::smoothstep((self.arena.phase_time - 0.35) / 0.4)
+        } else {
+            1.0
+        };
+        let board = scene::battle(
+            &self.arena,
+            self.entry,
+            self.bounds.clone(),
+            self.projection.clone(),
+            reduced_motion,
+        );
         v_flex()
             .id("unbound-game")
             .debug_selector(|| "unbound-game".into())
             .key_context("Unbound")
             .track_focus(&self.focus)
+            .relative()
+            .overflow_hidden()
             .size_full()
             .min_h_0()
             .min_w_0()
@@ -814,7 +803,6 @@ impl Render for ArenaView {
             .border_color(cx.theme().transparent)
             .focus_visible(|style| style.border_color(cx.theme().ring))
             .on_action(cx.listener(Self::roll))
-            .on_action(cx.listener(Self::stillness))
             .on_action(cx.listener(Self::toggle_pause))
             .on_action(cx.listener(Self::retry))
             .on_action(cx.listener(Self::advance))
@@ -825,7 +813,13 @@ impl Render for ArenaView {
             .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Right, cx.listener(Self::mouse_up))
-            .child(self.header(cx))
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .opacity(chrome)
+                    .child(self.header(cx)),
+            )
             .child(
                 div()
                     .id("unbound-battlefield")
@@ -835,9 +829,9 @@ impl Render for ArenaView {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .overflow_hidden()
+                    .when(!entering, |this| this.overflow_hidden())
                     .border_y_1()
-                    .border_color(cx.theme().border.opacity(0.55))
+                    .border_color(cx.theme().border.opacity(0.55 * chrome))
                     .when(!self.paused && self.arena.phase == Phase::Battle, |this| {
                         this.cursor_crosshair()
                     })
@@ -845,11 +839,18 @@ impl Render for ArenaView {
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
                     .on_mouse_move(cx.listener(Self::mouse_move))
                     .child(board)
-                    .when(self.paused || self.arena.phase != Phase::Battle, |this| {
-                        this.child(self.outcome(cx))
-                    }),
+                    .when(
+                        (self.paused && self.started) || self.arena.outcome_ready(),
+                        |this| this.child(self.outcome(cx)),
+                    ),
             )
-            .child(self.footer(cx))
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .opacity(chrome)
+                    .child(self.footer(cx)),
+            )
     }
 }
 

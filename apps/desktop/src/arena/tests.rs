@@ -36,6 +36,19 @@ fn press(cx: &mut VisualTestContext, name: &str) {
     key(cx, name, false);
 }
 
+fn awaken(view: &Entity<ArenaView>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, cx| {
+        for _ in 0..100 {
+            if view.arena.phase != Phase::Awakening {
+                break;
+            }
+            view.arena.tick(Controls::default());
+        }
+        cx.notify();
+    });
+    draw(cx);
+}
+
 fn setup(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -282,11 +295,138 @@ fn leaving_home_cancels_pending_focus_and_running_combat(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn entry_preserves_the_preview_and_guardian_selection_returns_to_the_same_draft(
+    cx: &mut TestAppContext,
+) {
+    setup(cx);
+    let mut home = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| Home::new(window, cx));
+        home = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let home = home.unwrap();
+    cx.update(|window, _| window.activate_window());
+    draw(cx);
+    let state = home.read_with(cx, |home, _| home.arena.clone());
+    cx.update(|window, cx| {
+        home.read(cx)
+            .input
+            .clone()
+            .update(cx, |input, cx| input.focus(window, cx));
+    });
+    cx.simulate_input("keep this draft");
+    let opened = cx.update(|window, cx| {
+        state.update(cx, |state, cx| {
+            let sample = scene::PreviewSample {
+                guardian: Guardian::Pi,
+                time: 2.375,
+                ..state.preview.get()
+            };
+            assert!(sample.viewport.is_some());
+            state.preview.set(sample);
+            state.open(window, cx);
+            let battle = state.battle.clone().unwrap();
+            assert_eq!(battle.read(cx).arena.boss.guardian, Guardian::Pi);
+            assert_eq!(battle.read(cx).arena.visual_time, sample.time);
+            assert_eq!(battle.read(cx).entry, sample.viewport);
+            assert!(!battle.read(cx).started);
+            battle
+        })
+    });
+    draw(cx);
+    draw(cx);
+    for (guardian, selector) in Guardian::ALL.into_iter().zip([
+        "unbound-guardian-Claude",
+        "unbound-guardian-Codex",
+        "unbound-guardian-Pi",
+        "unbound-guardian-OpenCode",
+        "unbound-guardian-DeepSeek",
+        "unbound-guardian-Copilot",
+    ]) {
+        key(cx, "j", true);
+        let button = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(button.center(), Modifiers::none());
+        draw(cx);
+        opened.read_with(cx, |view, _| {
+            assert_eq!(view.arena.boss.guardian, guardian);
+            assert_eq!(view.arena.phase, Phase::Awakening);
+            assert_eq!(view.attempt, 1);
+            assert!(view.keys.is_empty());
+            assert!(!view.mouse_shoot && !view.mouse_recall);
+            assert!(view.entry.is_none());
+            assert!(view.clock.is_some() && !view.paused);
+        });
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+    let last_time = opened.read_with(cx, |view, _| view.arena.visual_time);
+    press(cx, "escape");
+    draw(cx);
+    let preview = state.read_with(cx, |state, _| state.preview.get());
+    assert_eq!(preview.guardian, Guardian::Copilot);
+    assert_eq!(preview.time, last_time);
+    assert!(opened.read_with(cx, |view, _| view.closed && view.clock.is_none()));
+    cx.simulate_input("!");
+    assert_eq!(
+        home.read_with(cx, |home, cx| home.input.read(cx).value().to_string()),
+        "keep this draft!"
+    );
+}
+
+#[gpui::test]
+fn the_live_entry_camera_keeps_the_preview_then_settles_into_the_field(cx: &mut TestAppContext) {
+    setup(cx);
+    cx.update(|cx| cx.set_reduce_motion(false));
+    let mut home = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| Home::new(window, cx));
+        home = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let home = home.unwrap();
+    cx.update(|window, _| window.activate_window());
+    draw(cx);
+    let state = home.read_with(cx, |home, _| home.arena.clone());
+    let (opened, preview) = cx.update(|window, cx| {
+        state.update(cx, |state, cx| {
+            let preview = state.preview.get().viewport.unwrap();
+            state.open(window, cx);
+            (state.battle.clone().unwrap(), preview)
+        })
+    });
+    draw(cx);
+    draw(cx);
+    assert!(cx.debug_bounds("unbound-continue").is_none());
+    opened.update(cx, |view, cx| {
+        view.clock = None;
+        view.arena.phase_time = 0.0;
+        cx.notify();
+    });
+    draw(cx);
+    assert_eq!(
+        opened.read_with(cx, |view, _| view.projection.get()),
+        Some(preview.geometry)
+    );
+    opened.update(cx, |view, cx| {
+        view.arena.phase_time = combat::INTRO_DURATION;
+        cx.notify();
+    });
+    draw(cx);
+    opened.read_with(cx, |view, _| {
+        let field = scene::Geometry::battle(view.bounds.get().unwrap());
+        let actual = view.projection.get().unwrap();
+        assert!((actual.unit - field.unit).abs() < px(0.001));
+        assert!((actual.origin.x - field.origin.x).abs() < px(0.001));
+        assert!((actual.origin.y - field.origin.y).abs() < px(0.001));
+    });
+}
+
+#[gpui::test]
 fn keyboard_combat_pause_pointer_resume_and_retry_use_the_live_view(cx: &mut TestAppContext) {
     setup(cx);
     let mut arena = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
-        let view = cx.new(|cx| ArenaView::new(window, cx));
+        let view = cx.new(|cx| ArenaView::new(scene::PreviewSample::default(), window, cx));
         arena = Some(view.clone());
         Root::new(view, window, cx)
     });
@@ -295,6 +435,7 @@ fn keyboard_combat_pause_pointer_resume_and_retry_use_the_live_view(cx: &mut Tes
     draw(cx);
     cx.update(|window, cx| view.update(cx, |view, cx| view.resume(window, cx)));
     draw(cx);
+    awaken(&view, cx);
     key(cx, "d", true);
     view.update(cx, |view, _| {
         let controls = view.controls();
@@ -321,8 +462,6 @@ fn keyboard_combat_pause_pointer_resume_and_retry_use_the_live_view(cx: &mut Tes
         view.read_with(cx, |view, _| view.arena.arrow.state),
         ArrowState::Flying
     );
-    press(cx, "e");
-    assert!(view.read_with(cx, |view, _| view.arena.focus_remaining > 0.0));
     press(cx, "space");
     assert!(view.read_with(cx, |view, _| view.arena.player.roll_remaining > 0.0));
 
@@ -341,7 +480,11 @@ fn keyboard_combat_pause_pointer_resume_and_retry_use_the_live_view(cx: &mut Tes
     assert!(view.read_with(cx, |view, _| view.paused && view.clock.is_none()));
     press(cx, "p");
     press(cx, "r");
-    assert_eq!(view.read_with(cx, |view, _| view.arena.player.health), 3);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.arena.phase),
+        Phase::Awakening
+    );
+    awaken(&view, cx);
     assert_eq!(
         view.read_with(cx, |view, _| view.arena.arrow.state),
         ArrowState::Ready
@@ -385,17 +528,18 @@ fn keyboard_combat_pause_pointer_resume_and_retry_use_the_live_view(cx: &mut Tes
     assert!(!view.read_with(cx, |view, _| view.mouse_recall));
     view.update(cx, |view, cx| {
         view.arena.phase = Phase::Victory;
+        view.arena.phase_time = 1.25;
         cx.notify();
     });
     draw(cx);
     press(cx, "enter");
     assert_eq!(
         view.read_with(cx, |view, _| view.arena.boss.guardian),
-        Guardian::Knot
+        Guardian::Codex
     );
     assert_eq!(
         view.read_with(cx, |view, _| view.arena.phase),
-        Phase::Battle
+        Phase::Awakening
     );
 
     cx.update(|window, cx| window.blur(cx));
@@ -408,7 +552,7 @@ fn battlefield_and_controls_fit_resizes_zoom_and_both_themes(cx: &mut TestAppCon
     setup(cx);
     let mut arena = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
-        let view = cx.new(|cx| ArenaView::new(window, cx));
+        let view = cx.new(|cx| ArenaView::new(scene::PreviewSample::default(), window, cx));
         arena = Some(view.clone());
         Root::new(view, window, cx)
     });
@@ -424,7 +568,7 @@ fn battlefield_and_controls_fit_resizes_zoom_and_both_themes(cx: &mut TestAppCon
             Theme::global_mut(cx).font_size = px(rem);
             Theme::sync_base(cx);
             view.update(cx, |view, cx| {
-                view.arena = Arena::new(Guardian::Prism);
+                view.arena = Arena::new(Guardian::Pi, 0.0);
                 cx.notify();
             });
         });
