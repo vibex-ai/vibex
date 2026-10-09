@@ -92,15 +92,16 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   stable `reasoning-live:{turn_id}` row; that non-final indicator disappears
   when another process row follows or the turn ends. **In timeline** retains
   historical reasoning. These preferences are local to each client.
-- Only the current live thought automatically opens in **Window** mode,
-  even when default expansion is off. Explicit expansion/collapse wins and
+- Nothing opens itself: default expansion decides the initial state of every
+  reasoning row, settled or live. Explicit expansion/collapse wins and
   survives streamed updates, including a temporarily absent bottom indicator
-  within the same turn. Settled reasoning opens in full; default expansion
-  decides its initial state. **Full** mode does not automatically open live
-  thoughts. Changing display mode or default expansion clears per-row reasoning
-  overrides; changing expansion mode preserves them. Mobile likewise supports
-  full reasoning and explicit collapse during streaming. TUI keeps its
-  incremental Markdown renderer, tail fold marker, rail, and scroll controls.
+  within the same turn. **Window** mode is a shape, not an invitation: once a
+  row is open it clips a body that is still arriving to its newest rows, while
+  a settled thought opens in full. Changing display mode or default expansion
+  clears per-row reasoning overrides; changing expansion mode preserves them.
+  Mobile likewise supports full reasoning and explicit collapse during
+  streaming. TUI keeps its incremental Markdown renderer, tail fold marker,
+  rail, and scroll controls.
 - Reasoning content keeps its natural height, bottom-aligned within the
   six-line cap. Answers and commentary use body foreground; reasoning stays
   muted. A turn without process rows has no empty process header.

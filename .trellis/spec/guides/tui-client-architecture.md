@@ -441,13 +441,13 @@ per `FRAME_INTERVAL`, so a burst of tokens costs one repaint rather than one per
 token, and an unchanged frame writes nothing.
 
 **Reasoning follows the desktop's preferences and live-turn projection.**
-The TUI defaults to Latest at bottom, default expansion off, and Window. The
-current live thought automatically opens its window unless explicitly
-collapsed; Full mode and settled reasoning use the default-expansion preference
-until the reader chooses otherwise. In timeline retains historical reasoning;
-Latest at bottom follows the current turn's live status. See
-[Timeline Presentation](../frontend/timeline-presentation.md) for the setting
-fields, state retention, and disclosure contracts.
+The TUI defaults to Latest at bottom, default expansion off, and Window. A
+reasoning row opens only when the reader expands it or default expansion is on;
+Window mode then clips a body that is still arriving to its newest rows, while
+Full mode and a settled thought draw the whole body. In timeline retains
+historical reasoning; Latest at bottom follows the current turn's live status.
+See [Timeline Presentation](../frontend/timeline-presentation.md) for the
+setting fields, state retention, and disclosure contracts.
 
 A live window shows up to `STREAMING_WINDOW_LINES` rows of newest content, with
 a `…` row once older rows have left the top. Its marker column carries an

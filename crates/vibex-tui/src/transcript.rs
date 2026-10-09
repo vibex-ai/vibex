@@ -893,12 +893,15 @@ impl Transcript {
             return;
         }
         let live = trailing && block.streaming;
+        // The window is the shape of an open body, not an invitation: a live
+        // thought is windowed only while the mode asks for one, but it opens
+        // only when the reader chose to open it or default expansion is on.
         let window = live && self.reasoning_expansion_mode == ReasoningExpansionMode::Window;
         block.expanded = self
             .reasoning_expansion
             .get(&block.id)
             .copied()
-            .unwrap_or(self.reasoning_expanded_by_default || window);
+            .unwrap_or(self.reasoning_expanded_by_default);
         block.reasoning_window = window;
     }
 
@@ -3864,6 +3867,8 @@ mod tests {
             thought,
         ]);
         assert_eq!(transcript.blocks()[2].group, GroupRole::Solo);
+        // Nothing opens itself, so the reader opens the live thought.
+        transcript.toggle_block(2);
         let text = transcript
             .visible_lines(ScrollState::default(), 20, &theme(), strings())
             .iter()
@@ -3878,6 +3883,8 @@ mod tests {
         let mut transcript = Transcript::new();
         transcript.configure(80, &theme());
         let palette = theme();
+        // Nothing opens itself, so the reader's preference opens the window.
+        transcript.set_reasoning_preferences(true, ReasoningExpansionMode::Window);
         transcript.set_blocks(vec![running_thought()]);
         let _ = transcript.visible_lines(ScrollState::default(), 30, &palette, strings());
         let first = transcript.stats.blocks_rendered;
@@ -4542,6 +4549,9 @@ mod density_tests {
                 true,
             ),
         ]);
+        // Nothing opens itself, so the reader opens the thought the Agent is
+        // on. The older thought stays folded, and only the open one can window.
+        transcript.toggle_block(2);
         let screen = transcript
             .visible_lines(ScrollState::default(), 30, &theme(), strings())
             .iter()

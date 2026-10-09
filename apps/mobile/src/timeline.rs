@@ -102,12 +102,17 @@ impl MobileApp {
             return div().id(row.id.clone()).into_any_element();
         }
         let live = self.reasoning_live(row);
+        // Nothing opens itself: the reader's own choice wins, and without one
+        // the shared "expand reasoning by default" preference decides — for a
+        // settled thought and a thought the Agent is still on alike. A live
+        // body is still drawn in the window once it is open.
         let expanded = self.row_expansion(&row.id).unwrap_or(
-            live || self
-                .effective_timeline_display_settings()
+            self.effective_timeline_display_settings()
                 .reasoning_expanded_by_default,
         );
-        let windowed = live && !self.expanded_timeline_rows.contains(&row.id);
+        // The window is the shape of an open live body, not an invitation: the
+        // reader's "show all" choice is what widens it to the whole thought.
+        let windowed = live && !self.full_reasoning_rows.contains(&row.id);
         let summary = reasoning_summary_cached(&row.id, row.last_sequence.max(0), &row.body);
         let label = if expanded {
             locale::text("Reasoning", "推理", "推理").to_string()
@@ -185,9 +190,9 @@ impl MobileApp {
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if windowed {
-                                        this.expanded_timeline_rows.insert(full_id.clone());
+                                        this.full_reasoning_rows.insert(full_id.clone());
                                     } else {
-                                        this.expanded_timeline_rows.remove(&full_id);
+                                        this.full_reasoning_rows.remove(&full_id);
                                     }
                                     this.collapsed_timeline_rows.remove(&full_id);
                                     this.timeline_list.remeasure();

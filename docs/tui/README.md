@@ -307,9 +307,11 @@ the group summary in place. Runtime attribution is available with expanded
 details. Disclosures animate briefly and reverse from their current position
 when clicked again; turning off **Motion** makes changes immediate.
 
-In the default window mode, the current live thought opens a window of up to
-six rendered lines. An explicit collapse stays in effect across new content.
-When a tool follows or the turn ends, the bottom indicator disappears. Choose
+In the default window mode, opening the current live thought shows a window of
+up to six rendered lines. Nothing opens on its own: with **Expand reasoning by
+default** off, every reasoning row — the live thought included — stays folded
+until you open it. Your expansion stays in effect across new content. When a
+tool follows or the turn ends, the bottom indicator disappears. Choose
 **In timeline** to retain earlier reasoning rows; settled thoughts start closed
 unless **Expand reasoning by default** is on, and open in full when requested.
 
@@ -729,11 +731,12 @@ The **Transcript** section has three reasoning preferences:
 | Expand reasoning by default | Off | On |
 | Reasoning expansion | Window | Full expansion |
 
-These use the desktop's presentation rules. Window mode opens the current
-live thought automatically, while a manual collapse takes precedence. Full
-expansion shows all live content when opened. Changing the display mode or the
-default expansion resets per-row reasoning choices; changing Window/Full keeps
-them.
+These use the desktop's presentation rules. Nothing opens on its own: with
+**Expand reasoning by default** off, a row stays folded until you open it, the
+current live thought included. Window mode then shows a short tail of a thought
+that is still arriving, and Full expansion shows all live content. Changing the
+display mode or the default expansion resets per-row reasoning choices; changing
+Window/Full keeps them.
 
 Every value the page changes is remembered for the next run: the appearance,
 the theme, the icon set, the logo and its effects, the reasoning preferences,

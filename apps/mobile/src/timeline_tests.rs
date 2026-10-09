@@ -316,6 +316,11 @@ fn reasoning_tracks_the_tail_and_preserves_explicit_full_or_collapsed_choices(
     });
     let window_selector = format!("reasoning-window:{row_id}");
     let body_selector = format!("reasoning-content:{row_id}");
+    // Default expansion is off, so a live thought stays folded: nothing opens
+    // itself, not even the thought the Agent is on.
+    assert!(cx.debug_bounds(body_selector.clone().leak()).is_none());
+    // The reader opens it, and the live window is the shape it opens in.
+    click(cx, &format!("reasoning-header:{row_id}"));
     let window = cx.debug_bounds(window_selector.clone().leak()).unwrap();
     let content = cx.debug_bounds(body_selector.clone().leak()).unwrap();
     assert!(window.size.height <= px(15.0 * markdown::LINE_HEIGHT_REM * 6.0 + 1.0));

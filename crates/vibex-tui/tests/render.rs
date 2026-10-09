@@ -5762,12 +5762,19 @@ fn a_running_session_reads_as_rows() {
         .replace_authoritative(session_id.clone(), vec![user_item.clone(), thought.clone()]);
     app.sync_transcript();
     with_attribution(&mut app);
+    // Default expansion is off, so the running thought is one folded row:
+    // nothing opens itself, not even the thought the Agent is on.
     let screen = text(&render(&mut app, 110, 26));
+    assert!(
+        screen.contains("▸ Thinking") && !screen.contains("LAST-SENTINEL"),
+        "the running thought did not stay folded:\n{screen}"
+    );
 
-    // A running thought is the one dense row whose body is drawn without being
-    // opened. It is drawn in a fixed window on its tail: the newest rows are
-    // there, the oldest have left the top, and the rail marks the window's
-    // height — one cell per row, the header included.
+    // The reader opens it, and the body is drawn in a fixed window on its tail:
+    // the newest rows are there, the oldest have left the top, and the rail
+    // marks the window's height — one cell per row, the header included.
+    app.transcript.toggle_block(1);
+    let screen = text(&render(&mut app, 110, 26));
     assert!(
         screen.contains("LAST-SENTINEL"),
         "the newest rows of the thought are not on screen:\n{screen}"
@@ -5795,9 +5802,9 @@ fn a_running_session_reads_as_rows() {
         "the window grew past its bound: {railed} rows:\n{screen}"
     );
 
-    // The Agent moves on to a tool call. The runtime does not close a reasoning
-    // stream, so the row still says it is streaming — but it is no longer the
-    // tail, and the window folds to the one row a finished thought keeps.
+    // The Agent moves on to a tool call. Latest-at-bottom draws a non-final
+    // thought only through the live indicator, so the thought and its window
+    // leave together; the tool rows take their place.
     app.agent.state.timeline.replace_authoritative(
         session_id.clone(),
         vec![

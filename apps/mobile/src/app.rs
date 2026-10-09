@@ -972,6 +972,9 @@ pub struct MobileApp {
     expanded_process: BTreeMap<String, bool>,
     expanded_timeline_rows: BTreeSet<String>,
     collapsed_timeline_rows: BTreeSet<String>,
+    /// Live reasoning rows whose reader asked for the whole thought instead of
+    /// the live window. The window is the default shape of an open live row.
+    full_reasoning_rows: BTreeSet<String>,
     expanded_approval: BTreeSet<String>,
     workspaces: Vec<WorkspaceRecord>,
     workspace_summaries: Vec<WorkspaceSummary>,
@@ -1262,6 +1265,7 @@ impl MobileApp {
             expanded_process: BTreeMap::new(),
             expanded_timeline_rows: BTreeSet::new(),
             collapsed_timeline_rows: BTreeSet::new(),
+            full_reasoning_rows: BTreeSet::new(),
             expanded_approval: BTreeSet::new(),
             workspaces: Vec::new(),
             workspace_summaries: Vec::new(),
@@ -4012,6 +4016,7 @@ impl MobileApp {
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
+        self.full_reasoning_rows.clear();
         self.expanded_approval.clear();
         self.timeline_markdown_views.borrow_mut().clear();
         if restored_from_cache {
@@ -5154,6 +5159,7 @@ impl MobileApp {
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
+        self.full_reasoning_rows.clear();
         self.expanded_approval.clear();
         self.elicitation_request_id = None;
         self.elicitation_inputs.clear();
@@ -6300,6 +6306,7 @@ impl MobileApp {
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
+        self.full_reasoning_rows.clear();
         self.expanded_approval.clear();
         self.elicitation_request_id = None;
         self.elicitation_inputs.clear();

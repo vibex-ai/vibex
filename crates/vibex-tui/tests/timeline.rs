@@ -311,6 +311,13 @@ fn reasoning_keeps_its_live_tail_window_and_settles_when_a_tool_follows() {
         })],
         AgentSessionState::Running,
     );
+    // The preference is off, so the running thought stays folded: nothing
+    // opens itself, not even the thought the Agent is on.
+    let text = draw(&mut app, 80, 30);
+    assert!(!app.transcript.blocks()[1].expanded);
+    assert!(!text.contains("Reasoning paragraph 19"), "{text}");
+    // The reader opens it, and the live window shows the tail only.
+    app.transcript.toggle_block(1);
     let text = draw(&mut app, 80, 30);
     assert!(text.contains("Reasoning paragraph 19"), "{text}");
     assert!(!text.contains("Reasoning paragraph 0"));
@@ -379,7 +386,7 @@ fn thought(text: &str) -> TimelinePayload {
 }
 
 #[test]
-fn reasoning_settings_choose_placement_and_the_default_for_settled_rows() {
+fn reasoning_settings_choose_placement_and_the_default_for_every_row() {
     let mut app = app(
         vec![
             thought("Earlier thought"),
@@ -405,9 +412,11 @@ fn reasoning_settings_choose_placement_and_the_default_for_settled_rows() {
             .map(|block| (block.body.clone(), block.expanded, block.streaming))
             .collect::<Vec<_>>()
     };
+    // Default expansion is off, so even the trailing live thought is folded:
+    // the timeline only opens what the reader opens.
     assert_eq!(
         reasoning(&app),
-        vec![("Current thought".into(), true, true)]
+        vec![("Current thought".into(), false, true)]
     );
 
     app.apply_setting_value(SettingRow::ReasoningDisplay, "timeline");
@@ -415,7 +424,7 @@ fn reasoning_settings_choose_placement_and_the_default_for_settled_rows() {
         reasoning(&app),
         vec![
             ("Earlier thought".into(), false, false),
-            ("Current thought".into(), true, true)
+            ("Current thought".into(), false, true)
         ]
     );
     assert_eq!(app.transcript.blocks()[2].kind, TimelineRowKind::Command);

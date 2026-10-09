@@ -49093,7 +49093,7 @@ impl VibexWorkbench {
             TimelineRowKind::Reasoning => {
                 if row.body.is_empty() {
                     4.0
-                } else if self.reasoning_row_open(&row.id, row.streaming) {
+                } else if self.reasoning_row_open(&row.id) {
                     // A windowed body costs the window rather than the thought:
                     // the estimate has to see the same cap the renderer clips
                     // to, or a streaming thought would keep reserving the height
@@ -49668,7 +49668,7 @@ impl VibexWorkbench {
                         })
                         .map(|body| {
                             let key = format!("reasoning-live:{}", turn.id);
-                            if self.reasoning_row_open(&key, true) {
+                            if self.reasoning_row_open(&key) {
                                 // The bottom panel draws the same live body the
                                 // timeline does, so it is held to the same
                                 // window while the Agent is still thinking.
@@ -50211,24 +50211,25 @@ impl VibexWorkbench {
     ///
     /// The reader's own answer outranks everything else: a row they expanded or
     /// collapsed keeps that state for the rest of the turn. Without one, the
-    /// "expand reasoning by default" preference decides — and so does a thought
-    /// the Agent is still on, which opens into its window by itself. That is the
-    /// TUI's rule: a running thought's window is the shape the thought has while
-    /// it arrives, not something the reader has to ask for. A thought the Agent
-    /// has finished with is not streaming any more, so it goes back behind the
-    /// row's preview and chevron, and expanding it then shows it in full.
-    fn reasoning_row_open(&self, row_id: &str, streaming: bool) -> bool {
+    /// "expand reasoning by default" preference decides for every row,
+    /// including a thought the Agent is still on. Nothing opens itself: a
+    /// running thought arrives in a window only because the reader — or that
+    /// preference — opened it, so turning the preference off really does leave
+    /// the timeline collapsed.
+    fn reasoning_row_open(&self, row_id: &str) -> bool {
         match self.reasoning_expansion.get(row_id).copied() {
             Some(explicit) => explicit,
-            None => {
-                self.ui_state.session.reasoning_expanded_by_default
-                    || self.live_reasoning_window_opens(streaming)
-            }
+            None => self.ui_state.session.reasoning_expanded_by_default,
         }
     }
 
-    /// Whether a thought that is still arriving opens its window on its own.
-    fn live_reasoning_window_opens(&self, streaming: bool) -> bool {
+    /// Whether a thought that is still arriving is drawn in the fixed window.
+    ///
+    /// This decides the shape of an open body, not whether it opens: only a
+    /// body that is still arriving is windowed, and only while the reader's
+    /// expansion mode asks for a window. A thought the Agent has finished with
+    /// is not growing any more, so it always opens in full.
+    fn live_reasoning_uses_window(&self, streaming: bool) -> bool {
         streaming
             && self.ui_state.session.reasoning_expansion_mode == ReasoningExpansionMode::Window
     }
@@ -50236,9 +50237,9 @@ impl VibexWorkbench {
     /// Flip a reasoning row between open and closed.
     ///
     /// `open` is the state the caller drew the row in, which is not always the
-    /// state [`Self::reasoning_row_open`] would report back: in window mode a
-    /// running thought opens itself, so the click on it has to mean "close
-    /// this" rather than "open it again".
+    /// state [`Self::reasoning_row_open`] would report back: a running thought
+    /// the reader left open keeps its shape while it settles, so the click on
+    /// it has to mean "close this" rather than "open it again".
     fn toggle_reasoning_expansion(
         &mut self,
         row_id: String,
@@ -50424,7 +50425,7 @@ impl VibexWorkbench {
         streaming: bool,
         remaining: Option<&str>,
     ) -> Option<ReasoningWindow> {
-        if !self.live_reasoning_window_opens(streaming) {
+        if !self.live_reasoning_uses_window(streaming) {
             return None;
         }
         Some(reasoning_window_for(
@@ -50441,7 +50442,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row_id = format!("reasoning-live:{}", turn.id);
-        let expanded = self.reasoning_row_open(&row_id, true);
+        let expanded = self.reasoning_row_open(&row_id);
         let reveal = self.reasoning_reveal(&row_id, expanded, window, cx);
         let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
@@ -50524,7 +50525,7 @@ impl VibexWorkbench {
         }
         let row_id = row.id.clone();
         let turn_id = row.turn_id.clone();
-        let expanded = self.reasoning_row_open(&row_id, row.streaming);
+        let expanded = self.reasoning_row_open(&row_id);
         let reveal = self.reasoning_reveal(&row_id, expanded, window, cx);
         // A body still travelling back keeps the expanded shape on screen, the
         // same way a closing tool card keeps its detail until the spring lands.
@@ -81733,11 +81734,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_live_reasoning("))
             .map(|(body, _)| body)
             .expect("the window policy should remain inspectable");
-        assert!(policy.contains("live_reasoning_window_opens(streaming)"));
+        assert!(policy.contains("live_reasoning_uses_window(streaming)"));
         assert!(policy.contains("reasoning_window_for("));
 
         let rule = source
-            .split_once("    fn live_reasoning_window_opens(")
+            .split_once("    fn live_reasoning_uses_window(")
             .and_then(|(_, tail)| {
                 tail.split_once("\n    /// Flip a reasoning row between open and closed.")
             })
@@ -81746,20 +81747,22 @@ mod tests {
         assert!(rule.contains("streaming"));
         assert!(rule.contains("ReasoningExpansionMode::Window"));
 
-        // A live thought opens that window by itself, but never over the
-        // reader's own answer about the row.
+        // Nothing opens itself: the reader's own answer wins, and without one
+        // the default-expansion preference decides for a settled thought and a
+        // thought the Agent is still on alike.
         let open = source
             .split_once("    fn reasoning_row_open(")
             .and_then(|(_, tail)| {
                 tail.split_once(
-                    "\n    /// Whether a thought that is still arriving opens its window on its own.",
+                    "\n    /// Whether a thought that is still arriving is drawn in the fixed window.",
                 )
             })
             .map(|(body, _)| body)
             .expect("the open rule should remain inspectable");
         assert!(open.contains("self.reasoning_expansion.get(row_id).copied()"));
         assert!(open.contains("reasoning_expanded_by_default"));
-        assert!(open.contains("live_reasoning_window_opens(streaming)"));
+        assert!(!open.contains("live_reasoning_uses_window"));
+        assert!(!open.contains("streaming"));
 
         // Both surfaces that draw a live body ask for the window, and the
         // timeline row asks with the row's own streaming flag rather than
