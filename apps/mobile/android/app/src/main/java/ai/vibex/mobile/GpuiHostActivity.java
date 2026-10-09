@@ -93,7 +93,7 @@ public final class GpuiHostActivity extends Activity {
     private static native void nativeSurfaceCreated(Surface surface, float scale);
     private static native void nativeSurfaceDestroyed();
     private static native void nativeOnAppLifecycle(boolean foreground);
-    private static native void nativeInsets(int contentLeft, int contentTop, int contentRight, int contentBottom);
+    private static native void nativeInsets(int left, int top, int right, int bottom);
     private static native void nativeKeyboardState(boolean visible, float height);
     private static native void nativeIme(long session, int kind, String text, int start, int end);
     private static native void nativeTouch(int action, int pointerId, float x, float y);
@@ -179,14 +179,12 @@ public final class GpuiHostActivity extends Activity {
     }
 
     private void reportInsets(WindowInsetsCompat insets) {
-        int width = surfaceView.getWidth();
-        int height = surfaceView.getHeight();
-        if (width > 0 && height > 0) {
-            Insets bars = insets.getInsets(
-                    WindowInsetsCompat.Type.systemBars()
-                            | WindowInsetsCompat.Type.displayCutout());
-            nativeInsets(bars.left, bars.top, width - bars.right, height - bars.bottom);
-        }
+        Insets bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars()
+                        | WindowInsetsCompat.Type.displayCutout());
+        // The GPUI render thread may not have processed surfaceChanged yet.
+        // Send edge distances, never a rect derived from this View's new size.
+        nativeInsets(bars.left, bars.top, bars.right, bars.bottom);
 
         boolean visible = insets.isVisible(WindowInsetsCompat.Type.ime());
         Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());

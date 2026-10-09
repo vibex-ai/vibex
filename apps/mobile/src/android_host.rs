@@ -17,38 +17,15 @@
 //! [`GpuiHostActivity`]: ../../../android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use gpui::AppLifecyclePhase;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::{Env, EnvUnowned};
 
+use crate::android_insets;
 use crate::assets::MobileAssets;
 use crate::platform;
-
-/// The content rect the Activity reported last, in physical pixels.
-///
-/// The window-inset listener can fire before the render thread has opened the
-/// window, so the value is cached and applied as soon as there is a window.
-static CONTENT_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
-
-/// Applies a reported content rect once the platform has a window to size.
-///
-/// Called when the Activity reports insets, and again from
-/// [`crate::open_root_window`] because the first report usually arrives before
-/// the window exists — dropping it would leave GPUI with no safe area at all.
-pub fn apply_pending_insets() {
-    let rect = CONTENT_RECT.lock().ok().and_then(|rect| *rect);
-    let Some((left, top, right, bottom)) = rect else {
-        return;
-    };
-    if let Some(platform) = gpui_mobile::android::jni::platform()
-        && let Some(window) = platform.primary_window()
-    {
-        window.update_safe_area_from_content_rect(left, top, right, bottom);
-    }
-}
 
 /// Records the Activity and starts the process-lived render thread.
 ///
@@ -166,24 +143,22 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnAppLifecycl
         .resolve::<jni::errors::LogErrorAndDefault>();
 }
 
-/// Reports the window area the system bars leave free, in physical pixels.
+/// Reports system-bar/cutout edge distances in physical pixels.
 ///
-/// GPUI draws edge to edge, so the app pads its own root view by these values.
+/// Java and GPUI resize asynchronously, so this must not be a content rect
+/// calculated using the Java view's dimensions.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeInsets<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
-    content_left: jint,
-    content_top: jint,
-    content_right: jint,
-    content_bottom: jint,
+    left: jint,
+    top: jint,
+    right: jint,
+    bottom: jint,
 ) {
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
-            if let Ok(mut rect) = CONTENT_RECT.lock() {
-                *rect = Some((content_left, content_top, content_right, content_bottom));
-            }
-            apply_pending_insets();
+            android_insets::report(left, top, right, bottom);
             Ok(())
         })
         .resolve::<jni::errors::LogErrorAndDefault>();

@@ -7,6 +7,8 @@
 mod android_bridge;
 #[cfg(target_os = "android")]
 mod android_host;
+#[cfg(any(target_os = "android", test))]
+mod android_insets;
 mod app;
 mod assets;
 mod background_connection;
@@ -57,31 +59,31 @@ pub(crate) fn open_root_window(data_dir: PathBuf, cx: &mut App) {
     // paint, so no component is ever drawn from the framework palette.
     theme::apply_component_theme(None, cx);
 
-    cx.open_window(
-        WindowOptions {
-            // Mobile windows are fullscreen; the platform owns their geometry.
-            window_bounds: None,
-            window_background: WindowBackgroundAppearance::Opaque,
-            focus: true,
-            show: true,
-            ..Default::default()
-        },
-        move |window, cx| {
-            let view = cx.new(|cx| app::MobileApp::new(data_dir, window, cx));
-            // `Root` owns the overlay layers (sheets, dialogs,
-            // notifications, menus) and restores focus after one
-            // closes. A fullscreen phone window is not client
-            // decorated, so the kit's window frame draws nothing.
-            cx.new(|cx| gpui_component::Root::new(view, window, cx))
-        },
-    )
-    .expect("failed to open Vibex mobile window");
+    let _window = cx
+        .open_window(
+            WindowOptions {
+                // Mobile windows are fullscreen; the platform owns their geometry.
+                window_bounds: None,
+                window_background: WindowBackgroundAppearance::Opaque,
+                focus: true,
+                show: true,
+                ..Default::default()
+            },
+            move |window, cx| {
+                let view = cx.new(|cx| app::MobileApp::new(data_dir, window, cx));
+                // `Root` owns the overlay layers (sheets, dialogs,
+                // notifications, menus) and restores focus after one
+                // closes. A fullscreen phone window is not client
+                // decorated, so the kit's window frame draws nothing.
+                cx.new(|cx| gpui_component::Root::new(view, window, cx))
+            },
+        )
+        .expect("failed to open Vibex mobile window");
 
-    // The Android Activity reports its window insets from `onCreate`, before
-    // this window exists; apply whatever it already reported now that GPUI has
-    // a window to size.
+    // Replay early Android inset reports and observe later changes on the GPUI
+    // thread, where surface dimensions and root layout are owned.
     #[cfg(target_os = "android")]
-    android_host::apply_pending_insets();
+    android_insets::observe(_window.into(), cx);
 }
 
 /// Keeps `android-activity`'s glue linkable. **Not** an entry point.

@@ -285,6 +285,75 @@ Correct: menu fallback + full-page Sessions <- right swipe - center session -
          left swipe -> full-page workspace tools with internal tabs.
 ```
 
+## Scenario: Android Insets During Rotation
+
+### 1. Scope / Trigger
+
+- Changing Android host callbacks, window geometry, or safe-area handling.
+- A `SurfaceView` resize and the GPUI render-thread resize are asynchronous;
+  either can run before the latest system-bar/cutout inset notification.
+
+### 2. Signatures
+
+```text
+GpuiHostActivity.nativeInsets(left, top, right, bottom)
+android_insets::report(left, top, right, bottom)
+android_insets::observe(window, cx)
+AndroidWindow::update_safe_area_from_content_rect(left, top, right, bottom)
+```
+
+### 3. Contracts
+
+- The Java/JNI payload contains four **edge distances in physical pixels**,
+  not the corners of a content rectangle derived from the Java view size.
+- JNI publishes the latest value without reading or mutating the GPUI window.
+  Retain notifications that precede window creation and coalesce bursts to
+  the latest value; duplicate reports must not schedule repeated repaints.
+- On the GPUI thread, convert edge distances to the platform's content-rect API
+  using that same window's current physical size, then refresh the GPUI window.
+  Computing the rect and consuming it against different orientations is invalid.
+- The window observer lives with the existing GPUI window across Activity and
+  Surface recreation. Rotation must not rebuild application/session state.
+- Inset-only changes must refresh layout even when no resize or remote event
+  occurs. System-bar and IME insets continue to overlap, not stack.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Insets arrive before the window exists | Apply the latest report when the window opens. |
+| Insets arrive before or after a queued rotation | Preserve actual edge distances in both orders. |
+| Portrait → landscape → portrait | Restore usable portrait bounds without stale right/bottom padding. |
+| Repeated equal reports | No additional inset-driven repaint. |
+| Rapid rotation or Activity recreation | Consume current insets; retain the same logical GPUI window. |
+| System bars change without a resize | Refresh root layout. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: transmit `bars.right`, then calculate `window_width - bars.right` on
+  the render thread immediately before the platform consumes that rectangle.
+- Base: first launch and resume restore the platform-reported safe area.
+- Bad: transmit `view_width - bars.right`; consuming that coordinate against a
+  previous landscape width can produce a right inset wider than the portrait
+  viewport. Waiting an arbitrary number of milliseconds does not fix the contract.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-mobile --lib android_insets::tests --locked` covers both rotation event orders,
+  startup replay, latest-value delivery, and duplicate notifications.
+- `node scripts/check-mobile-native.mjs --self-test` rejects a Java content-rect
+  payload and missing observer/refresh wiring.
+- Build the Android target. On a device, repeat rotations in both directions
+  and inspect native inset/resize logs and compositor dimensions, including
+  return to portrait and a background/foreground cycle.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: Java view size → content rect → previous GPUI size → oversized padding.
+Correct: Java edge distances → latest-value channel → GPUI size → content rect.
+```
+
 ## Scenario: Native Mobile QR Pairing Entry
 
 ### 1. Scope / Trigger

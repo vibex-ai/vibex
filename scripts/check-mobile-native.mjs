@@ -39,6 +39,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/ios/Headers/module.modulemap",
     "apps/mobile/src/android_bridge.rs",
     "apps/mobile/src/android_host.rs",
+    "apps/mobile/src/android_insets.rs",
     "apps/mobile/src/platform.rs",
     "apps/mobile/src/scroll_capture.rs"
   ]) {
@@ -63,6 +64,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
   const androidBridge = read("apps/mobile/src/android_bridge.rs");
   const androidHost = read("apps/mobile/src/android_host.rs");
+  const androidInsets = read("apps/mobile/src/android_insets.rs");
   const iosMain = read("apps/mobile/ios/Vibex/main.m");
   const iosProject = read("apps/mobile/ios/project.yml");
   const iosScanner = read("apps/mobile/ios/Vibex/QRScanner.swift");
@@ -183,6 +185,16 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(androidActivity.includes("setDecorFitsSystemWindows(getWindow(), false)"), "android_host_edge_to_edge_missing");
   assert(androidActivity.includes("setOnApplyWindowInsetsListener"), "android_host_insets_bridge_missing");
   assert(androidActivity.includes("nativeInsets"), "android_host_insets_export_missing");
+  assert(
+    androidActivity.includes("nativeInsets(bars.left, bars.top, bars.right, bars.bottom)"),
+    "android_host_insets_must_be_edge_distances"
+  );
+  assert(
+    androidHost.includes("android_insets::report(left, top, right, bottom)"),
+    "android_host_insets_queue_missing"
+  );
+  assert(entry.includes("android_insets::observe("), "android_host_insets_observer_missing");
+  assert(androidInsets.includes("window.refresh()"), "android_host_insets_refresh_missing");
   assert(androidActivity.includes("nativeKeyboardState"), "android_host_keyboard_state_missing");
   assert(androidActivity.includes("extends EditText"), "android_ime_editor_missing");
   assert(androidActivity.includes("public void gpuiShowKeyboard"), "android_ime_show_bridge_missing");
@@ -315,6 +327,7 @@ function runSelfTest() {
     ["apps/mobile/src/discovery.rs", source("apps/mobile/src/discovery.rs")],
     ["apps/mobile/src/android_bridge.rs", source("apps/mobile/src/android_bridge.rs")],
     ["apps/mobile/src/android_host.rs", source("apps/mobile/src/android_host.rs")],
+    ["apps/mobile/src/android_insets.rs", source("apps/mobile/src/android_insets.rs")],
     ["crates/vibex-remote-client/Cargo.toml", source("crates/vibex-remote-client/Cargo.toml")],
     ["crates/vibex-remote-client/src/transport.rs", source("crates/vibex-remote-client/src/transport.rs")],
     ["apps/mobile/src/platform.rs", source("apps/mobile/src/platform.rs")],
@@ -373,6 +386,24 @@ function runSelfTest() {
     "private static native void nativeIme",
     "private static native void nativeMissing",
     "native_mobile_checker_self_test_accepted_missing_ime_bridge"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
+    "nativeInsets(bars.left, bars.top, bars.right, bars.bottom)",
+    "nativeInsets(bars.left, bars.top, width - bars.right, height - bars.bottom)",
+    "native_mobile_checker_self_test_accepted_host_inset_rect"
+  );
+  expectRejected(
+    "apps/mobile/src/lib.rs",
+    "android_insets::observe(",
+    "android_insets::missing_observer(",
+    "native_mobile_checker_self_test_accepted_missing_insets_observer"
+  );
+  expectRejected(
+    "apps/mobile/src/android_insets.rs",
+    "window.refresh()",
+    "window.viewport_size()",
+    "native_mobile_checker_self_test_accepted_missing_insets_refresh"
   );
   expectRejected(
     "apps/mobile/Cargo.toml",
