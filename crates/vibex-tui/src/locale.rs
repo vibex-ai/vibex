@@ -326,6 +326,11 @@ strings! {
         "剪贴板里没有可粘贴的内容",
         "剪貼簿裡沒有可貼上的內容"
     },
+    clipboard_refused => {
+        "The terminal would not hand over its clipboard",
+        "终端拒绝提供它的剪贴板",
+        "終端拒絕提供它的剪貼簿"
+    },
     image_clipboard_empty => {
         "No image on the clipboard — type a path instead",
         "剪贴板里没有图片 — 请改为输入路径",

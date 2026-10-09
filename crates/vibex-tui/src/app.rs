@@ -5436,6 +5436,17 @@ pub enum ManagementEntryEdit {
     },
 }
 
+/// Which half of the clipboard a read wants.
+///
+/// The two gestures that read a clipboard are the paste chord, which takes
+/// whatever the reader copied, and the composer's attach action, which wants a
+/// picture and asks for a file when there is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardWanted {
+    Everything,
+    Image,
+}
+
 /// Asynchronous work the reducer asks the worker to perform.
 ///
 /// The variants carry only data; the worker owns the tokio runtime and the
@@ -5506,19 +5517,16 @@ pub enum Effect {
     ContinueTurn {
         session_id: VibexSessionId,
     },
-    /// Ask the worker for whatever the system clipboard holds.
+    /// Ask the worker for whatever the clipboard holds.
     ///
     /// An image is attached; text is pasted. Reading a clipboard is I/O and
-    /// belongs to the worker, so the reducer only asks.
+    /// belongs to the worker, so the reducer only asks — and the terminal's
+    /// own clipboard, which is the one a reader on the far side of an `ssh`
+    /// link has, is asked afterwards by the event loop, because its answer
+    /// arrives on the queue the loop owns.
     ReadClipboard {
         ticket: ComposerTicket,
-    },
-    /// Ask the host for an image on the system clipboard.
-    ///
-    /// Reading a clipboard is I/O and belongs to the worker; the reducer asks
-    /// and gets an [`crate::worker::AppMessage::ClipboardImage`] back.
-    ReadClipboardImage {
-        ticket: ComposerTicket,
+        wanted: ClipboardWanted,
     },
     Interrupt {
         session_id: VibexSessionId,
@@ -5671,7 +5679,6 @@ impl Effect {
             Effect::DeleteSession { .. } => "delete_session",
             Effect::ForkSession { .. } => "fork_session",
             Effect::ReadClipboard { .. } => "read_clipboard",
-            Effect::ReadClipboardImage { .. } => "read_clipboard_image",
             Effect::SendMessage { .. } => "send_message",
             Effect::ContinueTurn { .. } => "continue_turn",
             Effect::Interrupt { .. } => "interrupt",

@@ -262,6 +262,25 @@ impl Session {
     fn bytes_since(&self, mark: usize) -> usize {
         self.captured.len().saturating_sub(mark)
     }
+
+    /// Wait until the client has written `needle` at or after `from`.
+    ///
+    /// The clipboard conversation is only visible in the bytes: what the client
+    /// asks the terminal for is the whole point of it, and the emulated screen
+    /// cannot show a query the terminal is meant to answer.
+    fn wait_for_output(&mut self, needle: &[u8], from: usize) -> bool {
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            let tail = &self.captured[from.min(self.captured.len())..];
+            if tail.windows(needle.len()).any(|window| window == needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(Duration::from_millis(50));
+        }
+    }
 }
 
 impl Drop for Session {
@@ -741,4 +760,227 @@ fn enter_still_sends_where_the_newline_chords_do_not() {
     session.send(b"\r");
     let screen = session.wait_for(|screen| screen.contains("Message is empty"));
     assert!(screen.contains('❯'), "{screen}");
+}
+
+/// The mode report a terminal that implements OSC 5522 sends back.
+const CAPABILITY_YES: &[u8] = b"\x1b[?5522;2$y";
+
+/// A one-pixel PNG, base64, exactly as the protocol carries a picture.
+///
+/// The client never decodes it in this test — the chip is what the reader sees
+/// — but a real PNG is what a terminal would answer with, so the test speaks
+/// the same wire format the reader's clipboard would.
+const PIXEL_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AGtE0zaAAAAAElFTkSuQmCC";
+
+/// One `DATA` packet of the answer, carrying a chunk of a PNG.
+fn data_packet(chunk: &str) -> Vec<u8> {
+    // `aW1hZ2UvcG5n` is `image/png`: the media type travels base64 too.
+    format!("\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;{chunk}\x1b\\").into_bytes()
+}
+
+/// The answer to the type list: one `DATA` packet per media type on offer.
+fn types_packet(mimes: &[&str]) -> Vec<u8> {
+    let mut packets = Vec::new();
+    for mime in mimes {
+        // The listed types carry their name and no data: the list is what a
+        // terminal may hand over without asking its reader.
+        packets.extend_from_slice(
+            format!(
+                "\x1b]5522;type=read:status=DATA:mime={};\x1b\\",
+                base64(mime.as_bytes())
+            )
+            .as_bytes(),
+        );
+    }
+    packets.extend_from_slice(b"\x1b]5522;type=read:status=DONE\x1b\\");
+    packets
+}
+
+/// Base64, so the test can spell the media types the way the wire does.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        output.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+/// The client's request for the media types the clipboard offers.
+const TYPES_REQUEST: &[u8] = b"\x1b]5522;type=read;Lg==\x1b\\";
+
+/// The client's request for the clipboard's data, which the terminal confirms
+/// with its reader.
+const DATA_REQUEST: &[u8] = b"\x1b]5522;type=read:name=";
+
+/// A terminal with no clipboard tools of its own.
+///
+/// This is the `ssh` case in one line: the host the client runs on cannot see
+/// the reader's clipboard, so the terminal is the only one that can hand it
+/// over. An empty `PATH` is what guarantees the host's tools are not found
+/// first — a developer machine with `wl-paste` installed would otherwise answer
+/// with their real clipboard and the test would prove nothing.
+fn session_without_host_clipboard() -> Session {
+    Session::start_with(120, 40, &[("PATH", "/nonexistent")])
+}
+
+#[test]
+fn a_paste_over_a_link_takes_the_picture_from_the_terminal() {
+    let mut session = session_without_host_clipboard();
+    session.wait_for_first_frame();
+
+    // `Ctrl+V` is the reader's paste chord.
+    session.send(b"\x16");
+
+    // The client asks whether the protocol is there before it asks for data,
+    // because only a terminal that answers will ever answer the read.
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(b"\x1b[?5522$p", mark),
+        "the client never asked the terminal about its clipboard:\n{}",
+        session.raw_tail()
+    );
+    session.send(CAPABILITY_YES);
+
+    // Asking for the clipboard prompts the terminal's reader, so the client
+    // asks what is on offer first — a request no terminal puts to its reader —
+    // and only asks for data when there is something it can use.
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(TYPES_REQUEST, mark),
+        "the client never asked the terminal what it holds:\n{}",
+        session.raw_tail()
+    );
+    session.send(&types_packet(&["image/png"]));
+
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(DATA_REQUEST, mark),
+        "the client never asked the terminal for its clipboard:\n{}",
+        session.raw_tail()
+    );
+
+    // The picture arrives in chunks and ends with `DONE`, which is the shape
+    // every answer to a read has.
+    let (first, second) = PIXEL_PNG.split_at(32);
+    session.send(&data_packet(first));
+    session.send(&data_packet(second));
+    session.send(b"\x1b]5522;type=read:status=DONE\x1b\\");
+
+    let screen = session.wait_for(|screen| screen.contains("[Image #1]"));
+    assert!(screen.contains("Image attached"), "{screen}");
+    // The answer was read off the input queue, so none of it may have reached
+    // the draft as text: that is the failure this whole path exists to avoid.
+    assert!(
+        !screen.contains("5522") && !screen.contains(PIXEL_PNG),
+        "the answer was typed into the draft:\n{screen}"
+    );
+}
+
+#[test]
+fn a_silent_terminal_leaves_the_draft_alone() {
+    // Nothing answers the capability query, which is every terminal that does
+    // not implement the protocol. The client has to give the input queue back
+    // and say what happened rather than wait for an answer that is not coming.
+    let mut session = session_without_host_clipboard();
+    session.wait_for_first_frame();
+    session.send(b"\x16");
+    let screen = session.wait_for(|screen| screen.contains("Nothing to paste"));
+    assert!(screen.contains('❯'), "{screen}");
+
+    session.send(b"typed after the paste");
+    let screen = session.wait_for(|screen| screen.contains("typed after the paste"));
+    assert!(
+        !screen.contains("5522"),
+        "the capability query was typed into the draft:\n{screen}"
+    );
+}
+
+#[test]
+fn a_terminal_that_refuses_the_read_says_so() {
+    // The default terminal configuration asks its reader before it hands the
+    // clipboard over, and the answer may be no. "Nothing to paste" would send
+    // the reader looking in the wrong place.
+    let mut session = session_without_host_clipboard();
+    session.wait_for_first_frame();
+    session.send(b"\x16");
+
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(b"\x1b[?5522$p", mark),
+        "the client never asked the terminal about its clipboard:\n{}",
+        session.raw_tail()
+    );
+    session.send(CAPABILITY_YES);
+
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(TYPES_REQUEST, mark),
+        "the client never asked the terminal what it holds:\n{}",
+        session.raw_tail()
+    );
+    session.send(&types_packet(&["image/png"]));
+
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(DATA_REQUEST, mark),
+        "the client never asked the terminal for its clipboard:\n{}",
+        session.raw_tail()
+    );
+    session.send(b"\x1b]5522;type=read:status=EPERM\x1b\\");
+
+    let screen = session.wait_for(|screen| screen.contains("would not hand over its clipboard"));
+    assert!(!screen.contains("Nothing to paste"), "{screen}");
+}
+
+#[test]
+fn a_gesture_with_nothing_to_take_never_asks_for_data() {
+    // `Alt+I` wants a picture. The clipboard holds text, which the type list
+    // says without asking the reader anything — so the request that *would*
+    // make the terminal ask ("allow this program to read the clipboard?") is
+    // never sent, and the composer falls back to the path prompt it always had.
+    let mut session = session_without_host_clipboard();
+    session.wait_for_first_frame();
+    session.send(b"\x1bi");
+
+    // The capability query comes first, and this terminal speaks the protocol.
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(b"\x1b[?5522$p", mark),
+        "the client never asked the terminal about its clipboard:\n{}",
+        session.raw_tail()
+    );
+    session.send(CAPABILITY_YES);
+
+    let mark = session.captured.len();
+    assert!(
+        session.wait_for_output(TYPES_REQUEST, mark),
+        "the client never asked the terminal what it holds:\n{}",
+        session.raw_tail()
+    );
+    session.send(&types_packet(&["text/plain", "text/html"]));
+
+    let screen = session.wait_for(|screen| screen.contains("No image on the clipboard"));
+    assert!(
+        !session.wait_for_output(DATA_REQUEST, mark),
+        "the client asked for data the gesture cannot use:\n{}",
+        session.raw_tail()
+    );
+    assert!(screen.contains("Image path"), "{screen}");
 }

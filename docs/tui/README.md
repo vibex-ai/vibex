@@ -215,6 +215,25 @@ image file attaches it too, rather than typing the path into the prompt: quoted,
 pictures in one paste attach together, and a path mentioned inside a sentence
 stays a sentence.
 
+A client on the far side of an `ssh` link has no clipboard of its own to read:
+the screenshot is on the machine the reader is sitting at, and no `wl-paste` on
+the host will ever find it. The terminal, however, is holding it — and a
+terminal that implements kitty's OSC 5522 extension of OSC 52 will hand it over
+on request, images included. So when the host's own clipboard comes back empty,
+the client asks the terminal, in three steps that keep the reader out of it for
+as long as possible: a capability query, which is a mode report and no question
+for anybody; the list of media types the clipboard offers, which a terminal is
+required to serve without a prompt; and only then the read itself, which a
+terminal may confirm with its reader. A clipboard holding nothing the gesture
+can use — an empty one, or text under `Alt+I` — therefore never causes a prompt
+at all. When the terminal does ask, the answer is allowed to be seconds behind
+the request, and `Ctrl+C` is still honoured while the client waits for it. A
+terminal that refuses is told about rather than reported as an empty clipboard,
+and a terminal that does not speak the protocol is asked once per run, not once
+per paste. The answer arrives on the input queue, so the client reads that queue
+at the byte level and reads no keys until the answer is in — which is the one
+moment the interface does not echo typing.
+
 The image becomes a second kind of chip, `[Image #1]`, numbered monotonically
 for the draft and capped at ten per prompt. The info line under the draft
 reports how many are attached.
@@ -861,6 +880,7 @@ Every one of these has a defined behaviour rather than a broken screen:
 | narrow terminal | a mark that cannot be drawn whole is not drawn at all; the lines under it name the product instead |
 | sixteen colours only | the page keeps the terminal's own background; the palette carries ink, accents and rules, and no plane is painted |
 | no keyboard protocol | `Shift+Enter` arrives as `Enter`; `Ctrl+J` breaks the line, and the help panel lists it |
+| no clipboard on the host — the `ssh` case — with a terminal that does not speak OSC 5522 | the paste says there is nothing to paste, once per run; a terminal that refuses the read says so instead, and naming an image file still attaches it |
 | disconnected | a banner, mutations disabled, the last known state marked stale |
 | read-only device | actions are visible, disabled, and say which permission they need |
 | very long conversation | the transcript is capped and the oldest blocks are dropped |
@@ -906,7 +926,7 @@ Five layers:
 | Render | `cargo test -p vibex-tui --test render` | layout degrades at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
 | Tiny terminal | `cargo test -p vibex-tui --test tiny_terminal` | every page draws a whole frame down to 1×1, and a small terminal keeps a line of transcript and a composer that shows the draft |
 | Contract | `cargo test -p vibex-tui --test contracts` | dependency boundary, key tables, locale coverage, no secret-shaped copy |
-| PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, keeps in-process diagnostics out of the terminal, restores the terminal on exit, and survives a resize storm |
+| PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, keeps in-process diagnostics out of the terminal, restores the terminal on exit, survives a resize storm, and takes a picture from a terminal that answers its clipboard protocol |
 
 The PTY layer is the only one that can catch a failure outside the renderer.
 The idle test is the `idle_cost` contract from the design report: after startup

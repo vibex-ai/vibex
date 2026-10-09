@@ -29,7 +29,7 @@ const AUTO_CONTINUE_PROBE_LIMIT: u32 = 500;
 
 /// One message from the worker back to the UI thread.
 ///
-/// What the system clipboard held when the reader pressed paste.
+/// What a clipboard held when the reader asked for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardContent {
     Image {
@@ -37,8 +37,15 @@ pub enum ClipboardContent {
         bytes: Vec<u8>,
     },
     Text(String),
-    /// Nothing pasteable: no image, no text.
+    /// Nothing pasteable on the host: no image, no text.
+    ///
+    /// The terminal on the reader's side of the connection may still hold
+    /// something, so this is not yet "nothing to paste" — see
+    /// [`crate::terminal_clipboard`].
     Empty,
+    /// The terminal was asked for its own clipboard and would not hand it
+    /// over: the reader declined, or its configuration forbids the read.
+    Refused,
 }
 
 /// The variants differ a lot in size because they carry whole catalogues and
@@ -58,15 +65,14 @@ pub enum AppMessage {
     SidebarOrganization(BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot>),
     /// The arrangement after a change this client asked for.
     SidebarOrganizationMutated(BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot>),
-    /// An image off the system clipboard: its media type and bytes, or `None`
-    /// when there is none or the desktop offers no way to read one.
-    ClipboardImage {
-        ticket: crate::app::ComposerTicket,
-        image: Option<(String, Vec<u8>)>,
-    },
-    /// What the system clipboard held when the reader pressed paste.
+    /// What a clipboard held when the reader asked for it.
+    ///
+    /// The answer carries the gesture that asked, because the two of them do
+    /// different things with nothing: a paste says so, and the attach action
+    /// opens the path prompt.
     Pasted {
         ticket: crate::app::ComposerTicket,
+        wanted: crate::app::ClipboardWanted,
         content: ClipboardContent,
     },
     SessionOpened {
@@ -317,6 +323,28 @@ fn home_directory() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
+/// Read the clipboard of the machine this client runs on.
+///
+/// Image first: a clipboard can hold both, and the picture is the half a
+/// terminal cannot paste by itself. Nothing here reaches the reader's own
+/// clipboard when the client is on the far side of an `ssh` link — the host has
+/// no display to read it from — which is why an empty answer is not the end of
+/// the story: the event loop asks the terminal itself next.
+fn read_host_clipboard(wanted: crate::app::ClipboardWanted) -> ClipboardContent {
+    if let Some((mime_type, bytes)) = crate::terminal::read_clipboard_image() {
+        return ClipboardContent::Image { mime_type, bytes };
+    }
+    if wanted == crate::app::ClipboardWanted::Image {
+        // The attach action names a file when there is no picture to take, so
+        // a host that has only text is a host with nothing to offer it.
+        return ClipboardContent::Empty;
+    }
+    match crate::terminal::read_clipboard_text() {
+        Some(text) if !text.is_empty() => ClipboardContent::Text(text),
+        _ => ClipboardContent::Empty,
+    }
+}
+
 struct Dispatch {
     facade: BackendFacade,
     sender: UnboundedSender<AppMessage>,
@@ -491,30 +519,17 @@ impl Dispatch {
                     result,
                 });
             }
-            Effect::ReadClipboard { ticket } => {
-                // Image first: a clipboard can hold both, and the picture is
-                // the half a terminal cannot paste by itself.
-                let content = tokio::task::spawn_blocking(|| {
-                    if let Some((mime_type, bytes)) = crate::terminal::read_clipboard_image() {
-                        return ClipboardContent::Image { mime_type, bytes };
-                    }
-                    match crate::terminal::read_clipboard_text() {
-                        Some(text) if !text.is_empty() => ClipboardContent::Text(text),
-                        _ => ClipboardContent::Empty,
-                    }
-                })
-                .await
-                .unwrap_or(ClipboardContent::Empty);
-                self.send(AppMessage::Pasted { ticket, content });
-            }
-            Effect::ReadClipboardImage { ticket } => {
+            Effect::ReadClipboard { ticket, wanted } => {
                 // Talking to a clipboard owner can block for the whole
                 // deadline, so it runs off the worker's own thread.
-                let image = tokio::task::spawn_blocking(crate::terminal::read_clipboard_image)
+                let content = tokio::task::spawn_blocking(move || read_host_clipboard(wanted))
                     .await
-                    .ok()
-                    .flatten();
-                self.send(AppMessage::ClipboardImage { ticket, image });
+                    .unwrap_or(ClipboardContent::Empty);
+                self.send(AppMessage::Pasted {
+                    ticket,
+                    wanted,
+                    content,
+                });
             }
             Effect::ContinueTurn { session_id } => {
                 let request = payloads::continue_turn(session_id);

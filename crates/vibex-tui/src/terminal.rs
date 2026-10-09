@@ -339,7 +339,7 @@ fn sanitize(value: &str) -> String {
 /// most other modern terminals, and it works over SSH — which a native
 /// clipboard library would not.
 pub fn copy_to_clipboard(text: &str) -> BackendResult<()> {
-    use base64_encode::encode;
+    use base64::encode;
     let encoded = encode(text.as_bytes());
     let sequence = format!("\x1b]52;c;{encoded}\x07");
     let mut stdout = io::stdout();
@@ -584,11 +584,20 @@ fn run_clipboard_command(program: &str, args: &[String]) -> Option<Vec<u8>> {
 
 /// Base64 for a data URL, exposed so attachments do not grow a second copy.
 pub fn encode_base64(input: &[u8]) -> String {
-    base64_encode::encode(input)
+    base64::encode(input)
 }
 
-/// Minimal base64 so the client does not pull a dependency for one call.
-mod base64_encode {
+/// Base64 for the terminal's own clipboard, which carries its answer in it.
+///
+/// `None` for anything that is not valid base64, padding included: the module
+/// below is deliberately strict, because a decoder that skips what it does not
+/// understand turns a corrupted packet into an apparently valid one.
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    base64::decode(input)
+}
+
+/// Minimal base64 so the client does not pull a dependency for two calls.
+mod base64 {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(input: &[u8]) -> String {
@@ -612,6 +621,43 @@ mod base64_encode {
             });
         }
         output
+    }
+
+    /// Decode `input`, refusing anything that is not whole padded base64.
+    pub fn decode(input: &str) -> Option<Vec<u8>> {
+        let bytes = input.as_bytes();
+        if !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            let mut values = [0u32; 4];
+            let mut padding = 0usize;
+            for (index, byte) in chunk.iter().enumerate() {
+                if *byte == b'=' {
+                    // Padding is only ever the tail of a quantum.
+                    if index < 2 {
+                        return None;
+                    }
+                    padding += 1;
+                    continue;
+                }
+                if padding > 0 {
+                    // Data behind padding is not a padded quantum.
+                    return None;
+                }
+                values[index] = u32::try_from(ALPHABET.iter().position(|it| it == byte)?).ok()?;
+            }
+            let triple = (values[0] << 18) | (values[1] << 12) | (values[2] << 6) | values[3];
+            output.push(((triple >> 16) & 0xff) as u8);
+            if padding < 2 {
+                output.push(((triple >> 8) & 0xff) as u8);
+            }
+            if padding < 1 {
+                output.push((triple & 0xff) as u8);
+            }
+        }
+        Some(output)
     }
 }
 
@@ -673,23 +719,42 @@ mod tests {
 
     #[test]
     fn base64_matches_the_reference_vectors() {
-        assert_eq!(base64_encode::encode(b""), "");
-        assert_eq!(base64_encode::encode(b"f"), "Zg==");
-        assert_eq!(base64_encode::encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode::encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode::encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode::encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode::encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64::encode(b""), "");
+        assert_eq!(base64::encode(b"f"), "Zg==");
+        assert_eq!(base64::encode(b"fo"), "Zm8=");
+        assert_eq!(base64::encode(b"foo"), "Zm9v");
+        assert_eq!(base64::encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64::encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64::encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]
     fn base64_handles_cjk_and_emoji() {
         let value = "中文 👋";
-        let encoded = base64_encode::encode(value.as_bytes());
+        let encoded = base64::encode(value.as_bytes());
         assert!(encoded.len().is_multiple_of(4));
-        // Decoding is not implemented here, so assert the length relationship:
-        // 3 bytes → 4 characters.
-        assert_eq!(encoded.len(), value.len().div_ceil(3) * 4);
+        // The terminal's own clipboard answers in base64, so the two halves
+        // have to be each other's inverse for every width of input.
+        assert_eq!(decode_base64(&encoded).as_deref(), Some(value.as_bytes()));
+    }
+
+    #[test]
+    fn base64_decoding_refuses_what_is_not_base64() {
+        assert_eq!(decode_base64("").as_deref(), Some(&b""[..]));
+        assert_eq!(decode_base64("Zg==").as_deref(), Some(&b"f"[..]));
+        assert_eq!(decode_base64("Zm8=").as_deref(), Some(&b"fo"[..]));
+        assert_eq!(decode_base64("Zm9v").as_deref(), Some(&b"foo"[..]));
+        // A packet is decoded as it arrives, so a truncated quantum must not
+        // pass for a short one.
+        assert_eq!(decode_base64("Zg="), None);
+        assert_eq!(decode_base64("Z"), None);
+        // Padding is only ever the tail of a quantum.
+        assert_eq!(decode_base64("=Zg="), None);
+        assert_eq!(decode_base64("Z=g="), None);
+        assert_eq!(decode_base64("Zg==Zg==").as_deref(), Some(&b"ff"[..]));
+        // Characters outside the alphabet are refused rather than skipped.
+        assert_eq!(decode_base64("Zm9\n"), None);
+        assert_eq!(decode_base64("Zm9-"), None);
     }
 
     #[test]

@@ -21,11 +21,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use vibex_backend::{BackendError, BackendResult};
 
-use crate::app::{App, Focus, LiveState, Overlay, Page, PromptField, Toast};
+use crate::app::{App, ClipboardWanted, Focus, LiveState, Overlay, Page, PromptField, Toast};
 use crate::keymap::Chord;
 use crate::reduce::Outcome;
 use crate::terminal::{TerminalGuard, with_terminal_restored};
-use crate::worker::{AppMessage, Worker};
+use crate::worker::{AppMessage, ClipboardContent, Worker};
 
 /// Logical tick period. A tick never performs I/O; it only expires toasts and
 /// re-evaluates time-based state.
@@ -82,6 +82,9 @@ fn event_loop(
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     let mut last_tick = Instant::now();
     let mut reason = ExitReason::UserQuit;
+    // The clipboard question the terminal has not answered yet, if any. While
+    // one is in flight nothing else may read the input queue.
+    let mut clipboard_read: Option<TerminalClipboardRead> = None;
 
     // First frame: paint the skeleton before any I/O result arrives. The
     // client opens on the page a session is written on, so what the first
@@ -92,65 +95,78 @@ fn event_loop(
     app.sync_transcript();
 
     loop {
+        // ---- the terminal's own clipboard --------------------------------
+        match pump_terminal_clipboard(app, worker, guard, &mut clipboard_read)? {
+            ClipboardPump::Quit => return Ok(ExitReason::UserQuit),
+            ClipboardPump::Applied => dirty = true,
+            ClipboardPump::Waiting => {}
+        }
+
         // ---- input -------------------------------------------------------
-        let mut drained = 0usize;
-        let batch_start = Instant::now();
-        while drained < INPUT_BATCH_LIMIT && batch_start.elapsed() < INPUT_BATCH_BUDGET {
-            match event::poll(Duration::from_millis(if dirty { 0 } else { 16 })) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    return Err(BackendError::failed(
-                        "tui_input_unavailable",
-                        error.to_string(),
-                    ));
-                }
-            }
-            let event = match event::read() {
-                Ok(event) => event,
-                Err(error) => {
-                    return Err(BackendError::failed(
-                        "tui_input_unavailable",
-                        error.to_string(),
-                    ));
-                }
-            };
-            drained += 1;
-            match event {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if handle_key(app, worker, guard, key)? {
-                        return Ok(ExitReason::UserQuit);
+        // A probe owns the input queue for as long as it is alive: the
+        // terminal's answer and a keystroke are the same kind of byte on the
+        // same descriptor, so reading keys here would read the answer as keys.
+        if clipboard_read.is_none() {
+            let mut drained = 0usize;
+            let batch_start = Instant::now();
+            while drained < INPUT_BATCH_LIMIT && batch_start.elapsed() < INPUT_BATCH_BUDGET {
+                match event::poll(Duration::from_millis(if dirty { 0 } else { 16 })) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        return Err(BackendError::failed(
+                            "tui_input_unavailable",
+                            error.to_string(),
+                        ));
                     }
-                    dirty = true;
                 }
-                Event::Mouse(mouse) => {
-                    if handle_mouse(app, worker, mouse) {
+                let event = match event::read() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        return Err(BackendError::failed(
+                            "tui_input_unavailable",
+                            error.to_string(),
+                        ));
+                    }
+                };
+                drained += 1;
+                match event {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if handle_key(app, worker, guard, key)? {
+                            return Ok(ExitReason::UserQuit);
+                        }
                         dirty = true;
                     }
-                }
-                Event::Resize(columns, rows) => {
-                    app.resize(columns, rows);
-                    dirty = true;
-                }
-                Event::Paste(text) => {
-                    if app.search_composing() {
-                        if let Some(search) = app.search.as_mut() {
-                            let mut query = search.query.clone();
-                            query.push_str(&text);
-                            search.set_query(query);
+                    Event::Mouse(mouse) => {
+                        if handle_mouse(app, worker, mouse) {
+                            dirty = true;
                         }
-                        app.refresh_search_matches();
-                    } else {
-                        // One route for every paste: a path to a picture is a
-                        // request to attach it, anything else is draft text.
-                        app.insert_pasted_text(&text);
                     }
-                    dirty = true;
+                    Event::Resize(columns, rows) => {
+                        app.resize(columns, rows);
+                        dirty = true;
+                    }
+                    Event::Paste(text) => {
+                        if app.search_composing() {
+                            if let Some(search) = app.search.as_mut() {
+                                let mut query = search.query.clone();
+                                query.push_str(&text);
+                                search.set_query(query);
+                            }
+                            app.refresh_search_matches();
+                        } else {
+                            // One route for every paste: a path to a picture is
+                            // a request to attach it, anything else is draft
+                            // text.
+                            app.insert_pasted_text(&text);
+                        }
+                        dirty = true;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            if app.should_quit {
-                return Ok(ExitReason::UserQuit);
+                if app.should_quit {
+                    return Ok(ExitReason::UserQuit);
+                }
             }
         }
 
@@ -161,7 +177,29 @@ fn event_loop(
             match messages.try_recv() {
                 Ok(message) => {
                     handled += 1;
-                    apply_message(app, worker, message)?;
+                    match message {
+                        // The host the client runs on has nothing on its
+                        // clipboard. The reader's clipboard may still be the one
+                        // the *terminal* holds — a client reached over `ssh` has
+                        // no other way to see it — so the terminal is asked
+                        // before the gesture is called empty.
+                        AppMessage::Pasted {
+                            ticket,
+                            wanted,
+                            content: crate::worker::ClipboardContent::Empty,
+                        } if crate::terminal_clipboard::available()
+                            && app.accepts_composer_ticket(&ticket) =>
+                        {
+                            clipboard_read = Some(TerminalClipboardRead {
+                                ticket,
+                                wanted,
+                                probe: crate::terminal_clipboard::Probe::start(terminal_wanted(
+                                    wanted,
+                                )),
+                            });
+                        }
+                        message => apply_message(app, worker, message)?,
+                    }
                     dirty = true;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -1452,53 +1490,147 @@ fn mouse_cell_clamped(app: &mut App, column: u16, row: u16) -> Option<(usize, u1
     Some((line, column - rect.x))
 }
 
+/// A clipboard read the terminal itself has to answer.
+///
+/// The host this client runs on had nothing on its clipboard, so the reader's
+/// clipboard can only be the one the terminal is holding — which is the whole
+/// situation of a client reached over `ssh`. The terminal's answer arrives on
+/// the input queue the event loop owns, so the loop reads it, and nothing else
+/// may read that queue until it has.
+struct TerminalClipboardRead {
+    ticket: crate::app::ComposerTicket,
+    wanted: ClipboardWanted,
+    probe: crate::terminal_clipboard::Probe,
+}
+
+/// Advance a clipboard read the terminal is answering, if one is in flight.
+///
+/// The probe swallows what the queue holds while it waits — it has to, or the
+/// terminal's own answer would be read as keystrokes — and `Ctrl+C` is the one
+/// key that is handed back, so a reader waiting on a prompt they cannot see can
+/// still leave.
+fn pump_terminal_clipboard(
+    app: &mut App,
+    worker: &Worker,
+    guard: &mut TerminalGuard,
+    read: &mut Option<TerminalClipboardRead>,
+) -> BackendResult<ClipboardPump> {
+    use crate::terminal_clipboard::Progress;
+
+    let Some(active) = read.as_mut() else {
+        return Ok(ClipboardPump::Waiting);
+    };
+    match active.probe.pump() {
+        Progress::Waiting => Ok(ClipboardPump::Waiting),
+        Progress::Interrupted => {
+            *read = None;
+            let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            Ok(if handle_key(app, worker, guard, ctrl_c)? {
+                ClipboardPump::Quit
+            } else {
+                ClipboardPump::Waiting
+            })
+        }
+        Progress::Answered(content) => {
+            let active = read.take().expect("the read was in flight");
+            apply_clipboard(
+                app,
+                &active.ticket,
+                active.wanted,
+                clipboard_content(content),
+            );
+            Ok(ClipboardPump::Applied)
+        }
+    }
+}
+
+/// What one pump of the terminal's clipboard produced.
+enum ClipboardPump {
+    /// The terminal has not finished.
+    Waiting,
+    /// The answer was applied, and the frame has something new to draw.
+    Applied,
+    /// The reader asked to leave.
+    Quit,
+}
+
+/// What the terminal's own clipboard held, in the worker's vocabulary.
+fn clipboard_content(content: crate::terminal_clipboard::TerminalClipboard) -> ClipboardContent {
+    use crate::terminal_clipboard::TerminalClipboard;
+    match content {
+        TerminalClipboard::Image { mime_type, bytes } => {
+            ClipboardContent::Image { mime_type, bytes }
+        }
+        TerminalClipboard::Text(text) => ClipboardContent::Text(text),
+        TerminalClipboard::Refused => ClipboardContent::Refused,
+        // A terminal that does not speak the protocol is a clipboard this
+        // client cannot reach; it is not a refusal to report.
+        TerminalClipboard::Empty | TerminalClipboard::Unsupported => ClipboardContent::Empty,
+    }
+}
+
+/// The half of the terminal's clipboard a gesture asks it for.
+fn terminal_wanted(wanted: ClipboardWanted) -> crate::terminal_clipboard::Wanted {
+    match wanted {
+        ClipboardWanted::Everything => crate::terminal_clipboard::Wanted::Everything,
+        ClipboardWanted::Image => crate::terminal_clipboard::Wanted::Image,
+    }
+}
+
+/// Apply what a clipboard read produced, whichever clipboard answered it.
+///
+/// Who asked decides what "nothing" means: a paste says so, the composer's
+/// attach action opens the path prompt, because naming a file is still a way
+/// to attach a picture.
+fn apply_clipboard(
+    app: &mut App,
+    ticket: &crate::app::ComposerTicket,
+    wanted: ClipboardWanted,
+    content: ClipboardContent,
+) {
+    if !app.accepts_composer_ticket(ticket) {
+        return;
+    }
+    match content {
+        ClipboardContent::Image { mime_type, bytes } => {
+            match app.attach_image_bytes(mime_type, bytes) {
+                Ok(label) => {
+                    let message = format!("{} {label}", app.strings.image_attached());
+                    app.toast(Toast::success(message));
+                }
+                Err(error) => app.toast(Toast::warning(error)),
+            }
+        }
+        ClipboardContent::Text(text) => app.insert_pasted_text(&text),
+        // The clipboard is there and this client was not allowed to read it:
+        // saying "nothing to paste" would send the reader looking in the wrong
+        // place.
+        ClipboardContent::Refused => {
+            app.toast(Toast::info(app.strings.clipboard_refused().to_string()));
+        }
+        ClipboardContent::Empty => match wanted {
+            ClipboardWanted::Image => {
+                app.overlay = Some(crate::app::Overlay::Prompt {
+                    title: app.strings.image_path_title().to_string(),
+                    field: crate::app::PromptField::ImagePath,
+                    value: String::new(),
+                });
+                app.toast(Toast::info(app.strings.image_clipboard_empty().to_string()));
+            }
+            ClipboardWanted::Everything => {
+                app.toast(Toast::info(app.strings.clipboard_empty().to_string()));
+            }
+        },
+    }
+}
+
 fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> BackendResult<()> {
     match message {
-        AppMessage::Pasted { ticket, content } => {
-            if !app.accepts_composer_ticket(&ticket) {
-                return Ok(());
-            }
-            use crate::worker::ClipboardContent;
-            match content {
-                ClipboardContent::Image { mime_type, bytes } => {
-                    match app.attach_image_bytes(mime_type, bytes) {
-                        Ok(label) => {
-                            let message = format!("{} {label}", app.strings.image_attached());
-                            app.toast(Toast::success(message));
-                        }
-                        Err(error) => app.toast(Toast::warning(error)),
-                    }
-                }
-                ClipboardContent::Text(text) => app.insert_pasted_text(&text),
-                ClipboardContent::Empty => {
-                    app.toast(Toast::info(app.strings.clipboard_empty().to_string()));
-                }
-            }
-        }
-        AppMessage::ClipboardImage { ticket, image } => {
-            if !app.accepts_composer_ticket(&ticket) {
-                return Ok(());
-            }
-            match image {
-                Some((mime_type, bytes)) => match app.attach_image_bytes(mime_type, bytes) {
-                    Ok(label) => {
-                        let message = format!("{} {label}", app.strings.image_attached());
-                        app.toast(Toast::success(message));
-                    }
-                    Err(error) => app.toast(Toast::warning(error)),
-                },
-                // No clipboard image: the reader can still name a file, and saying
-                // so is better than a key that appears to do nothing.
-                None => {
-                    app.overlay = Some(crate::app::Overlay::Prompt {
-                        title: app.strings.image_path_title().to_string(),
-                        field: crate::app::PromptField::ImagePath,
-                        value: String::new(),
-                    });
-                    app.toast(Toast::info(app.strings.image_clipboard_empty().to_string()));
-                }
-            }
-        }
+        AppMessage::Pasted {
+            ticket,
+            wanted,
+            content,
+        } => apply_clipboard(app, &ticket, wanted, content),
         AppMessage::Sessions(result) => {
             if let Err(error) = app.agent.apply_sessions(result) {
                 app.toast(Toast::danger(error.message));
@@ -3730,11 +3862,16 @@ mod tests {
         let messages = [
             AppMessage::Pasted {
                 ticket: ticket.clone(),
+                wanted: crate::app::ClipboardWanted::Everything,
                 content: crate::worker::ClipboardContent::Text("stale paste".into()),
             },
-            AppMessage::ClipboardImage {
+            AppMessage::Pasted {
                 ticket: ticket.clone(),
-                image: Some(("image/png".into(), vec![1, 2, 3])),
+                wanted: crate::app::ClipboardWanted::Image,
+                content: crate::worker::ClipboardContent::Image {
+                    mime_type: "image/png".into(),
+                    bytes: vec![1, 2, 3],
+                },
             },
             AppMessage::EditorFinished {
                 ticket: Some(ticket.clone()),
@@ -3782,6 +3919,7 @@ mod tests {
             &worker,
             AppMessage::Pasted {
                 ticket,
+                wanted: crate::app::ClipboardWanted::Everything,
                 content: crate::worker::ClipboardContent::Text(" accepted".into()),
             },
         )

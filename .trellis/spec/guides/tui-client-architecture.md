@@ -923,13 +923,32 @@ is never a column count.
   per draft and never recycled, `IMAGE_CAP` bounds a prompt, and clipboard bytes
   travel as a shared `Arc` so the undo snapshots do not copy the pixels.
 * **Clipboard reading is the worker's job, never the reducer's.**
-  `Effect::ReadClipboardImage` and `Effect::ReadClipboard` run on
-  `spawn_blocking`, shell out to the desktop's clipboard tool with a deadline
-  and a kill, and answer with an `AppMessage`. The read is *type-aware*: the
-  owner lists what it offers and the bytes come back under the type it offers,
-  because asking for PNG and nothing else finds nothing on a clipboard holding a
-  JPEG. The client still *writes* the clipboard only over OSC 52; reading is an
-  enhancement that degrades to "name a file instead" when no tool exists.
+  `Effect::ReadClipboard` — one variant, carrying `ClipboardWanted` so the
+  gesture that asked travels with the answer — runs on `spawn_blocking`, shells
+  out to the desktop's clipboard tool with a deadline and a kill, and answers
+  with an `AppMessage::Pasted` that names the gesture again. The read is
+  *type-aware*: the owner lists what it offers and the bytes come back under the
+  type it offers, because asking for PNG and nothing else finds nothing on a
+  clipboard holding a JPEG. The client still *writes* the clipboard only over
+  OSC 52.
+* **An empty host clipboard is not yet "nothing to paste": the terminal may be
+  holding it.** A client on the far side of an `ssh` link cannot read the
+  reader's clipboard from the host — the screenshot is on the machine the reader
+  is sitting at — so the loop asks the terminal itself, over kitty's OSC 5522.
+  `terminal_clipboard::Probe` is that conversation and the loop drives it,
+  because the answer arrives on the input queue `crossterm` reads and would
+  otherwise deliver as keystrokes: while a probe is in flight the loop reads no
+  keys and reads the queue at the byte level itself, which is the one moment the
+  interface does not echo typing. The three steps are ordered by what the reader
+  has to be asked about: the capability query (a DECRQM report nobody is asked
+  about) so an unsupporting terminal is only ever waited on once per run, the
+  type list (which a terminal must serve without a prompt) so a clipboard with
+  nothing the gesture can use never causes one, and only then the read itself,
+  which a terminal may confirm. `Ctrl+C` is handed back to the interface, noise
+  in the queue is skipped rather than allowed to end the answer, and the
+  answer's packets are reassembled per media type with the picture preferred. `TerminalClipboard::Refused` is its own outcome: a terminal
+  that will not hand the clipboard over is reported as that, never as an empty
+  clipboard, and everything degrades to "name a file instead".
 * **An attachment travels with its place in the message.** The chip label is
   dropped from the text, so the offset — `inline_text_offset`, in UTF-16 units
   of the *sent* text — is the only thing that says where the picture was: a
@@ -1053,7 +1072,7 @@ is never a column count.
 | `TestBackend` render tests | layout degrades correctly at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
 | Tiny-terminal render tests | every page paints a whole frame down to 1×1; a small terminal keeps a line of transcript and a composer that shows the draft |
 | Contract tests | dependency boundary, key tables, locale coverage, no secret-shaped copy, docs exist per page |
-| PTY end-to-end | the real binary enters raw mode, paints a first frame, writes zero bytes when idle, keeps in-process diagnostics out of the terminal, restores the terminal on exit, survives a resize storm |
+| PTY end-to-end | the real binary enters raw mode, paints a first frame, writes zero bytes when idle, keeps in-process diagnostics out of the terminal, restores the terminal on exit, survives a resize storm, and takes a picture from a terminal that answers the clipboard protocol — and gives the input queue back when the terminal stays silent or refuses |
 
 `cargo test -p vibex-tui` runs the first four. The PTY layer needs the harness
 entry point, so it runs as

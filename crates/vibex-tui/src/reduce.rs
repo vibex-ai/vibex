@@ -16,9 +16,9 @@ use vibex_core::{
 
 use crate::action::Intent;
 use crate::app::{
-    App, Availability, ComposerTarget, Effect, Focus, ManagementRow, Overlay, Page,
-    PendingCreation, PromptField, RunOption, RunOptionKey, RunOptionKind, RuntimePickerView, Toast,
-    WorkspacePickerRow,
+    App, Availability, ClipboardWanted, ComposerTarget, Effect, Focus, ManagementRow, Overlay,
+    Page, PendingCreation, PromptField, RunOption, RunOptionKey, RunOptionKind, RuntimePickerView,
+    Toast, WorkspacePickerRow,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
@@ -700,11 +700,13 @@ impl App {
                 });
                 Outcome::effects(effects)
             }
-            Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboardImage {
+            Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboard {
                 ticket: self.composer_ticket(),
+                wanted: ClipboardWanted::Image,
             }]),
             Intent::PasteClipboard => Outcome::effects(vec![Effect::ReadClipboard {
                 ticket: self.composer_ticket(),
+                wanted: ClipboardWanted::Everything,
             }]),
             Intent::ToggleDock => {
                 self.dock_open = !self.dock_open;
