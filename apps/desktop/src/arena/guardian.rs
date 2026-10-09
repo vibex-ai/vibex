@@ -1,8 +1,10 @@
-//! Guardian identities, attack choreography, and the shared animation state.
+//! Six encounter identities and their visible, spatial combat state.
 
-use std::f32::consts::TAU;
-
-use super::geometry::{Vec2, smoothstep};
+use super::{
+    geometry::{Vec2, smoothstep},
+    map::CENTER,
+};
+use std::f32::consts::{PI, TAU};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Guardian {
@@ -23,11 +25,6 @@ impl Guardian {
         Self::DeepSeek,
         Self::Copilot,
     ];
-
-    pub fn next(self) -> Self {
-        Self::ALL[(self as usize + 1) % Self::ALL.len()]
-    }
-
     pub fn agent(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
@@ -38,15 +35,15 @@ impl Guardian {
             Self::Copilot => "Copilot",
         }
     }
-
-    pub fn logo(self) -> &'static [u8] {
-        match self {
-            Self::Claude => include_bytes!("../../assets/icons/claude.svg"),
-            Self::Codex => include_bytes!("../../assets/icons/openai.svg"),
-            Self::Pi => include_bytes!("../../assets/icons/agents/pi.svg"),
-            Self::OpenCode => include_bytes!("../../assets/icons/opencode.svg"),
-            Self::DeepSeek => include_bytes!("../../assets/icons/agents/deepseek-harness.svg"),
-            Self::Copilot => include_bytes!("../../assets/icons/copilot.svg"),
+    pub fn from_agent(id: &str) -> Option<Self> {
+        match id {
+            "claude" | "claude-code" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "pi" | "pi-agent" => Some(Self::Pi),
+            "opencode" => Some(Self::OpenCode),
+            "deepseek" | "deepseek-harness" => Some(Self::DeepSeek),
+            "copilot" | "github-copilot" => Some(Self::Copilot),
+            _ => None,
         }
     }
 }
@@ -59,6 +56,8 @@ pub(super) enum BossState {
     Striking,
     Rushing,
     Recovery,
+    Submerged,
+    Relocating,
     Fallen,
 }
 
@@ -78,29 +77,13 @@ pub(super) enum Attack {
     Dive,
 }
 
-impl Attack {
-    pub fn strike_duration(self) -> f32 {
-        match self {
-            Self::Rush => 3.0,
-            Self::Dash => 0.36,
-            Self::Leap | Self::Dive => 0.65,
-            _ => 0.18,
-        }
-    }
-    pub fn impact_radius(self) -> f32 {
-        match self {
-            Self::Clap => 6.0,
-            Self::Stomp | Self::Leap | Self::Dive => 6.5,
-            _ => 4.5,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Boss {
     pub guardian: Guardian,
     pub position: Vec2,
     pub previous_position: Vec2,
+    /// Aim-plane coordinates of the actual visible weak point, distinct from
+    /// the footprint used for body contact and terrain collisions.
     pub core: Vec2,
     pub from: Vec2,
     pub target: Vec2,
@@ -112,19 +95,30 @@ pub(super) struct Boss {
     pub duration: f32,
     pub attacks: u32,
     pub spin: f32,
-    spin_from: f32,
+    pub height: f32,
+    pub from_height: f32,
+    pub pitch: f32,
+    pub bank: f32,
+    pub yaw: f32,
+    pub stride: f32,
+    /// Independent hand anchors keep reaching attacks separate from the torso.
+    pub hands: [Vec2; 2],
+    pub hand_heights: [f32; 2],
+    pub beam_end: Vec2,
+    pub fired: u32,
+    pub ward: u8,
 }
 
 impl Boss {
     pub fn new(guardian: Guardian) -> Self {
-        let position = Vec2::new(48.0, 22.0);
+        let position = CENTER.plus(Vec2::new(0.0, -12.0));
         let mut boss = Self {
             guardian,
             position,
             previous_position: position,
             core: position,
             from: position,
-            target: Vec2::new(48.0, 43.0),
+            target: CENTER.plus(Vec2::new(0.0, 25.0)),
             direction: Vec2::new(0.0, 1.0),
             exposed: 0.0,
             state: BossState::Dormant,
@@ -133,50 +127,113 @@ impl Boss {
             duration: 1.0,
             attacks: 0,
             spin: 0.0,
-            spin_from: 0.0,
+            height: 0.0,
+            from_height: 0.0,
+            pitch: 0.0,
+            bank: 0.0,
+            yaw: 0.0,
+            stride: 0.0,
+            hands: [position; 2],
+            hand_heights: [0.0; 2],
+            beam_end: position,
+            fired: 0,
+            ward: 0,
         };
+        boss.rest_hands();
         boss.update_core();
         boss
     }
     pub fn radius(&self) -> f32 {
         match self.guardian {
-            Guardian::Claude | Guardian::OpenCode => 6.0,
-            Guardian::Codex | Guardian::Copilot => 6.5,
-            Guardian::Pi | Guardian::DeepSeek => 4.8,
+            Guardian::Claude => 6.5,
+            Guardian::Codex => 6.6,
+            Guardian::Pi => 3.3,
+            Guardian::OpenCode => 6.2,
+            Guardian::DeepSeek => 7.0,
+            Guardian::Copilot => 5.0,
         }
     }
     pub fn progress(&self) -> f32 {
         (self.time / self.duration).clamp(0.0, 1.0)
     }
     pub fn airborne(&self) -> bool {
-        self.state == BossState::Striking && matches!(self.attack, Attack::Leap | Attack::Dive)
+        self.height > 5.0 || self.state == BossState::Submerged
     }
     pub fn enter(&mut self, state: BossState, duration: f32) {
+        self.from_height = self.height;
         self.state = state;
         self.time = 0.0;
         self.duration = duration;
-        self.spin_from = self.spin;
+        self.fired = 0;
     }
-    pub fn animate(&mut self, delta: f32) {
-        if self.guardian != Guardian::Codex {
-            return;
-        }
-        self.spin = match self.state {
-            BossState::Windup => self.spin_from - smoothstep(self.progress()) * 0.55,
-            BossState::Rushing => self.spin + delta * 7.0,
-            BossState::Recovery => {
-                let rest = (self.spin_from / TAU).round() * TAU;
-                self.spin_from + (rest - self.spin_from) * smoothstep(self.time / 0.45)
-            }
-            _ => self.spin,
+    pub fn face(&mut self, target: Vec2, rate: f32) {
+        let direction = target.minus(self.position).normalized();
+        let desired = direction.angle() - PI * 0.5;
+        let delta = (desired - self.yaw + PI).rem_euclid(TAU) - PI;
+        self.yaw += delta.clamp(-rate, rate);
+        self.direction = Vec2::from_angle(self.yaw + PI * 0.5);
+    }
+    pub fn local(&self, x: f32, y: f32, z: f32) -> Vec2 {
+        let (sin, cos) = self.yaw.sin_cos();
+        self.position.plus(Vec2::new(
+            x * cos - y * sin,
+            (x * sin + y * cos) * 0.62 - z - self.height,
+        ))
+    }
+    pub fn resting_hand(&self, side: f32) -> Vec2 {
+        let (sin, cos) = self.yaw.sin_cos();
+        self.position.plus(Vec2::new(
+            side * 12.0 * cos - 2.4 * sin,
+            (side * 12.0 * sin + 2.4 * cos) * 0.62,
+        ))
+    }
+    pub fn rest_hands(&mut self) {
+        self.hands = [self.resting_hand(-1.0), self.resting_hand(1.0)];
+        self.hand_heights = [3.0, 3.0];
+    }
+    pub fn update_core(&mut self) {
+        self.core = match self.guardian {
+            Guardian::Claude => self.local(0.0, 4.5, 6.5),
+            Guardian::Codex => self
+                .position
+                .minus(self.direction.scale(5.4))
+                .plus(Vec2::new(0.0, -3.0 - self.height)),
+            Guardian::Pi => self.local(-2.5, -1.0, 6.5),
+            Guardian::OpenCode => self.local(0.0, 5.0, 6.5),
+            Guardian::DeepSeek => self.local(0.0, 8.0, 4.2),
+            Guardian::Copilot => self.local(
+                if self.attacks.is_multiple_of(2) {
+                    -2.7
+                } else {
+                    2.7
+                },
+                4.2,
+                9.1,
+            ),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
-        if self.attack == Attack::Sweep {
-            self.core
-        } else {
-            self.position
+        self.local(0.0, 5.0, 6.5)
+    }
+    pub fn impact_radius(&self) -> f32 {
+        match (self.guardian, self.attack) {
+            (Guardian::Claude, Attack::Clap) => 5.0,
+            (Guardian::Codex, Attack::Leap) => 7.0,
+            (Guardian::OpenCode, _) => 6.2,
+            (Guardian::DeepSeek, _) => 8.0,
+            (Guardian::Copilot, _) => 6.7,
+            _ => 4.5,
         }
+    }
+    pub fn hover_height(&self, time: f32) -> f32 {
+        match self.guardian {
+            Guardian::Copilot => 9.0 + (time * 3.0).sin(),
+            Guardian::Pi => 1.0 + (time * 2.0).sin() * 0.5,
+            _ => 0.0,
+        }
+    }
+    pub fn rolling_height(pitch: f32) -> f32 {
+        pitch.cos().abs() * 7.5 + pitch.sin().abs() * 4.5 - 7.5
     }
     pub fn prepare(&mut self, player: Vec2) {
         self.attack = match self.guardian {
@@ -198,13 +255,19 @@ impl Boss {
                 }
             }
             Guardian::OpenCode => {
-                if self.attacks.is_multiple_of(2) {
-                    Attack::Stomp
-                } else {
+                if self.attacks % 3 == 2 {
                     Attack::Sweep
+                } else {
+                    Attack::Stomp
                 }
             }
-            Guardian::DeepSeek => Attack::Dash,
+            Guardian::DeepSeek => {
+                if self.attacks % 3 == 2 {
+                    Attack::Leap
+                } else {
+                    Attack::Dash
+                }
+            }
             Guardian::Copilot => {
                 if self.attacks.is_multiple_of(2) {
                     Attack::Volley
@@ -213,23 +276,137 @@ impl Boss {
                 }
             }
         };
-        self.from = self.position;
-        self.target = player.clamped(6.0);
-        self.direction = self.target.minus(self.attack_origin()).normalized();
-        let duration = match self.attack {
-            Attack::LeftFist | Attack::RightFist | Attack::Stomp => 0.95,
-            Attack::Clap | Attack::Cross | Attack::Pulse | Attack::Dive => 1.15,
-            Attack::Dash if !self.attacks.is_multiple_of(3) => 0.70,
-            _ => 1.05,
-        };
         self.attacks = self.attacks.wrapping_add(1);
+        self.from = self.position;
+        let reach = player.minus(self.position);
+        self.target = if self.guardian == Guardian::Claude && reach.length() > 25.0 {
+            self.position.plus(reach.normalized().scale(25.0))
+        } else {
+            player
+        };
+        self.direction = player.minus(self.position).normalized();
+        let duration = match self.attack {
+            Attack::Clap => 1.1,
+            Attack::LeftFist | Attack::RightFist => 0.85,
+            Attack::Rush => 0.9,
+            Attack::Leap => 1.0,
+            Attack::Cross => 1.2,
+            Attack::Pulse => 0.95,
+            Attack::Stomp => 0.65,
+            Attack::Sweep => 1.25,
+            Attack::Dash => 0.85,
+            Attack::Volley => 0.85,
+            Attack::Dive => 1.05,
+        };
         self.enter(BossState::Windup, duration);
     }
-    pub fn update_core(&mut self) {
-        self.core = if self.guardian == Guardian::Codex && self.exposed > 0.0 {
-            self.position.minus(self.direction.scale(5.0))
-        } else {
-            self.position.plus(Vec2::new(0.0, -4.0))
+    /// Smooth, deterministic roaming. No combat entity or clock is needed on
+    /// the home; the displayed pose is copied verbatim when the user enters.
+    pub fn idle(guardian: Guardian, time: f32, reduced: bool) -> Self {
+        let mut boss = Self::new(guardian);
+        if reduced {
+            boss.position = CENTER.plus(Vec2::new(0.0, -34.0));
+            boss.previous_position = boss.position;
+            boss.rest_hands();
+            boss.update_core();
+            return boss;
+        }
+        let t = time.rem_euclid(36.0) * TAU / 36.0;
+        let (x, y, tangent) = match guardian {
+            Guardian::Claude => {
+                let phase = t - PI * 0.25;
+                (
+                    phase.sin(),
+                    (phase * 2.0).sin(),
+                    Vec2::new(phase.cos() * 52.0, (phase * 2.0).cos() * 68.0),
+                )
+            }
+            Guardian::Codex => {
+                let phase = t + PI;
+                (
+                    phase.sin(),
+                    phase.cos() * 0.9,
+                    Vec2::new(phase.cos() * 52.0, -phase.sin() * 30.6),
+                )
+            }
+            Guardian::Pi => {
+                let phase = t - PI * 0.25;
+                (
+                    -phase.cos(),
+                    (phase * 2.0).sin() * 0.9,
+                    Vec2::new(phase.sin() * 52.0, (phase * 2.0).cos() * 61.2),
+                )
+            }
+            Guardian::OpenCode => {
+                let t = t + PI;
+                let x_curve = 0.65 + 0.35 * t.sin().abs();
+                let y_curve = 0.65 + 0.35 * t.cos().abs();
+                (
+                    t.sin() / x_curve,
+                    t.cos() / y_curve * 0.9,
+                    Vec2::new(
+                        t.cos() * 33.8 / x_curve.powi(2),
+                        -t.sin() * 19.89 / y_curve.powi(2),
+                    ),
+                )
+            }
+            Guardian::DeepSeek => {
+                let phase = t + PI;
+                (
+                    phase.sin(),
+                    phase.cos() * 0.9,
+                    Vec2::new(phase.cos() * 52.0, -phase.sin() * 30.6),
+                )
+            }
+            Guardian::Copilot => {
+                let phase = t + PI;
+                (
+                    phase.sin(),
+                    phase.cos(),
+                    Vec2::new(phase.cos() * 52.0, -phase.sin() * 34.0),
+                )
+            }
         };
+        boss.position = CENTER.plus(Vec2::new(x * 52.0, y * 34.0));
+        boss.previous_position = boss.position;
+        // Model heading follows the derivative of its own route, including
+        // the mage's figure eight and the terminal's rounded corners.
+        boss.yaw = tangent.angle() - PI * 0.5;
+        boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
+        boss.stride = t * 24.0;
+        boss.height = match guardian {
+            Guardian::Copilot => 8.0 + (t * 6.0).sin(),
+            Guardian::Pi => 1.5 + (t * 4.0).sin() * 0.7,
+            Guardian::DeepSeek => 1.0 + (t * 4.0).sin(),
+            _ => 0.0,
+        };
+        boss.spin = if guardian == Guardian::Codex {
+            t * 6.0
+        } else {
+            0.0
+        };
+        if guardian == Guardian::OpenCode {
+            boss.pitch = -t * 6.0;
+            boss.height = Self::rolling_height(boss.pitch);
+        }
+        boss.bank = if matches!(guardian, Guardian::DeepSeek | Guardian::Copilot) {
+            (t * 2.0).sin() * 0.16
+        } else {
+            0.0
+        };
+        boss.rest_hands();
+        boss.update_core();
+        boss
+    }
+    pub fn opening(&mut self, duration: f32) {
+        self.exposed = duration;
+        self.enter(BossState::Recovery, duration + 0.3);
+        self.update_core();
+    }
+    pub fn settle(&mut self) {
+        let t = smoothstep(self.progress());
+        self.height *= 1.0 - t * 0.08;
+        self.pitch *= 0.92;
+        self.bank *= 0.92;
     }
 }

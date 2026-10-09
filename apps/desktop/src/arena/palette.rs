@@ -1,67 +1,72 @@
-//! Authored raster material ramps. These colors belong to the game artwork;
-//! surrounding controls and the preview's compositing surface use the UI theme.
-
-use gpui::{App, Hsla, rgb};
-use gpui_component::ActiveTheme as _;
+//! Authored raster materials. Home and combat use these exact same colors;
+//! only the map's presence changes during entry and departure.
 
 use super::{guardian::Guardian, raster::ink};
-
+use gpui::{Hsla, rgb};
 const MATERIALS: [u32; ink::COUNT] = [
-    0x000000, 0x242931, 0x353d44, 0x6c716a, 0x939580, 0xb0af95, 0x737771, 0x4c5660, 0x7a8182,
-    0x354f49, 0x567655, 0x8fa16b, 0xbdc488, 0x3e4249, 0x5b625f, 0x858d7d, 0xb0b7a0, 0xd8d9b7,
+    0x000000, 0x19222c, 0x18222b, 0x55635b, 0x69776a, 0x82907c, 0x424d48, 0x35454c, 0x88978b,
+    0x273d36, 0x425c43, 0x73845d, 0x98a477, 0x3e4249, 0x5b625f, 0x858d7d, 0xb0b7a0, 0xd8d9b7,
     0xd3b774, 0x86744f, 0x623744, 0xcc5975, 0xf29c9c, 0xffefd2, 0xab7560, 0xe9b890, 0x312b38,
-    0x554252, 0x2d4158, 0x4f7897, 0x8bb2bd, 0x9a4b5d, 0xd67976, 0x555e56, 0x254f60, 0x3a7787,
-    0x8fc6bf, 0xe78963, 0xedb779, 0x9b724e, 0xbdb499, 0xe3dec0, 0xc49b67,
+    0x554252, 0x2d4158, 0x4f7897, 0x8bb2bd, 0x9a4b5d, 0xd67976, 0x1c2d32, 0x214751, 0x326572,
+    0x85b9b9, 0xe78963, 0xedb779, 0x9b724e, 0xbdb499, 0xe3dec0, 0xc49b67,
 ];
-
 pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
     let mut colors = MATERIALS.map(|value| rgb(value).into());
     let body = match guardian {
-        Guardian::Claude => [0x633f3a, 0x9b5143, 0xc76d50, 0xe18a65, 0xf1b58a],
-        Guardian::Codex => [0x304743, 0x49675a, 0x72917a, 0xa3b79a, 0xd2d9b8],
-        Guardian::Pi => [0x464150, 0x706476, 0xb6a48e, 0xe0d0aa, 0xf6eacb],
-        Guardian::OpenCode => [0x344049, 0x51616a, 0x829298, 0xb9c7c5, 0xe2e6d5],
-        Guardian::DeepSeek => [0x293955, 0x3b5482, 0x567daf, 0x87b3d0, 0xc1dbe0],
-        Guardian::Copilot => [0x343b50, 0x57607a, 0x8990aa, 0xbcbcd0, 0xe7dbdd],
+        Guardian::Claude => [0x593b38, 0x8a493b, 0xbc6449, 0xe18a63, 0xf2b88a],
+        Guardian::Codex => [0x254039, 0x3d6250, 0x648975, 0x9ebca1, 0xd3dfbc],
+        Guardian::Pi => [0x454051, 0x766978, 0xb8ac9c, 0xe6d6b3, 0xf7ebcb],
+        Guardian::OpenCode => [0x26353b, 0x485963, 0x7d9194, 0xb9cdca, 0xe2e9d8],
+        Guardian::DeepSeek => [0x203451, 0x355785, 0x507daf, 0x7daed0, 0xb5d5de],
+        Guardian::Copilot => [0x30394c, 0x515e75, 0x8295a8, 0xb7c6cc, 0xe4e0d2],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
     }
-    colors
-}
-
-pub(super) fn colors(
-    guardian: Guardian,
-    preview: bool,
-    reveal: f32,
-    cx: &App,
-) -> [Hsla; ink::COUNT] {
-    let mut colors = material_colors(guardian);
-    let background = cx.theme().background;
-    if preview || reveal < 1.0 {
-        let foreground = cx.theme().foreground;
-        for (ix, color) in colors.iter_mut().enumerate() {
-            let depth = match ix as u8 {
-                ink::SHADOW => 0.055,
-                ink::OUTLINE | ink::BODY_SHADOW | ink::BODY_DARK => 0.26,
-                ink::CORE | ink::CORE_LIGHT | ink::WHITE => 0.30,
-                _ => 0.19,
-            };
-            // Keep the silhouette readable in both themes, retaining a trace of
-            // each material's hue instead of imposing a second page background.
-            let idle = background
-                .blend(foreground.opacity(depth))
-                .blend(color.opacity(0.18));
-            *color = if preview {
-                idle
-            } else {
-                idle.blend(color.opacity(reveal))
-            };
-        }
+    let floor = match guardian {
+        Guardian::Claude => [
+            0x24322d, 0x647462, 0x83927a, 0x9caa8a, 0x4d5d4c, 0x3d4b41, 0xa3ad8a,
+        ],
+        Guardian::Codex => [
+            0x172c2c, 0x385450, 0x47655d, 0x617d6b, 0x2c4341, 0x2d4543, 0x829779,
+        ],
+        Guardian::Pi => [
+            0x222332, 0x353747, 0x414555, 0x51586a, 0x292e3e, 0x2e3344, 0x797a8d,
+        ],
+        Guardian::OpenCode => [
+            0x202733, 0x3b4a58, 0x50606b, 0x607782, 0x293b46, 0x30444c, 0x8ba1a4,
+        ],
+        Guardian::DeepSeek => [
+            0x142f3d, 0x516c69, 0x7c9180, 0xa6b49a, 0x385c59, 0x335457, 0x9cad94,
+        ],
+        Guardian::Copilot => [
+            0x2d3a4f, 0x687b89, 0x8a9ba1, 0xb0bbb4, 0x4b606f, 0x425768, 0xb6c4bc,
+        ],
+    };
+    for (ix, color) in [
+        ink::DEPTH,
+        ink::FLOOR_SHADE,
+        ink::FLOOR,
+        ink::FLOOR_LIGHT,
+        ink::SEAM,
+        ink::WALL,
+        ink::WALL_LIGHT,
+    ]
+    .into_iter()
+    .zip(floor)
+    {
+        colors[ix as usize] = rgb(color).into();
+    }
+    let core = match guardian {
+        Guardian::Claude => [0x683630, 0xeaaa69, 0xffddb2],
+        Guardian::Codex => [0x224d4d, 0x7de1c0, 0xd8ffe1],
+        Guardian::Pi => [0x673f68, 0xd789c1, 0xffd6eb],
+        Guardian::OpenCode => [0x25455d, 0x79d2e6, 0xd9ffff],
+        Guardian::DeepSeek => [0x663c61, 0xe488ac, 0xffdaed],
+        Guardian::Copilot => [0x645337, 0xedc77a, 0xffedb8],
+    };
+    for (ix, value) in core.into_iter().enumerate() {
+        colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
     }
     colors
-}
-
-pub(super) fn ground_colors(guardian: Guardian, reveal: f32, cx: &App) -> [Hsla; ink::COUNT] {
-    material_colors(guardian).map(|color| cx.theme().background.blend(color.opacity(reveal)))
 }

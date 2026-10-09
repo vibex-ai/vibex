@@ -12122,6 +12122,7 @@ impl VibexWorkbench {
                                 &agents,
                                 preferred_new_session_agent.as_ref(),
                             );
+                            this.sync_home_arena_agent(cx);
                             // Keep the last complete catalog visible while a
                             // profile-only refresh fetches the authoritative
                             // runtime snapshot. Replacing it with an empty
@@ -12279,6 +12280,7 @@ impl VibexWorkbench {
                                 &agents,
                                 preferred_new_session_agent.as_ref(),
                             );
+                            this.sync_home_arena_agent(cx);
                             if this.agent_catalog_generation == catalog_generation
                                 && this.runtime_catalog.is_none()
                             {
@@ -26975,6 +26977,7 @@ impl VibexWorkbench {
                 .or_else(|| self.new_session_agent_id.clone());
             self.new_session_agent_id =
                 default_new_session_agent_id(&self.agent_snapshots, preferred_agent.as_ref());
+            self.sync_home_arena_agent(cx);
             let preferred_runtime = self
                 .new_session_agent_id
                 .as_ref()
@@ -27591,6 +27594,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.new_session_agent_id = Some(selection.agent_id.clone());
+        self.sync_home_arena_agent(cx);
         self.clear_runtime_provider_keyboard_selection();
         self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_auth_source = None;
@@ -27759,6 +27763,12 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn sync_home_arena_agent(&mut self, cx: &mut Context<Self>) {
+        let agent = self.new_session_agent_id.as_ref().map(AgentId::as_str);
+        self.home_arena
+            .update(cx, |arena, cx| arena.select_agent(agent, cx));
+    }
+
     /// Draft-local Agent switch shared by the new-session home chips and the
     /// provider/model Agent row, so both surfaces derive the same provider and
     /// model preference for the chosen Agent.
@@ -27769,6 +27779,7 @@ impl VibexWorkbench {
         });
         self.set_new_session_runtime_selection(selection);
         self.new_session_agent_id = Some(agent_id);
+        self.sync_home_arena_agent(cx);
         self.new_session_error = None;
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
     }

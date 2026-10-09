@@ -1,117 +1,130 @@
-//! One pixel canvas shared by the idle preview and the playable arena.
-
-use std::{cell::Cell, rc::Rc, sync::OnceLock};
-
-use gpui::{
-    AnyElement, App, Background, Bounds, Hsla, IntoElement, Pixels, Point, Styled as _, Window,
-    canvas, fill, linear_color_stop, linear_gradient, point, px, size,
-};
-use gpui_component::ActiveTheme as _;
+//! Camera, native entry hit target and one clipped pixel canvas. Aim conversion
+//! always uses the last displayed camera, including its transient shake.
 
 use super::{
-    art,
-    combat::{Arena, Guardian, HEIGHT, INTRO_DURATION, Phase, Vec2, WIDTH, smoothstep},
+    HomeArena, art,
+    combat::{Arena, Boss, Guardian, HEIGHT, INTRO_DURATION, Phase, Vec2, WIDTH, smoothstep},
+    map::CENTER,
     palette,
-    raster::{PixelRect, ink},
+    raster::{PixelRect, Raster, ink},
 };
+use gpui::{
+    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, GlobalElementId, Hsla,
+    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, Pixels, Point, Style,
+    Styled as _, WeakEntity, Window, canvas, fill, point, px, relative, size,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use std::{cell::Cell, rc::Rc, sync::OnceLock};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PreviewSample {
     pub guardian: Guardian,
     pub time: f32,
+    pub boss: Boss,
     pub viewport: Option<PreviewViewport>,
 }
-
-impl Default for PreviewSample {
-    fn default() -> Self {
+impl PreviewSample {
+    pub fn at(guardian: Guardian, time: f32, reduced: bool) -> Self {
         Self {
-            guardian: Guardian::Claude,
-            time: 0.0,
+            guardian,
+            time,
+            boss: Boss::idle(guardian, time, reduced),
             viewport: None,
         }
     }
 }
-
+impl Default for PreviewSample {
+    fn default() -> Self {
+        Self::at(Guardian::Claude, 0.0, true)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PreviewViewport {
     pub bounds: Bounds<Pixels>,
     pub geometry: Geometry,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Geometry {
     pub origin: Point<Pixels>,
     pub unit: Pixels,
 }
-
 impl Geometry {
-    pub fn battle(bounds: Bounds<Pixels>) -> Self {
-        let unit = (bounds.size.width / WIDTH).min(bounds.size.height / HEIGHT);
+    pub fn battle(bounds: Bounds<Pixels>, camera: Vec2, rem: Pixels) -> Self {
+        let unit = (rem * 0.52)
+            .max(bounds.size.width / (WIDTH - 6.0))
+            .max(bounds.size.height / (HEIGHT - 6.0));
+        let half = Vec2::new(
+            bounds.size.width / unit * 0.5,
+            bounds.size.height / unit * 0.5,
+        );
+        let camera = Vec2::new(
+            camera.x.clamp(half.x, WIDTH - half.x),
+            camera.y.clamp(half.y - 20.0, HEIGHT + 8.0 - half.y),
+        );
         Self {
-            origin: bounds.origin
-                + point(
-                    (bounds.size.width - unit * WIDTH) * 0.5,
-                    (bounds.size.height - unit * HEIGHT) * 0.5,
-                ),
+            origin: bounds.center() - point(unit * camera.x, unit * camera.y),
             unit,
         }
     }
-
-    fn preview(bounds: Bounds<Pixels>, rem: Pixels) -> Self {
-        let unit = (rem * 0.5).min(bounds.size.width / 34.0);
+    pub fn preview(bounds: Bounds<Pixels>, rem: Pixels) -> Self {
+        let unit = (rem * 0.52)
+            .min(bounds.size.width / 152.0)
+            .min(bounds.size.height / 128.0);
         Self {
-            origin: bounds.origin
-                + point(
-                    bounds.size.width * 0.60 - unit * 48.0,
-                    bounds.size.height * 0.78 - unit * 22.0,
-                ),
+            // Reserve room for the winged guardian above its ground anchor.
+            origin: bounds.center() - point(unit * CENTER.x, unit * (CENTER.y - 5.0)),
             unit,
         }
     }
-
-    fn interpolate(self, target: Self, progress: f32) -> Self {
+    fn interpolate(self, target: Self, t: f32) -> Self {
         Self {
-            origin: self.origin + (target.origin - self.origin) * progress,
-            unit: self.unit + (target.unit - self.unit) * progress,
+            origin: self.origin + (target.origin - self.origin) * t,
+            unit: self.unit + (target.unit - self.unit) * t,
         }
     }
-
-    pub fn world(self, position: Point<Pixels>) -> Option<Vec2> {
+    #[cfg(test)]
+    pub fn screen(self, p: Vec2) -> Point<Pixels> {
+        self.origin + point(self.unit * p.x, self.unit * p.y)
+    }
+    pub fn world(self, p: Point<Pixels>) -> Option<Vec2> {
         if self.unit <= px(0.0) {
             return None;
         }
-        let x = (position.x - self.origin.x) / self.unit;
-        let y = (position.y - self.origin.y) / self.unit;
-        ((0.0..WIDTH).contains(&x) && (0.0..HEIGHT).contains(&y)).then_some(Vec2::new(x, y))
+        let p = Vec2::new(
+            (p.x - self.origin.x) / self.unit,
+            (p.y - self.origin.y) / self.unit,
+        );
+        ((0.0..WIDTH).contains(&p.x) && (0.0..HEIGHT).contains(&p.y)).then_some(p)
     }
 }
-
-struct Layout {
+pub(super) struct Layout {
     rectangles: Vec<PixelRect>,
     geometry: Geometry,
     colors: [Hsla; ink::COUNT],
-    ground: Option<[Hsla; ink::COUNT]>,
-    fade: Option<(Bounds<Pixels>, Background)>,
+    ground: Option<(Guardian, [Hsla; ink::COUNT])>,
+    background: Option<Hsla>,
 }
-
-fn paint(_: Bounds<Pixels>, layout: Layout, window: &mut Window, _: &mut App) {
+fn paint(bounds: Bounds<Pixels>, layout: Layout, window: &mut Window, _: &mut App) {
     if layout.geometry.unit <= px(0.0) {
         return;
     }
-    if let Some(colors) = layout.ground {
-        paint_rectangles(ground_rectangles(), layout.geometry, &colors, window);
+    if let Some(color) = layout.background {
+        window.paint_quad(fill(bounds, color));
+    }
+    if let Some((guardian, colors)) = layout.ground {
+        paint_rectangles(
+            ground_rectangles(guardian),
+            layout.geometry,
+            &colors,
+            window,
+        );
     }
     paint_rectangles(&layout.rectangles, layout.geometry, &layout.colors, window);
-    if let Some((bounds, fade)) = layout.fade {
-        window.paint_quad(fill(bounds, fade));
-    }
 }
-
-fn ground_rectangles() -> &'static [PixelRect] {
-    static GROUND: OnceLock<Vec<PixelRect>> = OnceLock::new();
-    GROUND.get_or_init(|| art::floor().rectangles())
+fn ground_rectangles(guardian: Guardian) -> &'static [PixelRect] {
+    static GROUND: OnceLock<[Vec<PixelRect>; 6]> = OnceLock::new();
+    &GROUND.get_or_init(|| Guardian::ALL.map(|g| art::floor(g).rectangles()))[guardian as usize]
 }
-
 fn paint_rectangles(
     rectangles: &[PixelRect],
     geometry: Geometry,
@@ -120,15 +133,22 @@ fn paint_rectangles(
 ) {
     let pixel = geometry.unit / art::SCALE;
     let scale = window.scale_factor();
-    // Snap shared raster edges to device pixels. Fractional viewport fits stay
-    // crisp without filtering, seams, per-pixel elements, or retained textures.
+    let clip = window.content_mask().bounds;
     let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
     for rect in rectangles {
         let left = snap(geometry.origin.x + pixel * f32::from(rect.x));
-        let top = snap(geometry.origin.y + pixel * f32::from(rect.y));
+        let top = snap(geometry.origin.y + pixel * (f32::from(rect.y) - art::TOP_PAD as f32));
         let right = snap(geometry.origin.x + pixel * f32::from(rect.x + rect.width));
-        let bottom = snap(geometry.origin.y + pixel * f32::from(rect.y + rect.height));
-        if right > left && bottom > top {
+        let bottom = snap(
+            geometry.origin.y + pixel * (f32::from(rect.y + rect.height) - art::TOP_PAD as f32),
+        );
+        if right > left
+            && bottom > top
+            && right >= clip.left()
+            && left <= clip.right()
+            && bottom >= clip.top()
+            && top <= clip.bottom()
+        {
             window.paint_quad(fill(
                 Bounds::new(point(left, top), size(right - left, bottom - top)),
                 colors[rect.ink as usize],
@@ -142,52 +162,50 @@ pub(super) fn battle(
     entry: Option<PreviewViewport>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     projection: Rc<Cell<Option<Geometry>>>,
-    reduced_motion: bool,
+    reduced: bool,
+    paused: bool,
 ) -> AnyElement {
-    let frame = art::battle(arena, reduced_motion);
+    let mut frame = art::battle(arena, reduced);
+    if paused && arena.phase == Phase::Battle {
+        let (x, y) = art::pixel(arena.player.position);
+        frame.rect(x - 5, y - 27, 3, 8, ink::IVORY);
+        frame.rect(x + 2, y - 27, 3, 8, ink::IVORY);
+    }
     let guardian = arena.boss.guardian;
-    let reveal = if arena.phase == Phase::Awakening {
-        smoothstep(arena.phase_time / INTRO_DURATION)
+    let reveal = arena.ground_visibility();
+    let opacity = if arena.phase == Phase::Victory {
+        reveal
     } else {
         1.0
     };
-    let travel = if reduced_motion {
+    let camera = arena.camera;
+    let travel = if reduced {
         1.0
     } else {
-        smoothstep(arena.phase_time / (INTRO_DURATION * 0.65))
+        smoothstep(arena.phase_time / (INTRO_DURATION * 0.95))
     };
     let entry = entry.filter(|_| arena.phase == Phase::Awakening);
-    let shake = if reduced_motion {
+    let shake = if reduced {
         Vec2::default()
     } else {
         arena.shake()
     };
     canvas(
-        move |layout_bounds, _, cx| {
+        move |layout_bounds, window, _| {
             bounds.set(Some(layout_bounds));
-            let mut geometry = Geometry::battle(layout_bounds);
+            let mut geometry = Geometry::battle(layout_bounds, camera, window.rem_size());
             if let Some(entry) = entry {
                 geometry = entry.geometry.interpolate(geometry, travel);
             }
             geometry.origin += point(geometry.unit * shake.x, geometry.unit * shake.y);
             projection.set(Some(geometry));
+            let material = palette::material_colors(guardian);
             Layout {
                 rectangles: frame.rectangles(),
                 geometry,
-                colors: palette::colors(guardian, false, reveal, cx),
-                ground: (reveal > 0.0).then(|| palette::ground_colors(guardian, reveal, cx)),
-                fade: entry
-                    .filter(|_| reveal < 1.0 && !reduced_motion)
-                    .map(|entry| {
-                        (
-                            entry.bounds,
-                            linear_gradient(
-                                180.0,
-                                linear_color_stop(cx.theme().background.opacity(0.0), 0.45),
-                                linear_color_stop(cx.theme().background.opacity(1.0 - reveal), 1.0),
-                            ),
-                        )
-                    }),
+                colors: material.map(|c| c.opacity(opacity)),
+                ground: (reveal > 0.0).then(|| (guardian, material.map(|c| c.opacity(reveal)))),
+                background: (reveal > 0.0).then(|| material[ink::DEPTH as usize].opacity(reveal)),
             }
         },
         paint,
@@ -196,198 +214,142 @@ pub(super) fn battle(
     .into_any_element()
 }
 
-pub(super) fn preview(
+/// The custom element only measures a moving raster. A normal Button still
+/// owns keyboard activation, focus, accessibility and pointer dispatch.
+pub(super) struct Entry {
     sample: PreviewSample,
     measured: Rc<Cell<PreviewSample>>,
-    reduced_motion: bool,
-) -> AnyElement {
-    canvas(
-        move |bounds, window, cx| {
-            // This is the last *displayed* pose, not an independent battle clock.
-            let geometry = Geometry::preview(bounds, window.rem_size());
-            measured.set(PreviewSample {
-                viewport: Some(PreviewViewport { bounds, geometry }),
-                ..sample
-            });
-            let frame = art::preview(sample.guardian, sample.time, reduced_motion);
-            Layout {
-                rectangles: frame.rectangles(),
-                geometry,
-                colors: palette::colors(sample.guardian, true, 1.0, cx),
-                ground: None,
-                fade: Some((
-                    bounds,
-                    linear_gradient(
-                        180.0,
-                        linear_color_stop(cx.theme().background.opacity(0.0), 0.45),
-                        linear_color_stop(cx.theme().background, 1.0),
-                    ),
-                )),
-            }
-        },
-        paint,
-    )
-    .size_full()
-    .into_any_element()
+    reduced: bool,
+    button: AnyElement,
+}
+impl Entry {
+    pub fn new(
+        sample: PreviewSample,
+        measured: Rc<Cell<PreviewSample>>,
+        reduced: bool,
+        state: WeakEntity<HomeArena>,
+    ) -> Self {
+        let button = Button::new("open-unbound")
+            .debug_selector(|| "unbound-boss-entry".into())
+            .ghost()
+            .w_full()
+            .h_full()
+            .p_0()
+            .accessibility_label(super::copy::entry_label(sample.guardian))
+            .tooltip(super::copy::entry_help())
+            .on_click(move |_, window, cx| {
+                let _ = state.update(cx, |state, cx: &mut Context<HomeArena>| {
+                    state.open(window, cx)
+                });
+            })
+            .into_any_element();
+        Self {
+            sample,
+            measured,
+            reduced,
+            button,
+        }
+    }
+}
+impl IntoElement for Entry {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+impl Element for Entry {
+    type RequestLayoutState = ();
+    type PrepaintState = Layout;
+    fn id(&self) -> Option<ElementId> {
+        Some("unbound-roaming-entry".into())
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Layout {
+        let geometry = Geometry::preview(bounds, window.rem_size());
+        self.measured.set(PreviewSample {
+            viewport: Some(PreviewViewport { bounds, geometry }),
+            ..self.sample
+        });
+        let frame = art::idle(&self.sample.boss, self.sample.time, self.reduced);
+        let (left, top, right, bottom) = model_bounds(&frame);
+        let pixel = geometry.unit / art::SCALE;
+        let hit_origin = geometry.origin
+            + point(
+                pixel * left as f32,
+                pixel * (top as f32 - art::TOP_PAD as f32),
+            );
+        self.button.layout_as_root(
+            size(
+                AvailableSpace::Definite(pixel * (right - left) as f32),
+                AvailableSpace::Definite(pixel * (bottom - top) as f32),
+            ),
+            window,
+            cx,
+        );
+        self.button.prepaint_at(hit_origin, window, cx);
+        Layout {
+            rectangles: frame.rectangles(),
+            geometry,
+            colors: palette::material_colors(self.sample.guardian),
+            ground: None,
+            background: None,
+        }
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        layout: &mut Layout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.button.paint(window, cx);
+        paint_rectangles(&layout.rectangles, layout.geometry, &layout.colors, window);
+        let _ = bounds;
+    }
+}
+fn model_bounds(frame: &Raster) -> (usize, usize, usize, usize) {
+    let mut left = frame.width;
+    let mut top = frame.height;
+    let mut right = 0;
+    let mut bottom = 0;
+    for (ix, color) in frame.pixels.iter().enumerate() {
+        if *color != ink::CLEAR && *color != ink::SHADOW {
+            let x = ix % frame.width;
+            let y = ix / frame.width;
+            left = left.min(x);
+            right = right.max(x + 1);
+            top = top.min(y);
+            bottom = bottom.max(y + 1);
+        }
+    }
+    (left.min(right), top.min(bottom), right, bottom)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::arena::raster::Raster;
-
-    fn assert_same_pixels(expected: &Raster, actual: &Raster, context: &str) {
-        assert_eq!(
-            (expected.width, expected.height),
-            (actual.width, actual.height)
-        );
-        let difference = expected
-            .pixels
-            .iter()
-            .zip(&actual.pixels)
-            .enumerate()
-            .find(|(_, (a, b))| a != b);
-        assert!(
-            difference.is_none(),
-            "{context}: first changed pixel {difference:?}"
-        );
-    }
-
-    #[test]
-    fn pointer_coordinates_follow_the_letterboxed_arena() {
-        for (width, height) in [(960.0, 560.0), (320.0, 420.0), (1400.0, 400.0)] {
-            let bounds = Bounds::new(point(px(17.0), px(31.0)), size(px(width), px(height)));
-            let geometry = Geometry::battle(bounds);
-            let center = geometry.origin + point(geometry.unit * 48.0, geometry.unit * 28.0);
-            let world = geometry.world(center).unwrap();
-            assert!((world.x - 48.0).abs() < 0.001);
-            assert!((world.y - 28.0).abs() < 0.001);
-            assert!(
-                geometry
-                    .world(geometry.origin - point(px(1.0), px(1.0)))
-                    .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn merged_rectangles_reconstruct_the_exact_raster() {
-        for guardian in Guardian::ALL {
-            let actors = art::battle(&Arena::new(guardian, 0.0), false);
-            let mut frame = art::floor().clone();
-            frame.blit(&actors, 0, 0);
-            let mut rectangles = ground_rectangles().to_vec();
-            rectangles.extend(actors.rectangles());
-            assert!(
-                rectangles.len() < 12_000,
-                "{guardian:?}: {} quads",
-                rectangles.len()
-            );
-            let mut restored = Raster::new(art::WIDTH, art::HEIGHT);
-            for rect in rectangles {
-                assert!((rect.ink as usize) < ink::COUNT);
-                restored.rect(
-                    i32::from(rect.x),
-                    i32::from(rect.y),
-                    i32::from(rect.width),
-                    i32::from(rect.height),
-                    rect.ink,
-                );
-            }
-            assert_same_pixels(&frame, &restored, &format!("{guardian:?} rectangles"));
-        }
-    }
-
-    #[test]
-    fn idle_preview_has_no_archer_and_entry_keeps_the_displayed_pose() {
-        for guardian in Guardian::ALL {
-            for time in [0.0, 0.37, 2.75, 5.99] {
-                let preview = art::preview(guardian, time, false);
-                assert!(
-                    !preview
-                        .pixels
-                        .iter()
-                        .any(|color| matches!(*color, ink::SKIN | ink::CAPE | ink::CLOTH))
-                );
-                let arena = Arena::new(guardian, time);
-                assert_same_pixels(
-                    &preview,
-                    &art::battle(&arena, false),
-                    &format!("{guardian:?} entry"),
-                );
-                assert_eq!(
-                    art::pose(time, 0.0, false),
-                    art::pose(arena.visual_time, arena.phase_time / INTRO_DURATION, false)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn reduced_motion_freezes_every_idle_guardian_and_preview_loops_join() {
-        for guardian in Guardian::ALL {
-            let still = art::preview(guardian, 0.0, true);
-            for time in [0.37, 2.75, 5.99] {
-                assert_same_pixels(
-                    &still,
-                    &art::preview(guardian, time, true),
-                    &format!("{guardian:?} reduced motion"),
-                );
-            }
-            assert_same_pixels(
-                &art::preview(guardian, 0.0, false),
-                &art::preview(guardian, art::IDLE_PERIOD, false),
-                &format!("{guardian:?} idle loop"),
-            );
-        }
-    }
-
-    #[test]
-    fn the_entry_camera_starts_at_the_preview_and_settles_in_the_field() {
-        let preview = Geometry::preview(
-            Bounds::new(point(px(80.0), px(32.0)), size(px(960.0), px(192.0))),
-            px(16.0),
-        );
-        let field = Geometry::battle(Bounds::new(
-            point(px(80.0), px(140.0)),
-            size(px(960.0), px(500.0)),
-        ));
-        assert_eq!(preview.interpolate(field, 0.0), preview);
-        assert_eq!(preview.interpolate(field, 1.0), field);
-        let middle = preview.interpolate(field, 0.5);
-        let center = middle.origin + point(middle.unit * 48.0, middle.unit * 22.0);
-        let world = middle.world(center).unwrap();
-        assert!((world.x - 48.0).abs() < 0.001);
-        assert!((world.y - 22.0).abs() < 0.001);
-    }
-
-    #[gpui::test]
-    fn entry_colors_join_the_home_theme_before_revealing_the_materials(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            for mode in [
-                gpui_component::ThemeMode::Light,
-                gpui_component::ThemeMode::Dark,
-            ] {
-                gpui_component::Theme::change(mode, None, cx);
-                for guardian in Guardian::ALL {
-                    assert_eq!(
-                        palette::colors(guardian, false, 0.0, cx),
-                        palette::colors(guardian, true, 1.0, cx)
-                    );
-                    assert_eq!(
-                        palette::colors(guardian, false, 1.0, cx),
-                        palette::material_colors(guardian)
-                    );
-                    assert!(
-                        palette::ground_colors(guardian, 0.0, cx)
-                            .iter()
-                            .all(|color| *color == cx.theme().background)
-                    );
-                }
-            }
-        });
-    }
-}
+#[path = "scene_tests.rs"]
+mod tests;

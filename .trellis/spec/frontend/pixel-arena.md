@@ -2,9 +2,9 @@
 
 ## 1. Scope / Trigger
 
-Read when changing AI Souls (AI 之魂), the optional new-session preview, pixel
-art, local boss combat, input lifecycle, or its appearance preference. The
-feature lives in `apps/desktop/src/arena/` and cannot mutate Agent sessions,
+Read when changing AI Souls (AI 之魂), roaming pixel guardians, local boss
+combat, terrain, camera, input lifecycle, or the home appearance preference.
+The feature lives in `apps/desktop/src/arena/`. It cannot mutate Agent sessions,
 workspaces, runtime state, or network services.
 
 ## 2. Signatures and Ownership
@@ -12,176 +12,207 @@ workspaces, runtime state, or network services.
 ```rust
 AppearanceUiState::show_home_arena: bool
 HomeArena::new(FocusHandle) -> HomeArena
-HomeArena::close(&mut self, &mut Context<Self>)
+HomeArena::select_agent(Option<&str>, &mut Context<Self>)
+HomeArena::close(&mut Context<Self>)
 arena::home_surface(&Entity<HomeArena>, bool, impl IntoElement, &mut Window, &mut App) -> AnyElement
-Arena::new(Guardian, f32) -> Arena // second argument: last displayed idle time
+Arena::from_preview(Boss, f32, u32) -> Arena // displayed pose, visual time, spawn seed
 Arena::tick(Controls)
 Arena::release_shot(Option<Vec2>)
 Arena::roll(Vec2)
-Arena::needs_tick() -> bool
+Arena::respawn()
 Arena::outcome_ready() -> bool
-Boss::attack_origin() -> Vec2
+Boss::idle(Guardian, f32, bool) -> Boss
+Map::move_body(Vec2, Vec2, f32) -> Vec2
+Map::cover_hit(Vec2, Vec2) -> bool
+Map::beam_end(Vec2, Vec2) -> Vec2
 Geometry::world(Point<Pixels>) -> Option<Vec2>
 ```
 
-- `showHomeArena` is the serialized appearance key. Legacy UI-state files
-  default to `true`; an explicit `false` survives save and load through the
-  existing `queue_ui_state` path.
-- `HomeArena` owns one optional `ArenaView`, the composer's focus handle, and
-  the last displayed `PreviewSample { guardian, time, viewport }`.
-- `ArenaView` owns held input, measured canvas geometry, the entry camera,
-  pause/closed flags, attempt count, and one cancellable GPUI clock.
-- `combat.rs`, `guardian.rs`, and `geometry.rs` have no GPUI dependency.
-  `art.rs` authors raster frames; `raster.rs` supplies integer primitives and
-  rectangle merging; `palette.rs` composites game materials into the UI theme;
-  `scene.rs` projects and paints them; `copy.rs` owns localized game copy.
-- Existing `Unbound` key context and element IDs remain internal stable
-  identifiers. User-visible naming comes from `copy::title()`.
+- `showHomeArena` is the persisted appearance key; absent values default to
+  `true`. The existing appearance update path persists changes and closes a
+  live battle when disabled.
+- `HomeArena` owns Agent identity, the completed flag, an optional `ArenaView`,
+  composer focus, and the last displayed `PreviewSample`. Catalog refresh,
+  draft initialization, runtime choice, and Agent choice call
+  `sync_home_arena_agent` from update handlers, never from render.
+- `ArenaView` owns input, the last measured projection, pause/closed flags,
+  home opacity, and one cancellable clock. Closing or navigating away releases
+  the clock and all input. The existing composer entity and draft survive.
+- `combat.rs`, `guardian.rs`, `encounters.rs`, `map.rs`, and `geometry.rs` are
+  independent of GPUI. `sculpture.rs` authors spatial meshes; `scenery.rs`
+  authors terrain; `art.rs` composes them with actors and effects. `raster.rs`
+  owns integer primitives and rectangle merging, `palette.rs` owns artwork
+  materials, `scene.rs` owns projection/painting, and `copy.rs` owns copy.
+- `Unbound` action context and element IDs remain stable internal identifiers.
+  Localized naming is AI Souls / AI 之魂.
 
 ## 3. Contracts
 
-### Home layering and entry
+### Home, entry, and return
 
-- The keyboard-accessible entry Button is an absolutely positioned background.
-  Its height reserves no space: enabling it must leave the introduction and
-  composer at identical bounds. Foreground content occludes its pointer target.
-- Preview renders only the selected guardian's idle pose, shadow, and ambient
-  details. It has no archer, arrow, attack, combat entity, or simulation task.
-- A six-second GPUI animation draws at most 12 FPS. All idle loops join at the
-  repeat boundary. Reduced motion freezes every ambient detail; inactive-window
-  animation follows the appearance preference; an open dialog freezes preview.
-- Prepaint records the guardian, animation time, bounds, and actual projection
-  shown to the user. Opening samples these values, creates one battle inside
-  the existing home viewport, and preserves the composer entity and its draft.
-  It never opens a dialog or covers workbench navigation.
-- The 1.2-second `Awakening` phase starts from that same pose and palette. The
-  camera interpolates from the measured preview into the letterboxed field;
-  the ground and controls appear gradually, and the archer materializes before
-  attacks are enabled. The root clips this transition to the home surface.
-  Reduced motion skips camera travel while retaining essential combat tells.
-- A pending first-focus callback must not flash a pause card or restart a battle
-  already closed by navigation. Retry and guardian selection clear the home
-  entry camera, so neither replays a stale transition from the home preview.
-- Escape/Back emit `DismissEvent`, stop and drop the battle, restore composer
-  focus, and resume preview with the last selected guardian and visual time.
-  Leaving home, reopening New Session, or disabling the preference also closes
-  combat without redirecting navigation focus.
+- The home is the guardian's roaming area. Preview is an absolute background
+  across the entire area and reserves no layout space. Enabling it must leave
+  introduction and composer bounds unchanged. Foreground controls occlude the
+  guardian's pointer target where they cover it.
+- Supported Agent selection determines the guardian. Switching Agent resets the
+  completed flag; catalog refreshes or reselecting the same Agent do not.
+  Unsupported Agents have no substitute guardian.
+- Preview draws the same model and material colors as combat, with its shadow
+  and idle articulation. It has no floor, archer, arrow, attack simulation, or
+  gameplay clock. The 36-second roaming loop runs at most 24 FPS; reduced motion
+  freezes every part. Dialogs freeze preview, and inactive windows follow the
+  existing ambient-animation appearance preference.
+- `scene::Entry` measures the current raster and positions a native ghost
+  `Button` around the visible model, excluding its shadow. The Button owns
+  pointer/keyboard activation, accessibility, hover, focus, and tooltip. Empty
+  home space is not a game entry. Do not replace it with a clickable canvas.
+- Prepaint records pose, visual time, bounds, and exact projection. Activation
+  copies that sample into `Arena::from_preview`; it never resets the pose or
+  re-samples a different animation time. Hover may redraw between pointer down
+  and up, so tests must inspect the sample actually consumed by activation.
+- The 1.4-second `Awakening` phase keeps the first model frame identical, fades
+  home content out, reveals terrain, materializes the archer, and interpolates
+  into the following camera. No gameplay input or damage runs during entry.
+  Flight height remains continuous; rolling models settle through the nearest
+  upright rotation. Reduced motion skips camera travel.
+- Battle fills the home area and remains clipped to it. There is no dialog,
+  title/header/footer, visible instruction panel, selector, control button, or
+  result card. Workbench navigation remains available. Instructions belong in
+  the entry tooltip and the canvas has an accessible name.
+- Death plays for one second, chooses a random clear spawn at a safe distance
+  from the guardian, then materializes the archer for 0.7 seconds. It clears
+  threats and input and starts a fresh opening delay without replaying entry.
+  Destroyed terrain remains destroyed.
+- Victory has a finite 3.3-second departure: the guardian collapses, unravels,
+  rises, splits, submerges, or folds according to its form. The final 0.7 seconds
+  fade the field away and restore home content. `DismissEvent` drops the battle,
+  restores composer focus, and hides the guardian until an Agent switch.
+- Escape emits the same dismissal event but resumes preview. Navigation and
+  disabling the preference close without redirecting navigation focus. A
+  pending first-focus callback must not restart an already closed battle.
 
 ### Combat and input
 
-- Simulate at fixed 60 Hz with an approximately 60 FPS GPUI clock. Each wake
-  accepts at most 100 ms of elapsed time; a suspended UI cannot catch up a
-  lethal backlog. Bound projectiles to 48, effects to 48, and shockwaves to 8.
+- Simulate at fixed 60 Hz. Each clock wake accepts at most 100 ms of elapsed
+  time, so suspension cannot replay a lethal backlog. Bound projectiles to 48,
+  effects to 64, waves to 8, and hazards to 16.
 - Focus loss, window deactivation, pause, and close release held keys, mouse
-  buttons, aim, charging, and recall, and cancel the clock. Combat pauses on
-  deactivation regardless of the ambient-animation preference. Resume resets
-  the elapsed-time baseline and retains one clock.
-- WASD/arrows move; hold J/left mouse then release to shoot; hold K/right mouse
-  to recall; Space rolls; P pauses; R retries; Enter continues; Escape returns.
-  Keyboard attacks restore assisted aim to the core after pointer use. Mouse
-  aiming uses the exact displayed projection, including letterboxing and shake.
-- The archer has one arrow and one life. Drawing requires at least 0.30 seconds.
-  Drawing/recalling commit the archer to standing still. Rolling cancels drawing,
-  moves for 0.26 seconds, protects for 0.28 seconds, and cools down for 0.54 seconds.
-- Attacks track during the first 60% of windup and commit for the final 40%.
-  Telegraphs cannot deal damage. Rendered beam paths and collisions share
-  `Boss::attack_origin()`; the sentinel's beam originates at its shutter/core.
-  Relative-motion segment tests prevent fast bodies/projectiles tunneling
-  through the archer. An arrow must intersect an exposed core to win.
-- Victory/defeat clear active threats immediately; lethal impacts cannot create
-  a new shockwave afterward. Results appear after one second of finite outro
-  animation. After 1.25 seconds, a finished battle is inert.
+  buttons, pointer aim, charging, and recall, and cancel the clock. Combat always
+  pauses on deactivation. Resume resets elapsed time and retains one clock.
+- WASD/arrows move; hold J or left mouse then release to shoot; K or right mouse
+  recalls; Space rolls; P pauses; Enter or a field click resumes; R respawns;
+  Escape returns. Keyboard attacks restore assisted weak-point aim after pointer
+  use. Pointer aim uses the last displayed camera, including shake.
+- The archer has one arrow and one life. Drawing requires 0.30 seconds. Drawing
+  and recalling hold position. A roll cancels drawing, moves for 0.28 seconds,
+  protects for 0.30 seconds, and cools down for 0.50 seconds.
+- Each choreography commits its target during windup. Aerial landing targets
+  must be clear terrain positions before the tell locks. Landing tells remain
+  visible during flight and share the impact radius used by collision.
+- Projectile/body collisions sweep relative motion to avoid tunneling. Beam
+  rendering and damage share the origin and terrain-clipped endpoint.
+  Telegraphs cannot cause damage. Victory/death clear live threats before
+  subsequent attacks can spawn additional hazards.
+- An arrow must intersect the exposed weak point, not merely the body. Core
+  coordinates are aim-plane points distinct from the grounded body footprint.
+  Closed armor never grants a win; every miss retains a retrieval path.
 
-### Guardian choreography
+### Six encounters
 
-`Guardian::ALL` defines selection, progression, and the bounded art-cache order.
-Each guardian must remain beatable through ordinary inputs without a damage
-override. Direct selection starts a fresh attempt and clears held input.
+`Guardian::ALL` is the bounded identity/art-cache order. Each encounter must be
+winnable using normal movement, charging, release, recall, roll, and automatic
+rebirth, without a damage override.
 
-| Guardian | Recognizable sculpture | Attack and opening |
+| Guardian | Form and choreography | Terrain and opening |
 | --- | --- | --- |
-| Claude | Orange mascot, square eyes, wide arms, four legs | Left fist, right fist, double slam; chest opens after the double slam. |
-| Codex | Extruded woven ring with stone limbs | Charges and leaps; a wall impact reveals the rear core. |
-| Pi | P-shaped mantle and staff-bearing i figure | Cross spell and expanding pulse; the exposed seal yields only to a returning arrow. |
-| OpenCode | Hollow terminal body and mechanical limbs | Slam followed by a beam; shutter opens after firing. |
-| DeepSeek | Blue whale, fins, and water ripples | Three surges; the third recovery reveals its heart. |
-| Copilot | Goggled helmet and layered mechanical wings | Paired volleys followed by a dive; landing exposes the core. |
+| Claude | Orange square mascot, four planted legs, independent reaching fists, alternating strikes and double slam | Mossy clipped garden; split ground faults follow the double slam and its chest fractures open. |
+| Codex | Six interwoven strands with visible depth, rolling rushes, leaps, and rebound | Circular stone court with breakable pillars; pillar or perimeter impacts expose the rear knot. The perimeter preserves opportunities after all pillars break. |
+| Pi | Hollow P mantle with an i-shaped staff bearer, crossing runes, radial pulses, and relocation | Three dais in a polygonal observatory; the exposed seal only yields to a returning arrow. |
+| OpenCode | Hollow terminal block, full spatial turns, directional shutter beam, and venting | Gridded foundry with physical column cover; the shutter opens after the beam and must be hit from the front. |
+| DeepSeek | Segmented whale, two-sided fins, tail motion, submerged travel, surges, and high breach | Lagoon with four islands; islands protect from water waves but not falling bodies. The throat opens after landing, with delayed geysers nearby. |
+| Copilot | Goggled helmet, articulated mechanical wings, circling, paired feather salvos, and dive | Stepped terrace with sparse columns; landing folds its wings and exposes a cracked lens before a smooth takeoff. |
 
-### Raster and projection
+### Raster and camera
 
-- World geometry is 96 × 56 units; authored art is a 384 × 224 palette-indexed
-  raster. Use integer primitives and nearest-neighbor transforms. Never use
-  glyph metrics, emoji, linear texture filtering, or one GPUI element per pixel.
-- One canvas paints cached ground rectangles and dynamic actors. Merge matching
-  horizontal runs vertically; work/memory remain linear in raster size. Cache
-  only the bounded floor, bundled logo reliefs, and hero sprite.
-- Give raised bodies side/top planes, a ground shadow, height during jumps,
-  grounded impact debris, and depth ordering against the archer. Idle breathing,
-  windup, strike, recovery, and defeat must be distinct readable poses.
-- Material ramps are authored game artwork, not UI tokens. Header/footer use
-  theme roles. Preview ink blends foreground/background with restrained material
-  hue in both theme modes. The initial battle palette exactly matches preview.
-- Composite the preview's vertical gradient over all artwork, starting at 45%
-  and reaching the exact home background at the bottom edge. Fade this same
-  measured overlay away during entry. Ground colors reveal separately.
-- Snap shared rectangle edges to device pixels. Fractional viewport fits must
-  remain crisp and seamless. `Geometry::world` rejects letterbox padding and
-  zero-sized projections; never derive aim from the window dimensions.
+- The world is 176 × 116 units. Art uses a 704 × 592 palette-indexed raster:
+  four pixels per world unit plus 128 pixels above ground for raised models.
+  Painting and model hit bounds both remove this top offset. Airborne parts
+  must not be cut off by a ground-only raster.
+- Sculptures use rotated vertices, face culling, depth ordering, and discrete
+  light ramps. Thin fins/plates render both sides. Full turns finish at an
+  equivalent orientation; do not reset a half turn to upright.
+- Body, independent hands, archer, and pillars sort by ground depth. Preview
+  and combat use the same ordering, including a hand behind the torso.
+- The camera smoothly follows the archer with a small guardian/look-ahead bias,
+  clamps near world edges, and leaves overhead room. It does not fit the whole
+  map into a fixed box. Resolve scale from rem and viewport coverage; never add
+  letterboxing or derive pointer aim from window size alone.
+- One canvas paints cached floor rectangles and dynamic actor rectangles.
+  Merge horizontal runs vertically; work/memory stay linear in raster size.
+  Caches are limited to six floors, their rectangles, and the hero sprite.
+  No glyph rendering, emoji, filtered texture scaling, or element per pixel.
+- Authored material ramps are raster content, not application chrome. Preview
+  and combat use identical colors on light and dark home surfaces. Terrain
+  opacity reveals separately; no theme-colored veil recolors the guardian.
+- Snap shared rectangle edges to physical pixels and cull against the clip.
+  `Geometry::world` rejects zero scale and positions outside the world.
 
 ## 4. Validation / Error Matrix
 
 | Condition | Required behavior |
 | --- | --- |
-| Legacy preference is absent / explicit false | Show entry / remove entry and preview animation |
-| Preview toggles or foreground composer is clicked | No content displacement; click edits the draft |
-| Entry is activated | Same displayed guardian/time/camera; no dialog; archer appears during awakening |
-| Reduced motion | Static preview, no camera travel or shake; attack tells still readable |
-| Shoot/roll during awakening | No attack, charge, or player movement |
-| Charge released too soon / arrow already away | Do not create an arrow / a second arrow |
-| Arrow intersects closed armor / misses an exposed core | No victory; retain the retrieval path |
-| Pi is hit with an outgoing arrow | No victory; explain the return-arrow opening |
-| Target moves after windup locks | Preserve the committed attack path |
-| Focus leaves / window deactivates | Pause and clear input immediately |
-| Select guardian / retry | Reset attempt state; cancel the prior clock; discard entry camera |
-| Home closes before initial focus callback | Stay closed with no clock |
-| Victory/defeat completes | No new threats, held input, or ongoing simulation |
+| Missing preference / explicit false | Show supported guardian / omit preview and close combat |
+| Unsupported Agent | No substitute guardian |
+| Empty home or composer clicked | No game entry; composer edits its existing draft |
+| Visible guardian activated | Same displayed pose/palette; native pointer and keyboard paths work |
+| Entry pending when home closes | No focus steal, restart, or clock |
+| Reduced motion | Static preview; no camera travel, shake, or decorative particles; essential tells remain |
+| Charge released early / arrow away | No arrow / no second arrow |
+| Closed armor or wrong weak-point direction | No victory; arrow remains retrievable |
+| All breakable pillars destroyed | Perimeter impacts still provide an opening |
+| Window or focus changes | Pause immediately and clear input |
+| Archer dies | Clear threats; random safe rebirth; no result card |
+| Guardian defeated | Finite departure, restored draft/focus, hidden preview until Agent changes |
 
 ## 5. Good / Base / Bad Cases
 
-- Good: lure a charge into the boundary, roll aside, then hit the exposed rear
-  core; pause safely by switching windows and continue with cleared input.
-- Base: open from an idle preview, switch guardian, return with Escape, and type
-  ordinary game-key letters into the original draft.
-- Bad: reserve a top inset for decoration, create a combat entity during every
-  render, attach global gameplay interceptors, keep a hidden clock alive, or
-  paint a beam from a different origin than its collision test.
+- Good: lure a rush into a pillar, avoid its impact, and hit the rear opening;
+  a later perimeter collision remains valid if that attempt misses.
+- Base: click a roaming model, play across a scrolling field, then Escape and
+  type game-key letters into the unchanged draft.
+- Bad: shift the composer to reserve preview space, reset the entry pose,
+  translate a flat logo for every attack, use one map for all guardians, leave
+  an invisible clock running, or make visible cover disagree with a beam.
 
 ## 6. Required Tests and Checks
 
-- Combat: awakening, minimum charge, one-arrow ownership, retrieval, armor,
-  return-only seal, every opening, target lock, roll protection, one-hit defeat,
-  beam origin, post-death threat cleanup, relative collision, long-run bounds,
-  finite outro, and normal-input victories for every guardian.
-- Raster/geometry: exact rectangle reconstruction and a bounded quad count,
-  no archer in preview, identical preview/initial actor rasters, frozen reduced
-  motion, joining idle loops, entry camera endpoints, pointer mapping, and
-  palette continuity in light and dark themes.
-- GPUI integration: pointer/keyboard entry without a dialog, Escape/Back,
-  retained draft/focus, navigation during play, pending-focus cancellation,
-  held input, pointer aim, pause/resume, retry/advance, all guardian selectors,
-  returning to the last guardian, narrow widths, zoom, and both themes.
-- Preference tests cover legacy decoding and a persisted opt-out.
+- Combat: entry/input exclusion, minimum draw, single arrow/retrieval, armor,
+  directional and return-only weak points, committed targets, swept collisions,
+  independent fists, cover, terrain breakage, island protection, random rebirth,
+  threat cleanup, finite victory, continuous flight/turn transitions, bounded
+  long runs, and normal-input wins for all six guardians.
+- Raster/camera: distinct maps, exact quad reconstruction and bounded count,
+  preview without an archer, identical preview/first combat frame, joining idle
+  loops, reduced motion, moving model bounds, two-sided fins, raised geometry,
+  following camera, pointer mapping, and entry projection endpoints.
+- GPUI integration: native pointer/keyboard entry, no dialogs/chrome, full-home
+  bounds at narrow sizes and rem zoom, composer hit testing, retained draft/focus,
+  navigation and pending-focus cancellation, Agent switching, victory hiding,
+  death/rebirth, held input, pointer release outside, and pause.
+- Preference tests retain legacy decoding and persisted opt-out coverage.
 - Run `cargo test -p vibex-desktop --lib arena:: --locked`,
   `cargo test -p vibex-desktop-model --locked`, formatting, and scoped Clippy.
+  Measure dynamic rasterization and rectangle counts after artwork changes;
+  CPU raster timings alone do not establish end-to-end UI frame rate.
 
 ## 7. Wrong vs Correct
 
 ```rust
-// Wrong: decoration moves the user's primary work and starts an unrelated pose.
-home.pt(rems(BANNER_HEIGHT_REM)).child(preview).child(composer);
+// Wrong: restarting entry discards the visible roaming pose and camera.
 let battle = Arena::new(Guardian::Claude, 0.0);
 
-// Correct: retain layering and initialize from the actual displayed preview.
-arena::home_surface(&self.home_arena, enabled, content, window, cx);
-let battle = Arena::new(sample.guardian, sample.time);
+// Correct: the entry owns the pose actually measured and displayed.
+let sample = self.preview.get();
+let arena = Arena::from_preview(sample.boss, sample.time, seed);
+let entry_camera = sample.viewport;
 ```

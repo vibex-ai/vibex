@@ -53,6 +53,8 @@ pub(super) struct Raster {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u8>,
+    offset_x: i32,
+    offset_y: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,14 +68,21 @@ pub(super) struct PixelRect {
 
 impl Raster {
     pub fn new(width: usize, height: usize) -> Self {
+        Self::with_offset(width, height, 0, 0)
+    }
+
+    pub fn with_offset(width: usize, height: usize, offset_x: i32, offset_y: i32) -> Self {
         Self {
             width,
             height,
             pixels: vec![ink::CLEAR; width * height],
+            offset_x,
+            offset_y,
         }
     }
 
     pub fn get(&self, x: i32, y: i32) -> u8 {
+        let (x, y) = (x + self.offset_x, y + self.offset_y);
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return ink::CLEAR;
         }
@@ -81,12 +90,14 @@ impl Raster {
     }
 
     pub fn put(&mut self, x: i32, y: i32, ink: u8) {
+        let (x, y) = (x + self.offset_x, y + self.offset_y);
         if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
             self.pixels[y as usize * self.width + x as usize] = ink;
         }
     }
 
     pub fn rect(&mut self, x: i32, y: i32, width: i32, height: i32, ink: u8) {
+        let (x, y) = (x + self.offset_x, y + self.offset_y);
         let left = x.clamp(0, self.width as i32) as usize;
         let right = (x + width).clamp(0, self.width as i32) as usize;
         if left >= right {
@@ -153,13 +164,18 @@ impl Raster {
     }
 
     pub fn polygon(&mut self, points: &[(i32, i32)], ink: u8) {
-        let top = points.iter().map(|p| p.1).min().unwrap_or(0).max(0);
+        let top = points
+            .iter()
+            .map(|p| p.1)
+            .min()
+            .unwrap_or(0)
+            .max(-self.offset_y);
         let bottom = points
             .iter()
             .map(|p| p.1)
             .max()
             .unwrap_or(0)
-            .min(self.height as i32 - 1);
+            .min(self.height as i32 - self.offset_y - 1);
         let mut intersections = Vec::with_capacity(points.len());
         for y in top..=bottom {
             intersections.clear();
@@ -175,13 +191,15 @@ impl Raster {
         }
     }
 
+    #[cfg(test)]
     pub fn blit(&mut self, sprite: &Self, left: i32, top: i32) {
-        for y in 0..sprite.height as i32 {
-            for x in 0..sprite.width as i32 {
-                let color = sprite.get(x, y);
-                if color != ink::CLEAR {
-                    self.put(left + x, top + y, color);
-                }
+        for (ix, color) in sprite.pixels.iter().enumerate() {
+            if *color != ink::CLEAR {
+                self.put(
+                    left + (ix % sprite.width) as i32 - sprite.offset_x,
+                    top + (ix / sprite.width) as i32 - sprite.offset_y,
+                    *color,
+                );
             }
         }
     }

@@ -1,7 +1,7 @@
 //! Logical world coordinates and collision geometry, independent of drawing.
 
-pub(super) const WIDTH: f32 = 96.0;
-pub(super) const HEIGHT: f32 = 56.0;
+pub(super) const WIDTH: f32 = 176.0;
+pub(super) const HEIGHT: f32 = 116.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Vec2 {
@@ -35,6 +35,15 @@ impl Vec2 {
     }
     pub fn dot(self, other: Self) -> f32 {
         self.x * other.x + self.y * other.y
+    }
+    pub fn perpendicular(self) -> Self {
+        Self::new(-self.y, self.x)
+    }
+    pub fn angle(self) -> f32 {
+        self.y.atan2(self.x)
+    }
+    pub fn from_angle(angle: f32) -> Self {
+        Self::new(angle.cos(), angle.sin())
     }
     pub fn lerp(self, other: Self, progress: f32) -> Self {
         self.plus(other.minus(self).scale(progress.clamp(0.0, 1.0)))
