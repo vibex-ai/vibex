@@ -1646,6 +1646,15 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   Management, Usage, Terminal, PDF, and Office surfaces) render through GPUI
   `Entity::cached(StyleRefinement::default().size_full())` boundaries so child
   notifications do not rebuild unrelated parent element trees.
+- Preview full screen must not re-host the editor panel. The panel keeps its
+  docked slot and its right edge, and the slot widens over the workbench column,
+  so the left seam is the only thing that travels — right-to-left on the way out,
+  left-to-right on the way back in — and the editor is never painted twice. The
+  slot takes whatever the columns beside it leave, so a sidebar or rail toggled
+  while the panel is full screen cannot push the row past the window. While the
+  seam travels, the page it passes is drawn at the column's own width under it and
+  rides with the slot; a docked pane's animation state reports the end of its
+  tween through a settle timer, which is what tells the shell to drop that page.
 - The unfiltered sidebar project/workspace/session projection is cached behind
   an explicit revision and shared as `Rc<Vec<SidebarProjectProjection>>`.
   Authoritative workspace/session/context replacement, pin changes, and
