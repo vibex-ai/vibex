@@ -1214,6 +1214,18 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   document that lands after the query still highlights. Setting highlights must
   be skipped when the rendered revision did not change, or the observer and the
   repaint it causes would keep each other awake.
+- A rendered file preview has a find bar of its own, and find follows focus
+  there as it does for the editor and the browser: `focused_markdown_preview`
+  answers the chord while the preview's text view — or the source editor the
+  tab keeps behind the rendered document — holds the keyboard, and
+  `CodeWorkbench::focused_editor` declines for a path whose tab is showing its
+  preview, so the hidden editor cannot open a find panel behind a document
+  nobody can see. The bar renders under the preview header, searches the
+  rendered text through the shared `session_search_match_ranges`, steps with
+  Enter/Shift+Enter and the arrows, reveals the current hit with
+  `reveal_range`, and clears its highlights when it closes. Its hits are the
+  workbench's own state (`MarkdownFindState`), not the conversation's: the
+  session's find bar searches messages, never the file on screen.
 - Links arrive exactly as the document wrote them. `http`/`https` opens through
   `validate_external_open_url`; a fragment stays in place; anything else resolves
   as a workspace path relative to the document's directory (`base_path_for_file`
@@ -1294,6 +1306,11 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   preview goes back to a fit-content text view — and
   `a_large_markdown_preview_is_fed_in_chunks` pins the feed: the preview must not
   take a document of several chunks in one hand-off.
+  `the_find_chord_reaches_the_focused_markdown_preview` pins the chord to the
+  focused rendered preview and away from its hidden source editor, and
+  `a_markdown_preview_find_searches_its_rendered_document` pins the hits to the
+  rendered text: source-only markup such as a `##` heading marker matches
+  nothing, stepping wraps, and closing clears the bar.
 - `cargo test -p vibex-tui --locked` covers its own terminal renderer, which parses
   with `pulldown-cmark` inside the crate and shares nothing with the GPUI surfaces.
 - Source audit: `rg -n 'vibex_markdown|MarkdownView::new|parse_markdown\(' apps crates`

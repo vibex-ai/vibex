@@ -6074,7 +6074,11 @@ fn session_search_folded_match_ranges(
     ranges
 }
 
-fn session_search_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+/// Every case-insensitive occurrence of `query` in `text`.
+///
+/// Shared with the code workbench, whose previews search their rendered text
+/// with the folding the conversation's find already uses.
+pub(crate) fn session_search_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
     session_search_match_ranges_with_limit(text, query, usize::MAX)
 }
 
@@ -6131,7 +6135,7 @@ fn session_search_highlighted_text(
 /// Only the keyword is tinted — never the message around it — and the find
 /// bar's current match is painted stronger than the other hits, so the row the
 /// bar scrolled to stays identifiable inside a wall of text.
-fn session_search_keyword_highlight(active: bool, cx: &App) -> HighlightStyle {
+pub(crate) fn session_search_keyword_highlight(active: bool, cx: &App) -> HighlightStyle {
     HighlightStyle {
         background_color: Some(cx.theme().warning.opacity(if active { 0.65 } else { 0.42 })),
         font_weight: Some(FontWeight::BOLD),
@@ -30659,16 +30663,18 @@ impl VibexWorkbench {
 
     /// Opens find on whichever surface holds the keyboard.
     ///
-    /// The file editor and the embedded browser bind the same chord for their
-    /// own find, but a workbench binding is registered after the component's
-    /// and so outranks it: with a file editor focused, the conversation's find
-    /// opened over the file the user was reading. Find follows focus — those
-    /// surfaces answer for themselves here, and only a conversation that
-    /// actually has the keyboard falls through to the session search.
+    /// The file editor, the rendered Markdown preview and the embedded browser
+    /// all bind the same chord for their own find, but a workbench binding is
+    /// registered after the component's and so outranks it: with a file editor
+    /// focused, the conversation's find opened over the file the user was
+    /// reading. Find follows focus — those surfaces answer for themselves here,
+    /// and only a conversation that actually has the keyboard falls through to
+    /// the session search.
     fn open_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let code_workbench = self.code_workbench.clone();
         if code_workbench.update(cx, |workbench, cx| {
-            workbench.open_focused_editor_find(window, cx)
+            workbench.open_focused_markdown_find(window, cx)
+                || workbench.open_focused_editor_find(window, cx)
                 || workbench.open_focused_browser_find(window, cx)
         }) {
             return;

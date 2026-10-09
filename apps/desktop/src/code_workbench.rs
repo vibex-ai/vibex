@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::markdown::{
-    MarkdownPresentation, TextView, TextViewState, base_path_for_file, data_url_image,
-    resolve_workspace_path, resources as markdown_resources, text_view_style,
+    MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
+    base_path_for_file, data_url_image, resolve_workspace_path, resources as markdown_resources,
+    text_view_style,
 };
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
@@ -88,7 +90,7 @@ use vibex_desktop_runtime::validate_external_open_url;
 use vibex_terminal::TerminalManager;
 
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
-use crate::app::VibexWorkbench;
+use crate::app::{VibexWorkbench, session_search_keyword_highlight, session_search_match_ranges};
 use crate::assets::{BUNDLED_SANS_FAMILY, agent_brand_icon, file_icon, open_tool_brand_icon};
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
@@ -466,6 +468,106 @@ struct MarkdownPreviewState {
     blocks_last_pushed: Option<usize>,
     /// Frames the pending chunk has waited for the previous one to land.
     frames_waited: u32,
+}
+
+/// The find bar of one rendered Markdown preview.
+///
+/// The bar belongs to the document it is over: its hits index that preview's
+/// rendered text, and the session goes away with the tab rather than following
+/// the reader into another file's find. The field keeps the reader's query, so
+/// reopening the bar over the same file resumes where they left off.
+struct MarkdownFindState {
+    /// The preview the bar searches, workspace-relative.
+    path: String,
+    /// Whether the bar is on screen. A closed bar paints nothing and searches
+    /// nothing, but keeps the reader's query for the next open.
+    open: bool,
+    /// The preview's retained text view, held so the bar can paint and reveal
+    /// hits even after the preview leaves the retained set.
+    state: Entity<TextViewState>,
+    /// Observes that text view's parses, so a document that lands after the
+    /// query still gets its hits.
+    _observed: Subscription,
+    /// What the reader typed.
+    input: Entity<InputState>,
+    /// The field's typing and Enter, routed to the bar for as long as it lives.
+    _input_events: Subscription,
+    /// Where each hit sits in the preview's rendered text, in document order.
+    matches: Vec<Range<usize>>,
+    /// Which hit the bar counts as current, and paints stronger than the rest.
+    current: usize,
+    /// The query and the document the hits were found in. A frame that changed
+    /// neither searches and paints nothing.
+    searched: Option<(String, RenderedText)>,
+    /// Whether the current hit still has to be scrolled into view.
+    reveal: bool,
+}
+
+/// The find bar's query, without the whitespace a reader leaves around it.
+///
+/// A document is searched literally: the conversation's find collapses runs of
+/// whitespace because it searches chat messages, but collapsing here would stop
+/// a query from matching the spacing a code block actually has.
+fn normalized_markdown_find_query(query: &str) -> String {
+    query.trim().to_string()
+}
+
+/// Route the bar's field to the open find for as long as the bar lives.
+fn subscribe_markdown_find_input(
+    cx: &mut Context<CodeWorkbench>,
+    input: &Entity<InputState>,
+) -> Subscription {
+    cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
+        InputEvent::Change => this.sync_markdown_find(cx),
+        InputEvent::PressEnter { shift, .. } => {
+            this.step_markdown_find(if *shift { -1 } else { 1 }, cx)
+        }
+        InputEvent::Focus | InputEvent::Blur => {}
+    })
+}
+
+/// Observe one preview's parses for the height of a find session.
+fn observe_markdown_find_parse(
+    cx: &mut Context<CodeWorkbench>,
+    state: &Entity<TextViewState>,
+) -> Subscription {
+    cx.observe(state, |this, _, cx| this.sync_markdown_find(cx))
+}
+
+/// Paint the find bar's hits over the preview's rendered document.
+///
+/// Every hit gets the find's own tint, and the current one a stronger tint
+/// painted after it, so the match the bar stepped to stays identifiable inside
+/// a wall of text.
+fn paint_markdown_find_highlights(find: &MarkdownFindState, cx: &mut App) {
+    let background = session_search_keyword_highlight(false, cx)
+        .background_color
+        .unwrap_or_default();
+    let active = session_search_keyword_highlight(true, cx)
+        .background_color
+        .unwrap_or_default();
+    let mut highlights = find
+        .matches
+        .iter()
+        .cloned()
+        .map(|range| RangeHighlight::new(range, background))
+        .collect::<Vec<_>>();
+    if let Some(range) = find.matches.get(find.current) {
+        highlights.push(RangeHighlight::new(range.clone(), active));
+    }
+    find.state.update(cx, |state, cx| {
+        let _ = state.set_range_highlights(highlights, cx);
+    });
+}
+
+/// Scroll the find bar's current hit into view.
+fn reveal_markdown_find_match(find: &MarkdownFindState, cx: &mut App) {
+    let Some(range) = find.matches.get(find.current).cloned() else {
+        return;
+    };
+    find.state.update(cx, |state, cx| {
+        let _ = state.reveal_range(range, cx);
+    });
 }
 
 /// How many open Markdown previews keep a retained text view.
@@ -1373,6 +1475,12 @@ pub struct CodeWorkbench {
     git_preview_errors: BTreeMap<String, String>,
     preview_tab_scrolls: BTreeMap<String, ScrollHandle>,
     markdown_previews: BTreeMap<String, MarkdownPreviewState>,
+    /// The field the Markdown preview's find bar types into. One bar serves the
+    /// preview the reader is looking at, so its query follows them between the
+    /// files they search.
+    markdown_find_input: Entity<InputState>,
+    /// The find bar of the rendered Markdown preview, once one has been opened.
+    markdown_find: Option<MarkdownFindState>,
     preview_revealed_tab_ids: BTreeMap<String, String>,
     pending_file_search_reveal: Option<FileSearchReveal>,
     pending_file_search_directory_reveal: Option<String>,
@@ -1465,6 +1573,15 @@ impl CodeWorkbench {
                 .rows(3)
                 .placeholder(locale::text("Commit message", "提交信息", "提交訊息"))
         });
+        let markdown_find_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text(
+                    "Find in preview",
+                    "在预览中查找",
+                    "在預覽中尋找",
+                ))
+                .submit_on_enter(true)
+        });
         let mut this = Self {
             parent,
             backend: None,
@@ -1550,6 +1667,8 @@ impl CodeWorkbench {
             git_preview_errors: BTreeMap::new(),
             preview_tab_scrolls: BTreeMap::new(),
             markdown_previews: BTreeMap::new(),
+            markdown_find_input,
+            markdown_find: None,
             preview_revealed_tab_ids: BTreeMap::new(),
             pending_file_search_reveal: None,
             pending_file_search_directory_reveal: None,
@@ -1971,9 +2090,14 @@ impl CodeWorkbench {
             return None;
         }
         self.editor_bindings
-            .values()
-            .find(|binding| binding.input.read(cx).focus_handle(cx).is_focused(window))
-            .map(|binding| binding.input.clone())
+            .iter()
+            // A Markdown tab showing its rendered document has no editor on
+            // screen. The source editor the tab keeps behind it holds a stale
+            // focus handle, and answering for it would open a find panel nobody
+            // can see.
+            .filter(|(path, _)| !self.markdown_preview_showing(path))
+            .find(|(_, binding)| binding.input.read(cx).focus_handle(cx).is_focused(window))
+            .map(|(_, binding)| binding.input.clone())
     }
 
     /// Opens the focused editor's own find panel. Returns whether one took the
@@ -2516,6 +2640,7 @@ impl CodeWorkbench {
         self.file_tree.restore_navigation_state(Vec::new(), None);
         self.preview_tab_scrolls.clear();
         self.markdown_previews.clear();
+        self.markdown_find = None;
     }
 
     /// Apply a file rename or delete to the parked layouts of the current
@@ -6577,6 +6702,14 @@ impl CodeWorkbench {
                 self.editor_bindings.remove(path);
                 self.presentations.remove(path);
                 self.markdown_edit_paths.remove(path);
+                if self
+                    .markdown_find
+                    .as_ref()
+                    .is_some_and(|find| find.path == path)
+                {
+                    // The bar belongs to the tab, so it goes away with it.
+                    self.markdown_find = None;
+                }
                 self.file_tasks.remove(path);
                 self.file_tasks.remove(&format!("markdown:{path}"));
                 self.file_tasks.remove(&format!("markdown-scan:{path}"));
@@ -7215,6 +7348,9 @@ impl CodeWorkbench {
             .into_iter()
             .map(|(path, preview)| (replace_path_prefix(&path, source, destination), preview))
             .collect();
+        if let Some(find) = self.markdown_find.as_mut() {
+            find.path = replace_path_prefix(&find.path, source, destination);
+        }
         self.lifecycles = std::mem::take(&mut self.lifecycles)
             .into_iter()
             .map(|(tab_id, lifecycle)| {
@@ -9761,6 +9897,316 @@ impl CodeWorkbench {
         entry.frames_waited = 0;
     }
 
+    /// Whether a path's tab is on screen showing its rendered document.
+    ///
+    /// A Markdown file has two representations and one tab: the source editor
+    /// and the rendered preview. Only the preview answers for the file while it
+    /// is the representation on screen, and only while its tab is the active one
+    /// in a pane — a tab parked under another session, or one the reader
+    /// switched away from, keeps its retained view but shows nothing.
+    fn markdown_preview_showing(&self, path: &str) -> bool {
+        !self.markdown_edit_paths.contains(path)
+            && self.preview_active_tab_is(
+                PreviewTarget::File {
+                    path: path.to_string(),
+                }
+                .tab_id()
+                .as_str(),
+            )
+    }
+
+    /// Whether the find bar, or the document it searches, holds the keyboard.
+    ///
+    /// The bar is open over one preview: a second Ctrl+F belongs to it rather
+    /// than to the conversation behind the panel, and Escape closes it.
+    fn markdown_find_owns_keyboard(&self, window: &Window, cx: &App) -> bool {
+        let Some(find) = self.markdown_find.as_ref().filter(|find| find.open) else {
+            return false;
+        };
+        find.input.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .markdown_previews
+                .get(&find.path)
+                .is_some_and(|preview| preview.state.read(cx).focus_handle().is_focused(window))
+    }
+
+    /// The rendered Markdown preview that holds the keyboard, if this workbench
+    /// draws one.
+    ///
+    /// Find follows focus, as it does for the editor and the browser: the chord
+    /// belongs to the document the reader is working in. A tab keeps the focus
+    /// handle of the source editor it shows the preview over, so an editor whose
+    /// file is currently rendered as a preview answers for that preview instead
+    /// of opening a find panel behind a document nobody can see. A panel that is
+    /// off screen, or lives in its own window, answers for nobody.
+    pub(crate) fn focused_markdown_preview(&self, window: &Window, cx: &App) -> Option<String> {
+        if self.preview_detached || !self.preview_visible {
+            return None;
+        }
+        if let Some(find) = self.markdown_find.as_ref()
+            && find.open
+            && self.markdown_preview_showing(&find.path)
+            && (find.input.read(cx).focus_handle(cx).is_focused(window)
+                || self
+                    .markdown_previews
+                    .get(&find.path)
+                    .is_some_and(|preview| {
+                        preview.state.read(cx).focus_handle().is_focused(window)
+                    }))
+        {
+            return Some(find.path.clone());
+        }
+        self.markdown_previews
+            .iter()
+            .find(|(path, preview)| {
+                self.markdown_preview_showing(path)
+                    && (preview.state.read(cx).focus_handle().is_focused(window)
+                        || self.editor_bindings.get(*path).is_some_and(|binding| {
+                            binding.input.read(cx).focus_handle(cx).is_focused(window)
+                        }))
+            })
+            .map(|(path, _)| path.clone())
+    }
+
+    /// Opens the find bar over the focused rendered Markdown preview. Returns
+    /// whether one took the request; `false` leaves the chord to whoever asked.
+    pub(crate) fn open_focused_markdown_find(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(path) = self.focused_markdown_preview(window, cx) else {
+            return false;
+        };
+        let Some(state) = self
+            .markdown_previews
+            .get(&path)
+            .map(|preview| preview.state.clone())
+        else {
+            return false;
+        };
+        let input = self.markdown_find_input.clone();
+        if self
+            .markdown_find
+            .as_ref()
+            .is_some_and(|find| find.path == path)
+        {
+            if let Some(find) = self.markdown_find.as_mut() {
+                find.open = true;
+            }
+        } else {
+            // One bar serves one document: the hits it was painting come off
+            // the preview it leaves behind.
+            if let Some(previous) = self.markdown_find.as_mut() {
+                previous
+                    .state
+                    .update(cx, |state, cx| state.clear_range_highlights(cx));
+            }
+            let _observed = observe_markdown_find_parse(cx, &state);
+            let _input_events = subscribe_markdown_find_input(cx, &input);
+            self.markdown_find = Some(MarkdownFindState {
+                path: path.clone(),
+                open: true,
+                state: state.clone(),
+                _observed,
+                input: input.clone(),
+                _input_events,
+                matches: Vec::new(),
+                current: 0,
+                searched: None,
+                reveal: true,
+            });
+        }
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        self.refresh_markdown_find(&path, &state, cx);
+        cx.notify();
+        true
+    }
+
+    /// Closes the Markdown find bar and takes its highlights off the document.
+    ///
+    /// The keyboard goes back to the document the bar was over, which is where
+    /// the reader was before they searched it.
+    pub(crate) fn close_markdown_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(find) = self.markdown_find.as_mut().filter(|find| find.open) else {
+            return;
+        };
+        find.open = false;
+        find.reveal = false;
+        find.searched = None;
+        find.matches.clear();
+        find.current = 0;
+        find.state
+            .update(cx, |state, cx| state.clear_range_highlights(cx));
+        let focus = find.state.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Moves the bar to the next or previous hit and scrolls it into view.
+    fn step_markdown_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(find) = self.markdown_find.as_mut() else {
+            return;
+        };
+        if !find.open || find.matches.is_empty() {
+            return;
+        }
+        let count = find.matches.len() as isize;
+        find.current = (find.current as isize + delta).rem_euclid(count) as usize;
+        paint_markdown_find_highlights(find, cx);
+        reveal_markdown_find_match(find, cx);
+        cx.notify();
+    }
+
+    /// Searches the bar's document for what the field holds and paints the hits.
+    ///
+    /// Ranges index the rendered text rather than the source, so they are taken
+    /// from `rendered_text` and painted in the same update. A document that
+    /// lands after the query is searched from the parse observer, and a revision
+    /// that did not change is not searched again — the observer would otherwise
+    /// keep repainting the highlights it just set.
+    fn refresh_markdown_find(
+        &mut self,
+        path: &str,
+        state: &Entity<TextViewState>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(find) = self.markdown_find.as_mut() else {
+            return;
+        };
+        if find.path != path {
+            return;
+        }
+        if &find.state != state {
+            // The preview was evicted from the retained set and parsed again:
+            // the bar follows the view on screen rather than painting a dead
+            // one.
+            find.state = state.clone();
+            find.searched = None;
+            find._observed = observe_markdown_find_parse(cx, state);
+        }
+        let query = normalized_markdown_find_query(find.input.read(cx).value().as_ref());
+        let rendered = find.state.read(cx).rendered_text();
+        if !find.open || query.is_empty() {
+            if find.searched.take().is_some() {
+                find.state
+                    .update(cx, |state, cx| state.clear_range_highlights(cx));
+            }
+            find.matches.clear();
+            find.current = 0;
+            find.reveal = false;
+            return;
+        }
+        let query_changed = find
+            .searched
+            .as_ref()
+            .is_none_or(|(searched, _)| searched != &query);
+        if query_changed {
+            // A new query starts at its first hit, not at the ordinal the
+            // previous one was stepped to.
+            find.matches.clear();
+            find.current = 0;
+            find.reveal = true;
+        }
+        let unchanged = find
+            .searched
+            .as_ref()
+            .is_some_and(|(searched, text)| searched == &query && *text == rendered);
+        if !unchanged {
+            find.matches = session_search_match_ranges(rendered.as_str(), &query);
+            find.searched = Some((query, rendered));
+            if find.current >= find.matches.len() {
+                find.current = 0;
+            }
+            paint_markdown_find_highlights(find, cx);
+        }
+        if find.reveal {
+            find.reveal = false;
+            reveal_markdown_find_match(find, cx);
+        }
+    }
+
+    /// Re-searches the open bar's document, after either it or the query changed.
+    fn sync_markdown_find(&mut self, cx: &mut Context<Self>) {
+        let Some((path, state)) = self
+            .markdown_find
+            .as_ref()
+            .map(|find| (find.path.clone(), find.state.clone()))
+        else {
+            return;
+        };
+        self.refresh_markdown_find(&path, &state, cx);
+    }
+
+    /// The find bar of one rendered Markdown preview, drawn under the header.
+    ///
+    /// The bar is the panel's own, like the browser's: the document keeps its
+    /// hits while the count and the steps live here.
+    fn render_markdown_find_bar(&self, path: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find = self
+            .markdown_find
+            .as_ref()
+            .filter(|find| find.open && find.path == path)?;
+        let counter = if find.matches.is_empty() {
+            locale::text("No matches", "无匹配", "無相符").to_string()
+        } else {
+            format!("{} / {}", find.current + 1, find.matches.len())
+        };
+        Some(
+            h_flex()
+                .id("markdown-find")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&find.input).small()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(counter),
+                )
+                .child(
+                    Button::new("markdown-find-previous")
+                        .icon(Icon::new(IconName::ArrowUp))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Previous match", "上一个匹配", "上一個相符"))
+                        .on_click(cx.listener(|this, _, _, cx| this.step_markdown_find(-1, cx))),
+                )
+                .child(
+                    Button::new("markdown-find-next")
+                        .icon(Icon::new(IconName::ArrowDown))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Next match", "下一个匹配", "下一個相符"))
+                        .on_click(cx.listener(|this, _, _, cx| this.step_markdown_find(1, cx))),
+                )
+                .child(
+                    Button::new("markdown-find-close")
+                        .icon(Icon::new(IconName::Close))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Close find", "关闭查找", "關閉尋找"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.close_markdown_find(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_file_content(
         &mut self,
         path: String,
@@ -9787,6 +10233,9 @@ impl CodeWorkbench {
             let workspace_links = links.iter().take(32).cloned().collect::<Vec<_>>();
             let state = self.markdown_preview_state(&path, &source, cx);
             self.feed_markdown_preview(&path, cx);
+            // The frame that feeds the preview is also the frame that paints
+            // the bar's hits over the part of the document it now holds.
+            self.refresh_markdown_find(&path, &state, cx);
             let markdown_entity = cx.weak_entity();
             let locate_path = path.clone();
             let base_path = base_path_for_file(&path);
@@ -9907,6 +10356,9 @@ impl CodeWorkbench {
                                     }))
                             })),
                     )
+                })
+                .when_some(self.render_markdown_find_bar(&path, cx), |this, bar| {
+                    this.child(bar)
                 })
                 .child(div().flex_1().min_h_0().p_4().child(markdown_view))
                 .into_any_element();
@@ -11064,6 +11516,15 @@ impl Render for CodeWorkbench {
             .min_w_0()
             .bg(cx.theme().background)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // The find bar is the topmost dismissible layer over the
+                // document; a dialog that took the keyboard keeps its Escape.
+                if event.keystroke.key == "escape"
+                    && this.markdown_find_owns_keyboard(window, cx)
+                {
+                    this.close_markdown_find(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 let modifiers = event.keystroke.modifiers;
                 if !(modifiers.control || modifiers.platform) || modifiers.alt {
                     return;
@@ -21388,6 +21849,259 @@ mod tests {
             })
         });
         assert!(!delegated, "an unfocused page leaves the chord alone");
+    }
+
+    /// The Markdown preview that holds the keyboard opens its find bar.
+    ///
+    /// The fixture's README opens as a rendered Markdown preview, and the tab
+    /// keeps the source editor behind it: if the editor answered the chord the
+    /// way it does when the source is on screen, its find panel would open
+    /// under a document nobody can see. The preview has to answer for that
+    /// focus instead, and keep answering while its own bar is up.
+    #[gpui::test]
+    fn the_find_chord_reaches_the_focused_markdown_preview(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| this.set_preview_visible(true, cx));
+        draw_window(cx);
+        let state = workbench.read_with(cx, |this, _| {
+            this.markdown_previews
+                .get("README.md")
+                .expect("the README preview retains its text view")
+                .state
+                .clone()
+        });
+        let focus = state.read_with(cx, |state, _| state.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+        draw_window(cx);
+
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_markdown_find(window, cx))
+        });
+        assert!(
+            delegated,
+            "the document the reader clicked into takes the find chord"
+        );
+        workbench.read_with(cx, |this, _| {
+            let find = this.markdown_find.as_ref().expect("the bar opens");
+            assert!(find.open, "the bar is on screen");
+            assert_eq!(find.path, "README.md", "the bar belongs to that document");
+        });
+        assert!(
+            !input.read_with(cx, |input, _| input.search_session().open),
+            "the hidden source editor must not open its own find"
+        );
+        assert!(
+            !cx.update(|window, cx| workbench
+                .update(cx, |this, cx| this.open_focused_editor_find(window, cx))),
+            "a file showing its preview never offers the chord to the hidden editor"
+        );
+
+        // A second Ctrl+F stays with the bar: it must not hand the chord to the
+        // conversation behind the panel while the reader is searching.
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_markdown_find(window, cx))
+        });
+        assert!(delegated, "the open bar keeps the chord");
+
+        // Escape closes the bar, which is the topmost dismissible layer over
+        // the document, and the document gets the keyboard back.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workbench.read_with(cx, |this, _| {
+            assert!(
+                !this
+                    .markdown_find
+                    .as_ref()
+                    .expect("the bar keeps the field")
+                    .open,
+                "escape closes the find bar"
+            );
+        });
+        assert!(
+            cx.update(|window, _| focus.is_focused(window)),
+            "the document takes the keyboard back when the bar closes"
+        );
+
+        // Closing the same bar through its own control does the same.
+        assert!(cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_markdown_find(window, cx))
+        }));
+        cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.close_markdown_find(window, cx))
+        });
+        assert!(
+            cx.update(|window, _| focus.is_focused(window)),
+            "closing the bar returns the keyboard to the document"
+        );
+
+        // A panel that is not on screen answers for nobody, and neither does
+        // one drawn by its own window.
+        workbench.update(cx, |this, cx| this.set_preview_visible(false, cx));
+        assert!(!cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_markdown_find(window, cx))
+        }));
+        workbench.update(cx, |this, cx| {
+            this.set_preview_visible(true, cx);
+            this.set_preview_detached(true, cx);
+        });
+        assert!(!cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_markdown_find(window, cx))
+        }));
+        workbench.update(cx, |this, cx| {
+            this.set_preview_detached(false, cx);
+            this.set_preview_visible(true, cx);
+        });
+
+        // And the source editor still answers the chord once the tab shows it.
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx)
+        });
+        draw_window(cx);
+        assert!(
+            !cx.update(|window, cx| workbench
+                .update(cx, |this, cx| this.open_focused_markdown_find(window, cx))),
+            "a tab showing its source has no rendered document to search"
+        );
+        assert!(
+            cx.update(|window, cx| workbench
+                .update(cx, |this, cx| this.open_focused_editor_find(window, cx))),
+            "the source editor takes the chord back"
+        );
+    }
+
+    /// A rendered preview's find searches what the view shows, not the source.
+    ///
+    /// Ranges index the component's rendered text, so markup that only exists in
+    /// the file — heading markers, emphasis delimiters — is not a hit, and a
+    /// query typed into the bar paints the occurrences the reader can see.
+    #[gpui::test]
+    fn a_markdown_preview_find_searches_its_rendered_document(cx: &mut gpui::TestAppContext) {
+        let (workbench, _input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| this.set_preview_visible(true, cx));
+        draw_window(cx);
+        let state = workbench.read_with(cx, |this, _| {
+            this.markdown_previews
+                .get("README.md")
+                .expect("the README preview retains its text view")
+                .state
+                .clone()
+        });
+        let focus = state.read_with(cx, |state, _| state.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+        draw_window(cx);
+        assert!(cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_markdown_find(window, cx))
+        }));
+
+        // Typing drives the change event the way the field does.
+        cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| {
+                let input = this.markdown_find_input.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("bounded", window, cx);
+                    cx.emit(InputEvent::Change);
+                });
+            });
+        });
+        cx.run_until_parked();
+        workbench.read_with(cx, |this, cx| {
+            let find = this.markdown_find.as_ref().expect("the bar is open");
+            assert!(
+                !find.matches.is_empty(),
+                "the fixture's Rust code block holds `bounded`"
+            );
+            let rendered = find.state.read(cx).rendered_text();
+            assert_eq!(
+                find.searched.as_ref().map(|(query, _)| query.as_str()),
+                Some("bounded")
+            );
+            for range in &find.matches {
+                assert_eq!(
+                    rendered.as_str()[range.clone()].to_lowercase(),
+                    "bounded",
+                    "a hit must index the rendered text"
+                );
+            }
+            assert!(
+                session_search_match_ranges(rendered.as_str(), "## Code").is_empty(),
+                "the heading's source markers are not part of the rendered text"
+            );
+        });
+
+        // Stepping walks the hits and wraps around them.
+        let count = workbench.read_with(cx, |this, _| {
+            this.markdown_find
+                .as_ref()
+                .expect("the bar is open")
+                .matches
+                .len()
+        });
+        assert!(count > 0);
+        for step in 1..=count {
+            cx.update(|_window, cx| {
+                workbench.update(cx, |this, cx| this.step_markdown_find(1, cx))
+            });
+            workbench.read_with(cx, |this, _| {
+                assert_eq!(
+                    this.markdown_find
+                        .as_ref()
+                        .expect("the bar is open")
+                        .current,
+                    step % count,
+                    "the bar advances one hit per step and wraps"
+                );
+            });
+        }
+        cx.update(|_window, cx| workbench.update(cx, |this, cx| this.step_markdown_find(-1, cx)));
+        workbench.read_with(cx, |this, _| {
+            assert_eq!(
+                this.markdown_find
+                    .as_ref()
+                    .expect("the bar is open")
+                    .current,
+                count - 1,
+                "the previous step wraps backwards"
+            );
+            assert!(
+                !this.markdown_find.as_ref().expect("the bar is open").reveal,
+                "a reveal does not stay pending once it has been asked for"
+            );
+        });
+
+        // A query the document does not hold paints nothing and counts none.
+        cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| {
+                let input = this.markdown_find_input.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("no such text in the fixture", window, cx);
+                    cx.emit(InputEvent::Change);
+                });
+            });
+        });
+        cx.run_until_parked();
+        workbench.read_with(cx, |this, _| {
+            let find = this.markdown_find.as_ref().expect("the bar is open");
+            assert!(find.matches.is_empty(), "an unmatched query has no hits");
+            assert_eq!(find.current, 0);
+        });
+
+        // Closing takes the highlights with it and forgets the search, so the
+        // next open starts from the document rather than a stale revision.
+        cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.close_markdown_find(window, cx))
+        });
+        draw_window(cx);
+        workbench.read_with(cx, |this, _| {
+            let find = this
+                .markdown_find
+                .as_ref()
+                .expect("the bar keeps the field");
+            assert!(!find.open, "the bar is off screen");
+            assert!(find.searched.is_none() && find.matches.is_empty());
+        });
     }
 
     #[test]
