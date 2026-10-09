@@ -23777,9 +23777,9 @@ enum ManagementAgentToolAction {
 
 /// One built-in tool glyph on an Agent card's footer.
 ///
-/// A lit glyph is a panel that reaches this Agent, a muted one is a panel that
-/// does not; an Agent that can never receive the panel gets an inert glyph with
-/// the reason in its tip rather than a switch that would do nothing.
+/// A green glyph is a panel that reaches this Agent, a muted one is a panel
+/// that does not; an Agent that can never receive the panel gets an inert glyph
+/// with the reason in its tip rather than a switch that would do nothing.
 fn management_agent_tool_icon(
     id: String,
     icon_path: &'static str,
@@ -23794,7 +23794,9 @@ fn management_agent_tool_icon(
     let color = if inert {
         cx.theme().muted_foreground.opacity(0.45)
     } else if lit {
-        cx.theme().primary
+        // The same green the rest of the interface uses for "on": the primary
+        // accent is the action colour, and these glyphs are a state.
+        cx.theme().success
     } else {
         cx.theme().muted_foreground
     };
