@@ -318,6 +318,18 @@ struct PersistenceNotification;
 
 struct SettingsOperationNotification;
 
+/// Replace-by-id marker for the runtime manager's failure hint.
+///
+/// One id for every failure the registry reports keeps the newest reason on
+/// screen instead of stacking a queue of them.
+struct RuntimeRegistryNotification;
+
+/// Replace-by-id marker for the new-session dialog's failure hint.
+///
+/// One id for every reason the dialog reports keeps the newest one on screen
+/// instead of stacking a queue of them.
+struct NewSessionErrorNotification;
+
 /// The tone a settings operation result is announced with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsOperationTone {
@@ -2180,6 +2192,64 @@ impl VibexWorkbench {
                     .id::<SettingsOperationNotification>()
                     .autohide(true)
                     .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
+
+    /// Hands a failed runtime-registry write to the window's hint layer.
+    ///
+    /// Pairing, removing or switching a runtime is an action whose result is a
+    /// light hint like any other, not a strip pinned inside the manager panel:
+    /// the strip sat in the panel's own column until a later save happened to
+    /// succeed, so it outlived the action and pushed the rows down while it
+    /// waited. The pending failure is taken here because the write runs from
+    /// handlers and tasks, and `window.defer` keeps the push out of the update
+    /// that raised it.
+    fn present_runtime_registry_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.runtime_registry_error.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Error,
+                    locale::localize_ui_message(&error),
+                    cx,
+                )
+                .id::<RuntimeRegistryNotification>()
+                .autohide(true)
+                .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
+
+    /// Hands the new-session dialog's failure to the window's hint layer.
+    ///
+    /// Creating a session is an action whose rejection is a light hint. The
+    /// dialog's reasons are not tied to a field — no Agent is available, the
+    /// backend is not ready, a durable create failed — so a danger box inside
+    /// the dialog only restated, in its own column and without an auto-hide,
+    /// what the notification layer already says above every dialog.
+    fn present_new_session_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.new_session_error.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Error,
+                    locale::localize_error_message(&error),
+                    cx,
+                )
+                .id::<NewSessionErrorNotification>()
+                .autohide(true)
+                .on_click(|_, _, _| {}),
                 cx,
             );
         });
@@ -7230,9 +7300,10 @@ pub struct VibexWorkbench {
     shared_management: Option<ManagementWorkflowController>,
     runtime_status: RuntimeStatus,
     runtime_note: Option<String>,
-    /// A failed write of `remote-runtimes.json`. Kept apart from
-    /// [`Self::runtime_note`] because it is the one runtime failure no row or
-    /// detail stage can show, and the panel has to say it in its own voice.
+    /// A failed write of `remote-runtimes.json`, waiting for
+    /// [`Self::present_runtime_registry_error`] to hand it to the hint layer.
+    /// Kept apart from [`Self::runtime_note`] because it is a failure rather
+    /// than the progress the add form reports in place.
     runtime_registry_error: Option<String>,
     ui_state: DesktopUiStateV1,
     ui_writer: Option<ThrottledUiStateWriter>,
@@ -7530,6 +7601,8 @@ pub struct VibexWorkbench {
     workspace_contexts: BTreeMap<String, WorkspaceContextProjection>,
     workspace_context_generation: u64,
     new_session_attachments: Vec<InlineComposerAttachment>,
+    /// Why the last create-session attempt was rejected, waiting for
+    /// [`Self::present_new_session_error`] to hand it to the hint layer.
     new_session_error: Option<String>,
     navigation_history: NavigationHistory,
     runtime_client_id: RuntimeClientId,
@@ -11058,9 +11131,6 @@ impl VibexWorkbench {
                     )),
             )
             .child(body)
-            .when_some(self.runtime_registry_error.clone(), |this, error| {
-                this.child(runtime_registry_error_strip(&error, cx))
-            })
             .child(
                 div().w_full().flex_none().pt_3().child(
                     Button::new("runtime-manager-add")
@@ -44222,31 +44292,6 @@ impl VibexWorkbench {
                                                 ),
                                         )
                                     })
-                                    .when_some(self.new_session_error.clone(), |this, error| {
-                                        this.child(
-                                            h_flex()
-                                                .min_w_0()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .rounded(px(8.0))
-                                                .border_1()
-                                                .border_color(cx.theme().danger.opacity(0.45))
-                                                .bg(cx.theme().danger.opacity(0.08))
-                                                .px_2p5()
-                                                .py_1p5()
-                                                .text_xs()
-                                                .text_color(cx.theme().danger)
-                                                .child(
-                                                    Icon::new(IconName::TriangleAlert)
-                                                        .size(px(14.0)),
-                                                )
-                                                .child(
-                                                    div().min_w_0().truncate().child(
-                                                        locale::localize_error_message(&error),
-                                                    ),
-                                                ),
-                                        )
-                                    }),
                             ),
                     )
                     .child(workspace_controls),
@@ -70436,6 +70481,8 @@ impl Render for VibexWorkbench {
         motion::schedule_hover_frames(window);
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
+        self.present_runtime_registry_error(window, cx);
+        self.present_new_session_error(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
             let workbench = cx.weak_entity();
@@ -71994,32 +72041,6 @@ fn divider_lane(cx: &App) -> AnyElement {
         .h(px(1.0))
         .my(px(4.0))
         .bg(cx.theme().border.opacity(0.60))
-        .into_any_element()
-}
-
-/// A failed registry write is the one panel-level failure with no row to show
-/// it, so it gets its own strip instead of the shared transient note that the
-/// rows already restate.
-fn runtime_registry_error_strip(message: &str, cx: &App) -> AnyElement {
-    h_flex()
-        .w_full()
-        .flex_none()
-        .gap_2()
-        .mt_1()
-        .px_2()
-        .py_1()
-        .rounded(cx.theme().radius)
-        .bg(cx.theme().danger.opacity(0.10))
-        .text_xs()
-        .text_color(cx.theme().danger)
-        .child(Icon::new(IconName::TriangleAlert).size(px(14.0)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .whitespace_normal()
-                .child(message.to_string()),
-        )
         .into_any_element()
 }
 
@@ -83128,6 +83149,76 @@ mod tests {
             .expect("workbench renderer should remain inspectable");
         assert!(render.contains("self.present_persistence_note(window, cx);"));
         assert!(!render.contains(".when_some(self.persistence_note.clone()"));
+    }
+
+    /// A failed registry write is a result of the action that triggered it, so
+    /// it is announced by the notification layer rather than by a strip pinned
+    /// inside the runtime manager panel.
+    #[test]
+    fn runtime_registry_failures_use_top_light_notifications_instead_of_a_panel_strip() {
+        let source = include_str!("app.rs");
+        let presenter = source
+            .split_once("    fn present_runtime_registry_error(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("runtime registry presenter should remain inspectable");
+        assert!(presenter.contains("self.runtime_registry_error.take()"));
+        assert!(presenter.contains("hint_notification("));
+        assert!(presenter.contains("NotificationType::Error"));
+        assert!(presenter.contains("locale::localize_ui_message(&error)"));
+        assert!(presenter.contains(".id::<RuntimeRegistryNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("Anchor::TopCenter"));
+
+        // This test names the strip it rejects, so only the production region of
+        // the file is inspected.
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(source, |(head, _)| head);
+        assert!(!production.contains("runtime_registry_error_strip"));
+
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\npub fn bind_foundation_keys"))
+            .map(|(body, _)| body)
+            .expect("workbench renderer should remain inspectable");
+        assert!(render.contains("self.present_runtime_registry_error(window, cx);"));
+        assert!(!render.contains(".when_some(self.runtime_registry_error.clone()"));
+    }
+
+    /// A rejected create-session attempt is answered by the notification layer,
+    /// above the dialog, instead of by a danger box inside the dialog body.
+    #[test]
+    fn new_session_failures_use_top_light_notifications_instead_of_a_dialog_banner() {
+        let source = include_str!("app.rs");
+        let presenter = source
+            .split_once("    fn present_new_session_error(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("new session presenter should remain inspectable");
+        assert!(presenter.contains("self.new_session_error.take()"));
+        assert!(presenter.contains("hint_notification("));
+        assert!(presenter.contains("NotificationType::Error"));
+        assert!(presenter.contains("locale::localize_error_message(&error)"));
+        assert!(presenter.contains(".id::<NewSessionErrorNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("Anchor::TopCenter"));
+
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\npub fn bind_foundation_keys"))
+            .map(|(body, _)| body)
+            .expect("workbench renderer should remain inspectable");
+        assert!(render.contains("self.present_new_session_error(window, cx);"));
+
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("new session panel should remain inspectable");
+        assert!(!panel.contains("self.new_session_error"));
     }
 
     #[test]

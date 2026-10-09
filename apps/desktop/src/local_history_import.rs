@@ -13,12 +13,13 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, WindowExt as _,
+    StyledExt as _, Theme, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariants as _},
     empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
     h_flex,
     input::{Input, InputEvent, InputState},
+    notification::NotificationType,
     popover::Popover,
     scroll::ScrollableElement as _,
     v_flex,
@@ -33,6 +34,8 @@ use vibex_desktop_runtime::DesktopRuntime;
 
 use crate::app::VibexWorkbench;
 use crate::assets::agent_brand_icon;
+use crate::gpui_ext::hint_notification;
+use crate::hint_layer;
 use crate::locale::{self, ResolvedLocale};
 use crate::skeleton;
 use crate::spinner::Spinner;
@@ -1150,10 +1153,47 @@ impl LocalHistoryImportDialog {
                 ),
             )
     }
+
+    /// Hands a failed import to the window's hint layer.
+    ///
+    /// The failure answers the Import command, so it is reported the way every
+    /// other result in the workbench is: a top-centered light hint that clears
+    /// itself and stacks above the dialog's backdrop. Painting it inside the
+    /// picker instead left a banner under the list — still there long after the
+    /// failure stopped being news, and off the bottom of a short dialog.
+    ///
+    /// The pending failure is taken here because the import runs in a task with
+    /// no window of its own, and `window.defer` keeps the push out of the update
+    /// that raised it.
+    fn present_import_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.import_error.take() else {
+            return;
+        };
+        let label = text(self.locale()).import_failed;
+        let message = format!("{label}: {}", locale::localize_error_message(&error));
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(NotificationType::Error, message, cx)
+                    .id::<LocalHistoryImportErrorNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
 }
 
+/// Replace-by-id marker for the picker's failed-import hint.
+///
+/// One id for every failure the picker reports keeps the newest reason on
+/// screen instead of stacking a queue of them.
+struct LocalHistoryImportErrorNotification;
+
 impl Render for LocalHistoryImportDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.present_import_error(window, cx);
         let locale = self.locale();
         let strings = text(locale);
         match self.phase {
@@ -1481,9 +1521,6 @@ impl Render for LocalHistoryImportDialog {
             .child(list)
             .when_some(self.scan_error.clone(), |view, error| {
                 view.child(error_banner(strings.scan_failed, &error, cx))
-            })
-            .when_some(self.import_error.clone(), |view, error| {
-                view.child(error_banner(strings.import_failed, &error, cx))
             })
     }
 }

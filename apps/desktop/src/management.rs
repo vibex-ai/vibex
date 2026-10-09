@@ -970,9 +970,6 @@ pub struct ManagementCenter {
     profile_secret_clear: bool,
     /// Provider-name problem, rendered under the field and cleared on edit.
     profile_name_error: Option<String>,
-    /// The Provider editor's own failure, rendered next to its Save button
-    /// instead of riding the notification layer over the dialog.
-    profile_submit_error: Option<String>,
     profile_configured_models: Vec<vibex_core::ProviderConfiguredModel>,
     /// The Model catalogue the endpoint advertised on the last fetch. It is
     /// discovery data rather than a draft: the picker shows it so the user can
@@ -1767,7 +1764,6 @@ impl ManagementCenter {
             profile_secret_task: None,
             profile_secret_clear: false,
             profile_name_error: None,
-            profile_submit_error: None,
             profile_configured_models: Vec::new(),
             profile_available_models: Vec::new(),
             profile_detached_models: Vec::new(),
@@ -4456,7 +4452,6 @@ impl ManagementCenter {
         self.profile_secret_loaded = None;
         self.profile_secret_clear = false;
         self.profile_name_error = None;
-        self.profile_submit_error = None;
         self.projection_editor.set_secret_intent(false, false);
         self.profile_configured_models.clear();
         self.profile_available_models.clear();
@@ -4467,7 +4462,6 @@ impl ManagementCenter {
         self.profile_model_edit_error = None;
         self.profile_model_advanced_open = false;
         self.profile_protocol_advanced_open = false;
-        self.profile_submit_error = None;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.rebuild_profile_protocol_base_urls(window, cx);
         self.profile_editor_open = true;
@@ -4567,7 +4561,6 @@ impl ManagementCenter {
             self.load_profile_secret(profile.id.clone(), window, cx);
         }
         self.profile_name_error = None;
-        self.profile_submit_error = None;
         self.projection_editor.set_secret_intent(false, false);
         self.profile_editor_open = true;
         self.error = None;
@@ -5436,7 +5429,7 @@ impl ManagementCenter {
         let Some(agent) = self.snapshot.agents.iter().find(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
         }) else {
-            self.profile_submit_error = Some(
+            self.error = Some(
                 management_error_text(
                     "Select an Agent before creating a provider profile",
                     "请先选择 Agent，再创建供应商配置",
@@ -5449,7 +5442,7 @@ impl ManagementCenter {
         };
         let name = self.profile_name.read(cx).value().trim().to_string();
         // The name is the one field the backend refuses outright, so it reports
-        // under its own control instead of in the dialog's status line.
+        // under its own control instead of on the dialog's failure lane.
         self.profile_name_error = name.is_empty().then(|| {
             management_error_text(
                 "Provider name is required",
@@ -5509,7 +5502,7 @@ impl ManagementCenter {
         {
             Ok(id) => id,
             Err(_) => {
-                self.profile_submit_error = Some(
+                self.error = Some(
                     management_error_text(
                         "Provider profile identity is invalid",
                         "供应商配置标识无效",
@@ -5528,7 +5521,7 @@ impl ManagementCenter {
             self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
         let secret_clear = secret_surface && self.profile_secret_clear;
         let Some(backend) = self.backend.clone() else {
-            self.profile_submit_error = Some(
+            self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
                     "配置中心运行时未连接",
@@ -5542,7 +5535,6 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
-        self.profile_submit_error = None;
         self.mutation = Some(
             editing_profile_id
                 .as_ref()
@@ -5652,12 +5644,11 @@ impl ManagementCenter {
                         this.refresh(cx);
                     }
                     Ok(Err(error)) => {
-                        this.profile_submit_error =
-                            Some(format!("{}: {}", error.code, error.message));
+                        this.error = Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                     }
                     Err(error) => {
-                        this.profile_submit_error = Some(format!(
+                        this.error = Some(format!(
                             "{}: {error}",
                             management_error_text(
                                 "Provider configuration save failed",
@@ -5751,7 +5742,7 @@ impl ManagementCenter {
             AgentId::parse(agent_id),
             self.backend.clone(),
         ) else {
-            self.profile_submit_error = Some(
+            self.error = Some(
                 management_error_text(
                     "Provider profile identity is invalid",
                     "供应商配置标识无效",
@@ -5825,14 +5816,16 @@ impl ManagementCenter {
                 });
             }
             Ok(Err(error)) => {
-                // The Models section is inside the Provider dialog, so its
-                // failures report next to the dialog's own actions.
-                self.profile_submit_error = Some(format!("{}: {}", error.code, error.message));
+                // A catalogue fetch answers the button the user just pressed,
+                // so its failure rides the dialog's failure lane — the light
+                // hint `present_feedback` puts above the dialog — rather than a
+                // band the dialog has to remember to clear.
+                self.error = Some(format!("{}: {}", error.code, error.message));
             }
             Err(error) => {
                 let failed =
                     management_error_text("Model detection failed", "模型探测失败", "模型探測失敗");
-                self.profile_submit_error = Some(format!("{}: {error}", failed));
+                self.error = Some(format!("{}: {error}", failed));
             }
         }
         cx.notify();
@@ -5866,7 +5859,6 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ProviderProbe(format!(
             "models:{profile_id}"
         )));
-        self.profile_submit_error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let agent_owns_catalog = vibex_core::agent_owns_model_catalog(&agent_id);
@@ -5918,7 +5910,7 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         let Some(agent_id) = AgentId::parse(agent_id).ok() else {
-            self.profile_submit_error = Some(
+            self.error = Some(
                 management_error_text(
                     "Select an Agent before fetching models",
                     "请先选择 Agent，再拉取模型",
@@ -5930,7 +5922,7 @@ impl ManagementCenter {
             return;
         };
         let Some(backend) = self.backend.clone() else {
-            self.profile_submit_error = Some(
+            self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
                     "配置中心运行时未连接",
@@ -5947,7 +5939,6 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ProviderProbe(format!(
             "draft-models:{agent_id}"
         )));
-        self.profile_submit_error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let configured_models = normalized_provider_models(&self.profile_configured_models);
@@ -13964,11 +13955,6 @@ impl ManagementCenter {
             .size_full()
             .min_h_0()
             .child(body)
-            .children(
-                self.profile_submit_error
-                    .clone()
-                    .map(|error| status_line(locale::localize_error_message(&error), true, cx)),
-            )
             .child(
                 h_flex()
                     .w_full()
