@@ -1503,6 +1503,40 @@ impl VibexUseService {
                     })
                 })
                 .transpose()?;
+        // Following is the documented way to continue finished work: the old
+        // task stays an immutable record, and only a task that actually ended
+        // can be followed. Following a running task would create two owners
+        // for one outcome.
+        if let Some(follows) = follows_task_id.as_ref() {
+            let followed = AgentDelegationRepository::get(&conn, follows)?.ok_or_else(|| {
+                VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    "followsTaskRef does not reference a task of this authority",
+                )
+            })?;
+            if !followed.phase().is_terminal() {
+                return Err(VibexError::conflict(
+                    use_codes::REQUEST_INVALID,
+                    "the task being followed has not finished yet; continue it instead",
+                )
+                .with_diagnostic("phase", followed.phase().as_str()));
+            }
+            let scope = match followed.child_session_id.as_ref() {
+                Some(child) => self.require_readable(&conn, actor, child).map(|_| ()),
+                None => self
+                    .require_readable(&conn, actor, &followed.parent_session_id)
+                    .map(|_| ()),
+            };
+            if let Err(error) = scope {
+                self.settle_operation(
+                    &conn,
+                    &operation,
+                    VibexUseOperationState::Failed,
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        }
 
         let session_spec = arguments.get("session").cloned().unwrap_or_default();
         let kind = optional_string(&session_spec, "kind", 32).unwrap_or_else(|| "new".to_string());
@@ -1807,6 +1841,20 @@ impl VibexUseService {
                     .map(VibexUseRef::session)
                     .map(|reference| reference.as_uri()),
             }),
+        )?;
+        // The acceptance says the request was recorded; this says the child
+        // session exists and the work was actually handed over. A parent
+        // waiting on a task that never gets this far learns it from the event
+        // stream instead of from a timeout.
+        VibexUseEventRepository::append(
+            conn,
+            &format!("task_started_{}", task.id.as_str()),
+            Some(&root),
+            DelegationTaskEventKind::TaskStarted,
+            Some(&task.id),
+            task.child_session_id.as_ref(),
+            task.revision,
+            &serde_json::json!({ "taskRef": VibexUseRef::task(&task.id).as_uri() }),
         )?;
         Ok(())
     }
@@ -3430,6 +3478,17 @@ impl VibexUseService {
             return Err(VibexError::conflict(
                 use_codes::TASK_TERMINAL,
                 "that task already reached a terminal state",
+            )
+            .with_diagnostic("phase", task.phase().as_str()));
+        }
+        // Acceptance closes a round that ended, not work that is still running.
+        // A task that never reached `awaiting_review` is stopped with
+        // `vibex_cancel_task`, which records a cancellation instead of a
+        // completion the evidence does not support.
+        if task.phase() != DelegationTaskPhase::AwaitingReview {
+            return Err(VibexError::conflict(
+                use_codes::REQUEST_INVALID,
+                "that task has no finished round to accept yet",
             )
             .with_diagnostic("phase", task.phase().as_str()));
         }
