@@ -37649,7 +37649,10 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let _ = (window, cx);
+        let _ = window;
+        // The pane's rail spans the pane, composer and all: a pane whose plan
+        // panel grows must not move the ticks beside its own conversation.
+        let rail = self.render_session_pane_rail(cx);
         v_flex()
             .size_full()
             .min_w_0()
@@ -37665,6 +37668,7 @@ impl VibexWorkbench {
             )
             .when_some(conversation_find, |this, find| this.child(find))
             .child(composer)
+            .when_some(rail, |this, rail| this.child(rail))
             .into_any_element()
     }
 
@@ -44663,6 +44667,7 @@ impl VibexWorkbench {
                     }))
                     .child(
                         div()
+                            .debug_selector(move || format!("turn-preview-tick-{preview_index}"))
                             .ml(px(5.6))
                             .w(px(line_width))
                             .h(px(line_height))
@@ -44702,6 +44707,7 @@ impl VibexWorkbench {
 
         div()
             .id("agent-turn-preview-rail")
+            .debug_selector(|| "agent-turn-preview-rail".to_string())
             .absolute()
             .top_0()
             .bottom_0()
@@ -44832,13 +44838,16 @@ impl VibexWorkbench {
         self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
         let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
-        let turn_preview_rail = (self.ui_state.session.turn_preview_rail
-            && turns
-                .iter()
-                .any(|turn| agent_turn_preview_rail_numbers_turn(turn)))
-        .then(|| {
-            self.render_agent_turn_preview_rail(turns.as_slice(), content_insets.rail_pinned, cx)
-        });
+        // The rail is the pane's reading lane, not the conversation viewport's.
+        // Every composer extension (plan, queue, goal) resizes the viewport
+        // from below, and a rail anchored to it slid a tick up under the
+        // reader's eye whenever one of them opened. A group pane builds its own
+        // rail over its own composer instead.
+        let turn_preview_rail = if include_composer {
+            self.render_session_pane_rail(cx)
+        } else {
+            None
+        };
         let timeline_layout_entity = cx.weak_entity();
         // Prepaint runs after the whole element tree is built, so by then the
         // borrowed view may already belong to another pane. Carry the measured
@@ -45040,8 +45049,7 @@ impl VibexWorkbench {
                         )
                         .scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical),
                 )
-            })
-            .when_some(turn_preview_rail, |this, rail| this.child(rail));
+            });
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
@@ -45234,7 +45242,32 @@ impl VibexWorkbench {
             )
             .when_some(conversation_find, |this, find| this.child(find))
             .when_some(composer, |this, composer| this.child(composer))
+            .when_some(turn_preview_rail, |this, rail| this.child(rail))
             .into_any_element()
+    }
+
+    /// The turn preview rail for the pane this view is laying out.
+    ///
+    /// The rail's lane is the session page, not the conversation viewport the
+    /// page lays out above its composer: the composer's extension stack (plan,
+    /// queue, goal) changes how much room the timeline has, and a reading aid
+    /// that moved with it would slide out from under the pointer every time the
+    /// user opened one. The rail is built here rather than inside
+    /// [`Self::render_agent_workbench_for`] so a pane adds it over its own
+    /// composer, wherever that composer is mounted.
+    fn render_session_pane_rail(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.ui_state.session.turn_preview_rail {
+            return None;
+        }
+        let turns = self.conversation_turns_cached();
+        if !turns
+            .iter()
+            .any(|turn| agent_turn_preview_rail_numbers_turn(turn))
+        {
+            return None;
+        }
+        let pinned = self.session_content_insets().rail_pinned;
+        Some(self.render_agent_turn_preview_rail(turns.as_slice(), pinned, cx))
     }
 
     fn render_runtime_controls(
@@ -81426,9 +81459,7 @@ mod tests {
         let timeline = source
             .split_once("let timeline_render_session_id = self.timeline.session_id.clone();")
             .and_then(|(_, tail)| {
-                tail.split_once(
-                    "\n            .when_some(turn_preview_rail, |this, rail| this.child(rail));",
-                )
+                tail.split_once("\n        let runtime_controls = self.render_runtime_controls(")
             })
             .map(|(body, _)| body)
             .expect("the timeline surface should remain inspectable");
@@ -90446,9 +90477,7 @@ mod tests {
                 "        let timeline_render_session_id = self.timeline.session_id.clone();",
             )
             .and_then(|(_, tail)| {
-                tail.split_once(
-                    "\n            .when_some(turn_preview_rail, |this, rail| this.child(rail));",
-                )
+                tail.split_once("\n        let runtime_controls = self.render_runtime_controls(")
             })
             .map(|(body, _)| body)
             .expect("the timeline surface should remain inspectable");

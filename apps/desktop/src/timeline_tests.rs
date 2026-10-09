@@ -1270,3 +1270,149 @@ fn a_reasoning_body_reveals_on_the_same_spring_a_tool_detail_does(cx: &mut TestA
         assert_eq!(measured.get(), expected, "reveal at {progress}");
     }
 }
+
+/// A workbench laid out at a fixed size, so the composer's growth and the
+/// conversation viewport above it can be measured against each other.
+struct RailLaneProbe {
+    workbench: Entity<VibexWorkbench>,
+}
+
+impl Render for RailLaneProbe {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = self.workbench.update(cx, |workbench, cx| {
+            workbench.render_agent_workbench(window, cx)
+        });
+        div().w(px(900.0)).h(px(700.0)).child(page)
+    }
+}
+
+/// The turn preview rail is a reading aid for the pane, not for whatever the
+/// composer is currently showing.
+///
+/// Expanding a composer extension (a plan, a queue, a goal) grows the composer
+/// and shortens the conversation viewport above it. The rail's lane must not
+/// follow that: it belongs to the session page, whose height the composer
+/// cannot change.
+#[gpui::test]
+fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_rail_lane").unwrap();
+    let workbench_slot: Rc<RefCell<Option<Entity<VibexWorkbench>>>> = Rc::new(RefCell::new(None));
+    let slot = workbench_slot.clone();
+    let session_for_items = session_id.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let mut ui_state = DesktopUiStateV1::default();
+        ui_state.appearance.locale = LocaleMode::En;
+        ui_state.session.turn_preview_rail = true;
+        let workbench = cx.new(|cx| {
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_for_items.clone());
+            workbench.view_session_id = Some(session_for_items.clone());
+            let item =
+                |sequence: i64, payload: TimelinePayload, source: TimelineSource| TimelineItem {
+                    id: TimelineItemId::parse(format!("timeline_rail_lane-{sequence}")).unwrap(),
+                    session_id: session_for_items.clone(),
+                    sequence,
+                    timestamp_ms: sequence,
+                    source,
+                    kind: payload.kind(),
+                    correlation_id: None,
+                    provider_correlation_id: None,
+                    redaction_state: TimelineRedactionState::None,
+                    execution_attribution: None,
+                    payload,
+                };
+            let mut items = Vec::new();
+            for turn in 0..5 {
+                items.push(item(
+                    items.len() as i64 + 1,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: format!("Request {turn}"),
+                        attachments: Vec::new(),
+                        ..Default::default()
+                    }),
+                    TimelineSource::User,
+                ));
+            }
+            // The plan rides the last turn, which is the one the composer's
+            // plan card mirrors.
+            items.push(item(
+                items.len() as i64 + 1,
+                TimelinePayload::Plan(vibex_core::PlanPayload {
+                    title: "Lane plan".into(),
+                    steps: (0..9)
+                        .map(|index| vibex_core::PlanStepPayload {
+                            title: format!("Step {index}"),
+                            status: vibex_core::PlanStepStatus::Pending,
+                        })
+                        .collect(),
+                }),
+                TimelineSource::Agent,
+            ));
+            workbench
+                .timeline
+                .replace_authoritative(session_for_items.clone(), items);
+            workbench.rebuild_timeline_sizes();
+            workbench
+        });
+        *slot.borrow_mut() = Some(workbench.clone());
+        RailLaneProbe { workbench }
+    });
+    let workbench = workbench_slot
+        .borrow()
+        .clone()
+        .expect("the probe should keep its workbench");
+
+    fn draw(cx: &mut VisualTestContext) {
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+    }
+
+    draw(cx);
+    let collapsed_rail = cx
+        .debug_bounds("agent-turn-preview-rail")
+        .expect("the rail should be laid out");
+    let collapsed_viewport =
+        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.bounds());
+    let collapsed_tick = cx
+        .debug_bounds("turn-preview-tick-0")
+        .expect("the rail's first tick should be laid out");
+
+    workbench.update(cx, |workbench, cx| {
+        let items = workbench.timeline.items.clone();
+        let plan = current_agent_plan(&items).expect("the plan item should project");
+        let identity = composer_plan_identity(&session_id, &plan, &items);
+        workbench.composer_plan_expanded = Some(identity);
+        cx.notify();
+    });
+    draw(cx);
+    let expanded_rail = cx
+        .debug_bounds("agent-turn-preview-rail")
+        .expect("the rail should still be laid out");
+    let expanded_viewport =
+        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.bounds());
+    let expanded_tick = cx
+        .debug_bounds("turn-preview-tick-0")
+        .expect("the rail's first tick should still be laid out");
+
+    assert!(
+        (collapsed_viewport.size.height - expanded_viewport.size.height).abs() > px(1.0),
+        "the expanded plan should shorten the conversation viewport: collapsed={:?} expanded={:?}",
+        collapsed_viewport.size.height,
+        expanded_viewport.size.height
+    );
+    assert_eq!(
+        expanded_rail, collapsed_rail,
+        "the rail's lane must not follow the composer's height"
+    );
+    assert_eq!(
+        expanded_tick, collapsed_tick,
+        "opening the plan panel must not move a tick the reader is aiming at"
+    );
+}
