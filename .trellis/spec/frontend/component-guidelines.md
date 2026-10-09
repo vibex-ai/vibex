@@ -616,10 +616,16 @@ Use `new(id)` beside a timeline label, with IDs scoped to the owning turn or row
 The fixed rem-sized canvas changes only cell brightness, preserving adjacent
 text and row geometry. Keep the frame budget bounded, and render a fully
 visible static V for reduced motion or the opt-in inactive-window pause.
-Only live turns show the timeline mark. Sidebar session/workspace rows use
-`Spinner::status_indicator()` with `IconName::LoaderCircle` at `xsmall()` size,
-retaining the theme's running and auto-continue colors and the lower sidebar
-frame budget. Waiting, error, and completion states keep their distinct symbols.
+Only live turns show the timeline mark. Sidebar session, group, and workspace
+rows use `ActivityIndicator::sidebar(id)`: four stationary dots in a diamond
+pass a soft glow clockwise in the same cycle, inside a fixed `size_3()` slot.
+Keep the lower `STATUS_INDICATOR_MAX_FPS` budget, scope the animation ID under
+the domain-keyed row, and show all four dots without animation for reduced
+motion or the opt-in inactive-window pause. Running marks use the theme's
+`primary`; auto-continue sessions and groups use `success` (green). Workspace
+aggregates keep `primary` because their sessions can have different
+auto-continue settings. Waiting, error, and completion states keep their
+distinct symbols.
 
 ## Timeline Cards
 

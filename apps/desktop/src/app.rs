@@ -39854,8 +39854,8 @@ impl VibexWorkbench {
             turn_pending,
         );
         // A worktree row stands for sessions whose auto-continue preferences can
-        // disagree, so it never claims the green ring; only a group, which
-        // carries one flag for all of its members, can.
+        // disagree, so it never claims the green activity mark; only a group
+        // carrying one flag for all of its members can.
         let status_indicator = sidebar_aggregate_status_indicator(workspace_status, false, cx);
         let workspace_menu_entity = cx.weak_entity();
         let workspace_menu_branch = branch.clone();
@@ -40484,8 +40484,8 @@ impl VibexWorkbench {
                 .flatten()
         };
         // The compact mark every row shows for the session's own state: a
-        // spinner while the Agent works, the attention glyph while it is parked
-        // on the user, a dot for the states a dot can carry. A pinned row keeps
+        // light pulse while the Agent works, the attention glyph while it is
+        // parked on the user, a dot for the states a dot can carry. A pinned row keeps
         // it too, drawn in the lane left of the pin mark, so pinning a session
         // never hides whether it is still working.
         let session_status_mark = if session_awaiting_user {
@@ -62409,9 +62409,9 @@ fn sidebar_workspace_status(
 /// is the most actionable thing among my sessions" — so they draw it the same
 /// way.
 ///
-/// `auto_continue_enabled` recolors only the running ring, the same way a
-/// session row's spinner turns green when that session continues on its own.
-/// The other states keep their own colors: the ring is the one mark that says
+/// `auto_continue_enabled` recolors only the running mark, the same way a
+/// session row's light pulse turns green when that session continues on its own.
+/// The other states keep their own colors: the pulse is the one mark that says
 /// "still working", so it is also the one mark that can say "and it will keep
 /// going by itself".
 fn sidebar_aggregate_status_indicator(
@@ -62420,14 +62420,12 @@ fn sidebar_aggregate_status_indicator(
     cx: &App,
 ) -> AnyElement {
     match status {
-        SidebarWorkspaceStatus::Running => Spinner::status_indicator()
-            .icon(Icon::new(IconName::LoaderCircle))
+        SidebarWorkspaceStatus::Running => ActivityIndicator::sidebar("sidebar-aggregate-activity")
             .color(if auto_continue_enabled {
                 cx.theme().success
             } else {
                 cx.theme().primary
             })
-            .xsmall()
             .into_any_element(),
         SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
         SidebarWorkspaceStatus::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
@@ -62444,15 +62442,15 @@ fn sidebar_session_status_indicator(
     cx: &App,
 ) -> AnyElement {
     match state {
-        AgentSessionState::Running | AgentSessionState::Initializing => Spinner::status_indicator()
-            .icon(Icon::new(IconName::LoaderCircle))
-            .color(if auto_continue_enabled {
-                cx.theme().success
-            } else {
-                cx.theme().primary
-            })
-            .xsmall()
-            .into_any_element(),
+        AgentSessionState::Running | AgentSessionState::Initializing => {
+            ActivityIndicator::sidebar("sidebar-session-activity")
+                .color(if auto_continue_enabled {
+                    cx.theme().success
+                } else {
+                    cx.theme().primary
+                })
+                .into_any_element()
+        }
         AgentSessionState::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
         AgentSessionState::Error => sidebar_status_dot(cx.theme().danger),
         AgentSessionState::Archived | AgentSessionState::Closed => {
