@@ -514,7 +514,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     // What the page is about to draw is what says whether a line changed, so
     // the transition is begun here — before the first frame that shows the new
     // text, rather than a tick after it.
-    app.observe_landing_text();
+    app.observe_composer_text();
     let area = frame.area();
     app.shell = crate::app::shell_for_columns(area.width);
     let theme = app.theme.clone();

@@ -893,14 +893,13 @@ is never a column count.
   on the way in even though it draws none of it: the countdown, the unread mark
   and "is this session's turn running" are derived from that state, and none of
   it may be wrong because the reader started on the prompt.
-* **The waiting mark is the only chrome that animates by itself.** The landing
-  mark's sweep is a greeting rather than a heartbeat:
-  `chrome_animating` gates both the tick period and
-  `advance_transcript_animation`, and the greeting ends after one whole pass
-  (`LANDING_SWEEP_FRAMES`), so a session that is merely open — and a prompt left
-  waiting — costs zero frames. A terminal that
-  cannot blend colours gets the mark at full strength rather than a sweep it
-  cannot show.
+* **Animation completion still needs a repaint.** The landing mark alternates
+  moving passes with quiet intervals; composer labels animate only when their
+  text changes. Before suppressing quiet repaints, paint the final resting mark
+  or settled text. Keep text transitions scoped to the editor that owns them,
+  including existing sessions. See the
+  [TUI Session State contract](../frontend/tui-session-state.md) for scheduling,
+  overlay, and composer-target rules and the required render assertions.
 * **A paste over the threshold collapses into a chip.** `PASTE_CHIP_LINES` /
   `PASTE_CHIP_BYTES` decide; the buffer's text holds the label and the original
   bytes ride in a `Chip`. A chip is atomic — the cursor steps over it, one

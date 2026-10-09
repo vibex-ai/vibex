@@ -39,7 +39,7 @@ struct Session {
     /// Every byte the process has written, in order.
     captured: Vec<u8>,
     emulator: TerminalEmulator,
-    /// Owns the spill file the client diverts in-process diagnostics into.
+    /// Owns the harness's interface files and captured diagnostics.
     spill: tempfile::TempDir,
 }
 
@@ -90,6 +90,16 @@ impl Session {
         // directory.
         let spill = tempfile::tempdir().expect("a temporary directory for the spill file");
         command.env("VIBEX_TUI_LOG", spill.path().join("vibex-tui.log"));
+        // Remembered settings outrank the process locale. Keep every client
+        // file local to this scenario so a developer's language, motion,
+        // workspace, or key overrides cannot change what the harness draws.
+        command.env("VIBEX_TUI_HOME", spill.path());
+        command.env(
+            "VIBEX_TUI_INTERFACE",
+            spill.path().join("tui-interface.json"),
+        );
+        command.env("VIBEX_TUI_RUNTIME", spill.path().join("tui-runtime.json"));
+        command.env("VIBEX_TUI_KEYS", spill.path().join("tui-keys.toml"));
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -275,7 +285,7 @@ fn startup_paints_a_first_frame() {
         "the status band is missing:\n{screen}"
     );
     assert!(
-        screen.contains("Runtime") && screen.contains("Workspace"),
+        screen.contains("Agent setup") && screen.contains("Workspace"),
         "the prompt does not name what the message goes through:\n{screen}"
     );
     assert!(

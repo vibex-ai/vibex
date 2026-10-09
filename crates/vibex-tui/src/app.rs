@@ -916,7 +916,7 @@ pub struct App {
     pub activity: Option<String>,
     /// Monotonic clock driving every animation.
     pub animation_phase: u32,
-    /// The character transitions the composing page's lines are wearing.
+    /// Character transitions for the current composer's runtime and workspace.
     ///
     /// Driven by the frame that draws the page rather than by the gestures that
     /// change it, so every path into a new Agent or a new workspace gets the
@@ -1982,7 +1982,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Note the lines the composing page is about to draw.
+    /// Note the runtime and workspace text the composer is about to show.
     ///
     /// Called by the frame that draws the page, because the text is the only
     /// honest answer to "did this line change": every path into a new Agent or
@@ -1993,16 +1993,20 @@ impl App {
     /// is covering is left alone rather than recorded: a change the reader
     /// cannot see waits until they can, instead of playing to an empty room and
     /// being over by the time the page is back.
-    pub fn observe_landing_text(&mut self) {
-        if self.overlay.is_some() {
-            return;
-        }
-        if self.page != Page::NewSession {
+    pub fn observe_composer_text(&mut self) {
+        if !self.page.is_composing_page() {
             self.transitions.cancel();
             return;
         }
+        if self.overlay.is_some() {
+            return;
+        }
         let (agent, model) = self.composer_runtime_labels();
-        let workspace = self.new_session_workspace();
+        let workspace = if self.page == Page::NewSession {
+            self.new_session_workspace()
+        } else {
+            String::new()
+        };
         self.transitions.observe(
             &agent,
             &model,
@@ -3286,12 +3290,14 @@ impl App {
         if !self.is_animating() {
             return false;
         }
+        // The first resting frame still replaces an animated frame. Suppress
+        // repaints only when both sides of this tick are already at rest.
+        let was_waiting = self.landing_mark_waits();
         self.animation_phase = self.animation_phase.wrapping_add(1);
-        // A transition that has drawn its last frame is dropped rather than
-        // kept: it is the difference between a clock that stops when the page
-        // settles and one that ticks for the rest of the session.
+        // Finished transitions release the clock; the repaint below still
+        // draws their settled text.
         self.transitions.prune(self.animation_phase);
-        !self.landing_mark_waits()
+        !was_waiting || !self.landing_mark_waits()
     }
 
     /// Keep the turn clock in step with what the session actually is.
@@ -3454,6 +3460,9 @@ impl App {
         if self.composer_target.as_ref() == Some(&target) {
             return;
         }
+        // A newly opened editor starts with its own labels. Neither a running
+        // transition nor the previous editor's text belongs to this target.
+        self.transitions = crate::scramble::Transitions::default();
         let buffer = std::mem::take(&mut self.composer);
         if let Some(previous) = self.composer_target.replace(target.clone()) {
             self.composer_drafts.insert(previous, buffer);

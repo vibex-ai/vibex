@@ -573,7 +573,8 @@ drawings ship, and the **Logo** row in the settings chooses between them:
 
 Either way it is a greeting rather than a heartbeat — a pass or a burst, then
 the mark rests — and it stops the moment the reader leaves. A prompt left open
-therefore costs no frames, which is the idle contract the PTY layer measures.
+repaints once to restore the whole mark, then draws no frames during the quiet
+stretch before the next pass.
 The **Motion** row switches the mark's animation off outright, and the mark is
 then drawn at rest rather than left on whichever frame the clock stopped on.
 
@@ -582,6 +583,10 @@ swapped under the reader's eye: it arrives, cell by cell, out of a scatter of
 noise. The part of the line that did not change holds still, so picking a
 directory one level down scrambles the folder that changed and leaves the path
 that led there alone, and the text resolves from the left the way it is read.
+The transition settles in about 0.7 seconds. Both new and existing sessions
+animate the composer's Agent and model when `Ctrl+G` changes them; a new session
+also animates the matching line in the centre of the page. Opening another
+session starts with that session's labels and clears any previous transition.
 The effect is driven by the frame that draws the page rather than by the
 gesture that changed it, so every path into a new Agent or workspace gets it,
 and a change made while the Agent setup picker is still open waits for the

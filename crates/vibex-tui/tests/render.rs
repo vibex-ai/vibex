@@ -366,36 +366,55 @@ fn the_composer_reaches_the_session_list_without_giving_up_the_draft() {
 
 #[test]
 fn the_landing_mark_loops_without_repainting_between_passes() {
-    // The light comes round for as long as the page waits, but the stretch
-    // between passes draws what is already on screen: the clock runs, the
-    // repaint does not. That is what keeps a looping mark from being a repaint
-    // every animation tick for the life of the page.
-    let mut app = app(120, 40);
-    assert!(app.chrome_animating(), "the landing mark does not light up");
-    let mut drew = 0usize;
-    let mut quiet = 0usize;
-    // One whole loop. Every tick moves the clock, and asks for a repaint
-    // exactly when the frame it lands on is one that differs from rest.
-    for _ in 0..vibex_tui::logo::LOOP_FRAMES {
-        let lands_on = (app.animation_phase() + 1) % vibex_tui::logo::LOOP_FRAMES;
-        assert!(app.is_animating(), "the loop's clock stopped");
-        assert_eq!(
-            app.advance_transcript_animation(),
-            vibex_tui::logo::moving(vibex_tui::logo::MarkStyle::Classic, lands_on),
-            "the tick landing on phase {lands_on} asked for the wrong thing"
-        );
-        if vibex_tui::logo::moving(vibex_tui::logo::MarkStyle::Classic, lands_on) {
-            drew += 1;
-        } else {
-            quiet += 1;
+    use vibex_tui::logo::{self, MarkStyle};
+
+    for (style, moving_frames, loop_frames) in [
+        (MarkStyle::Classic, logo::SWEEP_FRAMES, logo::LOOP_FRAMES),
+        (
+            MarkStyle::Glitch,
+            logo::GLITCH_BURST_FRAMES,
+            logo::GLITCH_LOOP_FRAMES,
+        ),
+    ] {
+        let mut app = app(120, 40);
+        app.settings.mark = style;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| vibex_tui::view::render(frame, &mut app))
+            .expect("first frame");
+        let mut drew = 0;
+
+        for _ in 0..loop_frames {
+            assert!(app.is_animating(), "the loop's clock stopped");
+            let repaint = app.advance_transcript_animation();
+            if repaint {
+                terminal
+                    .draw(|frame| vibex_tui::view::render(frame, &mut app))
+                    .expect("scheduled frame");
+                drew += 1;
+            }
+            let phase = app.animation_phase() % loop_frames;
+            if !logo::moving(style, phase) {
+                // Compare the actual scheduled screen with a fresh resting
+                // frame. Forcing every frame to draw would hide a lost repaint.
+                let resting = render_buffer(&mut app, 120, 40);
+                assert!(
+                    terminal.backend().buffer() == &resting,
+                    "{style:?}: phase {phase} left an animated frame on screen"
+                );
+                if phase > moving_frames {
+                    assert!(!repaint, "{style:?}: the resting mark kept repainting");
+                }
+            }
         }
+
+        // A pass includes one repaint to restore the resting frame, then the
+        // longer quiet stretch keeps the clock without repainting.
+        assert_eq!(drew, moving_frames + 1);
+        assert!(loop_frames - drew > drew);
+        assert_eq!(app.animation_phase() % loop_frames, 0);
+        assert!(app.chrome_animating(), "the mark did not come round again");
     }
-    // Most of a loop is the quiet stretch, which is the point of it.
-    assert_eq!(drew, vibex_tui::logo::SWEEP_FRAMES as usize);
-    assert!(quiet > drew, "the light is on more often than it is off");
-    // And the clock has come round exactly.
-    assert_eq!(app.animation_phase() % vibex_tui::logo::LOOP_FRAMES, 0);
-    assert!(app.chrome_animating(), "the light did not come round again");
 }
 
 #[test]
@@ -4688,6 +4707,44 @@ fn a_changed_line_arrives_in_characters_rather_than_being_swapped() {
     assert!(!app.transitions.running(app.animation_phase()));
 }
 
+#[test]
+fn a_text_transition_draws_its_final_frame_before_the_mark_waits() {
+    let mut app = app(120, 40);
+    app.settings.mark = vibex_tui::logo::MarkStyle::Glitch;
+    app.animation_phase = vibex_tui::logo::GLITCH_BURST_FRAMES + 1;
+    app.workspace_path = Some("/tmp/workspace-before".to_string());
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, &mut app))
+        .expect("first frame");
+
+    app.workspace_path = Some("/tmp/workspace-after".to_string());
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, &mut app))
+        .expect("changed workspace");
+    assert!(app.transitions.running(app.animation_phase()));
+
+    for _ in 0..vibex_tui::scramble::FRAMES {
+        if app.advance_transcript_animation() {
+            terminal
+                .draw(|frame| vibex_tui::view::render(frame, &mut app))
+                .expect("scheduled frame");
+        }
+    }
+    let screen = text(&buffer_lines(terminal.backend().buffer(), 120, 40));
+    assert!(
+        workspace_row(&screen).contains("/tmp/workspace-after"),
+        "the workspace needed input to finish its transition:\n{screen}"
+    );
+    assert!(
+        vibex_tui::run::ANIMATION_TICK * vibex_tui::scramble::FRAMES
+            <= std::time::Duration::from_millis(750),
+        "a text change took too long to settle"
+    );
+    assert!(!app.chrome_animating());
+    assert!(!app.advance_transcript_animation());
+}
+
 /// The composing page's workspace row, which is the line `Ctrl+W` changes.
 ///
 /// Found by its label rather than by its row number: the page is centred in the
@@ -4771,6 +4828,120 @@ fn the_agent_and_the_composer_line_carry_a_new_runtime_together() {
         naming(&settled) >= 2,
         "the runtime is not named on both surfaces:\n{settled}"
     );
+}
+
+#[test]
+fn an_existing_session_carries_its_runtime_change_after_the_picker_closes() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::app::Effect;
+
+    for enabled in [true, false] {
+        let mut app = app(120, 40);
+        app.live = vibex_tui::app::LiveState::Ready;
+        app.capabilities = vibex_backend::BackendCapabilitySnapshot::desktop_native_v1();
+        app.settings.transitions = enabled;
+        let catalog = run_option_catalog();
+        open_session_on(&mut app, catalog.options[0].selection.clone());
+        app.open_session(app.selected_session_id().unwrap().clone());
+        app.runtime_options = Some(catalog);
+        app.composer.set_text("keep this draft");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| vibex_tui::view::render(frame, &mut app))
+            .expect("first session frame");
+        assert!(!app.is_animating());
+
+        app.perform(Intent::SwitchAgentRuntime);
+        pick_entry(&mut app, 1);
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        let [
+            Effect::SwitchRuntime {
+                session_id,
+                selection,
+            },
+        ] = outcome.effects.as_slice()
+        else {
+            panic!("expected one runtime switch, got {outcome:?}");
+        };
+        assert_eq!(Some(session_id), app.selected_session_id());
+        assert!(app.overlay.is_some(), "the run options should remain open");
+
+        // The authority reports the new selection while the picker covers the
+        // composer. No transition should be spent behind that overlay.
+        let state = app.agent.state.runtime_selection.value.as_mut().unwrap();
+        state.desired = selection.clone();
+        state.effective = selection.clone();
+        terminal
+            .draw(|frame| vibex_tui::view::render(frame, &mut app))
+            .expect("updated session behind picker");
+        for _ in 0..=vibex_tui::scramble::FRAMES {
+            assert!(!app.advance_transcript_animation());
+        }
+
+        app.perform(Intent::CloseOverlay);
+        assert!(app.overlay.is_some(), "Esc first returns to the catalogue");
+        terminal
+            .draw(|frame| vibex_tui::view::render(frame, &mut app))
+            .expect("catalogue still open");
+        assert!(!app.transitions.running(app.animation_phase()));
+        app.perform(Intent::CloseOverlay);
+        assert!(app.overlay.is_none());
+        terminal
+            .draw(|frame| vibex_tui::view::render(frame, &mut app))
+            .expect("picker closed");
+        let arriving = text(&buffer_lines(terminal.backend().buffer(), 120, 40));
+        assert_eq!(app.transitions.running(app.animation_phase()), enabled);
+        assert_eq!(arriving.contains("codex · gpt-5"), !enabled, "{arriving}");
+        assert!(arriving.contains("keep this draft"));
+
+        for _ in 0..vibex_tui::scramble::FRAMES {
+            if app.advance_transcript_animation() {
+                terminal
+                    .draw(|frame| vibex_tui::view::render(frame, &mut app))
+                    .expect("scheduled frame");
+            }
+        }
+        let settled = text(&buffer_lines(terminal.backend().buffer(), 120, 40));
+        assert!(settled.contains("codex · gpt-5"), "{settled}");
+        assert!(!app.is_animating());
+        assert!(!app.advance_transcript_animation());
+    }
+}
+
+#[test]
+fn opening_another_composer_does_not_carry_the_previous_runtime_transition() {
+    let mut app = app(120, 40);
+    let catalog = run_option_catalog();
+    app.runtime_options = Some(catalog.clone());
+    app.perform(vibex_tui::action::Intent::NewSession);
+    render(&mut app, 120, 40);
+    app.new_session_runtime = Some(catalog.options[1].selection.clone());
+    render(&mut app, 120, 40);
+    assert!(app.transitions.running(app.animation_phase()));
+
+    // A session opens with its own labels, even if the draft was mid-change.
+    open_session_on(&mut app, catalog.options[0].selection.clone());
+    app.open_session(app.selected_session_id().unwrap().clone());
+    let opened = text(&render(&mut app, 120, 40));
+    assert!(opened.contains("claude · claude-sonnet"), "{opened}");
+    assert!(!app.transitions.running(app.animation_phase()));
+
+    app.agent
+        .state
+        .runtime_selection
+        .value
+        .as_mut()
+        .unwrap()
+        .desired = catalog.options[1].selection.clone();
+    render(&mut app, 120, 40);
+    assert!(app.transitions.running(app.animation_phase()));
+
+    // Moving between two existing sessions also clears the previous run.
+    open_session_on(&mut app, catalog.options[0].selection.clone());
+    app.open_session(app.selected_session_id().unwrap().clone());
+    let opened = text(&render(&mut app, 120, 40));
+    assert!(opened.contains("claude · claude-sonnet"), "{opened}");
+    assert!(!app.is_animating());
 }
 
 /// The mark with its styling: the light changes, and so does the mark it draws.

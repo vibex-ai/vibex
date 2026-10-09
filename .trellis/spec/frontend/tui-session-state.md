@@ -3,8 +3,9 @@
 ## 1. Scope / Trigger
 
 Read this contract when changing TUI new-session composition, session navigation,
-runtime selection, asynchronous creation/fork/send results, or optimistic
-transcripts. The runtime owns durable sessions; the TUI owns editor buffers and
+runtime selection, asynchronous creation/fork/send results, optimistic
+transcripts, composer text transitions, or animation repaint scheduling.
+The runtime owns durable sessions; the TUI owns editor buffers and
 the association between a user's action and its result.
 
 ## 2. Signatures
@@ -20,6 +21,9 @@ AppMessage::SessionForked { request_id, result }
 Effect::SendMessage { session_id, send_id, correlation_id, text, attachments }
 AppMessage::MessageSent { session_id, send_id, result }
 ComposerTicket { target, navigation_serial, runtime, text, cursor }
+App::switch_composer(target: ComposerTarget)
+App::observe_composer_text()
+App::advance_transcript_animation() -> bool // whether a repaint is due
 ```
 
 Creation reserves its `VibexSessionId` before dispatch and passes it through
@@ -80,6 +84,20 @@ without fetching a record before creation has completed.
 - Transcript expansion is local presentation state keyed by block ID. A live
   update or final snapshot must preserve it. Group expansion opens every member;
   toggling all reasoning chooses a target state once before walking groups.
+- Runtime text transitions follow the current `ComposerTarget` on both
+  `Page::NewSession` and `Page::Agent`. Observe workspace text only on New Session,
+  where that animated row is visible. `switch_composer` clears both observed
+  labels and running transitions when the target changes, so opening another
+  editor starts with its own labels.
+- `observe_composer_text` defers observation while an overlay covers the page.
+  A runtime change received behind the picker begins on the first frame after
+  it closes. With text transitions disabled, observations still record the
+  current labels; re-enabling the setting cannot replay an old change.
+- `advance_transcript_animation` must request the final resting frame before
+  suppressing repaints. Check whether the landing mark was waiting both before
+  and after advancing the phase and pruning finished text transitions. A burst
+  or transition ending is still a visible change; subsequent quiet ticks must
+  not repaint. Text transitions settle within 750 ms at `ANIMATION_TICK` cadence.
 
 ## 4. Validation & Error Matrix
 
@@ -96,6 +114,10 @@ without fetching a record before creation has completed.
 | Creation takes longer than the optimistic display timeout | The first real send still blocks queued follow-ups until accepted. |
 | Clipboard/editor/workspace result arrives after changing targets | Do not modify the later editor or navigate away from it. |
 | Background send repeats text already in history | Keep its pending identity until that particular send is confirmed. |
+| A mark burst or text transition ends | Repaint its resting frame without requiring input, then stop quiet repaints. |
+| An existing session's runtime changes behind its picker | Begin the composer transition only after the overlay closes. |
+| A different composer opens during a transition | Clear the previous labels and transition before its first frame. |
+| Text transitions are disabled | Show updated labels immediately and do not replay them when re-enabled. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -105,6 +127,10 @@ without fetching a record before creation has completed.
   first message immediately, and sends with the selected Agent and workspace.
 - Bad: one global `pending_new_session.take()` supplies whichever creation
   happens to finish first, or a missing session ID matches all transcripts.
+- Good: the last animated frame is replaced by a scheduled resting frame, and
+  the mark's quiet interval then produces no repaints.
+- Bad: pruning a completed text transition before deciding whether to repaint
+  leaves its last noise characters on screen until the next input event.
 
 ## 6. Tests Required
 
@@ -115,6 +141,14 @@ without fetching a record before creation has completed.
   deliberately reordered success/failure results. Cover stale session loads,
   concurrent and duplicate creations, mismatched IDs, forks, failed recovery,
   picker targets, and send completion isolation.
+- `tests/render.rs` must draw animation frames only when the scheduler requests
+  them. Assert that Classic and Glitch restore their resting buffers, a text
+  transition finishes while the mark is resting, and later quiet ticks do not
+  repaint. Cover existing-session runtime switches with the picker open/closed,
+  the disabled setting, and transitions cleared when changing composer targets.
+- PTY scenarios own temporary interface, runtime-preference, and keymap files.
+  Pinning `LC_ALL` alone is insufficient because remembered locale settings
+  outrank environment detection.
 - Run the TUI unit, render, contract, and PTY suites, affected shared-controller
   tests, formatting, and Clippy. Screenshots are not required to establish
   ownership or callback ordering.
@@ -134,4 +168,19 @@ if reply.id == request_id {
         worker.dispatch(effect);
     }
 }
+```
+
+```rust
+// Wrong: the state is quiet now, but the screen still holds a moving frame.
+self.animation_phase = self.animation_phase.wrapping_add(1);
+self.transitions.prune(self.animation_phase);
+!self.landing_mark_waits()
+```
+
+```rust
+// Correct: restore the resting frame before suppressing later repaints.
+let was_waiting = self.landing_mark_waits();
+self.animation_phase = self.animation_phase.wrapping_add(1);
+self.transitions.prune(self.animation_phase);
+!was_waiting || !self.landing_mark_waits()
 ```

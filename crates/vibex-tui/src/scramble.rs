@@ -44,7 +44,7 @@ use unicode_width::UnicodeWidthChar;
 /// scramble both to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Slot {
-    /// The Agent and model the composing page will run.
+    /// The Agent and model the current composer will run.
     Runtime,
     /// The directory the session will work in.
     Workspace,
@@ -52,12 +52,9 @@ pub enum Slot {
 
 /// Frames one transition takes.
 ///
-/// Read at the tick the client runs while something is moving — about eight
-/// frames a second — a transition is a second and a half: long enough to be
-/// seen as a settle, short enough that a reader walking a directory tree with
-/// `Ctrl+W` is never waiting for the last one to finish before starting the
-/// next.
-pub const FRAMES: u32 = 12;
+/// Six animation ticks settle the text in 720 ms. Runtime and workspace
+/// changes remain readable without holding noise on screen between choices.
+pub const FRAMES: u32 = 6;
 
 /// The characters a cell wears while it waits its turn.
 ///
@@ -100,7 +97,7 @@ impl Scramble {
         Self { from, started }
     }
 
-    /// Whether the transition has drawn its last frame.
+    /// Whether the transition has reached its settled phase.
     pub fn finished(&self, phase: u32) -> bool {
         phase.wrapping_sub(self.started) >= FRAMES
     }
@@ -172,7 +169,7 @@ fn noise(index: u64, phase: u64, hidden: char) -> char {
     character
 }
 
-/// The three lines of the composing page, as the last frame drew them.
+/// The runtime and workspace labels, as the last frame drew them.
 ///
 /// Held apart rather than as one string because that is how they are drawn: the
 /// Agent and the model are two spans, and the workspace is its own row.
@@ -201,7 +198,7 @@ pub struct Transitions {
 }
 
 impl Transitions {
-    /// Note the lines the composing page is about to draw, and begin a
+    /// Note the lines the current composer is about to draw, and begin a
     /// transition for each one that changed since the last look.
     ///
     /// `enabled` is the reader's setting. It is checked here rather than at the
@@ -262,12 +259,13 @@ impl Transitions {
         }
     }
 
-    /// Whether any transition still has a frame to draw.
+    /// Whether any transition is before its settled phase.
     pub fn running(&self, phase: u32) -> bool {
         self.runs.values().any(|run| !run.finished(phase))
     }
 
     /// Drop the transitions that have finished.
+    /// The caller still owes the screen a repaint of their settled text.
     pub fn prune(&mut self, phase: u32) {
         self.runs.retain(|_, run| !run.finished(phase));
     }
