@@ -5142,6 +5142,44 @@ fn timeline_scroll_anchor_from_offset(
         .map(|index| (index, row_heights[index]))
 }
 
+/// The timeline rows the pane's viewport currently shows.
+///
+/// `offset_y` is the raw [`ScrollHandle`] offset (zero at the top, negative
+/// while scrolled down) and `padding_top` is the list's own top padding, which
+/// scrolls with the content — the same pair [`timeline_scroll_anchor_from_offset`]
+/// resolves the viewport's top row with. A row counts while any of it is on
+/// screen, and the viewport's own height is measured from the scroll handle's
+/// bounds, so a viewport that straddles a turn boundary reports both turns.
+/// That is what lets the turn preview rail keep every turn the reader can
+/// actually see lit at once instead of only the one the pointer names.
+fn timeline_visible_row_range(
+    row_heights: impl IntoIterator<Item = f32>,
+    offset_y: f32,
+    padding_top: f32,
+    viewport_height: f32,
+) -> Range<usize> {
+    if !(viewport_height.is_finite() && viewport_height > 0.0) {
+        // Before the first layout reports the pane there is no viewport to
+        // intersect, and lighting a guessed row would be worse than none.
+        return 0..0;
+    }
+    let viewport_top = -offset_y - padding_top;
+    let viewport_bottom = viewport_top + viewport_height;
+    let mut visible: Option<Range<usize>> = None;
+    let mut row_top = 0.0;
+    for (index, height) in row_heights.into_iter().enumerate() {
+        let row_bottom = row_top + height;
+        if row_bottom > viewport_top && row_top < viewport_bottom {
+            match visible.as_mut() {
+                Some(visible) => visible.end = index + 1,
+                None => visible = Some(index..index + 1),
+            }
+        }
+        row_top = row_bottom;
+    }
+    visible.unwrap_or(0..0)
+}
+
 /// Scroll offset that puts `row_index`'s top `offset_in_row` below the viewport
 /// top. The inverse of [`timeline_scroll_anchor_from_offset`], so an unchanged
 /// row table maps an offset back to itself.
@@ -43953,6 +43991,12 @@ impl VibexWorkbench {
 
     /// Renders the conversation turn preview rail.
     ///
+    /// The rail answers two independent questions. Where is the pointer — the
+    /// hovered slot, which also opens its preview card — and where is the
+    /// reader: every slot whose turn the timeline viewport shows keeps the
+    /// reading emphasis, so a viewport that straddles a turn boundary lights
+    /// every turn it holds at once.
+    ///
     /// `pinned` means the pane's left gutter is wide enough to hold the rail:
     /// the rail then stays on screen as a reading aid, and only its preview
     /// card still answers the pointer. Without that gutter the rail falls back
@@ -44001,6 +44045,25 @@ impl VibexWorkbench {
         let active_index = self
             .turn_preview_active_index
             .filter(|index| *index < rail_turn_count);
+        // The reader's second signal besides the pointer: every turn the
+        // timeline viewport currently shows. Both edges come from the scroll
+        // handle the virtual list is tracking, so the highlighted band follows
+        // the conversation as it scrolls instead of waiting for a hover. A rail
+        // that is not on screen has no slot to light, so it does not walk the
+        // row table either.
+        let visible_slots = if rail_entries.is_empty() {
+            0..0
+        } else {
+            let visible_rows = timeline_visible_row_range(
+                self.timeline_row_sizes
+                    .iter()
+                    .map(|row_size| f32::from(row_size.height)),
+                f32::from(self.timeline_scroll.offset().y),
+                self.timeline_list_padding_top_px,
+                f32::from(self.timeline_scroll.bounds().size.height),
+            );
+            agent_turn_preview_rail_visible_slots(&rail_entries, visible_rows)
+        };
         let items = rail_entries
             .iter()
             .enumerate()
@@ -44021,15 +44084,26 @@ impl VibexWorkbench {
                         format!("跳轉到第 {turn_number} 輪：{title}")
                     }
                 };
-                let distance = active_index.map(|active| active.abs_diff(preview_index));
-                let (line_width, line_height, line_color) = match distance {
-                    Some(0) => (26.4, 2.88, foreground),
-                    Some(1) => (20.0, 2.24, muted_foreground.opacity(0.48)),
-                    Some(2) => (16.8, 2.24, muted_foreground.opacity(0.34)),
-                    _ => (14.4, 2.24, muted_foreground.opacity(0.24)),
+                let hovered = active_index == Some(preview_index);
+                // The pointer owns one slot outright: the longest, brightest
+                // bar and the preview card that goes with it. Every slot the
+                // viewport shows keeps the reading emphasis instead of fading
+                // with its distance to the pointer, otherwise scrolling across
+                // a turn boundary would light one turn and dim the other the
+                // reader can see just as well.
+                let (line_width, line_height, line_color) = if hovered {
+                    (26.4, 2.88, foreground)
+                } else if visible_slots.contains(&preview_index) {
+                    (23.2, 2.88, foreground.opacity(0.72))
+                } else {
+                    match active_index.map(|active| active.abs_diff(preview_index)) {
+                        Some(1) => (20.0, 2.24, muted_foreground.opacity(0.48)),
+                        Some(2) => (16.8, 2.24, muted_foreground.opacity(0.34)),
+                        _ => (14.4, 2.24, muted_foreground.opacity(0.24)),
+                    }
                 };
 
-                let preview_card = (distance == Some(0)).then(|| {
+                let preview_card = hovered.then(|| {
                     let content = agent_turn_preview_content(turn, &label, empty_message);
                     let card_shadow = if is_dark {
                         vec![
@@ -56489,6 +56563,40 @@ fn agent_turn_preview_rail_entries(
             },
         )
         .collect()
+}
+
+/// The rail slots whose turn the timeline viewport shows.
+///
+/// A slot owns every row from its own turn down to the row before the next
+/// numbered turn: a continuation turn carries no slot of its own, so the rows
+/// it contributes still light the user turn that triggered it while they are on
+/// screen. Entries are ordered by row, so one contiguous row range always
+/// covers one contiguous slot range — the rail reports the whole range instead
+/// of the single slot a pointer would name.
+fn agent_turn_preview_rail_visible_slots(
+    entries: &[AgentTurnPreviewRailEntry],
+    visible_rows: Range<usize>,
+) -> Range<usize> {
+    if entries.is_empty() || visible_rows.is_empty() {
+        return 0..0;
+    }
+    // The last slot that reaches into the viewport is the last numbered turn
+    // that starts above its bottom edge; every continuation row below that
+    // turn still belongs to it.
+    let Some(last) = entries
+        .iter()
+        .rposition(|entry| entry.turn_index < visible_rows.end)
+    else {
+        return 0..0;
+    };
+    // The first is the last slot starting at or above the viewport top. Rows
+    // above the first numbered turn belong to no slot, so a viewport parked
+    // there lights nothing.
+    let first = entries
+        .iter()
+        .rposition(|entry| entry.turn_index <= visible_rows.start)
+        .unwrap_or(0);
+    first..last + 1
 }
 
 /// Publication time of a signed release, or `None` when the manifest carried a
@@ -87513,6 +87621,89 @@ mod tests {
             agent_turn_preview_rail_entries(&[rail_preview_turn("turn:continuation:only", false)])
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn timeline_visible_rows_cover_every_turn_the_viewport_shows() {
+        let rows = [100.0, 120.0, 80.0, 200.0];
+        // Parked at the top, the viewport's leading padding is admitted exactly
+        // like the virtual list admits it: the first row counts even though its
+        // top sits under the padding.
+        assert_eq!(timeline_visible_row_range(rows, 0.0, 16.0, 150.0), 0..2);
+        // Scrolled into the middle: the turn under the top edge and the one
+        // under the bottom edge are both in view.
+        assert_eq!(
+            timeline_visible_row_range(rows, -110.0, 16.0, 240.0),
+            0..4
+        );
+        // A turn that only starts at the bottom edge is not on screen: the
+        // viewport ends exactly on its first row, so it stays dark while the
+        // turn above it stays lit.
+        assert_eq!(
+            timeline_visible_row_range(rows, -116.0, 16.0, 120.0),
+            1..2
+        );
+        // Every edge case the pane can actually report before it has laid out,
+        // or with no conversation to show, lights nothing rather than guessing.
+        assert_eq!(timeline_visible_row_range(rows, 0.0, 16.0, 0.0), 0..0);
+        assert_eq!(timeline_visible_row_range([], 0.0, 16.0, 400.0), 0..0);
+        assert_eq!(
+            timeline_visible_row_range(rows, 0.0, 16.0, f32::NAN),
+            0..0
+        );
+    }
+
+    #[test]
+    fn turn_preview_rail_lights_every_slot_in_the_viewport() {
+        let entries = |rows: &[usize]| {
+            rows.iter()
+                .enumerate()
+                .map(|(number_index, turn_index)| AgentTurnPreviewRailEntry {
+                    turn_index: *turn_index,
+                    turn_number: number_index + 1,
+                })
+                .collect::<Vec<_>>()
+        };
+        let rail = entries(&[0, 3]);
+        // A viewport inside one turn lights one slot...
+        assert_eq!(agent_turn_preview_rail_visible_slots(&rail, 0..1), 0..1);
+        assert_eq!(agent_turn_preview_rail_visible_slots(&rail, 3..5), 1..2);
+        // ... and one that straddles a boundary lights both, which is the whole
+        // point of tracking the viewport instead of the pointer.
+        assert_eq!(agent_turn_preview_rail_visible_slots(&rail, 2..4), 0..2);
+        assert_eq!(agent_turn_preview_rail_visible_slots(&rail, 0..9), 0..2);
+        // A continuation turn owns no slot, so its rows light the user turn
+        // that triggered it while they are the only thing on screen.
+        assert_eq!(agent_turn_preview_rail_visible_slots(&rail, 1..3), 0..1);
+        // Nothing numbered is on screen: a viewport parked above the first user
+        // turn, an empty conversation, and a layout that has not reported a
+        // viewport yet all stay dark.
+        assert_eq!(agent_turn_preview_rail_visible_slots(&rail, 0..0), 0..0);
+        assert_eq!(agent_turn_preview_rail_visible_slots(&[], 0..4), 0..0);
+        assert_eq!(
+            agent_turn_preview_rail_visible_slots(&entries(&[5]), 0..3),
+            0..0
+        );
+    }
+
+    #[test]
+    fn turn_preview_rail_reading_emphasis_follows_the_viewport() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_agent_turn_preview_rail(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_workbench("))
+            .map(|(body, _)| body)
+            .expect("turn preview renderer should remain inspectable");
+
+        assert!(renderer.contains("agent_turn_preview_rail_visible_slots("));
+        assert!(renderer.contains("timeline_visible_row_range("));
+        assert!(renderer.contains("f32::from(self.timeline_scroll.offset().y)"));
+        assert!(renderer.contains("f32::from(self.timeline_scroll.bounds().size.height)"));
+        // The pointer still outranks the reading position for its own slot, and
+        // the reading position outranks the pointer's neighbourhood fade.
+        assert!(renderer.contains("let (line_width, line_height, line_color) = if hovered {"));
+        assert!(renderer.contains("} else if visible_slots.contains(&preview_index) {"));
+        assert!(renderer.contains("let preview_card = hovered.then(|| {"));
     }
 
     #[test]
