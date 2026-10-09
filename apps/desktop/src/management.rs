@@ -1588,16 +1588,14 @@ impl ManagementCenter {
                 if !management_input_changed(event) {
                     return;
                 }
-                this.navigation
-                    .mark_dirty(ManagementSection::PromptsHooks, true);
+                this.sync_prompt_draft_dirty(cx);
                 cx.notify();
             }),
             cx.subscribe(&prompt_body, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
                 }
-                this.navigation
-                    .mark_dirty(ManagementSection::PromptsHooks, true);
+                this.sync_prompt_draft_dirty(cx);
                 cx.notify();
             }),
             cx.subscribe(&hook_name, |this, _, event: &InputEvent, cx| {
@@ -7298,11 +7296,19 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(success)) => {
                         match &completed_mutation {
+                            // Both actions persist the editor's own fields, so
+                            // the form now matches the record it belongs to —
+                            // unless it was edited while the save was still in
+                            // flight, which keeps the tab dirty.
                             ManagementMutation::PromptAction(action)
-                                if action.starts_with("create") =>
+                                if action.starts_with("create")
+                                    || action.starts_with("update:") =>
                             {
+                                let saved =
+                                    success.prompt.as_ref().or_else(|| this.selected_prompt());
+                                let dirty = this.prompt_draft_differs(saved, cx);
                                 this.navigation
-                                    .mark_dirty(ManagementSection::PromptsHooks, false);
+                                    .mark_dirty(ManagementSection::PromptsHooks, dirty);
                             }
                             ManagementMutation::HookAction(action)
                                 if action.starts_with("create") =>
@@ -9177,6 +9183,38 @@ impl ManagementCenter {
         }
     }
 
+    /// Whether the Prompt editor holds text that `saved` does not.
+    fn prompt_draft_differs(&self, saved: Option<&vibex_core::Prompt>, cx: &App) -> bool {
+        prompt_draft_differs_from(
+            saved,
+            &self.prompt_name.read(cx).value(),
+            &self.prompt_body.read(cx).value(),
+            locale::current_locale(),
+        )
+    }
+
+    /// The Prompt the editor is editing, while the sidebar's selection still
+    /// names a record.
+    fn selected_prompt(&self) -> Option<&vibex_core::Prompt> {
+        let selected_id = self.selected_prompt_id.as_deref()?;
+        self.snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id.as_str() == selected_id)
+    }
+
+    /// Re-reads the Prompts tab's unsaved-changes flag from the form itself.
+    ///
+    /// The flag is derived rather than latched, so every transition that leaves
+    /// the editor holding something that is already stored — loading a record,
+    /// starting a blank Prompt, or saving one — stops reporting changes without
+    /// each of those paths having to remember to clear it.
+    fn sync_prompt_draft_dirty(&mut self, cx: &App) {
+        let dirty = self.prompt_draft_differs(self.selected_prompt(), cx);
+        self.navigation
+            .mark_dirty(ManagementSection::PromptsHooks, dirty);
+    }
+
     /// Loads one Prompt into the editor and marks it as the sidebar selection.
     fn begin_prompt_edit(
         &mut self,
@@ -9191,6 +9229,7 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value(display_name, window, cx));
         self.prompt_body
             .update(cx, |state, cx| state.set_value(body, window, cx));
+        self.sync_prompt_draft_dirty(cx);
         cx.notify();
     }
 
@@ -9205,6 +9244,7 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.prompt_body
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.sync_prompt_draft_dirty(cx);
         cx.notify();
     }
 
@@ -16593,16 +16633,7 @@ impl ManagementCenter {
     fn render_prompts(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let editing = self.selected_prompt_id.is_some();
-        let selected = self
-            .selected_prompt_id
-            .as_deref()
-            .and_then(|id| {
-                self.snapshot
-                    .prompts
-                    .iter()
-                    .find(|prompt| prompt.id.as_str() == id)
-            })
-            .cloned();
+        let selected = self.selected_prompt().cloned();
 
         let mut form = v_flex().w_full().gap_3();
         if let Some(prompt) = &selected {
@@ -24186,6 +24217,55 @@ fn management_prompt_preview(body: &str) -> String {
         .to_string()
 }
 
+/// The name and body the Prompt editor's `Save` submits.
+///
+/// The two fields are optional: a blank name or body falls back to the same
+/// default a Prompt could start from, so these are also the values a draft has
+/// to match before the tab stops calling it unsaved.
+fn normalized_prompt_draft(
+    locale: ResolvedLocale,
+    display_name: &str,
+    body: &str,
+) -> (String, String) {
+    let display_name = display_name.trim();
+    let display_name = if display_name.is_empty() {
+        management_locale_text_for(locale, "Reusable prompt", "可复用提示词", "可重用提示詞")
+    } else {
+        display_name
+    };
+    let body = body.trim();
+    let body = if body.is_empty() {
+        management_locale_text_for(
+            locale,
+            "Review this workspace.",
+            "检查此工作区。",
+            "檢查此工作區。",
+        )
+    } else {
+        body
+    };
+    (display_name.to_string(), body.to_string())
+}
+
+/// Whether the Prompt editor's two fields hold anything the given record does
+/// not.
+///
+/// `saved` is the record the form belongs to: the selected Prompt, or the one
+/// `Save` just persisted. `None` means the editor is still a new Prompt, where
+/// any text at all is a draft.
+fn prompt_draft_differs_from(
+    saved: Option<&vibex_core::Prompt>,
+    display_name: &str,
+    body: &str,
+    locale: ResolvedLocale,
+) -> bool {
+    let Some(saved) = saved else {
+        return !display_name.trim().is_empty() || !body.trim().is_empty();
+    };
+    let (display_name, body) = normalized_prompt_draft(locale, display_name, body);
+    saved.display_name != display_name || saved.body != body
+}
+
 fn management_hook_status_label(status: vibex_core::HookStatus) -> &'static str {
     match status {
         vibex_core::HookStatus::Draft => management_locale_text("Draft", "草稿", "草稿"),
@@ -25541,6 +25621,66 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Skills"));
         assert!(renderer.contains("ManagementSection::PromptsHooks"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    /// Saving a Prompt has to leave its tab clean, so the editor compares the
+    /// form with the record it belongs to instead of latching a flag the save
+    /// path can forget to clear.
+    #[test]
+    fn prompt_draft_is_measured_against_the_record_it_edits() {
+        let saved = vibex_core::Prompt {
+            id: vibex_core::PromptId::parse("prompt_draft_probe").expect("fixture id"),
+            // The defaults `Save` fills blank fields with, so the blank form
+            // asserted below is this record rather than a change to it.
+            display_name: "Reusable prompt".into(),
+            kind: vibex_core::PromptKind::ReusablePrompt,
+            status: vibex_core::PromptStatus::Enabled,
+            scope_kind: vibex_core::PromptScopeKind::User,
+            project_id: None,
+            workspace_id: None,
+            body: "Review this workspace.".into(),
+            description: None,
+            tags: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            deleted_at_ms: None,
+        };
+        let locale = ResolvedLocale::En;
+
+        // The form the save just submitted: the same text, so nothing is left
+        // unsaved and switching tabs must not ask to discard it.
+        assert!(!prompt_draft_differs_from(
+            Some(&saved),
+            "Reusable prompt",
+            "Review this workspace.",
+            locale
+        ));
+        // `Save` trims, and fills blank fields with the record's defaults, so
+        // neither counts as a change the user still has to store.
+        assert!(!prompt_draft_differs_from(
+            Some(&saved),
+            "  Reusable prompt  ",
+            "Review this workspace.\n",
+            locale
+        ));
+        assert!(!prompt_draft_differs_from(Some(&saved), "", "", locale));
+        // An edited body or name is still a draft.
+        assert!(prompt_draft_differs_from(
+            Some(&saved),
+            "Reusable prompt",
+            "Review this workspace twice.",
+            locale
+        ));
+        assert!(prompt_draft_differs_from(
+            Some(&saved),
+            "Reference",
+            "Review this workspace.",
+            locale
+        ));
+        // A Prompt that has not been created yet holds a draft as soon as it
+        // has any text, and none while its fields are still blank.
+        assert!(!prompt_draft_differs_from(None, "  ", "", locale));
+        assert!(prompt_draft_differs_from(None, "", "Check this.", locale));
     }
 
     /// Quick phrases are a composer concept, so the Prompt tab owns the editor
