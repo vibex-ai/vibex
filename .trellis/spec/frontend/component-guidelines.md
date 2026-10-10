@@ -912,6 +912,43 @@ the diff handle offsets, the parent offset remaining zero, and a late row's
 changed bounds for the vertical path. Compile-only checks and source-string
 assertions do not exercise GPUI layout, wheel routing, or event propagation.
 
+### GPUI File Tree Menus And Inline Editing
+
+`CodeRightRail` owns the context target and the name input. The file tree has one
+context-menu trigger. Capture the right press from the tree to the row and then
+the compact-directory segment, so the most specific path wins before the menu's
+deferred builder runs. Do not nest row and empty-space popup triggers: two menus
+for one press can cover each other, making the first command act on the workspace
+root and leaving the other popup visible afterward. Cover the first press with
+a real pointer test.
+
+The open menu snapshots its target. `file_context_target` retains the popup's
+entity id and target path until `DismissEvent`, so the row keeps its full-row
+selection frame after the pointer moves into the menu. Ignore dismissal from a
+previous popup after a new target has opened. Copy paths, clipboard commands,
+rename and delete must all use that same snapshot; the delete menu label is
+simply `Delete`, with the affected path shown in the confirmation.
+
+Creating an entry expands the target directory, inserts the blank input directly
+beneath it, scrolls it into view and focuses it after the menu closes. Selecting
+a compact directory segment first exposes the correct parent for insertion.
+Enter or blur submits a nonempty name; empty blur and Escape cancel without a
+mutation. Rename shares the retained input, and clicking it must not focus its
+containing directory row. Finishing or canceling restores tree focus only while
+the input owns focus; a blur keeps the user's new focus destination. Validation
+appears beneath the input and wraps within the pane.
+
+Keep the input and action until `FileMutationFinished` arrives. A submitting
+input is read-only, so Enter followed by blur cannot submit twice or lose the
+draft. A failed mutation restores editing with the name and error intact.
+Completion and UI state are fenced by the workspace generation; switching
+workspaces clears the draft, context target and file clipboard.
+
+`code_workbench::file_panel_tests` exercises first-click copy/cut, current-target
+clipboard values, compact-segment targets, menu dismissal, name-input focus,
+cancellation and native file mutations. Rendering or compilation alone does not
+prove the event ordering.
+
 ### File Tree Icons
 
 Desktop file trees, including the right rail file preview panel, should keep

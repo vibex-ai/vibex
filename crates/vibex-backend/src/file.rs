@@ -6,6 +6,19 @@ use vibex_core::{
 use crate::{BackendBound, BackendFuture, MutationRequest};
 
 pub trait FileBackend: BackendBound {
+    /// Resolves an existing file or directory on the client's own machine.
+    ///
+    /// Native backends validate the path through the workspace file service.
+    /// Remote backends return `None`: a server path is not a local path, even
+    /// when a directory with the same name happens to exist on the client.
+    fn resolve_local_path(
+        &self,
+        _workspace_id: WorkspaceId,
+        _path: String,
+    ) -> BackendFuture<'_, Option<std::path::PathBuf>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn file_tree(&self, request: FileTreeRequest) -> BackendFuture<'_, Vec<FileTreeEntry>>;
 
     fn search_files(&self, request: FileSearchRequest) -> BackendFuture<'_, Vec<FileSearchResult>>;

@@ -1091,6 +1091,22 @@ fn temporary_session_root() -> vibex_core::VibexResult<String> {
 }
 
 impl FileBackend for NativeBackend {
+    fn resolve_local_path(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BackendFuture<'_, Option<std::path::PathBuf>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .files()
+                .resolve_existing_path(&workspace_id, &path)
+                .map(Some)
+                .map_err(Into::into)
+        })
+    }
+
     fn file_tree(&self, request: FileTreeRequest) -> BackendFuture<'_, Vec<FileTreeEntry>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
