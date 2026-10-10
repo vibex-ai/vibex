@@ -72,11 +72,12 @@ use crate::storage::{
 };
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme};
-use gpui_component::StyledExt as _;
-use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
 use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
 use gpui_component::shimmer::ShimmerText;
+use gpui_component::{Disableable as _, StyledExt as _};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -168,7 +169,7 @@ enum RootMode {
 /// entries front-to-back; an empty stack means the host back behavior applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackScreen {
-    /// A full-screen overlay (Hosts, Settings, Usage, NewProject, NewSession).
+    /// A full-screen overlay or a sheet opened from one.
     Overlay(MobileOverlay),
     /// A renamed/detached session with its title still open in the prompt.
     SessionAction,
@@ -517,7 +518,8 @@ enum InputField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobileOverlay {
-    Hosts,
+    /// The pairing page opened over the existing connection and session.
+    Pairing,
     /// The read-only runtime detail page.
     HostDetail,
     /// The per-runtime action sheet.
@@ -538,8 +540,7 @@ impl MobileOverlay {
     fn is_host_overlay(self) -> bool {
         matches!(
             self,
-            MobileOverlay::Hosts
-                | MobileOverlay::HostDetail
+            MobileOverlay::HostDetail
                 | MobileOverlay::HostActions
                 | MobileOverlay::HostRename
                 | MobileOverlay::HostRemove
@@ -739,8 +740,6 @@ impl RuntimeStatus {
         }
     }
 
-    /// A failed state, where the transport's own error text is worth showing
-    /// together with a retry.
     fn is_failure(self) -> bool {
         matches!(self, Self::Offline | Self::Revoked | Self::Incompatible)
     }
@@ -980,7 +979,9 @@ pub struct MobileApp {
     workspace_summaries: Vec<WorkspaceSummary>,
     sidebar_state: SidebarState,
     overlay: Option<MobileOverlay>,
-    overlay_parent: Option<MobileOverlay>,
+    /// Retain every parent so runtime sheets return through the pairing page
+    /// even when it was opened from another overlay such as Settings.
+    overlay_parents: Vec<MobileOverlay>,
     overlay_returns_to_drawer: bool,
     known_hosts: Vec<MobileHostEntry>,
     active_host_id: Option<String>,
@@ -1271,7 +1272,7 @@ impl MobileApp {
             workspace_summaries: Vec::new(),
             sidebar_state: SidebarState::default(),
             overlay: None,
-            overlay_parent: None,
+            overlay_parents: Vec::new(),
             overlay_returns_to_drawer: false,
             known_hosts,
             active_host_id: None,
@@ -1468,7 +1469,7 @@ impl MobileApp {
             MobileLifecycleEvent::Resumed => {
                 self.app_backgrounded = false;
                 self.refresh_battery_allowlist(cx);
-                if self.mode == RootMode::Pairing {
+                if self.is_pairing_visible() {
                     // Nothing was probed while the app was away.
                     self.refresh_host_reachability(cx);
                 }
@@ -1876,6 +1877,15 @@ impl MobileApp {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = connection.await;
             let _ = entity.update(cx, |this, cx| {
+                // Switching or disconnecting can finish before the old
+                // connection attempt delivers its cancellation.
+                if !this
+                    .backend
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &backend))
+                {
+                    return;
+                }
                 this.operation_busy = false;
                 match outcome {
                     Ok(Ok(_)) => {
@@ -2217,8 +2227,7 @@ impl MobileApp {
 
     /// Asks every saved runtime whether it is up, and records the answers.
     ///
-    /// The pairing page is the one place where nothing is connected, so this is
-    /// the only state a saved runtime can show there. Each probe is the
+    /// Saved runtimes without a live connection show this state. Each probe is the
     /// transport's own bounded `/api/v2/info` request, which cannot claim a
     /// pairing offer or rotate a device grant.
     fn refresh_host_reachability(&mut self, cx: &mut Context<Self>) {
@@ -2303,7 +2312,7 @@ impl MobileApp {
                     }
                     let alive = entity
                         .update(cx, |this, cx| {
-                            if this.mode == RootMode::Pairing
+                            if this.is_pairing_visible()
                                 && !this.known_hosts.is_empty()
                                 && !this.app_backgrounded
                             {
@@ -2560,7 +2569,7 @@ impl MobileApp {
     }
 
     fn claim_scanned_pairing_link(&mut self, link: String, cx: &mut Context<Self>) {
-        if self.pairing_busy || self.mode != RootMode::Pairing {
+        if self.pairing_busy || !self.is_pairing_visible() {
             return;
         }
         self.pairing_busy = true;
@@ -2612,7 +2621,7 @@ impl MobileApp {
     /// certificate. Asking the user which of the two they hold would be asking
     /// them to read our protocol.
     fn claim_entered_pairing_entry(&mut self, cx: &mut Context<Self>) {
-        if self.pairing_busy || self.mode != RootMode::Pairing {
+        if self.pairing_busy || !self.is_pairing_visible() {
             return;
         }
         let entry = self.pairing_code_input.read(cx).value().trim().to_string();
@@ -4850,10 +4859,13 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) {
         let previous = self.overlay;
+        if previous == Some(overlay) {
+            return;
+        }
         if previous.is_none() {
             self.overlay_returns_to_drawer = self.drawer_open;
-        } else {
-            self.overlay_parent = previous;
+        } else if let Some(previous) = previous {
+            self.overlay_parents.push(previous);
         }
         self.overlay = Some(overlay);
         self.push_back_screen(BackScreen::Overlay(overlay));
@@ -4863,7 +4875,7 @@ impl MobileApp {
 
     fn clear_overlay(&mut self) {
         self.overlay = None;
-        self.overlay_parent = None;
+        self.overlay_parents.clear();
         self.overlay_returns_to_drawer = false;
         self.host_overlay_target = None;
         Self::remove_back_screens(&mut self.back_stack, |screen| {
@@ -4905,6 +4917,12 @@ impl MobileApp {
             BackScreen::SidebarSearch => sidebar_search_open,
             BackScreen::SidebarBatchMode => sidebar_batch_mode,
         });
+        self.back_stack.extend(
+            self.overlay_parents
+                .iter()
+                .copied()
+                .map(BackScreen::Overlay),
+        );
         if let Some(overlay) = self.overlay {
             self.push_back_screen(BackScreen::Overlay(overlay));
         }
@@ -4923,13 +4941,20 @@ impl MobileApp {
         // A pairing fallback is a sheet over the first screen, and a runtime's
         // own surfaces stack on top of it, so back closes the topmost one the
         // way it closes every other sheet instead of leaving the app.
-        if self.mode == RootMode::Pairing {
-            if self.overlay.is_some() {
+        if self.is_pairing_visible() {
+            if self
+                .overlay
+                .is_some_and(|overlay| overlay != MobileOverlay::Pairing)
+            {
                 self.dismiss_overlay(Some(window), cx);
                 return;
             }
             if self.pairing_panel != PairingPanel::None {
                 self.dismiss_pairing_panel(cx);
+                return;
+            }
+            if self.overlay == Some(MobileOverlay::Pairing) && !self.pairing_busy {
+                self.dismiss_overlay(Some(window), cx);
             }
             return;
         }
@@ -4964,9 +4989,14 @@ impl MobileApp {
         self.dismiss_overlay(Some(window), cx);
     }
 
-    fn dismiss_overlay(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        if let Some(parent) = self.overlay_parent.take() {
+    fn dismiss_overlay(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
+        crate::platform::hide_keyboard();
+        if let Some(window) = window.as_deref_mut() {
+            self.root_focus.focus(window, cx);
+        }
+        if let Some(parent) = self.overlay_parents.pop() {
             self.overlay = Some(parent);
+            self.sync_back_stack_with_ui();
             cx.notify();
             return;
         }
@@ -4977,16 +5007,36 @@ impl MobileApp {
         if return_to_drawer {
             self.start_drawer_snap(DrawerPage::Sessions.open_offset(), window, cx);
         }
+        self.sync_back_stack_with_ui();
         cx.notify();
     }
 
-    fn open_hosts(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_overlay(MobileOverlay::Hosts, window, cx);
+    fn is_pairing_overlay_open(&self) -> bool {
+        self.overlay == Some(MobileOverlay::Pairing)
+            || self.overlay_parents.contains(&MobileOverlay::Pairing)
+    }
+
+    fn is_pairing_visible(&self) -> bool {
+        self.mode == RootMode::Pairing || self.is_pairing_overlay_open()
+    }
+
+    /// Opening runtime management is navigation; the active connection and
+    /// session stay alive until the user switches or disconnects explicitly.
+    fn open_pairing(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_pairing_visible() {
+            return;
+        }
+        self.pairing_panel = PairingPanel::None;
+        self.error = None;
+        crate::platform::hide_keyboard();
+        self.root_focus.focus(window, cx);
+        self.show_overlay(MobileOverlay::Pairing, window, cx);
+        self.refresh_host_reachability(cx);
     }
 
     /// Opens one of the runtime surfaces for `host_id`. The target is recorded
     /// before `show_overlay` so the render helpers always have it, and the
-    /// overlay nesting (`overlay_parent`) walks back through the sheet that
+    /// overlay nesting (`overlay_parents`) walks back through the sheet that
     /// opened it.
     fn show_host_overlay(
         &mut self,
@@ -5000,6 +5050,9 @@ impl MobileApp {
     }
 
     fn open_host_actions(&mut self, host_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pairing_busy {
+            return;
+        }
         self.show_host_overlay(host_id, MobileOverlay::HostActions, window, cx);
     }
 
@@ -5178,14 +5231,12 @@ impl MobileApp {
         self.persist_known_hosts();
         self.host_reachability.remove(&host_id);
         if !was_active {
-            // The list is still valid; return to it rather than to the action
-            // sheet that pointed at the runtime just removed. The pairing page
-            // shows the runtimes themselves and has no list to go back to, so
-            // it stays where it is.
-            self.clear_overlay();
-            if self.mode != RootMode::Pairing {
-                self.overlay = Some(MobileOverlay::Hosts);
+            // Close only this runtime's surfaces, preserving the pairing page
+            // and its own return destination.
+            while self.overlay.is_some_and(MobileOverlay::is_host_overlay) {
+                self.dismiss_overlay(Some(window), cx);
             }
+            self.host_overlay_target = None;
             cx.notify();
             return;
         }
@@ -5324,28 +5375,10 @@ impl MobileApp {
         self.start_drawer_snap(DrawerPage::Workbench.open_offset(), Some(window), cx);
     }
 
-    fn begin_pairing_host(
-        &mut self,
-        _: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.stop_connection_tasks();
-        crate::background_connection::disconnect();
-        self.backend = None;
-        self.controller = None;
-        self.timeline_markdown_views.borrow_mut().clear();
-        self.pending_workbench_surface = None;
-        if let Some(workbench) = self.workbench.take() {
-            workbench.update(cx, |workbench, _| workbench.suspend());
-        }
-        self.reset_drawers();
-        self.clear_overlay();
+    fn disconnect_host(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.teardown_active_connection(cx);
         self.mode = RootMode::Pairing;
         self.error = None;
-        self.workspaces.clear();
-        self.workspace_summaries.clear();
-        self.reset_sidebar_ui();
         crate::platform::hide_keyboard();
         // The page about to show is the one that reports which saved runtimes
         // answer, so it asks as soon as it is on screen.
@@ -5360,6 +5393,9 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pairing_busy {
+            return;
+        }
         if self.active_host_id.as_deref() == Some(host_id.as_str())
             && self.mode == RootMode::Workspace
         {
@@ -5384,7 +5420,7 @@ impl MobileApp {
         self.install_bundle(entry.bundle, server_kind, cx);
     }
 
-    fn cancel_pairing_host(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn reconnect_active_host(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(host_id) = self.active_host_id.clone() else {
             return;
         };
@@ -6556,6 +6592,7 @@ impl MobileApp {
         &self,
         runtimes_max_height: Pixels,
         sheet_max_height: Pixels,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let scan_busy = self.pairing_action == Some(PairingAction::Scan);
@@ -6624,13 +6661,39 @@ impl MobileApp {
                         page.child(self.render_pairing_actions(scan_busy, scan_enabled, cx))
                     }),
             )
+            .when(self.is_pairing_overlay_open(), |page| {
+                page.child(
+                    div()
+                        .debug_selector(|| "pairing-back".to_string())
+                        .absolute()
+                        .top_0()
+                        .left_2()
+                        .child(
+                            Button::new("pairing-back")
+                                .ghost()
+                                .size_11()
+                                // Keep the native touch minimum even at the
+                                // mobile theme's smaller rem size.
+                                .min_w(px(theme::TOUCH_TARGET))
+                                .min_h(px(theme::TOUCH_TARGET))
+                                .icon(
+                                    gpui_component::Icon::default().path("icons/chevron-left.svg"),
+                                )
+                                .tooltip(locale::common("Back"))
+                                .disabled(self.pairing_busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.handle_navigate_back(&NavigateBack, window, cx);
+                                })),
+                        ),
+                )
+            })
             .child(self.render_pairing_sheet(sheet_max_height, cx))
             // Last, so a runtime's own surfaces sit above the page that opened
             // them: the rows here are the same runtime list, so the same
             // actions, rename and remove sheets belong to them.
             .when_some(
                 self.overlay.filter(|overlay| overlay.is_host_overlay()),
-                |page, overlay| page.child(self.render_mobile_overlay(overlay, cx)),
+                |page, overlay| page.child(self.render_mobile_overlay(overlay, window, cx)),
             )
     }
 
@@ -6716,11 +6779,9 @@ impl MobileApp {
     /// leading dot, what it is called, the kind it is as a glyph, and the way
     /// into its own actions.
     ///
-    /// Nothing is connected on this page — the phone is between runtimes — so
-    /// the dot answers the only question that means anything here: did the
-    /// runtime answer the phone's probe? Both readings are color and glyph; the
-    /// words stay on the row's accessible name, so the state is never color
-    /// alone.
+    /// The active runtime keeps its live connection status while the others
+    /// show reachability. Both readings are color and glyph; the words stay
+    /// on the row's accessible name, so the state is never color alone.
     fn render_pairing_runtime_card(
         &self,
         host: &MobileHostEntry,
@@ -6732,16 +6793,33 @@ impl MobileApp {
             .get(&host.id)
             .copied()
             .unwrap_or_default();
-        let probing = reachability == HostReachability::Probing;
+        let (status_label, status_color, probing) =
+            match selected.then(|| self.active_host_status()).flatten() {
+                Some(status) => (
+                    status.label(),
+                    status.status.dot_color(),
+                    matches!(
+                        status.status,
+                        RuntimeStatus::Connecting | RuntimeStatus::Reconnecting
+                    ),
+                ),
+                None => (
+                    reachability.label().to_string(),
+                    reachability.dot_color(),
+                    reachability == HostReachability::Probing,
+                ),
+            };
         let switch_id = host.id.clone();
         let menu_id = host.id.clone();
         div()
             .id(format!("pairing-runtime-{}", host.id))
+            .debug_selector(|| format!("pairing-runtime-{}", host.id))
+            .when(self.pairing_busy, |row| row.opacity(0.4))
             .aria_label(format!(
                 "{} · {} · {}",
                 host.display_label(),
                 host_kind_label(host.server_kind),
-                reachability.label()
+                status_label
             ))
             .w_full()
             .min_h(px(PAIRING_RUNTIME_ROW_HEIGHT))
@@ -6777,9 +6855,9 @@ impl MobileApp {
             // The dot leads the row: green once the runtime answers, red when
             // it does not, and the spinner while the phone is still asking.
             .child(if probing {
-                sidebar_running_indicator(reachability.dot_color())
+                sidebar_running_indicator(status_color)
             } else {
-                sidebar_status_dot(reachability.dot_color())
+                sidebar_status_dot(status_color)
             })
             .child(
                 div()
@@ -6807,6 +6885,7 @@ impl MobileApp {
             .child(
                 div()
                     .id(format!("pairing-runtime-menu-{}", host.id))
+                    .debug_selector(|| format!("pairing-runtime-menu-{}", host.id))
                     .aria_label(locale::common("Runtime actions"))
                     .size(px(theme::SIDEBAR_ACTION_WIDTH))
                     .flex_shrink_0()
@@ -7065,6 +7144,7 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         pairing_action_button(id, Some(icon), label, false, self.pairing_panel == panel)
+            .debug_selector(|| id.to_string())
             .when(self.pairing_busy, |button| button.opacity(0.4))
             .when(!self.pairing_busy, |button| {
                 button
@@ -7492,7 +7572,7 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_connecting(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_connecting(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .relative()
@@ -7606,7 +7686,7 @@ impl MobileApp {
                                         .active(|style| style.opacity(0.7))
                                         .on_mouse_up(
                                             MouseButton::Left,
-                                            cx.listener(Self::open_hosts),
+                                            cx.listener(Self::open_pairing),
                                         )
                                         .child(locale::common("Switch host")),
                                 )
@@ -7615,11 +7695,16 @@ impl MobileApp {
             )
             .when_some(
                 self.overlay.filter(|overlay| overlay.is_host_overlay()),
-                |root, overlay| root.child(self.render_mobile_overlay(overlay, cx)),
+                |root, overlay| root.child(self.render_mobile_overlay(overlay, window, cx)),
             )
     }
 
-    fn render_workspace(&mut self, page_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_workspace(
+        &mut self,
+        page_width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let title = self
             .controller
             .as_ref()
@@ -7859,7 +7944,7 @@ impl MobileApp {
                     root.child(self.render_runtime_options_sheet(cx))
                 })
                 .when_some(overlay, |root, overlay| {
-                    root.child(self.render_mobile_overlay(overlay, cx))
+                    root.child(self.render_mobile_overlay(overlay, window, cx))
                 })
                 .when_some(attachment_preview, |root, preview| {
                     root.child(self.render_attachment_preview(preview, cx))
@@ -13113,6 +13198,7 @@ impl MobileApp {
                     .child(
                         div()
                             .id("mobile-host-switcher")
+                            .debug_selector(|| "mobile-host-switcher".to_string())
                             // The state belongs in the accessible name too: a
                             // screen reader must not have to infer it from a dot.
                             .aria_label(format!("{host_label} · {host_status_label}"))
@@ -13126,7 +13212,7 @@ impl MobileApp {
                             .gap(px(theme::SPACING_SM))
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_hosts))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
                             .child(
                                 div()
                                     .size(px(theme::ICON_STATUS))
@@ -13272,239 +13358,52 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_hosts(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let hosts = self.known_hosts.clone();
-        let mut body = div()
-            .id("mobile-hosts-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .restrict_scroll_to_axis()
-            .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
-            .px(px(theme::SPACING_LG))
-            .py(px(theme::SPACING_MD));
-        if hosts.is_empty() {
-            body = body.child(self.render_hosts_empty(cx));
-        } else {
-            body = body
-                .child(overlay_section_heading("Current connection"))
-                .child(self.render_active_host_card(cx))
-                .child(overlay_section_heading("All runtimes"))
-                .children(
-                    hosts
-                        .iter()
-                        .map(|host| self.render_host_row(host, cx))
-                        .collect::<Vec<_>>(),
-                );
-        }
-        div()
-            .absolute()
-            .inset_0()
-            .bg(theme::bg_primary())
-            .block_mouse_except_scroll()
-            .flex()
-            .flex_col()
-            .child(self.render_overlay_header(
-                "mobile-hosts",
-                "Runtimes",
-                Some(self.render_hosts_add_button(cx)),
-                cx,
-            ))
-            .child(body)
-            .into_any_element()
-    }
-
-    /// The single primary "add a runtime" affordance, in the list's header.
-    fn render_hosts_add_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        div()
-            .id("mobile-add-host")
-            .aria_label(locale::common("Add runtime"))
-            .size(px(theme::TOUCH_TARGET))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(theme::RADIUS_CONTROL))
-            .cursor_pointer()
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host))
-            .child(
-                svg()
-                    .path("icons/circle-plus.svg")
-                    .size(px(theme::ICON_SM))
-                    .text_color(theme::text_primary()),
-            )
-            .into_any_element()
-    }
-
-    fn render_hosts_empty(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        Empty::new()
-            .flex_none()
-            .gap(px(theme::SPACING_SM))
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_subtle())
-            .bg(theme::bg_card_dim())
-            .p(px(theme::SPACING_LG))
-            .header(
-                EmptyHeader::new()
-                    .max_w_full()
-                    .title(
-                        EmptyTitle::new()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_primary())
-                            .child(locale::common("No runtimes yet")),
-                    )
-                    .description(
-                        EmptyDescription::new()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_muted())
-                            .child(locale::common(
-                                "Open pairing on the desktop or server, then scan the QR code with the camera.",
-                            )),
-                    ),
-            )
-            .content(EmptyContent::new().child(
-                runtime_sheet_action_button(
-                    "mobile-hosts-empty-add",
-                    locale::common("Add runtime"),
-                    false,
-                )
-                .mt(px(theme::SPACING_XS))
-                .cursor_pointer()
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
-            ))
-            .into_any_element()
-    }
-
-    /// The runtime the phone is on, with the live state the transport reports.
-    fn render_active_host_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(host) = self.active_host_entry() else {
-            return Empty::new()
-                .flex_none()
-                .items_start()
-                .text_left()
-                .gap(px(theme::SPACING_SM))
-                .rounded(px(theme::RADIUS_CARD))
-                .border_1()
-                .border_color(theme::border_subtle())
-                .bg(theme::bg_card_dim())
-                .p(px(theme::SPACING_MD))
-                .header(
-                    EmptyHeader::new().items_start().max_w_full().title(
-                        EmptyTitle::new()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_secondary())
-                            .child(locale::common("No runtime connected")),
-                    ),
-                )
-                .content(
-                    EmptyContent::new().items_start().child(
-                        runtime_sheet_action_button(
-                            "mobile-hosts-connect",
-                            locale::common("Add runtime"),
-                            false,
-                        )
-                        .cursor_pointer()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
-                    ),
-                )
-                .into_any_element();
-        };
-        let status = self.host_status(&host.id);
-        let error_message = status
-            .error_message
-            .clone()
-            .filter(|_| status.status.is_failure());
-        div()
-            .w_full()
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_default())
-            .bg(theme::bg_card())
-            .p(px(theme::SPACING_MD))
-            .flex()
-            .flex_col()
-            .gap(px(theme::SPACING_SM))
-            .child(
-                div()
-                    .text_size(px(theme::FONT_BODY))
-                    .text_color(theme::text_primary())
-                    .child(host.display_label()),
-            )
-            .child(runtime_status_line(&status, theme::text_secondary()))
-            .child(
-                div()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(theme::FONT_MICRO))
-                    .text_color(theme::text_muted())
-                    .child(host.bundle.record.server_url.clone()),
-            )
-            .when_some(error_message, |card, message| {
-                card.child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap(px(theme::SPACING_SM))
-                        .child(
-                            svg()
-                                .path("icons/triangle-alert.svg")
-                                .size(px(theme::ICON_SM))
-                                .flex_shrink_0()
-                                .text_color(theme::accent_red()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(theme::FONT_MICRO))
-                                .text_color(theme::accent_red())
-                                .child(message),
-                        ),
-                )
-            })
-            .child(self.render_active_host_actions(status.status, cx))
-            .into_any_element()
-    }
-
-    /// The state-dependent action row of the current-connection card. Every
-    /// button keeps the 44px touch target of the shared action style.
+    /// Connection controls belong to the active runtime's action sheet.
     fn render_active_host_actions(
         &self,
         state: RuntimeStatus,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let button = |id: &'static str, label: &'static str| {
-            runtime_sheet_action_button(id, label, false)
-                .cursor_pointer()
-                .active(|style| style.bg(theme::row_pressed_bg()))
+            host_sheet_action_row(id, label, false).debug_selector(|| id.to_string())
         };
-        let mut row = div().flex().items_center().gap(px(theme::SPACING_SM));
+        let mut row = div().flex().flex_col();
         match state {
             RuntimeStatus::Connected | RuntimeStatus::Unstable => {
                 // Disconnecting leaves the pairing in place: it hands the phone
                 // back to the pairing screen, where this runtime's own card is
                 // what restores it, matching the cancel-connect flow here.
                 row = row.child(
-                    button("mobile-runtime-disconnect", locale::common("Disconnect"))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
+                    button("mobile-runtime-disconnect", locale::common("Disconnect")).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            cx.stop_propagation();
+                            this.disconnect_host(event, window, cx);
+                        }),
+                    ),
                 );
             }
             RuntimeStatus::Connecting | RuntimeStatus::Reconnecting => {
-                row = row
-                    .child(sidebar_running_indicator(theme::text_muted()))
-                    .child(
-                        button("mobile-runtime-cancel", locale::common("Cancel"))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
-                    );
+                row = row.child(
+                    button("mobile-runtime-cancel", locale::common("Cancel")).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            cx.stop_propagation();
+                            this.disconnect_host(event, window, cx);
+                        }),
+                    ),
+                );
             }
             RuntimeStatus::Offline | RuntimeStatus::Revoked | RuntimeStatus::Incompatible => {
                 row = row.child(
-                    button("mobile-runtime-retry", locale::common("Retry"))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::retry_connection)),
+                    button("mobile-runtime-retry", locale::common("Retry")).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            cx.stop_propagation();
+                            this.clear_overlay();
+                            this.retry_connection(event, window, cx);
+                        }),
+                    ),
                 );
             }
             RuntimeStatus::NotConnected => {
@@ -13513,144 +13412,17 @@ impl MobileApp {
                 // install. Re-installing the bundle is what reconnects, and the
                 // pairing screen's runtime cards do exactly the same thing.
                 row = row.child(
-                    button("mobile-runtime-connect", locale::common("Connect"))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_pairing_host)),
+                    button("mobile-runtime-connect", locale::common("Connect")).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            cx.stop_propagation();
+                            this.reconnect_active_host(event, window, cx);
+                        }),
+                    ),
                 );
             }
         }
         row.into_any_element()
-    }
-
-    fn render_host_row(&self, host: &MobileHostEntry, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let selected = self.active_host_id.as_deref() == Some(host.id.as_str());
-        let status = self.host_status(&host.id);
-        let switch_id = host.id.clone();
-        let menu_id = host.id.clone();
-        // Only the runtime the phone is on has a live status; the others show
-        // what is actually known, which is when they were last reached.
-        let last_connected = if selected {
-            None
-        } else {
-            host.last_connected_at_ms.map(host_last_connected_label)
-        };
-        div()
-            .id(format!("mobile-host-{}", host.id))
-            .w_full()
-            .min_h(px(theme::TOUCH_TARGET))
-            .mb(px(theme::SPACING_XS))
-            .rounded(px(theme::RADIUS_CONTROL))
-            .border_1()
-            .border_color(if selected {
-                theme::border_default()
-            } else {
-                theme::border_subtle()
-            })
-            // The active runtime keeps a persistent selected treatment instead
-            // of relying on hover, which a phone does not have.
-            .when(selected, |row| row.bg(theme::bg_card()))
-            .pl(px(theme::SPACING_MD))
-            .pr(px(theme::SPACING_XS))
-            .py(px(theme::SPACING_XS))
-            .flex()
-            .items_center()
-            .gap(px(theme::SPACING_SM))
-            .cursor_pointer()
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, event, window, cx| {
-                    this.switch_host(switch_id.clone(), event, window, cx)
-                }),
-            )
-            .child(
-                div()
-                    .size(px(theme::ICON_STATUS))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(status.status.dot_color()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(if selected {
-                                theme::text_primary()
-                            } else {
-                                theme::text_secondary()
-                            })
-                            .child(host.display_label()),
-                    )
-                    .child(
-                        div()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_MICRO))
-                            .text_color(theme::text_muted())
-                            .child(host.bundle.record.server_url.clone()),
-                    )
-                    .child(
-                        div()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_MICRO))
-                            .text_color(theme::text_muted())
-                            .child(match last_connected {
-                                Some(last_connected) => {
-                                    format!("{} · {}", status.label(), last_connected)
-                                }
-                                None => status.label(),
-                            }),
-                    ),
-            )
-            .when(selected, |row| {
-                row.child(
-                    svg()
-                        .path("icons/check.svg")
-                        .size(px(theme::ICON_SM))
-                        .flex_shrink_0()
-                        .text_color(theme::accent_green()),
-                )
-            })
-            .child(
-                div()
-                    .id(format!("mobile-host-menu-{}", host.id))
-                    .aria_label(locale::common("Runtime actions"))
-                    .size(px(theme::TOUCH_TARGET))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            // The row underneath switches runtimes; the menu must
-                            // not also select the runtime it belongs to.
-                            cx.stop_propagation();
-                            this.open_host_actions(menu_id.clone(), window, cx);
-                        }),
-                    )
-                    .child(
-                        svg()
-                            .path("icons/ellipsis-vertical.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_muted()),
-                    ),
-            )
-            .into_any_element()
     }
 
     /// The runtime a host surface refers to, cloned so the render helpers can
@@ -13667,6 +13439,7 @@ impl MobileApp {
             return div().into_any_element();
         };
         let active = self.active_host_id.as_deref() == Some(host.id.as_str());
+        let status = self.host_status(&host.id);
         let switch_id = host.id.clone();
         let mut sheet = div()
             .w_full()
@@ -13690,7 +13463,31 @@ impl MobileApp {
                     .text_color(theme::text_muted())
                     .child(host.display_label()),
             );
-        if !active {
+        if active {
+            sheet = sheet
+                .child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .child(runtime_status_line(&status, theme::text_secondary()))
+                        .when_some(
+                            status
+                                .error_message
+                                .as_ref()
+                                .filter(|_| status.status.is_failure()),
+                            |header, message| {
+                                header.child(
+                                    div()
+                                        .pt_2()
+                                        .text_sm()
+                                        .text_color(theme::accent_red())
+                                        .child(message.clone()),
+                                )
+                            },
+                        ),
+                )
+                .child(self.render_active_host_actions(status.status, cx));
+        } else {
             sheet = sheet.child(
                 host_sheet_action_row("mobile-runtime-switch", locale::common("Switch"), false)
                     .on_mouse_up(
@@ -14082,8 +13879,17 @@ impl Render for MobileApp {
         }
         let insets = window.insets().effective();
         let page_width = workspace_page_width(window);
-        let root_background = match visible_drawer_page(self.drawer_offset, self.drawer_snap) {
-            Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench) => theme::sidebar_bg(),
+        let visible_mode = if self.is_pairing_visible() {
+            RootMode::Pairing
+        } else {
+            self.mode
+        };
+        let root_background = match (
+            visible_mode,
+            visible_drawer_page(self.drawer_offset, self.drawer_snap),
+        ) {
+            (RootMode::Pairing, _) => theme::bg_primary(),
+            (_, Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench)) => theme::sidebar_bg(),
             _ => theme::bg_primary(),
         };
         div()
@@ -14095,16 +13901,19 @@ impl Render for MobileApp {
             .pr(insets.right)
             .pb(insets.bottom)
             .pl(insets.left)
-            .child(match self.mode {
+            .child(match visible_mode {
                 RootMode::Pairing => self
                     .render_pairing(
                         pairing_runtimes_max_height(window),
                         pairing_sheet_max_height(window),
+                        window,
                         cx,
                     )
                     .into_any_element(),
-                RootMode::Connecting => self.render_connecting(cx).into_any_element(),
-                RootMode::Workspace => self.render_workspace(page_width, cx).into_any_element(),
+                RootMode::Connecting => self.render_connecting(window, cx).into_any_element(),
+                RootMode::Workspace => self
+                    .render_workspace(page_width, window, cx)
+                    .into_any_element(),
             })
             // Last child, so the selection toolbar sits above the composer it
             // belongs to. It positions itself in window coordinates.
@@ -15093,7 +14902,7 @@ impl MobileApp {
                             .gap(px(theme::SPACING_SM))
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_hosts))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
                             .child(
                                 svg()
                                     .path("icons/server.svg")
@@ -15431,10 +15240,18 @@ impl MobileApp {
     fn render_mobile_overlay(
         &self,
         overlay: MobileOverlay,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match overlay {
-            MobileOverlay::Hosts => self.render_hosts(cx),
+            MobileOverlay::Pairing => self
+                .render_pairing(
+                    pairing_runtimes_max_height(window),
+                    pairing_sheet_max_height(window),
+                    window,
+                    cx,
+                )
+                .into_any_element(),
             MobileOverlay::HostDetail => self.render_host_detail(cx),
             MobileOverlay::HostActions => self.render_host_actions_sheet(cx),
             MobileOverlay::HostRename => self.render_host_rename_sheet(cx),
@@ -18567,6 +18384,241 @@ mod tests {
         cx.update(gpui_component::init);
     }
 
+    fn click_mobile_control(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let bounds = cx
+            .debug_bounds(selector)
+            .expect("control should be visible");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn runtime_entry_opens_pairing_and_returns_without_replacing_the_session(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let session_id = VibexSessionId::new();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            let mut controller =
+                AgentWorkflowController::new(backend.clone(), backend.capability_snapshot().agent);
+            controller.state.selected_session_id = Some(session_id.clone());
+            app.controller = Some(controller);
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app.composer_input.update(cx, |input, cx| {
+                input.set_value("unfinished message", window, cx);
+            });
+            app.start_drawer_snap(DrawerPage::Sessions.open_offset(), None, cx);
+            app
+        });
+        cx.run_until_parked();
+
+        for return_control in ["pairing-back", "escape", "pairing-runtime-runtime-a"] {
+            app.update(cx, |app, cx| {
+                app.start_drawer_snap(DrawerPage::Sessions.open_offset(), None, cx);
+            });
+            cx.executor()
+                .advance_clock(Duration::from_millis(theme::DRAWER_OPEN_ANIMATION_MS));
+            cx.run_until_parked();
+            click_mobile_control(cx, "mobile-host-switcher");
+            assert_eq!(
+                app.read_with(cx, |app, _| app.overlay),
+                Some(MobileOverlay::Pairing)
+            );
+            assert!(cx.debug_bounds("pairing-runtimes").is_some());
+            let back = cx.debug_bounds("pairing-back").expect("return control");
+            assert!(back.size.width >= px(theme::TOUCH_TARGET));
+            assert!(back.size.height >= px(theme::TOUCH_TARGET));
+
+            if return_control == "pairing-back" {
+                click_mobile_control(cx, "pairing-manual-toggle");
+                assert_eq!(
+                    app.read_with(cx, |app, _| app.pairing_panel),
+                    PairingPanel::Manual
+                );
+                cx.simulate_keystrokes("back");
+                assert_eq!(
+                    app.read_with(cx, |app, _| app.pairing_panel),
+                    PairingPanel::None
+                );
+                assert_eq!(
+                    app.read_with(cx, |app, _| app.overlay),
+                    Some(MobileOverlay::Pairing)
+                );
+
+                // A claim still in flight owns the page until it resolves.
+                app.update(cx, |app, cx| {
+                    app.pairing_busy = true;
+                    cx.notify();
+                });
+                click_mobile_control(cx, "pairing-back");
+                cx.simulate_keystrokes("back");
+                click_mobile_control(cx, "pairing-runtime-menu-runtime-a");
+                click_mobile_control(cx, "pairing-runtime-runtime-a");
+                assert_eq!(
+                    app.read_with(cx, |app, _| app.overlay),
+                    Some(MobileOverlay::Pairing)
+                );
+                app.update(cx, |app, cx| {
+                    app.pairing_busy = false;
+                    cx.notify();
+                });
+            }
+
+            if return_control == "escape" {
+                cx.simulate_keystrokes("escape");
+            } else {
+                click_mobile_control(cx, return_control);
+            }
+            app.read_with(cx, |app, cx| {
+                assert_eq!(app.mode, RootMode::Workspace);
+                assert!(app.overlay.is_none());
+                assert!(app.overlay_parents.is_empty());
+                assert!(app.drawer_open, "return to the project/session page");
+                assert!(Arc::ptr_eq(
+                    app.backend.as_ref().expect("active backend"),
+                    &backend
+                ));
+                assert_eq!(
+                    app.controller
+                        .as_ref()
+                        .expect("active session")
+                        .state
+                        .selected_session_id,
+                    Some(session_id.clone()),
+                );
+                assert_eq!(
+                    app.composer_input.read(cx).value().as_ref(),
+                    "unfinished message"
+                );
+            });
+        }
+
+        app.update(cx, |app, cx| {
+            app.known_hosts.push(MobileHostEntry::from_bundle(
+                &host_bundle("runtime-b", "cloud"),
+                RemoteServerKind::Headless,
+            ));
+            app.start_drawer_snap(DrawerPage::Sessions.open_offset(), None, cx);
+        });
+        cx.executor()
+            .advance_clock(Duration::from_millis(theme::DRAWER_OPEN_ANIMATION_MS));
+        cx.run_until_parked();
+        click_mobile_control(cx, "mobile-host-switcher");
+        click_mobile_control(cx, "pairing-runtime-runtime-b");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.error.as_ref().expect("invalid saved route").code,
+                "mobile_route_missing"
+            );
+            assert_eq!(app.overlay, Some(MobileOverlay::Pairing));
+            assert!(Arc::ptr_eq(
+                app.backend.as_ref().expect("original backend"),
+                &backend
+            ));
+        });
+
+        // The selected backend is idle in this fixture, so its menu offers
+        // Cancel. It disconnects explicitly and retains the saved runtimes.
+        click_mobile_control(cx, "pairing-runtime-menu-runtime-a");
+        click_mobile_control(cx, "mobile-runtime-cancel");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.mode, RootMode::Pairing);
+            assert!(app.backend.is_none());
+            assert!(app.controller.is_none());
+            assert!(app.overlay.is_none());
+            assert_eq!(app.known_hosts.len(), 2);
+        });
+        assert!(cx.debug_bounds("pairing-back").is_none());
+    }
+
+    #[gpui::test]
+    fn runtime_management_returns_through_pairing_to_its_original_parent(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.remember_host(
+                &host_bundle("runtime-a", "studio"),
+                RemoteServerKind::Desktop,
+            );
+            app.known_hosts.push(MobileHostEntry::from_bundle(
+                &host_bundle("runtime-b", "cloud"),
+                RemoteServerKind::Headless,
+            ));
+            app.start_drawer_snap(DrawerPage::Sessions.open_offset(), None, cx);
+            app.open_settings(&noop_mouse_up(), window, cx);
+            app.open_pairing(&noop_mouse_up(), window, cx);
+            app
+        });
+        cx.run_until_parked();
+        click_mobile_control(cx, "pairing-runtime-menu-runtime-b");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::HostActions)
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_host_detail(&noop_mouse_up(), window, cx)
+            });
+            let _ = window.draw(cx);
+        });
+
+        for expected in [MobileOverlay::HostActions, MobileOverlay::Pairing] {
+            cx.simulate_keystrokes("back");
+            assert_eq!(app.read_with(cx, |app, _| app.overlay), Some(expected));
+        }
+        assert!(app.read_with(cx, |app, _| app.is_pairing_visible()));
+
+        // Removing another runtime returns to this same list and preserves
+        // Settings beneath it, with no stale sheet targeting the removed row.
+        click_mobile_control(cx, "pairing-runtime-menu-runtime-b");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_host_remove(&noop_mouse_up(), window, cx);
+                app.remove_host("runtime-b".to_string(), window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.known_hosts.len(), 1);
+            assert_eq!(app.overlay, Some(MobileOverlay::Pairing));
+            assert_eq!(app.overlay_parents, vec![MobileOverlay::Settings]);
+            assert!(app.host_overlay_target.is_none());
+        });
+
+        cx.simulate_keystrokes("back");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Settings)
+        );
+        cx.simulate_keystrokes("back");
+        app.read_with(cx, |app, _| {
+            assert!(app.overlay.is_none());
+            assert!(app.drawer_open);
+        });
+    }
+
     #[gpui::test]
     fn back_keystroke_pops_the_top_of_the_page_stack(cx: &mut TestAppContext) {
         cx.update(bind_keys);
@@ -18614,6 +18666,10 @@ mod tests {
             let _ = window.draw(cx);
         });
         assert!(app.read_with(cx, |app, _| matches!(app.mode, RootMode::Pairing)));
+        assert!(
+            cx.debug_bounds("pairing-back").is_none(),
+            "first launch has no parent"
+        );
 
         // Pressing back on the pairing screen must not panic or mutate state.
         cx.simulate_keystrokes("back");
@@ -19074,7 +19130,7 @@ mod tests {
             "self.render_pairing_sheet(sheet_max_height, cx)",
             // The cards here are a runtime list, so a runtime's own surfaces
             // belong to this page too.
-            "self.render_mobile_overlay(overlay, cx)",
+            "self.render_mobile_overlay(overlay, window, cx)",
         ] {
             assert!(page.contains(call), "the page should still render {call}");
         }
@@ -19101,16 +19157,15 @@ mod tests {
 
         // A row is a runtime's whole surface on this page: whether it is up as
         // the leading dot, what it is as a glyph, and the way into its own
-        // actions — removing it included. Both readings are an icon and a
-        // color on the row, never a line of text, and this page reports
-        // reachability rather than a connection it cannot have.
+        // actions — removing it included. The active runtime reports its live
+        // connection; the others report reachability.
         let card = renderer_source(source, "render_pairing_runtime_card");
         assert!(card.contains(".host_reachability"));
         assert!(card.contains("HostReachability::Probing"));
         assert!(card.contains("sidebar_running_indicator("));
         assert!(card.contains("sidebar_status_dot("));
         assert!(card.contains("host_kind_icon(host.server_kind)"));
-        assert!(!card.contains("self.host_status(&host.id)"));
+        assert!(card.contains("self.active_host_status()"));
         for marker in [
             "icons/ellipsis-vertical.svg",
             "open_host_actions(",
@@ -19696,7 +19751,7 @@ mod tests {
     fn removing_a_back_screen_also_drops_entries_opened_on_top_of_it() {
         let mut stack = vec![
             BackScreen::SessionsDrawer,
-            BackScreen::Overlay(MobileOverlay::Hosts),
+            BackScreen::Overlay(MobileOverlay::Pairing),
             BackScreen::Overlay(MobileOverlay::Settings),
         ];
         while let Some(index) = stack
@@ -20063,7 +20118,7 @@ mod tests {
         });
 
         for overlay in [
-            MobileOverlay::Hosts,
+            MobileOverlay::Pairing,
             MobileOverlay::HostActions,
             MobileOverlay::HostDetail,
             MobileOverlay::HostRename,

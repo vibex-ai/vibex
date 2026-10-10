@@ -446,6 +446,44 @@ Wrong: manifest library metadata -> restored scanner Activity -> unresolved JNI 
 Correct: Activity System.loadLibrary -> one-shot GPUI queue -> claim_pairing_link -> validated credential storage.
 ```
 
+### Convention: Runtime Switching Uses The Pairing Page
+
+`MobileApp::open_pairing` opens `MobileOverlay::Pairing` directly from the
+project/session footer, Settings, and the unavailable-connection screen. The
+pairing page owns the saved-runtime list and its management actions; do not
+insert a separate runtime-list page before it.
+
+- Opening this page preserves the active backend, controller, selected session,
+  and composer draft. `RootMode` continues to describe the underlying connection;
+  `is_pairing_visible()` also recognizes the pairing overlay and its child sheets.
+- An in-app visit shows a leading Back button. A first-launch pairing page has
+  no parent and no Back button. The button and system Back share
+  `handle_navigate_back`: dismiss a runtime sheet or pairing fallback first,
+  then return to the original page. An in-flight claim keeps its existing busy
+  guard. Preserve every overlay parent, including Settings beneath pairing.
+- The active runtime shows its live transport state; other saved runtimes show
+  probe reachability. Selecting the active runtime returns without reconnecting.
+  Selecting another runtime installs its saved credential through `switch_host`.
+  A connection attempt's completion may update the page only while its backend
+  is still active; cancellation from a previous runtime cannot replace the page.
+- Disconnect/retry/connect remain in the active runtime's action sheet. Removing
+  another runtime returns to the pairing list without losing its parent page;
+  removing the active runtime retains the existing fallback-selection behavior.
+
+```text
+Footer -> pairing -> runtime actions -> details -> Back -> actions -> Back -> pairing -> Back -> footer
+```
+
+Run `cargo test -p vibex-mobile --locked`, mobile Clippy, and
+`pnpm check:mobile-native`. UI interaction coverage must activate the footer and
+Back button, dispatch the system Back key, preserve backend/session/draft identity,
+and unwind nested runtime sheets to the page that opened pairing. Host tests do
+not replace Android/iOS gesture and connection qualification.
+
+The native bridge subscribers are process globals. If GPUI reports cross-test
+scheduler activity, execute each test case in its own process; serial Rust test
+threads still share those subscribers.
+
 
 ## Scenario: Native File Dialog Backend Isolation
 
