@@ -91,6 +91,8 @@ fn activity_kind(kind: BrowserActionKind) -> &'static str {
         BrowserActionKind::CompareBaseline => "compare",
         BrowserActionKind::ElementToSource => "source",
         BrowserActionKind::Download => "download",
+        BrowserActionKind::ImportLoginState => "import_login_state",
+        BrowserActionKind::ClearData => "clear_data",
         BrowserActionKind::Unknown => "other",
     }
 }
@@ -4645,6 +4647,29 @@ mod tests {
             _enabled: bool,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
+        }
+        fn browser_profile_sources(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Vec<vibex_core::BrowserProfileSource>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn import_browser_login_state(
+            &self,
+            _request: vibex_core::BrowserLoginImportRequest,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            vibex_core::BrowserLoginImportReport,
+        > {
+            Box::pin(async { Ok(vibex_core::BrowserLoginImportReport::default()) })
+        }
+        fn clear_browser_data(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserDataClearReport>
+        {
+            Box::pin(async { Ok(vibex_core::BrowserDataClearReport::default()) })
         }
         fn cursor_at(
             &self,

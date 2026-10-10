@@ -300,6 +300,11 @@ pub enum BrowserActionKind {
     CompareBaseline,
     ElementToSource,
     Download,
+    /// A Chromium-family profile's login state was copied into the isolated
+    /// Vibex profile. Recorded as counts; no cookie or storage value is stored.
+    ImportLoginState,
+    /// The isolated browser profile was deleted.
+    ClearData,
     #[serde(other)]
     Unknown,
 }
@@ -336,6 +341,8 @@ impl BrowserActionKind {
             Self::CompareBaseline => "compare_baseline",
             Self::ElementToSource => "element_to_source",
             Self::Download => "download",
+            Self::ImportLoginState => "import_login_state",
+            Self::ClearData => "clear_data",
             Self::Unknown => "unknown",
         }
     }
@@ -572,6 +579,65 @@ impl BrowserAvailability {
     pub fn is_available(&self) -> bool {
         self.unavailable_reason.is_none()
     }
+}
+
+/// One Chromium-family profile on the runtime host that Vibex can import from.
+///
+/// The figures are cheap metadata gathered without decrypting anything: cookie
+/// rows are counted through SQLite, while localStorage is reported as the size
+/// of its LevelDB directory, because counting its entries means parsing the
+/// store and that is what the import itself does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserProfileSource {
+    /// Browser family, matching [`BrowserInstallation::id`].
+    pub browser_id: String,
+    pub browser_label: String,
+    /// Directory under the browser's user-data directory (`Default`, `Profile 1`).
+    pub profile_dir: String,
+    /// Name the browser itself shows for the profile.
+    pub display_name: String,
+    pub cookie_count: u64,
+    pub site_count: u64,
+    pub local_storage_bytes: u64,
+}
+
+/// Which login state to copy out of one source profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserLoginImportRequest {
+    pub browser_id: String,
+    pub profile_dir: String,
+    pub include_cookies: bool,
+    pub include_local_storage: bool,
+}
+
+/// What one import copied, as counts only.
+///
+/// Cookie names, values, hosts and localStorage entries never leave the browser
+/// stores: this is the whole record the settings card, the notification and the
+/// audit ledger are allowed to show.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserLoginImportReport {
+    pub cookies_imported: u64,
+    /// Distinct sites the imported cookies belong to.
+    pub sites_imported: u64,
+    pub local_storage_entries: u64,
+    pub local_storage_origins: u64,
+    /// Origins whose localStorage could not be restored, because the page never
+    /// loaded or the browser refused the write.
+    pub local_storage_origins_skipped: u64,
+    pub local_storage_bytes: u64,
+    pub duration_ms: u64,
+}
+
+/// What one browser-data clear removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserDataClearReport {
+    pub removed_files: u64,
+    pub reclaimed_bytes: u64,
 }
 
 /// Live state of one browser tab.

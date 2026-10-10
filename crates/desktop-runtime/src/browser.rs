@@ -28,14 +28,22 @@ use vibex_browser::{
     BrowserSessionKey, issue_session_token, verify_session_token,
 };
 use vibex_core::{
-    BROWSER_ACTION_HIGHLIGHT_MS, BrowserActionRecord, BrowserToolDelivery, BrowserToolTier,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
-    PermissionRiskCategory, RequestId, VibexError, VibexResult, VibexSessionId, WorkspaceId,
-    unix_timestamp_ms,
+    BROWSER_ACTION_HIGHLIGHT_MS, BrowserActionKind, BrowserActionRecord, BrowserDataClearReport,
+    BrowserLoginImportReport, BrowserLoginImportRequest, BrowserProfileSource, BrowserToolDelivery,
+    BrowserToolTier, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResponseKind, PermissionRiskCategory, RequestId, VibexError, VibexResult,
+    VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_db::PermissionRepository;
 
 use crate::AgentHandle;
+
+/// The label the settings card and the ledger use for a browser family.
+fn browser_family_label(browser_id: &str) -> String {
+    vibex_browser::discovery::candidate_for(browser_id)
+        .map(|candidate| candidate.label.to_string())
+        .unwrap_or_else(|| browser_id.to_string())
+}
 
 /// How long a browser approval card stays open before it is denied.
 ///
@@ -203,6 +211,94 @@ impl BrowserRuntime {
             tracing::warn!(
                 target: "vibex_browser",
                 "an approved browser origin could not be persisted; it applies to this process only"
+            );
+        }
+    }
+
+    /// Every Chromium-family profile on this machine that an import can read.
+    ///
+    /// Read-only and cheap: cookie counts come from one SQLite query per
+    /// profile and localStorage is reported as a directory size. Nothing is
+    /// copied or decrypted until an import is confirmed.
+    pub async fn browser_profile_sources(&self) -> VibexResult<Vec<BrowserProfileSource>> {
+        self.service
+            .browser_profile_sources()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Copies one profile's login state into the isolated browser profile.
+    ///
+    /// The reader browser's own files are never modified, and a ledger row is
+    /// written with counts only -- a cookie value is a live credential and has
+    /// no representation in the audit table.
+    pub async fn import_browser_login_state(
+        &self,
+        request: BrowserLoginImportRequest,
+    ) -> VibexResult<BrowserLoginImportReport> {
+        let label = browser_family_label(&request.browser_id);
+        let profile_dir = request.profile_dir.clone();
+        let report = self.service.import_login_state(request).await?;
+        let summary = format!(
+            "Imported login state from {label} ({profile_dir}): {} cookies across {} sites, \
+             {} localStorage entries across {} origins",
+            report.cookies_imported,
+            report.sites_imported,
+            report.local_storage_entries,
+            report.local_storage_origins,
+        );
+        self.persist_system_action(
+            BrowserActionKind::ImportLoginState,
+            summary,
+            unix_timestamp_ms(),
+        )
+        .await;
+        Ok(report)
+    }
+
+    /// Deletes the isolated browser profile and everything in it.
+    pub async fn clear_browser_data(&self) -> VibexResult<BrowserDataClearReport> {
+        let report = self.service.clear_browser_data().await?;
+        let summary = format!(
+            "Cleared the isolated browser profile ({} files)",
+            report.removed_files
+        );
+        self.persist_system_action(BrowserActionKind::ClearData, summary, unix_timestamp_ms())
+            .await;
+        Ok(report)
+    }
+
+    /// Writes one ledger row for an action that has no tab or session.
+    ///
+    /// The import and the clear act on the profile itself, so there is no
+    /// session to attribute them to. Empty ids are the honest answer; inventing
+    /// one would collide with a real session's rows.
+    async fn persist_system_action(&self, kind: BrowserActionKind, summary: String, at_ms: i64) {
+        let row = vibex_db::BrowserAuditRecord {
+            id: format!("braction_{}", RequestId::new().as_str()),
+            session_id: String::new(),
+            workspace_id: None,
+            agent_session_id: None,
+            tab_id: String::new(),
+            kind: kind.as_str().to_string(),
+            summary,
+            domain: None,
+            execution_source: "user".to_string(),
+            status: "verified".to_string(),
+            at_ms,
+        };
+        let database_path = self.agent.manager().database_path().to_path_buf();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut connection = vibex_db::open_database(&database_path)?;
+            vibex_db::apply_migrations(&mut connection)?;
+            vibex_db::BrowserAuditRepository::insert(&connection, &row)
+        })
+        .await;
+        if let Ok(Err(error)) = outcome {
+            tracing::warn!(
+                target: "vibex_browser",
+                error_code = %error.code,
+                "failed to persist a browser audit row"
             );
         }
     }

@@ -287,7 +287,10 @@ retained pixel detail and full coverage after resizing, scrolling, and repaintin
 - **Isolated profile, always.** `--user-data-dir` points under the runtime data
   directory, never at the user's real profile and never inside the workspace.
   Chrome 136 and later refuse remote debugging against the default profile
-  anyway.
+  anyway. The one exception is an **explicit, one-shot import** the reader
+  confirms in Settings: login state is *copied* into the isolated profile and
+  the source profile is only ever read. See
+  [Importing a real profile's login state](#importing-a-real-profiles-login-state).
 - **`--remote-debugging-pipe` wherever it is available**, so no TCP port is
   opened. The loopback port fallback exists only for platforms where the pipe
   transport is not implemented and is read back from `DevToolsActivePort`
@@ -600,6 +603,66 @@ Two input translations are easy to get wrong and are pinned by tests:
   characters still travel the text path only. F5/Ctrl+R reload, Ctrl+L focuses
   the address bar, and Ctrl/Cmd+C/X/V are the panel's (`browser_command`,
   `clipboard_command`).
+
+## Importing a real profile's login state
+
+Settings → Browser can copy a local Chromium-family profile's cookies and
+localStorage into the isolated profile, so the Agent opens sites the reader is
+already signed in to. This is the one place the runtime reads a browser profile
+that is not its own, and every part of it is bounded by that fact.
+
+- **Explicit, user-only, one-shot.** The import runs only from the settings card
+  the reader clicks; it is not a tool, it is not on the MCP surface, and no
+  Agent can trigger it. It copies state once — it never shares, mirrors or
+  writes back the source profile, and nothing is re-read later.
+- **The source is read, never opened.** Cookies are read by launching a
+  throwaway browser against a *copy* of the profile (`Local State` plus the
+  cookie store, under `<home>/browser/import/<id>/`). Chrome performs its own
+  decryption, which is why this works on every platform and version — on
+  Windows it is also the only way past App-Bound Encryption, where no
+  third-party decryptor can read the values. localStorage is read from a copy of
+  `Local Storage/leveldb` with `rusty-leveldb`; Chrome's record format is
+  `_<origin>\x00<encoding><name>` with `<encoding><value>`, where `0` is UTF-16
+  and `1` is one byte per character.
+- **The staging tree never outlives the call.** It holds a copy of the reader's
+  cookie store, so it is deleted on success and on failure, and a new import
+  sweeps whatever a killed run left behind.
+- **`DOMStorage.setDOMStorageItem` needs a document.** Chrome answers
+  `Frame not found for the given storage id` for an origin no frame has loaded,
+  so localStorage is restored per origin: a hidden tab loads the origin once and
+  seeds it from a `Page.addScriptToEvaluateOnNewDocument` script, which runs
+  before the page's own scripts and therefore restores a session a site reads at
+  boot. The script reports how many entries it wrote, and that count is the
+  import's evidence; an origin that never commits, a third-party partition
+  (`origin^nonce`) and a `chrome-extension:` origin are counted as skipped
+  rather than silently dropped. The hidden tab is created the way `create_tab`
+  creates one (`creating_targets` guard, `ignored_targets` entry) so the panel
+  never adopts it, and it is always closed.
+- **Counts cross every seam.** A cookie value is a live credential: it never
+  reaches a `Debug` impl, a log line, the audit table, the transport payload or
+  interface copy. `BrowserLoginImportReport` and `BrowserDataClearReport` are
+  counts, and `ExportedCookie`/`ExportedStorage` keep their payloads out of
+  `Debug`. The ledger row records browser family, profile directory and counts
+  with empty session/tab ids, because the action belongs to the profile rather
+  than to a tab.
+- **Clear is one directory.** The browser is stopped first (Windows will not
+  delete open files) and `<home>/browser` is removed, which covers profiles,
+  imported state, caches and any staging tree. `stop_browser` deliberately does
+  not latch `shutting_down`: the next tab starts a fresh browser, so clearing is
+  not a shutdown.
+- **Desktop and server only.** The reader is behind the `profile-import` cargo
+  feature, which `vibex-desktop-runtime` enables. The mobile client compiles
+  `vibex-browser` through `vibex-backend` and has no browser panel, so it must
+  not gain SQLite's bundled C library and a LevelDB reader for nothing. On a
+  paired remote runtime the settings rows are disabled: the profile to import
+  from lives on the runtime host, not on the client.
+
+`crates/browser` carries the tests: the pure parts (storage key/value decoding,
+partitioned-cookie mapping, path-component validation, `Debug` redaction) plus
+live tests that build a source profile with a real browser and assert the
+round-trip — cookies and localStorage read back, then written into a service's
+isolated profile and read back out of it. A machine without a browser is the
+only reason those may skip.
 
 ## Approvals
 

@@ -25,8 +25,9 @@ use vibex_browser::{
     BrowserSessionKey,
 };
 use vibex_core::{
-    BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality, BrowserElementSource,
-    BrowserFrame, BrowserSession, BrowserSessionId, BrowserSessionSnapshot, BrowserTab,
+    BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality, BrowserDataClearReport,
+    BrowserElementSource, BrowserFrame, BrowserLoginImportReport, BrowserLoginImportRequest,
+    BrowserProfileSource, BrowserSession, BrowserSessionId, BrowserSessionSnapshot, BrowserTab,
     BrowserTabId, BrowserTabOwner, BrowserToolTier, BrowserUnavailableReason, SourceElementMatch,
     VibexError, VibexSessionId, WorkspaceId,
 };
@@ -249,6 +250,24 @@ pub trait BrowserTransport: Send + Sync + 'static {
     /// download directory under a name the runtime sanitized.
     fn set_downloads_enabled(&self, enabled: bool) -> BrowserTransportFuture<'_, ()>;
 
+    /// Every Chromium-family profile on the runtime host an import can read.
+    ///
+    /// The profile belongs to the machine running the runtime, which is why a
+    /// paired remote runtime cannot answer this from this client's own browser.
+    fn browser_profile_sources(&self) -> BrowserTransportFuture<'_, Vec<BrowserProfileSource>>;
+
+    /// Copies one browser profile's login state into the isolated profile.
+    ///
+    /// The report carries counts only; no cookie or storage value crosses this
+    /// seam.
+    fn import_browser_login_state(
+        &self,
+        request: BrowserLoginImportRequest,
+    ) -> BrowserTransportFuture<'_, BrowserLoginImportReport>;
+
+    /// Deletes the isolated browser profile and everything in it.
+    fn clear_browser_data(&self) -> BrowserTransportFuture<'_, BrowserDataClearReport>;
+
     /// The page's computed cursor at a viewport point.
     ///
     /// The screencast has no cursor of its own, so the panel asks the page what
@@ -438,6 +457,30 @@ impl BrowserTransport for LocalBrowserTransport {
         Box::pin(self.run(async move {
             service.set_downloads_enabled(enabled).await;
             Ok(())
+        }))
+    }
+
+    fn browser_profile_sources(&self) -> BrowserTransportFuture<'_, Vec<BrowserProfileSource>> {
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service.browser_profile_sources().await.map_err(Into::into)
+        }))
+    }
+
+    fn import_browser_login_state(
+        &self,
+        request: BrowserLoginImportRequest,
+    ) -> BrowserTransportFuture<'_, BrowserLoginImportReport> {
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service.import_login_state(request).await.map_err(Into::into)
+        }))
+    }
+
+    fn clear_browser_data(&self) -> BrowserTransportFuture<'_, BrowserDataClearReport> {
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service.clear_browser_data().await.map_err(Into::into)
         }))
     }
 
@@ -783,6 +826,23 @@ impl BrowserTransport for RemoteBrowserTransport {
         // The browser this would configure lives on the paired machine, and the
         // policy has no wire representation yet. Failing is the honest answer:
         // reporting success would flip a switch that does nothing.
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn browser_profile_sources(&self) -> BrowserTransportFuture<'_, Vec<BrowserProfileSource>> {
+        // Reading this client's browser would import from the wrong machine:
+        // the isolated profile being written belongs to the paired runtime.
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn import_browser_login_state(
+        &self,
+        _request: BrowserLoginImportRequest,
+    ) -> BrowserTransportFuture<'_, BrowserLoginImportReport> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn clear_browser_data(&self) -> BrowserTransportFuture<'_, BrowserDataClearReport> {
         Box::pin(async move { Self::unavailable() })
     }
 

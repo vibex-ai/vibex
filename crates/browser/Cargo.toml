@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Reading a real Chromium-family profile's login state. Desktop and server
+# builds enable it through `vibex-desktop-runtime`; the mobile client does not,
+# because the feature drags SQLite's bundled C library and a LevelDB reader
+# into a build that has no browser panel to import into.
+profile-import = ["dep:rusqlite", "dep:rusty-leveldb"]
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
@@ -14,6 +22,12 @@ command-group.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 image = { workspace = true, features = ["jpeg", "png"] }
+# The source profile's cookie store is SQLite; this is the same bundled engine
+# the rest of the workspace already links.
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+# The source profile's localStorage is a LevelDB store whose blocks are
+# Snappy-compressed.
+rusty-leveldb = { version = "4.0.1", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

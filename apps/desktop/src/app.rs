@@ -108,7 +108,8 @@ use vibex_core::{
     AgentGoalControlRequest, AgentId, AgentListRequest, AgentMessagePhase, AgentSession,
     AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState, AgentSnapshotEntry,
     AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, AgentTokenUsage,
-    AgentToolPreferences, AttachRuntimeRequest, BrowserCaptureQuality,
+    AgentToolPreferences, AttachRuntimeRequest, BrowserCaptureQuality, BrowserDataClearReport,
+    BrowserLoginImportReport, BrowserLoginImportRequest, BrowserProfileSource,
     CancelAgentSessionRuntimeSwitchRequest, ComputerAvailability, ComputerUnavailableReason,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
     ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest,
@@ -65201,6 +65202,20 @@ enum SettingsStorageUsageState {
     Unavailable,
 }
 
+/// Where the host's Chromium-family profiles stand for the import dialog.
+///
+/// The scan reads the user's own browser directory, so it runs as its own task
+/// and the dialog renders each phase: a request that silently showed an empty
+/// list would read as "this machine has no browser profiles".
+#[derive(Clone)]
+enum SettingsBrowserProfileSources {
+    Unloaded,
+    Loading,
+    Ready(Vec<BrowserProfileSource>),
+    /// The host cannot be asked -- a paired remote runtime, or a read failure.
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationKind {
     Completed,
@@ -66861,6 +66876,59 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// The figures under one import source's name.
+///
+/// Counts and a size only: the dialog never names a site, because the list of
+/// sites a reader is signed in to is itself private.
+fn browser_source_detail(source: &BrowserProfileSource) -> String {
+    format!(
+        "{} {} · {} {} · {} {}",
+        source.cookie_count,
+        locale::text("cookies", "条 Cookie", "條 Cookie"),
+        source.site_count,
+        locale::text("sites", "个站点", "個站點"),
+        format_bytes(source.local_storage_bytes),
+        locale::text("localStorage", "localStorage", "localStorage"),
+    )
+}
+
+/// What the import notification says: counts only.
+///
+/// A cookie value is a live credential, so it has no representation in
+/// interface copy or anywhere else that leaves the browser stores.
+fn browser_import_success(report: &BrowserLoginImportReport) -> String {
+    let mut summary = format!(
+        "{} · {} {} · {} {} · {} {} · {} {}",
+        locale::text("Login state imported", "登录状态已导入", "登入狀態已匯入"),
+        report.cookies_imported,
+        locale::text("cookies", "条 Cookie", "條 Cookie"),
+        report.sites_imported,
+        locale::text("sites", "个站点", "個站點"),
+        report.local_storage_entries,
+        locale::text("localStorage entries", "条 localStorage", "條 localStorage"),
+        report.local_storage_origins,
+        locale::text("origins", "个来源", "個來源"),
+    );
+    if report.local_storage_origins_skipped > 0 {
+        summary.push_str(&format!(
+            " · {} {}",
+            report.local_storage_origins_skipped,
+            locale::text("origins skipped", "个来源已跳过", "個來源已略過"),
+        ));
+    }
+    summary
+}
+
+/// What the clear notification says.
+fn browser_clear_success(report: &BrowserDataClearReport) -> String {
+    format!(
+        "{} · {} {}",
+        locale::text("Browser data cleared", "浏览器数据已清除", "瀏覽器資料已清除"),
+        report.removed_files,
+        locale::text("files", "个文件", "個檔案"),
+    )
+}
+
 fn storage_cleanup_dialog(kind: StorageCleanupKind) -> (&'static str, &'static str) {
     match kind {
         StorageCleanupKind::SessionsAndAttachments => (
@@ -67173,6 +67241,16 @@ struct FoundationSettings {
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
     storage_cleanup_task: Option<Task<()>>,
+    /// Where the host's browser profiles stand for the import dialog.
+    browser_profile_sources: SettingsBrowserProfileSources,
+    browser_profile_scan_task: Option<Task<()>>,
+    /// The profile picked in the import dialog, as `(browser_id, profile_dir)`.
+    ///
+    /// The dialog body is rebuilt on every frame, so the selection lives here
+    /// rather than inside the dialog closure.
+    browser_import_choice: Option<(String, String)>,
+    browser_import_task: Option<Task<()>>,
+    browser_clear_task: Option<Task<()>>,
     /// Why the shortcut dialog rejected the chord the user typed.
     ///
     /// The dialog keeps itself open on a rejection and renders this inside
@@ -67621,6 +67699,11 @@ impl FoundationSettings {
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
                 storage_cleanup_task: None,
+                browser_profile_sources: SettingsBrowserProfileSources::Unloaded,
+                browser_profile_scan_task: None,
+                browser_import_choice: None,
+                browser_import_task: None,
+                browser_clear_task: None,
                 shortcut_note: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
@@ -67830,6 +67913,358 @@ impl FoundationSettings {
         let _ = self.workbench.update(cx, |workbench, cx| {
             workbench.queue_settings_operation_notice(notice, cx)
         });
+    }
+
+    /// The browser transport the settings act through.
+    fn browser_settings_transport(
+        &self,
+        cx: &App,
+    ) -> Option<std::sync::Arc<dyn crate::browser_transport::BrowserTransport>> {
+        self.workbench
+            .read_with(cx, |workbench, cx| {
+                workbench
+                    .code_workbench
+                    .read(cx)
+                    .browser_settings_transport()
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Opens the login-state import dialog and starts the profile scan.
+    ///
+    /// The scan reads the user's own browser directory, so the dialog opens
+    /// immediately in its scanning state and fills in what it finds.
+    fn open_browser_login_import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.browser_import_choice = None;
+        self.start_browser_profile_scan(cx);
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            // The dialog body is rebuilt on every frame, so the weak handle is
+            // cloned per frame: the footer's action takes its own copy.
+            let entity = entity.clone();
+            let (sources, choice, busy) = entity
+                .update(cx, |this, _| {
+                    (
+                        this.browser_profile_sources.clone(),
+                        this.browser_import_choice.clone(),
+                        this.browser_import_task.is_some(),
+                    )
+                })
+                .unwrap_or((SettingsBrowserProfileSources::Unloaded, None, false));
+            let muted = cx.theme().muted_foreground;
+            let primary = cx.theme().primary;
+            let mut rows = v_flex().w_full().gap_1();
+            match &sources {
+                SettingsBrowserProfileSources::Ready(list) if list.is_empty() => {
+                    rows = rows.child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(locale::text(
+                                "This machine has no Chrome, Edge or Brave profile to import from.",
+                                "本机没有可用于导入的 Chrome、Edge 或 Brave 配置。",
+                                "本機沒有可用於匯入的 Chrome、Edge 或 Brave 設定檔。",
+                            )),
+                    );
+                }
+                SettingsBrowserProfileSources::Ready(list) => {
+                    for source in list {
+                        let selected =
+                            choice.as_ref().is_some_and(|(browser_id, profile_dir)| {
+                                browser_id == &source.browser_id
+                                    && profile_dir == &source.profile_dir
+                            });
+                        let row_entity = entity.clone();
+                        let key = (source.browser_id.clone(), source.profile_dir.clone());
+                        rows = rows.child(
+                            h_flex()
+                                .id(SharedString::from(format!(
+                                    "browser-import-source-{}-{}",
+                                    source.browser_id, source.profile_dir
+                                )))
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .px_3()
+                                .py_2()
+                                .rounded(px(8.0))
+                                .hover(|style| style.bg(cx.theme().muted.opacity(0.36)))
+                                .when(selected, |row| row.bg(primary.opacity(0.12)))
+                                .on_click(move |_, _, cx| {
+                                    let _ = row_entity.update(cx, |this, cx| {
+                                        this.browser_import_choice = Some(key.clone());
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(div().text_sm().font_medium().child(
+                                            SharedString::from(format!(
+                                                "{} · {}",
+                                                source.browser_label, source.display_name
+                                            )),
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(SharedString::from(
+                                                    browser_source_detail(source),
+                                                )),
+                                        ),
+                                )
+                                .when(selected, |row| row.child(Icon::new(IconName::Check).small())),
+                        );
+                    }
+                }
+                SettingsBrowserProfileSources::Loading
+                | SettingsBrowserProfileSources::Unloaded => {
+                    rows = rows.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Spinner::new().xsmall())
+                            .child(div().text_sm().text_color(muted).child(locale::text(
+                                "Reading this machine's browser profiles…",
+                                "正在读取本机浏览器配置…",
+                                "正在讀取本機瀏覽器設定檔…",
+                            ))),
+                    );
+                }
+                SettingsBrowserProfileSources::Unavailable(reason) => {
+                    rows = rows.child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(SharedString::from(reason.clone())),
+                    );
+                }
+            }
+            let body = v_flex()
+                .w_full()
+                .gap_3()
+                .child(rows)
+                .child(div().text_xs().whitespace_normal().text_color(muted).child(
+                    locale::text(
+                        "After the import the Agent can act on these sites as you. Cookies and \
+                         localStorage are copied into the Vibex browser only: your browser's own \
+                         profile is not changed and nothing is synced back. Pages that are already \
+                         open need a reload, and Clear browser data removes the imported state again.",
+                        "导入后，Agent 可以在这些站点上以你的身份操作。Cookie 与 localStorage 只复制到 Vibex 浏览器，不会改动或同步回你的浏览器；已打开的页面需要重新加载，随时可以用“清除浏览器数据”删除导入的状态。",
+                        "匯入後，Agent 可以在這些站點上以你的身分操作。Cookie 與 localStorage 只複製到 Vibex 瀏覽器，不會變更或同步回你的瀏覽器；已開啟的頁面需要重新載入，隨時可以用「清除瀏覽器資料」刪除匯入的狀態。",
+                    ),
+                ));
+            dialog
+                .title(locale::text(
+                    "Import browser login state",
+                    "导入本机 Chrome 登录状态",
+                    "匯入本機 Chrome 登入狀態",
+                ))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("cancel-browser-import")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("confirm-browser-import")
+                                .primary()
+                                .label(locale::text("Import", "导入", "匯入"))
+                                .disabled(busy || choice.is_none()),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| this.start_browser_login_import(cx));
+                    true
+                })
+        });
+    }
+
+    /// Asks the runtime host for the profiles an import could read.
+    fn start_browser_profile_scan(&mut self, cx: &mut Context<Self>) {
+        if self.browser_profile_scan_task.is_some() {
+            return;
+        }
+        let Some(transport) = self.browser_settings_transport(cx) else {
+            self.browser_profile_sources = SettingsBrowserProfileSources::Unavailable(
+                locale::text(
+                    "This client does not run the browser itself, so it cannot read a profile from \
+                     this machine.",
+                    "此客户端不负责运行浏览器，因此无法读取本机的浏览器配置。",
+                    "此客戶端不負責執行瀏覽器，因此無法讀取本機的瀏覽器設定檔。",
+                )
+                .to_string(),
+            );
+            return;
+        };
+        self.browser_profile_sources = SettingsBrowserProfileSources::Loading;
+        self.browser_profile_scan_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = transport.browser_profile_sources().await;
+            let _ = entity.update(cx, |this, cx| {
+                this.browser_profile_scan_task = None;
+                this.browser_profile_sources = match outcome {
+                    Ok(sources) => {
+                        // The first profile is the default, so a keyboard-only
+                        // reader can open the dialog and confirm without
+                        // touching the list.
+                        this.browser_import_choice = sources
+                            .first()
+                            .map(|source| (source.browser_id.clone(), source.profile_dir.clone()));
+                        SettingsBrowserProfileSources::Ready(sources)
+                    }
+                    Err(error) => SettingsBrowserProfileSources::Unavailable(error.message),
+                };
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Copies the chosen profile's login state into the isolated profile.
+    fn start_browser_login_import(&mut self, cx: &mut Context<Self>) {
+        if self.browser_import_task.is_some() {
+            return;
+        }
+        let Some((browser_id, profile_dir)) = self.browser_import_choice.clone() else {
+            return;
+        };
+        let Some(transport) = self.browser_settings_transport(cx) else {
+            self.notify_settings_operation(
+                SettingsOperationNotice::error(locale::text(
+                    "The local runtime is not ready.",
+                    "本地运行时尚未就绪。",
+                    "本機執行階段尚未就緒。",
+                )),
+                cx,
+            );
+            return;
+        };
+        let request = BrowserLoginImportRequest {
+            browser_id,
+            profile_dir,
+            include_cookies: true,
+            include_local_storage: true,
+        };
+        self.browser_import_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = transport.import_browser_login_state(request).await;
+            let _ = entity.update(cx, |this, cx| {
+                this.browser_import_task = None;
+                match outcome {
+                    Ok(report) => this.notify_settings_operation(
+                        SettingsOperationNotice::success(browser_import_success(&report)),
+                        cx,
+                    ),
+                    Err(error) => this.notify_settings_operation(
+                        SettingsOperationNotice::error(format!(
+                            "{} {}",
+                            locale::text(
+                                "Login state could not be imported.",
+                                "登录状态导入失败。",
+                                "登入狀態匯入失敗。",
+                            ),
+                            error.message,
+                        )),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Confirms deleting the whole isolated browser profile.
+    fn confirm_browser_data_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browser_clear_task.is_some() {
+            return;
+        }
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            dialog
+                .title(locale::text(
+                    "Clear browser data?",
+                    "清除浏览器数据？",
+                    "清除瀏覽器資料？",
+                ))
+                .child(locale::text(
+                    "This deletes the Vibex browser's own profile: cookies, localStorage, caches \
+                     and every imported login. Open browser tabs close, and the next tab starts \
+                     fresh. It cannot be undone.",
+                    "这会删除 Vibex 浏览器自己的配置：Cookie、localStorage、缓存以及已导入的登录状态。已打开的浏览器标签页会关闭，下次打开是全新状态，且无法撤销。",
+                    "這會刪除 Vibex 瀏覽器自己的設定：Cookie、localStorage、快取以及已匯入的登入狀態。已開啟的瀏覽器分頁會關閉，下次開啟是全新狀態，且無法復原。",
+                ))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("cancel-browser-clear")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("confirm-browser-clear")
+                                .danger()
+                                .label(locale::text("Clear", "清除", "清除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| this.start_browser_data_clear(cx));
+                    true
+                })
+        });
+    }
+
+    /// Deletes the isolated browser profile through the runtime.
+    fn start_browser_data_clear(&mut self, cx: &mut Context<Self>) {
+        if self.browser_clear_task.is_some() {
+            return;
+        }
+        let Some(transport) = self.browser_settings_transport(cx) else {
+            self.notify_settings_operation(
+                SettingsOperationNotice::error(locale::text(
+                    "The local runtime is not ready.",
+                    "本地运行时尚未就绪。",
+                    "本機執行階段尚未就緒。",
+                )),
+                cx,
+            );
+            return;
+        };
+        self.browser_clear_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = transport.clear_browser_data().await;
+            let _ = entity.update(cx, |this, cx| {
+                this.browser_clear_task = None;
+                match outcome {
+                    Ok(report) => this.notify_settings_operation(
+                        SettingsOperationNotice::success(browser_clear_success(&report)),
+                        cx,
+                    ),
+                    Err(error) => this.notify_settings_operation(
+                        SettingsOperationNotice::error(format!(
+                            "{} {}",
+                            locale::text(
+                                "Browser data could not be cleared.",
+                                "浏览器数据清除失败。",
+                                "瀏覽器資料清除失敗。",
+                            ),
+                            error.message,
+                        )),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     fn clear_storage_data(&mut self, kind: StorageCleanupKind, cx: &mut Context<Self>) {
@@ -71164,6 +71599,84 @@ impl FoundationSettings {
                     .into_any_element(),
             );
         }
+        // These two act on the isolated profile the panel's own tabs use, not on
+        // a page, so they sit together and stay out of the panel's toolbar.
+        let import_busy = self.browser_import_task.is_some();
+        let clear_busy = self.browser_clear_task.is_some();
+        let mut site_data_rows = vec![setting_row(
+            locale::text(
+                "Import browser login state",
+                "导入本机 Chrome 登录状态",
+                "匯入本機 Chrome 登入狀態",
+            ),
+            locale::text(
+                "Copy cookies and localStorage from this machine's Chrome, Edge or Brave into the \
+                 Vibex browser, so the Agent opens the sites you are already signed in to. The \
+                 browser's own profile is only read; nothing is written back to it.",
+                "把本机 Chrome、Edge 或 Brave 的 Cookie 与 localStorage 复制到 Vibex 浏览器，Agent 就能直接打开你已登录的网站。只读取浏览器自身的配置，不会写回。",
+                "把本機 Chrome、Edge 或 Brave 的 Cookie 與 localStorage 複製到 Vibex 瀏覽器，Agent 就能直接開啟你已登入的網站。只讀取瀏覽器本身的設定，不會寫回。",
+            ),
+            Button::new("browser-import-login-state")
+                .small()
+                .outline()
+                .icon(Icon::default().path("icons/vibex/import.svg"))
+                .label(locale::text("Choose profile…", "选择配置…", "選擇設定檔…"))
+                .disabled(degraded || import_busy || clear_busy)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_browser_login_import_dialog(window, cx)
+                })),
+            stacked,
+            cx,
+        )];
+        site_data_rows.push(setting_row(
+            locale::text("Clear browser data", "清除浏览器数据", "清除瀏覽器資料"),
+            locale::text(
+                "Delete the Vibex browser's profile: cookies, localStorage, caches and every \
+                 imported login. Open browser tabs close and the next tab starts fresh.",
+                "删除 Vibex 浏览器自己的配置：Cookie、localStorage、缓存以及已导入的登录状态。已打开的浏览器标签页会关闭，下次打开是全新状态。",
+                "刪除 Vibex 瀏覽器自己的設定：Cookie、localStorage、快取以及已匯入的登入狀態。已開啟的瀏覽器分頁會關閉，下次開啟是全新狀態。",
+            ),
+            Button::new("browser-clear-data")
+                .small()
+                .outline()
+                .danger()
+                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                .label(locale::text("Clear", "清除", "清除"))
+                .disabled(degraded || import_busy || clear_busy)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.confirm_browser_data_clear(window, cx)
+                })),
+            stacked,
+            cx,
+        ));
+        if import_busy || clear_busy {
+            site_data_rows.push(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Spinner::new().xsmall())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if import_busy {
+                                locale::text(
+                                    "Importing login state. A large profile can take a few minutes, \
+                                     so keep this window open.",
+                                    "正在导入登录状态。配置较大时可能需要几分钟，请保持窗口打开。",
+                                    "正在匯入登入狀態。設定檔較大時可能需要幾分鐘，請保持視窗開啟。",
+                                )
+                            } else {
+                                locale::text(
+                                    "Clearing the browser profile…",
+                                    "正在清除浏览器配置…",
+                                    "正在清除瀏覽器設定…",
+                                )
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
         settings_page(
             locale::text("Browser", "浏览器", "瀏覽器"),
             locale::text(
@@ -71178,6 +71691,14 @@ impl FoundationSettings {
                 ),
                 SettingsGroup::new(locale::text("Search", "搜索", "搜尋"), search_rows),
                 SettingsGroup::new(locale::text("Display", "显示", "顯示"), display_rows),
+                SettingsGroup::new(
+                    locale::text(
+                        "Login state and site data",
+                        "登录状态与站点数据",
+                        "登入狀態與站點資料",
+                    ),
+                    site_data_rows,
+                ),
             ],
             cx,
         )
