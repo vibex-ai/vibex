@@ -474,6 +474,36 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn unarchive_session(
+        &self,
+        request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .unarchive_session(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_archived_sessions(&self, limit: usize) -> BackendFuture<'_, Vec<AgentSession>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .list_archived_sessions(limit)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn delete_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

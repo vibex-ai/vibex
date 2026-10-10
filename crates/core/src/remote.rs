@@ -531,6 +531,7 @@ pub enum RemoteAgentOperationKind {
     CreateSession,
     RenameSession,
     ArchiveSession,
+    UnarchiveSession,
     DeleteSession,
     ForkSession,
     FetchTimeline,
@@ -671,6 +672,12 @@ pub struct RemoteAgentSessionActionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentSessionActionResponse {
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUnarchiveSessionResponse {
+    pub session: AgentSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1357,6 +1364,7 @@ pub enum RemoteAgentRequest {
     ForkSession(RemoteAgentForkSessionRequest),
     RenameSession(RemoteAgentRenameSessionRequest),
     ArchiveSession(RemoteAgentSessionActionRequest),
+    UnarchiveSession(RemoteAgentSessionActionRequest),
     DeleteSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
     GetTimelineDisplaySettings(RemoteAgentTimelineDisplaySettingsRequest),
@@ -1410,6 +1418,7 @@ impl RemoteAgentRequest {
             Self::ForkSession(_) => RemoteAgentOperationKind::ForkSession,
             Self::RenameSession(_) => RemoteAgentOperationKind::RenameSession,
             Self::ArchiveSession(_) => RemoteAgentOperationKind::ArchiveSession,
+            Self::UnarchiveSession(_) => RemoteAgentOperationKind::UnarchiveSession,
             Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
             Self::GetTimelineDisplaySettings(_) => {

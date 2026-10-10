@@ -88,10 +88,10 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineDisplaySettingsRequest,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchRequest,
-    RemoteAgentTimelineFetchResponse, RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest,
-    RemoteAuditRecord, RemoteAuthProof, RemoteCreatePairingCodeRequest,
-    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
+    RemoteAgentTimelineFetchResponse, RemoteAgentUnarchiveSessionResponse,
+    RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest, RemoteAuditRecord,
+    RemoteAuthProof, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
     RemoteDeviceCancelPairingOfferRequest, RemoteDeviceCreatePairingOfferRequest,
     RemoteDeviceDetail, RemoteDeviceListRequest, RemoteDeviceListResponse, RemoteDeviceRequest,
     RemoteDeviceRevokeRequest, RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse,
@@ -1184,6 +1184,31 @@ impl AgentBackend for WebRemoteBackend {
                     "the desktop did not confirm session archive",
                 ))
             }
+        })
+    }
+
+    fn unarchive_session(
+        &self,
+        request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::UnarchiveSession(RemoteAgentSessionActionRequest {
+                auth: this.auth(),
+                session_id: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Interactive,
+                )
+                .await?;
+            decode::<RemoteAgentUnarchiveSessionResponse>(value).map(|response| response.session)
         })
     }
 

@@ -664,6 +664,13 @@ const RUNTIME_CASCADE_PROJECTION_MEMO_LIMIT: usize = 8;
 const AUTO_CONTINUE_COUNTDOWN_SECONDS: u8 = 5;
 const AUTO_CONTINUE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Archived sessions one page of the archived-sessions page holds.
+///
+/// The archived list only grows, so the page is bounded rather than loading
+/// every row the database has ever retired.
+const ARCHIVED_SESSION_PAGE_LIMIT: usize = 200;
+/// One day in milliseconds, for the auto-archive inactivity window.
+const AUTO_ARCHIVE_MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 const AGENT_TIMELINE_SCROLLBAR_HIT_WIDTH_PX: f32 = 16.0;
 const SESSION_SEARCH_RESULT_LIMIT: usize = 200;
 /// Session rows the palette shows for a query. The scan itself keeps matching
@@ -7549,6 +7556,30 @@ pub struct VibexWorkbench {
     delegated_row_focus: BTreeMap<String, FocusHandle>,
     optimistically_removed_session_ids: BTreeSet<String>,
     pending_session_deletion_ids: BTreeSet<String>,
+    /// Sessions with an archive mutation in flight.
+    ///
+    /// The row leaves the sidebar as soon as the reader asks for it; this keeps
+    /// a second request from racing the first and decides whether a failure has
+    /// to put the row back.
+    pending_session_archive_ids: BTreeSet<String>,
+    /// Sessions with a restore mutation in flight.
+    pending_session_restore_ids: BTreeSet<String>,
+    /// The archived-session page, loaded on demand.
+    ///
+    /// The archived list is the one session list that only grows, so it is not
+    /// part of the ordinary overview load: the settings page asks for it when
+    /// it is opened, and a successful archive or restore marks it stale.
+    archived_sessions: Option<Vec<AgentSession>>,
+    archived_sessions_loading: bool,
+    archived_sessions_error: Option<String>,
+    archived_sessions_generation: u64,
+    /// Whether the next authoritative overview load should apply the
+    /// auto-archive window.
+    ///
+    /// The pass has to run against a complete list, but a failed archive
+    /// reloads the overview — consuming this flag is what keeps that reload
+    /// from retrying the same session in a loop.
+    auto_archive_pass_pending: bool,
     optimistically_removed_project_ids: BTreeSet<String>,
     pending_project_deletion_ids: BTreeSet<String>,
     pending_worktree_rename_ids: BTreeSet<String>,
@@ -8634,6 +8665,13 @@ impl VibexWorkbench {
             delegated_row_focus: BTreeMap::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
             pending_session_deletion_ids: BTreeSet::new(),
+            pending_session_archive_ids: BTreeSet::new(),
+            pending_session_restore_ids: BTreeSet::new(),
+            archived_sessions: None,
+            archived_sessions_loading: false,
+            archived_sessions_error: None,
+            archived_sessions_generation: 0,
+            auto_archive_pass_pending: true,
             optimistically_removed_project_ids: BTreeSet::new(),
             pending_project_deletion_ids: BTreeSet::new(),
             pending_worktree_rename_ids: BTreeSet::new(),
@@ -10094,7 +10132,14 @@ impl VibexWorkbench {
                     .await;
                 let active = entity
                     .update(cx, |this, cx| {
-                        if this.apply_sidebar_scheduled_archives(unix_timestamp_ms()) {
+                        let now_ms = unix_timestamp_ms();
+                        let folded = this.apply_sidebar_scheduled_archives(now_ms);
+                        // The same tick owns both ways a session leaves the
+                        // working list: the folder's scheduled move, which only
+                        // rearranges the sidebar, and the archive window, which
+                        // retires the row for good until it is restored.
+                        let retired = this.apply_auto_archive_sessions(now_ms, cx);
+                        if folded || retired {
                             this.invalidate_sidebar_projection_cache();
                             this.publish_sidebar_invalidation();
                             cx.notify();
@@ -12748,6 +12793,13 @@ impl VibexWorkbench {
                             // give them, which a listed placeholder title would
                             // otherwise put back on every refresh.
                             this.sessions_loaded = true;
+                            // The inactivity window runs against a complete
+                            // list, and only once per requested pass: a failed
+                            // archive reloads this overview, and retrying there
+                            // would loop on the session that just failed.
+                            if std::mem::take(&mut this.auto_archive_pass_pending) {
+                                this.apply_auto_archive_sessions(unix_timestamp_ms(), cx);
+                            }
                             this.apply_pending_scheduled_titles();
                             if this.ui_state.workbench.active_tab == "management" {
                                 this.sync_management_agent_ordering(cx);
@@ -32065,7 +32117,15 @@ impl VibexWorkbench {
                         this.load_agent_overview(cx);
                     }
                     match outcome {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            // The archived page is the surface that can still
+                            // show the row, so it is refreshed with the
+                            // deletion that just committed.
+                            if this.archived_sessions.is_some() {
+                                this.archived_sessions = None;
+                                this.load_archived_sessions(cx);
+                            }
+                        }
                         Ok(Err(error)) if active => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
                         }
@@ -32079,6 +32139,256 @@ impl VibexWorkbench {
             },
         )
         .detach();
+    }
+
+    /// Moves a session out of the sidebar without destroying it.
+    ///
+    /// Archive is the reversible half of removal: the row leaves the list, the
+    /// runtime is released, and the timeline stays where it is, so the archived
+    /// page can put it back. The row is dropped optimistically and only
+    /// restored when the mutation fails.
+    fn archive_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if self
+            .pending_session_archive_ids
+            .contains(session_id.as_str())
+        {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let session_ids = BTreeSet::from([session_id.as_str().to_string()]);
+        self.pending_session_archive_ids
+            .extend(session_ids.iter().cloned());
+        self.optimistically_remove_sessions(&session_ids);
+        self.queue_agent_ui_state();
+        cx.notify();
+        let generation = self.session_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .archive_session(MutationRequest::new(session_id.clone()))
+                .await
+                .map_err(remote_error_into_vibex)
+        });
+        self.finish_optimistic_session_archive(generation, session_ids, runner, cx);
+    }
+
+    fn finish_optimistic_session_archive(
+        &mut self,
+        generation: u64,
+        session_ids: BTreeSet<String>,
+        runner: Task<Result<Result<(), vibex_core::VibexError>, tokio::task::JoinError>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.pending_session_archive_ids
+                        .retain(|session_id| !session_ids.contains(session_id));
+                    let active = this.session_generation == generation;
+                    match outcome {
+                        Ok(Ok(())) => {
+                            // The archived page is the only surface that reads
+                            // the archived list, so it is refreshed rather than
+                            // reconciled with the sidebar's own load.
+                            this.archived_sessions = None;
+                            this.load_archived_sessions(cx);
+                        }
+                        Ok(Err(error)) if active => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                            this.optimistic_session_deletion_reconciliation_pending = true;
+                            this.load_agent_overview(cx);
+                        }
+                        Err(error) if active => {
+                            this.agent_error = Some(format!("session mutation failed: {error}"));
+                            this.optimistic_session_deletion_reconciliation_pending = true;
+                            this.load_agent_overview(cx);
+                        }
+                        Ok(Err(_)) | Err(_) => {}
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Puts an archived session back on the sidebar.
+    ///
+    /// The restore is not optimistic: the authoritative snapshot decides where
+    /// the row lands in recency order, so the list is reloaded once the runtime
+    /// answers instead of being patched by the client.
+    fn unarchive_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if self
+            .pending_session_restore_ids
+            .contains(session_id.as_str())
+        {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.pending_session_restore_ids
+            .insert(session_id.as_str().to_string());
+        cx.notify();
+        let restore_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .unarchive_session(MutationRequest::new(session_id))
+                .await
+                .map_err(remote_error_into_vibex)
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match outcome {
+                        Ok(Ok(session)) => {
+                            this.pending_session_restore_ids.remove(session.id.as_str());
+                            this.archived_sessions = None;
+                            this.load_archived_sessions(cx);
+                            this.load_agent_overview(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.pending_session_restore_ids
+                                .remove(restore_id.as_str());
+                            this.agent_error =
+                                Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.pending_session_restore_ids
+                                .remove(restore_id.as_str());
+                            this.agent_error = Some(format!("session mutation failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Loads the archived-session page from the runtime.
+    fn load_archived_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.archived_sessions_generation = self.archived_sessions_generation.wrapping_add(1);
+        let generation = self.archived_sessions_generation;
+        self.archived_sessions_loading = true;
+        self.archived_sessions_error = None;
+        cx.notify();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .list_archived_sessions(ARCHIVED_SESSION_PAGE_LIMIT)
+                .await
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.archived_sessions_generation != generation {
+                        return;
+                    }
+                    this.archived_sessions_loading = false;
+                    match outcome {
+                        Ok(Ok(sessions)) => {
+                            this.archived_sessions = Some(sessions);
+                            this.archived_sessions_error = None;
+                        }
+                        Ok(Err(error)) => {
+                            this.archived_sessions_error =
+                                Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.archived_sessions_error =
+                                Some(format!("archived sessions failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Sessions the inactivity window applies to, in sidebar order.
+    ///
+    /// A pinned session is a deliberate keep, a session with a live turn is
+    /// still working, and a delegated child belongs to its parent's timeline —
+    /// none of them are candidates.
+    fn auto_archive_candidates(&self, now_ms: i64) -> Vec<VibexSessionId> {
+        let Some(days) = self.ui_state.session.auto_archive_after_days else {
+            return Vec::new();
+        };
+        let cutoff_ms = now_ms.saturating_sub(i64::from(days) * AUTO_ARCHIVE_MILLIS_PER_DAY);
+        self.sessions
+            .iter()
+            .filter(|session| session.archived_at_ms.is_none() && session.deleted_at_ms.is_none())
+            .filter(|session| {
+                matches!(
+                    session.state,
+                    AgentSessionState::Idle
+                        | AgentSessionState::Error
+                        | AgentSessionState::Closed
+                )
+            })
+            .filter(|session| !self.sidebar_state.pinned_ids.contains(session.id.as_str()))
+            .filter(|session| {
+                !self
+                    .pending_agent_turn_session_ids
+                    .contains(session.id.as_str())
+            })
+            .filter(|session| session.last_message_at_ms.max(session.created_at_ms) <= cutoff_ms)
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
+    /// Applies the configured inactivity window once. Returns whether any
+    /// session was asked to archive.
+    fn apply_auto_archive_sessions(&mut self, now_ms: i64, cx: &mut Context<Self>) -> bool {
+        let candidates = self.auto_archive_candidates(now_ms);
+        if candidates.is_empty() {
+            return false;
+        }
+        for session_id in candidates {
+            self.archive_session(session_id, cx);
+        }
+        true
+    }
+
+    /// Deletes every session the archived page is holding.
+    ///
+    /// The page is bounded, so "all" means all of the page the reader is
+    /// looking at; the confirmation names the same count. Each deletion goes
+    /// through the sidebar's own path, which owns the pending set, the
+    /// optimistic removal and the failure reconciliation.
+    fn delete_all_archived_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(sessions) = self.archived_sessions.clone() else {
+            return;
+        };
+        for session in sessions {
+            self.delete_session(session.id.clone(), cx);
+        }
+    }
+
+    fn set_auto_archive_after_days(&mut self, days: Option<u8>, cx: &mut Context<Self>) {
+        if self.ui_state.session.auto_archive_after_days == days {
+            return;
+        }
+        self.ui_state.session.auto_archive_after_days = days.filter(|days| *days > 0);
+        self.queue_ui_state();
+        // Turning the window on applies it immediately: the reader who picked
+        // "after 30 days" is asking about the sessions that are already older
+        // than that, not only about the ones that will be. The pending pass is
+        // cleared so the reload that follows a failure does not repeat it.
+        self.auto_archive_pass_pending = false;
+        self.apply_auto_archive_sessions(unix_timestamp_ms(), cx);
+        cx.notify();
     }
 
     fn conversation_find_matches(&self, cx: &App) -> Vec<SessionSearchTarget> {
@@ -35489,6 +35799,21 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Opens Settings on the archived-sessions page.
+    ///
+    /// Archiving is only useful when the reader can find what they archived, so
+    /// the sidebar's own More menu carries the shortcut to the one page that
+    /// lists them.
+    fn open_archived_sessions_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.activate_settings_section(SettingsSection::Archived, cx);
+            settings.shortcut_note = None;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// Stores browser preferences and applies them to the panel that is open.
     ///
     /// Resolved here rather than in the panel: the workbench owns the settings,
@@ -36235,6 +36560,9 @@ impl VibexWorkbench {
                 let deletion_pending = self
                     .pending_session_deletion_ids
                     .contains(session.id.as_str());
+                let archive_pending = self
+                    .pending_session_archive_ids
+                    .contains(session.id.as_str());
                 div()
                     .id("title-session-actions")
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -36254,6 +36582,7 @@ impl VibexWorkbench {
                                     session_title.clone(),
                                     pinned,
                                     deletion_pending,
+                                    archive_pending,
                                     strings,
                                     entity.clone(),
                                     window,
@@ -36717,6 +37046,7 @@ impl VibexWorkbench {
         session_title: String,
         pinned: bool,
         deletion_pending: bool,
+        archive_pending: bool,
         strings: &'static Strings,
         entity: WeakEntity<Self>,
         window: &mut Window,
@@ -36727,9 +37057,11 @@ impl VibexWorkbench {
         Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let rename_entity = entity.clone();
         let pin_entity = entity.clone();
+        let archive_entity = entity.clone();
         let delete_entity = entity;
         let rename_id = session_id.clone();
         let pin_id = session_id.clone();
+        let archive_id = session_id.clone();
         let delete_id = session_id;
         let delete_label = strings.sidebar_delete;
         let pin_label = if pinned {
@@ -36757,6 +37089,15 @@ impl VibexWorkbench {
                     .on_click(move |_, _, cx| {
                         let _ =
                             pin_entity.update(cx, |this, cx| this.toggle_session_pin(&pin_id, cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(locale::text("Archive", "归档", "封存"))
+                    .icon(sidebar_icon("icons/vibex/package.svg"))
+                    .disabled(archive_pending)
+                    .on_click(move |_, _, cx| {
+                        let _ = archive_entity
+                            .update(cx, |this, cx| this.archive_session(archive_id.clone(), cx));
                     }),
             )
             .item(
@@ -37289,6 +37630,7 @@ impl VibexWorkbench {
         let new_folder_entity = entity.clone();
         let hierarchy_entity = entity.clone();
         let batch_entity = entity.clone();
+        let archived_entity = entity.clone();
         let import_entity = entity;
         let hierarchy_label = if state.hierarchy_mode == SidebarHierarchyMode::Detailed {
             locale::text("Switch to session view", "切换为会话视图", "切換為會話視圖")
@@ -37341,6 +37683,19 @@ impl VibexWorkbench {
                         this.open_local_history_import_dialog(None, None, window, cx)
                     });
                 }),
+        )
+        .item(
+            PopupMenuItem::new(locale::text(
+                "Archived sessions",
+                "已归档会话",
+                "已封存會話",
+            ))
+            .icon(sidebar_icon("icons/vibex/package.svg"))
+            .on_click(move |_, window, cx| {
+                let _ = archived_entity.update(cx, |this, cx| {
+                    this.open_archived_sessions_settings(window, cx)
+                });
+            }),
         )
     }
 
@@ -63164,6 +63519,41 @@ fn sidebar_icon(path: &'static str) -> Icon {
     Icon::default().path(path).small()
 }
 
+/// The auto-archive window choices, in the order the control shows them.
+///
+/// Days are compact because the control is a segmented row, and `Off` is the
+/// first segment so the default (no automatic archiving) is the one the reader
+/// sees selected on a fresh install.
+fn auto_archive_window_label(days: Option<u8>) -> String {
+    match days {
+        None => locale::text("Off", "关闭", "關閉").to_string(),
+        Some(days) => format!("{days}{}", locale::text("d", "天", "天")),
+    }
+}
+
+/// A muted line in the archived list: an empty state, a load failure or a note.
+fn archived_page_note(text: String, cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .py(px(12.0))
+        .text_xs()
+        .whitespace_normal()
+        .text_color(theme::semantic_color(
+            "muted-foreground",
+            cx.theme().is_dark(),
+        ))
+        .child(text)
+        .into_any_element()
+}
+
+/// How many sessions the archived page holds, phrased for the reader.
+fn archived_session_count_label(count: usize) -> String {
+    match count {
+        1 => locale::text("1 session", "1 个会话", "1 個會話").to_string(),
+        count => format!("{count} {}", locale::text("sessions", "个会话", "個會話")),
+    }
+}
+
 fn sidebar_auto_archive_days_label(days: u8, locale: locale::ResolvedLocale) -> String {
     match locale {
         locale::ResolvedLocale::En => {
@@ -65505,6 +65895,16 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
     ]) {
         Some(SettingsSection::Workbench)
     } else if matches(&[
+        "archived",
+        "archive",
+        "restore",
+        "归档",
+        "封存",
+        "復原",
+        "复原",
+    ]) {
+        Some(SettingsSection::Archived)
+    } else if matches(&[
         "session", "agent", "queue", "send", "会话", "消息", "队列", "會話", "訊息", "佇列",
     ]) {
         Some(SettingsSection::Session)
@@ -66199,6 +66599,23 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             ],
         ),
         settings_search_candidate(
+            SettingsSection::Archived,
+            locale::text("Archived sessions", "已归档会话", "已封存會話"),
+            locale::text(
+                "Restore or permanently delete archived sessions, and retire idle ones automatically.",
+                "恢复或永久删除已归档会话，并设置空闲会话的自动归档时间。",
+                "復原或永久刪除已封存會話，並設定閒置會話的自動封存時間。",
+            ),
+            &[
+                "archive",
+                "archived",
+                "restore",
+                "归档",
+                "封存",
+                "復原",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::Shortcuts,
             locale::text("All shortcuts", "全部快捷键", "全部快速鍵"),
             locale::text(
@@ -66360,6 +66777,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Appearance => locale::text("Appearance", "外观", "外觀"),
         SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
+        SettingsSection::Archived => locale::text("Archived sessions", "已归档会话", "已封存會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
         SettingsSection::Browser => locale::text("Browser", "浏览器", "瀏覽器"),
         SettingsSection::Computer => locale::text("Computer use", "电脑操作", "電腦操作"),
@@ -67727,6 +68145,13 @@ impl FoundationSettings {
         }
         if section == SettingsSection::About {
             self.request_about_update_check(cx);
+        }
+        if section == SettingsSection::Archived {
+            // The archived list is loaded on demand: it is the one session list
+            // that only grows, so the sidebar's own overview never carries it.
+            let _ = self
+                .workbench
+                .update(cx, |this, cx| this.load_archived_sessions(cx));
         }
     }
 
@@ -69552,6 +69977,7 @@ impl FoundationSettings {
                 &[
                     (SettingsSection::Workbench, IconName::LayoutDashboard),
                     (SettingsSection::Session, IconName::Bot),
+                    (SettingsSection::Archived, IconName::Inbox),
                     (SettingsSection::Terminal, IconName::SquareTerminal),
                     (SettingsSection::Browser, IconName::Globe),
                     (SettingsSection::Computer, IconName::Bot),
@@ -70605,9 +71031,385 @@ impl FoundationSettings {
                         ),
                     ],
                 ),
+                SettingsGroup::new(
+                    locale::text("Archived sessions", "已归档会话", "已封存會話"),
+                    vec![setting_row(
+                        locale::text("Archived sessions", "已归档会话", "已封存會話"),
+                        locale::text(
+                            "Restore or permanently delete archived sessions, and set how long an idle session waits before it is archived.",
+                            "恢复或永久删除已归档的会话，并设置空闲会话的自动归档时间。",
+                            "復原或永久刪除已封存的會話，並設定閒置會話的自動封存時間。",
+                        ),
+                        Button::new("open-archived-sessions")
+                            .small()
+                            .outline()
+                            .label(locale::text("Manage", "管理", "管理"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let _ = this.workbench.update(cx, |this, cx| {
+                                    this.open_archived_sessions_settings(window, cx)
+                                });
+                                cx.notify();
+                            })),
+                        stacked,
+                        cx,
+                    )],
+                ),
             ],
             cx,
         )
+    }
+
+    /// Every session the reader retired, plus the window that retires sessions
+    /// for them.
+    ///
+    /// Archiving is the reversible half of removal, so the page is built around
+    /// restoring: the list is loaded when the page opens, each row keeps its own
+    /// pending state, and the policy control sits above the list it acts on.
+    fn render_archived_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let auto_archive_after_days = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.session.auto_archive_after_days)
+            .ok()
+            .flatten();
+        let archived = self
+            .workbench
+            .read_with(cx, |this, _| this.archived_sessions.clone())
+            .ok()
+            .flatten();
+        let loading = self
+            .workbench
+            .read_with(cx, |this, _| this.archived_sessions_loading)
+            .unwrap_or(false);
+        let error = self
+            .workbench
+            .read_with(cx, |this, _| this.archived_sessions_error.clone())
+            .ok()
+            .flatten();
+
+        let auto_archive_options = [None, Some(7u8), Some(14), Some(30), Some(90)]
+            .into_iter()
+            .map(|days| {
+                settings_segmented_option(
+                    auto_archive_window_label(days),
+                    auto_archive_after_days == days,
+                    cx.listener(move |this, _, _, cx| this.set_auto_archive_after_days(days, cx)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let auto_archive_row = setting_row(
+            locale::text(
+                "Auto-archive idle sessions",
+                "自动归档空闲会话",
+                "自動封存閒置會話",
+            ),
+            locale::text(
+                "Move a session here once it has been inactive for this long. Pinned sessions and sessions with a running turn are never archived.",
+                "会话空闲超过这个时间后自动移到这里；置顶会话和正在运行的会话不会被归档。",
+                "會話閒置超過這個時間後自動移到這裡；置頂會話與正在執行的會話不會被封存。",
+            ),
+            settings_segmented_control("auto-archive-window", auto_archive_options),
+            stacked,
+            cx,
+        );
+
+        let mut list_rows = Vec::new();
+        if let Some(error) = error {
+            list_rows.push(archived_page_note(error, cx));
+        }
+        match &archived {
+            Some(sessions) if sessions.is_empty() => list_rows.push(archived_page_note(
+                locale::text(
+                    "No archived sessions. Archiving a session keeps its timeline and moves it here.",
+                    "还没有已归档的会话。归档会保留会话的时间线，并把它移到这里。",
+                    "還沒有已封存的會話。封存會保留會話的時間軸，並把它移到這裡。",
+                )
+                .to_string(),
+                cx,
+            )),
+            Some(sessions) => {
+                for session in sessions {
+                    list_rows.push(self.archived_session_row(session, cx));
+                }
+            }
+            None if loading => list_rows.push(archived_page_note(
+                locale::text(
+                    "Loading archived sessions…",
+                    "正在加载已归档会话…",
+                    "正在載入已封存會話…",
+                )
+                .to_string(),
+                cx,
+            )),
+            None => list_rows.push(archived_page_note(
+                locale::text(
+                    "Archived sessions could not be loaded. Refresh to try again.",
+                    "无法加载已归档会话，请刷新重试。",
+                    "無法載入已封存會話，請重新整理後再試。",
+                )
+                .to_string(),
+                cx,
+            )),
+        }
+
+        let count = archived.as_ref().map_or(0, Vec::len);
+        let refresh_entity = cx.weak_entity();
+        let refresh = Button::new("refresh-archived-sessions")
+            .small()
+            .outline()
+            .label(locale::text("Refresh", "刷新", "重新整理"))
+            .on_click(move |_, _, cx| {
+                let _ = refresh_entity.update(cx, |this, cx| {
+                    let _ = this
+                        .workbench
+                        .update(cx, |this, cx| this.load_archived_sessions(cx));
+                    cx.notify();
+                });
+            });
+        let mut header_children = vec![
+            div()
+                .text_xs()
+                .text_color(theme::semantic_color(
+                    "muted-foreground",
+                    cx.theme().is_dark(),
+                ))
+                .child(archived_session_count_label(count))
+                .into_any_element(),
+            div().flex_1().into_any_element(),
+            refresh.into_any_element(),
+        ];
+        if count > 0 {
+            let delete_entity = cx.weak_entity();
+            header_children.push(
+                Button::new("delete-all-archived-sessions")
+                    .small()
+                    .danger()
+                    .label(locale::text("Delete all", "全部删除", "全部刪除"))
+                    .on_click(move |_, window, cx| {
+                        let _ = delete_entity.update(cx, |this, cx| {
+                            this.confirm_delete_all_archived(window, cx)
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        let header = h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .pb(px(8.0))
+            .children(header_children)
+            .into_any_element();
+
+        settings_page(
+            locale::text("Archived sessions", "已归档会话", "已封存會話"),
+            locale::text(
+                "Archived sessions keep their full timeline and stay out of the sidebar. Restore one to bring it back, or delete it permanently.",
+                "已归档会话保留完整时间线，并从侧栏移出。可以恢复它，或永久删除。",
+                "已封存會話保留完整時間軸，並從側欄移出。可以復原它，或永久刪除。",
+            ),
+            vec![
+                SettingsGroup::new(
+                    locale::text("Automatic archiving", "自动归档", "自動封存"),
+                    vec![auto_archive_row],
+                ),
+                SettingsGroup::with_leading(
+                    locale::text("Archived", "已归档", "已封存"),
+                    header,
+                    list_rows,
+                ),
+            ],
+            cx,
+        )
+    }
+
+    /// One archived session: what it was, when it left, and the two actions
+    /// that decide its fate.
+    fn archived_session_row(&self, session: &AgentSession, cx: &mut Context<Self>) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let border = theme::semantic_color("border", is_dark);
+        let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+        let restore_pending = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.pending_session_restore_ids
+                    .contains(session.id.as_str())
+            })
+            .unwrap_or(false);
+        let restore_id = session.id.clone();
+        let delete_id = session.id.clone();
+        let title = if session.title.trim().is_empty() {
+            locale::text("Untitled session", "未命名会话", "未命名會話").to_string()
+        } else {
+            session.title.clone()
+        };
+        let meta = format!(
+            "{} · {}",
+            session.workspace_root,
+            relative_time_label(session.archived_at_ms.unwrap_or(session.updated_at_ms))
+        );
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .py(px(12.0))
+            .border_b_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1()
+                    .child(div().text_sm().font_medium().truncate().child(title))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .truncate()
+                            .child(meta),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "restore-archived-{}",
+                            session.id.as_str()
+                        )))
+                        .small()
+                        .outline()
+                        .disabled(restore_pending)
+                        .label(locale::text("Restore", "恢复", "復原"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.restore_archived_session(restore_id.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "delete-archived-{}",
+                            session.id.as_str()
+                        )))
+                        .small()
+                        .danger()
+                        .disabled(restore_pending)
+                        .label(locale::text("Delete", "删除", "刪除"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.confirm_delete_archived_session(delete_id.clone(), window, cx)
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn set_auto_archive_after_days(&mut self, days: Option<u8>, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_auto_archive_after_days(days, cx));
+        cx.notify();
+    }
+
+    fn restore_archived_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.unarchive_session(session_id, cx));
+        cx.notify();
+    }
+
+    fn confirm_delete_archived_session(
+        &mut self,
+        session_id: VibexSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (locale, strings) = self
+            .workbench
+            .read_with(cx, |this, _| (this.resolved_locale(), this.strings()))
+            .unwrap_or((
+                locale::ResolvedLocale::En,
+                locale::strings(locale::ResolvedLocale::En),
+            ));
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let session_id = session_id.clone();
+            dialog
+                .title(sidebar_delete_sessions_title(locale, 1))
+                .child(sidebar_delete_sessions_description(locale, 1))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("cancel-delete-archived")
+                                .outline()
+                                .label(strings.sidebar_cancel),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("confirm-delete-archived")
+                                .danger()
+                                .label(strings.sidebar_delete),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        let _ = this
+                            .workbench
+                            .update(cx, |this, cx| this.delete_session(session_id.clone(), cx));
+                        cx.notify();
+                    });
+                    true
+                })
+        });
+    }
+
+    fn confirm_delete_all_archived(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.archived_sessions.as_ref().map_or(0, Vec::len)
+            })
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let (locale, strings) = self
+            .workbench
+            .read_with(cx, |this, _| (this.resolved_locale(), this.strings()))
+            .unwrap_or((
+                locale::ResolvedLocale::En,
+                locale::strings(locale::ResolvedLocale::En),
+            ));
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            dialog
+                .title(sidebar_delete_sessions_title(locale, count))
+                .child(sidebar_delete_sessions_description(locale, count))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("cancel-delete-all-archived")
+                                .outline()
+                                .label(strings.sidebar_cancel),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("confirm-delete-all-archived")
+                                .danger()
+                                .label(strings.sidebar_delete),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        let _ = this
+                            .workbench
+                            .update(cx, |this, cx| this.delete_all_archived_sessions(cx));
+                        cx.notify();
+                    });
+                    true
+                })
+        });
     }
 
     fn render_workbench_page(
@@ -72754,6 +73556,7 @@ impl Render for FoundationSettings {
             SettingsSection::Session => {
                 self.render_session_page(&session, &desktop_behavior, stacked_rows, strings, cx)
             }
+            SettingsSection::Archived => self.render_archived_page(stacked_rows, cx),
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
             SettingsSection::Browser => self.render_browser_page(stacked_rows, cx),
@@ -92189,8 +92992,10 @@ mod tests {
             .expect("title session menu should remain inspectable");
         assert!(menu.contains("TITLE_BAR_SESSION_MENU_WIDTH"));
         assert!(!menu.contains("Copy Session ID"));
-        assert!(!menu.contains("this.archive_session"));
-        assert!(!menu.contains("Archive"));
+        // The menu retires a session without destroying it: archiving is the
+        // reversible action, and deletion stays the confirmed one.
+        assert!(menu.contains("this.archive_session"));
+        assert!(menu.contains("Archive"));
         assert!(menu.contains("this.confirm_delete_session"));
     }
 

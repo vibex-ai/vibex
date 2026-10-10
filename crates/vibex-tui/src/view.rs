@@ -194,6 +194,11 @@ pub const PALETTE: &[PaletteEntry] = &[
         intent: Intent::ArchiveSession,
     },
     PaletteEntry {
+        label: "Restore session",
+        hint: "Restore an archived session",
+        intent: Intent::UnarchiveSession,
+    },
+    PaletteEntry {
         label: "Delete session",
         hint: "Delete the open session",
         intent: Intent::DeleteSession,
@@ -268,6 +273,7 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::BeginRenameSession
         | Intent::ForkSession
         | Intent::ArchiveSession
+        | Intent::UnarchiveSession
         | Intent::DeleteSession
         | Intent::SwitchWorkspace
         | Intent::OpenSelectedSession

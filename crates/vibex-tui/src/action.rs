@@ -80,7 +80,8 @@ intents! {
     NewSession => { scope: Sessions, id: "session_new", label: "New", help: "Create a session in a workspace you pick." },
     BeginRenameSession => { scope: Sessions, id: "session_rename", label: "Rename", help: "Rename the selected session." },
     ForkSession => { scope: Sessions, id: "session_fork", label: "Fork", help: "Copy the session up to a chosen point." },
-    ArchiveSession => { scope: Sessions, id: "session_archive", label: "Archive", help: "Archive the selected session." },
+    ArchiveSession => { scope: Sessions, id: "session_archive", label: "Archive", help: "Archive the selected session, or restore it when it is already archived." },
+    UnarchiveSession => { scope: Sessions, id: "session_unarchive", label: "Restore", help: "Restore the selected archived session to the list." },
     DeleteSession => { scope: Sessions, id: "session_delete", label: "Delete", help: "Permanently delete the selected session." },
     ToggleShowArchived => { scope: Sessions, id: "session_show_archived", label: "Archived", help: "Include archived sessions in the list." },
     ToggleSessionCard => { scope: Sessions, id: "session_card_toggle", label: "Details", help: "Open or close the selected session's detail card." },
@@ -242,6 +243,7 @@ impl Intent {
                 | Intent::BeginRenameSession
                 | Intent::ForkSession
                 | Intent::ArchiveSession
+                | Intent::UnarchiveSession
                 | Intent::DeleteSession
                 | Intent::CreatePairingCode
                 | Intent::RevokeSelectedDevice

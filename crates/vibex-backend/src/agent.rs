@@ -207,6 +207,38 @@ pub trait AgentBackend: BackendBound {
 
     fn archive_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()>;
 
+    /// Restores an archived session to the active list and returns its new
+    /// snapshot, so a client can reinsert the row without a full refetch.
+    fn unarchive_session(
+        &self,
+        request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession>;
+
+    /// Lists archived top-level sessions, most recently archived first.
+    ///
+    /// The archived list is the one session list that only grows, so callers
+    /// pass the page size they are prepared to render. The default
+    /// implementation derives the page from the ordinary session list; a
+    /// backend overrides it only to answer the query more cheaply.
+    fn list_archived_sessions(&self, limit: usize) -> BackendFuture<'_, Vec<AgentSession>> {
+        Box::pin(async move {
+            let mut archived = self
+                .list_sessions(true)
+                .await?
+                .into_iter()
+                .filter(|session| session.archived_at_ms.is_some())
+                .collect::<Vec<_>>();
+            archived.sort_by(|left, right| {
+                right
+                    .archived_at_ms
+                    .cmp(&left.archived_at_ms)
+                    .then_with(|| right.id.as_str().cmp(left.id.as_str()))
+            });
+            archived.truncate(limit);
+            Ok(archived)
+        })
+    }
+
     fn delete_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()>;
 
     fn list_runtime_options(&self) -> BackendFuture<'_, SessionRuntimeOptionCatalog>;

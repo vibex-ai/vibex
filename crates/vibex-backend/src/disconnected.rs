@@ -209,6 +209,13 @@ impl AgentBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn unarchive_session(
+        &self,
+        _request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession> {
+        disconnected_future!()
+    }
+
     fn delete_session(&self, _request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()> {
         disconnected_future!()
     }

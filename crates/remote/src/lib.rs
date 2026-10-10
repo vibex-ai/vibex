@@ -35,9 +35,10 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSessionTokenUsageResponse,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchResponse,
-    RemoteAgentUsageStatisticsResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
-    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
-    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentUnarchiveSessionResponse, RemoteAgentUsageStatisticsResponse, RemoteAuditAction,
+    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
+    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
+    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse,
@@ -4416,6 +4417,30 @@ async fn dispatch_agent_request(
             )?;
             let session = result?;
             serde_json::to_value(RemoteAgentRenameSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::UnarchiveSession(request) => {
+            let target_id = request.session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.unarchive_session(&request.session_id).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session unarchive",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let session = result?;
+            serde_json::to_value(RemoteAgentUnarchiveSessionResponse { session })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::ArchiveSession(request) => {

@@ -5499,6 +5499,11 @@ pub enum Effect {
     ArchiveSession {
         session_id: VibexSessionId,
     },
+    /// Restores an archived session to the list. Unlike archiving this is not
+    /// destructive, so the reader is not asked to confirm it.
+    UnarchiveSession {
+        session_id: VibexSessionId,
+    },
     DeleteSession {
         session_id: VibexSessionId,
     },
@@ -5676,6 +5681,7 @@ impl Effect {
             Effect::CreateSession { .. } => "create_session",
             Effect::RenameSession { .. } => "rename_session",
             Effect::ArchiveSession { .. } => "archive_session",
+            Effect::UnarchiveSession { .. } => "unarchive_session",
             Effect::DeleteSession { .. } => "delete_session",
             Effect::ForkSession { .. } => "fork_session",
             Effect::ReadClipboard { .. } => "read_clipboard",

@@ -647,6 +647,16 @@ Use exactly these top-level states at client boundaries:
 Provider-specific states must map into this set before crossing the Agent
 service boundary.
 
+Archiving is durable and reversible: `archived_at_ms` on the session record is
+the single source of truth, the timeline and provider binding stay in place,
+and only the provider runtime is released. Restoring clears the timestamp and
+returns the session to `idle`, so its next message resumes through the ordinary
+submission path. A turn requested for an archived session fails with
+`session_archived` — not a state-machine conflict — because the session has to
+be restored before it can accept input. `agent_list_archived_sessions` is the
+bounded page the archived-sessions surface reads; the ordinary session list
+carries archived rows only when `include_archived` is set.
+
 ## Required Session Operations
 
 The provider-neutral service must model these operations even if a provider
@@ -1998,6 +2008,8 @@ agent_continue_turn(request: ContinueAgentTurnRequest) -> Vec<TimelineItem>
 agent_execute_command(request: AgentCommandExecuteRequest) -> AgentCommandExecuteResult
 agent_interrupt(session_id: VibexSessionId) -> ()
 agent_archive_session(session_id: VibexSessionId) -> ()
+agent_unarchive_session(session_id: VibexSessionId) -> AgentSession
+agent_list_archived_sessions(limit: usize) -> Vec<AgentSession>
 agent_delete_session(session_id: VibexSessionId) -> ()
 agent_resolve_permission(request: ResolvePermissionRequest) -> TimelineItem
 agent_get_capabilities() -> ProviderCapabilitiesResponse

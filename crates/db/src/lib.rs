@@ -2999,6 +2999,100 @@ impl SessionRepository {
         Ok(())
     }
 
+    /// Lists archived top-level conversations, most recently archived first.
+    ///
+    /// The archived list is the one session list that only grows, so it is
+    /// bounded by the caller's limit rather than returning every archived row.
+    /// Delegated child sessions stay addressable through their parent and are
+    /// never listed on their own.
+    pub fn list_archived(conn: &Connection, limit: usize) -> VibexResult<Vec<AgentSession>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT session_id, title, project_id, workspace_id, workspace_root,
+                    workspace_mode, state,
+                    permission_mode, ask_on_risk, bypass_all_permissions,
+                    created_at_ms, updated_at_ms,
+                    COALESCE(
+                        (SELECT MAX(timestamp_ms)
+                         FROM agent_timeline_items
+                         WHERE agent_timeline_items.session_id = agent_sessions.session_id),
+                        created_at_ms
+                    ) AS last_message_at_ms,
+                    archived_at_ms, deleted_at_ms, current_agent_id
+                FROM agent_sessions
+                WHERE deleted_at_ms IS NULL
+                    AND archived_at_ms IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM agent_delegations
+                        WHERE agent_delegations.child_session_id = agent_sessions.session_id
+                    )
+                ORDER BY archived_at_ms DESC, session_id DESC
+                LIMIT ?1
+                ",
+            )
+            .map_err(storage_err(
+                "session_archive_list_failed",
+                "failed to list archived sessions",
+            ))?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_agent_session)
+            .map_err(storage_err(
+                "session_archive_list_failed",
+                "failed to list archived sessions",
+            ))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let session = row.map_err(storage_err(
+                "session_decode_failed",
+                "failed to decode session row",
+            ))?;
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    /// Restores an archived session to the active list.
+    ///
+    /// `archived_at_ms` is the single source of truth for archive state, so
+    /// clearing it is the whole restore; the session returns to `Idle` so its
+    /// next message starts a turn through the ordinary state transitions. The
+    /// runtime is materialized lazily, exactly as it is for a session restored
+    /// after a restart.
+    pub fn unarchive(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<AgentSession> {
+        let now = unix_timestamp_ms();
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET state = ?2, archived_at_ms = NULL, updated_at_ms = ?3
+                WHERE session_id = ?1
+                    AND deleted_at_ms IS NULL
+                    AND archived_at_ms IS NOT NULL
+                ",
+                params![
+                    session_id.as_str(),
+                    enum_to_db(&AgentSessionState::Idle)?,
+                    now
+                ],
+            )
+            .map_err(storage_err(
+                "session_unarchive_failed",
+                "failed to restore session",
+            ))?;
+        if changed_rows == 0 {
+            return Err(VibexError::conflict(
+                "session_not_archived",
+                "Agent session is not archived",
+            ));
+        }
+        Self::get(conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })
+    }
+
     pub fn archive_if_timeline_unchanged(
         conn: &Connection,
         session_id: &VibexSessionId,
@@ -19838,6 +19932,70 @@ mod tests {
                 .state,
             AgentSessionState::Archived
         );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn unarchive_returns_a_session_to_the_active_list() {
+        let temp = temp_db_path("session-unarchive");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-session-unarchive-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Restore me".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            last_message_at_ms: 100,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        SessionRepository::archive(&conn, &session.id).unwrap();
+        assert!(
+            SessionRepository::list_root_sessions(&conn, false)
+                .unwrap()
+                .is_empty()
+        );
+        let archived = SessionRepository::list_archived(&conn, 10).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, session.id);
+        assert_eq!(archived[0].state, AgentSessionState::Archived);
+
+        let restored = SessionRepository::unarchive(&conn, &session.id).unwrap();
+        assert_eq!(restored.state, AgentSessionState::Idle);
+        assert!(restored.archived_at_ms.is_none());
+        assert!(
+            SessionRepository::list_archived(&conn, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            SessionRepository::list_root_sessions(&conn, false)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Restoring a session that is already active is a conflict rather than
+        // a silent success: the caller asked for a state change that did not
+        // happen.
+        let error = SessionRepository::unarchive(&conn, &session.id).unwrap_err();
+        assert_eq!(error.code, "session_not_archived");
 
         cleanup_db(temp);
     }

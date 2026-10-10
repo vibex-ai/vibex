@@ -482,6 +482,13 @@ impl Dispatch {
                     Err(error) => self.failure("archive_session", error),
                 }
             }
+            Effect::UnarchiveSession { session_id } => {
+                let request = MutationRequest::new(session_id);
+                match self.facade.agent().unarchive_session(request).await {
+                    Ok(_) => self.ok("unarchive_session"),
+                    Err(error) => self.failure("unarchive_session", error),
+                }
+            }
             Effect::DeleteSession { session_id } => {
                 let request = MutationRequest::new(session_id);
                 match self.facade.agent().delete_session(request).await {
