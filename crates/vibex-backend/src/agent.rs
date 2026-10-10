@@ -192,6 +192,8 @@ pub trait AgentBackend: BackendBound {
 
     fn subscribe(&self) -> BackendResult<Box<dyn BackendEventSubscription>>;
 
+    /// Lists top-level conversations. Owned children are loaded through the
+    /// session tree, Team projection, or an explicit session read.
     fn list_sessions(&self, include_archived: bool) -> BackendFuture<'_, Vec<AgentSession>>;
 
     fn open_session(&self, session_id: VibexSessionId) -> BackendFuture<'_, AgentSession>;
@@ -310,6 +312,27 @@ pub trait AgentBackend: BackendBound {
     ) -> BackendFuture<'_, AgentSession>;
 
     fn archive_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()>;
+
+    /// Restores an archived session to the active list and returns its new
+    /// snapshot, so a client can reinsert the row without a full refetch.
+    fn unarchive_session(
+        &self,
+        request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession>;
+
+    /// Lists archived top-level sessions, most recently archived first.
+    ///
+    /// The authority filters creation ownership before applying the caller's
+    /// limit, capped at 500. Backends without this projection report it as
+    /// unavailable.
+    fn list_archived_sessions(&self, _limit: usize) -> BackendFuture<'_, Vec<AgentSession>> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_archived_sessions_unavailable",
+                "Archived sessions are unavailable on this backend",
+            ))
+        })
+    }
 
     fn delete_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()>;
 

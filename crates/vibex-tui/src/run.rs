@@ -1643,6 +1643,9 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // rather than dropped from the order.
             app.reconcile_sidebar_arrangement();
             app.live = LiveState::Ready;
+            if let Some(effect) = app.pending_session_list_refresh() {
+                worker.dispatch(effect);
+            }
         }
         AppMessage::AutoContinueTurnStatus {
             session_id,
@@ -2153,10 +2156,20 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             {
                 app.confirm_pending_item(&event.item);
             }
+            let session_update = matches!(&event, vibex_backend::BackendEvent::SessionUpdated(_));
             let decision = app.agent.apply_event(event);
             match decision {
                 vibex_ui::AgentEventDecision::Applied => {
                     app.live = LiveState::Ready;
+                    app.sync_transcript();
+                }
+                vibex_ui::AgentEventDecision::NeedsAuthoritativeRefetch if session_update => {
+                    // A new session event can describe an owned worker. Only
+                    // the authority's root list may add a navigation row;
+                    // refreshing it must preserve the worker already open.
+                    if let Some(effect) = app.refresh_session_list() {
+                        worker.dispatch(effect);
+                    }
                     app.sync_transcript();
                 }
                 vibex_ui::AgentEventDecision::NeedsAuthoritativeRefetch => {
@@ -2558,6 +2571,135 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn worker_session_events_refresh_roots_without_retargeting_the_open_worker() {
+        use vibex_core::{AgentMessageDeltaPayload, TimelinePayload};
+        let (worker, mut messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        app.dock_open = false;
+        let root = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        let mut child = isolation_session(vibex_core::VibexSessionId::new(), "deepseek-harness");
+        app.agent.apply_sessions(Ok(vec![root.clone()])).unwrap();
+        let ticket = app
+            .open_session_effects(child.id.clone())
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                crate::app::Effect::OpenSession { ticket, .. } => Some(ticket),
+                _ => None,
+            })
+            .unwrap();
+        let item = conversation_item(
+            &child.id,
+            1,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "Worker answer".to_string(),
+                chunk_index: 0,
+                phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionOpened {
+                ticket,
+                result: Ok(vibex_ui::AgentSessionSnapshot {
+                    session: child.clone(),
+                    timeline: vec![item.clone()],
+                    runtime_selection: None,
+                    timeline_has_older: false,
+                }),
+            },
+        )
+        .unwrap();
+        app.composer.set_text("Keep this worker draft");
+        let generation = app.agent.state.generation;
+
+        for revision in [2, 3] {
+            child.updated_at_ms = revision;
+            child.title = format!("Worker revision {revision}");
+            apply_message(
+                &mut app,
+                &worker,
+                AppMessage::Event(vibex_backend::BackendEvent::SessionUpdated(child.clone())),
+            )
+            .unwrap();
+            assert!(app.agent.state.sessions.is_loading());
+            assert_eq!(
+                app.agent.state.sessions.value.as_ref().unwrap(),
+                &vec![root.clone()]
+            );
+            assert_eq!(app.agent.state.active_session.value.as_ref(), Some(&child));
+            assert_eq!(app.agent.state.generation, generation);
+            assert_eq!(app.live, LiveState::Ready);
+        }
+
+        let new_root = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::SessionUpdated(
+                new_root.clone(),
+            )),
+        )
+        .unwrap();
+
+        async fn receive_only_root_refresh(
+            messages: &mut tokio::sync::mpsc::UnboundedReceiver<AppMessage>,
+        ) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match messages.recv().await {
+                        Some(AppMessage::Sessions(_)) => break,
+                        Some(AppMessage::Notice { .. }) => {}
+                        unexpected => {
+                            panic!("expected only a root-list refresh, got {unexpected:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("root-list refresh was dispatched");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), messages.recv())
+                    .await
+                    .is_err(),
+                "worker metadata events must coalesce while the root list is loading"
+            );
+        }
+
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        observer.block_on(receive_only_root_refresh(&mut messages));
+        // This request captured its snapshot before the new root appeared.
+        // The pending invalidation must produce a fresh read after it returns.
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Sessions(Ok(vec![root.clone()])),
+        )
+        .unwrap();
+        assert!(app.agent.state.sessions.is_loading());
+        observer.block_on(receive_only_root_refresh(&mut messages));
+        let roots = vec![root, new_root];
+        apply_message(&mut app, &worker, AppMessage::Sessions(Ok(roots.clone()))).unwrap();
+        assert!(!app.agent.state.sessions.is_loading());
+        assert_eq!(app.agent.state.sessions.value, Some(roots));
+        assert_eq!(
+            app.agent.state.selected_session_id.as_ref(),
+            Some(&child.id)
+        );
+        assert_eq!(app.agent.state.active_session.value.as_ref(), Some(&child));
+        assert_eq!(app.agent.state.timeline.items, vec![item]);
+        assert_eq!(app.agent.state.generation, generation);
+        assert_eq!(app.composer.text(), "Keep this worker draft");
+        assert_eq!(app.page, Page::Agent);
+        assert_eq!(app.live, LiveState::Ready);
     }
 
     #[test]

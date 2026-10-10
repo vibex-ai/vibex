@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+#[cfg(feature = "profile-import")]
+use std::time::Instant;
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
@@ -34,11 +36,13 @@ use vibex_core::{
     BROWSER_BACKGROUND_IDLE_MS, BROWSER_CDP_COMMAND_TIMEOUT_MS, BROWSER_MAX_BACKGROUND_SESSIONS,
     BROWSER_MAX_DIAGNOSTIC_ENTRIES, BROWSER_MAX_FRAME_BYTES, BROWSER_MAX_SESSION_LEDGER_ITEMS,
     BROWSER_MAX_TABS, BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality,
-    BrowserConsoleEntry, BrowserDialogRequest, BrowserExecutionSource, BrowserFrame,
-    BrowserFrameMetadata, BrowserNetworkEntry, BrowserSession, BrowserSessionId,
+    BrowserConsoleEntry, BrowserDataClearReport, BrowserDialogRequest, BrowserExecutionSource,
+    BrowserFrame, BrowserFrameMetadata, BrowserNetworkEntry, BrowserSession, BrowserSessionId,
     BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner, BrowserTabStatus,
     BrowserToolTier, BrowserUnavailableReason, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
+#[cfg(feature = "profile-import")]
+use vibex_core::{BrowserLoginImportReport, BrowserLoginImportRequest, BrowserProfileSource};
 
 use crate::ax::{PrunedElement, clamp_max_elements, prune_ax_tree, resolve_depth};
 use crate::cdp::{CdpConnection, CdpEvent, CdpSession, CdpTransportKind};
@@ -679,6 +683,11 @@ pub(crate) struct BrowserInner {
     event_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     reaper_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
+    /// Set while a login-state import is running.
+    ///
+    /// An import writes cookies and localStorage into the profile from a hidden
+    /// tab; a second import interleaving with it would race the same stores.
+    import_in_progress: AtomicBool,
     /// One dev-server scanner per workspace, fed by the runtime's PTY reader.
     dev_servers: std::sync::Mutex<HashMap<WorkspaceId, crate::devserver::DevServerScanner>>,
     /// Where a permitted download lands, and whether downloads are permitted.
@@ -731,6 +740,7 @@ impl BrowserService {
             event_task: Mutex::new(None),
             reaper_task: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
+            import_in_progress: AtomicBool::new(false),
             dev_servers: std::sync::Mutex::new(HashMap::new()),
             downloads: Mutex::new(DownloadsState {
                 enabled: false,
@@ -1975,7 +1985,8 @@ impl BrowserService {
         Ok(tab_id)
     }
 
-    async fn connection(&self) -> BrowserResult<Arc<CdpConnection>> {
+    /// The live debugging channel, once the browser is running.
+    pub(crate) async fn connection(&self) -> BrowserResult<Arc<CdpConnection>> {
         let state = self.inner.state.lock().await;
         state
             .process
@@ -2428,6 +2439,582 @@ impl BrowserService {
     }
 }
 
+impl BrowserService {
+    /// Stops the browser process but leaves the service usable.
+    ///
+    /// Unlike [`BrowserService::shutdown`] this does not latch `shutting_down`:
+    /// the next tab starts a fresh browser, which is what makes it safe to
+    /// delete the profile directory underneath.
+    pub async fn stop_browser(&self) {
+        let process = {
+            let mut state = self.inner.state.lock().await;
+            state.tabs.clear();
+            state.sessions.clear();
+            state.process.take()
+        };
+        if let Some(process) = process {
+            process.shutdown().await;
+        }
+        self.inner.state.lock().await.availability = discovery::availability();
+    }
+
+    /// Deletes the isolated browser profile: cookies, localStorage, IndexedDB,
+    /// caches, service workers and permissions.
+    ///
+    /// One directory is the whole answer, because everything the browser owns
+    /// lives under it. The browser is stopped first -- Windows will not delete a
+    /// directory whose files are open -- and the next tab recreates the profile
+    /// from scratch.
+    pub async fn clear_browser_data(&self) -> BrowserResult<BrowserDataClearReport> {
+        if self.inner.import_in_progress.load(Ordering::SeqCst) {
+            return Err(BrowserError::conflict(
+                "browser_import_in_progress",
+                "a login-state import is still running",
+            ));
+        }
+        let home_dir = self.inner.config.read().await.home_dir.clone();
+        self.stop_browser().await;
+        let browser_dir = home_dir.join("browser");
+        tokio::task::spawn_blocking(move || {
+            let (removed_files, reclaimed_bytes) = tree_usage(&browser_dir);
+            match std::fs::remove_dir_all(&browser_dir) {
+                Ok(()) => Ok(BrowserDataClearReport {
+                    removed_files,
+                    reclaimed_bytes,
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(BrowserDataClearReport::default())
+                }
+                Err(error) => Err(BrowserError::storage(
+                    "browser_data_clear_failed",
+                    format!("the browser profile could not be removed: {error}"),
+                )),
+            }
+        })
+        .await
+        .map_err(|error| {
+            BrowserError::storage(
+                "browser_data_clear_failed",
+                format!("clearing the browser profile did not finish: {error}"),
+            )
+        })?
+    }
+}
+
+/// Cookies per `Network.setCookies` call.
+///
+/// One round trip for a whole profile makes a single rejected cookie lose the
+/// batch, and the payload has to fit the transport's buffer.
+#[cfg(feature = "profile-import")]
+const IMPORT_COOKIE_BATCH: usize = 200;
+/// How long one origin is given to commit its document before its localStorage
+/// is written off as unreachable.
+#[cfg(feature = "profile-import")]
+const IMPORT_ORIGIN_TIMEOUT: Duration = Duration::from_secs(4);
+/// Poll interval while waiting for a document to commit.
+#[cfg(feature = "profile-import")]
+const IMPORT_ORIGIN_POLL: Duration = Duration::from_millis(50);
+/// Largest seed script one origin may need. Chrome's own localStorage quota is
+/// smaller than this, so a bigger origin could not be restored anyway.
+#[cfg(feature = "profile-import")]
+const IMPORT_MAX_SEED_BYTES: usize = 4 * 1024 * 1024;
+/// Command timeout for the import's own CDP calls. The default is tuned for a
+/// page that may be wedged; an import talks to a browser it just started.
+#[cfg(feature = "profile-import")]
+const IMPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// A tab the runtime opens for itself, which the panel never shows.
+#[cfg(feature = "profile-import")]
+struct ImportTab {
+    target_id: String,
+    session: CdpSession,
+}
+
+/// What one localStorage pass restored.
+#[cfg(feature = "profile-import")]
+#[derive(Default)]
+struct LocalStorageOutcome {
+    entries: u64,
+    origins: u64,
+    skipped: u64,
+    bytes: u64,
+}
+
+#[cfg(feature = "profile-import")]
+impl BrowserService {
+    /// Every Chromium-family profile on the runtime host an import can read.
+    ///
+    /// This touches the user's own browser directory, so it is read-only and
+    /// cheap: a SQLite count per profile and a directory size for localStorage.
+    /// Nothing is decrypted and nothing is copied until an import is confirmed.
+    pub async fn browser_profile_sources(&self) -> BrowserResult<Vec<BrowserProfileSource>> {
+        tokio::task::spawn_blocking(crate::profile_import::discover_sources)
+            .await
+            .map_err(|error| {
+                BrowserError::storage(
+                    "browser_profile_scan_failed",
+                    format!("the browser profile scan did not finish: {error}"),
+                )
+            })
+    }
+
+    /// Copies one profile's login state into the isolated Vibex profile.
+    ///
+    /// Cookies and localStorage are read from *copies* of the source stores and
+    /// written through the running browser's own CDP session. The source
+    /// browser's files are never modified, and every copy this creates is
+    /// deleted before the call returns.
+    pub async fn import_login_state(
+        &self,
+        request: BrowserLoginImportRequest,
+    ) -> BrowserResult<BrowserLoginImportReport> {
+        if self.inner.import_in_progress.swap(true, Ordering::SeqCst) {
+            return Err(BrowserError::conflict(
+                "browser_import_in_progress",
+                "another login-state import is already running",
+            ));
+        }
+        let outcome = self.import_login_state_guarded(request).await;
+        self.inner.import_in_progress.store(false, Ordering::SeqCst);
+        outcome
+    }
+
+    async fn import_login_state_guarded(
+        &self,
+        request: BrowserLoginImportRequest,
+    ) -> BrowserResult<BrowserLoginImportReport> {
+        let started = Instant::now();
+        self.require_browser()?;
+        let source =
+            crate::profile_import::resolve_source(&request.browser_id, &request.profile_dir)?;
+        let staging_root = self
+            .inner
+            .config
+            .read()
+            .await
+            .home_dir
+            .join("browser")
+            .join("import");
+        let staging = crate::profile_import::staging_directory(&staging_root)?;
+        let outcome = self
+            .import_from_source(&request, &source, &staging, started)
+            .await;
+        // The staging tree holds a copy of the user's cookie store: it never
+        // outlives the call, including when the call failed.
+        crate::profile_import::sweep_staged_copies(&staging_root);
+        outcome
+    }
+
+    /// Copies one source profile into the isolated profile.
+    ///
+    /// Split out of [`BrowserService::import_login_state`] so a test can point
+    /// it at a profile it built itself; the public entry resolves the source
+    /// from the host's real browser directories first.
+    #[cfg(feature = "profile-import")]
+    pub(crate) async fn import_from_source(
+        &self,
+        request: &BrowserLoginImportRequest,
+        source: &crate::profile_import::SourceProfile,
+        staging: &Path,
+        started: Instant,
+    ) -> BrowserResult<BrowserLoginImportReport> {
+        let outcome = self
+            .import_from_source_inner(request, source, staging, started)
+            .await;
+        // The staging tree holds a copy of the user's cookie store, so nothing
+        // it staged outlives the call -- including when the call failed.
+        let _ = std::fs::remove_dir_all(staging);
+        outcome
+    }
+
+    async fn import_from_source_inner(
+        &self,
+        request: &BrowserLoginImportRequest,
+        source: &crate::profile_import::SourceProfile,
+        staging: &Path,
+        started: Instant,
+    ) -> BrowserResult<BrowserLoginImportReport> {
+        let mut report = BrowserLoginImportReport::default();
+        let cookies = if request.include_cookies {
+            crate::profile_import::export_cookies(staging, source).await?
+        } else {
+            Vec::new()
+        };
+        let storages = if request.include_local_storage {
+            let staging = staging.to_path_buf();
+            let source = source.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::profile_import::export_local_storage(&staging, &source)
+            })
+            .await
+            .map_err(|error| {
+                BrowserError::storage(
+                    "browser_local_storage_read_failed",
+                    format!("the localStorage read did not finish: {error}"),
+                )
+            })??
+        } else {
+            Vec::new()
+        };
+
+        self.ensure_process().await?;
+        let connection = self.connection().await?;
+        let tab = self.open_import_tab(&connection).await?;
+        let injected = self
+            .inject_login_state(&tab, &cookies, &storages, &mut report)
+            .await;
+        self.close_import_tab(&connection, &tab).await;
+        injected?;
+
+        {
+            let mut state = self.inner.state.lock().await;
+            state.last_activity_ms = unix_timestamp_ms();
+        }
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        // Counts and names only: an imported cookie's value is a live
+        // credential and never reaches a log line.
+        tracing::info!(
+            target: "vibex_browser",
+            browser = %source.browser_id,
+            profile_dir = %source.profile_dir,
+            profile = %source.display_name,
+            cookies = report.cookies_imported,
+            sites = report.sites_imported,
+            local_storage_entries = report.local_storage_entries,
+            local_storage_origins = report.local_storage_origins,
+            local_storage_origins_skipped = report.local_storage_origins_skipped,
+            duration_ms = report.duration_ms,
+            "imported login state into the isolated browser profile"
+        );
+        Ok(report)
+    }
+
+    async fn inject_login_state(
+        &self,
+        tab: &ImportTab,
+        cookies: &[crate::profile_import::ExportedCookie],
+        storages: &[crate::profile_import::ExportedStorage],
+        report: &mut BrowserLoginImportReport,
+    ) -> BrowserResult<()> {
+        tab.session
+            .command("Page.enable", json!({}), IMPORT_COMMAND_TIMEOUT)
+            .await?;
+        if !cookies.is_empty() {
+            tab.session
+                .command("Network.enable", json!({}), IMPORT_COMMAND_TIMEOUT)
+                .await?;
+            let (imported, sites) = self.set_cookies(&tab.session, cookies).await;
+            report.cookies_imported = imported;
+            report.sites_imported = sites;
+        }
+        if !storages.is_empty() {
+            let outcome = self.seed_local_storage(&tab.session, storages).await;
+            report.local_storage_entries = outcome.entries;
+            report.local_storage_origins = outcome.origins;
+            report.local_storage_origins_skipped = outcome.skipped;
+            report.local_storage_bytes = outcome.bytes;
+        }
+        Ok(())
+    }
+
+    /// Opens a page target the panel must not adopt as one of its own tabs.
+    async fn open_import_tab(&self, connection: &Arc<CdpConnection>) -> BrowserResult<ImportTab> {
+        self.inner.creating_targets.fetch_add(1, Ordering::SeqCst);
+        let created = connection
+            .command(
+                "Target.createTarget",
+                json!({ "url": "about:blank" }),
+                IMPORT_COMMAND_TIMEOUT,
+            )
+            .await;
+        self.inner.creating_targets.fetch_sub(1, Ordering::SeqCst);
+        let created = created?;
+        let target_id = created
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::cdp(
+                    "browser_target_create_failed",
+                    "the browser did not return a target id",
+                )
+            })?
+            .to_string();
+        // Remembered before the discovery event can arrive, exactly as
+        // `create_tab` does: without it the panel shows the import's own tab.
+        self.inner
+            .state
+            .lock()
+            .await
+            .ignored_targets
+            .insert(target_id.clone());
+        let attached = connection
+            .command(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+                IMPORT_COMMAND_TIMEOUT,
+            )
+            .await?;
+        let session_id = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::cdp(
+                    "browser_target_attach_failed",
+                    "the browser did not return a session for the import tab",
+                )
+            })?
+            .to_string();
+        Ok(ImportTab {
+            target_id: target_id.clone(),
+            session: CdpSession::new(Arc::clone(connection), session_id, target_id),
+        })
+    }
+
+    async fn close_import_tab(&self, connection: &Arc<CdpConnection>, tab: &ImportTab) {
+        let _ = connection
+            .command(
+                "Target.closeTarget",
+                json!({ "targetId": tab.target_id }),
+                Duration::from_millis(SHORT_TIMEOUT_MS),
+            )
+            .await;
+        self.inner
+            .state
+            .lock()
+            .await
+            .ignored_targets
+            .remove(&tab.target_id);
+    }
+
+    /// Writes every cookie, isolating the ones the browser refuses.
+    ///
+    /// A batch that fails is split until the offending cookie is alone: a
+    /// browser rejects a whole batch for one bad entry, and dropping the batch
+    /// would silently lose hundreds of good cookies. Returns how many landed
+    /// and how many distinct hosts they cover.
+    async fn set_cookies(
+        &self,
+        session: &CdpSession,
+        cookies: &[crate::profile_import::ExportedCookie],
+    ) -> (u64, u64) {
+        let mut imported = 0u64;
+        let mut hosts: HashSet<String> = HashSet::new();
+        let mut pending: Vec<&[crate::profile_import::ExportedCookie]> =
+            cookies.chunks(IMPORT_COOKIE_BATCH).collect();
+        // Depth-first rather than recursive: a rejected batch halves at most
+        // log2(batch) times, and the stack keeps that explicit.
+        while let Some(batch) = pending.pop() {
+            match self.set_cookie_batch(session, batch).await {
+                true => {
+                    imported += batch.len() as u64;
+                    for cookie in batch {
+                        hosts.insert(cookie.domain.trim_start_matches('.').to_string());
+                    }
+                }
+                false if batch.len() > 1 => {
+                    let (left, right) = batch.split_at(batch.len() / 2);
+                    pending.push(left);
+                    pending.push(right);
+                }
+                false => {}
+            }
+        }
+        (imported, hosts.len() as u64)
+    }
+
+    async fn set_cookie_batch(
+        &self,
+        session: &CdpSession,
+        batch: &[crate::profile_import::ExportedCookie],
+    ) -> bool {
+        let parameters: Vec<Value> = batch.iter().map(cookie_parameter).collect();
+        session
+            .command(
+                "Network.setCookies",
+                json!({ "cookies": parameters }),
+                IMPORT_COMMAND_TIMEOUT,
+            )
+            .await
+            .is_ok()
+    }
+
+    /// Restores localStorage by loading each origin once.
+    ///
+    /// `DOMStorage.setDOMStorageItem` refuses an origin no frame has loaded
+    /// (`Frame not found for the given storage id`), so the storage area has to
+    /// be created by a document. The entries are seeded from a document-start
+    /// script, which is what makes a site that reads its token at boot see the
+    /// restored session on the very first load.
+    async fn seed_local_storage(
+        &self,
+        session: &CdpSession,
+        storages: &[crate::profile_import::ExportedStorage],
+    ) -> LocalStorageOutcome {
+        let mut outcome = LocalStorageOutcome::default();
+        for storage in storages {
+            let bytes: u64 = storage
+                .entries
+                .iter()
+                .map(|(key, value)| key.len() as u64 + value.len() as u64)
+                .sum();
+            match self.seed_origin(session, storage).await {
+                Some(seeded) if seeded > 0 => {
+                    outcome.origins += 1;
+                    outcome.entries += seeded;
+                    outcome.bytes += bytes;
+                }
+                // An origin that did not load, a third-party storage partition
+                // (`origin^nonce`), or a page the browser refused to store for.
+                _ => outcome.skipped += 1,
+            }
+        }
+        outcome
+    }
+
+    async fn seed_origin(
+        &self,
+        session: &CdpSession,
+        storage: &crate::profile_import::ExportedStorage,
+    ) -> Option<u64> {
+        if !origin_is_loadable(&storage.origin) {
+            return None;
+        }
+        let script = seed_script(storage)?;
+        let registered = session
+            .command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": script }),
+                IMPORT_COMMAND_TIMEOUT,
+            )
+            .await
+            .ok()?;
+        let identifier = registered
+            .get("identifier")
+            .and_then(Value::as_str)
+            .map(str::to_string)?;
+        // A refused navigation can still commit the origin's storage area, so
+        // the navigation result is not the answer -- the document's own origin
+        // is, and `await_seeded` reads that.
+        let _ = session
+            .command(
+                "Page.navigate",
+                json!({ "url": storage.origin }),
+                IMPORT_ORIGIN_TIMEOUT,
+            )
+            .await;
+        let seeded = self.await_seeded(session, &storage.origin).await;
+        let _ = session
+            .command(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                json!({ "identifier": identifier }),
+                Duration::from_millis(SHORT_TIMEOUT_MS),
+            )
+            .await;
+        seeded
+    }
+
+    /// Waits for the document to commit, then reads how many entries the
+    /// document-start script managed to write.
+    /// Waits for the document to commit, then reads how many entries the
+    /// document-start script managed to write.
+    async fn await_seeded(&self, session: &CdpSession, origin: &str) -> Option<u64> {
+        let deadline = Instant::now() + IMPORT_ORIGIN_TIMEOUT;
+        while Instant::now() < deadline {
+            // The command helper answers with the CDP result payload already
+            // unwrapped, so the probe's value sits one level in.
+            if let Ok(answer) = session
+                .command(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "JSON.stringify({o: location.origin, n: window.__vibexLoginSeed ?? -1})",
+                        "returnByValue": true,
+                    }),
+                    Duration::from_millis(SHORT_TIMEOUT_MS),
+                )
+                .await
+                && let Some(value) = answer.pointer("/result/value").and_then(Value::as_str)
+                && let Ok(parsed) = serde_json::from_str::<Value>(value)
+                && parsed.get("o").and_then(Value::as_str) == Some(origin)
+            {
+                let seeded = parsed.get("n").and_then(Value::as_i64).unwrap_or(-1);
+                return if seeded < 0 {
+                    None
+                } else {
+                    Some(seeded as u64)
+                };
+            }
+            tokio::time::sleep(IMPORT_ORIGIN_POLL).await;
+        }
+        None
+    }
+}
+
+/// One cookie in the shape `Network.setCookies` expects.
+///
+/// A session cookie carries no `expires` at all: passing the `-1` the reader
+/// reported would expire it immediately.
+#[cfg(feature = "profile-import")]
+fn cookie_parameter(cookie: &crate::profile_import::ExportedCookie) -> Value {
+    let mut parameter = json!({
+        "name": cookie.name,
+        "value": cookie.value,
+        "domain": cookie.domain,
+        "path": cookie.path,
+        "httpOnly": cookie.http_only,
+        "secure": cookie.secure,
+    });
+    if cookie.expires > 0.0 {
+        parameter["expires"] = json!(cookie.expires);
+    }
+    if let Some(same_site) = &cookie.same_site {
+        parameter["sameSite"] = json!(same_site);
+    }
+    if let Some(partition) = &cookie.partition_key {
+        parameter["partitionKey"] = json!({
+            "topLevelSite": partition.top_level_site,
+            "hasCrossSiteAncestor": partition.has_cross_site_ancestor,
+        });
+    }
+    parameter
+}
+
+/// A storage key an import can restore by loading it as a top-level document.
+///
+/// A third-party partition is written as `<origin>^<nonce>` and an extension or
+/// `file:` origin has no server to load; neither can be restored this way.
+#[cfg(feature = "profile-import")]
+fn origin_is_loadable(origin: &str) -> bool {
+    if origin.contains('^') {
+        return false;
+    }
+    matches!(
+        url::Url::parse(origin).map(|parsed| parsed.scheme().to_string()),
+        Ok(scheme) if scheme == "http" || scheme == "https"
+    )
+}
+
+/// The document-start script that seeds one origin's localStorage.
+///
+/// It runs on every new document while it is registered, so it checks the
+/// origin first. Each write is guarded: one oversized value must not cost the
+/// rest of the origin's entries, and the browser's quota is per origin.
+#[cfg(feature = "profile-import")]
+fn seed_script(storage: &crate::profile_import::ExportedStorage) -> Option<String> {
+    let entries = serde_json::to_string(&storage.entries).ok()?;
+    if entries.len() > IMPORT_MAX_SEED_BYTES {
+        return None;
+    }
+    let origin = serde_json::to_string(&storage.origin).ok()?;
+    Some(format!(
+        "(() => {{ if (location.origin !== {origin}) return; \
+         window.__vibexLoginSeed = 0; \
+         for (const [key, value] of {entries}) {{ \
+           try {{ localStorage.setItem(key, value); window.__vibexLoginSeed += 1; }} \
+           catch (error) {{ break; }} \
+         }} }})()"
+    ))
+}
+
 impl BrowserInner {
     /// Latest frames and session bookkeeping accessors for the executor.
     pub(crate) async fn tab_session(
@@ -2509,7 +3096,47 @@ fn browser_not_running() -> BrowserError {
     BrowserError::process("browser_not_running", "the embedded browser is not running")
 }
 
-fn preferred_transport() -> CdpTransportKind {
+/// Files and bytes under one directory, without following symbolic links.
+///
+/// The walk is bounded: a browser profile holds tens of thousands of files, and
+/// the figure only ever feeds a size in the settings card.
+pub(crate) fn tree_usage(path: &Path) -> (u64, u64) {
+    /// Enough for a Chrome profile tree, small enough to stay a quick walk.
+    const MAX_ENTRIES: usize = 200_000;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut pending = vec![path.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES {
+                return (files, bytes);
+            }
+            // `DirEntry::metadata` does not follow a symlink, so a link cannot
+            // pull an unrelated tree into either figure.
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                files = files.saturating_add(1);
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// The debugging channel the runtime prefers on this platform.
+///
+/// Crate-visible because the login-state import launches its own throwaway
+/// browser, and it must use the same transport as the panel's browser.
+pub(crate) fn preferred_transport() -> CdpTransportKind {
     #[cfg(unix)]
     {
         CdpTransportKind::Pipe

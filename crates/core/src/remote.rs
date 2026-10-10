@@ -536,10 +536,12 @@ pub enum RemoteAgentOperationKind {
     AcknowledgeTeamEvents,
 
     ListSessions,
+    ListArchivedSessions,
     GetSession,
     CreateSession,
     RenameSession,
     ArchiveSession,
+    UnarchiveSession,
     DeleteSession,
     ForkSession,
     FetchTimeline,
@@ -599,6 +601,21 @@ pub struct RemoteAgentSessionListRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentSessionListResponse {
     pub sessions: Vec<AgentSessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentArchivedSessionListRequest {
+    pub auth: RemoteAuthProof,
+    /// Maximum top-level archived sessions to return, capped at 500.
+    /// Zero returns an empty page.
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentArchivedSessionListResponse {
+    pub sessions: Vec<AgentSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,6 +697,12 @@ pub struct RemoteAgentSessionActionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentSessionActionResponse {
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUnarchiveSessionResponse {
+    pub session: AgentSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1370,11 +1393,13 @@ pub enum RemoteAgentRequest {
     AcknowledgeTeamEvents(crate::RemoteTeamMutationRequest<crate::TeamAcknowledgeRequest>),
 
     ListSessions(RemoteAgentSessionListRequest),
+    ListArchivedSessions(RemoteAgentArchivedSessionListRequest),
     GetSession(RemoteAgentSessionDetailRequest),
     CreateSession(RemoteAgentCreateSessionRequest),
     ForkSession(RemoteAgentForkSessionRequest),
     RenameSession(RemoteAgentRenameSessionRequest),
     ArchiveSession(RemoteAgentSessionActionRequest),
+    UnarchiveSession(RemoteAgentSessionActionRequest),
     DeleteSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
     GetTimelineDisplaySettings(RemoteAgentTimelineDisplaySettingsRequest),
@@ -1432,11 +1457,13 @@ impl RemoteAgentRequest {
             Self::AcknowledgeTeamEvents(_) => RemoteAgentOperationKind::AcknowledgeTeamEvents,
 
             Self::ListSessions(_) => RemoteAgentOperationKind::ListSessions,
+            Self::ListArchivedSessions(_) => RemoteAgentOperationKind::ListArchivedSessions,
             Self::GetSession(_) => RemoteAgentOperationKind::GetSession,
             Self::CreateSession(_) => RemoteAgentOperationKind::CreateSession,
             Self::ForkSession(_) => RemoteAgentOperationKind::ForkSession,
             Self::RenameSession(_) => RemoteAgentOperationKind::RenameSession,
             Self::ArchiveSession(_) => RemoteAgentOperationKind::ArchiveSession,
+            Self::UnarchiveSession(_) => RemoteAgentOperationKind::UnarchiveSession,
             Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
             Self::GetTimelineDisplaySettings(_) => {

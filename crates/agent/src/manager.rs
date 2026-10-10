@@ -1501,7 +1501,17 @@ impl AgentManager {
         .await
     }
 
+    /// Returns the complete runtime registry, including owned child sessions.
     pub async fn list_sessions(&self, include_archived: bool) -> VibexResult<Vec<AgentSession>> {
+        let conn = self.open_migrated()?;
+        SessionRepository::list(&conn, include_archived)
+    }
+
+    /// Returns the top-level conversations used by client session lists.
+    pub async fn list_root_sessions(
+        &self,
+        include_archived: bool,
+    ) -> VibexResult<Vec<AgentSession>> {
         let conn = self.open_migrated()?;
         SessionRepository::list_root_sessions(&conn, include_archived)
     }
@@ -2362,6 +2372,7 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
+        Self::ensure_session_accepts_turn(&session)?;
         let latest_timeline = TimelineRepository::fetch_after(
             &conn,
             &session.id,
@@ -3013,6 +3024,23 @@ impl AgentManager {
         })
     }
 
+    /// Rejects a new turn for a session the user archived.
+    ///
+    /// Archiving is reversible, so the rejection carries a recovery hint
+    /// instead of reading like a broken state machine. Clients surface the
+    /// code as a restore prompt rather than an unexplained failure.
+    fn ensure_session_accepts_turn(session: &AgentSession) -> VibexResult<()> {
+        if session.state == AgentSessionState::Archived {
+            return Err(
+                VibexError::conflict("session_archived", "this Agent session is archived")
+                    .with_recovery_hint(
+                        "Restore the session from the archived list, then send the message again.",
+                    ),
+            );
+        }
+        Ok(())
+    }
+
     async fn run_agent_turn<F, Fut>(
         &self,
         request: AgentTurnRequest,
@@ -3042,6 +3070,7 @@ impl AgentManager {
                 "Agent session already has a running turn",
             ));
         }
+        Self::ensure_session_accepts_turn(&session)?;
         validate_transition(session.state, AgentSessionState::Running)?;
         let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)?
             .ok_or_else(|| {
@@ -4136,6 +4165,10 @@ impl AgentManager {
         })
     }
 
+    /// Archiving is a durable visibility change, not a delete: the timeline,
+    /// the provider binding and the workspace record all stay in place, so the
+    /// session can be restored later. The provider runtime is released because
+    /// an archived session cannot accept a turn.
     pub async fn archive_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
         let conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, session_id)?;
@@ -4143,6 +4176,9 @@ impl AgentManager {
             .as_ref()
             .and_then(|session| self.runtime_for_close(&conn, session));
         SessionRepository::archive(&conn, session_id)?;
+        if let Some(archived) = SessionRepository::get(&conn, session_id)? {
+            self.publish_root_session_update(&conn, archived);
+        }
         drop(conn);
         self.close_provider_session(runtime).await;
         Ok(())
@@ -4159,9 +4195,33 @@ impl AgentManager {
             .as_ref()
             .and_then(|session| self.runtime_for_close(&conn, session));
         SessionRepository::archive_if_timeline_unchanged(&conn, session_id, expected_end_sequence)?;
+        if let Some(archived) = SessionRepository::get(&conn, session_id)? {
+            self.publish_root_session_update(&conn, archived);
+        }
         drop(conn);
         self.close_provider_session(runtime).await;
         Ok(())
+    }
+
+    /// Restores an archived session to the active list.
+    ///
+    /// The runtime is not materialized here; the first message after a restore
+    /// resumes the provider session through the ordinary submission path, the
+    /// same way a session restored after an application restart does.
+    pub async fn unarchive_session(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<AgentSession> {
+        let conn = self.open_migrated()?;
+        let restored = SessionRepository::unarchive(&conn, session_id)?;
+        self.publish_root_session_update(&conn, restored.clone());
+        Ok(restored)
+    }
+
+    /// Lists archived top-level sessions, most recently archived first.
+    pub async fn list_archived_sessions(&self, limit: usize) -> VibexResult<Vec<AgentSession>> {
+        let conn = self.open_migrated()?;
+        SessionRepository::list_archived(&conn, limit)
     }
 
     pub async fn rename_session(
@@ -5134,16 +5194,10 @@ impl AgentManager {
         Ok(item)
     }
 
-    fn publish_root_session_update(&self, conn: &DbConnection, session: AgentSession) {
-        // Session update subscribers own root-session navigation. Child panels
-        // follow their timeline stream, so failing closed here prevents a
-        // delegated child from being reinserted into a sidebar by a late event.
-        if matches!(
-            SessionRepository::is_delegated_child(conn, &session.id),
-            Ok(false)
-        ) {
-            let _ = self.session_events.send(session);
-        }
+    fn publish_root_session_update(&self, _conn: &DbConnection, session: AgentSession) {
+        // Child updates refresh open worker views and tree metadata. Client
+        // session-list queries keep their authoritative roots-only projection.
+        let _ = self.session_events.send(session);
     }
 
     fn apply_auto_session_title(
@@ -8405,6 +8459,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_and_unarchive_publish_the_session_and_refuse_new_turns() {
+        let db_path = temp_db_path("archive-session-snapshots");
+        let workspace_root = temp_workspace_path("archive-session-snapshots");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "archive snapshots",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("archive-snapshot-agent").unwrap(),
+            AgentSessionState::Idle,
+        );
+        drop(conn);
+        let mut session_updates = manager.subscribe_session_updates();
+
+        manager.archive_session(&session.id).await.unwrap();
+        let archived = session_updates.try_recv().unwrap();
+        assert_eq!(archived.state, AgentSessionState::Archived);
+        assert!(archived.archived_at_ms.is_some());
+
+        let restored = manager.unarchive_session(&session.id).await.unwrap();
+        assert_eq!(restored.state, AgentSessionState::Idle);
+        assert!(restored.archived_at_ms.is_none());
+        assert_eq!(
+            session_updates.try_recv().unwrap().state,
+            AgentSessionState::Idle
+        );
+
+        // A turn never starts on an archived session: the caller gets the
+        // restore hint instead of a state-machine conflict, and the session
+        // stays archived until it is restored explicitly.
+        let mut archived_session = session.clone();
+        archived_session.state = AgentSessionState::Archived;
+        let error = AgentManager::ensure_session_accepts_turn(&archived_session).unwrap_err();
+        assert_eq!(error.code, "session_archived");
+        assert_eq!(
+            manager.list_archived_sessions(10).await.unwrap().len(),
+            0,
+            "the restore above leaves nothing on the archived page"
+        );
+
+        drop(manager);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn turn_boundaries_publish_the_running_and_settled_session_snapshots() {
         let db_path = temp_db_path("turn-boundary-session-snapshots");
         let workspace_root = temp_workspace_path("turn-boundary-session-snapshots");
@@ -9528,6 +9635,10 @@ mod tests {
         assert!(listed.iter().any(|session| session.id == unrelated.id));
         assert!(listed.iter().any(|session| session.id == child.id));
         assert!(listed.iter().any(|session| session.id == grandchild.id));
+        let roots = manager.list_root_sessions(false).await.unwrap();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|session| session.id == parent.id));
+        assert!(roots.iter().any(|session| session.id == unrelated.id));
 
         let mut updates = manager.subscribe_session_updates();
         manager
@@ -9540,6 +9651,21 @@ mod tests {
         let renamed_child = updates.try_recv().unwrap();
         assert_eq!(renamed_child.id, child.id);
         assert_eq!(renamed_child.title, "Renamed child");
+
+        manager.archive_session(&child.id).await.unwrap();
+        let archived_child = updates.try_recv().unwrap();
+        assert_eq!(archived_child.id, child.id);
+        assert!(archived_child.archived_at_ms.is_some());
+        assert_eq!(manager.list_sessions(false).await.unwrap().len(), 3);
+        assert_eq!(manager.list_sessions(true).await.unwrap().len(), 4);
+        assert!(manager.list_archived_sessions(10).await.unwrap().is_empty());
+
+        let restored_child = manager.unarchive_session(&child.id).await.unwrap();
+        assert_eq!(restored_child.state, AgentSessionState::Idle);
+        assert!(restored_child.archived_at_ms.is_none());
+        assert_eq!(updates.try_recv().unwrap(), restored_child);
+        assert_eq!(manager.list_sessions(false).await.unwrap().len(), 4);
+
         manager
             .rename_session(RenameAgentSessionRequest {
                 session_id: parent.id.clone(),
@@ -9827,6 +9953,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        SessionOwnershipRepository::upsert(conn, &child.id, &parent.id, Some(&delegation.id))
+            .unwrap();
     }
 
     fn temp_db_path(label: &str) -> PathBuf {

@@ -236,7 +236,7 @@ impl Entry {
             .h_full()
             .p_0()
             .accessibility_label(super::copy::entry_label(sample.guardian))
-            .tooltip(super::copy::entry_help())
+            .tooltip(super::copy::entry_help(sample.guardian))
             .on_click(move |_, window, cx| {
                 let _ = state.update(cx, |state, cx: &mut Context<HomeArena>| {
                     state.open(window, cx)

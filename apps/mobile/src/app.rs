@@ -2045,6 +2045,7 @@ impl MobileApp {
         }
         let should_follow = self.timeline_is_near_bottom();
         let mut timeline_changed = false;
+        let mut sessions_need_refresh = false;
         let mut sidebar_needs_refresh = false;
         let mut needs_refetch = false;
         let mut needs_repaint = false;
@@ -2081,6 +2082,7 @@ impl MobileApp {
                 &event,
                 BackendEvent::Timeline(_) | BackendEvent::SessionUpdated(_)
             );
+            let session_update = matches!(&event, BackendEvent::SessionUpdated(_));
             let decision = self
                 .controller
                 .as_mut()
@@ -2089,6 +2091,14 @@ impl MobileApp {
                 Some(AgentEventDecision::Applied) => {
                     self.notice = None;
                     timeline_changed |= rebuild_timeline;
+                    needs_repaint = true;
+                }
+                Some(AgentEventDecision::NeedsAuthoritativeRefetch) if session_update => {
+                    // Worker metadata can update the open session, but only
+                    // the root query may add a navigation row. Keep the open
+                    // timeline while that independent projection refreshes.
+                    sessions_need_refresh = true;
+                    timeline_changed = true;
                     needs_repaint = true;
                 }
                 Some(AgentEventDecision::NeedsAuthoritativeRefetch) => {
@@ -2121,8 +2131,11 @@ impl MobileApp {
                 self.timeline_list.scroll_to_end();
             }
         }
-        if sidebar_needs_refresh {
+        if sessions_need_refresh || sidebar_needs_refresh {
             self.refresh_sessions(cx);
+            needs_repaint = true;
+        }
+        if sidebar_needs_refresh {
             self.refresh_workspaces(cx);
             self.refresh_sidebar_organization(cx);
             needs_repaint = true;

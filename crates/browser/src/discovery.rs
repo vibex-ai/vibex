@@ -25,6 +25,15 @@ pub struct BrowserCandidate {
     /// Windows executable names looked up through the `App Paths` registry key
     /// and the well-known install directories.
     pub windows_executables: &'static [&'static str],
+    /// The family's user-data directory, as path segments under the platform's
+    /// configuration root. This is where the browser keeps its profiles, and it
+    /// is what a login-state import reads -- never something the runtime writes.
+    ///
+    /// Segments rather than one string so the separator is `Path::join`'s
+    /// business and not a platform `cfg` at every use site.
+    pub linux_user_data: &'static [&'static str],
+    pub mac_user_data: &'static [&'static str],
+    pub windows_user_data: &'static [&'static str],
 }
 
 /// Preference order: Chrome, then Chromium, then Edge, then Brave.
@@ -39,6 +48,9 @@ pub const BROWSER_CANDIDATES: &[BrowserCandidate] = &[
         commands: &["google-chrome", "google-chrome-stable", "chrome"],
         mac_apps: &["Google Chrome"],
         windows_executables: &["chrome.exe"],
+        linux_user_data: &["google-chrome"],
+        mac_user_data: &["Google", "Chrome"],
+        windows_user_data: &["Google", "Chrome", "User Data"],
     },
     BrowserCandidate {
         id: "chromium",
@@ -46,6 +58,9 @@ pub const BROWSER_CANDIDATES: &[BrowserCandidate] = &[
         commands: &["chromium", "chromium-browser", "chromium-freeworld"],
         mac_apps: &["Chromium"],
         windows_executables: &["chromium.exe"],
+        linux_user_data: &["chromium"],
+        mac_user_data: &["Chromium"],
+        windows_user_data: &["Chromium", "User Data"],
     },
     BrowserCandidate {
         id: "edge",
@@ -53,6 +68,9 @@ pub const BROWSER_CANDIDATES: &[BrowserCandidate] = &[
         commands: &["microsoft-edge", "microsoft-edge-stable", "msedge"],
         mac_apps: &["Microsoft Edge"],
         windows_executables: &["msedge.exe"],
+        linux_user_data: &["microsoft-edge"],
+        mac_user_data: &["Microsoft Edge"],
+        windows_user_data: &["Microsoft", "Edge", "User Data"],
     },
     BrowserCandidate {
         id: "brave",
@@ -60,8 +78,49 @@ pub const BROWSER_CANDIDATES: &[BrowserCandidate] = &[
         commands: &["brave-browser", "brave"],
         mac_apps: &["Brave Browser"],
         windows_executables: &["brave.exe"],
+        linux_user_data: &["BraveSoftware", "Brave-Browser"],
+        mac_user_data: &["BraveSoftware", "Brave-Browser"],
+        windows_user_data: &["BraveSoftware", "Brave-Browser", "User Data"],
     },
 ];
+
+/// The candidate for one browser family id.
+pub fn candidate_for(id: &str) -> Option<&'static BrowserCandidate> {
+    BROWSER_CANDIDATES.iter().find(|entry| entry.id == id)
+}
+
+/// The directory a family keeps its profiles in, when the platform's
+/// configuration root can be resolved.
+///
+/// The directory is only a *candidate*: the caller checks that a `Cookies`
+/// store exists there before treating it as an import source. Nothing about a
+/// browser's user-data directory is created here.
+pub fn candidate_user_data_dir(candidate: &BrowserCandidate) -> Option<PathBuf> {
+    let root = if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join("Library")
+            .join("Application Support")
+    } else if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".config")))?
+    };
+    let segments = if cfg!(target_os = "macos") {
+        candidate.mac_user_data
+    } else if cfg!(windows) {
+        candidate.windows_user_data
+    } else {
+        candidate.linux_user_data
+    };
+    let mut directory = root;
+    for segment in segments {
+        directory = directory.join(segment);
+    }
+    Some(directory)
+}
 
 /// Executable candidates for a command name, including Windows extensions.
 pub fn executable_candidates(command: &str) -> Vec<String> {

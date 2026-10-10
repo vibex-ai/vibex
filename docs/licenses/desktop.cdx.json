@@ -5417,6 +5417,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:crc32c@0.6.8:c19b7c6f923b580a",
+      "name": "crc32c",
+      "version": "0.6.8",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/crc32c@0.6.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zowens/crc32c"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:crc32fast@1.5.0:c19b7c6f923b580a",
       "name": "crc32fast",
       "version": "1.5.0",
@@ -7685,6 +7721,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:errno@0.2.8:c19b7c6f923b580a",
+      "name": "errno",
+      "version": "0.2.8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/errno@0.2.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/lambda-fairy/rust-errno"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:errno@0.3.14:c19b7c6f923b580a",
       "name": "errno",
       "version": "0.3.14",
@@ -7716,6 +7788,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/lambda-fairy/rust-errno"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:errno-dragonfly@0.1.2:c19b7c6f923b580a",
+      "name": "errno-dragonfly",
+      "version": "0.1.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/errno-dragonfly@0.1.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mneumann/errno-dragonfly-rs"
         }
       ]
     },
@@ -13692,6 +13800,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/sebcrozet/instant"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:integer-encoding@3.0.4:c19b7c6f923b580a",
+      "name": "integer-encoding",
+      "version": "3.0.4",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/integer-encoding@3.0.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dermesser/integer-encoding-rs"
         }
       ]
     },
@@ -24317,6 +24461,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:rusty-leveldb@4.0.1:c19b7c6f923b580a",
+      "name": "rusty-leveldb",
+      "version": "4.0.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/rusty-leveldb@4.0.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dermesser/leveldb-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:rustybuzz@0.20.1:c19b7c6f923b580a",
       "name": "rustybuzz",
       "version": "0.20.1",
@@ -26544,6 +26724,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:snap@1.1.2:c19b7c6f923b580a",
+      "name": "snap",
+      "version": "1.1.2",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/snap@1.1.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-snappy"
         }
       ]
     },
@@ -41500,6 +41716,12 @@
       ]
     },
     {
+      "ref": "cargo:crc32c@0.6.8:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:rustc_version@0.4.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:crc32fast@1.5.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a"
@@ -41945,6 +42167,21 @@
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_core@1.0.228:c19b7c6f923b580a",
         "cargo:typeid@1.0.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:errno-dragonfly@0.1.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cc@1.2.65:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:errno@0.2.8:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:errno-dragonfly@0.1.2:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:winapi@0.3.9:c19b7c6f923b580a"
       ]
     },
     {
@@ -43627,6 +43864,10 @@
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a",
         "cargo:web-sys@0.3.102:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "cargo:integer-encoding@3.0.4:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:interpolate_name@0.2.4:c19b7c6f923b580a",
@@ -45928,6 +46169,18 @@
       ]
     },
     {
+      "ref": "cargo:rusty-leveldb@4.0.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bytes@1.12.0:c19b7c6f923b580a",
+        "cargo:crc32c@0.6.8:c19b7c6f923b580a",
+        "cargo:errno@0.2.8:c19b7c6f923b580a",
+        "cargo:fs2@0.4.3:c19b7c6f923b580a",
+        "cargo:integer-encoding@3.0.4:c19b7c6f923b580a",
+        "cargo:rand@0.8.6:c19b7c6f923b580a",
+        "cargo:snap@1.1.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:rustybuzz@0.20.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
@@ -46383,6 +46636,10 @@
       "dependsOn": [
         "cargo:serde_core@1.0.228:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "cargo:snap@1.1.2:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:socket-pktinfo@0.4.1:c19b7c6f923b580a",
@@ -47655,6 +47912,8 @@
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
+        "cargo:rusqlite@0.37.0:c19b7c6f923b580a",
+        "cargo:rusty-leveldb@4.0.1:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",

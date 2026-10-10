@@ -10501,181 +10501,193 @@ impl ManagementCenter {
                 .count();
             let model_provider_configuration_supported =
                 self.model_provider_agent_ids.contains(&id);
-            let row =
-                v_flex()
-                    .id(SharedString::from(format!("management-agent-row-{id}")))
-                    .aria_label(agent.label.clone())
-                    .relative()
-                    .w_full()
-                    .gap_1()
-                    .overflow_hidden()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
-                    .bg(if selected {
+            let row = h_flex()
+                .id(SharedString::from(format!("management-agent-row-{id}")))
+                .aria_label(agent.label.clone())
+                .relative()
+                .w_full()
+                .items_center()
+                .gap_1()
+                .overflow_hidden()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
+                .bg(if selected {
+                    cx.theme().primary.opacity(0.08)
+                } else {
+                    cx.theme().background.opacity(0.70)
+                })
+                .px_2()
+                .py_2()
+                .hover(|style| {
+                    style.bg(if selected {
                         cx.theme().primary.opacity(0.08)
                     } else {
-                        cx.theme().background.opacity(0.70)
+                        cx.theme().accent
                     })
-                    .px_2()
-                    .py_2()
-                    .hover(|style| {
-                        style.bg(if selected {
-                            cx.theme().primary.opacity(0.08)
-                        } else {
-                            cx.theme().accent
-                        })
-                    })
-                    .when(added, |row| {
-                        row.role(Role::Button)
-                            .focusable()
-                            .tab_index(0)
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_management_agent(row_select_id.clone(), cx);
-                            }))
-                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                                if event.keystroke.key == "enter" || event.keystroke.key == "space"
-                                {
-                                    this.select_management_agent(keyboard_select_id.clone(), cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                    })
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1()
-                            .child(management_agent_glyph(
-                                agent.id.as_str(),
-                                &agent.label,
-                                selected,
-                                cx,
-                            ))
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h(px(28.0))
-                                    .px_1()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_medium()
-                                            .text_color(if added {
-                                                cx.theme().foreground
-                                            } else {
-                                                cx.theme().foreground.opacity(0.72)
-                                            })
-                                            .child(agent.label.clone()),
-                                    )
-                                    .when(update_available, |title| title.child(update_indicator))
-                                    .child(div().flex_1()),
-                            )
-                            .when(show_install_prompt, |actions| {
-                                actions.child(
-                                    Button::new(SharedString::from(format!(
-                                        "management-agent-probe-{probe_id}"
-                                    )))
-                                    .small()
-                                    .outline()
-                                    .h(px(34.0))
-                                    .px_3()
-                                    .icon(IconName::ExternalLink)
-                                    .label(management_install_label())
-                                    .loading(matches!(
-                                        mutation,
-                                        Some(ManagementMutation::AgentToggle(action))
-                                            if action == &format!("probe:{probe_id}")
-                                    ))
-                                    .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.probe_agent(probe_id.clone(), cx)
-                                    })),
-                                )
-                            })
-                            .when(added && !show_install_prompt, |actions| {
-                                actions.child(
-                                    Switch::new(SharedString::from(format!(
-                                        "management-agent-toggle-{toggle_id}"
-                                    )))
-                                    .small()
-                                    .checked(enabled)
-                                    .disabled(pending)
-                                    .tooltip(management_agent_toggle_selector_label())
-                                    .on_click(cx.listener(move |this, checked, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_agent(toggle_id.clone(), *checked, cx)
-                                    })),
-                                )
-                            })
-                            .when(!added, |actions| {
-                                actions.child(button_with_aria_label(
-                                    Button::new(SharedString::from(format!(
-                                        "management-agent-add-{add_id}"
-                                    )))
-                                    .small()
-                                    .outline()
-                                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
-                                    .icon(IconName::Plus)
-                                    .tooltip(management_add_label())
-                                    .loading(
-                                        managed_installing
-                                            || matches!(
-                                                mutation,
-                                                Some(ManagementMutation::AgentToggle(action))
-                                                    if action == &format!("add:{add_id}")
-                                            ),
-                                    )
-                                    .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.set_agent_added(add_id.clone(), true, cx)
-                                    })),
-                                    management_add_label(),
-                                ))
-                            }),
-                    )
-                    .child({
-                        // One footer band: the built-in tool glyphs on the
-                        // left, the profile count (or the status sentence) on
-                        // the right. The two panels used to be a second text
-                        // line; a glyph says the same thing without costing a
-                        // line per card.
-                        let mut footer = h_flex()
-                            .pl(px(40.0))
-                            .w_full()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1();
-                        if added && enabled {
-                            footer = footer.child(management_agent_tool_icons(
-                                &id,
-                                &self.agent_tools,
-                                self.computer_tools_ready,
-                                cx,
-                            ));
-                        }
-                        footer.child(
-                            div()
-                                .flex_1()
+                })
+                .when(added, |row| {
+                    row.role(Role::Button)
+                        .focusable()
+                        .tab_index(0)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_management_agent(row_select_id.clone(), cx);
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                                this.select_management_agent(keyboard_select_id.clone(), cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                })
+                // The Agent logo is a leading column of its own rather than
+                // the first cell of the title row: the identity block beside
+                // it is what grows, so the glyph stays vertically centred
+                // against the full card height instead of riding the top.
+                .child(management_agent_glyph(
+                    agent.id.as_str(),
+                    &agent.label,
+                    selected,
+                    cx,
+                ))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .w_full()
                                 .min_w_0()
-                                .truncate()
-                                .text_right()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if added && model_provider_configuration_supported {
-                                    management_profile_count(profile_count)
-                                } else {
-                                    status_label.to_string()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h(px(28.0))
+                                        .px_1()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .font_medium()
+                                                .text_color(if added {
+                                                    cx.theme().foreground
+                                                } else {
+                                                    cx.theme().foreground.opacity(0.72)
+                                                })
+                                                .child(agent.label.clone()),
+                                        )
+                                        .when(update_available, |title| {
+                                            title.child(update_indicator)
+                                        })
+                                        .child(div().flex_1()),
+                                )
+                                .when(show_install_prompt, |actions| {
+                                    actions.child(
+                                        Button::new(SharedString::from(format!(
+                                            "management-agent-probe-{probe_id}"
+                                        )))
+                                        .small()
+                                        .outline()
+                                        .h(px(34.0))
+                                        .px_3()
+                                        .icon(IconName::ExternalLink)
+                                        .label(management_install_label())
+                                        .loading(matches!(
+                                            mutation,
+                                            Some(ManagementMutation::AgentToggle(action))
+                                                if action == &format!("probe:{probe_id}")
+                                        ))
+                                        .disabled(pending)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.probe_agent(probe_id.clone(), cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .when(added && !show_install_prompt, |actions| {
+                                    actions.child(
+                                        Switch::new(SharedString::from(format!(
+                                            "management-agent-toggle-{toggle_id}"
+                                        )))
+                                        .small()
+                                        .checked(enabled)
+                                        .disabled(pending)
+                                        .tooltip(management_agent_toggle_selector_label())
+                                        .on_click(
+                                            cx.listener(move |this, checked, _, cx| {
+                                                cx.stop_propagation();
+                                                this.toggle_agent(toggle_id.clone(), *checked, cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .when(!added, |actions| {
+                                    actions.child(button_with_aria_label(
+                                        Button::new(SharedString::from(format!(
+                                            "management-agent-add-{add_id}"
+                                        )))
+                                        .small()
+                                        .outline()
+                                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                                        .icon(IconName::Plus)
+                                        .tooltip(management_add_label())
+                                        .loading(
+                                            managed_installing
+                                                || matches!(
+                                                    mutation,
+                                                    Some(ManagementMutation::AgentToggle(action))
+                                                        if action == &format!("add:{add_id}")
+                                                ),
+                                        )
+                                        .disabled(pending)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_agent_added(add_id.clone(), true, cx)
+                                            }),
+                                        ),
+                                        management_add_label(),
+                                    ))
                                 }),
                         )
-                    });
+                        .child({
+                            // One footer band: the built-in tool glyphs on the
+                            // left, the profile count (or the status sentence) on
+                            // the right. The two panels used to be a second text
+                            // line; a glyph says the same thing without costing a
+                            // line per card.
+                            let mut footer = h_flex().w_full().min_w_0().items_center().gap_1();
+                            if added && enabled {
+                                footer = footer.child(management_agent_tool_icons(
+                                    &id,
+                                    &self.agent_tools,
+                                    self.computer_tools_ready,
+                                    cx,
+                                ));
+                            }
+                            footer.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_right()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if added && model_provider_configuration_supported {
+                                        management_profile_count(profile_count)
+                                    } else {
+                                        status_label.to_string()
+                                    }),
+                            )
+                        }),
+                );
             agent_rows = agent_rows.child(row);
         }
 

@@ -18,13 +18,13 @@ use crate::terminal_transport::{
 use crate::typography::code_font_weight;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
-    DragMoveEvent, Entity, FocusHandle, Focusable as _, HighlightStyle, Hsla, Image, ImageFormat,
-    ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
-    ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, MouseDownEvent, Orientation,
-    ParentElement as _, PathBuilder, Render, RenderImage, Resource, Role, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred, div, img,
-    list, point, prelude::*, px, relative, uniform_list,
+    DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable as _, HighlightStyle,
+    Hsla, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
+    MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, RenderImage, Resource,
+    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    canvas, deferred, div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
@@ -767,6 +767,11 @@ struct FileContextMenuTarget {
     directory_error: bool,
 }
 
+struct FileMutationFinished {
+    workspace_generation: u64,
+    result: Result<(), String>,
+}
+
 impl Render for FileRowDrag {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
@@ -1506,6 +1511,7 @@ pub struct CodeWorkbench {
 }
 
 impl gpui::EventEmitter<CodeWorkbenchEvent> for CodeWorkbench {}
+impl gpui::EventEmitter<FileMutationFinished> for CodeWorkbench {}
 
 impl CodeWorkbench {
     #[allow(clippy::too_many_arguments)]
@@ -2781,6 +2787,17 @@ impl CodeWorkbench {
 
     /// Points the browser surfaces at whichever authority owns the browser.
     ///
+    /// The browser transport the settings act through.
+    ///
+    /// The import and clear rows belong to the settings, but the transport
+    /// belongs to the panel; this is the seam between them. `None` when this
+    /// client does not own the runtime.
+    pub(crate) fn browser_settings_transport(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::browser_transport::BrowserTransport>> {
+        self.browser_transport.clone()
+    }
+
     /// Mirrors [`Self::set_terminal_transport`]: when the transport goes away
     /// every materialized surface is discarded, because a surface without an
     /// authority can only render a stale frame.
@@ -2973,6 +2990,8 @@ impl CodeWorkbench {
         self.reset_preview_surface_state();
         self.restored_workspace_id = None;
         self.workspace_generation = self.workspace_generation.saturating_add(1).max(1);
+        self.mutation_task = None;
+        self.file_mutation_pending = false;
         // The file browser reads the local disk, so a project that is not on
         // this machine leaves it unavailable rather than pointing it at a path
         // the local filesystem does not have. The root is canonical so the
@@ -7601,13 +7620,17 @@ impl CodeWorkbench {
             target_path: destination,
         });
         self.file_mutation_pending = true;
+        let workspace_generation = self.workspace_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { operation().await });
         self.mutation_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                if this.workspace_generation != workspace_generation {
+                    return;
+                }
                 this.file_mutation_pending = false;
                 this.file_tree.finish_pending(&operation_id);
-                match outcome {
+                let result = match outcome {
                     Ok(Ok(())) => {
                         apply(this, cx);
                         this.sync_terminal_surface_activity(cx);
@@ -7617,14 +7640,23 @@ impl CodeWorkbench {
                         this.load_git_status(cx);
                         this.persist(cx);
                         this.persist_editor_recovery(cx);
+                        Ok(())
                     }
                     Ok(Err(error)) => {
-                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
+                        let message = format!("{}: {}", error.code, error.message);
+                        this.pending_error = Some(message.clone());
+                        Err(message)
                     }
                     Err(error) => {
-                        this.pending_error = Some(format!("file mutation task failed: {error}"));
+                        let message = format!("file mutation task failed: {error}");
+                        this.pending_error = Some(message.clone());
+                        Err(message)
                     }
-                }
+                };
+                cx.emit(FileMutationFinished {
+                    workspace_generation,
+                    result,
+                });
                 cx.notify();
             });
         }));
@@ -7644,7 +7676,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn reveal_in_file_manager(&mut self, path: String, cx: &mut Context<Self>) {
-        let Some(local) = self.local_materialized_path(&path, cx) else {
+        let Some(local) = self.local_open_path(&path, cx) else {
             return;
         };
         let task_path = path.clone();
@@ -7681,7 +7713,7 @@ impl CodeWorkbench {
         terminal: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(local) = self.local_materialized_path(&path, cx) else {
+        let Some(local) = self.local_open_path(&path, cx) else {
             return;
         };
         let task_path = path.clone();
@@ -7723,33 +7755,33 @@ impl CodeWorkbench {
 
     /// Resolves a workspace-relative path to a path on **this** machine.
     ///
-    /// Opening a file in an external tool, revealing it in the OS file manager,
-    /// or handing it to a native renderer are all client-side actions, so the
-    /// desktop materializes the authoritative bytes locally first. That keeps
-    /// the behaviour identical for a local and a remote authority.
-    fn local_materialized_path(
-        &self,
+    /// Local workspaces use the authoritative path, including directories.
+    /// Only remote files need a downloaded copy for client-side openers.
+    fn local_open_path(
+        &mut self,
         path: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Result<PathBuf, BackendError>, tokio::task::JoinError>>> {
         if is_local_external_path(path) {
             let path = path.to_string();
             return Some(gpui_tokio::Tokio::spawn(cx, async move {
-                local_external_file_path(&path)
+                local_external_path(&path)
             }));
         }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
-            let this = cx.entity();
-            this.update(cx, |this, cx| {
-                this.pending_error = Some("Select a workspace before opening a file".into());
-                cx.notify();
-            });
+            self.pending_error = Some("Select a workspace before opening a file".into());
+            cx.notify();
             return None;
         };
+        let directory = path.is_empty()
+            || self.file_tree.all_visible_rows().iter().any(|row| {
+                row.kind == FileEntryKind::Directory
+                    && (row.path == path || row.path_chain.iter().any(|part| part == path))
+            });
         let path = path.to_string();
         Some(gpui_tokio::Tokio::spawn(cx, async move {
-            materialize_preview_file(&backend, &workspace.id, &path).await
+            resolve_external_open_path(&backend, &workspace.id, &path, directory).await
         }))
     }
 
@@ -11852,9 +11884,12 @@ pub struct CodeRightRail {
     inline_path_input: Entity<InputState>,
     inline_file_action: Option<InlineFileAction>,
     inline_file_error: Option<String>,
+    inline_file_submitting: bool,
     file_tree_focus: FocusHandle,
     file_typeahead: String,
     file_clipboard: Option<FileClipboardEntry>,
+    file_context_target: Option<(EntityId, String)>,
+    file_context_pending_target: Option<FileContextMenuTarget>,
     file_drag_path: Option<String>,
     file_drop_target_path: Option<String>,
     selected_open_tool_id: Option<String>,
@@ -11935,6 +11970,12 @@ impl CodeRightRail {
                 };
                 this.projection = next;
                 if this.projection.revision.workspace_generation != previous_workspace_generation {
+                    this.inline_file_action = None;
+                    this.inline_file_error = None;
+                    this.inline_file_submitting = false;
+                    this.file_context_target = None;
+                    this.file_context_pending_target = None;
+                    this.file_clipboard = None;
                     this.file_search_results.clear();
                     this.file_search_collapsed_paths.clear();
                     this.file_search_error = None;
@@ -11967,6 +12008,26 @@ impl CodeRightRail {
                     this.submit_inline_file_action(window, cx);
                 }
                 _ => {}
+            },
+        );
+        let file_mutation_subscription = cx.subscribe_in(
+            &workbench,
+            window,
+            |this, _, event: &FileMutationFinished, window, cx| {
+                if !this.inline_file_submitting
+                    || event.workspace_generation != this.projection.revision.workspace_generation
+                {
+                    return;
+                }
+                this.inline_file_submitting = false;
+                match &event.result {
+                    Ok(()) => this.cancel_inline_file_action(window, cx),
+                    Err(error) => {
+                        this.inline_file_error = Some(locale::localize_error_message(error));
+                        this.defer_inline_path_input_focus(window, cx);
+                        cx.notify();
+                    }
+                }
             },
         );
         let history_search_subscription = cx.subscribe_in(
@@ -12045,9 +12106,12 @@ impl CodeRightRail {
             inline_path_input,
             inline_file_action: None,
             inline_file_error: None,
+            inline_file_submitting: false,
             file_tree_focus,
             file_typeahead: String::new(),
             file_clipboard: None,
+            file_context_target: None,
+            file_context_pending_target: None,
             file_drag_path: None,
             file_drop_target_path: None,
             selected_open_tool_id: None,
@@ -12055,6 +12119,7 @@ impl CodeRightRail {
                 workbench_subscription,
                 file_search_subscription,
                 input_subscription,
+                file_mutation_subscription,
                 history_search_subscription,
                 history_branch_subscription,
                 history_author_subscription,
@@ -12387,39 +12452,79 @@ impl CodeRightRail {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.workbench.read(cx).file_mutation_pending {
+            return;
+        }
         let placeholder = inline_path_placeholder(Some(&action));
         self.inline_file_action = Some(action);
         self.inline_file_error = None;
+        self.inline_file_submitting = false;
         let selection_end = initial.len();
         self.inline_path_input.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx);
             input.set_value(initial, window, cx);
             input.set_selected_range(0..selection_end, cx);
         });
+        self.reveal_inline_file_action(cx);
         self.defer_inline_path_input_focus(window, cx);
         cx.notify();
     }
 
     fn defer_inline_path_input_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self.inline_path_input.clone();
+        let view = cx.weak_entity();
+        let action = self.inline_file_action.clone();
         window.defer(cx, move |window, cx| {
-            input.update(cx, |input, cx| input.focus(window, cx));
+            let _ = view.update(cx, |this, cx| {
+                if this.inline_file_action == action
+                    && action.is_some()
+                    && !this.inline_file_submitting
+                {
+                    this.inline_path_input
+                        .update(cx, |input, cx| input.focus(window, cx));
+                }
+            });
         });
     }
 
-    fn cancel_inline_file_action(&mut self, cx: &mut Context<Self>) {
+    fn reveal_inline_file_action(&self, cx: &App) {
+        let Some(action) = &self.inline_file_action else {
+            return;
+        };
+        let (path, offset) = match action {
+            InlineFileAction::CreateFile { parent }
+            | InlineFileAction::CreateDirectory { parent } => (parent, 1),
+            InlineFileAction::Rename { source } => (source, 0),
+        };
+        let workbench = self.workbench.read(cx);
+        if let Some(index) = workbench.file_tree.visible_row_position(path) {
+            workbench
+                .file_scroll
+                .scroll_to_item(index + offset, gpui::ScrollStrategy::Top);
+        }
+    }
+
+    fn cancel_inline_file_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_file_submitting {
+            return;
+        }
         self.inline_file_action = None;
         self.inline_file_error = None;
+        if self.inline_path_input.focus_handle(cx).is_focused(window) {
+            self.file_tree_focus.focus(window, cx);
+        }
         cx.notify();
     }
 
     fn submit_inline_file_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_file_submitting || self.workbench.read(cx).file_mutation_pending {
+            return;
+        }
         let Some(action) = self.inline_file_action.clone() else {
             return;
         };
         let name = self.inline_path_input.read(cx).value().trim().to_string();
         if name.is_empty() {
-            self.cancel_inline_file_action(cx);
+            self.cancel_inline_file_action(window, cx);
             return;
         }
         if !valid_file_name(&name) {
@@ -12460,16 +12565,20 @@ impl CodeRightRail {
             return;
         }
         if unchanged {
-            self.cancel_inline_file_action(cx);
+            self.cancel_inline_file_action(window, cx);
             return;
         }
+        if self.workbench.read(cx).backend.is_none() || self.workbench.read(cx).workspace.is_none()
+        {
+            return;
+        }
+        self.inline_file_submitting = true;
+        self.inline_file_error = None;
         self.update_workbench(cx, move |workbench, cx| match action {
             InlineFileAction::CreateFile { .. } => workbench.create_file(destination, cx),
             InlineFileAction::CreateDirectory { .. } => workbench.create_directory(destination, cx),
             InlineFileAction::Rename { source } => workbench.rename_path(source, destination, cx),
         });
-        self.inline_file_action = None;
-        self.inline_file_error = None;
         cx.notify();
     }
 
@@ -12645,10 +12754,23 @@ impl CodeRightRail {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.workbench.read(cx).file_mutation_pending {
+            return;
+        }
+        self.clear_file_search(window, cx);
         let expand_parent = parent.clone();
         self.update_workbench(cx, |workbench, cx| {
-            if !workbench.file_tree.is_expanded(&expand_parent) {
-                workbench.toggle_directory(expand_parent.clone(), cx);
+            let chain = workbench
+                .file_tree
+                .all_visible_rows()
+                .iter()
+                .find(|row| row.path_chain.contains(&expand_parent))
+                .map(|row| row.path_chain.clone())
+                .unwrap_or_else(|| vec![expand_parent.clone()]);
+            if chain.len() > 1 {
+                workbench.select_directory_segment(expand_parent, chain, cx);
+            } else if !workbench.file_tree.is_expanded(&expand_parent) {
+                workbench.toggle_directory(expand_parent, cx);
             }
         });
         let action = if directory {
@@ -12789,6 +12911,25 @@ impl CodeRightRail {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        // This builder runs when the trigger opens, after pointer dispatch.
+        // Keep the target visible while the popup owns hover and focus.
+        let menu_entity = cx.entity();
+        let menu_id = menu_entity.entity_id();
+        let _ = view.update(cx, |this, cx| {
+            this.file_context_target = Some((menu_id, target.path.clone()));
+            cx.notify();
+        });
+        let dismiss_view = view.clone();
+        window
+            .subscribe(&menu_entity, cx, move |_, _: &DismissEvent, _, cx| {
+                let _ = dismiss_view.update(cx, |this, cx| {
+                    if this.file_context_target.as_ref().map(|(id, _)| *id) == Some(menu_id) {
+                        this.file_context_target = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         let is_root = target.path.is_empty();
         let editor_available = file_can_open_in_editor(&target.path, target.kind);
         let tools = available_external_tools();
@@ -12817,11 +12958,6 @@ impl CodeRightRail {
         let delete_path = target.path.clone();
         let relative_path = target.path.clone();
         let file_name = target.name.clone();
-        let delete_label = match locale::current_locale() {
-            locale::ResolvedLocale::En => format!("Delete {}", target.name),
-            locale::ResolvedLocale::ZhCn => format!("删除 {}", target.name),
-            locale::ResolvedLocale::ZhTw => format!("刪除 {}", target.name),
-        };
         let mut menu = menu
             .min_w(px(224.0))
             .max_w(px(224.0))
@@ -12937,7 +13073,7 @@ impl CodeRightRail {
                     }),
             )
             .item(
-                PopupMenuItem::new(delete_label)
+                PopupMenuItem::new(locale::text("Delete", "删除", "刪除"))
                     .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                     .disabled(is_root || mutation_pending)
                     .on_click(move |_, window, cx| {
@@ -13568,7 +13704,6 @@ impl CodeRightRail {
         measurement_index = measurement_index.min(item_count.saturating_sub(1));
         let blank_context_view = cx.weak_entity();
         let typeahead = self.file_typeahead.clone();
-        let inline_error = self.inline_file_error.clone();
         let workspace_root = self.projection.files.workspace_root.clone();
         let root_name = self.projection.files.root_name.clone();
         let scroll = self.projection.files.scroll.clone();
@@ -13584,7 +13719,10 @@ impl CodeRightRail {
                 self.render_file_search_results(cx)
             } else {
                 div()
-                    .id("code-workbench-file-tree")
+                    .id(format!(
+                        "code-workbench-file-tree:{}",
+                        self.projection.revision.workspace_generation
+                    ))
                     .relative()
                     .flex_1()
                     .min_h_0()
@@ -13592,6 +13730,12 @@ impl CodeRightRail {
                     .focusable()
                     .tab_index(0)
                     .track_focus(&self.file_tree_focus)
+                    .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if event.button == MouseButton::Right {
+                            this.file_context_pending_target = None;
+                        }
+                        cx.propagate();
+                    }))
                     .on_key_down(cx.listener(Self::on_file_tree_key_down))
                     .on_drag_move(cx.listener(Self::auto_scroll_file_tree))
                     .child(if item_count == 0 && loading {
@@ -13682,34 +13826,21 @@ impl CodeRightRail {
                                 ),
                         )
                     })
-                    .when_some(inline_error, |this, error| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .top(px(40.0))
-                                .right_2()
-                                .max_w(px(240.0))
-                                .px_2()
-                                .py_1()
-                                .rounded(cx.theme().radius_lg)
-                                .border_1()
-                                .border_color(cx.theme().danger.opacity(0.35))
-                                .bg(cx.theme().popover)
-                                .text_xs()
-                                .text_color(cx.theme().danger)
-                                .child(error),
-                        )
-                    })
                     .context_menu(move |menu, window, cx| {
-                        Self::build_file_context_menu(
-                            menu,
-                            FileContextMenuTarget {
+                        let target = blank_context_view
+                            .update(cx, |this, _| this.file_context_pending_target.take())
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| FileContextMenuTarget {
                                 path: String::new(),
                                 name: root_name.clone(),
                                 kind: FileEntryKind::Directory,
                                 target_directory: String::new(),
                                 directory_error: false,
-                            },
+                            });
+                        Self::build_file_context_menu(
+                            menu,
+                            target,
                             workspace_root.clone(),
                             clipboard_available,
                             mutation_pending,
@@ -13727,14 +13858,44 @@ impl CodeRightRail {
     fn render_inline_path_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("inline-file-tree-name-editor")
-            .h(px(24.0))
-            .w(px(224.0))
+            .debug_selector(|| "inline-file-tree-name-editor".to_string())
+            .relative()
+            .h_6()
             .min_w_0()
-            .flex_none()
-            .child(Input::new(&self.inline_path_input).small().w_full())
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .flex_1()
+            .child(
+                Input::new(&self.inline_path_input)
+                    .small()
+                    .w_full()
+                    .readonly(self.inline_file_submitting),
+            )
+            .when_some(self.inline_file_error.clone(), |this, error| {
+                this.child(
+                    deferred(
+                        div()
+                            .absolute()
+                            .top_full()
+                            .left_0()
+                            .w_full()
+                            .mt_1()
+                            .px_2()
+                            .py_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().popover)
+                            .border_1()
+                            .border_color(cx.theme().danger)
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .whitespace_normal()
+                            .child(error),
+                    )
+                    .with_priority(gpui_base::POPUP_PRIORITY),
+                )
+            })
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    this.cancel_inline_file_action(cx);
+                    this.cancel_inline_file_action(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -13759,12 +13920,16 @@ impl CodeRightRail {
         });
         h_flex()
             .id("inline-file-tree-editor")
+            .debug_selector(|| "inline-file-tree-editor".to_string())
             .relative()
             .h(px(FILE_ROW_HEIGHT))
             .w_full()
             .flex_none()
             .items_center()
             .px_2()
+            .border_1()
+            .border_color(cx.theme().primary.opacity(0.4))
+            .bg(cx.theme().primary.opacity(0.07))
             .children(file_tree_guides(depth, cx))
             .child(
                 h_flex()
@@ -13806,6 +13971,15 @@ impl CodeRightRail {
                 _ => None,
             });
         let row_rename_active = rename_source.is_some();
+        let context_active = self
+            .file_context_target
+            .as_ref()
+            .is_some_and(|(_, target)| path_chain.contains(target));
+        let selected = if self.file_context_target.is_some() {
+            context_active
+        } else {
+            row.selected
+        };
         if row_rename_active && !is_directory {
             return self.render_inline_file_row(row.depth, Some(row.icon.kind), cx);
         }
@@ -13898,12 +14072,17 @@ impl CodeRightRail {
                     name: segment.name.clone().into(),
                     kind: FileEntryKind::Directory,
                 };
-                let segment_selected = selected_directory.as_deref() == Some(&segment.path);
+                let segment_selected = self.file_context_target.as_ref().map_or_else(
+                    || selected_directory.as_deref() == Some(&segment.path),
+                    |(_, target)| target == &segment.path,
+                );
                 let segment_dragging = active_drag_path.as_deref() == Some(segment.path.as_str());
                 let segment_drop_active =
                     active_drop_target.as_deref() == Some(segment.path.as_str());
+                let segment_id = format!("file-tree-segment:{}", segment.path);
                 let mut element = div()
-                    .id(format!("file-tree-segment:{}", segment.path))
+                    .id(segment_id.clone())
+                    .debug_selector(move || segment_id)
                     .h(px(24.0))
                     .flex_none()
                     .items_center()
@@ -13992,7 +14171,30 @@ impl CodeRightRail {
                             cx.stop_propagation();
                         });
                 }
-                names.push(element.into_any_element());
+                if has_chain {
+                    let context_target = FileContextMenuTarget {
+                        path: segment.path.clone(),
+                        name: segment.name.clone(),
+                        kind: FileEntryKind::Directory,
+                        target_directory: segment.path.clone(),
+                        directory_error,
+                    };
+                    names.push(
+                        element
+                            .capture_any_mouse_down(cx.listener(
+                                move |this, event: &MouseDownEvent, _, cx| {
+                                    if event.button == MouseButton::Right {
+                                        this.file_context_pending_target =
+                                            Some(context_target.clone());
+                                    }
+                                    cx.propagate();
+                                },
+                            ))
+                            .into_any_element(),
+                    );
+                } else {
+                    names.push(element.into_any_element());
+                }
             }
         } else {
             names.push(render_file_name_match(
@@ -14003,17 +14205,14 @@ impl CodeRightRail {
         let context_path = path.clone();
         let context_name = row.name.clone();
         let context_target_directory = drop_directory.clone();
-        let context_controller = controller.clone();
-        let context_view = row_view.clone();
-        let clipboard_available = self.file_clipboard.is_some();
-        let mutation_pending = self.projection.files.mutation_pending;
-        let workspace_root = self.projection.files.workspace_root.clone();
         let row_drag_view = row_view.clone();
         let row_drop_view = row_view.clone();
         let row_move_directory = drop_directory.clone();
 
+        let row_id = row.id.clone();
         h_flex()
             .id(row.id.clone())
+            .debug_selector(move || row_id)
             .relative()
             .h(px(FILE_ROW_HEIGHT))
             .w_full()
@@ -14024,7 +14223,7 @@ impl CodeRightRail {
             .border_1()
             .border_color(if row_drop_active {
                 cx.theme().primary.opacity(0.40)
-            } else if row.selected {
+            } else if selected {
                 cx.theme().primary.opacity(0.25)
             } else if typeahead_active {
                 cx.theme().primary.opacity(0.30)
@@ -14033,7 +14232,7 @@ impl CodeRightRail {
             })
             .bg(if row_drop_active {
                 cx.theme().primary.opacity(0.12)
-            } else if row.selected {
+            } else if selected {
                 cx.theme().primary.opacity(0.07)
             } else if row_drop_scope_active {
                 cx.theme().primary.opacity(0.055)
@@ -14043,7 +14242,7 @@ impl CodeRightRail {
                 cx.theme().transparent
             })
             .when(
-                !row_drop_active && !row.selected && !row_drop_scope_active && !typeahead_active,
+                !row_drop_active && !selected && !row_drop_scope_active && !typeahead_active,
                 |this| {
                     // Animated hover wash: rest → wash over 150ms instead of a
                     // snap (theme state washes; frames driven by the window
@@ -14062,6 +14261,7 @@ impl CodeRightRail {
             .focusable()
             .tab_index(0)
             .aria_label(row.accessible_name.clone())
+            .aria_selected(selected)
             .children(file_tree_guides(row.depth, cx))
             .when(!is_root && !row_rename_active, |this| {
                 this.on_drag(drag, move |drag, _, _, cx| {
@@ -14126,10 +14326,10 @@ impl CodeRightRail {
                     }),
             )
             .on_click(move |event, window, cx| {
-                focus.focus(window, cx);
                 if row_rename_active {
                     return;
                 }
+                focus.focus(window, cx);
                 let temporary = event.click_count() < 2;
                 let _ = click_controller.update(cx, |workbench, cx| {
                     if is_directory {
@@ -14159,25 +14359,20 @@ impl CodeRightRail {
                 });
                 cx.stop_propagation();
             })
-            .context_menu(move |menu, window, cx| {
-                Self::build_file_context_menu(
-                    menu,
-                    FileContextMenuTarget {
+            // Capture the target before the tree's single menu opens. A
+            // compact segment can then replace it with its more specific path.
+            .capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Right {
+                    this.file_context_pending_target = Some(FileContextMenuTarget {
                         path: context_path.clone(),
                         name: context_name.clone(),
                         kind: row_kind,
                         target_directory: context_target_directory.clone(),
                         directory_error,
-                    },
-                    workspace_root.clone(),
-                    clipboard_available,
-                    mutation_pending,
-                    context_view.clone(),
-                    context_controller.clone(),
-                    window,
-                    cx,
-                )
-            })
+                    });
+                }
+                cx.propagate();
+            }))
             .into_any_element()
     }
 
@@ -17907,6 +18102,28 @@ fn tab_tooltip(target: &PreviewTarget, label: &str) -> String {
 /// local preview surface (PDF / Office).
 const PREVIEW_MATERIALIZE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+async fn resolve_external_open_path(
+    backend: &BackendFacade,
+    workspace_id: &WorkspaceId,
+    path: &str,
+    directory: bool,
+) -> Result<PathBuf, BackendError> {
+    if let Some(local) = backend
+        .file()
+        .resolve_local_path(workspace_id.clone(), path.to_string())
+        .await?
+    {
+        return Ok(local);
+    }
+    if directory {
+        return Err(BackendError::unsupported(
+            "remote_directory_open_unavailable",
+            "Remote folders cannot be opened in a local application. Use the workspace terminal instead.",
+        ));
+    }
+    materialize_preview_file(backend, workspace_id, path).await
+}
+
 /// Materializes a workspace-relative file locally so a local renderer can open
 /// it. An absolute path is already local and is returned after checking that it
 /// still names a regular file.
@@ -17965,13 +18182,7 @@ fn preview_cache_directory() -> PathBuf {
 }
 
 fn local_external_file_path(path: &str) -> Result<PathBuf, BackendError> {
-    let path = PathBuf::from(path);
-    let canonical = path.canonicalize().map_err(|error| {
-        BackendError::failed(
-            "local_file_missing",
-            format!("the selected file is no longer available: {error}"),
-        )
-    })?;
+    let canonical = local_external_path(path)?;
     if !canonical.is_file() {
         return Err(BackendError::failed(
             "local_file_not_file",
@@ -17979,6 +18190,15 @@ fn local_external_file_path(path: &str) -> Result<PathBuf, BackendError> {
         ));
     }
     Ok(canonical)
+}
+
+fn local_external_path(path: &str) -> Result<PathBuf, BackendError> {
+    Path::new(path).canonicalize().map_err(|error| {
+        BackendError::failed(
+            "local_file_missing",
+            format!("the selected path is no longer available: {error}"),
+        )
+    })
 }
 
 fn read_local_file_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
@@ -19751,6 +19971,9 @@ fn wrapped_tab_index(current: usize, offset: isize, len: usize) -> Option<usize>
 }
 
 #[cfg(test)]
+mod file_panel_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -20306,6 +20529,29 @@ mod tests {
             self.downloads_enabled
                 .store(enabled, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { Ok(()) })
+        }
+        fn browser_profile_sources(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Vec<vibex_core::BrowserProfileSource>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn import_browser_login_state(
+            &self,
+            _request: vibex_core::BrowserLoginImportRequest,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            vibex_core::BrowserLoginImportReport,
+        > {
+            Box::pin(async { Ok(vibex_core::BrowserLoginImportReport::default()) })
+        }
+        fn clear_browser_data(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserDataClearReport>
+        {
+            Box::pin(async { Ok(vibex_core::BrowserDataClearReport::default()) })
         }
         fn cursor_at(
             &self,

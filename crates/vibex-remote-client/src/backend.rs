@@ -88,10 +88,10 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineDisplaySettingsRequest,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchRequest,
-    RemoteAgentTimelineFetchResponse, RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest,
-    RemoteAuditRecord, RemoteAuthProof, RemoteCreatePairingCodeRequest,
-    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
+    RemoteAgentTimelineFetchResponse, RemoteAgentUnarchiveSessionResponse,
+    RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest, RemoteAuditRecord,
+    RemoteAuthProof, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
     RemoteDeviceCancelPairingOfferRequest, RemoteDeviceCreatePairingOfferRequest,
     RemoteDeviceDetail, RemoteDeviceListRequest, RemoteDeviceListResponse, RemoteDeviceRequest,
     RemoteDeviceRevokeRequest, RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse,
@@ -1428,6 +1428,54 @@ impl AgentBackend for WebRemoteBackend {
                     "the desktop did not confirm session archive",
                 ))
             }
+        })
+    }
+
+    fn list_archived_sessions(&self, limit: usize) -> BackendFuture<'_, Vec<AgentSession>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::ListArchivedSessions(
+                vibex_core::RemoteAgentArchivedSessionListRequest {
+                    auth: this.auth(),
+                    limit: limit.min(vibex_core::MAX_ARCHIVED_SESSION_PAGE_SIZE) as u32,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode::<vibex_core::RemoteAgentArchivedSessionListResponse>(value)
+                .map(|response| response.sessions)
+        })
+    }
+
+    fn unarchive_session(
+        &self,
+        request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::UnarchiveSession(RemoteAgentSessionActionRequest {
+                auth: this.auth(),
+                session_id: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Interactive,
+                )
+                .await?;
+            decode::<RemoteAgentUnarchiveSessionResponse>(value).map(|response| response.session)
         })
     }
 
@@ -7467,6 +7515,45 @@ mod tests {
                 .git
                 .supports(BackendOperation::GitWorktreeLifecycleMutate)
         );
+    }
+
+    #[tokio::test]
+    async fn archived_sessions_use_the_authoritative_bounded_read_operation() {
+        let transport = Arc::new(MockTransport::with_responses((0..3).map(|_| {
+            vibex_core::RemoteRpcResponseV2 {
+                request_id: vibex_core::RequestId::new(),
+                correlation_id: None,
+                payload: Some(serde_json::json!({ "sessions": [] })),
+                error: None,
+                metadata: Default::default(),
+                completed_at_ms: unix_timestamp_ms(),
+            }
+        })));
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+        for limit in [0, 12, usize::MAX] {
+            assert!(
+                backend
+                    .list_archived_sessions(limit)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        for (request, expected_limit) in requests.iter().zip([0, 12, 500]) {
+            assert_eq!(request.operation, "agent_session");
+            assert!(request.mutation.is_none());
+            let payload = request.payload.as_ref().unwrap();
+            assert_eq!(payload["type"], "list_archived_sessions");
+            assert_eq!(payload["data"]["limit"], expected_limit);
+        }
     }
 
     #[test]

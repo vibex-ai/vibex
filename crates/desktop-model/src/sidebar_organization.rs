@@ -798,18 +798,30 @@ impl SidebarOrganizationState {
         if accepted.is_empty() {
             return false;
         }
-        for session_id in &accepted {
-            if let Some(other_group_id) = self.group_of_session(session_id)
-                && other_group_id != group_id
-            {
-                let other_group_id = other_group_id.to_string();
-                self.remove_sessions_from_group(&other_group_id, std::slice::from_ref(session_id));
-            }
-        }
+        let source_memberships = accepted
+            .iter()
+            .filter_map(|session_id| {
+                self.group_of_session(session_id)
+                    .filter(|source| *source != group_id)
+                    .map(|source| (source.to_string(), session_id.clone()))
+            })
+            .collect::<Vec<_>>();
         let Some(group) = self.groups.get_mut(group_id) else {
             return false;
         };
-        group.add_members(&accepted)
+        if !group.add_members(&accepted) {
+            return false;
+        }
+        // Admission enforces the member limit. Only a member that actually
+        // joined the destination can leave its previous group.
+        let moved = source_memberships
+            .into_iter()
+            .filter(|(_, session_id)| group.contains(session_id))
+            .collect::<Vec<_>>();
+        for (source, session_id) in moved {
+            self.remove_sessions_from_group(&source, std::slice::from_ref(&session_id));
+        }
+        true
     }
 
     /// Removes sessions from a group. A group that loses every member is
@@ -2990,6 +3002,72 @@ mod tests {
                 .member_session_ids,
             group_members(&["session-b", "session-a"])
         );
+    }
+
+    #[test]
+    fn group_transfers_only_admitted_members_and_preserves_sources_at_capacity() {
+        for available in [0, 1] {
+            let destination_members = (0..crate::SESSION_GROUP_MEMBER_LIMIT - available)
+                .map(|index| format!("session-destination-{index}"))
+                .collect::<Vec<_>>();
+            let incoming = group_members(&["session-first", "session-second"]);
+            let workspaces = destination_members
+                .iter()
+                .chain(&incoming)
+                .map(|id| (id.clone(), "workspace-a".to_string()))
+                .collect::<BTreeMap<_, _>>();
+            let mut state = SidebarOrganizationState::default();
+            assert!(state.create_group(
+                "destination",
+                "Destination",
+                "project-a",
+                "workspace-a",
+                &destination_members,
+                &workspaces,
+                None,
+            ));
+            for (group_id, member) in [
+                ("source-first", &incoming[0]),
+                ("source-second", &incoming[1]),
+            ] {
+                assert!(state.create_group(
+                    group_id,
+                    group_id,
+                    "project-a",
+                    "workspace-a",
+                    std::slice::from_ref(member),
+                    &workspaces,
+                    None,
+                ));
+            }
+            let before = state.clone();
+            let requested = vec![
+                destination_members[0].clone(),
+                incoming[0].clone(),
+                incoming[1].clone(),
+            ];
+            assert_eq!(
+                state.add_sessions_to_group("destination", &requested, &workspaces),
+                available > 0,
+            );
+            if available == 0 {
+                assert_eq!(state, before);
+            } else {
+                let mut expected = destination_members;
+                expected.push(incoming[0].clone());
+                assert_eq!(
+                    state.group("destination").unwrap().member_session_ids,
+                    expected
+                );
+                assert!(state.group("source-first").is_none());
+                assert_eq!(state.group_of_session(&incoming[0]), Some("destination"));
+                assert_eq!(state.group("source-second"), before.group("source-second"));
+                assert_eq!(state.group_of_session(&incoming[1]), Some("source-second"));
+            }
+            let after = state.clone();
+            assert!(!state.add_sessions_to_group("destination", &requested, &workspaces));
+            assert_eq!(state, after, "retrying a full destination must be a no-op");
+        }
     }
 
     #[test]

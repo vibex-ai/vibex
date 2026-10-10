@@ -360,7 +360,8 @@ impl AgentBackend for NativeBackend {
             runtime.ensure_accepting_actions()?;
             runtime
                 .agent()
-                .list_sessions(include_archived)
+                .manager()
+                .list_root_sessions(include_archived)
                 .await
                 .map_err(Into::into)
         })
@@ -609,6 +610,36 @@ impl AgentBackend for NativeBackend {
                 .agent()
                 .manager()
                 .archive_session(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn unarchive_session(
+        &self,
+        request: MutationRequest<VibexSessionId>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .unarchive_session(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_archived_sessions(&self, limit: usize) -> BackendFuture<'_, Vec<AgentSession>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .list_archived_sessions(limit)
                 .await
                 .map_err(Into::into)
         })
@@ -1231,6 +1262,22 @@ fn temporary_session_root() -> vibex_core::VibexResult<String> {
 }
 
 impl FileBackend for NativeBackend {
+    fn resolve_local_path(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BackendFuture<'_, Option<std::path::PathBuf>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .files()
+                .resolve_existing_path(&workspace_id, &path)
+                .map(Some)
+                .map_err(Into::into)
+        })
+    }
+
     fn file_tree(&self, request: FileTreeRequest) -> BackendFuture<'_, Vec<FileTreeEntry>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

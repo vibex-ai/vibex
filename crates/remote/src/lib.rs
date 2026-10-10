@@ -35,9 +35,10 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSessionTokenUsageResponse,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchResponse,
-    RemoteAgentUsageStatisticsResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
-    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
-    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentUnarchiveSessionResponse, RemoteAgentUsageStatisticsResponse, RemoteAuditAction,
+    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
+    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
+    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse,
@@ -4559,7 +4560,7 @@ async fn dispatch_agent_request(
                 correlation_id,
             )?;
             let sessions = manager
-                .list_sessions(request.include_archived.unwrap_or(false))
+                .list_root_sessions(request.include_archived.unwrap_or(false))
                 .await?;
             let mut summaries = Vec::with_capacity(sessions.len());
             for session in sessions {
@@ -4574,6 +4575,22 @@ async fn dispatch_agent_request(
                 sessions: summaries,
             })
             .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ListArchivedSessions(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let sessions = manager
+                .list_archived_sessions(
+                    (request.limit as usize).min(vibex_core::MAX_ARCHIVED_SESSION_PAGE_SIZE),
+                )
+                .await?;
+            serde_json::to_value(vibex_core::RemoteAgentArchivedSessionListResponse { sessions })
+                .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::GetSession(request) => {
             authorize_agent_action(
@@ -4664,6 +4681,30 @@ async fn dispatch_agent_request(
             )?;
             let session = result?;
             serde_json::to_value(RemoteAgentRenameSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::UnarchiveSession(request) => {
+            let target_id = request.session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.unarchive_session(&request.session_id).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session unarchive",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let session = result?;
+            serde_json::to_value(RemoteAgentUnarchiveSessionResponse { session })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::ArchiveSession(request) => {
@@ -9021,6 +9062,131 @@ mod tests {
             .unwrap();
         assert_eq!(history.items.len(), 1);
         assert!(history.has_older);
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_archived_sessions_filter_ownership_and_require_control_to_restore() {
+        let (db_path, manager) = test_agent_manager("archive-ownership");
+        let root = create_mock_session(&manager, "Archived root").await;
+        let child = create_mock_session(&manager, "Archived taskless child").await;
+        let conn = open_database(&db_path).unwrap();
+        vibex_db::SessionOwnershipRepository::upsert(&conn, &child.id, &root.id, None).unwrap();
+        drop(conn);
+        manager.archive_session(&root.id).await.unwrap();
+        manager.archive_session(&child.id).await.unwrap();
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let router =
+            build_router_with_agent(RemoteServiceConfig::loopback_disabled(), manager.clone());
+
+        let roots = post_agent(
+            router.clone(),
+            RemoteAgentRequest::ListSessions(RemoteAgentSessionListRequest {
+                auth: reader.clone(),
+                include_archived: Some(true),
+                timeline_limit: Some(0),
+            }),
+        )
+        .await;
+        let roots: RemoteAgentSessionListResponse =
+            serde_json::from_value(roots.payload.unwrap()).unwrap();
+        assert_eq!(roots.sessions.len(), 1);
+        assert_eq!(roots.sessions[0].session.id, root.id);
+        let child_read = post_agent(
+            router.clone(),
+            RemoteAgentRequest::GetSession(vibex_core::RemoteAgentSessionDetailRequest {
+                auth: reader.clone(),
+                session_id: child.id.clone(),
+                timeline_limit: Some(0),
+            }),
+        )
+        .await;
+        let child_read: RemoteAgentSessionDetailResponse =
+            serde_json::from_value(child_read.payload.unwrap()).unwrap();
+        assert_eq!(child_read.session.id, child.id);
+
+        for limit in [0, 1, u32::MAX] {
+            let page = post_agent(
+                router.clone(),
+                RemoteAgentRequest::ListArchivedSessions(
+                    vibex_core::RemoteAgentArchivedSessionListRequest {
+                        auth: reader.clone(),
+                        limit,
+                    },
+                ),
+            )
+            .await;
+            let page: vibex_core::RemoteAgentArchivedSessionListResponse =
+                serde_json::from_value(page.payload.unwrap()).unwrap();
+            assert_eq!(page.sessions.len(), usize::from(limit > 0));
+            if limit > 0 {
+                assert_eq!(page.sessions[0].id, root.id);
+            }
+        }
+
+        let denied = post_agent(
+            router.clone(),
+            RemoteAgentRequest::UnarchiveSession(vibex_core::RemoteAgentSessionActionRequest {
+                auth: reader.clone(),
+                session_id: root.id.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(denied.error.unwrap().code, "remote_permission_denied");
+        assert!(
+            manager
+                .get_session(&root.id)
+                .await
+                .unwrap()
+                .archived_at_ms
+                .is_some()
+        );
+
+        let restored = post_agent(
+            router.clone(),
+            RemoteAgentRequest::UnarchiveSession(vibex_core::RemoteAgentSessionActionRequest {
+                auth: controller.clone(),
+                session_id: root.id.clone(),
+            }),
+        )
+        .await;
+        let restored: vibex_core::RemoteAgentUnarchiveSessionResponse =
+            serde_json::from_value(restored.payload.unwrap()).unwrap();
+        assert_eq!(restored.session.id, root.id);
+        assert_eq!(restored.session.state, vibex_core::AgentSessionState::Idle);
+        assert!(restored.session.archived_at_ms.is_none());
+
+        let remaining = post_agent(
+            router,
+            RemoteAgentRequest::ListArchivedSessions(
+                vibex_core::RemoteAgentArchivedSessionListRequest {
+                    auth: reader,
+                    limit: 10,
+                },
+            ),
+        )
+        .await;
+        let remaining: vibex_core::RemoteAgentArchivedSessionListResponse =
+            serde_json::from_value(remaining.payload.unwrap()).unwrap();
+        assert!(remaining.sessions.is_empty());
+        let audits = RemoteAuditRepository::list(
+            &open_database(&db_path).unwrap(),
+            &RemoteAuditListRequest {
+                device_id: Some(controller.device_id),
+                limit: Some(20),
+            },
+        )
+        .unwrap();
+        assert!(audits.iter().any(|record| {
+            record.target_id.as_deref() == Some(root.id.as_str())
+                && record.redacted_summary == "Agent session unarchive"
+                && record.outcome == RemoteAuditOutcome::Allowed
+        }));
         cleanup_db(db_path);
     }
 

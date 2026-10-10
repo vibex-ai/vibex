@@ -122,6 +122,92 @@ fn open_timeline<'a>(
     (app, probe, cx)
 }
 
+#[gpui::test]
+fn session_metadata_refreshes_roots_without_reloading_the_open_worker(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::AgentMessage(
+            vibex_core::AgentMessagePayload {
+                text: "Worker result".into(),
+                is_final: true,
+            },
+        )],
+    );
+    let worker = app.read_with(cx, |app, _| {
+        app.controller
+            .as_ref()
+            .unwrap()
+            .state
+            .active_session
+            .value
+            .clone()
+            .unwrap()
+    });
+    let root = AgentSession {
+        id: VibexSessionId::new(),
+        title: "Team owner".into(),
+        ..worker.clone()
+    };
+    let new_root = AgentSession {
+        id: VibexSessionId::new(),
+        title: "New independent session".into(),
+        ..root.clone()
+    };
+    let updated_worker = AgentSession {
+        title: "Worker ready for review".into(),
+        updated_at_ms: worker.updated_at_ms + 1,
+        ..worker.clone()
+    };
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.composer_input.update(cx, |input, cx| {
+                input.set_value("Keep this worker draft", window, cx);
+            });
+            let controller = app.controller.as_mut().unwrap();
+            controller.apply_sessions(Ok(vec![root.clone()])).unwrap();
+            // A root snapshot is already in flight when metadata arrives.
+            // Retain one follow-up refresh instead of losing the new root.
+            controller.begin_sessions_refresh();
+            app.session_sync_busy = true;
+        });
+    });
+    let (generation, timeline) = app.read_with(cx, |app, _| {
+        let state = &app.controller.as_ref().unwrap().state;
+        (state.generation, state.timeline.items.clone())
+    });
+    app.update(cx, |app, cx| {
+        assert!(!app.apply_event_batch(
+            vec![
+                BackendEvent::SessionUpdated(updated_worker.clone()),
+                BackendEvent::SessionUpdated(new_root.clone()),
+            ],
+            cx,
+        ));
+        assert!(app.session_sync_queued);
+        let controller = app.controller.as_mut().unwrap();
+        assert_eq!(controller.state.sessions.value, Some(vec![root.clone()]));
+        controller
+            .apply_sessions(Ok(vec![root.clone(), new_root.clone()]))
+            .unwrap();
+        app.sync_sidebar_state();
+    });
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        let state = &app.controller.as_ref().unwrap().state;
+        assert_eq!(state.sessions.value, Some(vec![root, new_root]));
+        assert_eq!(state.selected_session_id, Some(worker.id));
+        assert_eq!(state.active_session.value, Some(updated_worker));
+        assert_eq!(state.generation, generation);
+        assert_eq!(state.timeline.items, timeline);
+        assert_eq!(
+            app.composer_input.read(cx).value(),
+            "Keep this worker draft"
+        );
+    });
+}
+
 fn read(path: &str, status: ToolCallStatus, output: &str) -> TimelinePayload {
     let input = serde_json::json!({ "path": path, "limit": 40 }).to_string();
     TimelinePayload::ToolCall(ToolCallPayload {

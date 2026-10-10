@@ -31,6 +31,10 @@ pub mod http;
 pub mod mcp;
 pub mod policy;
 pub mod process;
+/// Reading a real Chromium-family profile's login state. Gated because it
+/// pulls SQLite and a LevelDB reader that only desktop and server builds need.
+#[cfg(feature = "profile-import")]
+pub mod profile_import;
 pub mod recording;
 pub mod service;
 pub mod stdio;

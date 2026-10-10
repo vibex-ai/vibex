@@ -664,6 +664,8 @@ impl AgentWorkflowController {
         Box::pin(async move { backend.list_sessions(include_archived).await })
     }
 
+    /// Replaces root navigation rows without changing an explicitly opened
+    /// session. Team workers remain valid selections outside this root list.
     pub fn apply_sessions(
         &mut self,
         result: BackendResult<Vec<AgentSession>>,
@@ -1472,14 +1474,13 @@ impl AgentWorkflowController {
             }
             BackendEvent::SessionUpdated(session) => {
                 let mut changed = false;
-                if let Some(sessions) = self.state.sessions.value.as_mut() {
-                    if let Some(existing) = sessions.iter_mut().find(|item| item.id == session.id) {
-                        if existing != &session && session_update_is_current(existing, &session) {
-                            *existing = session.clone();
-                            changed = true;
-                        }
-                    } else {
-                        sessions.push(session.clone());
+                let mut known_root = false;
+                if let Some(sessions) = self.state.sessions.value.as_mut()
+                    && let Some(existing) = sessions.iter_mut().find(|item| item.id == session.id)
+                {
+                    known_root = true;
+                    if existing != &session && session_update_is_current(existing, &session) {
+                        *existing = session.clone();
                         changed = true;
                     }
                 }
@@ -1496,7 +1497,11 @@ impl AgentWorkflowController {
                     changed = true;
                     self.state.active_session.resolve(session);
                 }
-                if changed {
+                if !known_root {
+                    // Updates include workers as well as roots. Only the
+                    // authoritative list can establish navigation membership.
+                    AgentEventDecision::NeedsAuthoritativeRefetch
+                } else if changed {
                     AgentEventDecision::Applied
                 } else {
                     AgentEventDecision::IgnoredStale
@@ -1979,6 +1984,15 @@ mod tests {
             _request: MutationRequest<VibexSessionId>,
         ) -> BackendFuture<'_, ()> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn unarchive_session(
+            &self,
+            _request: MutationRequest<VibexSessionId>,
+        ) -> BackendFuture<'_, AgentSession> {
+            let mut session = self.session.clone();
+            session.archived_at_ms = None;
+            Box::pin(async move { Ok(session) })
         }
 
         fn delete_session(
@@ -2524,6 +2538,106 @@ mod tests {
                 .title,
             "Release plan"
         );
+    }
+
+    #[test]
+    fn unknown_session_updates_require_authoritative_root_membership() {
+        let root = session();
+        let unknown = session();
+        for listed in [None, Some(Vec::new()), Some(vec![root.clone()])] {
+            let backend = Arc::new(MockAgentBackend::new(root.clone(), Vec::new()));
+            let mut controller = AgentWorkflowController::new(backend, capabilities());
+            if let Some(sessions) = listed.clone() {
+                controller.apply_sessions(Ok(sessions)).unwrap();
+            }
+
+            assert_eq!(
+                controller.apply_event(BackendEvent::SessionUpdated(unknown.clone())),
+                AgentEventDecision::NeedsAuthoritativeRefetch
+            );
+            assert_eq!(controller.state.sessions.value, listed);
+            assert!(controller.state.selected_session_id.is_none());
+            assert!(controller.state.active_session.value.is_none());
+
+            // A worker stays out of the root list when the backend confirms
+            // only the existing root. A real new root can enter through a
+            // subsequent authoritative list, never through the event alone.
+            controller.begin_sessions_refresh();
+            controller.apply_sessions(Ok(vec![root.clone()])).unwrap();
+            assert_eq!(controller.state.sessions.value, Some(vec![root.clone()]));
+            controller
+                .apply_sessions(Ok(vec![root.clone(), unknown.clone()]))
+                .unwrap();
+            assert_eq!(
+                controller.state.sessions.value,
+                Some(vec![root.clone(), unknown.clone()])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_refetch_preserves_a_team_worker_and_its_updated_metadata() {
+        let root = session();
+        let worker = session();
+        let item = timeline_item(
+            &worker.id,
+            1,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "Worker result".into(),
+                is_final: true,
+            }),
+        );
+        let backend = Arc::new(MockAgentBackend::new(worker.clone(), vec![item.clone()]));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.apply_sessions(Ok(vec![root.clone()])).unwrap();
+        let ticket = controller.begin_session_load(worker.id.clone()).unwrap();
+        let snapshot = controller.load_session(ticket.clone()).await;
+        // A root-list refresh while the worker read is outstanding must not
+        // invalidate the explicit Team navigation or its load ticket.
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionUpdated(session())),
+            AgentEventDecision::NeedsAuthoritativeRefetch
+        );
+        controller.begin_sessions_refresh();
+        controller.apply_sessions(Ok(vec![root.clone()])).unwrap();
+        assert!(controller.apply_session_snapshot(&ticket, snapshot));
+        let generation = controller.state.generation;
+        let mutation_generation = controller.state.mutation_generation;
+
+        let updated = AgentSession {
+            title: "Worker review finished".into(),
+            updated_at_ms: worker.updated_at_ms + 1,
+            ..worker.clone()
+        };
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionUpdated(updated.clone())),
+            AgentEventDecision::NeedsAuthoritativeRefetch
+        );
+        assert_eq!(controller.state.active_session.value, Some(updated.clone()));
+        assert_eq!(controller.state.sessions.value, Some(vec![root.clone()]));
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionUpdated(session())),
+            AgentEventDecision::NeedsAuthoritativeRefetch
+        );
+
+        for roots in [vec![root], Vec::new()] {
+            controller.begin_sessions_refresh();
+            controller.apply_sessions(Ok(roots)).unwrap();
+            assert_eq!(
+                controller.state.selected_session_id,
+                Some(worker.id.clone())
+            );
+            assert_eq!(controller.state.active_session.value, Some(updated.clone()));
+            assert_eq!(controller.state.timeline.items, vec![item.clone()]);
+            assert_eq!(controller.state.generation, generation);
+            assert_eq!(controller.state.mutation_generation, mutation_generation);
+        }
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionUpdated(worker)),
+            AgentEventDecision::NeedsAuthoritativeRefetch
+        );
+        assert_eq!(controller.state.active_session.value, Some(updated));
+        assert_eq!(controller.state.sessions.value, Some(Vec::new()));
     }
 
     #[test]

@@ -5,6 +5,10 @@ use vibex_backend::{
     BackendCapabilitySnapshot, BackendEventSubscription, BackendFuture, DisconnectedBackend,
 };
 use vibex_core::*;
+use vibex_db::{
+    GroupPresentationRepository, SessionOwnershipRepository, SessionRepository,
+    WorkspaceRepository, open_database,
+};
 
 enum Observed {
     Message(HumanAgentMessageRequest),
@@ -118,6 +122,7 @@ impl vibex_backend::AgentBackend for TeamAgent {
         replace_user_message(_request: MutationRequest<ReplaceUserMessagePayload>) -> Vec<TimelineItem>;
         rename_session(_request: MutationRequest<RenameAgentSessionRequest>) -> AgentSession;
         archive_session(_request: MutationRequest<VibexSessionId>) -> ();
+        unarchive_session(_request: MutationRequest<VibexSessionId>) -> AgentSession;
         delete_session(_request: MutationRequest<VibexSessionId>) -> ();
         list_runtime_options() -> SessionRuntimeOptionCatalog;
         probe_agent_runtime_options(_request: MutationRequest<AgentRuntimeOptionProbeRequest>) -> AgentRuntimeOptionProbeResult;
@@ -298,6 +303,46 @@ fn group(workbench: &mut VibexWorkbench, count: usize) {
         &workspaces,
         None
     ));
+}
+
+async fn attach_team_runtime(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &mut VisualTestContext,
+) -> (Arc<DesktopRuntime>, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_path_buf();
+    let runtime = cx
+        .update(|_, cx| {
+            gpui_tokio::Tokio::spawn(cx, async move {
+                DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(home_path))
+                    .await
+                    .unwrap()
+            })
+        })
+        .await
+        .unwrap();
+    let conn = open_database(&runtime.config().database_path).unwrap();
+    let (project, workspace) = WorkspaceRepository::ensure(
+        &conn,
+        home.path().join("workspace"),
+        WorkspaceMode::CurrentCheckout,
+    )
+    .unwrap();
+    workbench.update(cx, |workbench, _| {
+        workbench.runtime = Some(runtime.clone());
+        workbench.workspaces = vec![(project.clone(), workspace.clone())];
+        for session in workbench
+            .sessions
+            .iter_mut()
+            .chain(workbench.delegated_sessions.values_mut())
+        {
+            session.project_id = project.id.clone();
+            session.workspace_id = workspace.id.clone();
+            session.workspace_root = workspace.root_path.clone();
+            SessionRepository::insert(&conn, session).unwrap();
+        }
+    });
+    (runtime, home)
 }
 
 fn queued_worker_message() -> ComposerQueueMessage {
@@ -689,6 +734,262 @@ fn team_presentation_recovers_missing_groups_preserves_manual_layout_and_respect
 }
 
 #[gpui::test]
+async fn team_batch_group_moves_and_removals_update_every_durable_definition(
+    cx: &mut TestAppContext,
+) {
+    let (workbench, cx, _) = fixture(cx, 6);
+    let (runtime, _home) = attach_team_runtime(&workbench, cx).await;
+    let conn = open_database(&runtime.config().database_path).unwrap();
+    let members = |indexes: &[usize]| {
+        indexes
+            .iter()
+            .map(|index| session(*index).id)
+            .collect::<Vec<_>>()
+    };
+    let session_ids = |indexes: &[usize]| {
+        members(indexes)
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    };
+    workbench.update(cx, |workbench, _| {
+        let (project, workspace) = &workbench.workspaces[0];
+        let session_workspaces = workbench.sidebar_session_workspaces();
+        for (group_id, indexes) in [
+            ("group_destination", vec![0]),
+            ("group_source", vec![1, 2]),
+            ("group_emptied", vec![3]),
+            ("group_untouched", vec![4, 5]),
+        ] {
+            GroupPresentationRepository::reserve_or_get(
+                &conn,
+                None,
+                "session:team",
+                group_id,
+                &SessionGroupScope::Workspace {
+                    workspace_ref: VibexUseRef::new(
+                        VibexUseResourceKind::Workspace,
+                        workspace.id.as_str(),
+                    ),
+                },
+                group_id,
+                &members(&indexes),
+                &SessionGroupLayoutIntent::default(),
+                group_id,
+            )
+            .unwrap();
+            assert!(workbench.ui_state.sidebar.organization.create_group(
+                group_id,
+                group_id,
+                project.id.as_str(),
+                workspace.id.as_str(),
+                &session_ids(&indexes),
+                &session_workspaces,
+                None,
+            ));
+            workbench
+                .ui_state
+                .sidebar
+                .organization
+                .group_mut(group_id)
+                .unwrap()
+                .set_automatic_layout(SessionGroupLayoutIntent::default(), 80.0);
+        }
+    });
+    let revision = workbench.update(cx, |workbench, cx| {
+        workbench.add_sessions_to_group_from_menu("group_destination", &session_ids(&[1, 3]), cx);
+        assert!(workbench.persistence_note.is_none());
+        workbench.sidebar_organization_view().revision
+    });
+    for (group_id, expected) in [
+        ("group_destination", vec![0, 1, 3]),
+        ("group_source", vec![2]),
+    ] {
+        let saved = GroupPresentationRepository::get(&conn, group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.member_session_ids, members(&expected));
+        assert!(!saved.created_by_caller);
+        assert_eq!(saved.client_revision, Some(revision));
+    }
+    assert!(
+        GroupPresentationRepository::get(&conn, "group_emptied")
+            .unwrap()
+            .is_none()
+    );
+    let untouched = GroupPresentationRepository::get(&conn, "group_untouched")
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.member_session_ids, members(&[4, 5]));
+    assert!(untouched.created_by_caller);
+    assert_eq!(untouched.client_revision, None);
+
+    let revision = workbench.update(cx, |workbench, cx| {
+        workbench.remove_sessions_from_groups_from_menu(&session_ids(&[0, 1, 2, 4]), cx);
+        assert!(workbench.persistence_note.is_none());
+        workbench.sidebar_organization_view().revision
+    });
+    for (group_id, expected) in [("group_destination", vec![3]), ("group_untouched", vec![5])] {
+        let saved = GroupPresentationRepository::get(&conn, group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.member_session_ids, members(&expected));
+        assert!(!saved.created_by_caller);
+        assert_eq!(saved.client_revision, Some(revision));
+    }
+    assert!(
+        GroupPresentationRepository::get(&conn, "group_source")
+            .unwrap()
+            .is_none()
+    );
+
+    // Matching ids on another authority cannot remove the local definitions.
+    workbench.update(cx, |workbench, _| {
+        workbench.ui_state.sidebar.switch_authority("server:other");
+        workbench.sync_user_session_groups(&BTreeSet::from([
+            "group_destination".to_string(),
+            "group_untouched".to_string(),
+        ]));
+    });
+    assert!(
+        GroupPresentationRepository::get(&conn, "group_destination")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        GroupPresentationRepository::get(&conn, "group_untouched")
+            .unwrap()
+            .is_some()
+    );
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
+#[gpui::test]
+fn team_capacity_rejected_transfers_keep_source_group_ownership(cx: &mut TestAppContext) {
+    let limit = vibex_desktop_model::SESSION_GROUP_MEMBER_LIMIT;
+    let (workbench, cx, _) = fixture(cx, limit + 2);
+    workbench.update(cx, |workbench, cx| {
+        group(workbench, limit);
+        let session_workspaces = workbench.sidebar_session_workspaces();
+        for (group_id, index) in [("accepted", limit), ("rejected", limit + 1)] {
+            assert!(workbench.ui_state.sidebar.organization.create_group(
+                group_id,
+                group_id,
+                session(0).project_id.as_str(),
+                session(0).workspace_id.as_str(),
+                &[session(index).id.to_string()],
+                &session_workspaces,
+                None,
+            ));
+            workbench
+                .ui_state
+                .sidebar
+                .organization
+                .group_mut(group_id)
+                .unwrap()
+                .set_automatic_layout(SessionGroupLayoutIntent::default(), 80.0);
+        }
+        let source_groups = workbench.ui_state.sidebar.organization.clone();
+        let moving = [
+            session(limit).id.to_string(),
+            session(limit + 1).id.to_string(),
+        ];
+        workbench.add_sessions_to_group_from_menu("team", &moving, cx);
+        assert_eq!(workbench.ui_state.sidebar.organization, source_groups);
+
+        assert!(
+            workbench
+                .ui_state
+                .sidebar
+                .organization
+                .remove_sessions_from_group("team", &[session(limit - 1).id.to_string()])
+        );
+        workbench.add_sessions_to_group_from_menu("team", &moving, cx);
+        assert!(
+            workbench
+                .ui_state
+                .sidebar
+                .organization
+                .group("accepted")
+                .is_none()
+        );
+        assert_eq!(
+            workbench
+                .ui_state
+                .sidebar
+                .organization
+                .group_of_session(&moving[0]),
+            Some("team"),
+        );
+        assert_eq!(
+            workbench.ui_state.sidebar.organization.group("rejected"),
+            source_groups.group("rejected"),
+            "a capacity rejection must not transfer ownership of the source group",
+        );
+    });
+}
+
+#[gpui::test]
+async fn team_root_listing_and_worker_updates_keep_automatic_archive_off_unloaded_workers(
+    cx: &mut TestAppContext,
+) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    let (runtime, _home) = attach_team_runtime(&workbench, cx).await;
+    let conn = open_database(&runtime.config().database_path).unwrap();
+    SessionOwnershipRepository::upsert(&conn, &session(1).id, &session(0).id, None).unwrap();
+    let mut worker = SessionRepository::get(&conn, &session(1).id)
+        .unwrap()
+        .unwrap();
+    let backend = Arc::new(NativeBackend::new(runtime.clone())).facade();
+    let roots = cx
+        .update(|_, cx| {
+            gpui_tokio::Tokio::spawn(cx, async move {
+                backend.agent().list_sessions(false).await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        roots.iter().map(|session| &session.id).collect::<Vec<_>>(),
+        [&session(0).id]
+    );
+    workbench.update(cx, |workbench, cx| {
+        workbench.sessions = roots;
+        workbench.delegated_sessions.clear();
+        assert!(workbench.delegated_tree.is_empty());
+        assert!(workbench.delegated_pages.is_empty());
+        let now_ms = 40 * AUTO_ARCHIVE_MILLIS_PER_DAY;
+        assert!(workbench.auto_archive_candidates(now_ms).is_empty());
+        workbench.ui_state.session.auto_archive_after_days = Some(30);
+        assert_eq!(workbench.auto_archive_candidates(now_ms), [session(0).id]);
+
+        // The first broadcast arrives before any ownership page. Later
+        // broadcasts update that registry entry without promoting it to a root.
+        for revision in [2, 3] {
+            worker.updated_at_ms = revision;
+            workbench.apply_desktop_event(DesktopEvent::SessionUpdated(worker.clone()), cx);
+            assert_eq!(workbench.sessions.len(), 1);
+            assert_eq!(
+                workbench.registered_session(worker.id.as_str()),
+                Some(&worker)
+            );
+            assert_eq!(workbench.auto_archive_candidates(now_ms), [session(0).id]);
+            assert!(workbench.delegated_tree.is_empty());
+        }
+        assert!(workbench.delegated_roots_dirty);
+    });
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
+#[gpui::test]
 fn team_hidden_tabs_materialize_only_the_four_live_conversations(cx: &mut TestAppContext) {
     let (workbench, cx, receiver) = fixture(cx, 64);
     workbench.update(cx, |workbench, cx| {
@@ -726,6 +1027,12 @@ fn team_hidden_tabs_materialize_only_the_four_live_conversations(cx: &mut TestAp
             .unwrap();
         group.layout.focus_session(&pane, session(63).id.as_str());
         group.focus_pane(&pane);
+        workbench.record_composer_geometry(Some(session(3).id.as_str()), |geometry| {
+            geometry.input_bounds = Some(Bounds::new(
+                point(px(10.0), px(20.0)),
+                size(px(30.0), px(40.0)),
+            ));
+        });
         workbench.selected_session_id = Some(session(63).id);
         workbench.borrow_session_view(&session(63).id);
         workbench.ensure_session_group_views("team", cx);
@@ -734,11 +1041,60 @@ fn team_hidden_tabs_materialize_only_the_four_live_conversations(cx: &mut TestAp
         assert_eq!(resident.len(), 4);
         assert!(resident.contains(session(63).id.as_str()));
         assert!(!resident.contains(session(3).id.as_str()));
+        assert!(
+            !workbench
+                .pending_composer_geometries
+                .contains_key(session(3).id.as_str())
+        );
     });
     let Observed::Timeline(id) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() else {
         panic!("expected lazy tab fetch");
     };
     assert_eq!(id, session(63).id);
+}
+
+#[gpui::test]
+fn team_view_removal_and_eviction_discard_only_their_composer_measurements(
+    cx: &mut TestAppContext,
+) {
+    let count = AGENT_SESSION_VIEW_CACHE_LIMIT + 2;
+    let (workbench, cx, _) = fixture(cx, count);
+    workbench.update(cx, |workbench, _| {
+        let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(30.0), px(40.0)));
+        for index in 0..3 {
+            workbench.ensure_session_view(&session(index).id);
+            workbench.record_composer_geometry(Some(session(index).id.as_str()), |geometry| {
+                geometry.input_bounds = Some(bounds);
+            });
+        }
+        workbench.optimistically_remove_sessions(&BTreeSet::from([session(2).id.to_string()]));
+        assert!(
+            !workbench
+                .pending_composer_geometries
+                .contains_key(session(2).id.as_str())
+        );
+        assert!(
+            workbench
+                .pending_composer_geometries
+                .contains_key(session(1).id.as_str())
+        );
+        for index in 2..count {
+            workbench.ensure_session_view(&session(index).id);
+        }
+        assert!(!workbench.session_views.contains_key(session(1).id.as_str()));
+        assert!(
+            !workbench
+                .pending_composer_geometries
+                .contains_key(session(1).id.as_str())
+        );
+        assert!(
+            workbench
+                .pending_composer_geometries
+                .contains_key(session(0).id.as_str())
+        );
+        workbench.adopt_composer_geometry();
+        assert_eq!(workbench.composer_geometry.input_bounds, Some(bounds));
+    });
 }
 
 #[gpui::test]

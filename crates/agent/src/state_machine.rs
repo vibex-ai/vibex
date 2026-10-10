@@ -19,6 +19,12 @@ pub const fn is_transition_allowed(from: AgentSessionState, to: AgentSessionStat
             | (Closed, Archived)
             | (Idle, Archived)
             | (Error, Archived)
+            // Restoring an archived session returns it to the active list in
+            // `Idle`, so its next message starts a turn through the ordinary
+            // documented transitions. `Closed` stays reachable for callers
+            // that park a restored session without materializing a runtime.
+            | (Archived, Idle)
+            | (Archived, Closed)
     )
 }
 
@@ -54,6 +60,14 @@ mod tests {
         assert!(is_transition_allowed(
             AgentSessionState::Error,
             AgentSessionState::Running
+        ));
+        assert!(is_transition_allowed(
+            AgentSessionState::Archived,
+            AgentSessionState::Idle
+        ));
+        assert!(is_transition_allowed(
+            AgentSessionState::Archived,
+            AgentSessionState::Closed
         ));
     }
 

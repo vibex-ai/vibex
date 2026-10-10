@@ -220,6 +220,9 @@ at most 16 same-workspace members and four live panes. Hidden tabs retain metada
 `appliedLayout`/degradation. Manual edits release Agent ownership and fence late replies/recovery. [Automatic
 layout](../../../crates/desktop-model/src/session_group.rs) uses 24rem per column: below 48rem tabs; three lead/workers
 use columns at 72rem; four use a grid when two columns fit. Preserve selected tab and manual ownership.
+Batch membership moves/removals persist every affected group at one client revision, including emptied source groups.
+Destination capacity is checked before removing source members. Rejected members keep their source membership and
+presentation ownership; only groups whose membership changed are persisted.
 
 ## 4. Validation & Error Matrix
 

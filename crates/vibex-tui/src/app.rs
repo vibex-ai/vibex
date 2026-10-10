@@ -740,6 +740,8 @@ pub struct App {
     pub filter: String,
     pub filtering: bool,
     pub show_archived: bool,
+    /// A root-list invalidation received while its previous read is in flight.
+    session_list_refresh_pending: bool,
     pub session_title: Option<String>,
     pub live: LiveState,
     pub pending: BTreeMap<String, ()>,
@@ -1398,6 +1400,7 @@ impl App {
             filter: String::new(),
             filtering: false,
             show_archived: false,
+            session_list_refresh_pending: false,
             session_title: None,
             live: LiveState::Connecting,
             pending: BTreeMap::new(),
@@ -2140,6 +2143,27 @@ impl App {
     pub fn active_workspace_id(&self) -> Option<vibex_core::WorkspaceId> {
         self.active_session()
             .map(|session| session.workspace_id.clone())
+    }
+
+    /// Coalesces list reads while retaining one refresh after the current read.
+    pub(crate) fn refresh_session_list(&mut self) -> Option<Effect> {
+        if self.agent.state.sessions.is_loading() {
+            self.session_list_refresh_pending = true;
+            return None;
+        }
+        self.session_list_refresh_pending = false;
+        self.agent.begin_sessions_refresh();
+        Some(Effect::ListSessions {
+            include_archived: self.show_archived,
+        })
+    }
+
+    pub(crate) fn pending_session_list_refresh(&mut self) -> Option<Effect> {
+        if std::mem::take(&mut self.session_list_refresh_pending) {
+            self.refresh_session_list()
+        } else {
+            None
+        }
     }
 
     /// Sidebar rows for the current filter, with the reader's grouping applied.
@@ -5537,6 +5561,11 @@ pub enum Effect {
     ArchiveSession {
         session_id: VibexSessionId,
     },
+    /// Restores an archived session to the list. Unlike archiving this is not
+    /// destructive, so the reader is not asked to confirm it.
+    UnarchiveSession {
+        session_id: VibexSessionId,
+    },
     DeleteSession {
         session_id: VibexSessionId,
     },
@@ -5717,6 +5746,7 @@ impl Effect {
             Effect::CreateSession { .. } => "create_session",
             Effect::RenameSession { .. } => "rename_session",
             Effect::ArchiveSession { .. } => "archive_session",
+            Effect::UnarchiveSession { .. } => "unarchive_session",
             Effect::DeleteSession { .. } => "delete_session",
             Effect::ForkSession { .. } => "fork_session",
             Effect::ReadClipboard { .. } => "read_clipboard",

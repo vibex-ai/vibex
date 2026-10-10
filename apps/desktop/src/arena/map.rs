@@ -1,11 +1,25 @@
 //! Encounter terrain. The same footprints drive drawing, cover and navigation.
 
 use super::{
-    geometry::{HEIGHT, Vec2, WIDTH, segment_distance},
+    geometry::{HEIGHT, Vec2, WIDTH, circle_hit},
     guardian::Guardian,
 };
 
 pub(super) const CENTER: Vec2 = Vec2::new(WIDTH * 0.5, HEIGHT * 0.5);
+pub(super) const MAX_SCARS: usize = 48;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScarKind {
+    Crack,
+    Scorch,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Scar {
+    pub position: Vec2,
+    pub radius: f32,
+    pub kind: ScarKind,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Pillar {
@@ -20,6 +34,8 @@ pub(super) struct Map {
     /// Broken columns remain rubble for this encounter; perimeter impacts still
     /// open the rolling guardian, so missing an opening cannot exhaust the puzzle.
     pub broken: u8,
+    pub sunken: u8,
+    pub scars: Vec<Scar>,
 }
 
 const GARDEN: [Pillar; 4] = pillars(
@@ -50,6 +66,8 @@ pub(super) const DAIS: [Vec2; 3] = [
     Vec2::new(53.0, 76.0),
     Vec2::new(123.0, 76.0),
 ];
+pub(super) const SEALS: [Vec2; 2] = [Vec2::new(57.0, 64.0), Vec2::new(119.0, 64.0)];
+pub(super) const SEAL_RADIUS: f32 = 5.5;
 
 const fn pillars<const N: usize>(
     positions: [(f32, f32); N],
@@ -74,6 +92,8 @@ impl Map {
         Self {
             guardian,
             broken: 0,
+            sunken: 0,
+            scars: Vec::with_capacity(MAX_SCARS),
         }
     }
 
@@ -146,51 +166,63 @@ impl Map {
     }
 
     pub fn pillar_hit(&self, from: Vec2, to: Vec2, radius: f32) -> Option<usize> {
-        self.pillars().iter().enumerate().find_map(|(ix, pillar)| {
-            (self.intact(ix)
-                && segment_distance(pillar.position, from, to) <= radius + pillar.radius)
-                .then_some(ix)
-        })
+        self.pillars()
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| self.intact(*ix))
+            .filter_map(|(ix, p)| {
+                circle_hit(p.position, from, to, radius + p.radius).map(|t| (ix, t))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(ix, _)| ix)
     }
 
     /// Projectiles meet the visible column face, which extends north of its
     /// footprint by its height. Movement continues to use ground circles.
     pub fn cover_hit(&self, from: Vec2, to: Vec2) -> bool {
-        self.pillars().iter().enumerate().any(|(ix, pillar)| {
-            if !self.intact(ix) {
-                return false;
-            }
-            let low = Vec2::new(
-                pillar.position.x - pillar.radius,
-                pillar.position.y - pillar.height - pillar.radius * 0.5,
-            );
-            let high = Vec2::new(
-                pillar.position.x + pillar.radius,
-                pillar.position.y + pillar.radius * 0.5,
-            );
-            let delta = to.minus(from);
-            let mut enter: f32 = 0.0;
-            let mut leave: f32 = 1.0;
-            for (origin, step, low, high) in [
-                (from.x, delta.x, low.x, high.x),
-                (from.y, delta.y, low.y, high.y),
-            ] {
-                if step.abs() < f32::EPSILON {
-                    if origin < low || origin > high {
-                        return false;
-                    }
-                } else {
-                    let a = (low - origin) / step;
-                    let b = (high - origin) / step;
-                    enter = enter.max(a.min(b));
-                    leave = leave.min(a.max(b));
-                    if enter > leave {
-                        return false;
+        self.cover_contact(from, to).is_some()
+    }
+
+    pub fn cover_contact(&self, from: Vec2, to: Vec2) -> Option<(usize, f32)> {
+        self.pillars()
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, pillar)| {
+                if !self.intact(ix) {
+                    return None;
+                }
+                let low = Vec2::new(
+                    pillar.position.x - pillar.radius,
+                    pillar.position.y - pillar.height - pillar.radius * 0.5,
+                );
+                let high = Vec2::new(
+                    pillar.position.x + pillar.radius,
+                    pillar.position.y + pillar.radius * 0.5,
+                );
+                let delta = to.minus(from);
+                let mut enter: f32 = 0.0;
+                let mut leave: f32 = 1.0;
+                for (origin, step, low, high) in [
+                    (from.x, delta.x, low.x, high.x),
+                    (from.y, delta.y, low.y, high.y),
+                ] {
+                    if step.abs() < f32::EPSILON {
+                        if origin < low || origin > high {
+                            return None;
+                        }
+                    } else {
+                        let a = (low - origin) / step;
+                        let b = (high - origin) / step;
+                        enter = enter.max(a.min(b));
+                        leave = leave.min(a.max(b));
+                        if enter > leave {
+                            return None;
+                        }
                     }
                 }
-            }
-            true
-        })
+                Some((ix, enter))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
     pub fn beam_end(&self, from: Vec2, direction: Vec2) -> Vec2 {
@@ -207,10 +239,44 @@ impl Map {
 
     pub fn on_island(&self, p: Vec2) -> bool {
         self.guardian == Guardian::DeepSeek
-            && ISLANDS.iter().any(|(center, radius)| {
+            && ISLANDS.iter().enumerate().any(|(ix, (center, radius))| {
                 let d = p.minus(*center);
-                (d.x / radius).powi(2) + (d.y / (radius * 0.68)).powi(2) < 1.0
+                self.sunken & (1 << ix) == 0
+                    && (d.x / radius).powi(2) + (d.y / (radius * 0.68)).powi(2) < 1.0
             })
+    }
+
+    pub fn break_islands(&mut self, position: Vec2, radius: f32) -> u8 {
+        let before = self.sunken;
+        for (ix, (center, island_radius)) in ISLANDS.iter().enumerate() {
+            let d = position.minus(*center);
+            if (d.x / (island_radius + radius)).powi(2)
+                + (d.y / (island_radius * 0.68 + radius)).powi(2)
+                < 1.0
+            {
+                self.sunken |= 1 << ix;
+            }
+        }
+        self.sunken ^ before
+    }
+
+    pub fn scar(&mut self, position: Vec2, radius: f32, kind: ScarKind) {
+        if let Some(scar) = self
+            .scars
+            .iter_mut()
+            .find(|scar| scar.kind == kind && scar.position.minus(position).length() < 3.0)
+        {
+            scar.radius = scar.radius.max(radius);
+            return;
+        }
+        if self.scars.len() == MAX_SCARS {
+            self.scars.remove(0);
+        }
+        self.scars.push(Scar {
+            position,
+            radius,
+            kind,
+        });
     }
 
     pub fn speed(&self, p: Vec2) -> f32 {
@@ -222,6 +288,21 @@ impl Map {
     }
 
     pub fn spawn(&self, seed: &mut u32, avoid: Vec2) -> Vec2 {
+        if self.guardian == Guardian::DeepSeek && self.sunken != 0b1111 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 17;
+            *seed ^= *seed << 5;
+            for offset in 0..4 {
+                let ix = (*seed as usize + offset) % 4;
+                let (center, radius) = ISLANDS[ix];
+                let angle = (*seed >> 8) as f32 * 0.01;
+                let p =
+                    center.plus(Vec2::new(angle.cos(), angle.sin() * 0.68).scale(radius * 0.35));
+                if self.sunken & (1 << ix) == 0 && p.minus(avoid).length() > 29.0 {
+                    return p;
+                }
+            }
+        }
         let mut best = CENTER.plus(Vec2::new(0.0, 30.0));
         let mut distance = -1.0;
         for _ in 0..80 {

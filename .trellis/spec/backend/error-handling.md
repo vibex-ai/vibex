@@ -193,126 +193,84 @@ fn file_copy(
 
 ### 1. Scope / Trigger
 
-- Trigger: Desktop file tree Open In actions launch a selected workspace path
-  with the OS default app or native terminal.
-- These commands are desktop-only shell integrations, not Vibex PTY terminal
-  sessions and not frontend-only absolute path concatenation.
+Desktop file-tree and preview actions open an existing file or directory in the
+OS default app, file manager, native terminal or an installed project tool.
+Platform openers run on the client; the backend decides whether a workspace path
+is local to that client.
 
 ### 2. Signatures
 
-```text
-file_open_default_app(FileMutationRequest) -> ()
-file_open_native_terminal(FileMutationRequest) -> ()
-file_open_tool_list() -> FileOpenTool[]
-file_open_with_tool(FileOpenWithToolRequest) -> ()
-FileMutationRequest {
-  workspace_id,
-  path,
-  new_path,
-  recursive,
-  overwrite
-}
-FileOpenTool {
-  id,
-  label,
-  kind: fileManager | terminal | ide
-}
-FileOpenWithToolRequest {
-  workspace_id,
-  path,
-  tool_id
-}
+```rust
+FileBackend::resolve_local_path(WorkspaceId, String)
+    -> BackendFuture<Option<PathBuf>>
+CodeWorkbench::local_open_path(&mut self, path, cx)
+resolve_external_open_path(backend, workspace_id, path, directory)
+    -> Result<PathBuf, BackendError>
 ```
+
+`NativeBackend` delegates to `FileHandle::resolve_existing_path`, which uses
+`WorkspaceFileService::resolve_existing_path`. The default backend implementation
+returns `None`; it does not expose or reinterpret a remote filesystem path.
 
 ### 3. Contracts
 
-- Resolve `path` through `WorkspaceFileService::resolve_existing_path` before
-  launching any process so relative UI paths cannot escape the workspace root.
-- Default App may open files or directories and should use platform-specific
-  system openers such as macOS `open`, Windows `cmd /C start`, and Linux
-  desktop opener fallbacks.
-- Native Terminal opens the target directory directly; when the target is a
-  file, it opens the file's parent directory.
-- Missing paths return structured validation errors from the file service.
-- Failed process spawns return `Process/file_open_*` errors with redacted
-  diagnostics such as the attempted opener, not raw unchecked UI paths.
-- `file_open_tool_list` always includes File Manager and Native Terminal, then
-  appends only detected IDE/project tools such as VS Code, Cursor, Windsurf,
-  Zed, JetBrains IDEs, Sublime Text, or Xcode.
-- `file_open_with_tool` must resolve the workspace-relative path first, then
-  dispatch to the selected built-in opener or detected project tool. Unknown or
-  unavailable tool ids must not fall through to a shell string.
+- Native resolution validates the workspace and containment before returning
+  `Some(path)`. An empty relative path resolves to the workspace root. Files,
+  directories and allowed symlink targets retain the file service's semantics.
+- Local openers receive the actual file or directory, never a preview-cache
+  copy. Editing in another application must change the workspace file; terminals
+  must use the selected directory or the selected file's parent.
+- A remote file may be materialized through the bounded authoritative byte read
+  before opening locally. A remote directory cannot be materialized as a file:
+  report `remote_directory_open_unavailable` and offer the workspace terminal.
+- Never infer local authority from the existence of a server-supplied path on
+  the client's filesystem. Only the backend's validated `Some(path)` grants the
+  local path fast path.
+- The editor remains unavailable for directories and known binary formats.
+  Installed tool discovery controls the project-tool list, and an unknown tool
+  id must not fall through to arbitrary shell text.
 
 ### 4. Validation & Error Matrix
 
-- Missing or escaped path -> `Validation/file_path_missing` or the existing
-  file-service path validation error.
-- Native Terminal target is a file without a parent directory ->
-  `Validation/file_open_native_terminal_parent_missing`.
-- Default App opener spawn fails -> `Process/file_open_default_app_failed`.
-- Default App opener is unavailable on Linux ->
-  `Process/file_open_default_app_unavailable`.
-- File Manager target is a file without a parent directory ->
-  `Validation/file_open_file_manager_parent_missing`.
-- File Manager opener spawn fails -> `Process/file_open_file_manager_failed`.
-- Native Terminal spawn fails -> `Process/file_open_native_terminal_failed`.
-- Native Terminal opener is unavailable on Linux ->
-  `Process/file_open_native_terminal_unavailable`.
-- Open With tool id is unknown -> `Validation/file_open_tool_unknown`.
-- Open With tool id is known but not installed/detected ->
-  `Process/file_open_tool_unavailable`.
-- Open With project tool spawn fails -> `Process/file_open_tool_failed`.
+| Condition | Result |
+| --- | --- |
+| Native file, folder or empty root path | Validated original path |
+| Missing or escaped native path | Existing file-service validation error |
+| Remote file | Bounded local materialization |
+| Remote directory | `Unsupported/remote_directory_open_unavailable` |
+| Missing local external file | `local_file_missing` |
+| Unknown or unavailable tool | `file_open_tool_unknown` or `file_open_tool_unavailable` |
+| Platform opener fails | Existing `file_open_*` process error |
 
 ### 5. Good/Base/Bad Cases
 
-- Good: `file_open_default_app` receives `docs/readme.md`, resolves it inside
-  the workspace, then launches the OS default app.
-- Good: `file_open_native_terminal` receives `docs/readme.md` and launches the
-  native terminal with `docs/` as the working directory.
-- Base: empty `path` resolves to the workspace root and can be opened in the
-  default app or native terminal.
-- Good: `file_open_tool_list` returns File Manager, Native Terminal, and only
-  detected project tools; the frontend dropdown does not show unavailable IDEs.
-- Good: `file_open_with_tool` receives `tool_id=cursor`, verifies the Cursor
-  CLI or app exists, and spawns it with the resolved workspace path.
-- Bad: React computes an absolute path from `workspaceRootPath` and calls a
-  shell/open plugin directly for Default App or Native Terminal.
-- Bad: Native Terminal routes through Vibex PTY terminal creation before the PTY
-  shell workflow is explicitly designed.
-- Bad: `file_open_with_tool` accepts arbitrary shell command text from the UI.
+- Good: opening `docs/readme.md` in an IDE edits that workspace file; opening
+  `docs` or the empty root path does not attempt a byte read.
+- Base: a remote file opens a downloaded copy on this machine.
+- Bad: route every Open In action through `materialize_preview_file`, which
+  rejects directories and sends local files to a temporary cache.
+- Bad: concatenate a workspace root in the UI and bypass backend validation.
 
 ### 6. Tests Required
 
-- Unit test `WorkspaceFileService::resolve_existing_path` preserves existing
-  path traversal protection and resolves empty path to the workspace root.
-- Command-level smoke or mocked-process test should verify Default App resolves
-  through the file service before launching a platform opener.
-- Command-level smoke or mocked-process test should verify Native Terminal uses
-  the target directory for directories and the parent directory for files.
-- Frontend type/check coverage should keep Open In Editor disabled for known
-  binary-like extensions while Default App and Native Terminal remain available
-  for existing workspace paths.
-- Unit or command-level tests should verify `file_open_with_tool` rejects
-  unknown ids before process spawn and only launches tools from the static
-  detected-tool registry.
+`code_workbench::file_panel_tests` must assert that native files, directories and
+root resolve to their original canonical paths, and that missing/traversing
+paths fail. Remote directory resolution must fail before any file byte read.
+Changes to platform openers must also cover directory/file-parent behavior and
+installed-tool checks.
 
 ### 7. Wrong vs Correct
 
-#### Wrong
-
-```typescript
-const absolutePath = `${workspaceRootPath}/${target.path}`;
-await openPath(absolutePath);
+```rust
+// Wrong: a directory is not a file preview, and a local editor needs the original.
+materialize_preview_file(backend, workspace_id, path).await
 ```
 
-#### Correct
-
-```typescript
-await api.fileOpenDefaultApp({
-  workspaceId,
-  path: target.path,
-  newPath: null,
-  recursive: false,
-  overwrite: false
-});
+```rust
+// Correct: ask the authority for a validated local path before downloading bytes.
+if let Some(local) = backend.file()
+    .resolve_local_path(workspace_id.clone(), path.to_string()).await?
+{
+    return Ok(local);
+}
 ```

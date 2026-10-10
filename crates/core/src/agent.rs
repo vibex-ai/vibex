@@ -19,6 +19,7 @@ use crate::workspace::WorkspaceMode;
 
 pub const MAX_MESSAGE_IDEMPOTENCY_KEY_LEN: usize = 256;
 pub const MAX_AGENT_SESSION_TITLE_CHARS: usize = 120;
+pub const MAX_ARCHIVED_SESSION_PAGE_SIZE: usize = 500;
 pub const AGENT_ATTENTION_NOTIFICATION_TTL_MS: i64 = 15 * 60 * 1000;
 pub const AGENT_TERMINAL_NOTIFICATION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 

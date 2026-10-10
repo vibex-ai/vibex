@@ -1127,6 +1127,14 @@ pub struct SessionUiState {
     /// a restart; a new request changes the set and brings the alert back.
     #[serde(default)]
     pub dismissed_permission_alerts: BTreeMap<String, String>,
+    /// Rest a top-level session once it has been inactive for this many days.
+    ///
+    /// `None` keeps automatic archiving off, which is the default: archiving is
+    /// a visibility change the reader should opt into. Pinned sessions, sessions
+    /// with a live turn and delegated children are never touched, and a session
+    /// that is already archived stays archived.
+    #[serde(default)]
+    pub auto_archive_after_days: Option<u8>,
 }
 
 impl Default for SessionUiState {
@@ -1144,6 +1152,7 @@ impl Default for SessionUiState {
             auto_continue_session_overrides: BTreeMap::new(),
             auto_continue_paused_session_ids: BTreeSet::new(),
             dismissed_permission_alerts: BTreeMap::new(),
+            auto_archive_after_days: None,
         }
     }
 }
@@ -3097,6 +3106,7 @@ mod tests {
             SessionUiState::default().reasoning_expansion_mode,
             ReasoningExpansionMode::Window
         );
+        assert_eq!(SessionUiState::default().auto_archive_after_days, None);
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         let session = value
@@ -3113,6 +3123,7 @@ mod tests {
         session.remove("autoContinueSessionOverrides");
         session.remove("autoContinuePausedSessionIds");
         session.remove("dismissedPermissionAlerts");
+        session.remove("autoArchiveAfterDays");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -3132,6 +3143,14 @@ mod tests {
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
         assert!(decoded.session.auto_continue_paused_session_ids.is_empty());
         assert!(decoded.session.dismissed_permission_alerts.is_empty());
+        // Automatic archiving is opt-in: state written before the setting
+        // existed must come back with it off rather than with a default window.
+        assert_eq!(decoded.session.auto_archive_after_days, None);
+
+        let mut persisted = DesktopUiStateV1::default();
+        persisted.session.auto_archive_after_days = Some(30);
+        let round_tripped = decode_and_migrate(&serde_json::to_vec(&persisted).unwrap()).unwrap();
+        assert_eq!(round_tripped.session.auto_archive_after_days, Some(30));
     }
 
     #[test]

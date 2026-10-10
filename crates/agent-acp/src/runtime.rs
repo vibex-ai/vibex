@@ -4587,10 +4587,16 @@ impl AcpSessionAttachment {
         }
         match kind {
             "session_info_update" => {
-                if let Some(title) = update
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .and_then(vibex_core::normalize_agent_session_title)
+                // A forwarded child transcript carries the child's own title,
+                // which the Agent derives from the prompt the parent delegated
+                // to it. Only the root session may rename itself: applying a
+                // child's title here replaces the parent's title — and its
+                // sidebar row — with a delegation prompt.
+                if subagent.is_none()
+                    && let Some(title) = update
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .and_then(vibex_core::normalize_agent_session_title)
                 {
                     self.emit_turn_event(AcpEvent::SessionTitle { title });
                 }
@@ -34863,6 +34869,64 @@ for line in sys.stdin:
         assert!(matches!(
             events.as_slice(),
             [AcpEvent::SessionTitle { title }] if title == "Plan release work"
+        ));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// A forwarded child transcript shares the root session's update stream, so
+    /// the child's own title — the prompt the parent delegated to it — must not
+    /// rename the root session the user is watching.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_subagent_titles_do_not_rename_the_root_session() {
+        let Some(fixture) = MockAcpFixture::create("subagent-info-title") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: fixture_mcp_resources(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let payload = client.current_attachment(&session_id).unwrap().payload();
+
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "title": "You are doing READ-ONLY source-code research",
+                "_meta": {
+                    "dsh": {
+                        "subagent": {
+                            "state": "started",
+                            "runId": "run-1",
+                            "childSessionId": "child-1",
+                            "provider": "explore",
+                            "local": true
+                        }
+                    }
+                }
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "title": "Session archive research"
+            }
+        }));
+        let events = payload.finish_turn(false).unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [AcpEvent::SessionTitle { title }] if title == "Session archive research"
         ));
 
         client.close_session(&binding).await.unwrap();

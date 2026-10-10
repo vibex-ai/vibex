@@ -463,6 +463,33 @@ pane still split it. A drag that has not left its own pane cannot reorder tabs,
 so below the tab strip it reads as a split on the axis the pointer left the
 pane's center along.
 
+Workbench state that a split shares has to be scoped to the pane when the
+surface it drives is per-pane. The Composer geometry (surface, input and runtime
+trigger bounds), the runtime menu flags, and every popover element id are read or
+keyed per pane: a popover keeps its open state under its element id and the
+command menu anchors to the bounds it recorded, so one shared copy either opens
+the control in every pane at once or anchors it to whichever pane painted last.
+The geometry therefore lives on the session view, and because prepaint runs after
+the element tree is built — with the workspace already pointing the workbench
+back at the focused pane — a pane's measurement is parked by session id
+(`pending_composer_geometries`) and adopted by that view the next time the pane
+renders. Menu flags stay on the workbench but are honoured only by the pane whose
+borrowed view is the selected session (`composer_menu_scope_focused`), and ids
+carry the pane's session (`composer_menu_scope`).
+
+A drag source must also suppress window-level text selection on its press. GPUI's
+selection layer anchors at any press that does not ask it not to, and while a
+drag is live it ignores the pointer, so the selection is extended by the moves
+that follow the release — a resize left a paragraph selected in the pane beside
+the seam. A control that owns a press or drag calls
+`gpui_base::GlobalState::suppress_text_selection` from a bubble-phase mouse-down
+handler. A resizable divider cannot: its grab band occludes, so no ancestor of it
+is in the press's bubble path. Group splits therefore paint a guard band
+(`session_group_split_guard`) in front of each divider — normal hit behavior, so
+the divider underneath still reads as hovered and still owns the drag — whose own
+press suppresses the selection; the band covers exactly the divider's grab area,
+placed from the shares the layout already stores.
+
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks
 that expand/collapse sessions or activate a project are internal sidebar
@@ -640,6 +667,14 @@ mounted, so it takes the row's generating gate (`display_state == Running`,
 which already folds in the optimistic local dispatch) and nothing weaker — a
 parked, scheduled, initializing, or idle row keeps the plain truncated title
 with no animation. Its element ID is scoped to the row's session.
+
+A session tab in a group pane's strip is the same row in a narrower lane, so it
+resolves the same two things from the same places: the title takes `ShimmerText`
+under the same `display_state == Running` gate with the shared duration and
+spread, and the trailing slot draws `session_status_mark_for` — the row's own
+builder, so a spinner, an attention glyph and a dot cannot drift apart between
+the two surfaces. The tab's own projection folds in the optimistic local dispatch
+and the requests parked on the user exactly as the row's does.
 
 ## Timeline Cards
 
@@ -911,6 +946,43 @@ vertical and horizontal `ScrollWheelEvent` values inside the diff, and assert
 the diff handle offsets, the parent offset remaining zero, and a late row's
 changed bounds for the vertical path. Compile-only checks and source-string
 assertions do not exercise GPUI layout, wheel routing, or event propagation.
+
+### GPUI File Tree Menus And Inline Editing
+
+`CodeRightRail` owns the context target and the name input. The file tree has one
+context-menu trigger. Capture the right press from the tree to the row and then
+the compact-directory segment, so the most specific path wins before the menu's
+deferred builder runs. Do not nest row and empty-space popup triggers: two menus
+for one press can cover each other, making the first command act on the workspace
+root and leaving the other popup visible afterward. Cover the first press with
+a real pointer test.
+
+The open menu snapshots its target. `file_context_target` retains the popup's
+entity id and target path until `DismissEvent`, so the row keeps its full-row
+selection frame after the pointer moves into the menu. Ignore dismissal from a
+previous popup after a new target has opened. Copy paths, clipboard commands,
+rename and delete must all use that same snapshot; the delete menu label is
+simply `Delete`, with the affected path shown in the confirmation.
+
+Creating an entry expands the target directory, inserts the blank input directly
+beneath it, scrolls it into view and focuses it after the menu closes. Selecting
+a compact directory segment first exposes the correct parent for insertion.
+Enter or blur submits a nonempty name; empty blur and Escape cancel without a
+mutation. Rename shares the retained input, and clicking it must not focus its
+containing directory row. Finishing or canceling restores tree focus only while
+the input owns focus; a blur keeps the user's new focus destination. Validation
+appears beneath the input and wraps within the pane.
+
+Keep the input and action until `FileMutationFinished` arrives. A submitting
+input is read-only, so Enter followed by blur cannot submit twice or lose the
+draft. A failed mutation restores editing with the name and error intact.
+Completion and UI state are fenced by the workspace generation; switching
+workspaces clears the draft, context target and file clipboard.
+
+`code_workbench::file_panel_tests` exercises first-click copy/cut, current-target
+clipboard values, compact-segment targets, menu dismissal, name-input focus,
+cancellation and native file mutations. Rendering or compilation alone does not
+prove the event ordering.
 
 ### File Tree Icons
 

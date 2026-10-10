@@ -366,8 +366,17 @@ impl App {
                 }])
             }
             Intent::ArchiveSession => {
-                if self.list_session_target().is_none() {
+                let Some(session_id) = self.list_session_target() else {
                     return Outcome::quiet();
+                };
+                // One gesture, two directions: a session that is already in the
+                // archived list is restored, and nothing is destroyed either
+                // way, so only archiving asks for confirmation.
+                if self
+                    .session_by_id(&session_id)
+                    .is_some_and(|session| session.archived_at_ms.is_some())
+                {
+                    return Outcome::effects(vec![Effect::UnarchiveSession { session_id }]);
                 }
                 self.overlay = Some(Overlay::Confirm {
                     title: self.strings.session_archive().to_string(),
@@ -376,6 +385,12 @@ impl App {
                 });
                 self.set_selection(Scope::Overlay, 0);
                 Outcome::effects(vec![])
+            }
+            Intent::UnarchiveSession => {
+                let Some(session_id) = self.list_session_target() else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::UnarchiveSession { session_id }])
             }
             Intent::DeleteSession => {
                 if self.list_session_target().is_none() {
@@ -1544,6 +1559,12 @@ impl App {
                 };
                 Outcome::effects(vec![Effect::ArchiveSession { session_id }])
             }
+            Intent::UnarchiveSession => {
+                let Some(session_id) = self.list_session_target() else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::UnarchiveSession { session_id }])
+            }
             Intent::RevokeSelectedDevice => {
                 let index = self.selection_for(Scope::Devices);
                 let Some(device) = self.management_data.devices.get(index) else {
@@ -1973,10 +1994,10 @@ impl App {
         // still running — is derived from it, and none of that may be wrong
         // because the reader happened to start on the prompt. Once it is read
         // the state is kept, so `n` from the list does not read it again.
-        if self.agent.state.sessions.value.is_none() {
-            effects.push(Effect::ListSessions {
-                include_archived: self.show_archived,
-            });
+        if self.agent.state.sessions.value.is_none()
+            && let Some(effect) = self.refresh_session_list()
+        {
+            effects.push(effect);
         }
         Outcome::effects(effects)
     }
@@ -3070,17 +3091,16 @@ impl App {
     /// They travel together because the list is the arrangement applied to the
     /// sessions; a client that fetched one without the other would draw a tree
     /// that is already stale on arrival.
-    fn session_page_effects(&self) -> Vec<Effect> {
-        vec![
-            Effect::ListSessions {
-                include_archived: self.show_archived,
-            },
+    fn session_page_effects(&mut self) -> Vec<Effect> {
+        let mut effects = self.refresh_session_list().into_iter().collect::<Vec<_>>();
+        effects.extend([
             // Project rows are named by the runtime's project records, which is
             // what the desktop's sidebar shows; the session list alone would
             // spell the directory instead.
             Effect::ListWorkspaces,
             Effect::LoadSidebarOrganization,
-        ]
+        ]);
+        effects
     }
 
     fn refresh_current_page(&mut self) -> Outcome {
@@ -5149,6 +5169,37 @@ mod tests {
             Some(&open.id),
             "the list key moved the reader's session"
         );
+    }
+
+    #[test]
+    fn archiving_an_archived_row_restores_it_without_asking() {
+        // The gesture is a toggle: the row under the cursor picks the
+        // direction, and only retiring a session asks for confirmation.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        let mut archived = openable_session("session_archived001");
+        archived.archived_at_ms = Some(1);
+        app.agent
+            .apply_sessions(Ok(vec![archived.clone()]))
+            .expect("sessions apply");
+        app.navigate_to(Page::Sessions);
+        let cursor = app
+            .sidebar_rows()
+            .iter()
+            .position(|row| row.session_id.as_ref() == Some(&archived.id))
+            .expect("the archived session has a row");
+        app.set_selection(Scope::Sessions, cursor);
+
+        let restored = app.perform(Intent::ArchiveSession);
+        assert!(
+            app.overlay.is_none(),
+            "restoring destroys nothing, so it asks nothing: {:?}",
+            app.overlay
+        );
+        let [Effect::UnarchiveSession { session_id }] = restored.effects.as_slice() else {
+            panic!("expected one restore, got {restored:?}");
+        };
+        assert_eq!(session_id, &archived.id);
     }
 
     #[test]
