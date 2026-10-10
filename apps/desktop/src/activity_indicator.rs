@@ -1,24 +1,24 @@
 //! Activity marks for live timeline labels and compact sidebar rows.
 //!
-//! The timeline's V sweeps a highlight along its strokes; the sidebar sends a
-//! diagonal wave through a dot matrix. Both use a synchronized, bounded
-//! clock and a fixed, rem-sized canvas so motion never reflows adjacent text.
+//! The timeline's V sweeps a highlight along its strokes; the sidebar reuses
+//! the TUI's Braille spinner at a faster cadence. Both use synchronized, bounded
+//! clocks and fixed, rem-sized slots so motion never reflows adjacent text.
 
 use std::f32::consts::{PI, TAU};
 use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ElementId, Hsla, IntoElement, ParentElement as _,
-    RenderOnce, Styled as _, Window, canvas, div, fill, point, size,
+    RenderOnce, Styled as _, Window, canvas, div, fill, point, relative, size,
 };
 use gpui_component::ActiveTheme as _;
+use vibex_tui::glyphs::{self, GlyphTier};
 
 use crate::motion;
 
-const CYCLE: Duration = Duration::from_millis(2100);
-// Both waves share a smooth, bounded sample rate independent of display refresh.
-const MAX_FPS: f32 = 30.0;
-const SIDEBAR_GRID_SIDE: usize = 5;
+const TIMELINE_CYCLE: Duration = Duration::from_millis(2100);
+const TIMELINE_MAX_FPS: f32 = 30.0;
+const SIDEBAR_FRAME_DURATION: Duration = Duration::from_millis(100);
 
 // Normalized cell centers follow the V from its left tip to its right tip.
 // These are glyph coordinates; the enclosing slot owns the interface scale.
@@ -54,7 +54,7 @@ impl ActivityIndicator {
         }
     }
 
-    /// A dot-matrix mark in a fixed sidebar status slot.
+    /// The TUI's Braille spinner in a fixed sidebar status slot.
     /// The owning row scopes `id` to its session, group, or workspace.
     pub(crate) fn sidebar(id: impl Into<ElementId>) -> Self {
         Self {
@@ -72,9 +72,21 @@ impl ActivityIndicator {
 impl RenderOnce for ActivityIndicator {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Self { id, style, color } = self;
-        let (slot, default_color) = match style {
-            ActivityStyle::Timeline => (div().size_4(), cx.theme().foreground),
-            ActivityStyle::Sidebar => (div().size_5(), cx.theme().primary),
+        let (slot, default_color, cycle, max_fps) = match style {
+            ActivityStyle::Timeline => (
+                div().size_4(),
+                cx.theme().foreground,
+                TIMELINE_CYCLE,
+                TIMELINE_MAX_FPS,
+            ),
+            ActivityStyle::Sidebar => (
+                div()
+                    .size_5()
+                    .font_family(cx.theme().mono_font_family.clone()),
+                cx.theme().primary,
+                SIDEBAR_FRAME_DURATION * glyphs::spinner_frames(GlyphTier::Full).len() as u32,
+                1.0 / SIDEBAR_FRAME_DURATION.as_secs_f32(),
+            ),
         };
         let slot = slot.flex_none();
         let color = color.unwrap_or(default_color);
@@ -89,7 +101,7 @@ impl RenderOnce for ActivityIndicator {
 
         slot.with_animation(
             id,
-            Animation::new(CYCLE).repeat_synced().with_max_fps(MAX_FPS),
+            Animation::new(cycle).repeat_synced().with_max_fps(max_fps),
             move |this, phase| this.child(render_mark(Some(phase))),
         )
         .into_any_element()
@@ -126,39 +138,18 @@ fn timeline_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
 }
 
 fn sidebar_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let extent = bounds.size.width.min(bounds.size.height);
-            let center = bounds.center();
-            let last = (SIDEBAR_GRID_SIDE - 1) as f32;
-            let pitch = extent * 0.72 / last;
+    let frames = glyphs::spinner_frames(GlyphTier::Full);
+    let step = (phase.unwrap_or(0.0) * frames.len() as f32) as u32;
 
-            // Fixed dot centers keep the matrix crisp. The diagonal phase delay
-            // carries one soft wave across it, with enough overlap at the loop
-            // boundary to keep the running cue visible throughout the cycle.
-            for row in 0..SIDEBAR_GRID_SIDE {
-                for column in 0..SIDEBAR_GRID_SIDE {
-                    let intensity = phase.map_or(1.0, |phase| {
-                        let offset = (row + column) as f32 / last * 0.36;
-                        let wave = 0.5 + 0.5 * ((phase - offset) * TAU).cos();
-                        wave * wave
-                    });
-                    let diameter = extent * (0.075 + 0.055 * intensity);
-                    let origin = point(
-                        center.x + pitch * (column as f32 - last * 0.5) - diameter * 0.5,
-                        center.y + pitch * (row as f32 - last * 0.5) - diameter * 0.5,
-                    );
-                    window.paint_quad(
-                        fill(
-                            Bounds::new(origin, size(diameter, diameter)),
-                            color.opacity(0.30 + 0.70 * intensity),
-                        )
-                        .corner_radii(diameter * 0.5),
-                    );
-                }
-            }
-        },
-    )
-    .size_full()
+    // Keep the actual TUI glyphs and frame order. Each frame occupies the same
+    // centered slot and holds at full contrast until the next discrete step.
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xl()
+        .line_height(relative(1.0))
+        .text_color(color)
+        .child(glyphs::frame_at(frames, step, 1))
 }

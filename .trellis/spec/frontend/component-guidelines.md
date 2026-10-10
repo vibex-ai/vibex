@@ -618,13 +618,14 @@ The fixed rem-sized canvas changes only cell brightness, preserving adjacent
 text and row geometry. Keep the frame budget bounded, and render a fully
 visible static V for reduced motion or the opt-in inactive-window pause.
 Only live turns show the timeline mark. Sidebar session, group, and workspace
-rows use `ActivityIndicator::sidebar(id)`: a regular 5×5 matrix of circular dots
-in a fixed `size_5()` slot. A diagonal wave changes each dot's brightness and
-diameter while its center stays fixed; dim dots retain the matrix silhouette.
-Keep dots separate even at peak size, with all paint inside the canvas, and
-sample both activity styles at a bounded 30 fps on the shared cycle. Scope the
-animation ID under the domain-keyed row, and show the full matrix at steady
-brightness for reduced motion or the opt-in inactive-window pause.
+rows use `ActivityIndicator::sidebar(id)`: the TUI's Unicode Braille spinner,
+directly reusing `vibex_tui::glyphs::spinner_frames(GlyphTier::Full)` and
+`frame_at`. Center the glyph in a fixed `size_5()` slot with the theme's
+monospace font, `text_xl()`, and a single-height line box. Hold each frame at
+full contrast for 100ms: the eight-frame cycle takes 800ms, with frame requests
+bounded to the same cadence. The timeline keeps its separate 2100ms cycle and
+30 fps budget. Scope animation IDs under the domain-keyed row, and hold the
+first spinner frame for reduced motion or the opt-in inactive-window pause.
 Running marks use the theme's
 `primary`; auto-continue sessions and groups use `success` (green). Workspace
 aggregates keep `primary` because their sessions can have different
