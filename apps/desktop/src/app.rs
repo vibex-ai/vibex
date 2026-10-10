@@ -65879,6 +65879,7 @@ enum SettingsSection {
     Appearance,
     Workbench,
     Session,
+    Archived,
     Terminal,
     Browser,
     Computer,
