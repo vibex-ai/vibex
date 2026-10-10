@@ -618,14 +618,14 @@ The fixed rem-sized canvas changes only cell brightness, preserving adjacent
 text and row geometry. Keep the frame budget bounded, and render a fully
 visible static V for reduced motion or the opt-in inactive-window pause.
 Only live turns show the timeline mark. Sidebar session, group, and workspace
-rows use `ActivityIndicator::sidebar(id)`: two counter-rotating comet trails
-surround a breathing, slowly turning four-point spark in a fixed `size_5()`
-slot. Keep all glow layers inside the canvas and sample both activity styles
-at a bounded 30 fps on the shared cycle. Scope the animation ID under the
-domain-keyed row, and show the full orbital mark without animation for reduced
-motion or the opt-in inactive-window pause. The spark stays visible throughout
-the cycle; its highlight blends toward `sidebar_foreground` to retain contrast
-in light and dark themes. Running marks use the theme's
+rows use `ActivityIndicator::sidebar(id)`: a regular 5×5 matrix of circular dots
+in a fixed `size_5()` slot. A diagonal wave changes each dot's brightness and
+diameter while its center stays fixed; dim dots retain the matrix silhouette.
+Keep dots separate even at peak size, with all paint inside the canvas, and
+sample both activity styles at a bounded 30 fps on the shared cycle. Scope the
+animation ID under the domain-keyed row, and show the full matrix at steady
+brightness for reduced motion or the opt-in inactive-window pause.
+Running marks use the theme's
 `primary`; auto-continue sessions and groups use `success` (green). Workspace
 aggregates keep `primary` because their sessions can have different
 auto-continue settings. Waiting, error, and completion states keep their
