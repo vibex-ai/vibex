@@ -7838,6 +7838,13 @@ pub struct VibexWorkbench {
     agent_terminal_task: Option<Task<()>>,
     agent_action_task: Option<Task<()>>,
     fork_session_task: Option<Task<()>>,
+    /// Sessions a batch fork still owes, in the order the sidebar lists them.
+    ///
+    /// A fork holds the window-wide action lock from the request until its
+    /// runtime settles, so a selection of several rows cannot fork them all at
+    /// once. The queue drains one row per settled fork, which keeps every fork
+    /// on the same code path a single-row fork uses.
+    queued_fork_session_ids: VecDeque<VibexSessionId>,
     session_search_index_task: Option<Task<()>>,
     sidebar_picker_task: Option<Task<()>>,
     new_session_eligibility_task: Option<Task<()>>,
@@ -8793,6 +8800,7 @@ impl VibexWorkbench {
             agent_terminal_task: None,
             agent_action_task: None,
             fork_session_task: None,
+            queued_fork_session_ids: VecDeque::new(),
             session_search_index_task: None,
             sidebar_picker_task: None,
             new_session_eligibility_task: None,
@@ -13497,7 +13505,11 @@ impl VibexWorkbench {
     }
 
     fn auto_continue_enabled(&self, session_id: &VibexSessionId) -> bool {
-        self.auto_continue_session_ids.contains(session_id.as_str())
+        self.auto_continue_enabled_for(session_id.as_str())
+    }
+
+    fn auto_continue_enabled_for(&self, session_id: &str) -> bool {
+        self.auto_continue_session_ids.contains(session_id)
     }
 
     fn auto_continue_remaining_seconds(&self, session_id: &VibexSessionId) -> Option<u8> {
@@ -13724,6 +13736,24 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Applies one auto-continue setting to every session of a menu selection.
+    ///
+    /// A batch reads as one switch: the menu shows it checked only when every
+    /// row has auto-continue on, and flipping it sets them all to the same
+    /// state instead of toggling each row against the others.
+    fn set_auto_continue_enabled_for_sessions(
+        &mut self,
+        session_ids: &[String],
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for session_id in session_ids {
+            if let Ok(session_id) = VibexSessionId::parse(session_id.clone()) {
+                self.set_auto_continue_enabled(session_id, enabled, cx);
+            }
+        }
+    }
+
     fn sync_auto_continue_for_session(
         &mut self,
         session_id: &VibexSessionId,
@@ -13941,6 +13971,19 @@ impl VibexWorkbench {
         self.publish_sidebar_invalidation();
         self.sync_auto_continue_for_session(session_id, cx);
         cx.notify();
+    }
+
+    /// Lifts the persisted suspension for every paused session of a selection.
+    fn resume_auto_continue_for_sessions(
+        &mut self,
+        session_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        for session_id in session_ids {
+            if let Ok(session_id) = VibexSessionId::parse(session_id.clone()) {
+                self.resume_auto_continue(&session_id, cx);
+            }
+        }
     }
 
     fn activate_continue_button(&mut self, cx: &mut Context<Self>) {
@@ -14788,6 +14831,56 @@ impl VibexWorkbench {
         scope.map(|(project_id, workspace_id)| (project_id, workspace_id, session_ids))
     }
 
+    /// The groups a whole selection could join, by id and name.
+    ///
+    /// A group is single-Worktree, so a selection spanning Worktrees has no
+    /// common destination; the submenu stays empty instead of listing groups
+    /// that would silently drop rows.
+    fn sidebar_group_join_candidates_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> Vec<(String, String)> {
+        let mut scope: Option<(String, String)> = None;
+        for session_id in session_ids {
+            let Some(session) = self.registered_session(session_id) else {
+                return Vec::new();
+            };
+            let candidate = (
+                session.project_id.as_str().to_string(),
+                session.workspace_id.as_str().to_string(),
+            );
+            match scope.as_ref() {
+                Some(existing) if existing != &candidate => return Vec::new(),
+                Some(_) => {}
+                None => scope = Some(candidate),
+            }
+        }
+        let Some((project_id, workspace_id)) = scope else {
+            return Vec::new();
+        };
+        self.sidebar_group_ids_for_workspace(&project_id, &workspace_id)
+            .into_iter()
+            .filter_map(|group_id| {
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .group(&group_id)
+                    .map(|group| (group_id, group.name.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether any session of a selection already belongs to a group.
+    fn sidebar_selection_has_group_members(&self, session_ids: &[String]) -> bool {
+        session_ids.iter().any(|session_id| {
+            self.ui_state
+                .sidebar
+                .organization
+                .group_of_session(session_id)
+                .is_some()
+        })
+    }
+
     /// Turns the current selection into a session group.
     fn create_session_group_from_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((project_id, workspace_id, session_ids)) =
@@ -15228,6 +15321,32 @@ impl VibexWorkbench {
         items
     }
 
+    /// The sessions a right click inside a shift/ctrl selection acts on.
+    ///
+    /// The rows are read through [`Self::sidebar_drag_items`], so a command and
+    /// the drag gesture never disagree about what the selection holds. `None`
+    /// keeps the per-session menu for a right click on a row outside it, so a
+    /// batch command never appears for a selection the user cannot see.
+    fn sidebar_context_menu_session_ids(
+        &self,
+        primary: &SidebarOrganizationItem,
+    ) -> Option<Vec<String>> {
+        if self.sidebar_move_selected_items.len() < 2
+            || !self.sidebar_move_selected_items.contains(primary)
+        {
+            return None;
+        }
+        let session_ids = self
+            .sidebar_drag_items(primary)
+            .into_iter()
+            .filter_map(|item| match item {
+                SidebarOrganizationItem::Session(session_id) => Some(session_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (session_ids.len() > 1).then_some(session_ids)
+    }
+
     /// The items a drag carries: the whole selection, in sidebar order.
     ///
     /// The order comes from the placement tree, which does not list every row the
@@ -15332,10 +15451,25 @@ impl VibexWorkbench {
 
     fn toggle_sidebar_batch_mode(&mut self, cx: &mut Context<Self>) {
         self.sidebar_batch_mode = !self.sidebar_batch_mode;
-        self.clear_sidebar_move_selection();
-        if !self.sidebar_batch_mode {
+        if self.sidebar_batch_mode {
+            // A shift/ctrl selection is the same set of rows the user already
+            // picked, so entering batch mode checks every one of them instead of
+            // starting from an empty list.
+            let carried = self
+                .sidebar_move_selection_items()
+                .into_iter()
+                .filter_map(|item| match item {
+                    SidebarOrganizationItem::Session(session_id) => Some(session_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if !carried.is_empty() {
+                self.sidebar_state.selected_ids = carried;
+            }
+        } else {
             self.sidebar_state.clear_selection();
         }
+        self.clear_sidebar_move_selection();
         cx.notify();
     }
 
@@ -16873,10 +17007,24 @@ impl VibexWorkbench {
         session_id: &str,
         cx: &mut Context<Self>,
     ) {
+        self.add_sessions_to_group_from_menu(
+            group_id,
+            std::slice::from_ref(&session_id.to_string()),
+            cx,
+        );
+    }
+
+    /// Adds every session of a menu selection to one group.
+    fn add_sessions_to_group_from_menu(
+        &mut self,
+        group_id: &str,
+        session_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
         let session_workspaces = self.sidebar_session_workspaces();
         if !self.ui_state.sidebar.organization.add_sessions_to_group(
             group_id,
-            std::slice::from_ref(&session_id.to_string()),
+            session_ids,
             &session_workspaces,
         ) {
             return;
@@ -16907,6 +17055,47 @@ impl VibexWorkbench {
             return;
         }
         self.release_group_session_views(std::slice::from_ref(&session_id.to_string()));
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
+    /// Removes every session of a menu selection from the group holding it.
+    ///
+    /// A batch selection can straddle groups, so each session leaves the group
+    /// it is actually in instead of the one the right-clicked row happens to be
+    /// in.
+    fn remove_sessions_from_groups_from_menu(
+        &mut self,
+        session_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let memberships = session_ids
+            .iter()
+            .filter_map(|session_id| {
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .group_of_session(session_id)
+                    .map(|group_id| (group_id.to_string(), session_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        for (group_id, session_id) in memberships {
+            let members = std::slice::from_ref(&session_id);
+            if self
+                .ui_state
+                .sidebar
+                .organization
+                .remove_sessions_from_group(&group_id, members)
+            {
+                removed.push(session_id);
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+        self.release_group_session_views(&removed);
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -27603,6 +27792,65 @@ impl VibexWorkbench {
         .detach();
     }
 
+    /// Forks every session of a menu selection, one settled fork at a time.
+    ///
+    /// A fork owns the window-wide action lock until its runtime settles, so a
+    /// selection of several rows is forked through the queue instead of through
+    /// parallel requests that would race for that lock.
+    fn fork_sessions_at(
+        &mut self,
+        source_session_ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_action_pending || self.fork_session_pending {
+            return;
+        }
+        let queued = source_session_ids
+            .iter()
+            .filter_map(|session_id| VibexSessionId::parse(session_id.clone()).ok())
+            .filter(|session_id| {
+                self.registered_session(session_id.as_str()).is_some()
+                    && !self
+                        .pending_session_deletion_ids
+                        .contains(session_id.as_str())
+            })
+            .collect::<VecDeque<_>>();
+        if queued.is_empty() {
+            return;
+        }
+        self.queued_fork_session_ids = queued;
+        self.start_queued_fork_session(window, cx);
+    }
+
+    /// Starts the next queued fork, if the queue still holds one.
+    fn start_queued_fork_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A queued row can be gone by the time its turn comes — the batch runs
+        // one fork at a time — and a session that no longer exists has nothing
+        // to fork.
+        while let Some(source_session_id) = self.queued_fork_session_ids.pop_front() {
+            if self
+                .registered_session(source_session_id.as_str())
+                .is_none()
+            {
+                continue;
+            }
+            // The settled fork is the task being polled right now, and the next
+            // one replaces this handle; releasing it first keeps the drop from
+            // cancelling the completion that is still unwinding.
+            if let Some(settled) = self.fork_session_task.take() {
+                settled.detach();
+            }
+            self.fork_session_at(
+                source_session_id,
+                ForkAgentSessionRequest::AT_TIP,
+                window,
+                cx,
+            );
+            return;
+        }
+    }
+
     /// Forks `source_session_id` at `through_sequence`.
     ///
     /// A timeline row passes its own sequence. A sidebar row has no timeline
@@ -27821,6 +28069,9 @@ impl VibexWorkbench {
                             );
                         }
                     }
+                    // A batch fork drains one row per settled fork, and the
+                    // queue is empty for a single one.
+                    this.start_queued_fork_session(window, cx);
                     cx.notify();
                 });
             },
@@ -30313,6 +30564,8 @@ impl VibexWorkbench {
                             this.agent_error = Some(format!("Agent action failed: {error}"));
                         }
                     }
+                    // A batch fork drains one row per settled fork.
+                    this.start_queued_fork_session(window, cx);
                     let _ = selected_source_session_id;
                     cx.notify();
                 });
@@ -30981,7 +31234,26 @@ impl VibexWorkbench {
     }
 
     fn confirm_delete_selected_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.sidebar_state.selected_ids.len();
+        let session_ids = self
+            .sidebar_state
+            .selected_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.confirm_delete_sessions(session_ids, window, cx);
+    }
+
+    /// Asks before deleting the named sessions.
+    ///
+    /// The batch bar and a shift/ctrl selection both arrive here, so the
+    /// confirmation names the count either path is about to remove.
+    fn confirm_delete_sessions(
+        &mut self,
+        session_ids: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = session_ids.len();
         if count == 0 {
             return;
         }
@@ -30990,6 +31262,7 @@ impl VibexWorkbench {
         let entity = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
+            let session_ids = session_ids.clone();
             dialog
                 .title(sidebar_delete_sessions_title(locale, count))
                 .child(sidebar_delete_sessions_description(locale, count))
@@ -31011,26 +31284,23 @@ impl VibexWorkbench {
                         ),
                 )
                 .on_ok(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| this.delete_selected_sessions(cx));
+                    let session_ids = session_ids.clone();
+                    let _ = entity.update(cx, |this, cx| this.delete_sessions(session_ids, cx));
                     true
                 })
         });
     }
 
-    fn delete_selected_sessions(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_state.selected_ids.is_empty() {
-            return;
-        }
-        let session_ids = self
-            .sidebar_state
-            .selected_ids
-            .iter()
-            .filter_map(|id| VibexSessionId::parse(id).ok())
-            .collect::<Vec<_>>();
+    /// Deletes the named sessions and clears their rows optimistically.
+    ///
+    /// The batch bar and a shift/ctrl selection both arrive here, so the
+    /// selection those rows were part of stops with them.
+    fn delete_sessions(&mut self, session_ids: Vec<String>, cx: &mut Context<Self>) {
         self.sidebar_batch_mode = false;
         self.sidebar_state.clear_selection();
         let session_ids = session_ids
             .into_iter()
+            .filter_map(|id| VibexSessionId::parse(id).ok())
             .filter(|session_id| {
                 !self
                     .pending_session_deletion_ids
@@ -32581,10 +32851,34 @@ impl VibexWorkbench {
     }
 
     fn toggle_session_pin(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
-        if !self.sidebar_state.pinned_ids.remove(session_id.as_str()) {
-            self.sidebar_state
-                .pinned_ids
-                .insert(session_id.as_str().to_string());
+        let pinned = !self.sidebar_state.pinned_ids.contains(session_id.as_str());
+        self.set_sessions_pinned(
+            std::slice::from_ref(&session_id.as_str().to_string()),
+            pinned,
+            cx,
+        );
+    }
+
+    /// Pins or unpins every session of a menu selection as one setting.
+    ///
+    /// The menu shows one pin state for the selection, so the command applies
+    /// that state to all of it rather than flipping each row against the rest.
+    fn set_sessions_pinned(
+        &mut self,
+        session_ids: &[String],
+        pinned: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for session_id in session_ids {
+            changed |= if pinned {
+                self.sidebar_state.pinned_ids.insert(session_id.clone())
+            } else {
+                self.sidebar_state.pinned_ids.remove(session_id)
+            };
+        }
+        if !changed {
+            return;
         }
         self.invalidate_sidebar_projection_cache();
         self.queue_agent_ui_state();
@@ -41505,16 +41799,15 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>()
         };
-        // A right click on one row of a shift/ctrl selection offers the whole
-        // selection as a group, which is the click path for what the selection
-        // already means. A right click on a row outside it keeps the per-session
-        // menu, so the action never appears for a selection the user cannot see.
-        let selection_group_creation = (self.sidebar_move_selected_items.len() > 1
-            && self.sidebar_move_selected_items.contains(&session_item))
-        .then(|| self.sidebar_move_group_creation_candidates())
-        .flatten()
-        .map(|(_, _, session_ids)| session_ids)
-        .filter(|session_ids| session_ids.len() > 1);
+        // A right click inside a shift/ctrl selection makes the whole selection
+        // the target of every command the menu offers; a right click on a row
+        // outside it keeps the per-session menu, so a batch command never
+        // appears for a selection the user cannot see.
+        let selected_session_ids = self.sidebar_context_menu_session_ids(&session_item);
+        // The selection is the same set the drag gesture carries, so the group
+        // item names the rows the menu would put in one group — when they share
+        // a Worktree, because a group only holds one.
+        let selection_group_creation = self.sidebar_move_group_creation_candidates();
         let resolved_locale = self.resolved_locale();
         let row_background = if selected {
             sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
@@ -41644,27 +41937,79 @@ impl VibexWorkbench {
         let context_rename_id = session.id.clone();
         let context_fork_id = session.id.clone();
         let context_delete_id = session.id.clone();
+        // Every value below describes the rows the menu would act on: the whole
+        // shift/ctrl selection when the right click landed inside one, and this
+        // row alone otherwise. A batch reads its own state, so a check mark, a
+        // pin verb, or a disabled item is never borrowed from the clicked row.
+        let batch_session_ids = selected_session_ids.clone();
+        let batch_session_count = batch_session_ids.as_ref().map_or(0, Vec::len);
+        let batch_label = |label: &str| match batch_session_count {
+            0 => label.to_string(),
+            count => sidebar_batch_menu_label(resolved_locale, label, count),
+        };
+        let batch_group_candidates = batch_session_ids
+            .as_ref()
+            .map(|session_ids| self.sidebar_group_join_candidates_for_sessions(session_ids))
+            .unwrap_or_default();
+        let batch_has_group_members = batch_session_ids
+            .as_ref()
+            .is_some_and(|session_ids| self.sidebar_selection_has_group_members(session_ids));
         let mutation_pending = self.agent_action_pending;
         let session_deletion_pending = self
             .pending_session_deletion_ids
             .contains(session.id.as_str());
+        let batch_deletion_pending = batch_session_ids.as_ref().is_some_and(|session_ids| {
+            session_ids
+                .iter()
+                .all(|session_id| self.pending_session_deletion_ids.contains(session_id))
+        });
         // A fork holds the same window-wide action lock every other Agent
         // mutation does, and a row already being deleted has nothing worth
         // forking, so the item follows both states.
-        let fork_disabled =
-            mutation_pending || self.fork_session_pending || session_deletion_pending;
-        let auto_continue_enabled = self.auto_continue_enabled(&session.id);
-        let auto_continue_paused = self
-            .auto_continue_paused_session_ids
-            .contains(session.id.as_str());
-        let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
+        let fork_disabled = mutation_pending
+            || self.fork_session_pending
+            || session_deletion_pending
+            || batch_deletion_pending;
+        let auto_continue_enabled = match batch_session_ids.as_ref() {
+            Some(session_ids) => session_ids
+                .iter()
+                .all(|session_id| self.auto_continue_enabled_for(session_id)),
+            None => self.auto_continue_enabled(&session.id),
+        };
+        let auto_continue_paused = match batch_session_ids.as_ref() {
+            Some(session_ids) => session_ids.iter().any(|session_id| {
+                self.auto_continue_paused_session_ids
+                    .contains(session_id.as_str())
+            }),
+            None => self
+                .auto_continue_paused_session_ids
+                .contains(session.id.as_str()),
+        };
+        let auto_continue_label =
+            batch_label(locale::text("Auto continue", "自动继续", "自動繼續"));
         let auto_continue_paused_label =
             locale::text("Auto continue paused", "自动继续已暂停", "自動繼續已暫停");
-        let fork_label = locale::text("Fork session", "分叉会话", "分支會話");
-        let pin_label = if pinned {
-            strings.sidebar_unpin
-        } else {
-            strings.sidebar_pin
+        let resume_auto_continue_label = batch_label(locale::text(
+            "Resume auto continue",
+            "恢复自动继续",
+            "恢復自動繼續",
+        ));
+        let fork_label = batch_label(locale::text("Fork session", "分叉会话", "分支會話"));
+        let delete_label = batch_label(strings.sidebar_delete);
+        let pin_label = {
+            // The selection's own pin state decides the verb: a batch that is
+            // not entirely pinned offers "Pin" and pins the rest with it.
+            let pinned = match batch_session_ids.as_ref() {
+                Some(session_ids) => session_ids
+                    .iter()
+                    .all(|session_id| self.sidebar_state.pinned_ids.contains(session_id)),
+                None => pinned,
+            };
+            if pinned {
+                strings.sidebar_unpin
+            } else {
+                strings.sidebar_pin
+            }
         };
         let session_generating = display_state == AgentSessionState::Running;
         let session_has_error = display_state == AgentSessionState::Error;
@@ -42013,44 +42358,150 @@ impl VibexWorkbench {
                             window,
                             cx,
                         );
+                        let batch_ids = batch_session_ids.clone();
+                        let batch_count = batch_session_count;
                         let auto_continue_entity = context_entity.clone();
                         let auto_continue_id = context_auto_continue_id.clone();
+                        let auto_continue_targets = batch_ids.clone();
                         let resume_auto_continue_entity = context_entity.clone();
                         let resume_auto_continue_id = context_auto_continue_id.clone();
-                        let resume_auto_continue_label =
-                            locale::text("Resume auto continue", "恢复自动继续", "恢復自動繼續");
+                        let resume_auto_continue_targets = batch_ids.clone();
                         let pin_entity = context_entity.clone();
                         let pin_id = context_pin_id.clone();
+                        let pin_targets = batch_ids.clone();
                         let rename_entity = context_entity.clone();
                         let rename_id = context_rename_id.clone();
                         let fork_entity = context_entity.clone();
                         let fork_id = context_fork_id.clone();
+                        let fork_targets = batch_ids.clone();
                         let delete_entity = context_entity.clone();
                         let delete_id = context_delete_id.clone();
+                        let delete_targets = batch_ids.clone();
                         let mut menu = menu.item(
-                            PopupMenuItem::new(auto_continue_label)
+                            PopupMenuItem::new(auto_continue_label.clone())
                                 .checked(auto_continue_enabled)
                                 .on_click(move |_, _, cx| {
                                     let _ = auto_continue_entity.update(cx, |this, cx| {
-                                        this.set_auto_continue_enabled(
-                                            auto_continue_id.clone(),
-                                            !auto_continue_enabled,
-                                            cx,
-                                        )
+                                        match auto_continue_targets.clone() {
+                                            Some(session_ids) => this
+                                                .set_auto_continue_enabled_for_sessions(
+                                                    &session_ids,
+                                                    !auto_continue_enabled,
+                                                    cx,
+                                                ),
+                                            None => this.set_auto_continue_enabled(
+                                                auto_continue_id.clone(),
+                                                !auto_continue_enabled,
+                                                cx,
+                                            ),
+                                        }
                                     });
                                 }),
                         );
                         if auto_continue_paused {
                             menu = menu.item(
-                                PopupMenuItem::new(resume_auto_continue_label)
+                                PopupMenuItem::new(resume_auto_continue_label.clone())
                                     .on_click(move |_, _, cx| {
                                         let _ = resume_auto_continue_entity.update(cx, |this, cx| {
-                                            this.resume_auto_continue(&resume_auto_continue_id, cx)
+                                            match resume_auto_continue_targets.clone() {
+                                                Some(session_ids) => this
+                                                    .resume_auto_continue_for_sessions(
+                                                        &session_ids,
+                                                        cx,
+                                                    ),
+                                                None => this.resume_auto_continue(
+                                                    &resume_auto_continue_id,
+                                                    cx,
+                                                ),
+                                            }
                                         });
                                     }),
                             );
                         }
-                        if let Some(membership) = session_group_membership.clone() {
+                        if batch_ids.is_some() {
+                            // Every command below covers the whole selection, so
+                            // the membership items speak for all of it too.
+                            let create_entity = context_entity.clone();
+                            menu = menu.separator().item(
+                                PopupMenuItem::new(sidebar_group_creation_menu_label(
+                                    resolved_locale,
+                                    batch_count,
+                                ))
+                                .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                // A group holds one Worktree, so a selection
+                                // spanning Worktrees has no group to become.
+                                .disabled(selection_group_creation.is_none())
+                                .on_click(move |_, window, cx| {
+                                    let _ = create_entity.update(cx, |this, cx| {
+                                        this.create_session_group_from_move_selection(window, cx)
+                                    });
+                                }),
+                            );
+                            if batch_has_group_members {
+                                let leave_entity = context_entity.clone();
+                                let leave_targets = batch_ids.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(locale::text(
+                                        "Remove from session group",
+                                        "移出会话组",
+                                        "移出會話組",
+                                    ))
+                                    .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = leave_entity.update(cx, |this, cx| {
+                                            if let Some(session_ids) = leave_targets.clone() {
+                                                this.remove_sessions_from_groups_from_menu(
+                                                    &session_ids,
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    }),
+                                );
+                            }
+                            if !batch_group_candidates.is_empty() {
+                                // The candidate groups live in a submenu, the
+                                // same shape the single-row menu uses, and every
+                                // selected session joins the chosen one.
+                                let candidates = batch_group_candidates.clone();
+                                let submenu_entity = context_entity.clone();
+                                let submenu_targets = batch_ids.clone();
+                                menu = menu.submenu_with_icon(
+                                    Some(sidebar_icon("icons/vibex/layers.svg")),
+                                    locale::text(
+                                        "Add to session group",
+                                        "加入会话组",
+                                        "加入會話組",
+                                    ),
+                                    window,
+                                    cx,
+                                    move |mut submenu, _window, _cx| {
+                                        for (candidate_id, candidate_name) in candidates.clone() {
+                                            let join_entity = submenu_entity.clone();
+                                            let join_targets = submenu_targets.clone();
+                                            submenu = submenu.item(
+                                                PopupMenuItem::new(candidate_name)
+                                                    .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = join_entity.update(cx, |this, cx| {
+                                                            if let Some(session_ids) =
+                                                                join_targets.clone()
+                                                            {
+                                                                this.add_sessions_to_group_from_menu(
+                                                                    &candidate_id,
+                                                                    &session_ids,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        submenu
+                                    },
+                                );
+                            }
+                        } else if let Some(membership) = session_group_membership.clone() {
                             let leave_entity = context_entity.clone();
                             let leave_group_id = membership.clone();
                             let leave_session_id = menu_session_id_string.clone();
@@ -42068,21 +42519,6 @@ impl VibexWorkbench {
                                             &leave_session_id,
                                             cx,
                                         )
-                                    });
-                                }),
-                            );
-                        }
-                        if let Some(selected_ids) = selection_group_creation.clone() {
-                            let create_entity = context_entity.clone();
-                            menu = menu.separator().item(
-                                PopupMenuItem::new(sidebar_group_creation_menu_label(
-                                    resolved_locale,
-                                    selected_ids.len(),
-                                ))
-                                .icon(sidebar_icon("icons/vibex/layers.svg"))
-                                .on_click(move |_, window, cx| {
-                                    let _ = create_entity.update(cx, |this, cx| {
-                                        this.create_session_group_from_move_selection(window, cx)
                                     });
                                 }),
                             );
@@ -42121,52 +42557,88 @@ impl VibexWorkbench {
                                 },
                             );
                         }
-                        menu
-                        .separator()
-                        .item(
+                        menu = menu.separator().item(
                             PopupMenuItem::new(pin_label)
                                 .icon(sidebar_icon("icons/vibex/pin.svg"))
                                 .on_click(move |_, _, cx| {
                                     let _ = pin_entity.update(cx, |this, cx| {
-                                        this.toggle_session_pin(&pin_id, cx)
+                                        match pin_targets.clone() {
+                                            Some(session_ids) => {
+                                                let pinned = session_ids.iter().all(|session_id| {
+                                                    this.sidebar_state
+                                                        .pinned_ids
+                                                        .contains(session_id)
+                                                });
+                                                this.set_sessions_pinned(
+                                                    &session_ids,
+                                                    !pinned,
+                                                    cx,
+                                                );
+                                            }
+                                            None => this.toggle_session_pin(&pin_id, cx),
+                                        }
                                     });
                                 }),
-                        )
-                        .item(
-                            PopupMenuItem::new(strings.sidebar_rename)
-                                .icon(sidebar_icon("icons/vibex/pencil.svg"))
-                                .disabled(mutation_pending)
-                                .on_click(move |_, window, cx| {
-                                    let _ = rename_entity.update(cx, |this, cx| {
-                                        this.begin_sidebar_rename(rename_id.clone(), window, cx)
-                                    });
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new(fork_label)
-                                .icon(sidebar_icon("icons/vibex/git-branch.svg"))
-                                .disabled(fork_disabled)
-                                .on_click(move |_, window, cx| {
-                                    let _ = fork_entity.update(cx, |this, cx| {
-                                        this.fork_session_at(
-                                            fork_id.clone(),
-                                            ForkAgentSessionRequest::AT_TIP,
-                                            window,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new(strings.sidebar_delete)
-                                .icon(sidebar_icon("icons/vibex/trash-2.svg"))
-                                .disabled(session_deletion_pending)
-                                .on_click(move |_, window, cx| {
-                                    let _ = delete_entity.update(cx, |this, cx| {
-                                        this.confirm_delete_session(delete_id.clone(), window, cx)
-                                    });
-                                }),
-                        )
+                        );
+                        if batch_ids.is_none() {
+                            // Renaming one row out of a selection would leave the
+                            // other rows behind, so the item is only offered for
+                            // a single session.
+                            menu = menu.item(
+                                PopupMenuItem::new(strings.sidebar_rename)
+                                    .icon(sidebar_icon("icons/vibex/pencil.svg"))
+                                    .disabled(mutation_pending)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = rename_entity.update(cx, |this, cx| {
+                                            this.begin_sidebar_rename(rename_id.clone(), window, cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                            .item(
+                                PopupMenuItem::new(fork_label.clone())
+                                    .icon(sidebar_icon("icons/vibex/git-branch.svg"))
+                                    .disabled(fork_disabled)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = fork_entity.update(cx, |this, cx| {
+                                            match fork_targets.clone() {
+                                                Some(session_ids) => this.fork_sessions_at(
+                                                    &session_ids,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                None => this.fork_session_at(
+                                                    fork_id.clone(),
+                                                    ForkAgentSessionRequest::AT_TIP,
+                                                    window,
+                                                    cx,
+                                                ),
+                                            }
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(delete_label.clone())
+                                    .icon(sidebar_icon("icons/vibex/trash-2.svg"))
+                                    .disabled(session_deletion_pending)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = delete_entity.update(cx, |this, cx| {
+                                            match delete_targets.clone() {
+                                                Some(session_ids) => this.confirm_delete_sessions(
+                                                    session_ids,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                None => this.confirm_delete_session(
+                                                    delete_id.clone(),
+                                                    window,
+                                                    cx,
+                                                ),
+                                            }
+                                        });
+                                    }),
+                            )
                     })
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
                     .when(!self.sidebar_batch_mode, |this| this.pr_2())
@@ -63717,10 +64189,28 @@ fn sidebar_selected_count_label(
 /// in the label because the selection can be scrolled out of sight by the time
 /// the menu is open.
 fn sidebar_group_creation_menu_label(locale: locale::ResolvedLocale, count: usize) -> String {
+    sidebar_batch_menu_label(
+        locale,
+        locale::text("Create session group", "创建会话组", "建立會話組"),
+        count,
+    )
+}
+
+/// The menu label of a command a shift/ctrl selection widened to many rows.
+///
+/// The count names the scope the way the group item already does, so a menu
+/// opened on a selection reads as one command over that many sessions.
+fn sidebar_batch_menu_label(
+    locale: locale::ResolvedLocale,
+    label: impl AsRef<str>,
+    count: usize,
+) -> String {
+    let label = label.as_ref();
     match locale {
-        locale::ResolvedLocale::En => format!("Create session group ({count})"),
-        locale::ResolvedLocale::ZhCn => format!("创建会话组（{count}）"),
-        locale::ResolvedLocale::ZhTw => format!("建立會話組（{count}）"),
+        locale::ResolvedLocale::En => format!("{label} ({count})"),
+        locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
+            format!("{label}（{count}）")
+        }
     }
 }
 
@@ -79341,20 +79831,22 @@ mod tests {
     #[test]
     fn batch_session_delete_exits_selection_and_updates_the_sidebar_optimistically() {
         let source = include_str!("app.rs");
+        // The batch bar and a shift/ctrl selection share one deletion path, and
+        // it leaves selection mode before it removes anything.
         let deletion = source
-            .split_once("    fn delete_selected_sessions(")
+            .split_once("    fn delete_sessions(")
             .and_then(|(_, tail)| tail.split_once("\n    fn optimistically_remove_sessions("))
             .map(|(body, _)| body)
-            .expect("batch deletion should remain inspectable");
+            .expect("session deletion should remain inspectable");
         let exit_batch = deletion
             .find("self.sidebar_batch_mode = false;")
             .expect("batch deletion should exit selection mode");
         let optimistic_remove = deletion
             .find("self.optimistically_remove_sessions(&session_id_set);")
-            .expect("batch deletion should remove selected rows locally");
+            .expect("deletion should remove deleted rows locally");
         let repaint = deletion
             .find("cx.notify();\n        let generation")
-            .expect("batch deletion should repaint before background deletion");
+            .expect("deletion should repaint before background deletion");
         let background_delete = deletion
             .find("let runner = gpui_tokio::Tokio::spawn")
             .expect("authoritative deletion should remain asynchronous");
@@ -79472,8 +79964,13 @@ mod tests {
         assert!(row.contains(".disabled(session_deletion_pending)"));
         assert!(!row.contains("self.agent_action_pending"));
 
-        let menu = source
-            .split_once("PopupMenuItem::new(strings.sidebar_delete)")
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        let menu = session
+            .split_once("PopupMenuItem::new(delete_label")
             .and_then(|(_, tail)| tail.split_once(".on_click(move |_, window, cx|"))
             .map(|(body, _)| body)
             .expect("sidebar session delete menu item should remain inspectable");
@@ -79493,8 +79990,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session row renderer should remain inspectable");
         let fork = session
-            .split_once("PopupMenuItem::new(fork_label)")
-            .and_then(|(_, tail)| tail.split_once("PopupMenuItem::new(strings.sidebar_delete)"))
+            .split_once("PopupMenuItem::new(fork_label")
+            .and_then(|(_, tail)| tail.split_once("PopupMenuItem::new(delete_label"))
             .map(|(body, _)| body)
             .expect("sidebar fork item should remain inspectable");
 
@@ -79513,6 +80010,110 @@ mod tests {
             .expect("the fork item should target the row's own session");
         assert!(context.contains("self.fork_session_pending"));
         assert!(context.contains("session_deletion_pending"));
+    }
+
+    /// A right click inside a shift/ctrl selection makes every session command
+    /// act on the whole selection, and the commands that cannot speak for a
+    /// selection leave the menu.
+    #[test]
+    fn multi_selected_sessions_batch_the_row_menu() {
+        let source = include_str!("app.rs");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+
+        assert!(session.contains("self.sidebar_context_menu_session_ids(&session_item)"));
+
+        for batch_command in [
+            "set_auto_continue_enabled_for_sessions(",
+            "resume_auto_continue_for_sessions(",
+            ".set_sessions_pinned(",
+            "fork_sessions_at(",
+            "confirm_delete_sessions(",
+        ] {
+            assert!(
+                session.contains(batch_command),
+                "a multi-selection should run {batch_command} over every selected row"
+            );
+        }
+
+        // The group item is always offered for a selection, and it only acts
+        // when the rows share a Worktree.
+        assert!(session.contains(".disabled(selection_group_creation.is_none())"));
+        assert!(session.contains("this.remove_sessions_from_groups_from_menu("));
+        assert!(session.contains("this.add_sessions_to_group_from_menu("));
+
+        // Renaming one row out of a selection would leave the rest behind.
+        let rename = session
+            .split_once("if batch_ids.is_none() {")
+            .and_then(|(_, tail)| tail.split_once("PopupMenuItem::new(fork_label"))
+            .map(|(body, _)| body)
+            .expect("the rename item should be gated on a single session");
+        assert!(rename.contains("PopupMenuItem::new(strings.sidebar_rename)"));
+        assert!(rename.contains("this.begin_sidebar_rename("));
+        assert!(!rename.contains("batch_ids.clone()"));
+    }
+
+    /// Entering batch mode from a shift/ctrl selection checks every row the user
+    /// already picked instead of starting from an empty list.
+    #[test]
+    fn batch_mode_carries_the_multi_selection_into_its_checkboxes() {
+        let source = include_str!("app.rs");
+        let toggle = source
+            .split_once("    fn toggle_sidebar_batch_mode(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_all_batch_sessions("))
+            .map(|(body, _)| body)
+            .expect("batch mode toggle should remain inspectable");
+
+        assert!(toggle.contains("sidebar_move_selection_items()"));
+        assert!(toggle.contains("self.sidebar_state.selected_ids = carried;"));
+        assert!(toggle.contains("self.sidebar_state.clear_selection();"));
+    }
+
+    /// A batch fork forks one row per settled fork, because a fork owns the
+    /// window-wide action lock until its runtime settles.
+    #[test]
+    fn batch_forks_drain_one_settled_fork_at_a_time() {
+        let source = include_str!("app.rs");
+        let queue = source
+            .split_once("    fn fork_sessions_at(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Forks `source_session_id` at `through_sequence`.")
+            })
+            .map(|(body, _)| body)
+            .expect("batch fork queue should remain inspectable");
+        assert!(queue.contains("self.queued_fork_session_ids = queued;"));
+        assert!(queue.contains("self.start_queued_fork_session(window, cx);"));
+        assert!(queue.contains("pending_session_deletion_ids"));
+
+        let chain = queue
+            .split_once("    fn start_queued_fork_session(")
+            .map(|(_, body)| body)
+            .expect("queued fork chain should remain inspectable");
+        assert!(chain.contains("self.queued_fork_session_ids.pop_front()"));
+        assert!(chain.contains("registered_session(source_session_id.as_str())"));
+        assert!(chain.contains("ForkAgentSessionRequest::AT_TIP"));
+
+        let fork = source
+            .split_once("    fn fork_session_at(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_inline_user_message_edit("))
+            .map(|(body, _)| body)
+            .expect("fork session action should remain inspectable");
+        assert_eq!(
+            fork.matches("this.start_queued_fork_session(window, cx);")
+                .count(),
+            1,
+            "the local fork completion should drain the queue"
+        );
+
+        let remote = source
+            .split_once("    fn fork_session_at_remote(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn cancel_runtime_switch("))
+            .map(|(body, _)| body)
+            .expect("remote fork should remain inspectable");
+        assert!(remote.contains("this.start_queued_fork_session(window, cx);"));
     }
 
     #[test]
@@ -84349,7 +84950,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar session renderer should remain inspectable");
         assert!(sidebar.contains("let context_auto_continue_id = session.id.clone();"));
-        assert!(sidebar.contains("PopupMenuItem::new(auto_continue_label)"));
+        assert!(sidebar.contains("PopupMenuItem::new(auto_continue_label"));
         assert!(sidebar.contains(".checked(auto_continue_enabled)"));
         assert!(sidebar.contains("this.set_auto_continue_enabled("));
         assert!(sidebar.contains("icons/vibex/pause.svg"));
