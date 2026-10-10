@@ -463,6 +463,33 @@ pane still split it. A drag that has not left its own pane cannot reorder tabs,
 so below the tab strip it reads as a split on the axis the pointer left the
 pane's center along.
 
+Workbench state that a split shares has to be scoped to the pane when the
+surface it drives is per-pane. The Composer geometry (surface, input and runtime
+trigger bounds), the runtime menu flags, and every popover element id are read or
+keyed per pane: a popover keeps its open state under its element id and the
+command menu anchors to the bounds it recorded, so one shared copy either opens
+the control in every pane at once or anchors it to whichever pane painted last.
+The geometry therefore lives on the session view, and because prepaint runs after
+the element tree is built — with the workspace already pointing the workbench
+back at the focused pane — a pane's measurement is parked by session id
+(`pending_composer_geometries`) and adopted by that view the next time the pane
+renders. Menu flags stay on the workbench but are honoured only by the pane whose
+borrowed view is the selected session (`composer_menu_scope_focused`), and ids
+carry the pane's session (`composer_menu_scope`).
+
+A drag source must also suppress window-level text selection on its press. GPUI's
+selection layer anchors at any press that does not ask it not to, and while a
+drag is live it ignores the pointer, so the selection is extended by the moves
+that follow the release — a resize left a paragraph selected in the pane beside
+the seam. A control that owns a press or drag calls
+`gpui_base::GlobalState::suppress_text_selection` from a bubble-phase mouse-down
+handler. A resizable divider cannot: its grab band occludes, so no ancestor of it
+is in the press's bubble path. Group splits therefore paint a guard band
+(`session_group_split_guard`) in front of each divider — normal hit behavior, so
+the divider underneath still reads as hovered and still owns the drag — whose own
+press suppresses the selection; the band covers exactly the divider's grab area,
+placed from the shares the layout already stores.
+
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks
 that expand/collapse sessions or activate a project are internal sidebar
@@ -640,6 +667,14 @@ mounted, so it takes the row's generating gate (`display_state == Running`,
 which already folds in the optimistic local dispatch) and nothing weaker — a
 parked, scheduled, initializing, or idle row keeps the plain truncated title
 with no animation. Its element ID is scoped to the row's session.
+
+A session tab in a group pane's strip is the same row in a narrower lane, so it
+resolves the same two things from the same places: the title takes `ShimmerText`
+under the same `display_state == Running` gate with the shared duration and
+spread, and the trailing slot draws `session_status_mark_for` — the row's own
+builder, so a spinner, an attention glyph and a dot cannot drift apart between
+the two surfaces. The tab's own projection folds in the optimistic local dispatch
+and the requests parked on the user exactly as the row's does.
 
 ## Timeline Cards
 

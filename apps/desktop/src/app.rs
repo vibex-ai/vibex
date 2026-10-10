@@ -482,6 +482,15 @@ const SESSION_GROUP_AVATAR_LOGO_SIZE: f32 = 14.5;
 const SESSION_GROUP_AVATAR_SIZE: f32 = 18.0;
 /// How far consecutive avatars overlap.
 const SESSION_GROUP_AVATAR_OVERLAP: f32 = 7.0;
+/// Width of the guard band over a group split's divider, and how far it starts
+/// before the seam.
+///
+/// Both mirror the divider's own grab band as base lays it out: a one-pixel
+/// line plus four pixels of padding on each side, positioned four pixels before
+/// the seam. The guard therefore covers exactly the band that starts a resize,
+/// so a press can never cover one and not the other.
+const SESSION_GROUP_SPLIT_GUARD_WIDTH: f32 = 9.0;
+const SESSION_GROUP_SPLIT_GUARD_INSET: f32 = 4.0;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -3870,6 +3879,16 @@ pub struct SessionView {
     composer_queue_editing_id: Option<u64>,
     composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
     composer_queue_edit_geometry: ComposerGeometry,
+    /// Where this view's Composer was painted last frame.
+    ///
+    /// The geometry belongs to the view rather than to the workbench because a
+    /// split paints one Composer per pane. Held globally, every pane's
+    /// prepaint overwrote it and the surface that anchors to it — the command
+    /// menu, the runtime cascade — opened over whichever pane happened to be
+    /// painted last. A view keeps its own bounds, so a pane's menu lands on the
+    /// pane that owns it; the root overlay reads the borrowed view, which the
+    /// workspace leaves pointed at the selected (focused) pane.
+    composer_geometry: ComposerGeometry,
     composer_queue_drop_target: Option<ComposerQueueDropTarget>,
     composer_terminals: Vec<TerminalSession>,
     selected_composer_terminal_id: Option<TerminalId>,
@@ -3971,6 +3990,7 @@ impl SessionView {
             composer_queue_edit_attachments: Vec::new(),
             composer_queue_edit_geometry: ComposerGeometry::default(),
             composer_queue_drop_target: None,
+            composer_geometry: ComposerGeometry::default(),
             composer_terminals: Vec::new(),
             selected_composer_terminal_id: None,
             composer_terminal_mode: false,
@@ -6745,6 +6765,24 @@ impl Render for SidebarGroupDrag {
     }
 }
 
+/// Everything one session-group tab draws, resolved once per frame.
+///
+/// A tab is a sidebar session row in a narrower lane: the same Agent mark, the
+/// same title under the same running sweep, and the session's own state on the
+/// right. The projection is resolved here, while the pane's members are being
+/// read, so the tab renderer never re-derives a state the row already knows.
+struct SessionGroupTabState {
+    session_id: String,
+    title: String,
+    agent_id: String,
+    /// The state the tab shows, which folds in the optimistic local dispatch
+    /// and the requests parked on the user the way [`sidebar_session_display_state`]
+    /// does for a row.
+    display_state: AgentSessionState,
+    auto_continue_enabled: bool,
+    has_unread_completion: bool,
+}
+
 #[derive(Clone)]
 struct SessionGroupTabDrag {
     group_id: String,
@@ -7721,6 +7759,16 @@ pub struct VibexWorkbench {
     /// here is what keeps a split's panes from writing their row heights into
     /// whichever view released last. Keyed by session id, then by turn index.
     pending_timeline_turn_measurements: BTreeMap<String, BTreeMap<usize, (String, f32)>>,
+    /// Composer bounds prepaint measured for a session, parked until that
+    /// session's own view renders again.
+    ///
+    /// Same routing as [`Self::pending_timeline_turn_measurements`], for the
+    /// same reason: prepaint runs after the whole element tree is built, so the
+    /// borrow a pane rendered under is gone and a measurement written straight
+    /// into it would land in whichever view is borrowed then — every pane
+    /// reporting the last pane's Composer, which is what put one pane's command
+    /// menu and runtime cascade over another pane.
+    pending_composer_geometries: BTreeMap<String, ComposerGeometry>,
     child_agent_timelines: BTreeMap<String, ChildAgentTimelineState>,
     child_agent_expanded_delegations: BTreeSet<String>,
     child_agent_tabs: Vec<VibexSessionId>,
@@ -7787,7 +7835,6 @@ pub struct VibexWorkbench {
     /// began — a press that dismisses must not immediately reopen.
     runtime_menu_trigger_press_was_open: bool,
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
-    composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
     new_session_command_entry: Option<AgentCommandEntry>,
     new_session_schedule: Option<MessageSchedule>,
@@ -8751,6 +8798,7 @@ impl VibexWorkbench {
             timeline_view: None,
             composer_drafts: ComposerDraftStore::default(),
             pending_timeline_turn_measurements: BTreeMap::new(),
+            pending_composer_geometries: BTreeMap::new(),
             child_agent_timelines: BTreeMap::new(),
             child_agent_expanded_delegations: BTreeSet::new(),
             child_agent_tabs: Vec::new(),
@@ -8787,7 +8835,6 @@ impl VibexWorkbench {
             runtime_menu_closing_since: None,
             runtime_menu_trigger_press_was_open: false,
             runtime_authentication_menu: None,
-            composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
             new_session_command_entry: None,
             new_session_schedule: None,
@@ -17832,6 +17879,52 @@ impl VibexWorkbench {
     fn forget_session_view(&mut self, session_id: &str) {
         self.session_views.remove(session_id);
         self.session_view_lru.retain(|cached| cached != session_id);
+        self.pending_composer_geometries.remove(session_id);
+    }
+
+    /// Parks a Composer measurement for the session it was taken for.
+    ///
+    /// Called from a prepaint hook, which cannot write into the pane's own view:
+    /// see [`Self::pending_composer_geometries`]. Returns whether the value
+    /// moved, so the caller only asks for a repaint when there is something new
+    /// to paint.
+    fn record_composer_geometry(
+        &mut self,
+        session_id: Option<&str>,
+        update: impl FnOnce(&mut ComposerGeometry),
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            // No session to route by means the borrowed view is the only
+            // candidate left.
+            let before = self.composer_geometry;
+            update(&mut self.composer_geometry);
+            return self.composer_geometry != before;
+        };
+        let entry = self
+            .pending_composer_geometries
+            .entry(session_id.to_string())
+            .or_default();
+        let before = *entry;
+        update(entry);
+        *entry != before
+    }
+
+    /// Adopts the bounds this pane's own prepaint measured last frame.
+    ///
+    /// The composer reads its geometry while it renders — the command menu and
+    /// the runtime cascade anchor to it — so the parked measurement is folded
+    /// into the borrowed view here, once per pane per frame.
+    fn adopt_composer_geometry(&mut self) {
+        let Some(session_id) = self
+            .view_session_id
+            .as_ref()
+            .map(|id| id.as_str().to_string())
+        else {
+            return;
+        };
+        if let Some(geometry) = self.pending_composer_geometries.remove(&session_id) {
+            self.composer_geometry = geometry;
+        }
     }
 
     /// Borrows `session_id`'s view, runs `body`, and hands the view back.
@@ -38851,6 +38944,7 @@ impl VibexWorkbench {
             } => {
                 let weak = cx.weak_entity();
                 let resize_id = id.clone();
+                let split_id = id.clone();
                 let resize_group_id = group_id.to_string();
                 let mut split = match direction {
                     vibex_desktop_model::SplitDirection::Horizontal => h_resizable(id),
@@ -38889,6 +38983,7 @@ impl VibexWorkbench {
                         }
                     });
                 });
+                let children_len = children.len();
                 for (index, child) in children.into_iter().enumerate() {
                     let ratio = sizes
                         .get(index)
@@ -38903,7 +38998,32 @@ impl VibexWorkbench {
                             .child(self.render_session_group_node(group_id, child, cx)),
                     );
                 }
-                split.into_any_element()
+                // Every divider in this split gets a guard band in front of it.
+                // The bands are painted after the group, so they share its
+                // containing block and can be placed from the shares the layout
+                // already stores.
+                let mut guards = Vec::new();
+                let total = sizes.iter().copied().map(f32::from).sum::<f32>();
+                if total > 0.0 && children_len > 1 {
+                    let mut before = 0.0;
+                    for index in 0..children_len - 1 {
+                        before += f32::from(sizes.get(index).copied().unwrap_or(0));
+                        guards.push(session_group_split_guard(
+                            &split_id,
+                            index,
+                            before / total,
+                            direction,
+                        ));
+                    }
+                }
+                div()
+                    .relative()
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(split)
+                    .children(guards)
+                    .into_any_element()
             }
         }
     }
@@ -38946,12 +39066,39 @@ impl VibexWorkbench {
                     .session_desired_agent_id(session_id)
                     .cloned()
                     .unwrap_or_else(|| session.agent_id.clone());
-                Some((
-                    session_id.clone(),
-                    session.title.clone(),
-                    agent_id.as_str().to_string(),
-                    session.state,
-                ))
+                // An unanswered approval or input request outranks both the
+                // optimistic local dispatch and the still-open provider turn:
+                // the Agent is parked on the user, so the tab asks for the
+                // answer instead of spinning.
+                let awaiting_user = session.state == AgentSessionState::NeedsInput
+                    || self
+                        .pending_user_request_ids
+                        .contains_key(session_id.as_str());
+                let display_state = if awaiting_user {
+                    AgentSessionState::NeedsInput
+                } else {
+                    sidebar_session_display_state(
+                        session.state,
+                        self.pending_agent_turn_session_ids.contains(session_id),
+                    )
+                };
+                Some(SessionGroupTabState {
+                    session_id: session_id.clone(),
+                    title: session.title.clone(),
+                    agent_id: agent_id.as_str().to_string(),
+                    display_state,
+                    auto_continue_enabled: self.auto_continue_enabled_for(session_id),
+                    // Unread means "finished while you were looking elsewhere",
+                    // so the selection clears it exactly as it does for the row.
+                    has_unread_completion: self
+                        .selected_session_id
+                        .as_ref()
+                        .map(VibexSessionId::as_str)
+                        != Some(session_id.as_str())
+                        && self
+                            .unread_agent_completion_session_ids
+                            .contains(session_id.as_str()),
+                })
             })
             .collect::<Vec<_>>();
         // The strip is the preview panel's strip with session tabs in it: same
@@ -39044,7 +39191,57 @@ impl VibexWorkbench {
                     }
                 },
             ));
-        for (session_id, title, agent_id, state) in tabs {
+        for tab in tabs {
+            let SessionGroupTabState {
+                session_id,
+                title,
+                agent_id,
+                display_state,
+                auto_continue_enabled,
+                has_unread_completion,
+            } = tab;
+            // The title carries the run the way a sidebar row's does: the same
+            // sweep, at the same pace and spread, so the two surfaces read as
+            // one state in two places. Only a tab that is actually generating
+            // takes the animation; every other tab keeps static text that asks
+            // for no frames.
+            let title_element: AnyElement = if display_state == AgentSessionState::Running {
+                ShimmerText::new(title.clone())
+                    .id(format!("session-group-tab-title-{session_id}"))
+                    .duration(TIMELINE_SHIMMER_SWEEP)
+                    .spread(TIMELINE_SHIMMER_SPREAD)
+                    .into_any_element()
+            } else {
+                title.clone().into_any_element()
+            };
+            // The trailing slot is the sidebar's status column in miniature:
+            // the attention glyph while the Agent is parked on the user, the
+            // unread completion dot, and otherwise the same mark the row draws —
+            // the running pulse included.
+            let status_mark: AnyElement = if display_state == AgentSessionState::NeedsInput {
+                sidebar_attention_icon(
+                    format!("session-group-tab-attention-{session_id}"),
+                    self.strings().sidebar_needs_input,
+                    cx,
+                )
+            } else if has_unread_completion {
+                div()
+                    .id(SharedString::from(format!(
+                        "session-group-tab-unread-{session_id}"
+                    )))
+                    .size(px(7.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(cx.theme().primary)
+                    .into_any_element()
+            } else {
+                session_status_mark_for(
+                    format!("session-group-tab-activity-{session_id}"),
+                    display_state,
+                    auto_continue_enabled,
+                    cx,
+                )
+            };
             let selected = active_session_id.as_deref() == Some(session_id.as_str());
             let click_entity = cx.weak_entity();
             let click_group_id = group_id.to_string();
@@ -39089,14 +39286,8 @@ impl VibexWorkbench {
                             .text_color(cx.theme().foreground)
                     })
                     .child(sidebar_agent_logo(&agent_id, selected, cx))
-                    .child(div().min_w_0().truncate().child(title.clone()))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .bg(sidebar_session_status_color(state, cx)),
-                    )
+                    .child(div().min_w_0().truncate().child(title_element))
+                    .child(status_mark)
                     .when(selected, |this| {
                         this.child(
                             div()
@@ -43230,9 +43421,14 @@ impl VibexWorkbench {
         default_value: Option<String>,
         geometry: ComposerGeometry,
         max_height: f32,
+        // Whether the pane rendering this chip is the focused one. The open
+        // flag is shared by every pane's Composer, so only the focused pane may
+        // act on it; see `composer_menu_scope_focused`.
+        scope_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let menu_open = self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str());
+        let menu_open =
+            scope_focused && self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str());
         let menu_placement = composer_runtime_menu_placement(
             geometry.runtime_trigger_bounds,
             self.last_visibility.layout.viewport_height as f32,
@@ -43377,6 +43573,9 @@ impl VibexWorkbench {
             default_value,
             self.new_session_composer_geometry,
             NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
+            // The new-session home is the only place this Composer renders, so
+            // there is no sibling pane to scope it against.
+            true,
             cx,
         )
     }
@@ -43516,6 +43715,10 @@ impl VibexWorkbench {
                     None,
                     geometry,
                     menu_max_height,
+                    match target {
+                        RuntimeFeatureTarget::NewSession => true,
+                        RuntimeFeatureTarget::ActiveSession => self.composer_menu_scope_focused(),
+                    },
                     cx,
                 )
             }
@@ -47458,6 +47661,29 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The pane a session Composer's popovers belong to, as an element-id
+    /// suffix.
+    ///
+    /// A popover keys its open state by element id, so a split needs one id per
+    /// pane: shared, the panes are one popover repeated, and a chip pressed in
+    /// one of them opens in all of them. The borrowed view names the pane.
+    fn composer_menu_scope(&self) -> String {
+        match self.view_session_id.as_ref() {
+            Some(session_id) => format!("@{}", session_id.as_str()),
+            None => "@primary".to_string(),
+        }
+    }
+
+    /// Whether the Composer being rendered belongs to the focused pane.
+    ///
+    /// The runtime menu flags live on the workbench while a group renders one
+    /// Composer per pane, so a flag alone would paint the menu in every pane.
+    /// Only the pane whose borrowed view is the selected session — the one that
+    /// owns the keyboard — honours them.
+    fn composer_menu_scope_focused(&self) -> bool {
+        self.view_session_id.is_some() && self.view_session_id == self.selected_session_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_composer_runtime_choice(
         &mut self,
@@ -47477,7 +47703,7 @@ impl VibexWorkbench {
             .unwrap_or_else(|| label.to_string());
         let tooltip = format!("{label}: {selected_label}");
         let content = runtime_selector_dropdown_content(icon, selected_label, compact, cx);
-        let menu_id = format!("composer-runtime-choice-{id}");
+        let menu_id = format!("composer-runtime-choice-{id}{}", self.composer_menu_scope());
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
             .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
         let choices_empty = choices.is_empty();
@@ -47511,6 +47737,7 @@ impl VibexWorkbench {
             default_value,
             self.composer_geometry,
             menu_max_height,
+            self.composer_menu_scope_focused(),
             cx,
         )
     }
@@ -47558,18 +47785,25 @@ impl VibexWorkbench {
             cx,
         );
         let trigger_bounds_entity = cx.weak_entity();
+        let trigger_session = self
+            .view_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string());
         let tracked_content = div()
             .when(compact, |this| this.size_full())
             .when(!compact, |this| this.flex_none())
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
-                    if this.composer_geometry.runtime_trigger_bounds != Some(bounds) {
-                        this.composer_geometry.runtime_trigger_bounds = Some(bounds);
-                        if this.composer_runtime_menu_open
-                            || this.runtime_choice_menu_open.is_some()
-                        {
-                            cx.notify();
-                        }
+                    let changed = this
+                        .record_composer_geometry(trigger_session.as_deref(), |geometry| {
+                            geometry.runtime_trigger_bounds = Some(bounds)
+                        });
+                    // A moved trigger only matters while a panel hangs off it.
+                    if changed
+                        && (this.composer_runtime_menu_open
+                            || this.runtime_choice_menu_open.is_some())
+                    {
+                        cx.notify();
                     }
                 });
             })
@@ -47828,10 +48062,16 @@ impl VibexWorkbench {
             .bg(cx.theme().popover)
             .shadow_lg()
             .child(menu_content);
-        let menu_open = self.composer_runtime_menu_open;
-        let closing = self.runtime_menu_closing_since;
+        // One pane owns the cascade. Every other pane's Composer shares the
+        // flag, and a popover keys its open state by element id, so without both
+        // the scope and the id below a chip pressed in one pane opened in all of
+        // them — each one anchored to the last pane that painted a trigger.
+        let focused_pane = self.composer_menu_scope_focused();
+        let menu_open = self.composer_runtime_menu_open && focused_pane;
+        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
+        let scope = self.composer_menu_scope();
 
-        let popover = Popover::new("composer-runtime-cascade")
+        let popover = Popover::new(format!("composer-runtime-cascade{scope}"))
             .anchor(menu_placement.anchor)
             .appearance(false)
             // See the new-session twin: the exit timeline keeps the panel up.
@@ -56752,7 +56992,9 @@ impl VibexWorkbench {
     ///
     /// `enabled` is false for a group pane that does not hold the keyboard: the
     /// pane still shows its session's composer, but the surface is dimmed and
-    /// inert until the pane is clicked.
+    /// rejects edits until the pane is clicked. Its textarea stays focusable
+    /// while it is inert — see the `readonly` note on the textarea — so the
+    /// click that focuses the pane also places the caret.
     fn render_composer(
         &mut self,
         window: &mut Window,
@@ -56763,6 +57005,15 @@ impl VibexWorkbench {
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
         }
+        // The pane's own bounds, measured by its last prepaint. A split paints
+        // one composer per pane and every prepaint hook runs after the tree is
+        // built, so the measurement is parked by session instead of written
+        // here; adopting it keeps each pane's menus on its own composer.
+        self.adopt_composer_geometry();
+        let geometry_session = self
+            .view_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string());
         // The composer renders for the borrowed view, so every control on it —
         // the runtime cascade, the send gate and the auto-continue countdown —
         // reads that view's session. The sidebar selection names the focused
@@ -57238,13 +57489,19 @@ impl VibexWorkbench {
                             })
                             .when(!composer_extension_visible && is_dark, |this| this.shadow_lg())
                             .when(!composer_extension_visible && !is_dark, |this| this.shadow_sm())
-                            .on_prepaint(move |bounds, _, cx| {
-                                let _ = surface_geometry_entity.update(cx, |this, cx| {
-                                    if this.composer_geometry.surface_bounds != Some(bounds) {
-                                        this.composer_geometry.surface_bounds = Some(bounds);
-                                        cx.notify();
-                                    }
-                                });
+                            .on_prepaint({
+                                let surface_session = geometry_session.clone();
+                                move |bounds, _, cx| {
+                                    let _ = surface_geometry_entity.update(cx, |this, cx| {
+                                        let changed = this.record_composer_geometry(
+                                            surface_session.as_deref(),
+                                            |geometry| geometry.surface_bounds = Some(bounds),
+                                        );
+                                        if changed {
+                                            cx.notify();
+                                        }
+                                    });
+                                }
                             })
                             .child(
                                 h_flex()
@@ -57269,17 +57526,26 @@ impl VibexWorkbench {
                                             .when(self.composer_expanded, |this| {
                                                 this.self_stretch()
                                             })
-                                            .on_prepaint(move |bounds, _, cx| {
-                                                let _ =
-                                                    input_geometry_entity.update(cx, |this, cx| {
-                                                        if this.composer_geometry.input_bounds
-                                                            != Some(bounds)
-                                                        {
-                                                            this.composer_geometry.input_bounds =
-                                                                Some(bounds);
-                                                            cx.notify();
-                                                        }
-                                                    });
+                                            .on_prepaint({
+                                                let input_session = geometry_session.clone();
+                                                move |bounds, _, cx| {
+                                                    let _ = input_geometry_entity.update(
+                                                        cx,
+                                                        |this, cx| {
+                                                            let changed = this
+                                                                .record_composer_geometry(
+                                                                    input_session.as_deref(),
+                                                                    |geometry| {
+                                                                        geometry.input_bounds =
+                                                                            Some(bounds)
+                                                                    },
+                                                                );
+                                                            if changed {
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    );
+                                                }
                                             })
                                             .on_key_up(cx.listener(|this, _, window, cx| {
                                                 this.refresh_suggestions(
@@ -57410,7 +57676,20 @@ impl VibexWorkbench {
                                             .child(
                                                 Textarea::new(&composer_input)
                                                     .appearance(false)
-                                                    .disabled(!enabled)
+                                                    // Read-only, not disabled: a
+                                                    // disabled input swallows
+                                                    // the press that focuses its
+                                                    // pane, so the click that
+                                                    // gave a pane the keyboard
+                                                    // left its caret behind and
+                                                    // the next one was needed to
+                                                    // actually type. Read-only
+                                                    // keeps the press, the click
+                                                    // focuses the textarea, and
+                                                    // the pane is writable again
+                                                    // by the time the next frame
+                                                    // renders it.
+                                                    .readonly(!enabled)
                                                     .when(self.composer_expanded, |this| {
                                                         this.h_full()
                                                     })
@@ -64645,16 +64924,54 @@ fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &st
     }
 }
 
-/// The dot a group tab uses for one session's lifecycle state.
-fn sidebar_session_status_color(state: AgentSessionState, cx: &App) -> Hsla {
-    match state {
-        AgentSessionState::Running | AgentSessionState::Initializing => cx.theme().success,
-        AgentSessionState::NeedsInput => cx.theme().warning,
-        AgentSessionState::Error => cx.theme().danger,
-        AgentSessionState::Idle | AgentSessionState::Closed | AgentSessionState::Archived => {
-            cx.theme().muted_foreground
-        }
-    }
+/// The invisible band that keeps a split resize from selecting text.
+///
+/// A divider is a drag source, so the pointer leaves its nine-pixel grab area
+/// on the first move and travels across the panes with the button down. The
+/// window-level selection layer anchors a selection at the press regardless of
+/// what the press was for, and while a drag is live it deliberately ignores the
+/// pointer — so the selection is extended by the *next* moves after the button
+/// comes back up, and a resize leaves a paragraph selected in the pane beside
+/// the seam. Base only suppresses that for controls that ask, and the divider's
+/// own hitbox cannot: it blocks the mouse, so no ancestor of it is in the
+/// press's bubble path. This guard sits in front of the band instead — it does
+/// not occlude, so the divider underneath still reads as hovered and still owns
+/// the drag — and suppresses selection for the press.
+///
+/// `fraction` is the divider's position along the split's axis, from the shares
+/// the layout stores, so the band lands on the seam without measuring the flex
+/// pass.
+fn session_group_split_guard(
+    split_id: &str,
+    divider: usize,
+    fraction: f32,
+    direction: vibex_desktop_model::SplitDirection,
+) -> AnyElement {
+    let inset = SESSION_GROUP_SPLIT_GUARD_INSET;
+    let fraction = fraction.clamp(0.0, 1.0);
+    div()
+        .id(SharedString::from(format!(
+            "session-group-split-guard-{split_id}-{divider}"
+        )))
+        .absolute()
+        .map(|band| match direction {
+            vibex_desktop_model::SplitDirection::Horizontal => band
+                .top_0()
+                .bottom_0()
+                .left(relative(fraction))
+                .ml(px(-inset))
+                .w(px(SESSION_GROUP_SPLIT_GUARD_WIDTH)),
+            vibex_desktop_model::SplitDirection::Vertical => band
+                .left_0()
+                .right_0()
+                .top(relative(fraction))
+                .mt(px(-inset))
+                .h(px(SESSION_GROUP_SPLIT_GUARD_WIDTH)),
+        })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            gpui_base::GlobalState::suppress_text_selection(cx);
+        })
+        .into_any_element()
 }
 
 /// The half-pane hint shown while a session tab hovers a split edge.
@@ -64854,9 +65171,25 @@ fn sidebar_session_status_indicator(
     auto_continue_enabled: bool,
     cx: &App,
 ) -> AnyElement {
+    session_status_mark_for("sidebar-session-activity", state, auto_continue_enabled, cx)
+}
+
+/// The compact state mark for one listed session, whatever lists it.
+///
+/// A sidebar row and a session-group tab are the same lane at two widths, so
+/// they resolve their marks from one projection: a light pulse while the Agent
+/// works, the attention glyph while it is parked on the user, a dot for the
+/// states a dot can carry. `id` scopes the pulse — the one mark with motion —
+/// so several listed sessions animate independently.
+fn session_status_mark_for(
+    id: impl Into<ElementId>,
+    state: AgentSessionState,
+    auto_continue_enabled: bool,
+    cx: &App,
+) -> AnyElement {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => {
-            ActivityIndicator::sidebar("sidebar-session-activity")
+            ActivityIndicator::sidebar(id)
                 .color(if auto_continue_enabled {
                     cx.theme().success
                 } else {
@@ -89398,6 +89731,166 @@ mod tests {
         assert!(popover.contains("let rows = if menu_open { items() } else { Vec::new() }"));
         assert!(popover.contains("composer_runtime_choice_menu_height(choice_count, max_height)"));
         assert!(popover.contains("items: impl FnOnce() -> Vec<RuntimeChoiceMenuItem>"));
+    }
+
+    /// A chip pressed in one pane must not open the same chip in the others.
+    ///
+    /// Every pane builds the same Composer, so the menu flags are shared and a
+    /// popover keys its open state by element id. Both have to name the pane:
+    /// the flag alone left every cascade open, and a shared id made the panes
+    /// one popover repeated — each anchored to whichever pane painted a trigger
+    /// last, which put one pane's menu over another pane's Composer.
+    #[test]
+    fn split_composer_menus_belong_to_the_pane_that_opened_them() {
+        let source = include_str!("app.rs");
+
+        let cascade = source
+            .split_once("    fn render_composer_runtime_cascade(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .map(|(body, _)| body)
+            .expect("the composer cascade should remain inspectable");
+        assert!(cascade.contains("let focused_pane = self.composer_menu_scope_focused();"));
+        assert!(
+            cascade.contains("let menu_open = self.composer_runtime_menu_open && focused_pane;")
+        );
+        assert!(cascade.contains(".filter(|_| focused_pane);"));
+        assert!(cascade.contains("Popover::new(format!(\"composer-runtime-cascade{scope}\"))"));
+
+        let choice = source
+            .split_once("    fn render_composer_runtime_choice(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("the composer choice chips should remain inspectable");
+        // The menu id carries the pane, and the chip only honours the flag on the
+        // pane that owns the keyboard.
+        assert!(choice.contains("self.composer_menu_scope()"));
+        assert!(choice.contains("self.composer_menu_scope_focused(),"));
+
+        let popover = source
+            .split_once("    fn render_runtime_choice_popover(")
+            .and_then(|(_, tail)| tail.split_once("\n    #[allow(clippy::too_many_arguments)]"))
+            .map(|(body, _)| body)
+            .expect("the runtime choice popover should remain inspectable");
+        assert!(popover.contains(
+            "scope_focused && self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str())"
+        ));
+    }
+
+    /// A split's panes must not all report the last pane's Composer bounds.
+    ///
+    /// The Composer geometry is what the command menu and the runtime cascade
+    /// anchor to. Held on the workbench, every pane's prepaint overwrote it and
+    /// the surface that read it opened over whichever pane was painted last;
+    /// held on the view, each pane keeps its own. Prepaint runs after the whole
+    /// tree is built, so the measurement is parked by session id and adopted by
+    /// the view the next time that pane renders.
+    #[test]
+    fn composer_geometry_belongs_to_the_pane_that_measured_it() {
+        let source = include_str!("app.rs");
+
+        let view = source
+            .split_once("pub struct SessionView {")
+            .and_then(|(_, tail)| tail.split_once("\nimpl SessionView {"))
+            .map(|(body, _)| body)
+            .expect("the session view should remain inspectable");
+        assert_eq!(
+            view.matches("composer_geometry: ComposerGeometry,").count(),
+            1
+        );
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("the composer renderer should remain inspectable");
+        let adopt = composer
+            .find("self.adopt_composer_geometry();")
+            .expect("a pane's composer must adopt its own bounds");
+        let read = composer
+            .find("self.view_runtime_selection()")
+            .expect("the composer reads the borrowed view's runtime");
+        assert!(
+            adopt < read,
+            "the bounds have to be in place before they are read"
+        );
+        // Both measurements a pane takes — the surface and the input slot — are
+        // parked under that pane's session, never written into the borrow.
+        assert!(composer.contains("surface_session.as_deref(),"));
+        assert!(composer.contains("input_session.as_deref(),"));
+        assert_eq!(composer.matches(".record_composer_geometry(").count(), 2);
+        assert!(!composer.contains("this.composer_geometry.surface_bounds ="));
+    }
+
+    /// A divider drag must not leave a selection behind.
+    ///
+    /// The divider is a drag source, so the pointer leaves its grab band with
+    /// the button down and the window-level selection layer anchors a selection
+    /// at the seam — while the drag is live it ignores the pointer, so the
+    /// selection extends on the moves that follow the release. The divider's own
+    /// hitbox occludes, so no ancestor of it is in the press's bubble path; the
+    /// guard band painted in front of it is, and suppresses the selection.
+    #[test]
+    fn a_split_divider_press_suppresses_text_selection() {
+        let source = include_str!("app.rs");
+
+        let node = source
+            .split_once("    fn render_session_group_node(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane("))
+            .map(|(body, _)| body)
+            .expect("the group layout renderer should remain inspectable");
+        assert!(node.contains("for index in 0..children_len - 1 {"));
+        assert!(node.contains("guards.push(session_group_split_guard("));
+        // The guards ride the group's own box, so they are painted over the
+        // dividers instead of under them.
+        assert!(node.contains(".child(split)\n                    .children(guards)"));
+
+        let guard = source
+            .split_once("fn session_group_split_guard(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The half-pane hint"))
+            .map(|(body, _)| body)
+            .expect("the split guard should remain inspectable");
+        assert!(guard.contains(".on_mouse_down(MouseButton::Left"));
+        assert!(guard.contains("gpui_base::GlobalState::suppress_text_selection(cx);"));
+        // It has to be hovered for the press to reach it, and it must not
+        // occlude, or the divider underneath would stop owning the drag.
+        assert!(!guard.contains(".occlude()"));
+    }
+
+    /// A group tab is the sidebar row in a narrower lane.
+    ///
+    /// The same running sweep on the title, and the row's own status mark on
+    /// the right — one projection and one mark builder, so the two surfaces
+    /// cannot drift into disagreeing about a session.
+    #[test]
+    fn session_group_tabs_carry_the_sidebar_running_cue_and_status_mark() {
+        let source = include_str!("app.rs");
+
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("the group pane renderer should remain inspectable");
+        assert!(pane.contains("ShimmerText::new(title.clone())"));
+        assert!(pane.contains("TIMELINE_SHIMMER_SWEEP"));
+        assert!(pane.contains("TIMELINE_SHIMMER_SPREAD"));
+        assert!(pane.contains("session_status_mark_for("));
+        assert!(pane.contains("sidebar_attention_icon("));
+        // The tab resolves the row's state, optimistic dispatch and parked
+        // requests included.
+        assert!(pane.contains("sidebar_session_display_state("));
+        assert!(pane.contains(".pending_user_request_ids"));
+        assert!(!pane.contains("sidebar_session_status_color("));
+
+        let mark = source
+            .split_once("fn session_status_mark_for(")
+            .and_then(|(_, tail)| tail.split_once("\n/// Projects the state a sidebar row shows."))
+            .map(|(body, _)| body)
+            .expect("the shared status mark should remain inspectable");
+        assert!(mark.contains("ActivityIndicator::sidebar(id)"));
+        assert!(source.contains(
+            "session_status_mark_for(\"sidebar-session-activity\", state, auto_continue_enabled, cx)"
+        ));
+        assert!(pane.contains("session-group-tab-title-{session_id}"));
     }
 
     #[test]
