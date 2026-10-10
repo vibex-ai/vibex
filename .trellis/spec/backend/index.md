@@ -41,6 +41,7 @@ Read these files before backend work:
 | [Rust Dependency Sources](./rust-dependency-sources.md) | Adding or updating Rust Git dependencies, lockfiles, license policy, or third-party source inputs. |
 | [Agent Session Protocol](./agent-session-protocol.md) | Touching Agent sessions, timeline events, permissions, provider adapters, or live event sync. |
 | [Agent Usage Statistics](./agent-usage-statistics.md) | Touching ACP usage capture, execution facts, cumulative checkpoints, token aggregation, or typed Usage queries. |
+| [Vibex-use Contracts](./vibex-use.md) | Touching delegation, team access, execution results, context, recovery, event delivery, MCP transport, budgets, or shared team capabilities. |
 | [Runtime Switch Coordinator](./runtime-switch-coordinator.md) | Touching durable runtime switching, worker leases, active-work gates, operation journals, or startup reconciliation. |
 | [Managed Worktree Identity And Recovery](./worktree-coordinator.md) | Touching Worktree identity, eligibility, lifecycle coordination, recovery, destructive preflight, or remote Worktree capabilities. |
 | [Desktop Application Updates](./app-update.md) | Touching signed release discovery, artifact verification, update scheduling, installation recovery, or updater UI state. |

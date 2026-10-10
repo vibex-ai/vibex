@@ -88,6 +88,9 @@ use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use timeline_loading::PreparedTimeline;
 #[cfg(test)]
+#[path = "team_tests.rs"]
+mod team_tests;
+#[cfg(test)]
 #[path = "timeline_tests.rs"]
 mod timeline_tests;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -172,7 +175,7 @@ use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
     DesktopRuntimeFacade, DesktopRuntimeMode, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
     STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
-    StorageCleanupKind, StorageCleanupReport, runtime_option_ref, validate_external_open_url,
+    StorageCleanupKind, StorageCleanupReport, validate_external_open_url,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
@@ -960,7 +963,7 @@ struct ComposerSuggestionContext {
 /// session, so switching sessions cannot resume a stale cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ComposerHistoryState {
-    draft: String,
+    draft: Option<InputContent>,
     index: Option<usize>,
     session_id: Option<VibexSessionId>,
 }
@@ -1472,6 +1475,8 @@ struct VibexMessageClipboard {
     version: u8,
     text: String,
     attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    mentions: Vec<VibexUseMention>,
 }
 
 impl VibexMessageClipboard {
@@ -1481,14 +1486,25 @@ impl VibexMessageClipboard {
             version: VIBEX_MESSAGE_CLIPBOARD_VERSION,
             text,
             attachments,
+            mentions: Vec::new(),
         }
+    }
+
+    fn with_mentions(mut self, mentions: &[VibexUseMention]) -> Self {
+        self.mentions = mentions
+            .iter()
+            .take(VIBEX_USE_MAX_MENTIONS)
+            .cloned()
+            .collect();
+        self
     }
 
     fn is_supported(&self) -> bool {
         self.format == VIBEX_MESSAGE_CLIPBOARD_FORMAT
             && self.version == VIBEX_MESSAGE_CLIPBOARD_VERSION
-            && !self.attachments.is_empty()
+            && (!self.attachments.is_empty() || !self.mentions.is_empty())
             && self.attachments.len() <= VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS
+            && self.mentions.len() <= VIBEX_USE_MAX_MENTIONS
     }
 }
 
@@ -5083,6 +5099,7 @@ struct PendingUserMessageEdit {
     submitted_at_ms: i64,
     text: String,
     attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
 }
 
 impl PendingUserMessageEdit {
@@ -5109,6 +5126,7 @@ impl PendingUserMessageEdit {
         };
         message.text.clone_from(&self.text);
         message.attachments.clone_from(&self.attachments);
+        message.mentions.clone_from(&self.mentions);
         user_item.timestamp_ms = self.submitted_at_ms;
         items.truncate(user_item_index + 1);
         Some(items)
@@ -5125,6 +5143,7 @@ struct OptimisticUserMessage {
     submitted_at_ms: i64,
     text: String,
     attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
 }
 
 impl OptimisticUserMessage {
@@ -5162,6 +5181,7 @@ impl OptimisticUserMessage {
         let payload = TimelinePayload::UserMessage(UserMessagePayload {
             text: self.text.clone(),
             attachments: self.attachments.clone(),
+            mentions: self.mentions.clone(),
             ..Default::default()
         });
         items.push(TimelineItem {
@@ -7150,7 +7170,7 @@ struct PendingNewSession {
 
 #[derive(Clone)]
 struct SubmittedNewSessionDraft {
-    raw_text: String,
+    content: InputContent,
     attachments: Vec<InlineComposerAttachment>,
     command_entry: Option<AgentCommandEntry>,
     schedule: Option<MessageSchedule>,
@@ -7290,6 +7310,24 @@ enum SidebarSelectionState {
 enum SidebarMoveSelectionKind {
     Project,
     Session,
+}
+
+const DELEGATED_TREE_PAGE_SIZE: usize = 64;
+const DELEGATED_TREE_NODE_LIMIT: usize = 4_096;
+const DELEGATED_TREE_BRANCH_LIMIT: usize = 64;
+
+struct ComposerDelegationSubmission {
+    fingerprint: String,
+    idempotency_key: String,
+    pending: bool,
+}
+
+#[derive(Default)]
+struct DelegatedBranchPage {
+    session_ids: Vec<String>,
+    next_cursor: Option<String>,
+    loading: bool,
+    error: Option<String>,
 }
 
 pub struct VibexWorkbench {
@@ -7532,6 +7570,16 @@ pub struct VibexWorkbench {
     delegated_sessions: BTreeMap<String, AgentSession>,
     /// Ownership-tree nodes for every delegated descendant, keyed by child id.
     delegated_tree: BTreeMap<String, SessionTreeNode>,
+    delegated_pages: BTreeMap<Option<String>, DelegatedBranchPage>,
+    delegated_tree_generation: u64,
+    delegated_refresh_task: Option<Task<()>>,
+    delegated_refresh_offset: usize,
+    delegated_roots_dirty: bool,
+    delegated_reveal_target: Option<String>,
+    delegated_deferred_parent: Option<String>,
+    composer_delegations: BTreeMap<String, ComposerDelegationSubmission>,
+    /// Complete rendered navigation order, including rows virtualized offscreen.
+    sidebar_visible_session_ids: Vec<String>,
     /// Ownership-tree branches the user collapsed, mirrored into the UI state.
     ///
     /// Expansion is client navigation state: collapsing a branch changes what
@@ -7598,6 +7646,8 @@ pub struct VibexWorkbench {
     right_rail_activity_drop_target: Option<RightRailActivityDropTarget>,
     /// Group members whose parked view is being fetched.
     session_group_view_loads: BTreeSet<String>,
+    session_group_view_errors: BTreeMap<String, String>,
+    session_group_available_width_rem: f32,
     /// One cached view per rendered group pane, keyed by pane id.
     ///
     /// A pane that owns its element tree re-renders without rebuilding its
@@ -7610,6 +7660,7 @@ pub struct VibexWorkbench {
     sidebar_auto_archive_task: Option<Task<()>>,
     sidebar_organization_task: Option<Task<()>>,
     session_group_presentation_task: Option<Task<()>>,
+    session_group_presentation_recovery_pending: bool,
     new_session_agent_drop_target: Option<NewSessionAgentDropTarget>,
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
@@ -7770,6 +7821,7 @@ pub struct VibexWorkbench {
     /// entries stay untouched until then, so a session that simply has not
     /// loaded cannot be mistaken for one that was deleted.
     composer_queue_restore_pending: bool,
+    composer_queue_session_loads: BTreeSet<String>,
     /// Whether the authoritative session list has been read at least once. The
     /// restored queue waits for it before it is adopted or pruned.
     sessions_loaded: bool,
@@ -8622,6 +8674,15 @@ impl VibexWorkbench {
             sessions: Vec::new(),
             delegated_sessions: BTreeMap::new(),
             delegated_tree: BTreeMap::new(),
+            delegated_pages: BTreeMap::new(),
+            delegated_tree_generation: 0,
+            delegated_refresh_task: None,
+            delegated_refresh_offset: 0,
+            delegated_roots_dirty: false,
+            delegated_reveal_target: None,
+            delegated_deferred_parent: None,
+            composer_delegations: BTreeMap::new(),
+            sidebar_visible_session_ids: Vec::new(),
             delegated_collapsed_ids: restored_collapsed_delegated_ids,
             delegated_row_focus: BTreeMap::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
@@ -8658,12 +8719,15 @@ impl VibexWorkbench {
             session_group_tab_removal_active: false,
             right_rail_activity_drop_target: None,
             session_group_view_loads: BTreeSet::new(),
+            session_group_view_errors: BTreeMap::new(),
+            session_group_available_width_rem: 72.0,
             session_group_pane_views: BTreeMap::new(),
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
             sidebar_auto_archive_task: None,
             sidebar_organization_task: None,
             session_group_presentation_task: None,
+            session_group_presentation_recovery_pending: false,
             new_session_agent_drop_target: None,
             collapsed_project_restore: None,
             selected_session_id: selected_session_id.clone(),
@@ -8750,6 +8814,7 @@ impl VibexWorkbench {
             composer_queue: Vec::new(),
             composer_queue_serial: 0,
             composer_queue_restore_pending: false,
+            composer_queue_session_loads: BTreeSet::new(),
             sessions_loaded: false,
             composer_queue_manual_session_ids: BTreeSet::new(),
             composer_queue_paused_session_ids: BTreeSet::new(),
@@ -9518,15 +9583,10 @@ impl VibexWorkbench {
     ) {
         let bridge = runtime.session_group_presentation_bridge();
         bridge.publish_capability(self.presentation_capability());
-        // A group stored while no window was open is offered now. It is a
-        // presentation-only request in `when_user_returns` mode, so a client
-        // coming back does not get pulled out of the workspace it was in.
-        let recovery = runtime.vibex_use();
-        cx.spawn(async move |_entity, _cx| {
-            let _ = recovery.recover_presentations().await;
-        })
-        .detach();
         let mut requests = runtime.start_vibex_use_presentation();
+        // Recovery needs both this receiver and the current workspace list.
+        // The first overview triggers it after installing authoritative roots.
+        self.session_group_presentation_recovery_pending = true;
         let bridge_for_task = bridge.clone();
         self.session_group_presentation_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -9557,6 +9617,25 @@ impl VibexWorkbench {
         ));
     }
 
+    fn recover_session_group_presentations(&mut self, cx: &mut Context<Self>) {
+        if !self.session_group_presentation_recovery_pending
+            || !self.sessions_loaded
+            || self.ui_state.sidebar.active_authority() != SidebarUiState::LOCAL_AUTHORITY
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        self.session_group_presentation_recovery_pending = false;
+        let recovery = runtime.vibex_use();
+        gpui_tokio::Tokio::spawn(cx, async move {
+            if let Err(error) = recovery.recover_presentations().await {
+                tracing::warn!(target: "vibex_desktop", error_code = %error.code, "Session group presentation recovery failed");
+            }
+        }).detach();
+    }
+
     /// What this window can actually do with a group right now.
     fn presentation_capability(&self) -> VibexUsePresentationCapability {
         VibexUsePresentationCapability {
@@ -9583,6 +9662,11 @@ impl VibexWorkbench {
         command: &GroupPresentationCommand,
         cx: &mut Context<Self>,
     ) -> Result<GroupPresentationReply, vibex_core::VibexError> {
+        if self.ui_state.sidebar.active_authority() != SidebarUiState::LOCAL_AUTHORITY {
+            return Ok(GroupPresentationReply::unavailable(
+                VibexUseUnavailableReason::ForeignAuthority,
+            ));
+        }
         let member_ids: Vec<String> = command
             .member_session_refs
             .iter()
@@ -9607,7 +9691,6 @@ impl VibexWorkbench {
                 )
             })?;
         let session_workspaces = self.sidebar_session_workspaces();
-        let session_projects = self.sidebar_session_projects();
         let group_id = command.group_id.as_str().to_string();
         let members: Vec<String> = member_ids
             .iter()
@@ -9618,12 +9701,12 @@ impl VibexWorkbench {
             })
             .cloned()
             .collect();
-        if members.is_empty() {
+        if members.is_empty() || members.len() != member_ids.len() {
             // Reporting the mismatch is better than creating an empty group
             // that silently lost every member.
             return Err(vibex_core::VibexError::validation(
                 "presentation_members_unavailable",
-                "none of the named sessions belong to that workspace",
+                "the named sessions must all belong to that workspace",
             ));
         }
         let exists = self
@@ -9656,7 +9739,8 @@ impl VibexWorkbench {
                 });
             }
         }
-        let applied = if command.presentation_only {
+        let width_rem = self.session_group_available_width_rem;
+        let applied = if command.presentation_only && exists {
             // Showing a group must not restate its definition. The panes keep
             // whatever the user arranged, and the members keep whatever the
             // user moved.
@@ -9706,17 +9790,7 @@ impl VibexWorkbench {
                 .sidebar
                 .organization
                 .group_mut(&group_id)
-                .map(|group| {
-                    group.apply_layout_preset(
-                        command.layout.preset,
-                        command
-                            .layout
-                            .lead_session_ref
-                            .as_ref()
-                            .map(|reference| reference.id.as_str()),
-                        command.layout.preferred_live_panes,
-                    )
-                })
+                .map(|group| group.set_automatic_layout(command.layout.clone(), width_rem))
         } else {
             let foreign: Vec<String> = members
                 .iter()
@@ -9754,17 +9828,7 @@ impl VibexWorkbench {
                     .sidebar
                     .organization
                     .group_mut(&group_id)
-                    .map(|group| {
-                        group.apply_layout_preset(
-                            command.layout.preset,
-                            command
-                                .layout
-                                .lead_session_ref
-                                .as_ref()
-                                .map(|reference| reference.id.as_str()),
-                            command.layout.preferred_live_panes,
-                        )
-                    })
+                    .map(|group| group.set_automatic_layout(command.layout.clone(), width_rem))
             } else {
                 None
             }
@@ -9775,17 +9839,6 @@ impl VibexWorkbench {
                 "this window cannot build that group from the named sessions",
             ));
         };
-        let _ = session_projects;
-        // The revision is a content fingerprint of the arrangement, so the
-        // caller learns the exact revision it just produced instead of a
-        // counter this window happens to keep.
-        let mut revision_view = self.sidebar_organization_view();
-        sidebar_organization_revision(&mut revision_view);
-        let revision = revision_view.revision;
-        self.invalidate_sidebar_projection_cache();
-        self.queue_ui_state();
-        self.publish_sidebar_invalidation();
-
         // Presenting is what actually switches the central column. It only
         // happens when the user is already working in this team's workspace:
         // an Agent must not move somebody else's window out from under them.
@@ -9793,16 +9846,22 @@ impl VibexWorkbench {
         let mut reason = None;
         let mut message = None;
         if command.present {
-            let viewing_team = self
-                .selected_session_id
-                .as_ref()
-                .and_then(|session_id| session_workspaces.get(session_id.as_str()))
-                .is_some_and(|workspace| workspace == &workspace_id);
+            let viewing_team = self.selected_session_id.as_ref().is_some_and(|session_id| {
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .group(&group_id)
+                    .is_some_and(|group| group.contains(session_id.as_str()))
+            });
             let may_present = viewing_team
                 || command.activation_policy == PresentationActivationPolicy::WhenUserReturns;
             if viewing_team {
-                if let Some(lead) = applied.visible_session_refs.first()
-                    && let Ok(session_id) = VibexSessionId::parse(lead.id.clone())
+                if let Some(focus) = command
+                    .focus_session_ref
+                    .as_ref()
+                    .filter(|reference| members.contains(&reference.id))
+                    .or_else(|| applied.visible_session_refs.first())
+                    && let Ok(session_id) = VibexSessionId::parse(focus.id.clone())
                 {
                     self.select_session(session_id, cx);
                 }
@@ -9822,6 +9881,18 @@ impl VibexWorkbench {
                 );
             }
         }
+        let applied = self
+            .ui_state
+            .sidebar
+            .organization
+            .group(&group_id)
+            .map(SessionGroupUiState::observed_layout)
+            .unwrap_or(applied);
+        let revision = self.sidebar_organization_view().revision;
+        self.invalidate_sidebar_projection_cache();
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
         Ok(GroupPresentationReply {
             state,
             revision,
@@ -9837,6 +9908,12 @@ impl VibexWorkbench {
         group_id: &str,
         cx: &mut Context<Self>,
     ) -> Result<bool, vibex_core::VibexError> {
+        if self.ui_state.sidebar.active_authority() != SidebarUiState::LOCAL_AUTHORITY {
+            return Err(vibex_core::VibexError::capability(
+                "presentation_authority_not_displayed",
+                "the desktop is displaying another runtime",
+            ));
+        }
         if self.ui_state.sidebar.organization.group(group_id).is_none() {
             return Ok(false);
         }
@@ -9968,6 +10045,48 @@ impl VibexWorkbench {
         view
     }
 
+    fn sync_user_session_group(&mut self, group_id: &str) {
+        if self.ui_state.sidebar.active_authority() != SidebarUiState::LOCAL_AUTHORITY {
+            return;
+        }
+        let Some(group) = self.ui_state.sidebar.organization.group_mut(group_id) else {
+            self.remove_user_session_group(group_id);
+            return;
+        };
+        group.disable_automatic_layout();
+        let name = group.name.clone();
+        let members = group
+            .member_session_ids
+            .iter()
+            .filter_map(|id| VibexSessionId::parse(id).ok())
+            .collect::<Vec<_>>();
+        let applied = group.observed_layout();
+        let layout = vibex_core::SessionGroupLayoutIntent {
+            preset: applied.preset,
+            lead_session_ref: applied.visible_session_refs.first().cloned(),
+            preferred_live_panes: Some(applied.live_panes.max(1)),
+        };
+        let revision = self.sidebar_organization_view().revision;
+        if let Some(runtime) = self.runtime.as_ref()
+            && let Err(error) = runtime
+                .vibex_use()
+                .sync_user_group(group_id, &name, &members, &layout, revision)
+        {
+            self.persistence_note = Some(locale::localize_error_message(&error.message));
+        }
+    }
+
+    fn remove_user_session_group(&mut self, group_id: &str) {
+        if self.ui_state.sidebar.active_authority() != SidebarUiState::LOCAL_AUTHORITY {
+            return;
+        }
+        if let Some(runtime) = self.runtime.as_ref()
+            && let Err(error) = runtime.vibex_use().remove_user_group(group_id)
+        {
+            self.persistence_note = Some(locale::localize_error_message(&error.message));
+        }
+    }
+
     fn publish_sidebar_invalidation(&self) {
         let Some(runtime) = self.runtime.as_ref() else {
             return;
@@ -10019,6 +10138,7 @@ impl VibexWorkbench {
                     )));
                     return;
                 }
+                let previous_groups = view.organization.groups.clone();
                 let session_projects = self.sidebar_session_projects();
                 let session_workspaces = self.sidebar_session_workspaces();
                 let folder_id = RequestId::new().to_string();
@@ -10033,6 +10153,22 @@ impl VibexWorkbench {
                     Ok(SidebarMutationOutcome::Applied(effect)) => {
                         if effect.organization {
                             self.ui_state.sidebar.organization = view.organization.clone();
+                            let changed: Vec<_> = view
+                                .organization
+                                .groups
+                                .iter()
+                                .filter(|(id, group)| previous_groups.get(*id) != Some(*group))
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            for id in changed {
+                                self.sync_user_session_group(&id);
+                            }
+                            for id in previous_groups
+                                .keys()
+                                .filter(|id| !view.organization.groups.contains_key(*id))
+                            {
+                                self.remove_user_session_group(id);
+                            }
                             self.queue_ui_state();
                         }
                         if effect.navigation {
@@ -12697,6 +12833,18 @@ impl VibexWorkbench {
                                 .as_ref()
                                 .filter(|selected| {
                                     sessions.iter().any(|session| &session.id == *selected)
+                                        || (!this
+                                            .optimistically_removed_session_ids
+                                            .contains(selected.as_str())
+                                            && (this
+                                                .delegated_sessions
+                                                .contains_key(selected.as_str())
+                                                || this
+                                                    .ui_state
+                                                    .sidebar
+                                                    .organization
+                                                    .group_of_session(selected.as_str())
+                                                    .is_some()))
                                 })
                                 .cloned()
                                 .or_else(|| sessions.first().map(|session| session.id.clone()));
@@ -12731,13 +12879,10 @@ impl VibexWorkbench {
                             // list, from the runtime's ownership edges, so a
                             // child that is not a navigation row still has a
                             // registry entry and a tree node.
-                            this.refresh_delegated_sessions();
-                            // The list is authoritative from here on: the
-                            // restored pre-send queue can finally be told apart
-                            // from messages whose session is gone. The rows also
-                            // re-derive the names their pending scheduled sends
-                            // give them, which a listed placeholder title would
-                            // otherwise put back on every refresh.
+                            this.refresh_delegated_sessions(cx);
+                            // Root metadata is now available. Owned sessions
+                            // remain lazy and must not lose restored queues just
+                            // because the overview does not enumerate them.
                             this.sessions_loaded = true;
                             this.apply_pending_scheduled_titles();
                             if this.ui_state.workbench.active_tab == "management" {
@@ -12748,9 +12893,16 @@ impl VibexWorkbench {
                             // `restored_auto_continue_session_ids` only knows
                             // about persisted per-session `true` values, so a
                             // project-enabled session must be added here too.
+                            let unresolved_auto_continue = this
+                                .auto_continue_session_ids
+                                .iter()
+                                .filter(|id| this.registered_session(id).is_none())
+                                .cloned()
+                                .collect::<BTreeSet<_>>();
                             this.auto_continue_session_ids = this
                                 .sessions
                                 .iter()
+                                .chain(this.delegated_sessions.values())
                                 .filter(|session| {
                                     this.ui_state
                                         .session
@@ -12762,6 +12914,7 @@ impl VibexWorkbench {
                                         })
                                 })
                                 .map(|session| session.id.as_str().to_string())
+                                .chain(unresolved_auto_continue)
                                 .collect();
                             // A persisted pause only applies while the
                             // auto-continue preference itself is still on.
@@ -12786,6 +12939,7 @@ impl VibexWorkbench {
                             let auto_continue_sessions = this
                                 .sessions
                                 .iter()
+                                .chain(this.delegated_sessions.values())
                                 .filter(|session| {
                                     this.auto_continue_session_ids.contains(session.id.as_str())
                                 })
@@ -12797,15 +12951,17 @@ impl VibexWorkbench {
                             if this.ui_state.composer.queue_send_mode
                                 == ComposerQueueSendMode::Manual
                             {
-                                this.composer_queue_manual_session_ids = this
-                                    .sessions
-                                    .iter()
-                                    .map(|session| session.id.as_str().to_string())
-                                    .collect();
+                                this.composer_queue_manual_session_ids.extend(
+                                    this.sessions
+                                        .iter()
+                                        .chain(this.delegated_sessions.values())
+                                        .map(|session| session.id.as_str().to_string()),
+                                );
                             } else {
                                 this.composer_queue_manual_session_ids.clear();
                             }
                             this.reconcile_sidebar_state();
+                            this.recover_session_group_presentations(cx);
                             this.publish_sidebar_invalidation();
                             this.refresh_workspace_contexts(cx);
                             if this.reconcile_new_session_runtime_selection()
@@ -13137,15 +13293,38 @@ impl VibexWorkbench {
     }
 
     fn reconcile_sidebar_state(&mut self) {
-        let valid_session_ids = self
+        let root_session_ids = self
             .sessions
             .iter()
             .map(|session| session.id.as_str().to_string())
             .collect::<BTreeSet<_>>();
+        // The overview is authoritative for navigation roots only. Persisted
+        // group members and queued drafts can precede their ownership pages.
+        // Only an explicit deletion may discard their local session state.
+        let mut valid_session_ids = root_session_ids.clone();
+        valid_session_ids.extend(self.delegated_sessions.keys().cloned());
+        valid_session_ids.extend(self.delegated_tree.keys().cloned());
+        valid_session_ids.extend(
+            self.ui_state
+                .sidebar
+                .organization
+                .groups
+                .values()
+                .flat_map(|group| group.member_session_ids.iter().cloned()),
+        );
+        valid_session_ids.extend(
+            self.composer_queue
+                .iter()
+                .map(|message| message.session_id.to_string()),
+        );
+        valid_session_ids.extend(self.composer_drafts.drafts.keys().cloned());
+        valid_session_ids.extend(self.pending_agent_turn_session_ids.iter().cloned());
+        valid_session_ids.extend(self.auto_continue_session_ids.iter().cloned());
+        valid_session_ids.retain(|id| !self.optimistically_removed_session_ids.contains(id));
         let mut seen = BTreeSet::new();
         self.sidebar_state
             .row_order
-            .retain(|id| valid_session_ids.contains(id) && seen.insert(id.clone()));
+            .retain(|id| root_session_ids.contains(id) && seen.insert(id.clone()));
         self.sidebar_state
             .pinned_ids
             .retain(|id| valid_session_ids.contains(id));
@@ -13254,7 +13433,11 @@ impl VibexWorkbench {
         self.ui_state
             .sidebar
             .organization
-            .reconcile(&ordered_project_ids, &ordered_session_projects);
+            .reconcile_with_group_members(
+                &ordered_project_ids,
+                &ordered_session_projects,
+                &valid_session_ids,
+            );
         let valid_group_ids = self
             .ui_state
             .sidebar
@@ -13334,10 +13517,7 @@ impl VibexWorkbench {
             return session;
         }
         let is_fallback = session.title == agent_session_fallback_title(&session.agent_id);
-        let known_row = self
-            .sessions
-            .iter()
-            .any(|existing| existing.id == session.id);
+        let known_row = self.registered_session(session.id.as_str()).is_some();
         if !is_fallback {
             // An authoritative update (the seeded prompt title or an
             // Agent-supplied title) releases the record. The optimistic
@@ -13371,11 +13551,16 @@ impl VibexWorkbench {
             return;
         }
         let session = self.reconcile_pending_new_session_title(session);
-        let previous_session = self
-            .sessions
-            .iter()
-            .find(|existing| existing.id == session.id);
+        let delegated = (self.delegated_sessions.contains_key(session.id.as_str())
+            && !self.sessions.iter().any(|root| root.id == session.id))
+            || self
+                .delegated_tree
+                .get(session.id.as_str())
+                .is_some_and(|node| node.parent_session_ref.is_some());
+        let previous_session = self.registered_session(session.id.as_str());
         let sidebar_changed = session_snapshot_sidebar_changed(previous_session, &session);
+        let previous_revision =
+            previous_session.map(|existing| (existing.state, existing.updated_at_ms));
         let auto_continue_enabled = self
             .ui_state
             .session
@@ -13383,36 +13568,35 @@ impl VibexWorkbench {
             .get(session.id.as_str())
             .copied()
             .unwrap_or_else(|| self.project_auto_continue_enabled(&session.project_id));
-        if let Some((existing_state, existing_updated_at_ms)) = self
-            .sessions
-            .iter()
-            .find(|existing| existing.id == session.id)
-            .map(|existing| (existing.state, existing.updated_at_ms))
+        if let Some((existing_state, existing_updated_at_ms)) = previous_revision
+            && (existing_state != session.state || existing_updated_at_ms != session.updated_at_ms)
         {
-            if existing_state != session.state || existing_updated_at_ms != session.updated_at_ms {
-                self.auto_continue_probe_attempts
-                    .remove(session.id.as_str());
-                self.auto_continue_turn_statuses.remove(session.id.as_str());
-                self.auto_continue_probe_tasks.remove(session.id.as_str());
-                self.cancel_auto_continue_countdown(&session.id);
-                // The completion probe for the superseded revision can no longer
-                // answer for this one. Re-arm a waiting auto-send queue so the
-                // next frame probes the current revision instead of stranding it
-                // on an unobserved turn boundary.
-                self.mark_composer_queue_for_recheck(&session.id);
-            }
-            if let Some(existing) = self
-                .sessions
-                .iter_mut()
-                .find(|existing| existing.id == session.id)
-            {
-                *existing = session;
-            }
+            self.auto_continue_probe_attempts
+                .remove(session.id.as_str());
+            self.auto_continue_turn_statuses.remove(session.id.as_str());
+            self.auto_continue_probe_tasks.remove(session.id.as_str());
+            self.cancel_auto_continue_countdown(&session.id);
+            // The completion probe for the superseded revision can no longer
+            // answer for this one. Re-arm a waiting auto-send queue so the
+            // next frame probes the current revision instead of stranding it
+            // on an unobserved turn boundary.
+            self.mark_composer_queue_for_recheck(&session.id);
+        }
+        if auto_continue_enabled {
+            self.auto_continue_session_ids
+                .insert(session.id.as_str().to_string());
+        }
+        if delegated {
+            self.sessions.retain(|root| root.id != session.id);
+            self.delegated_sessions
+                .insert(session.id.as_str().to_string(), session);
+        } else if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.id == session.id)
+        {
+            *existing = session;
         } else {
-            if auto_continue_enabled {
-                self.auto_continue_session_ids
-                    .insert(session.id.as_str().to_string());
-            }
             self.sessions.insert(0, session);
         }
         if sidebar_changed {
@@ -13530,11 +13714,7 @@ impl VibexWorkbench {
         ended_normally: Option<bool>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id)
-        else {
+        let Some(session) = self.registered_session(session_id.as_str()) else {
             return false;
         };
         if session.updated_at_ms != session_updated_at_ms {
@@ -13730,9 +13910,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let Some((session_state, session_updated_at_ms)) = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| (session.state, session.updated_at_ms))
         else {
             self.cancel_auto_continue_countdown(session_id);
@@ -13838,10 +14016,7 @@ impl VibexWorkbench {
                 .remove(session_id.as_str());
             return false;
         };
-        let current_session = self
-            .sessions
-            .iter()
-            .find(|session| session.id == countdown.session_id);
+        let current_session = self.registered_session(countdown.session_id.as_str());
         let countdown_is_current = current_session.is_some_and(|session| {
             let cached_status =
                 self.cached_auto_continue_turn_status(session_id, session.updated_at_ms);
@@ -13977,6 +14152,26 @@ impl VibexWorkbench {
         // Flush the live selection state into the arrangement being parked.
         self.queue_agent_ui_state();
         self.ui_state.sidebar.switch_authority(authority);
+        self.delegated_collapsed_ids = self
+            .ui_state
+            .sidebar
+            .collapsed_delegated_session_ids
+            .clone();
+        self.delegated_sessions.clear();
+        self.delegated_tree.clear();
+        self.delegated_pages.clear();
+        self.session_group_view_loads.clear();
+        self.session_group_view_errors.clear();
+        self.delegated_tree_generation = self.delegated_tree_generation.wrapping_add(1);
+        self.composer_delegations.clear();
+        self.delegated_refresh_task = None;
+        self.delegated_refresh_offset = 0;
+        self.delegated_roots_dirty = false;
+        self.composer_queue_session_loads.clear();
+        self.delegated_reveal_target = None;
+        self.delegated_deferred_parent = None;
+        self.sidebar_visible_session_ids.clear();
+        self.delegated_row_focus.clear();
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
         self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
         self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
@@ -14270,48 +14465,391 @@ impl VibexWorkbench {
             .or_else(|| self.delegated_sessions.get(session_id))
     }
 
-    /// Reloads the delegated ownership forest for the current root sessions.
-    ///
-    /// The tree is read from the runtime's ownership edges rather than from a
-    /// parent timeline card, so a child that arrived while its parent was not
-    /// on screen still appears.
-    fn refresh_delegated_sessions(&mut self) {
-        let Some(runtime) = self.runtime.clone() else {
+    fn registered_session_mut(&mut self, session_id: &str) -> Option<&mut AgentSession> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id.as_str() == session_id)
+            .or_else(|| self.delegated_sessions.get_mut(session_id))
+    }
+
+    /// Refreshes bounded metadata pages; histories load only for live panes.
+    fn refresh_delegated_sessions(&mut self, cx: &mut Context<Self>) {
+        if !self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capabilities()
+                .agent
+                .supports(BackendOperation::AgentTeamRead)
+        }) {
             return;
+        }
+        if self.delegated_refresh_task.is_none() {
+            self.delegated_refresh_task = Some(cx.spawn(
+                async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(3)).await;
+                        if entity
+                            .update(cx, |this, cx| {
+                                if this.delegated_roots_dirty {
+                                    this.delegated_roots_dirty = false;
+                                    this.load_agent_overview(cx);
+                                }
+                                this.refresh_delegated_sessions(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+            ));
+        }
+        self.load_delegated_page(None, false, cx);
+        let parents: Vec<String> = self
+            .delegated_pages
+            .keys()
+            .flatten()
+            .filter(|id| !self.delegated_branch_hidden(id))
+            .cloned()
+            .collect();
+        let mut refresh: BTreeSet<String> = parents
+            .iter()
+            .cycle()
+            .skip(self.delegated_refresh_offset.min(parents.len()))
+            .take(parents.len().min(16))
+            .cloned()
+            .collect();
+        self.delegated_refresh_offset = if parents.is_empty() {
+            0
+        } else {
+            (self.delegated_refresh_offset + 16) % parents.len()
         };
-        let roots: Vec<VibexSessionId> = self
-            .sessions
-            .iter()
-            .map(|session| session.id.clone())
+        if let Some(selected) = self.selected_session_id.as_ref() {
+            refresh.insert(selected.as_str().to_string());
+        }
+        // Group members may be absent from the ordinary ownership-root list.
+        // Fetch their path metadata without opening their timelines.
+        if let Some((_, group)) = self.active_session_group() {
+            refresh.extend(
+                group
+                    .member_session_ids
+                    .iter()
+                    .filter(|id| !self.delegated_tree.contains_key(*id))
+                    .take(16)
+                    .cloned(),
+            );
+        }
+        for parent in refresh {
+            self.load_delegated_page(Some(parent), false, cx);
+        }
+    }
+
+    fn delegated_branch_hidden(&self, session_id: &str) -> bool {
+        let mut current = Some(session_id);
+        for _ in 0..=16 {
+            let Some(id) = current else {
+                return false;
+            };
+            if self.delegated_collapsed_ids.contains(id) {
+                return true;
+            }
+            current = self
+                .delegated_tree
+                .get(id)
+                .and_then(|node| node.parent_session_ref.as_ref())
+                .map(|reference| reference.id.as_str());
+        }
+        true
+    }
+
+    fn prune_delegated_cache(&mut self, requested: &Option<String>) {
+        let remove: Vec<_> = self
+            .delegated_pages
+            .keys()
+            .flatten()
+            .filter(|id| requested.as_ref() != Some(*id) && self.delegated_branch_hidden(id))
+            .cloned()
             .collect();
-        let Ok(nodes) = runtime.vibex_use().delegation_forest(&roots) else {
-            return;
-        };
-        let session_ids: Vec<VibexSessionId> = nodes
-            .iter()
-            .filter_map(|node| node.session_ref.session_id())
+        for id in remove {
+            self.delegated_pages.remove(&Some(id));
+        }
+        let mut retained: BTreeSet<String> = self
+            .delegated_pages
+            .values()
+            .flat_map(|page| page.session_ids.iter().cloned())
             .collect();
-        let sessions = runtime
-            .vibex_use()
-            .group_member_registry(&session_ids)
-            .unwrap_or_default();
-        // A child that is deleted must not leave a stale tree node or a pane
-        // bound to a session the runtime no longer has.
-        let live: BTreeSet<String> = sessions
-            .iter()
-            .map(|session| session.id.as_str().to_string())
-            .collect();
+        retained.extend(self.delegated_pages.keys().flatten().cloned());
+        if let Some(selected) = self.selected_session_id.as_ref() {
+            retained.insert(selected.as_str().to_string());
+        }
+        if let Some((_, group)) = self.active_session_group() {
+            retained.extend(group.member_session_ids.iter().cloned());
+        }
+        retained.extend(
+            self.composer_queue
+                .iter()
+                .map(|message| message.session_id.to_string()),
+        );
+        retained.extend(self.pending_agent_turn_session_ids.iter().cloned());
+        retained.extend(self.auto_continue_session_ids.iter().cloned());
+        // A retained child's bounded path remains available for Locate.
+        for id in retained.clone() {
+            let mut current = self.delegated_tree.get(&id);
+            for _ in 0..16 {
+                let Some(parent) = current.and_then(|node| node.parent_session_ref.as_ref()) else {
+                    break;
+                };
+                retained.insert(parent.id.clone());
+                current = self.delegated_tree.get(&parent.id);
+            }
+        }
+        self.delegated_tree.retain(|id, _| retained.contains(id));
         self.delegated_sessions
-            .retain(|session_id, _| live.contains(session_id));
-        self.delegated_sessions = sessions
-            .into_iter()
-            .map(|session| (session.id.as_str().to_string(), session))
+            .retain(|id, _| retained.contains(id));
+        self.delegated_row_focus.retain(|id, _| {
+            retained.contains(id)
+                || self
+                    .sessions
+                    .iter()
+                    .any(|session| session.id.as_str() == id)
+        });
+    }
+
+    fn load_delegated_page(&mut self, parent: Option<String>, more: bool, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if !backend
+            .capabilities()
+            .agent
+            .supports(BackendOperation::AgentTeamRead)
+            || self
+                .delegated_pages
+                .get(&parent)
+                .is_some_and(|page| page.loading)
+        {
+            return;
+        }
+        if !self.delegated_pages.contains_key(&parent)
+            && self.delegated_pages.len() >= DELEGATED_TREE_BRANCH_LIMIT
+        {
+            self.prune_delegated_cache(&parent);
+            if self.delegated_pages.len() >= DELEGATED_TREE_BRANCH_LIMIT {
+                self.delegated_deferred_parent = parent;
+                cx.notify();
+                return;
+            }
+        }
+        if self.delegated_deferred_parent.as_ref() == parent.as_ref() {
+            self.delegated_deferred_parent = None;
+        }
+        let cursor = more
+            .then(|| {
+                self.delegated_pages
+                    .get(&parent)
+                    .and_then(|page| page.next_cursor.clone())
+            })
+            .flatten();
+        if more && cursor.is_none() {
+            return;
+        }
+        let target_count = if more {
+            DELEGATED_TREE_PAGE_SIZE
+        } else {
+            self.delegated_pages
+                .get(&parent)
+                .map(|page| page.session_ids.len())
+                .unwrap_or_default()
+                .max(DELEGATED_TREE_PAGE_SIZE)
+        };
+        let page = self.delegated_pages.entry(parent.clone()).or_default();
+        page.loading = true;
+        page.error = None;
+        let mut request = vibex_core::SessionTreeRequest {
+            parent_session_id: parent
+                .as_ref()
+                .and_then(|id| VibexSessionId::parse(id).ok()),
+            cursor,
+            limit: Some(DELEGATED_TREE_PAGE_SIZE),
+            include_archived: false,
+        };
+        let authority = self.ui_state.sidebar.active_authority().to_string();
+        let generation = self.delegated_tree_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let mut combined = vibex_core::SessionTreePage::default();
+            loop {
+                let page = backend.agent().session_tree(request.clone()).await?;
+                combined.nodes.extend(page.nodes);
+                combined.registry.extend(page.registry);
+                combined.ancestors = page.ancestors;
+                combined.next_cursor = page.next_cursor;
+                combined.has_more = page.has_more;
+                if combined.nodes.len() >= target_count
+                    || !combined.has_more
+                    || combined.next_cursor.is_none()
+                    || combined.next_cursor == request.cursor
+                {
+                    break;
+                }
+                request.cursor = combined.next_cursor.clone();
+            }
+            Ok::<_, vibex_backend::BackendError>(combined)
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.delegated_tree_generation != generation
+                        || this.ui_state.sidebar.active_authority() != authority
+                    {
+                        return;
+                    }
+                    // The user may have closed and evicted this branch in flight.
+                    let Some(page) = this.delegated_pages.get_mut(&parent) else {
+                        return;
+                    };
+                    page.loading = false;
+                    match outcome {
+                        Ok(Ok(result)) => this.apply_delegated_page(parent, more, result, cx),
+                        Ok(Err(error)) => page.error = Some(error.message),
+                        Err(error) => page.error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    fn apply_delegated_page(
+        &mut self,
+        parent: Option<String>,
+        more: bool,
+        result: vibex_core::SessionTreePage,
+        cx: &mut Context<Self>,
+    ) {
+        let incoming: Vec<String> = result
+            .nodes
+            .iter()
+            .map(|node| node.session_ref.id.clone())
             .collect();
-        self.delegated_tree = nodes
-            .into_iter()
-            .filter(|node| live.contains(&node.session_ref.id))
-            .map(|node| (node.session_ref.id.clone(), node))
+        let incoming_nodes: BTreeSet<_> = result
+            .nodes
+            .iter()
+            .chain(&result.ancestors)
+            .map(|node| node.session_ref.id.clone())
             .collect();
+        let additional = |tree: &BTreeMap<String, SessionTreeNode>| {
+            incoming_nodes
+                .iter()
+                .filter(|id| !tree.contains_key(*id))
+                .count()
+        };
+        if self.delegated_tree.len() + additional(&self.delegated_tree) > DELEGATED_TREE_NODE_LIMIT
+        {
+            self.prune_delegated_cache(&parent);
+            if self.delegated_tree.len() + additional(&self.delegated_tree)
+                > DELEGATED_TREE_NODE_LIMIT
+            {
+                self.delegated_pages.entry(parent).or_default().error = Some(
+                    locale::text(
+                        "Collapse another branch before loading more sessions.",
+                        "请先折叠其他分支，再加载更多会话。",
+                        "請先摺疊其他分支，再載入更多會話。",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+        }
+        let page = self.delegated_pages.entry(parent.clone()).or_default();
+        let removed: Vec<_> = if more {
+            Vec::new()
+        } else {
+            page.session_ids
+                .iter()
+                .filter(|id| !incoming.contains(id))
+                .cloned()
+                .collect()
+        };
+        if !more {
+            page.session_ids.clear();
+        }
+        for id in incoming {
+            if !page.session_ids.contains(&id) {
+                page.session_ids.push(id);
+            }
+        }
+        page.next_cursor = result.has_more.then_some(result.next_cursor).flatten();
+        page.error = None;
+        let mut removed = VecDeque::from(removed);
+        let mut evicted = BTreeSet::new();
+        while let Some(id) = removed.pop_front() {
+            if !evicted.insert(id.clone()) {
+                continue;
+            }
+            if let Some(page) = self.delegated_pages.remove(&Some(id.clone())) {
+                removed.extend(page.session_ids);
+            }
+            removed.extend(
+                self.delegated_tree
+                    .values()
+                    .filter(|node| {
+                        node.parent_session_ref
+                            .as_ref()
+                            .is_some_and(|parent| parent.id == id)
+                    })
+                    .map(|node| node.session_ref.id.clone()),
+            );
+            self.delegated_tree.remove(&id);
+        }
+        for node in result.nodes.into_iter().chain(result.ancestors) {
+            if node.parent_session_ref.is_some() {
+                self.sessions
+                    .retain(|root| root.id.as_str() != node.session_ref.id);
+            }
+            self.delegated_tree
+                .insert(node.session_ref.id.clone(), node);
+        }
+        for session in result.registry {
+            if self.registered_session(session.id.as_str()).is_none() {
+                self.delegated_sessions
+                    .insert(session.id.as_str().to_string(), session.clone());
+            }
+            self.upsert_session_snapshot(session);
+        }
+        if !evicted.is_empty() {
+            self.prune_delegated_cache(&parent);
+        }
+        self.invalidate_sidebar_projection_cache();
+        if self
+            .delegated_reveal_target
+            .as_ref()
+            .is_some_and(|id| self.delegated_tree.contains_key(id))
+            && let Some(selected) = self.delegated_reveal_target.take()
+        {
+            self.reveal_delegated_session(&selected, cx);
+        }
+    }
+
+    fn delegated_has_children(&self, session_id: &str) -> bool {
+        self.delegated_tree
+            .get(session_id)
+            .is_some_and(|node| node.child_count > 0)
+            || self
+                .delegated_pages
+                .get(&Some(session_id.to_string()))
+                .is_some_and(|page| !page.session_ids.is_empty() || page.next_cursor.is_some())
+            || (!self.delegated_tree.contains_key(session_id)
+                && !self
+                    .delegated_pages
+                    .contains_key(&Some(session_id.to_string())))
+    }
+
+    fn delegated_branch_is_collapsed(&self, session_id: &str) -> bool {
+        self.delegated_collapsed_ids.contains(session_id)
+            || !self
+                .delegated_pages
+                .contains_key(&Some(session_id.to_string()))
     }
 
     /// Opens the ancestor path of one delegated session so it is visible.
@@ -14320,8 +14858,10 @@ impl VibexWorkbench {
     /// search list or a pane — where the reader asked to be taken to the row.
     /// A background delegation never calls it, so arriving work cannot pull a
     /// branch open or steal the scroll position on its own.
-    fn reveal_delegated_session(&mut self, session_id: &str) {
+    fn reveal_delegated_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         if !self.delegated_tree.contains_key(session_id) {
+            self.delegated_reveal_target = Some(session_id.to_string());
+            self.load_delegated_page(Some(session_id.to_string()), false, cx);
             return;
         }
         let mut current = self
@@ -14340,6 +14880,9 @@ impl VibexWorkbench {
                     self.delegated_collapsed_ids.clone();
                 self.queue_ui_state();
             }
+            if !self.delegated_pages.contains_key(&Some(id.clone())) {
+                self.load_delegated_page(Some(id.clone()), false, cx);
+            }
             current = self
                 .delegated_tree
                 .get(&id)
@@ -14350,7 +14893,15 @@ impl VibexWorkbench {
 
     /// Toggles one ownership-tree branch without touching anything else.
     fn toggle_delegated_branch(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        if !self.delegated_collapsed_ids.remove(session_id) {
+        if self.delegated_branch_is_collapsed(session_id) {
+            self.delegated_collapsed_ids.remove(session_id);
+            if !self
+                .delegated_pages
+                .contains_key(&Some(session_id.to_string()))
+            {
+                self.load_delegated_page(Some(session_id.to_string()), false, cx);
+            }
+        } else {
             self.delegated_collapsed_ids.insert(session_id.to_string());
         }
         self.ui_state.sidebar.collapsed_delegated_session_ids =
@@ -14370,7 +14921,7 @@ impl VibexWorkbench {
         depth: usize,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        if depth > 8 {
+        if depth > 16 || self.delegated_branch_is_collapsed(parent_session_id) {
             return Vec::new();
         }
         let children: Vec<SessionTreeNode> = self
@@ -14382,12 +14933,13 @@ impl VibexWorkbench {
         for node in children {
             // A child that is already shown as a group member is not drawn a
             // second time under its parent: one navigation branch, one row.
-            if self.delegated_node_is_group_member(&node.session_ref.id) {
+            if !self.delegated_child_visible_in_branch(parent_session_id, &node.session_ref.id) {
                 continue;
             }
-            let grandchildren = self.delegated_children(&node.session_ref.id);
-            let has_children = !grandchildren.is_empty();
-            let collapsed = self.delegated_collapsed_ids.contains(&node.session_ref.id);
+            self.sidebar_visible_session_ids
+                .push(node.session_ref.id.clone());
+            let has_children = self.delegated_has_children(&node.session_ref.id);
+            let collapsed = self.delegated_branch_is_collapsed(&node.session_ref.id);
             elements.push(self.render_delegated_session_row(
                 &node,
                 depth,
@@ -14399,17 +14951,220 @@ impl VibexWorkbench {
                 elements.extend(self.render_delegated_subtree(&node.session_ref.id, depth + 1, cx));
             }
         }
+        if let Some(action) =
+            self.render_delegated_page_action(Some(parent_session_id.to_string()), cx)
+        {
+            elements.push(action);
+        }
         elements
     }
 
-    /// Whether a delegated child is currently displayed inside a group row.
-    fn delegated_node_is_group_member(&self, session_id: &str) -> bool {
-        self.ui_state
-            .sidebar
-            .organization
-            .groups
-            .values()
-            .any(|group| group.contains(session_id))
+    fn render_delegated_page_action(
+        &self,
+        parent: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (parent, loading, error, more) = if parent.is_none()
+            && let Some(deferred) = self.delegated_deferred_parent.as_ref()
+        {
+            (
+                Some(deferred.clone()),
+                false,
+                Some(
+                    locale::text(
+                        "Collapse another branch before loading more sessions.",
+                        "请先折叠其他分支，再加载更多会话。",
+                        "請先摺疊其他分支，再載入更多會話。",
+                    )
+                    .to_string(),
+                ),
+                false,
+            )
+        } else {
+            let page = self.delegated_pages.get(&parent)?;
+            if !page.loading && page.error.is_none() && page.next_cursor.is_none() {
+                return None;
+            }
+            (
+                parent,
+                page.loading,
+                page.error.clone(),
+                page.next_cursor.is_some(),
+            )
+        };
+        let label = if loading {
+            locale::text("Loading sessions", "正在加载会话", "正在載入會話")
+        } else if error.is_some() {
+            locale::text("Retry loading sessions", "重试加载会话", "重試載入會話")
+        } else {
+            locale::text("Load more sessions", "加载更多会话", "載入更多會話")
+        };
+        Some(
+            v_flex()
+                .gap_1()
+                .when_some(error, |view, error| {
+                    view.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(error),
+                    )
+                })
+                .child(
+                    Button::new(format!(
+                        "delegated-page-{}",
+                        parent.as_deref().unwrap_or("roots")
+                    ))
+                    .small()
+                    .ghost()
+                    .label(label)
+                    .disabled(loading)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.load_delegated_page(parent.clone(), more, cx)
+                    })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn delegated_child_visible_in_branch(&self, parent: &str, child: &str) -> bool {
+        let organization = &self.ui_state.sidebar.organization;
+        organization.group_of_session(child).is_none()
+            || organization.group_of_session(child) == organization.group_of_session(parent)
+    }
+
+    fn render_group_navigation(
+        &mut self,
+        group_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
+            return Vec::new();
+        };
+        let members = group.member_session_ids.clone();
+        let mut elements = Vec::new();
+        for id in &members {
+            if self
+                .delegated_tree
+                .get(id)
+                .and_then(|node| node.parent_session_ref.as_ref())
+                .is_some_and(|parent| members.contains(&parent.id))
+            {
+                continue;
+            }
+            let Some(session) = self.registered_session(id).cloned() else {
+                continue;
+            };
+            self.sidebar_visible_session_ids.push(id.clone());
+            if let Some(node) = self
+                .delegated_tree
+                .get(id)
+                .filter(|node| node.parent_session_ref.is_some())
+                .cloned()
+            {
+                elements.push(self.render_delegated_session_row(
+                    &node,
+                    0,
+                    self.delegated_has_children(id),
+                    self.delegated_branch_is_collapsed(id),
+                    cx,
+                ));
+            } else {
+                elements.push(self.render_sidebar_session(
+                    &session,
+                    session.project_id.as_str(),
+                    false,
+                    true,
+                    self.strings(),
+                    cx,
+                ));
+            }
+            elements.extend(self.render_delegated_subtree(id, 0, cx));
+        }
+        elements
+    }
+
+    fn render_delegated_disclosure(
+        &mut self,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.delegated_has_children(session_id) {
+            return None;
+        }
+        let collapsed = self.delegated_branch_is_collapsed(session_id);
+        let session_id = session_id.to_string();
+        Some(
+            Button::new(format!("sidebar-delegated-toggle-{session_id}"))
+                .debug_selector({
+                    let id = session_id.clone();
+                    move || format!("sidebar-delegated-toggle-{id}")
+                })
+                .xsmall()
+                .ghost()
+                .compact()
+                .icon(sidebar_icon(if collapsed {
+                    "icons/vibex/chevrons-right.svg"
+                } else {
+                    "icons/vibex/chevrons-down-up.svg"
+                }))
+                .tooltip(if collapsed {
+                    locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
+                } else {
+                    locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
+                })
+                .toggled(!collapsed)
+                .accessibility_label(if collapsed {
+                    locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
+                } else {
+                    locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_delegated_branch(&session_id, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_delegated_guides(
+        &self,
+        node: &SessionTreeNode,
+        depth: usize,
+        cx: &App,
+    ) -> AnyElement {
+        let mut branches = Vec::new();
+        let mut current = Some(node);
+        for _ in 0..=depth.min(16) {
+            let Some(child) = current else {
+                break;
+            };
+            let Some(parent) = child.parent_session_ref.as_ref() else {
+                break;
+            };
+            let siblings = self.delegated_children(&parent.id);
+            let last = siblings
+                .into_iter()
+                .rfind(|sibling| {
+                    self.delegated_child_visible_in_branch(&parent.id, &sibling.session_ref.id)
+                })
+                .is_some_and(|sibling| sibling.session_ref == child.session_ref);
+            branches.push(!last);
+            current = self.delegated_tree.get(&parent.id);
+        }
+        branches.reverse();
+        let last_ix = branches.len().saturating_sub(1);
+        h_flex()
+            .h_full()
+            .flex_none()
+            .items_stretch()
+            .children(
+                branches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, continues)| delegated_tree_guide_line(continues, ix == last_ix, cx)),
+            )
+            .into_any_element()
     }
 
     /// One row of the ownership tree.
@@ -14433,19 +15188,20 @@ impl VibexWorkbench {
         let status = delegation_node_status(node);
         let summary = if collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
         {
-            Some(locale::text(
-                "descendants running or waiting",
-                "后代运行或等待中",
-                "後代執行或等待中",
+            Some(format!(
+                "{} {} · {} {}",
+                node.active_descendants,
+                locale::text("running", "运行中", "執行中"),
+                node.blocked_descendants,
+                locale::text("waiting", "等待中", "等待中")
             ))
         } else {
             None
         };
-        let indent = SIDEBAR_FOLDER_CHILD_INDENT * (depth as f32 + 1.0);
+        let guides = self.render_delegated_guides(node, depth, cx);
+        let disclosure = self.render_delegated_disclosure(&session_id, cx);
         let entity = cx.weak_entity();
-        let toggle_entity = entity.clone();
         let click_session = VibexSessionId::parse(session_id.clone()).ok();
-        let toggle_session_id = session_id.clone();
         // A row carries a stable focus handle so the tree can be walked with the
         // keyboard: standard disclosure semantics, and focus is visible
         // separately from selection.
@@ -14455,27 +15211,38 @@ impl VibexWorkbench {
             .or_insert_with(|| cx.focus_handle())
             .clone();
         let key_entity = entity.clone();
+        let key_session = session_id.clone();
         let row = div()
             .id(ElementId::Name(
                 format!("sidebar-delegated-{session_id}").into(),
             ))
             .relative()
-            .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
-            .min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+            .h_10()
+            .min_h_10()
             .w_full()
             .min_w_0()
-            .pl(px(indent))
-            .rounded(px(8.0))
+            .pl_1()
+            .rounded(cx.theme().radius)
             .track_focus(&focus_handle)
             .tab_index(0)
-            .on_key_down(move |event, _, cx| {
+            .aria_label(
+                node.task_title
+                    .clone()
+                    .unwrap_or_else(|| node.title.clone()),
+            )
+            .when(has_children, |row| row.aria_expanded(!collapsed))
+            .focus_visible(|style| style.border_1().border_color(cx.theme().ring))
+            .on_key_down(move |event, window, cx| {
                 let key = event.keystroke.key.as_str();
-                if !matches!(key, "left" | "right" | "up" | "down") {
+                if !matches!(
+                    key,
+                    "left" | "right" | "up" | "down" | "home" | "end" | "enter" | "space"
+                ) {
                     return;
                 }
                 cx.stop_propagation();
                 let _ = key_entity.update(cx, |this, cx| {
-                    this.delegated_tree_key(key, cx);
+                    this.delegated_tree_key(&key_session, key, window, cx);
                 });
             })
             .when(selected, |this| {
@@ -14491,7 +15258,6 @@ impl VibexWorkbench {
                 let tone = theme::hover_wash(cx.theme().is_dark());
                 row.hover(move |style| style.bg(tone))
             })
-            .cursor_pointer()
             .on_click({
                 let focus_handle = focus_handle.clone();
                 move |_, window, cx| {
@@ -14510,38 +15276,12 @@ impl VibexWorkbench {
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .gap(px(6.0))
+                    .h_full()
+                    .gap_1()
                     .items_center()
-                    .child(delegated_tree_guide_line(cx))
-                    .when(has_children, |this| {
-                        let toggle_entity = toggle_entity.clone();
-                        let toggle_id = toggle_session_id.clone();
-                        this.child(
-                            div()
-                                .id(ElementId::Name(
-                                    format!("sidebar-delegated-toggle-{session_id}").into(),
-                                ))
-                                .w(px(14.0))
-                                .h(px(14.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .aria_expanded(!collapsed)
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    let _ = toggle_entity.update(cx, |this, cx| {
-                                        this.toggle_delegated_branch(&toggle_id, cx);
-                                    });
-                                })
-                                .child(sidebar_icon(if collapsed {
-                                    "icons/vibex/chevrons-right.svg"
-                                } else {
-                                    "icons/vibex/chevrons-down-up.svg"
-                                })),
-                        )
-                    })
-                    .when(!has_children, |this| this.child(div().w(px(14.0))))
+                    .child(guides)
+                    .children(disclosure)
+                    .when(!has_children, |row| row.child(div().w_4()))
                     .child(sidebar_agent_logo(
                         node.agent_id
                             .as_ref()
@@ -14555,33 +15295,27 @@ impl VibexWorkbench {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div().truncate().text_size(px(12.0)).child(
+                                div().truncate().text_sm().child(
                                     node.task_title
                                         .clone()
                                         .unwrap_or_else(|| node.title.clone()),
                                 ),
                             )
                             .when_some(node.agent_label.clone(), |this, label| {
-                                this.child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(10.0))
-                                        .opacity(0.6)
-                                        .child(label),
-                                )
+                                this.child(div().truncate().text_xs().opacity(0.6).child(label))
                             }),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(10.0))
+                            .text_xs()
                             .when(status.attention || node.blocked_descendants > 0, |this| {
                                 this.text_color(cx.theme().warning)
                             })
                             .when(!status.attention && node.blocked_descendants == 0, |this| {
                                 this.opacity(0.75)
                             })
-                            .child(summary.unwrap_or(status.text)),
+                            .child(summary.unwrap_or_else(|| status.text.to_string())),
                     ),
             );
         row.into_any_element()
@@ -14592,125 +15326,85 @@ impl VibexWorkbench {
     /// Depth-first, children after their parent, skipping what a collapsed
     /// branch hides — the same walk the renderer performs, so "the next visible
     /// node" means the next row the reader can actually see.
-    fn delegated_visible_order(&self) -> Vec<(String, usize)> {
-        let mut ordered = Vec::new();
-        for root in &self.sessions {
-            self.push_delegated_visible(root.id.as_str(), 0, &mut ordered);
-        }
-        ordered
+    fn delegated_visible_order(&self) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        self.sidebar_visible_session_ids
+            .iter()
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect()
     }
 
-    fn push_delegated_visible(
-        &self,
-        parent_session_id: &str,
-        depth: usize,
-        ordered: &mut Vec<(String, usize)>,
+    fn delegated_tree_key(
+        &mut self,
+        session_id: &str,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        if depth > 8 {
-            return;
-        }
-        for node in self.delegated_children(parent_session_id) {
-            let session_id = node.session_ref.id.clone();
-            ordered.push((session_id.clone(), depth));
-            if !self.delegated_collapsed_ids.contains(&session_id) {
-                self.push_delegated_visible(&session_id, depth + 1, ordered);
-            }
-        }
-    }
-
-    /// Moves the ownership-tree cursor by one row.
-    fn move_delegated_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let ordered = self.delegated_visible_order();
-        if ordered.is_empty() {
-            return;
-        }
-        let current = self
-            .selected_session_id
-            .as_ref()
-            .map(|session_id| session_id.as_str().to_string())
-            .and_then(|session_id| {
-                ordered
-                    .iter()
-                    .position(|(candidate, _)| candidate == &session_id)
-            });
-        let next = match (current, delta.is_negative()) {
-            (Some(index), true) => index.saturating_sub(1),
-            (Some(index), false) => (index + 1).min(ordered.len() - 1),
-            (None, true) => ordered.len() - 1,
-            (None, false) => 0,
-        };
-        if let Ok(session_id) = VibexSessionId::parse(ordered[next].0.clone()) {
-            self.select_session(session_id, cx);
-        }
-    }
-
-    /// Applies one arrow key to the ownership tree.
-    ///
-    /// The semantics are the standard disclosure-tree ones: left closes an open
-    /// branch and otherwise steps to the parent, right opens a closed branch and
-    /// otherwise steps into it, up and down walk the visible rows.
-    fn delegated_tree_key(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(session_id) = self
-            .selected_session_id
-            .as_ref()
-            .map(|session_id| session_id.as_str().to_string())
-        else {
-            return;
-        };
-        if !self.delegated_tree.contains_key(&session_id) {
-            return;
-        }
-        let has_children = !self.delegated_children(&session_id).is_empty();
-        let collapsed = self.delegated_collapsed_ids.contains(&session_id);
+        let index = ordered.iter().position(|id| id == session_id);
+        let mut target = None;
         match key {
+            "left"
+                if self.delegated_has_children(session_id)
+                    && !self.delegated_branch_is_collapsed(session_id) =>
+            {
+                self.toggle_delegated_branch(session_id, cx);
+            }
             "left" => {
-                if has_children && !collapsed {
-                    self.toggle_delegated_branch(&session_id, cx);
-                } else if let Some(parent) = self
+                target = self
                     .delegated_tree
-                    .get(&session_id)
+                    .get(session_id)
                     .and_then(|node| node.parent_session_ref.as_ref())
                     .map(|parent| parent.id.clone())
-                    && let Ok(parent_id) = VibexSessionId::parse(parent)
-                {
-                    self.select_session(parent_id, cx);
-                }
+                    .filter(|parent| ordered.contains(parent))
+            }
+            "right"
+                if self.delegated_has_children(session_id)
+                    && self.delegated_branch_is_collapsed(session_id) =>
+            {
+                self.toggle_delegated_branch(session_id, cx);
             }
             "right" => {
-                if has_children && collapsed {
-                    self.toggle_delegated_branch(&session_id, cx);
-                } else if let Some(first) = self
-                    .delegated_children(&session_id)
-                    .first()
+                target = self
+                    .delegated_children(session_id)
+                    .into_iter()
+                    .find(|node| {
+                        self.delegated_child_visible_in_branch(session_id, &node.session_ref.id)
+                    })
                     .map(|node| node.session_ref.id.clone())
-                    && let Ok(child_id) = VibexSessionId::parse(first)
-                {
-                    self.select_session(child_id, cx);
-                }
             }
-            "up" => self.move_delegated_selection(-1, cx),
-            "down" => self.move_delegated_selection(1, cx),
+            "up" => {
+                target = index
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| ordered.get(index).cloned())
+            }
+            "down" => target = index.and_then(|index| ordered.get(index + 1).cloned()),
+            "home" => target = ordered.first().cloned(),
+            "end" => target = ordered.last().cloned(),
+            "enter" | "space" => target = Some(session_id.to_string()),
             _ => {}
+        }
+        if let Some(target) = target.and_then(|id| VibexSessionId::parse(id).ok()) {
+            let focus = self
+                .delegated_row_focus
+                .entry(target.as_str().to_string())
+                .or_insert_with(|| cx.focus_handle())
+                .clone();
+            self.select_session(target, cx);
+            window.focus(&focus, cx);
         }
     }
 
     /// Delegated children of one session, in creation order.
     fn delegated_children(&self, parent_session_id: &str) -> Vec<&SessionTreeNode> {
-        let mut children: Vec<&SessionTreeNode> = self
-            .delegated_tree
-            .values()
-            .filter(|node| {
-                node.parent_session_ref
-                    .as_ref()
-                    .is_some_and(|parent| parent.id == parent_session_id)
-            })
-            .collect();
-        children.sort_by(|left, right| {
-            left.updated_at_ms
-                .cmp(&right.updated_at_ms)
-                .then_with(|| left.session_ref.id.cmp(&right.session_ref.id))
-        });
-        children
+        self.delegated_pages
+            .get(&Some(parent_session_id.to_string()))
+            .into_iter()
+            .flat_map(|page| page.session_ids.iter())
+            .filter_map(|id| self.delegated_tree.get(id))
+            .collect()
     }
 
     /// Group ids of one project, in sidebar order.
@@ -15604,6 +16298,7 @@ impl VibexWorkbench {
                         delivery: UserMessageDelivery::Prompt,
                         prompt_context: None,
                         provenance: vibex_core::MessageProvenance::HumanInput,
+                        mentions: Vec::new(),
                     })
                     .with_idempotency_key(format!(
                         "worktree-assistance-context:{}",
@@ -16674,6 +17369,7 @@ impl VibexWorkbench {
             .organization
             .collapsed_group_ids
             .remove(group_id);
+        self.sync_user_session_group(group_id);
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -16744,6 +17440,7 @@ impl VibexWorkbench {
                 .remove_sessions_from_group(&group_id, &members)
             {
                 self.release_group_session_views(&members);
+                self.sync_user_session_group(&group_id);
                 changed = true;
             }
         }
@@ -16886,6 +17583,7 @@ impl VibexWorkbench {
             .organization
             .collapsed_group_ids
             .remove(group_id);
+        self.sync_user_session_group(group_id);
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -16907,6 +17605,7 @@ impl VibexWorkbench {
             return;
         }
         self.release_group_session_views(std::slice::from_ref(&session_id.to_string()));
+        self.sync_user_session_group(group_id);
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -17019,6 +17718,7 @@ impl VibexWorkbench {
         if !self.ui_state.sidebar.organization.delete_group(group_id) {
             return;
         }
+        self.remove_user_session_group(group_id);
         self.release_group_session_views(&members);
         self.clear_sidebar_context_menu_target(cx);
         self.queue_ui_state();
@@ -17096,6 +17796,7 @@ impl VibexWorkbench {
         // The group row goes with its sessions, so the user never sees a group
         // pointing at rows that are already being deleted.
         if self.ui_state.sidebar.organization.delete_group(group_id) {
+            self.remove_user_session_group(group_id);
             self.queue_ui_state();
             self.publish_sidebar_invalidation();
         }
@@ -17344,9 +18045,7 @@ impl VibexWorkbench {
     /// its own session while the sidebar keeps its selection.
     fn view_session(&self) -> Option<&AgentSession> {
         let session_id = self.view_session_id.as_ref()?;
-        self.sessions
-            .iter()
-            .find(|session| &session.id == session_id)
+        self.registered_session(session_id.as_str())
     }
 
     /// Borrows `session_id`'s view for an input event.
@@ -17581,7 +18280,9 @@ impl VibexWorkbench {
         if let Some(live) = self.view_session_id.as_ref() {
             pinned.insert(live.as_str().to_string());
         }
-        pinned.extend(self.ui_state.sidebar.organization.grouped_session_ids());
+        if let Some((_, group)) = self.active_session_group() {
+            pinned.extend(group.live_session_ids());
+        }
         pinned
     }
 
@@ -18207,10 +18908,7 @@ impl VibexWorkbench {
         &self,
         session_id: &VibexSessionId,
     ) -> Option<SessionRuntimeSelection> {
-        let session = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id)?;
+        let session = self.registered_session(session_id.as_str())?;
         let agent_id = session.agent_id.clone();
         let catalog = self.runtime_catalog.as_ref()?;
         if let Some(selection) = self
@@ -18567,11 +19265,7 @@ impl VibexWorkbench {
         } else {
             timeline_session_id
                 .as_ref()
-                .and_then(|session_id| {
-                    self.sessions
-                        .iter()
-                        .find(|session| &session.id == session_id)
-                })
+                .and_then(|session_id| self.registered_session(session_id.as_str()))
                 .map(|session| session.state)
         };
         timeline_session_state_for_render(
@@ -18698,7 +19392,7 @@ impl VibexWorkbench {
         // user closed stays closed until they open it, but a branch that only
         // happens to be closed because it was never touched must not hide the
         // session that was just asked for.
-        self.reveal_delegated_session(session_id.as_str());
+        self.reveal_delegated_session(session_id.as_str(), cx);
         let primary_tab_changed = self.ui_state.workbench.active_tab != "agent";
         if primary_tab_changed {
             self.sync_current_navigation_entry();
@@ -18725,7 +19419,7 @@ impl VibexWorkbench {
         let Ok(session_id) = VibexSessionId::parse(session_id) else {
             return;
         };
-        if !self.sessions.iter().any(|session| session.id == session_id) {
+        if self.registered_session(session_id.as_str()).is_none() {
             return;
         }
         self.select_session(session_id, cx);
@@ -18772,27 +19466,20 @@ impl VibexWorkbench {
             self.composer_goal_editing = false;
         }
         let runtime_initializing = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .registered_session(session_id.as_str())
             .is_some_and(|session| session.state == AgentSessionState::Initializing);
         if record_history && navigation_changed {
             self.sync_current_navigation_entry();
         }
         let state_owner = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| self.workspace_state_owner(session));
         if let Some(owner) = state_owner.clone() {
             self.switch_workspace_layout_owner(Some(owner), cx);
         }
         if let (Some(backend), Some(session)) = (
             self.backend.clone(),
-            self.sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .cloned(),
+            self.registered_session(session_id.as_str()).cloned(),
         ) {
             self.ui_state.workbench.selected_workspace_id =
                 Some(session.workspace_id.as_str().to_string());
@@ -18895,9 +19582,7 @@ impl VibexWorkbench {
             return;
         }
         let workspace_id = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| session.workspace_id.clone());
         if let Some(runtime) = runtime.clone() {
             self.load_agent_session_timeline(
@@ -19071,9 +19756,7 @@ impl VibexWorkbench {
                                 this.refresh_selected_agent_timeline(cx);
                             }
                             if let Some(session_updated_at_ms) = this
-                                .sessions
-                                .iter()
-                                .find(|session| session.id == session_id)
+                                .registered_session(session_id.as_str())
                                 .map(|session| session.updated_at_ms)
                             {
                                 let ended_normally =
@@ -19331,9 +20014,7 @@ impl VibexWorkbench {
             return;
         };
         let workspace_id = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| session.workspace_id.clone());
         self.timeline.mark_lagged();
         self.load_agent_session_timeline(
@@ -19635,10 +20316,8 @@ impl VibexWorkbench {
                                     cx,
                                 ),
                                 AgentPollSignal::Session(session) => {
-                                    let previous_session = this
-                                        .sessions
-                                        .iter()
-                                        .find(|existing| existing.id == session.id);
+                                    let previous_session =
+                                        this.registered_session(session.id.as_str());
                                     let sidebar_changed = session_snapshot_sidebar_changed(
                                         previous_session,
                                         &session,
@@ -19650,9 +20329,7 @@ impl VibexWorkbench {
                                         && previous_session
                                             .is_none_or(|existing| existing.state != session.state);
                                     let changed = this
-                                        .sessions
-                                        .iter()
-                                        .find(|existing| existing.id == session.id)
+                                        .registered_session(session.id.as_str())
                                         .is_none_or(|existing| existing != &session);
                                     if changed {
                                         let session_id = session.id.clone();
@@ -19741,10 +20418,7 @@ impl VibexWorkbench {
         let mut sidebar_changed = false;
         for event in &events {
             if timeline_live_event_updates_sidebar_timestamp(event)
-                && let Some(session) = self
-                    .sessions
-                    .iter_mut()
-                    .find(|session| session.id == event.session_id)
+                && let Some(session) = self.registered_session_mut(event.session_id.as_str())
                 && event.item.timestamp_ms > session.last_message_at_ms
             {
                 session.last_message_at_ms = event.item.timestamp_ms;
@@ -19910,9 +20584,7 @@ impl VibexWorkbench {
         if changed > 0 {
             if auto_continue_refresh
                 && let Some(session_updated_at_ms) = self
-                    .sessions
-                    .iter()
-                    .find(|session| &session.id == session_id)
+                    .registered_session(session_id.as_str())
                     .map(|session| session.updated_at_ms)
             {
                 let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
@@ -20015,6 +20687,12 @@ impl VibexWorkbench {
             self.refresh_selected_agent_timeline(cx);
             return;
         }
+        if !self.pinned_session_view_ids().contains(session_id.as_str()) {
+            if let Some(view) = self.session_views.get_mut(session_id.as_str()) {
+                view.timeline.mark_lagged();
+            }
+            return;
+        }
         self.with_session_view(session_id, |this| this.timeline.mark_lagged());
         self.load_session_group_view(session_id, true, cx);
     }
@@ -20047,9 +20725,7 @@ impl VibexWorkbench {
             return;
         }
         let agent_id = self
-            .sessions
-            .iter()
-            .find(|session| session.id.as_str() == session_id.as_str())
+            .registered_session(session_id.as_str())
             .map(|session| &session.agent_id);
         let agent_label = agent_id
             .map(|agent_id| runtime_agent_label(&self.agent_snapshots, agent_id))
@@ -20091,21 +20767,15 @@ impl VibexWorkbench {
         match event {
             DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
             DesktopEvent::SessionUpdated(session) => {
-                let previous_session = self
-                    .sessions
-                    .iter()
-                    .find(|existing| existing.id == session.id);
+                let previous_session = self.registered_session(session.id.as_str());
                 let sidebar_changed = session_snapshot_sidebar_changed(previous_session, &session);
                 let selected_projection_changed = self
                     .selected_session_id
                     .as_ref()
                     .is_some_and(|selected| selected == &session.id)
                     && previous_session.is_none_or(|existing| existing.state != session.state);
-                let changed = self
-                    .sessions
-                    .iter()
-                    .find(|existing| existing.id == session.id)
-                    .is_none_or(|existing| existing != &session);
+                let changed = previous_session.is_none_or(|existing| existing != &session);
+                let unknown = previous_session.is_none();
                 // A turn boundary is what auto-continue reacts to, and it belongs
                 // to the session that changed — not only to the selected one.
                 // The render path used to pick up a background session's
@@ -20119,7 +20789,14 @@ impl VibexWorkbench {
                 });
                 if changed {
                     let session_id = session.id.clone();
-                    self.upsert_session_snapshot(session);
+                    if unknown {
+                        self.delegated_sessions
+                            .insert(session_id.as_str().to_string(), session);
+                        self.delegated_roots_dirty = true;
+                        self.refresh_delegated_sessions(cx);
+                    } else {
+                        self.upsert_session_snapshot(session);
+                    }
                     if sidebar_changed {
                         self.reconcile_sidebar_state();
                     }
@@ -22021,7 +22698,7 @@ impl VibexWorkbench {
     /// (attachment only) have nothing to recall and are skipped; a message
     /// still waiting for its authoritative row is appended so the newest send
     /// is recallable at once.
-    fn composer_history_entries(&self, session_id: &VibexSessionId) -> Vec<String> {
+    fn composer_history_entries(&self, session_id: &VibexSessionId) -> Vec<InputContent> {
         if self.timeline.session_id.as_ref() != Some(session_id) {
             return Vec::new();
         }
@@ -22030,16 +22707,22 @@ impl VibexWorkbench {
             .items
             .iter()
             .filter_map(|item| match &item.payload {
-                TimelinePayload::UserMessage(message) => Some(message.text.clone()),
+                TimelinePayload::UserMessage(message) => Some(composer_content_with_mentions(
+                    &message.text,
+                    &message.mentions,
+                )),
                 _ => None,
             })
-            .filter(|text| !text.trim().is_empty())
+            .filter(|content| !content.text().trim().is_empty())
             .collect::<Vec<_>>();
         if let Some(pending) = self.optimistic_user_messages.get(session_id.as_str())
             && !pending.is_confirmed_by(&self.timeline)
             && !pending.text.trim().is_empty()
         {
-            entries.push(pending.text.clone());
+            entries.push(composer_content_with_mentions(
+                &pending.text,
+                &pending.mentions,
+            ));
         }
         entries
     }
@@ -22084,7 +22767,11 @@ impl VibexWorkbench {
                 return false;
             }
             // Past the newest message: the walk ends and the draft returns.
-            let draft = std::mem::take(&mut self.composer_history.draft);
+            let draft = self
+                .composer_history
+                .draft
+                .take()
+                .unwrap_or_else(|| InputContent::new(""));
             self.composer_history.index = None;
             self.composer_history.session_id = None;
             self.apply_composer_history_text(draft, window, cx);
@@ -22099,7 +22786,7 @@ impl VibexWorkbench {
             return false;
         };
         if !active {
-            self.composer_history.draft = composer_input.read(cx).value().to_string();
+            self.composer_history.draft = Some(composer_input.read(cx).content());
             self.composer_history.session_id = Some(session_id);
         }
         self.composer_history.index = Some(index);
@@ -22117,7 +22804,11 @@ impl VibexWorkbench {
         if !self.composer_history_recall_active() {
             return false;
         }
-        let draft = std::mem::take(&mut self.composer_history.draft);
+        let draft = self
+            .composer_history
+            .draft
+            .take()
+            .unwrap_or_else(|| InputContent::new(""));
         self.composer_history.index = None;
         self.composer_history.session_id = None;
         self.apply_composer_history_text(draft, window, cx);
@@ -22128,7 +22819,7 @@ impl VibexWorkbench {
     /// leaving the caret at the end so the next arrow press keeps walking.
     fn apply_composer_history_text(
         &mut self,
-        text: String,
+        text: InputContent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -22683,18 +23374,42 @@ impl VibexWorkbench {
         } else {
             self.ensure_composer_input(window, cx)
         };
-        let (text, selection) = {
+        let (text, selection, tokens) = {
             let input = input.read(cx);
-            (input.value().to_string(), input.selected_range())
+            (
+                input.value().to_string(),
+                input.selected_range(),
+                input.tokens().to_vec(),
+            )
         };
         let attachments = if new_session {
             &self.new_session_attachments
         } else {
             &self.composer_attachments
         };
-        let Some(clipboard) = inline_composer_clipboard_item(&text, attachments, selection) else {
+        let selected_tokens: Vec<_> = tokens
+            .into_iter()
+            .filter(|span| {
+                let range = span.range();
+                range.start >= selection.start && range.end <= selection.end
+            })
+            .collect();
+        let mentions = composer_mentions(&selected_tokens);
+        let Some(mut clipboard) =
+            inline_composer_clipboard_item(&text, attachments, selection.clone())
+        else {
             return;
         };
+        if !mentions.is_empty() {
+            let selected_text = text.get(selection).unwrap_or_default();
+            let (message_text, selected_attachments) =
+                composer_submission_payload(selected_text, attachments);
+            clipboard = user_message_clipboard_item_with_mentions(
+                &message_text,
+                &selected_attachments,
+                &mentions,
+            );
+        }
         cx.write_to_clipboard(clipboard);
         cx.stop_propagation();
     }
@@ -22784,7 +23499,7 @@ impl VibexWorkbench {
             return self.take_composer_message_remote(window, cx);
         };
         let session_id = self.view_session_id.clone()?;
-        let Some(selection) = self.selected_runtime_selection() else {
+        let Some(selection) = self.view_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
             return None;
         };
@@ -22863,7 +23578,7 @@ impl VibexWorkbench {
     ) -> Option<ComposerQueueMessage> {
         let composer_input = self.ensure_composer_input(window, cx);
         let session_id = self.view_session_id.clone()?;
-        let Some(selection) = self.selected_runtime_selection() else {
+        let Some(selection) = self.view_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
             return None;
         };
@@ -22888,15 +23603,6 @@ impl VibexWorkbench {
         self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
         let mentions = composer_input.read(cx).tokens().to_vec();
         let mentions = composer_mentions(&mentions);
-        if let Some(stale) =
-            stale_composer_mention(&mentions, self.runtime_catalog.as_deref(), |session_id| {
-                self.registered_session(session_id).is_some()
-            })
-        {
-            self.agent_error = Some(stale);
-            cx.notify();
-            return None;
-        }
         let message = ComposerQueueMessage {
             id: self.composer_queue_serial,
             session_id,
@@ -22922,9 +23628,6 @@ impl VibexWorkbench {
         Some(message)
     }
 
-    /// Remote twin of the composer dispatch: optimistic message plus a
-    /// single `send_message` RPC. Durable-submission locators and command
-    /// execution stay authority-local; live updates arrive through events.
     /// Starts a delegation straight from the composer.
     ///
     /// This is the user's direct entry: it does not ask the main Agent to
@@ -22940,24 +23643,20 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(runtime) = self.runtime.clone() else {
-            self.agent_error = Some(
-                locale::text(
-                    "Delegation needs the local runtime",
-                    "立即委派需要本地 Runtime",
-                    "立即委派需要本地 Runtime",
-                )
-                .to_string(),
-            );
-            cx.notify();
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let Some(session_id) = self.view_session_id.clone() else {
             return;
         };
+        let Some(selection_ref) = vibex_core::VibexUseRef::parse(&selection_ref) else {
+            return;
+        };
         let composer_input = self.ensure_composer_input(window, cx);
-        let raw_text = composer_input.read(cx).value().to_string();
-        let (prompt, _) = composer_submission_payload(&raw_text, &self.composer_attachments);
+        let content = composer_input.read(cx).content();
+        let inline_attachments = self.composer_attachments.clone();
+        let (prompt, attachments) =
+            composer_submission_payload(content.text(), &inline_attachments);
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             self.agent_error = Some(
@@ -22971,66 +23670,109 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
-        let title: String = prompt
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(vibex_core::VIBEX_USE_TITLE_CHARS)
+        let mentions = composer_mentions(composer_input.read(cx).tokens());
+        let mut request = vibex_core::HumanDelegationRequest::new(session_id.clone(), prompt);
+        request.title = Some(
+            request
+                .task
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(vibex_core::VIBEX_USE_TITLE_CHARS)
+                .collect(),
+        );
+        request.runtime_option_ref = Some(selection_ref);
+        request.attachments = attachments;
+        request.context_refs = mentions
+            .iter()
+            .filter_map(|mention| {
+                (mention.kind == vibex_core::VibexUseMentionKind::Session)
+                    .then(|| mention.reference.session_id())
+                    .flatten()
+                    .map(|session_id| vibex_core::TeamContextReference {
+                        session_id,
+                        from_sequence: None,
+                        through_sequence: None,
+                    })
+            })
             .collect();
-        // The key is derived from what the user asked for, so a double-click or a
-        // retry after a lost reply resolves to the same task instead of starting
-        // a second one.
-        let idempotency_key = format!(
-            "composer-delegate:{}:{}",
-            session_id.as_str(),
-            vibex_desktop_runtime::fingerprint_of(&[
-                agent_id.as_str(),
-                selection_ref.as_str(),
-                prompt.as_str()
-            ])
-        );
-        let arguments = serde_json::json!({
-            "idempotencyKey": idempotency_key,
-            "task": {
-                "title": title,
-                "prompt": prompt,
-                "completionPolicy": "owner_review"
-            },
-            "target": { "selectionRef": selection_ref },
-            "session": { "kind": "new" }
+        request.mentions = mentions;
+        let payload = serde_json::to_string(&request).unwrap_or_default();
+        let fingerprint = vibex_desktop_runtime::fingerprint_of(&[&agent_id, &payload]);
+        if self
+            .composer_delegations
+            .get(session_id.as_str())
+            .is_some_and(|submission| submission.pending)
+        {
+            return;
+        }
+        let submission = self
+            .composer_delegations
+            .entry(session_id.as_str().to_string())
+            .or_insert_with(|| ComposerDelegationSubmission {
+                fingerprint: fingerprint.clone(),
+                idempotency_key: format!("composer-delegate:{}", RequestId::new().as_str()),
+                pending: false,
+            });
+        if submission.fingerprint != fingerprint {
+            submission.fingerprint = fingerprint;
+            submission.idempotency_key = format!("composer-delegate:{}", RequestId::new().as_str());
+        }
+        submission.pending = true;
+        let idempotency_key = submission.idempotency_key.clone();
+        let authority = self.ui_state.sidebar.active_authority().to_string();
+        let generation = self.session_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .delegate_session(
+                    MutationRequest::new(request).with_idempotency_key(idempotency_key),
+                )
+                .await
         });
-        let actor = vibex_core::VibexUseActor::new(
-            runtime.vibex_use().authority(),
-            session_id.clone(),
-            runtime.vibex_use().activation_revision(),
-        );
-        let service = runtime.vibex_use();
-        let host: Arc<dyn vibex_core::VibexUseToolHost> = service.clone();
-        let weak = cx.weak_entity();
-        cx.spawn_in(window, async move |_entity, cx| {
-            let outcome = host
-                .call(actor, vibex_core::VibexUseTool::Delegate, arguments)
-                .await;
-            let _ = weak.update_in(cx, |this, window, cx| {
+        cx.spawn_in(window, async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.ui_state.sidebar.active_authority() != authority {
+                    return;
+                }
+                if let Some(submission) = this.composer_delegations.get_mut(session_id.as_str()) {
+                    submission.pending = false;
+                }
+                let active = agent_turn_completion_is_active(
+                    this.session_generation,
+                    generation,
+                    this.selected_session_id.as_ref(),
+                    &session_id,
+                );
                 match outcome {
-                    Ok(_) => {
-                        // The draft became a task; the composer is consumed.
-                        let input = this.ensure_composer_input(window, cx);
-                        input.update(cx, |input, cx| input.set_value("", window, cx));
-                        this.composer_attachments.clear();
-                        this.composer_command_entry = None;
-                        this.agent_error = None;
-                        this.clear_suggestions();
-                        this.refresh_delegated_sessions();
+                    Ok(Ok(_)) => {
+                        this.composer_delegations.remove(session_id.as_str());
+                        if active {
+                            let input = this.ensure_composer_input(window, cx);
+                            if input.read(cx).content() == content
+                                && this.composer_attachments == inline_attachments
+                            {
+                                input.update(cx, |input, cx| input.set_value("", window, cx));
+                                this.composer_attachments.clear();
+                                this.composer_command_entry = None;
+                                this.composer_drafts.consume(session_id.as_str());
+                                this.clear_suggestions();
+                            }
+                            this.agent_error = None;
+                        }
+                        this.refresh_delegated_sessions(cx);
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
                     }
-                    Err(error) => {
-                        // The draft is left untouched: a refused delegation is
-                        // something the reader fixes, not something a send eats.
-                        this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                    Ok(Err(error)) if active => {
+                        this.agent_error = Some(format!("{}: {}", error.code, error.message))
                     }
+                    Err(error) if active => {
+                        this.agent_error = Some(format!("Delegation failed: {error}"))
+                    }
+                    _ => {}
                 }
                 cx.notify();
             });
@@ -23038,27 +23780,8 @@ impl VibexWorkbench {
         .detach();
     }
 
-    /// The provider-only preamble for one composer message.
-    ///
-    /// A `@` reference is an instruction to the main Agent, not a task
-    /// assignment: the note names the target and the tool that reaches it, and
-    /// the call that follows is re-authorized on its own. It is never shown in
-    /// the timeline, never used for the session title, and never indexed.
-    fn composer_prompt_context(
-        &self,
-        mentions: &[VibexUseMention],
-        session_id: &VibexSessionId,
-    ) -> Option<String> {
-        let mut note = vibex_core::vibex_use_route_note(mentions)?;
-        if let Some(session) = self.registered_session(session_id.as_str()) {
-            note.push_str(&format!(
-                "\nWork inside this workspace and keep to the files it covers: {}",
-                session.workspace_root
-            ));
-        }
-        Some(note)
-    }
-
+    /// Sends a typed human message to the selected authority while events
+    /// continue to update the optimistic conversation.
     fn dispatch_composer_message_remote(
         &mut self,
         message: ComposerQueueMessage,
@@ -23078,7 +23801,8 @@ impl VibexWorkbench {
         } = message;
         self.notification_suppressed_session_ids
             .remove(session_id.as_str());
-        let prompt_context = self.composer_prompt_context(&mentions, &session_id);
+        let prompt_context = None;
+        let reasoning_effort = selection.reasoning_effort.clone();
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
         let idempotency_key = format!(
@@ -23090,6 +23814,7 @@ impl VibexWorkbench {
         );
         let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
+            mentions: mentions.clone(),
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
             after_sequence,
@@ -23109,19 +23834,25 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let outcome = backend
                 .agent()
-                .send_message(MutationRequest::new(SendAgentMessageRequest {
-                    session_id: session_id.clone(),
-                    message_idempotency_key: idempotency_key,
-                    desired_runtime: selection,
-                    text,
-                    attachments,
-                    reasoning_effort: None,
-                    correlation_id: None,
-                    delivery,
-                    prompt_context,
-                    // A person typed this in the composer.
-                    provenance: vibex_core::MessageProvenance::HumanInput,
-                }))
+                .send_message_with_mentions(MutationRequest::new(
+                    vibex_core::HumanAgentMessageRequest {
+                        mentions,
+                        message: SendAgentMessageRequest {
+                            session_id: session_id.clone(),
+                            message_idempotency_key: idempotency_key,
+                            desired_runtime: selection,
+                            text,
+                            attachments,
+                            reasoning_effort,
+                            correlation_id: None,
+                            delivery,
+                            prompt_context,
+                            // A person typed this in the composer.
+                            provenance: vibex_core::MessageProvenance::HumanInput,
+                            mentions: Vec::new(),
+                        },
+                    },
+                ))
                 .await
                 .map(|_| ());
             let session = backend.agent().open_session(session_id.clone()).await.ok();
@@ -23170,13 +23901,14 @@ impl VibexWorkbench {
 
     fn agent_session_is_active(&self, session_id: &VibexSessionId) -> bool {
         self.session_turn_pending(session_id)
-            || self.sessions.iter().any(|session| {
-                session.id == *session_id
-                    && matches!(
+            || self
+                .registered_session(session_id.as_str())
+                .is_some_and(|session| {
+                    matches!(
                         session.state,
                         AgentSessionState::Running | AgentSessionState::NeedsInput
                     )
-            })
+                })
     }
 
     fn dispatch_composer_message(
@@ -23188,10 +23920,7 @@ impl VibexWorkbench {
     ) {
         let session_id = message.session_id.clone();
         let delivery = composer_queue_message_delivery(behavior);
-        let session = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id);
+        let session = self.registered_session(session_id.as_str());
         let session_state = session.map(|session| session.state);
         let cached_turn_status = session.and_then(|session| {
             self.cached_auto_continue_turn_status(&session_id, session.updated_at_ms)
@@ -23260,7 +23989,7 @@ impl VibexWorkbench {
         // The routing note is built at the send boundary from the references
         // the user actually picked, and it rides the prompt rather than the
         // user's message, so the transcript keeps only their own words.
-        let prompt_context = self.composer_prompt_context(&mentions, &session_id);
+        let prompt_context = None;
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
         let idempotency_key = format!(
@@ -23271,6 +24000,7 @@ impl VibexWorkbench {
             unix_timestamp_ms()
         );
         let optimistic_message = (!is_command).then(|| OptimisticUserMessage {
+            mentions: mentions.clone(),
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
             after_sequence: self.session_view_end_sequence(&session_id).unwrap_or(0),
@@ -23304,6 +24034,7 @@ impl VibexWorkbench {
         }
         let submit_key = idempotency_key.clone();
         let reasoning_effort = selection.reasoning_effort.clone();
+        let message_backend = self.backend.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let outcome = if let Some(invocation) = command_invocation {
                 runtime
@@ -23328,23 +24059,38 @@ impl VibexWorkbench {
                     .await
                     .map(|_| ())
             } else {
-                runtime
-                    .agent()
-                    .message_submission()
-                    .submit(SendAgentMessageRequest {
-                        session_id: session_id.clone(),
-                        message_idempotency_key: idempotency_key,
-                        desired_runtime: selection,
-                        text,
-                        attachments,
-                        reasoning_effort,
-                        correlation_id: None,
-                        delivery,
-                        prompt_context,
-                        provenance: vibex_core::MessageProvenance::HumanInput,
-                    })
-                    .await
-                    .map(|_| ())
+                let backend = message_backend.ok_or_else(|| {
+                    vibex_core::VibexError::capability(
+                        "backend_unavailable",
+                        "the authoritative runtime is unavailable",
+                    )
+                });
+                match backend {
+                    Ok(backend) => backend
+                        .agent()
+                        .send_message_with_mentions(MutationRequest::new(
+                            vibex_core::HumanAgentMessageRequest {
+                                mentions,
+                                message: SendAgentMessageRequest {
+                                    session_id: session_id.clone(),
+                                    message_idempotency_key: idempotency_key,
+                                    desired_runtime: selection,
+                                    text,
+                                    attachments,
+                                    reasoning_effort,
+                                    correlation_id: None,
+                                    delivery,
+                                    prompt_context,
+                                    provenance: vibex_core::MessageProvenance::HumanInput,
+                                    mentions: Vec::new(),
+                                },
+                            },
+                        ))
+                        .await
+                        .map(|_| ())
+                        .map_err(backend_error_to_vibex),
+                    Err(error) => Err(error),
+                }
             };
             let session = runtime
                 .agent()
@@ -23445,9 +24191,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let Some(session_updated_at_ms) = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms)
         else {
             return;
@@ -23499,10 +24243,11 @@ impl VibexWorkbench {
         } else {
             behavior
         };
-        let session = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id);
+        if self.registered_session(session_id.as_str()).is_none() {
+            self.load_queued_session(session_id.clone(), behavior, window, cx);
+            return false;
+        }
+        let session = self.registered_session(session_id.as_str());
         let session_state = session.map(|session| session.state);
         let cached_turn_status = session.and_then(|session| {
             self.cached_auto_continue_turn_status(session_id, session.updated_at_ms)
@@ -23556,9 +24301,7 @@ impl VibexWorkbench {
                 continue;
             };
             let Some(session_state) = self
-                .sessions
-                .iter()
-                .find(|session| session.id == session_id)
+                .registered_session(session_id.as_str())
                 .map(|session| session.state)
             else {
                 continue;
@@ -23627,7 +24370,11 @@ impl VibexWorkbench {
         self.composer_queue_edit_attachments = attachments;
         self.composer_queue_edit_geometry.input_bounds = None;
         self.composer_queue_edit_input.update(cx, |input, cx| {
-            input.set_value(text, window, cx);
+            input.set_value(
+                composer_content_with_mentions(&text, &message.mentions),
+                window,
+                cx,
+            );
             input.focus(window, cx);
         });
         cx.notify();
@@ -23714,6 +24461,7 @@ impl VibexWorkbench {
         }
         message.text = text;
         message.attachments = attachments;
+        message.mentions = composer_mentions(self.composer_queue_edit_input.read(cx).tokens());
         message.command_invocation = None;
         let session_id = message.session_id.clone();
         self.composer_queue_editing_id = None;
@@ -24441,7 +25189,12 @@ impl VibexWorkbench {
         };
         edit.attachments.extend(attachments);
         self.user_message_edit_input.update(cx, |input, cx| {
-            input.replace(insertion, window, cx);
+            insert_composer_content(
+                input,
+                composer_content_with_mentions(&insertion, &clipboard.mentions),
+                window,
+                cx,
+            );
             input.focus(window, cx);
         });
         cx.notify();
@@ -24534,7 +25287,12 @@ impl VibexWorkbench {
         self.composer_attachment_serial = serial;
         self.composer_queue_edit_attachments.extend(attachments);
         self.composer_queue_edit_input.update(cx, |input, cx| {
-            input.replace(insertion, window, cx);
+            insert_composer_content(
+                input,
+                composer_content_with_mentions(&insertion, &clipboard.mentions),
+                window,
+                cx,
+            );
             input.focus(window, cx);
         });
         cx.notify();
@@ -24731,7 +25489,12 @@ impl VibexWorkbench {
             self.ensure_composer_input(window, cx)
         };
         input.update(cx, |input, cx| {
-            input.replace(insertion, window, cx);
+            insert_composer_content(
+                input,
+                composer_content_with_mentions(&insertion, &clipboard.mentions),
+                window,
+                cx,
+            );
             input.focus(window, cx);
         });
         cx.notify();
@@ -27425,7 +28188,7 @@ impl VibexWorkbench {
         else {
             return;
         };
-        if !self.agent_session_is_active(&session_id) {
+        if !message.mentions.is_empty() || !self.agent_session_is_active(&session_id) {
             self.steer_composer_queue_message(message_id, window, cx);
             return;
         }
@@ -27433,6 +28196,7 @@ impl VibexWorkbench {
             .remove(session_id.as_str());
         let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
+            mentions: message.mentions.clone(),
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
             after_sequence,
@@ -27508,9 +28272,7 @@ impl VibexWorkbench {
             return;
         }
         let Some((session_state, turn_updated_at_ms)) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| (session.state, session.updated_at_ms))
         else {
             return;
@@ -27837,6 +28599,7 @@ impl VibexWorkbench {
         expected_source_end_sequence: i64,
         initial: String,
         attachments: Vec<MessageAttachment>,
+        mentions: Vec<VibexUseMention>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -27860,7 +28623,11 @@ impl VibexWorkbench {
         self.rebuild_timeline_sizes();
         let selection_end = initial.len();
         self.user_message_edit_input.update(cx, move |input, cx| {
-            input.set_value(initial, window, cx);
+            input.set_value(
+                composer_content_with_mentions(&initial, &mentions),
+                window,
+                cx,
+            );
             input.set_selected_range(0..selection_end, cx);
             input.focus(window, cx);
         });
@@ -27897,8 +28664,13 @@ impl VibexWorkbench {
             edit.source_session_id,
             edit.user_sequence,
             edit.expected_source_end_sequence,
-            text,
-            attachments,
+            UserMessagePayload {
+                text,
+                attachments,
+                mentions: composer_mentions(self.user_message_edit_input.read(cx).tokens()),
+                delivery: UserMessageDelivery::Prompt,
+                provenance: vibex_core::MessageProvenance::HumanInput,
+            },
             cx,
         );
     }
@@ -27908,8 +28680,7 @@ impl VibexWorkbench {
         source_session_id: VibexSessionId,
         user_sequence: i64,
         expected_source_end_sequence: i64,
-        text: String,
-        attachments: Vec<MessageAttachment>,
+        message: UserMessagePayload,
         cx: &mut Context<Self>,
     ) {
         if self.agent_action_pending
@@ -27927,12 +28698,19 @@ impl VibexWorkbench {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        let UserMessagePayload {
+            text,
+            attachments,
+            mentions,
+            ..
+        } = message;
         let submitted_at_ms = unix_timestamp_ms();
         let editing_turn_id = self
             .inline_user_message_edit
             .take()
             .map(|edit| edit.turn_id);
         self.pending_user_message_edit = Some(PendingUserMessageEdit {
+            mentions: mentions.clone(),
             source_session_id: source_session_id.clone(),
             user_sequence,
             submitted_at_ms,
@@ -27977,6 +28755,7 @@ impl VibexWorkbench {
                                 delivery: UserMessageDelivery::Prompt,
                                 prompt_context: None,
                                 provenance: vibex_core::MessageProvenance::HumanInput,
+                                mentions,
                             },
                         }))
                         .await
@@ -28241,12 +29020,14 @@ impl VibexWorkbench {
         if active && !self.new_session_open {
             self.new_session_schedule = draft.schedule;
             self.restore_new_session_message_draft(
-                draft.raw_text,
+                draft.content.text().to_string(),
                 draft.attachments,
                 draft.command_entry,
                 window,
                 cx,
             );
+            self.new_session_input
+                .update(cx, |input, cx| input.set_value(draft.content, window, cx));
             self.new_session_draft_initialized = true;
             self.new_session_workspace.mark_failed(failure.code);
             self.new_session_error = Some(failure.message);
@@ -28509,9 +29290,7 @@ impl VibexWorkbench {
             return;
         };
         let Some(session_workspace_id) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == *session_id)
+            .registered_session(session_id.as_str())
             .map(|session| session.workspace_id.as_str().to_string())
         else {
             return;
@@ -28965,7 +29744,6 @@ impl VibexWorkbench {
         } else {
             None
         };
-        let raw_text = self.new_session_input.read(cx).value().to_string();
         let scheduled_at_ms = match self
             .new_session_schedule
             .map(|schedule| schedule.deadline(unix_timestamp_ms()))
@@ -28979,11 +29757,12 @@ impl VibexWorkbench {
             }
         };
         let draft = SubmittedNewSessionDraft {
-            raw_text: raw_text.clone(),
+            content: self.new_session_input.read(cx).content(),
             attachments: self.new_session_attachments.clone(),
             command_entry: self.new_session_command_entry.clone(),
             schedule: self.new_session_schedule,
         };
+        let mentions = composer_mentions(self.new_session_input.read(cx).tokens());
         let (text, attachments) = self.new_session_draft_payload(cx);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
         // Manual slash expansion reads the authority's discovery capability.
@@ -29069,6 +29848,7 @@ impl VibexWorkbench {
             );
         }
         let optimistic_message = has_initial_message.then(|| OptimisticUserMessage {
+            mentions: mentions.clone(),
             session_id: optimistic_session_id.clone(),
             item_id: TimelineItemId::new(),
             after_sequence: 0,
@@ -29098,9 +29878,7 @@ impl VibexWorkbench {
                 attachments: attachments.clone(),
                 command_invocation: command_invocation.clone(),
                 scheduled_at_ms: Some(at_ms),
-                // This path opens a brand-new session; its document was already
-                // consumed into the message that is being dispatched.
-                mentions: Vec::new(),
+                mentions: mentions.clone(),
             });
             self.start_message_schedule_timer(window, cx);
             self.publish_sidebar_invalidation();
@@ -29243,22 +30021,26 @@ impl VibexWorkbench {
                                 .await
                                 .map_err(backend_error_to_vibex)?;
                         }
-                        let submission = message_backend.agent().send_message(
-                            MutationRequest::new(SendAgentMessageRequest {
-                                session_id: session_id.clone(),
-                                message_idempotency_key: format!(
-                                    "gpui:new-session:{}:{}",
-                                    session_id.as_str(),
-                                    unix_timestamp_ms()
-                                ),
-                                desired_runtime: desired_runtime.clone(),
-                                text: text.clone(),
-                                attachments: initial_attachments.clone(),
-                                reasoning_effort: desired_runtime.reasoning_effort.clone(),
-                                correlation_id: None,
-                                delivery: UserMessageDelivery::Prompt,
-                                prompt_context: None,
-                                provenance: vibex_core::MessageProvenance::HumanInput,
+                        let submission = message_backend.agent().send_message_with_mentions(
+                            MutationRequest::new(vibex_core::HumanAgentMessageRequest {
+                                mentions,
+                                message: SendAgentMessageRequest {
+                                    session_id: session_id.clone(),
+                                    message_idempotency_key: format!(
+                                        "gpui:new-session:{}:{}",
+                                        session_id.as_str(),
+                                        unix_timestamp_ms()
+                                    ),
+                                    desired_runtime: desired_runtime.clone(),
+                                    text: text.clone(),
+                                    attachments: initial_attachments.clone(),
+                                    reasoning_effort: desired_runtime.reasoning_effort.clone(),
+                                    correlation_id: None,
+                                    delivery: UserMessageDelivery::Prompt,
+                                    prompt_context: None,
+                                    provenance: vibex_core::MessageProvenance::HumanInput,
+                                    mentions: Vec::new(),
+                                },
                             })
                             .with_idempotency_key(format!(
                                 "gpui:new-session:message:{}",
@@ -30388,9 +31170,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let Some(title) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .registered_session(session_id.as_str())
             .map(|session| session.title.clone())
         else {
             return;
@@ -30716,9 +31496,7 @@ impl VibexWorkbench {
                     return;
                 }
                 if self
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == session_id)
+                    .registered_session(session_id.as_str())
                     .is_some_and(|session| session.title == value)
                 {
                     self.cancel_sidebar_rename(cx);
@@ -30799,6 +31577,7 @@ impl VibexWorkbench {
                 self.sidebar_rename_target = None;
                 self.sidebar_rename_error = None;
                 if changed {
+                    self.sync_user_session_group(&group_id);
                     self.queue_ui_state();
                     self.publish_sidebar_invalidation();
                 }
@@ -30864,10 +31643,7 @@ impl VibexWorkbench {
                     let active = this.session_generation == generation;
                     match outcome {
                         Ok(Ok(updated)) => {
-                            if let Some(session) = this
-                                .sessions
-                                .iter_mut()
-                                .find(|session| session.id == updated.id)
+                            if let Some(session) = this.registered_session_mut(updated.id.as_str())
                             {
                                 *session = updated;
                                 this.invalidate_sidebar_projection_cache();
@@ -30911,12 +31687,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-        else {
+        let Some(session) = self.registered_session(session_id.as_str()).cloned() else {
             return;
         };
         let strings = self.strings();
@@ -31085,6 +31856,14 @@ impl VibexWorkbench {
             .is_some_and(|session_id| session_ids.contains(session_id.as_str()));
         self.sessions
             .retain(|session| !session_ids.contains(session.id.as_str()));
+        self.delegated_sessions
+            .retain(|session_id, _| !session_ids.contains(session_id));
+        self.delegated_tree
+            .retain(|session_id, _| !session_ids.contains(session_id));
+        self.delegated_pages.retain(|parent, page| {
+            page.session_ids.retain(|id| !session_ids.contains(id));
+            parent.as_ref().is_none_or(|id| !session_ids.contains(id))
+        });
         self.session_views
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_view_lru
@@ -31724,8 +32503,18 @@ impl VibexWorkbench {
         let removed_session_ids = self
             .sessions
             .iter()
+            .chain(self.delegated_sessions.values())
             .filter(|session| session.project_id.as_str() == project_id)
             .map(|session| session.id.as_str().to_string())
+            .chain(
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .groups
+                    .values()
+                    .filter(|group| group.project_id == project_id)
+                    .flat_map(|group| group.member_session_ids.iter().cloned()),
+            )
             .collect::<BTreeSet<_>>();
         self.workspaces
             .retain(|(project, _)| project.id.as_str() != project_id);
@@ -32419,7 +33208,7 @@ impl VibexWorkbench {
 
     fn selected_session(&self) -> Option<&AgentSession> {
         let selected = self.selected_session_id.as_ref()?;
-        self.sessions.iter().find(|session| &session.id == selected)
+        self.registered_session(selected.as_str())
     }
 
     /// The Agent that owns a session.
@@ -32429,9 +33218,7 @@ impl VibexWorkbench {
     /// Agent's own icon instead of a generic robot. A session this client has
     /// not loaded answers `None`, which leaves the generic mark in place.
     pub(crate) fn agent_id_for_session(&self, session_id: &VibexSessionId) -> Option<&AgentId> {
-        self.sessions
-            .iter()
-            .find(|session| &session.id == session_id)
+        self.registered_session(session_id.as_str())
             .map(|session| &session.agent_id)
     }
 
@@ -32574,9 +33361,7 @@ impl VibexWorkbench {
     }
 
     fn session_agent_id(&self, session_id: &VibexSessionId) -> Option<AgentId> {
-        self.sessions
-            .iter()
-            .find(|session| &session.id == session_id)
+        self.registered_session(session_id.as_str())
             .map(|session| session.agent_id.clone())
     }
 
@@ -36477,6 +37262,7 @@ impl VibexWorkbench {
     }
 
     fn render_agent_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.sidebar_visible_session_ids.clear();
         let strings = self.strings();
         let groups = self.sidebar_workspace_groups("");
         let reorder_enabled = !self.sidebar_batch_mode;
@@ -36499,7 +37285,7 @@ impl VibexWorkbench {
                 self.selected_session()
                     .map(|session| session.workspace_id.as_str().to_string())
             });
-        let group_elements = self.render_sidebar_root_children(
+        let mut group_elements = self.render_sidebar_root_children(
             &groups,
             None,
             selected_workspace_id,
@@ -36508,6 +37294,9 @@ impl VibexWorkbench {
             0,
             cx,
         );
+        if let Some(action) = self.render_delegated_page_action(None, cx) {
+            group_elements.push(action);
+        }
         let selected_count = self.sidebar_state.selected_ids.len();
         let group_creation = self.sidebar_group_creation_candidates();
         let total_count = self.sessions.len();
@@ -37555,33 +38344,7 @@ impl VibexWorkbench {
                     let children = if collapsed {
                         Vec::new()
                     } else {
-                        let member_ids = self
-                            .ui_state
-                            .sidebar
-                            .organization
-                            .group(&group_id)
-                            .map(|group| group.member_session_ids.clone())
-                            .unwrap_or_default();
-                        let mut member_run = member_ids
-                            .iter()
-                            .filter_map(|id| session_indices.get(id.as_str()).copied())
-                            .collect::<Vec<_>>();
-                        let mut member_elements = Vec::new();
-                        push_sidebar_session_run(
-                            &mut member_elements,
-                            &mut member_run,
-                            &entity,
-                            groups,
-                            project_index,
-                            None,
-                            &project_id,
-                            reorder_enabled,
-                            true,
-                            rename_target.as_deref(),
-                            selected_session.as_deref(),
-                            strings,
-                        );
-                        member_elements
+                        self.render_group_navigation(&group_id, cx)
                     };
                     elements.push(self.render_sidebar_group(
                         group_id,
@@ -37593,8 +38356,27 @@ impl VibexWorkbench {
                 SidebarOrganizationItem::Session(session_id)
                     if parent_folder_id.is_some() || include_root_sessions =>
                 {
+                    self.sidebar_visible_session_ids.push(session_id.clone());
                     if let Some(index) = session_indices.get(session_id.as_str()) {
                         run.push(*index);
+                    }
+                    let children = self.render_delegated_subtree(&session_id, 0, cx);
+                    if !children.is_empty() {
+                        push_sidebar_session_run(
+                            &mut elements,
+                            &mut run,
+                            &entity,
+                            groups,
+                            project_index,
+                            None,
+                            &project_id,
+                            reorder_enabled,
+                            true,
+                            rename_target.as_deref(),
+                            selected_session.as_deref(),
+                            strings,
+                        );
+                        elements.extend(children);
                     }
                 }
                 SidebarOrganizationItem::Project(_)
@@ -37739,33 +38521,7 @@ impl VibexWorkbench {
                     let children = if collapsed {
                         Vec::new()
                     } else {
-                        let member_ids = self
-                            .ui_state
-                            .sidebar
-                            .organization
-                            .group(&group_id)
-                            .map(|group| group.member_session_ids.clone())
-                            .unwrap_or_default();
-                        let mut member_run = member_ids
-                            .iter()
-                            .filter_map(|id| session_indices.get(id.as_str()).copied())
-                            .collect::<Vec<_>>();
-                        let mut member_elements = Vec::new();
-                        push_sidebar_session_run(
-                            &mut member_elements,
-                            &mut member_run,
-                            &entity,
-                            groups,
-                            project_index,
-                            Some(workspace_index),
-                            &project_id,
-                            reorder_enabled,
-                            false,
-                            rename_target.as_deref(),
-                            selected_session.as_deref(),
-                            strings,
-                        );
-                        member_elements
+                        self.render_group_navigation(&group_id, cx)
                     };
                     elements.push(self.render_sidebar_group(
                         group_id,
@@ -37775,6 +38531,7 @@ impl VibexWorkbench {
                     ));
                 }
                 SidebarOrganizationItem::Session(session_id) => {
+                    self.sidebar_visible_session_ids.push(session_id.clone());
                     if let Some(index) = session_indices.get(session_id.as_str()) {
                         run.push(*index);
                     }
@@ -37827,11 +38584,7 @@ impl VibexWorkbench {
     fn session_group_agent_identities(&self, group: &SessionGroupUiState) -> Vec<String> {
         let mut identities = Vec::new();
         for member_id in &group.member_session_ids {
-            let Some(session) = self
-                .sessions
-                .iter()
-                .find(|session| session.id.as_str() == member_id)
-            else {
+            let Some(session) = self.registered_session(member_id) else {
                 continue;
             };
             let identity = session.agent_id.as_str().to_string();
@@ -37875,11 +38628,7 @@ impl VibexWorkbench {
         let mut has_unread_completion = false;
         let mut turn_pending = false;
         for member_id in &group.member_session_ids {
-            let Some(session) = self
-                .sessions
-                .iter()
-                .find(|session| session.id.as_str() == member_id)
-            else {
+            let Some(session) = self.registered_session(member_id) else {
                 continue;
             };
             summary.total += 1;
@@ -38047,6 +38796,29 @@ impl VibexWorkbench {
         self.session_group_revealed_tab_ids
             .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
         let strings = self.strings();
+        let applied = group.observed_layout();
+        let feedback = group
+            .automatic_layout
+            .as_ref()
+            .map(|_| match applied.preset {
+                vibex_core::SessionGroupLayoutPreset::Single
+                | vibex_core::SessionGroupLayoutPreset::Tabs => locale::text(
+                    "Tabs · select a session to view it",
+                    "标签页 · 选择会话查看",
+                    "分頁 · 選取會話檢視",
+                ),
+                vibex_core::SessionGroupLayoutPreset::Grid => locale::text(
+                    "Grid · up to four live conversations",
+                    "网格 · 最多四个实时会话",
+                    "網格 · 最多四個即時會話",
+                ),
+                vibex_core::SessionGroupLayoutPreset::Columns => {
+                    locale::text("Columns", "分列", "分欄")
+                }
+                vibex_core::SessionGroupLayoutPreset::LeadAndWorkers => {
+                    locale::text("Lead and workers", "主 Agent 与协作者", "主 Agent 與協作者")
+                }
+            });
         v_flex()
             .id("session-group-workspace")
             .size_full()
@@ -38060,12 +38832,15 @@ impl VibexWorkbench {
                     .justify_between()
                     .gap_2()
                     .px_3()
-                    .h(px(32.0))
+                    .min_h_8()
+                    .py_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
                             .min_w_0()
+                            .flex_1()
+                            .flex_wrap()
                             .gap_2()
                             .child(sidebar_icon("icons/vibex/layers.svg").size(px(14.0)))
                             .child(
@@ -38096,11 +38871,23 @@ impl VibexWorkbench {
                         ),
                     ),
             )
+            .when_some(feedback, |workspace, feedback| {
+                workspace.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(feedback),
+                )
+            })
             .child(div().flex_1().min_h_0().min_w_0().child(pane_tree))
             .into_any_element()
     }
 
-    /// The counts a team header shows: running, waiting for the user, done.
+    /// The counts a team header shows distinguish review, collected results,
+    /// accepted tasks, failure and cancellation.
     ///
     /// It is built from the authoritative task phases of the group's own
     /// members, so a pane that is merely streaming tokens does not inflate
@@ -38110,50 +38897,63 @@ impl VibexWorkbench {
         group: &SessionGroupUiState,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let mut running = 0usize;
-        let mut waiting = 0usize;
-        let mut finished = 0usize;
-        for session_id in &group.member_session_ids {
-            let Some(node) = self.delegated_tree.get(session_id) else {
-                continue;
-            };
-            if node.blocked_on.is_some() {
-                waiting += 1;
-                continue;
-            }
-            match node.task_phase {
-                Some(vibex_core::DelegationTaskPhase::Queued)
-                | Some(vibex_core::DelegationTaskPhase::Starting)
-                | Some(vibex_core::DelegationTaskPhase::Active)
-                | Some(vibex_core::DelegationTaskPhase::Cancelling) => running += 1,
-                Some(vibex_core::DelegationTaskPhase::AwaitingReview) => finished += 1,
-                Some(vibex_core::DelegationTaskPhase::Completed)
-                | Some(vibex_core::DelegationTaskPhase::Failed)
-                | Some(vibex_core::DelegationTaskPhase::Cancelled) => finished += 1,
-                None => {}
-            }
+        let mut status = vibex_desktop_model::SessionGroupTeamStatus::default();
+        for id in &group.member_session_ids {
+            status.record(
+                self.delegated_tree.get(id),
+                self.registered_session(id)
+                    .map(|session| session.state)
+                    .unwrap_or(AgentSessionState::Idle),
+            );
         }
-        let mut elements = Vec::new();
-        let chip = |count: usize, key: &str, tone: Hsla, cx: &App| -> Option<AnyElement> {
-            (count > 0).then(|| {
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(div().size(px(6.0)).rounded_full().bg(tone))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{count} {key}")),
-                    )
-                    .into_any_element()
-            })
-        };
-        elements.extend(chip(running, "running", cx.theme().success, cx));
-        elements.extend(chip(waiting, "waiting", cx.theme().warning, cx));
-        elements.extend(chip(finished, "done", cx.theme().muted_foreground, cx));
-        elements
+        [
+            (
+                status.running,
+                locale::text("running", "运行中", "執行中"),
+                cx.theme().muted_foreground,
+            ),
+            (
+                status.waiting,
+                locale::text("waiting for you", "等待用户", "等待使用者"),
+                cx.theme().warning,
+            ),
+            (
+                status.review,
+                locale::text("awaiting review", "等待主 Agent 审阅", "等待主 Agent 審閱"),
+                cx.theme().muted_foreground,
+            ),
+            (
+                status.results_ready,
+                locale::text("results ready", "结果待回收", "結果待回收"),
+                cx.theme().muted_foreground,
+            ),
+            (
+                status.completed,
+                locale::text("confirmed", "已确认", "已確認"),
+                cx.theme().muted_foreground,
+            ),
+            (
+                status.failed,
+                locale::text("failed", "失败", "失敗"),
+                cx.theme().danger,
+            ),
+            (
+                status.cancelled,
+                locale::text("cancelled", "已取消", "已取消"),
+                cx.theme().muted_foreground,
+            ),
+        ]
+        .into_iter()
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, label, color)| {
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(color)
+                .child(format!("{count} {label}"))
+                .into_any_element()
+        })
+        .collect()
     }
 
     /// The cached view that renders one group pane.
@@ -38234,7 +39034,9 @@ impl VibexWorkbench {
                             return;
                         };
                         if group.layout.resize_split(&resize_id, normalized) {
+                            this.sync_user_session_group(&resize_group_id);
                             this.queue_ui_state();
+                            this.publish_sidebar_invalidation();
                             cx.notify();
                         }
                     });
@@ -38624,9 +39426,47 @@ impl VibexWorkbench {
         }
 
         let content = match active_session_id.as_deref() {
-            Some(session_id) => {
+            Some(session_id)
+                if self
+                    .ui_state
+                    .sidebar
+                    .organization
+                    .group(group_id)
+                    .is_some_and(|group| {
+                        group.live_session_ids().iter().any(|id| id == session_id)
+                    }) =>
+            {
                 self.render_session_group_pane_content(session_id, focused, window, cx)
             }
+            Some(_) => v_flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "Select this pane to load its conversation",
+                            "选择此窗格以加载会话",
+                            "選取此窗格以載入會話",
+                        )),
+                )
+                .child(
+                    Button::new(format!("session-group-load-{pane_id}"))
+                        .small()
+                        .label(locale::text("Open conversation", "打开会话", "開啟會話"))
+                        .on_click(cx.listener({
+                            let group_id = group_id.to_string();
+                            let pane_id = pane_id.clone();
+                            move |this, _, _, cx| {
+                                this.focus_session_group_pane(&group_id, &pane_id, cx)
+                            }
+                        })),
+                )
+                .into_any_element(),
             None => div()
                 .flex_1()
                 .min_h_0()
@@ -38761,7 +39601,35 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let _ = focused;
+        if let Some(error) = self.session_group_view_errors.get(session_id).cloned() {
+            let session_id = session_id.to_string();
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .p_3()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::localize_error_message(&error)),
+                )
+                .child(
+                    Button::new(format!("session-group-retry-{session_id}"))
+                        .small()
+                        .label(locale::text(
+                            "Reload conversation",
+                            "重新加载会话",
+                            "重新載入會話",
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Ok(session_id) = VibexSessionId::parse(&session_id) {
+                                this.load_session_group_view(&session_id, true, cx);
+                            }
+                        })),
+                )
+                .into_any_element();
+        }
         let Ok(pane_session_id) = VibexSessionId::parse(session_id).ok().ok_or(()) else {
             return Empty.into_any_element();
         };
@@ -38849,8 +39717,8 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    /// Gives every group member a complete view and loads the ones that have no
-    /// timeline yet.
+    /// Gives every group member selected by the live-pane budget a complete
+    /// view; hidden tabs load their timelines only when selected.
     ///
     /// A session only has a timeline once something asked for it. Without this
     /// pass the workspace would show one complete conversation beside panes
@@ -38859,10 +39727,26 @@ impl VibexWorkbench {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
             return;
         };
-        let members = group.member_session_ids.clone();
-        // Every member owns a view for as long as it is a member, so a pane can
-        // always borrow one. Members are pinned against eviction, which is what
-        // keeps a wide split from losing the conversation it is showing.
+        let members = group.live_session_ids();
+        let hidden: Vec<String> = self
+            .ui_state
+            .sidebar
+            .organization
+            .groups
+            .values()
+            .flat_map(|group| group.member_session_ids.iter())
+            .filter(|id| {
+                !members.contains(id)
+                    && self
+                        .view_session_id
+                        .as_ref()
+                        .is_none_or(|borrowed| borrowed.as_str() != *id)
+            })
+            .cloned()
+            .collect();
+        for id in hidden {
+            self.forget_session_view(&id);
+        }
         for member_id in &members {
             let Ok(session_id) = VibexSessionId::parse(member_id) else {
                 continue;
@@ -38902,15 +39786,25 @@ impl VibexWorkbench {
     ) {
         // This runs for every group member on every frame, so keep the lookups
         // borrowed and allocate an owned key only when a fetch is really queued.
-        if self.session_group_view_loads.contains(session_id.as_str()) {
+        if !self.pinned_session_view_ids().contains(session_id.as_str())
+            || (!force
+                && self
+                    .session_group_view_errors
+                    .contains_key(session_id.as_str()))
+            || self.session_group_view_loads.contains(session_id.as_str())
+        {
             return;
         }
         let loaded = match self.view_session_id.as_ref() {
-            Some(borrowed) if borrowed == session_id => self.timeline.session_id.is_some(),
+            Some(borrowed) if borrowed == session_id => {
+                self.timeline.session_id.is_some() && !self.timeline.needs_authoritative_refetch
+            }
             _ => self
                 .session_views
                 .get(session_id.as_str())
-                .is_some_and(|view| view.timeline.session_id.is_some()),
+                .is_some_and(|view| {
+                    view.timeline.session_id.is_some() && !view.timeline.needs_authoritative_refetch
+                }),
         };
         if loaded && !force {
             return;
@@ -38920,6 +39814,9 @@ impl VibexWorkbench {
         };
         self.session_group_view_loads
             .insert(session_id.as_str().to_string());
+        self.session_group_view_errors.remove(session_id.as_str());
+        let loading_id = session_id.clone();
+        let authority = self.ui_state.sidebar.active_authority().to_string();
         let runner = gpui_tokio::Tokio::spawn(cx, {
             let backend = backend.clone();
             let session_id = session_id.clone();
@@ -38933,14 +39830,26 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
-                    let Ok(Ok((session_id, items))) = outcome else {
-                        // The id stays in the set, so a session whose timeline
-                        // could not be fetched does not start a fetch on every
-                        // frame. Its view keeps whatever it already had.
+                    if this.ui_state.sidebar.active_authority() != authority {
                         return;
-                    };
-                    this.session_group_view_loads.remove(session_id.as_str());
-                    this.adopt_session_view_timeline(session_id, items);
+                    }
+                    this.session_group_view_loads.remove(loading_id.as_str());
+                    if !this.pinned_session_view_ids().contains(loading_id.as_str()) {
+                        return;
+                    }
+                    match outcome {
+                        Ok(Ok((session_id, items))) => {
+                            this.adopt_session_view_timeline(session_id, items)
+                        }
+                        Ok(Err(error)) => {
+                            this.session_group_view_errors
+                                .insert(loading_id.as_str().to_string(), error.message);
+                        }
+                        Err(error) => {
+                            this.session_group_view_errors
+                                .insert(loading_id.as_str().to_string(), error.to_string());
+                        }
+                    }
                     cx.notify();
                 });
             },
@@ -39122,6 +40031,7 @@ impl VibexWorkbench {
         self.session_group_tab_drop_target = None;
         self.session_group_pane_drop_target = None;
         if changed {
+            self.sync_user_session_group(group_id);
             self.queue_ui_state();
             self.publish_sidebar_invalidation();
         }
@@ -39289,6 +40199,7 @@ impl VibexWorkbench {
         };
         self.session_group_pane_drop_target = None;
         if changed {
+            self.sync_user_session_group(group_id);
             self.queue_ui_state();
             self.publish_sidebar_invalidation();
         }
@@ -39304,6 +40215,7 @@ impl VibexWorkbench {
             .group_mut(group_id)
             .is_some_and(|group| group.merge_panes());
         if changed {
+            self.sync_user_session_group(group_id);
             self.queue_ui_state();
             self.publish_sidebar_invalidation();
         }
@@ -41423,6 +42335,29 @@ impl VibexWorkbench {
         let renaming =
             self.sidebar_rename_target == Some(SidebarRenameTarget::Session(session.id.clone()));
         let session_id_string = session.id.as_str().to_string();
+        let disclosure = self.render_delegated_disclosure(&session_id_string, cx);
+        let branch_collapsed = self.delegated_branch_is_collapsed(&session_id_string);
+        let branch_summary = self
+            .delegated_tree
+            .get(&session_id_string)
+            .filter(|node| {
+                branch_collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
+            })
+            .map(|node| {
+                format!(
+                    "{} {} · {} {}",
+                    node.active_descendants,
+                    locale::text("running", "运行中", "執行中"),
+                    node.blocked_descendants,
+                    locale::text("waiting", "等待中", "等待中")
+                )
+            });
+        let row_focus = self
+            .delegated_row_focus
+            .entry(session_id_string.clone())
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        let key_session_id = session_id_string.clone();
         // An unanswered approval or input request outranks both the optimistic
         // local dispatch and the still-open provider turn: the Agent is parked
         // on the user, so the row must ask for the answer instead of spinning.
@@ -41605,6 +42540,7 @@ impl VibexWorkbench {
                                     ),
                             )
                         })
+                        .children(disclosure)
                         .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                         .child(
                             Input::new(&self.sidebar_rename_input)
@@ -41835,6 +42771,17 @@ impl VibexWorkbench {
 
         let row = div()
             .id(format!("sidebar-session-row-{session_id_string}"))
+            .track_focus(&row_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(cx.theme().ring))
+            .when(self.delegated_has_children(&session_id_string), |row| row.aria_expanded(!branch_collapsed))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                if matches!(key, "left" | "right" | "up" | "down" | "home" | "end" | "enter" | "space") {
+                    cx.stop_propagation();
+                    this.delegated_tree_key(&key_session_id, key, window, cx);
+                }
+            }))
             .group(hover_group.clone())
             .relative()
             .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
@@ -41978,7 +42925,8 @@ impl VibexWorkbench {
                     .items_center()
                     .gap_2()
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        window.focus(&row_focus, cx);
                         this.clear_sidebar_context_menu_target(cx);
                         if this.sidebar_batch_mode {
                             this.sidebar_state.toggle_selected(batch_id.clone());
@@ -42197,6 +43145,7 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
+                            .children(disclosure)
                             .child(
                                 div()
                                     .flex_none()
@@ -42214,7 +43163,10 @@ impl VibexWorkbench {
                                         .group_hover(&hover_group, |style| {
                                             style.text_color(cx.theme().sidebar_foreground)
                                         })
-                                        .child(row_title),
+                                        .child(row_title)
+                            .when_some(branch_summary, |column, summary| column.child(
+                                div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(summary)
+                            )),
                                 ),
                             ),
                     )
@@ -51124,16 +52076,18 @@ impl VibexWorkbench {
             return self.render_child_agent_user_message_row(row, cx);
         }
         self.sync_timeline_item_index();
-        let (attachments, delivery) = {
+        let (attachments, delivery, mentions) = {
             let timeline_item_index = self.timeline_item_index.borrow();
             row.item_ids
                 .iter()
                 .filter_map(|item_id| timeline_item_index.positions.get(item_id).copied())
                 .filter_map(|position| self.timeline.items.get(position))
                 .find_map(|item| match &item.payload {
-                    vibex_core::TimelinePayload::UserMessage(message) => {
-                        Some((message.attachments.clone(), message.delivery))
-                    }
+                    vibex_core::TimelinePayload::UserMessage(message) => Some((
+                        message.attachments.clone(),
+                        message.delivery,
+                        message.mentions.clone(),
+                    )),
                     _ => None,
                 })
                 .unwrap_or_default()
@@ -51144,7 +52098,8 @@ impl VibexWorkbench {
         } else {
             attachments
         };
-        let copy_item = user_message_clipboard_item(&row.body, &attachments);
+        let copy_item =
+            user_message_clipboard_item_with_mentions(&row.body, &attachments, &mentions);
         let edit_attachments = attachments.clone();
         let timestamp = self.timeline_row_timestamp(row);
         let locale = self.resolved_locale();
@@ -51275,6 +52230,7 @@ impl VibexWorkbench {
                                                             source_end_sequence,
                                                             edit_text.clone(),
                                                             edit_attachments.clone(),
+                                                            mentions.clone(),
                                                             window,
                                                             cx,
                                                         )
@@ -52610,11 +53566,7 @@ impl VibexWorkbench {
         let workspace_root = self
             .selected_session_id
             .as_ref()
-            .and_then(|session_id| {
-                self.sessions
-                    .iter()
-                    .find(|session| &session.id == session_id)
-            })
+            .and_then(|session_id| self.registered_session(session_id.as_str()))
             .map(|session| session.workspace_root.as_str());
         let preview_source = image
             .image_reference
@@ -57834,6 +58786,35 @@ impl VibexWorkbench {
             right_rail_docked.then_some(right_rail_content_width),
             agent_open && !new_session_open,
         );
+        let group_width_rem = column_width / f32::from(window.rem_size()).max(1.0);
+        if (self.session_group_available_width_rem - group_width_rem).abs() > 0.05
+            || self
+                .active_session_group()
+                .is_some_and(|(_, group)| group.needs_layout_adaptation(group_width_rem))
+        {
+            self.session_group_available_width_rem = group_width_rem;
+            let entity = cx.entity();
+            cx.defer(move |cx| {
+                entity.update(cx, |this, cx| {
+                    let width = this.session_group_available_width_rem;
+                    let Some((group_id, _)) = this.active_session_group() else {
+                        return;
+                    };
+                    let changed = this
+                        .ui_state
+                        .sidebar
+                        .organization
+                        .group_mut(&group_id)
+                        .is_some_and(|group| group.adapt_layout_to_width(width));
+                    if changed {
+                        this.session_group_pane_views.clear();
+                        this.queue_ui_state();
+                        this.publish_sidebar_invalidation();
+                        cx.notify();
+                    }
+                })
+            });
+        }
         let preview_dock_width = if preview_fullscreen && preview_docked {
             column_width + preview_width
         } else {
@@ -61413,13 +62394,35 @@ fn delegation_node_status(node: &SessionTreeNode) -> DelegatedNodeStatus {
 ///
 /// It is a real element rather than padding so the line can stop at the last
 /// child of a branch instead of running past unrelated rows.
-fn delegated_tree_guide_line(cx: &App) -> AnyElement {
+fn delegated_tree_guide_line(continues: bool, elbow: bool, cx: &App) -> AnyElement {
     div()
+        .relative()
         .flex_none()
-        .w(px(6.0))
-        .h(px(SIDEBAR_SESSION_ROW_HEIGHT - 12.0))
-        .border_l_1()
-        .border_color(cx.theme().border)
+        .w_4()
+        .h_full()
+        .when(continues || elbow, |slot| {
+            slot.child(
+                div()
+                    .absolute()
+                    .left_1()
+                    .top_0()
+                    .h_full()
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .when(elbow && !continues, |line| line.h(gpui::relative(0.5))),
+            )
+        })
+        .when(elbow, |slot| {
+            slot.child(
+                div()
+                    .absolute()
+                    .left_1()
+                    .top(gpui::relative(0.5))
+                    .w_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border),
+            )
+        })
         .into_any_element()
 }
 
@@ -61785,14 +62788,17 @@ const COMPOSER_FILE_TOKEN_PREFIX: &str = "reference:file:";
 /// whitespace could not be one unit.
 fn composer_token_for_entry(entry: &AgentCommandEntry) -> Option<InlineToken> {
     let text = entry.insertion_text.trim_end();
+    let mention = composer_entry_mention(entry);
     let mut characters = text.chars();
-    if !matches!(characters.next(), Some('/' | '@' | '$')) || characters.any(char::is_whitespace) {
+    if !matches!(characters.next(), Some('/' | '@' | '$'))
+        || (mention.is_none() && characters.any(char::is_whitespace))
+    {
         return None;
     }
     // A collaborator or conversation reference carries its typed identity in the
     // token rather than in a side table: the token survives a draft, a copy and
     // a paste, and the send boundary reads the same reference back out.
-    let id = match composer_entry_mention(entry) {
+    let id = match mention {
         Some(mention) => mention.encode(),
         None => entry.id.clone(),
     };
@@ -61827,50 +62833,6 @@ fn composer_entry_mention(entry: &AgentCommandEntry) -> Option<VibexUseMention> 
             &session_id,
             Some(entry.label.as_str()),
         ));
-    }
-    None
-}
-
-/// Rejects a send whose `@` references no longer resolve.
-///
-/// A suggestion is offered from one catalogue snapshot; by the time the message
-/// is sent the target may have been disabled or signed out. Sending anyway
-/// would put a route in the prompt that the Agent cannot act on, so the send
-/// stops and says which reference went stale.
-fn stale_composer_mention(
-    mentions: &[VibexUseMention],
-    catalog: Option<&SessionRuntimeOptionCatalog>,
-    known_session: impl Fn(&str) -> bool,
-) -> Option<String> {
-    for mention in mentions {
-        match mention.kind {
-            vibex_core::VibexUseMentionKind::Agent => {
-                let available = catalog.is_some_and(|catalog| {
-                    catalog.options.iter().any(|option| {
-                        runtime_option_ref(option) == mention.reference.as_uri()
-                            && option.availability
-                                == vibex_core::RuntimeOptionAvailability::Available
-                    })
-                });
-                if !available {
-                    return Some(format!(
-                        "{} is no longer available with that configuration; pick it again",
-                        mention.label.as_deref().unwrap_or("that collaborator")
-                    ));
-                }
-            }
-            vibex_core::VibexUseMentionKind::Session => {
-                let Some(session_id) = mention.reference.session_id() else {
-                    return Some("a conversation reference is no longer valid".to_string());
-                };
-                if !known_session(session_id.as_str()) {
-                    return Some(format!(
-                        "{} is no longer open; pick another conversation",
-                        mention.label.as_deref().unwrap_or("that conversation")
-                    ));
-                }
-            }
-        }
     }
     None
 }
@@ -62111,7 +63073,11 @@ fn composer_mentions(tokens: &[InlineTokenSpan]) -> Vec<VibexUseMention> {
         let Some(mention) = VibexUseMention::parse(span.token().id().as_ref()) else {
             continue;
         };
-        if mentions.iter().any(|existing| existing == &mention) {
+        if mentions.iter().any(|existing| {
+            existing.reference == mention.reference
+                && existing.kind == mention.kind
+                && existing.agent_id == mention.agent_id
+        }) {
             continue;
         }
         // A last label wins: the token carries the name the user saw, and a
@@ -62125,6 +63091,72 @@ fn composer_mentions(tokens: &[InlineTokenSpan]) -> Vec<VibexUseMention> {
         }
     }
     mentions
+}
+
+/// Rebuilds editing tokens only from references the user already selected.
+/// Labels are matched to the saved text; pasted or typed names alone never
+/// become typed references or acquire session access.
+fn composer_content_with_mentions(text: &str, mentions: &[VibexUseMention]) -> InputContent {
+    let mut content = InputContent::new(text.to_string());
+    let mut occupied: Vec<Range<usize>> = Vec::new();
+    for mention in mentions.iter().take(VIBEX_USE_MAX_MENTIONS) {
+        let Some(label) = mention.label.as_deref().filter(|label| !label.is_empty()) else {
+            continue;
+        };
+        let label = if label.starts_with('@') {
+            label.to_string()
+        } else {
+            format!("@{label}")
+        };
+        let Some((start, _)) = text.match_indices(&label).find(|(start, _)| {
+            let end = *start + label.len();
+            occupied
+                .iter()
+                .all(|range| end <= range.start || *start >= range.end)
+                && (*start == 0
+                    || text[..*start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| !ch.is_alphanumeric() && !matches!(ch, '_' | '@')))
+                && (end == text.len()
+                    || text[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| !ch.is_alphanumeric() && ch != '_'))
+        }) else {
+            continue;
+        };
+        let range = start..start + label.len();
+        if let Ok(next) = content.clone().with_token(
+            range.clone(),
+            InlineToken::new(mention.encode(), label.clone()).with_label(label),
+        ) {
+            content = next;
+            occupied.push(range);
+        }
+    }
+    content
+}
+
+fn insert_composer_content(
+    input: &mut TextareaState,
+    content: InputContent,
+    window: &mut Window,
+    cx: &mut Context<TextareaState>,
+) {
+    input.replace(content.text().clone(), window, cx);
+    let end = input.selected_range().end;
+    let start = end.saturating_sub(content.text().len());
+    for span in content.tokens() {
+        let range = span.range();
+        let _ = input.replace_range_with_token(
+            start + range.start..start + range.end,
+            span.token().clone(),
+            window,
+            cx,
+        );
+    }
+    input.set_selected_range(end..end, cx);
 }
 
 fn composer_submission_payload(
@@ -62281,20 +63313,29 @@ fn user_message_clipboard_plain_text(text: &str, attachments: &[MessageAttachmen
     output
 }
 
+#[cfg(test)]
 fn user_message_clipboard_item(text: &str, attachments: &[MessageAttachment]) -> ClipboardItem {
+    user_message_clipboard_item_with_mentions(text, attachments, &[])
+}
+
+fn user_message_clipboard_item_with_mentions(
+    text: &str,
+    attachments: &[MessageAttachment],
+    mentions: &[VibexUseMention],
+) -> ClipboardItem {
     let image_attachments = attachments
         .iter()
         .filter(|attachment| message_attachment_is_image(attachment))
         .take(VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS)
         .cloned()
         .collect::<Vec<_>>();
-    if image_attachments.is_empty() {
+    if image_attachments.is_empty() && mentions.is_empty() {
         return ClipboardItem::new_string(text.to_string());
     }
     let plain_text = user_message_clipboard_plain_text(text, &image_attachments);
     ClipboardItem::new_string_with_json_metadata(
         plain_text,
-        VibexMessageClipboard::new(text.to_string(), image_attachments),
+        VibexMessageClipboard::new(text.to_string(), image_attachments).with_mentions(mentions),
     )
 }
 
@@ -62364,7 +63405,7 @@ fn vibex_message_composer_insertion(
     attachments: &[MessageAttachment],
     mut serial: u64,
 ) -> Option<(String, Vec<InlineComposerAttachment>, u64)> {
-    if attachments.is_empty() || attachments.len() > VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS {
+    if attachments.len() > VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS {
         return None;
     }
     let mut insertion = String::with_capacity(text.len());
@@ -62389,7 +63430,7 @@ fn vibex_message_composer_insertion(
             }
         }
     }
-    (!inline_attachments.is_empty()).then_some((insertion, inline_attachments, serial))
+    Some((insertion, inline_attachments, serial))
 }
 
 fn attachment_local_path(uri: &str) -> Option<String> {
@@ -67387,9 +68428,7 @@ impl FoundationSettings {
                                     workbench.selected_session_id.clone(),
                                 ) {
                                     let workspace_id = workbench
-                                        .sessions
-                                        .iter()
-                                        .find(|session| session.id == session_id)
+                                        .registered_session(session_id.as_str())
                                         .map(|session| session.workspace_id.clone());
                                     let generation = workbench.session_generation;
                                     workbench.load_agent_session_terminals(
@@ -82561,7 +83600,7 @@ mod tests {
 
         let take_remote = source
             .split_once("    fn take_composer_message_remote(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Remote twin of the composer dispatch"))
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_immediate_delegation("))
             .map(|(body, _)| body)
             .expect("remote composer submission should remain inspectable");
         assert!(take_remote.contains("self.composer_drafts.consume(message.session_id.as_str());"));
@@ -85879,7 +86918,7 @@ mod tests {
             .find("announce_created_session_before_initial_message(")
             .expect("durable session should be announced before its initial message runs");
         assert!(initial_message < announce);
-        assert!(submit[initial_message..announce].contains(".send_message("));
+        assert!(submit[initial_message..announce].contains(".send_message_with_mentions("));
         assert!(
             submit[initial_message..announce].contains(".runtime_selection(session_id.clone())")
         );
@@ -86009,10 +87048,15 @@ mod tests {
         assert!(submit.contains("self.composer_queue.push(message);"));
         assert!(submit.contains("self.set_session_turn_pending(&session_id, true);"));
         assert!(submit.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
-        let clear = submit
+        let dispatch = submit
+            .split_once("    fn dispatch_composer_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_composer_queue_turn_status("))
+            .map(|(body, _)| body)
+            .expect("message dispatch completion should remain inspectable");
+        let clear = dispatch
             .find("this.set_session_turn_pending(&submitted_session_id, false);")
             .expect("submission should clear its per-session pending state");
-        let completion_fence = submit
+        let completion_fence = dispatch
             .find("let active = agent_turn_completion_is_active(")
             .expect("submission completion should remain session-fenced");
         assert!(clear < completion_fence);
@@ -88315,7 +89359,7 @@ mod tests {
         // The optimistic new-session row is itself a non-fallback snapshot;
         // releasing the recorded title on any non-fallback title would drop
         // the record before the manager's fallback snapshot ever arrives.
-        assert!(reconcile.contains("existing.id == session.id"));
+        assert!(reconcile.contains("self.registered_session(session.id.as_str()).is_some()"));
 
         let submit = source
             .split_once("    fn submit_new_session(")
@@ -90414,7 +91458,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("inline message edit initializer should remain inspectable");
         assert!(!begin.contains("open_dialog"));
-        assert!(begin.contains("input.set_value(initial"));
+        assert!(begin.contains("composer_content_with_mentions(&initial, &mentions)"));
         assert!(begin.contains("input.focus(window, cx)"));
         assert!(begin.contains("invalidate_timeline_turn_measurement(&measured_turn_id)"));
         assert!(begin.contains("self.session_turn_pending(&source_session_id)"));
@@ -90517,6 +91561,7 @@ mod tests {
             inline_text_offset: None,
         };
         let pending = PendingUserMessageEdit {
+            mentions: Vec::new(),
             source_session_id: session_id,
             user_sequence: 7,
             submitted_at_ms: 20,
@@ -90554,6 +91599,7 @@ mod tests {
             inline_text_offset: None,
         };
         let optimistic = OptimisticUserMessage {
+            mentions: Vec::new(),
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
             after_sequence: 1,
@@ -90621,6 +91667,7 @@ mod tests {
         let messages = BTreeMap::from([(
             session_id.as_str().to_string(),
             OptimisticUserMessage {
+                mentions: Vec::new(),
                 session_id: session_id.clone(),
                 item_id: TimelineItemId::new(),
                 after_sequence: 0,
@@ -91723,9 +92770,7 @@ mod tests {
         assert!(session_menu.contains("move |mut submenu, _window, _cx|"));
     }
 
-    /// Every pane renders a complete conversation because every member owns a
-    /// complete view: the group opens one per member, loads the ones that have
-    /// no timeline yet, and never hands a pane another session's view.
+    /// Each live pane owns a complete view and resolves its own requests.
     #[test]
     fn group_panes_materialize_views_and_resolve_requests_for_their_own_session() {
         let source = include_str!("app.rs");
@@ -91737,7 +92782,8 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("group view materialization should remain inspectable");
-        // Every member gets a view, and every view without a timeline is loaded.
+        // Only the live members materialize views and histories.
+        assert!(ensure.contains("group.live_session_ids()"));
         assert!(ensure.contains("self.ensure_session_view(&session_id);"));
         assert!(ensure.contains("self.ensure_session_group_view_loaded(&session_id, cx);"));
 
@@ -91750,7 +92796,7 @@ mod tests {
             .expect("group view loading should remain inspectable");
         assert!(load.contains("fetch_authoritative_timeline_via_backend("));
         assert!(load.contains("session_group_view_loads"));
-        assert!(load.contains("this.adopt_session_view_timeline(session_id, items);"));
+        assert!(load.contains("this.adopt_session_view_timeline(session_id, items)"));
         // The load is keyed by session id, so it cannot land in another view.
         assert!(!load.contains("session_generation"));
 

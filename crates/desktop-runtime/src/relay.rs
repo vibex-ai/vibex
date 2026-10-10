@@ -1640,6 +1640,7 @@ mod tests {
                 RemoteAgentSendMessageRequest {
                     auth,
                     request: SendAgentMessageRequest {
+                        mentions: Vec::new(),
                         session_id: session.id.clone(),
                         message_idempotency_key: "relay-denied-message".to_string(),
                         desired_runtime: SessionRuntimeSelection::provider(

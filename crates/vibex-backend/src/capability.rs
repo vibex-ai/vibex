@@ -7,6 +7,11 @@ pub const BACKEND_CAPABILITY_SCHEMA_VERSION: &str = "vibex-backend-capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendOperation {
+    AgentTeamRead,
+    AgentTeamMutate,
+    AgentSessionAccess,
+    AgentSendMessageWithMentions,
+    AgentTeamPresentation,
     AgentListSessions,
     AgentCreateSession,
     AgentOpenSession,
@@ -212,6 +217,11 @@ impl BackendCapabilitySnapshot {
             schema_version: BACKEND_CAPABILITY_SCHEMA_VERSION.to_string(),
             revision: 1,
             agent: DomainCapabilities::available([
+                AgentTeamRead,
+                AgentTeamMutate,
+                AgentSessionAccess,
+                AgentSendMessageWithMentions,
+                AgentTeamPresentation,
                 AgentListSessions,
                 AgentCreateSession,
                 AgentOpenSession,

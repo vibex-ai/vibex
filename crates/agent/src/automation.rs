@@ -430,6 +430,7 @@ impl<'a> AutomationGraphRunner<'a> {
         match self
             .manager
             .send_message(SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: session.id.clone(),
                 message_idempotency_key: format!(
                     "automation:{}:{}",
@@ -1073,6 +1074,7 @@ mod tests {
 
             if request.text.to_ascii_lowercase().contains("permission") {
                 return Ok(crate::adapter::ProviderTurnResult {
+                    stop_reason: None,
                     events: vec![crate::adapter::ProviderEvent {
                         source: vibex_core::TimelineSource::Provider,
                         payload: vibex_core::TimelinePayload::PermissionRequest(
@@ -1108,6 +1110,7 @@ mod tests {
             }
 
             Ok(crate::adapter::ProviderTurnResult {
+                stop_reason: None,
                 events: vec![crate::adapter::ProviderEvent::agent(
                     vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
                         text: format!("Test response to: {}", request.text),

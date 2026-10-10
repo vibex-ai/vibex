@@ -523,6 +523,11 @@ pub struct SendAgentMessageRequest {
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+    /// Durable reference metadata. Only the trusted human submission API may
+    /// grant read access from explicitly selected tokens; this field alone
+    /// never grants access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::VibexUseMention>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     pub correlation_id: Option<CorrelationId>,
@@ -1004,6 +1009,7 @@ mod tests {
     #[test]
     fn durable_send_request_serializes_required_runtime_and_idempotency_key() {
         let request = SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: VibexSessionId::new(),
             message_idempotency_key: "message-1".to_string(),
             desired_runtime: SessionRuntimeSelection {

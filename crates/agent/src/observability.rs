@@ -38,6 +38,13 @@ pub enum RuntimeMetricName {
     EventEnricherFallback,
     TranscriptWatcherLag,
     ProcessTreeCleanupFailure,
+    DelegationAdmission,
+    DelegationQueueWait,
+    DelegationAttentionWait,
+    DelegationCancellation,
+    DelegationDeadline,
+    DelegationDelivery,
+    DelegationPresentation,
 }
 
 impl RuntimeMetricName {
@@ -66,6 +73,13 @@ impl RuntimeMetricName {
             Self::EventEnricherFallback => "runtime_event_enricher_fallback_total",
             Self::TranscriptWatcherLag => "runtime_transcript_watcher_lag_ms",
             Self::ProcessTreeCleanupFailure => "runtime_process_tree_cleanup_failure_total",
+            Self::DelegationAdmission => "delegation_admission_total",
+            Self::DelegationQueueWait => "delegation_queue_wait_ms",
+            Self::DelegationAttentionWait => "delegation_attention_wait_ms",
+            Self::DelegationCancellation => "delegation_cancellation_total",
+            Self::DelegationDeadline => "delegation_deadline_total",
+            Self::DelegationDelivery => "delegation_delivery_total",
+            Self::DelegationPresentation => "delegation_presentation_total",
         }
     }
 }

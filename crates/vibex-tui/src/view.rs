@@ -2532,6 +2532,15 @@ fn render_dock_band(
             theme.base()
         };
         match row {
+            crate::app::DockRow::Team { label, .. } => {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_to_width(label, usize::from(area.width).saturating_sub(2), "…")
+                    ),
+                    base,
+                )));
+            }
             crate::app::DockRow::Header { section, count } => {
                 let folded = app.dock_collapsed.contains(section);
                 lines.push(Line::from(vec![

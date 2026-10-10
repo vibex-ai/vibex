@@ -5037,6 +5037,12 @@ fn mutation_requires_idempotency(kind: &str) -> bool {
             | "set_desired_runtime"
             | "cancel_runtime_switch"
             | "send_message"
+            | "send_message_with_mentions"
+            | "set_session_access"
+            | "delegate_session"
+            | "control_team_task"
+            | "present_team"
+            | "acknowledge_team_events"
             | "continue_turn"
             | "interrupt"
             | "resolve_permission"
@@ -5729,6 +5735,9 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
         .supports_agent_account_auth
     {
         features.push("agent_account_auth".to_string());
+    }
+    if state.dispatcher.supports_team() {
+        features.push("agent_team".to_string());
     }
     if state.dispatcher.supports_timeline_display_settings() {
         features.push("agent_timeline_display_settings".to_string());

@@ -367,6 +367,7 @@ pub struct AcpSession {
 
 #[derive(Debug, Clone)]
 pub struct AcpTurn {
+    pub stop_reason: Option<String>,
     pub events: Vec<AcpEvent>,
     pub binding_update: Option<AcpSession>,
     pub completed: bool,
@@ -1074,7 +1075,7 @@ impl AcpClient for OpenCodeAcpClient {
                 message: "OpenCode ACP turn completed without assistant text".to_string(),
             });
         }
-        if let Some(stop_reason) = prompt_result.stop_reason {
+        if let Some(stop_reason) = prompt_result.stop_reason.as_ref() {
             events.push(AcpEvent::SystemNotice {
                 level: SystemNoticeLevel::Info,
                 message: format!("OpenCode ACP stop reason: {stop_reason}"),
@@ -1082,6 +1083,7 @@ impl AcpClient for OpenCodeAcpClient {
         }
 
         Ok(AcpTurn {
+            stop_reason: prompt_result.stop_reason,
             events,
             binding_update: None,
             completed: !permission_requested,
@@ -2552,6 +2554,7 @@ impl AgentProvider for AcpAgentProvider {
             .collect();
 
         Ok(ProviderTurnResult {
+            stop_reason: turn.stop_reason,
             events,
             binding_update,
             completed: turn.completed,
@@ -3836,6 +3839,7 @@ mod tests {
         let provider = AcpAgentProvider::new(Arc::new(FixtureAcpClient::new(
             AcpSession::default(),
             Ok(AcpTurn {
+                stop_reason: None,
                 events: Vec::new(),
                 binding_update: None,
                 completed: true,
@@ -3885,6 +3889,7 @@ mod tests {
             Arc::new(FixtureAcpClient::new(
                 AcpSession::default(),
                 Ok(AcpTurn {
+                    stop_reason: None,
                     events: Vec::new(),
                     binding_update: None,
                     completed: true,
@@ -3949,6 +3954,7 @@ mod tests {
             Arc::new(FixtureAcpClient::new(
                 AcpSession::default(),
                 Ok(AcpTurn {
+                    stop_reason: None,
                     events: Vec::new(),
                     binding_update: None,
                     completed: true,
@@ -4022,6 +4028,7 @@ mod tests {
             FixtureAcpClient::new(
                 AcpSession::default(),
                 Ok(AcpTurn {
+                    stop_reason: None,
                     events: Vec::new(),
                     binding_update: None,
                     completed: true,
@@ -4067,6 +4074,7 @@ mod tests {
         let provider = AcpAgentProvider::new(Arc::new(FixtureAcpClient::new(
             AcpSession::default(),
             Ok(AcpTurn {
+                stop_reason: None,
                 events: Vec::new(),
                 binding_update: None,
                 completed: true,
@@ -4103,6 +4111,7 @@ mod tests {
             FixtureAcpClient::new(
                 AcpSession::default(),
                 Ok(AcpTurn {
+                    stop_reason: None,
                     events: Vec::new(),
                     binding_update: None,
                     completed: true,
@@ -4159,6 +4168,7 @@ mod tests {
             Arc::new(FixtureAcpClient::new(
                 AcpSession::default(),
                 Ok(AcpTurn {
+                    stop_reason: None,
                     events: Vec::new(),
                     binding_update: None,
                     completed: true,
@@ -4254,6 +4264,7 @@ mod tests {
             Arc::new(FixtureAcpClient::new(
                 AcpSession::default(),
                 Ok(AcpTurn {
+                    stop_reason: None,
                     events: Vec::new(),
                     binding_update: None,
                     completed: true,
@@ -4755,6 +4766,7 @@ mod tests {
                 history_events: Vec::new(),
             },
             Ok(AcpTurn {
+                stop_reason: None,
                 events: Vec::new(),
                 binding_update: None,
                 completed: true,
@@ -4792,6 +4804,7 @@ mod tests {
         let provider = AcpAgentProvider::new(Arc::new(FixtureAcpClient::new(
             AcpSession::default(),
             Ok(AcpTurn {
+                stop_reason: None,
                 events: vec![
                     AcpEvent::Reasoning {
                         text: "thinking".to_string(),

@@ -77,6 +77,9 @@ use vibex_db::{
 use vibex_fs::WorkspaceFileService;
 use vibex_terminal::TerminalManager;
 
+mod team;
+pub use team::RemoteTeamService;
+
 mod identity;
 pub use identity::{RemoteIdentity, RemoteIdentityStore};
 mod gateway;
@@ -144,6 +147,7 @@ struct RemoteRouterState {
     composer_commands: Option<Arc<dyn RemoteAgentCommandDiscoverySource>>,
     recovery: Option<Arc<dyn RemoteRecoverySource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
+    team_service: Option<Arc<dyn RemoteTeamService>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
 }
@@ -727,6 +731,7 @@ impl RemoteRouterState {
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
+            team_service: None,
             workbench: None,
             provider: None,
         }
@@ -752,6 +757,7 @@ impl RemoteRouterState {
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
+            team_service: None,
             workbench: None,
             provider: None,
         }
@@ -782,6 +788,7 @@ impl RemoteRouterState {
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
+            team_service: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -814,6 +821,7 @@ impl RemoteRouterState {
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
+            team_service: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -955,6 +963,15 @@ impl RemoteDispatcher {
     ) -> Self {
         self.state.timeline_display_settings = Some(source);
         self
+    }
+
+    pub fn with_team_service(mut self, service: Arc<dyn RemoteTeamService>) -> Self {
+        self.state.team_service = Some(service);
+        self
+    }
+
+    pub fn supports_team(&self) -> bool {
+        self.state.team_service.is_some()
     }
 
     pub fn supports_timeline_display_settings(&self) -> bool {
@@ -4302,6 +4319,237 @@ async fn dispatch_agent_request(
     })?;
 
     match request {
+        RemoteAgentRequest::GetTeamSnapshot(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service.team_snapshot(request.request).await;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::GetSessionTree(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service.session_tree(request.request).await;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::SendMessageWithMentions(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service
+                .send_message_with_mentions(
+                    request.request,
+                    format!("human:device:{}", auth.device_id),
+                )
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "team",
+                "Team request from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::SetSessionAccess(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service
+                .set_session_access(
+                    request.request,
+                    request.idempotency_key,
+                    format!("human:device:{}", auth.device_id),
+                )
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "team",
+                "Team request from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::DelegateSession(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service
+                .delegate_session(
+                    request.request,
+                    request.idempotency_key,
+                    format!("human:device:{}", auth.device_id),
+                )
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "team",
+                "Team request from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ControlTeamTask(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service
+                .control_team_task(
+                    request.request,
+                    request.idempotency_key,
+                    format!("human:device:{}", auth.device_id),
+                )
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "team",
+                "Team request from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::PresentTeam(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service
+                .present_team(
+                    request.request,
+                    request.idempotency_key,
+                    format!("human:device:{}", auth.device_id),
+                )
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "team",
+                "Team request from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::AcknowledgeTeamEvents(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let service = state.team_service.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "agent_team_unavailable",
+                    "Team capabilities are unavailable on this runtime",
+                )
+            })?;
+            let result = service
+                .acknowledge_team_events(
+                    request.request,
+                    format!("human:device:{}", auth.device_id),
+                )
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "team",
+                "Team request from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
+
         RemoteAgentRequest::ListSessions(request) => {
             authorize_agent_action(
                 &manager,
@@ -5196,12 +5444,16 @@ async fn dispatch_agent_request(
                 )
             })?;
             let session_id = request.payload.message.session_id.clone();
+            let granted_by = format!("human:device:{}", auth.device_id);
             let result = coordinator
-                .replace_user_message(vibex_agent::ReplaceUserMessageRequest {
-                    user_sequence: request.payload.user_sequence,
-                    expected_end_sequence: request.payload.expected_end_sequence,
-                    message: request.payload.message,
-                })
+                .replace_user_message_with_mentions(
+                    vibex_agent::ReplaceUserMessageRequest {
+                        user_sequence: request.payload.user_sequence,
+                        expected_end_sequence: request.payload.expected_end_sequence,
+                        message: request.payload.message,
+                    },
+                    &granted_by,
+                )
                 .await;
             audit_agent_mutation(
                 &manager,
@@ -8394,6 +8646,236 @@ mod tests {
         assert_eq!(expired.code, "remote_pairing_code_expired");
     }
 
+    #[derive(Default)]
+    struct TestTeamService {
+        reads: AtomicUsize,
+        mutations: AtomicUsize,
+        identities: Mutex<Vec<String>>,
+    }
+
+    impl TestTeamService {
+        fn unexpected_mutation(&self) -> VibexError {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            VibexError::capability("unexpected_team_mutation", "unexpected team mutation")
+        }
+    }
+
+    #[async_trait]
+    impl RemoteTeamService for TestTeamService {
+        async fn team_snapshot(
+            &self,
+            _: vibex_core::TeamSnapshotRequest,
+        ) -> VibexResult<vibex_core::TeamSnapshot> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Err(VibexError::capability(
+                "team_read_reached",
+                "team read reached the runtime",
+            ))
+        }
+        async fn session_tree(
+            &self,
+            _: vibex_core::SessionTreeRequest,
+        ) -> VibexResult<vibex_core::SessionTreePage> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Default::default())
+        }
+        async fn send_message_with_mentions(
+            &self,
+            _: vibex_core::HumanAgentMessageRequest,
+            _: String,
+        ) -> VibexResult<Vec<vibex_core::TimelineItem>> {
+            Err(self.unexpected_mutation())
+        }
+        async fn set_session_access(
+            &self,
+            request: vibex_core::SessionAccessRequest,
+            _: String,
+            identity: String,
+        ) -> VibexResult<vibex_core::SessionAccessResult> {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            self.identities.lock().unwrap().push(identity);
+            Ok(vibex_core::SessionAccessResult {
+                grantee_session_id: request.grantee_session_id,
+                target_session_id: request.target_session_id,
+                access: request.access,
+                changed: true,
+            })
+        }
+        async fn delegate_session(
+            &self,
+            _: vibex_core::HumanDelegationRequest,
+            _: String,
+            _: String,
+        ) -> VibexResult<vibex_core::HumanDelegationResult> {
+            Err(self.unexpected_mutation())
+        }
+        async fn control_team_task(
+            &self,
+            _: vibex_core::TeamTaskControlRequest,
+            _: String,
+            _: String,
+        ) -> VibexResult<vibex_core::DelegationTaskView> {
+            Err(self.unexpected_mutation())
+        }
+        async fn present_team(
+            &self,
+            _: vibex_core::TeamPresentationRequest,
+            _: String,
+            _: String,
+        ) -> VibexResult<vibex_core::PresentationOutcome> {
+            Err(self.unexpected_mutation())
+        }
+        async fn acknowledge_team_events(
+            &self,
+            _: vibex_core::TeamAcknowledgeRequest,
+            _: String,
+        ) -> VibexResult<usize> {
+            Err(self.unexpected_mutation())
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_team_reads_and_mutations_use_device_permissions_and_trusted_identity() {
+        use vibex_core::VibexSessionId;
+        use vibex_core::team::*;
+        let (db_path, manager) = test_agent_manager("team-permissions");
+        let session = create_mock_session(&manager, "Team permissions").await;
+        let source = Arc::new(TestTeamService::default());
+        let dispatcher =
+            RemoteDispatcher::with_agent_manager(RemoteServiceConfig::loopback_disabled(), manager)
+                .with_team_service(source.clone());
+        assert!(dispatcher.supports_team());
+        let router = build_router_with_dispatcher(dispatcher);
+        for level in [
+            RemoteDevicePermissionLevel::ReadOnly,
+            RemoteDevicePermissionLevel::ApproveOnly,
+        ] {
+            let auth = pair_device(&db_path, level, "Team reader");
+            let tree = post_agent(
+                router.clone(),
+                RemoteAgentRequest::GetSessionTree(RemoteTeamReadRequest {
+                    auth: auth.clone(),
+                    request: SessionTreeRequest::default(),
+                }),
+            )
+            .await;
+            assert!(tree.error.is_none());
+            let snapshot = post_agent(
+                router.clone(),
+                RemoteAgentRequest::GetTeamSnapshot(RemoteTeamReadRequest {
+                    auth: auth.clone(),
+                    request: TeamSnapshotRequest::new(session.id.clone()),
+                }),
+            )
+            .await;
+            assert_eq!(snapshot.error.unwrap().code, "team_read_reached");
+            let target = VibexSessionId::new();
+            let key = "team-request".to_string();
+            let requests = vec![
+                RemoteAgentRequest::SendMessageWithMentions(RemoteTeamMutationRequest {
+                    auth: auth.clone(),
+                    idempotency_key: key.clone(),
+                    request: HumanAgentMessageRequest {
+                        message: test_send_request(
+                            &session,
+                            "secret-reference",
+                            "secret task text",
+                        ),
+                        mentions: vec![vibex_core::VibexUseMention::session(&target, None)],
+                    },
+                }),
+                RemoteAgentRequest::SetSessionAccess(RemoteTeamMutationRequest {
+                    auth: auth.clone(),
+                    idempotency_key: key.clone(),
+                    request: SessionAccessRequest {
+                        grantee_session_id: session.id.clone(),
+                        target_session_id: target,
+                        access: SessionAccess::Control,
+                    },
+                }),
+                RemoteAgentRequest::DelegateSession(RemoteTeamMutationRequest {
+                    auth: auth.clone(),
+                    idempotency_key: key.clone(),
+                    request: HumanDelegationRequest::new(session.id.clone(), "secret task text"),
+                }),
+                RemoteAgentRequest::ControlTeamTask(RemoteTeamMutationRequest {
+                    auth: auth.clone(),
+                    idempotency_key: key.clone(),
+                    request: TeamTaskControlRequest {
+                        session_id: session.id.clone(),
+                        task_id: vibex_core::AgentDelegationId::new(),
+                        action: TeamTaskAction::Cancel { cascade: true },
+                        expected_revision: Some(1),
+                    },
+                }),
+                RemoteAgentRequest::PresentTeam(RemoteTeamMutationRequest {
+                    auth: auth.clone(),
+                    idempotency_key: key.clone(),
+                    request: TeamPresentationRequest {
+                        session_id: session.id.clone(),
+                        group_ref: vibex_core::VibexUseRef::group(
+                            vibex_core::SessionGroupId::new().as_str(),
+                        ),
+                        expected_revision: Some(1),
+                        activation_policy: Default::default(),
+                        focus_session_id: None,
+                    },
+                }),
+                RemoteAgentRequest::AcknowledgeTeamEvents(RemoteTeamMutationRequest {
+                    auth: auth.clone(),
+                    idempotency_key: key,
+                    request: TeamAcknowledgeRequest {
+                        session_id: session.id.clone(),
+                        event_ids: vec!["result".into()],
+                    },
+                }),
+            ];
+            for request in requests {
+                let response = post_agent(router.clone(), request).await;
+                assert_eq!(response.error.unwrap().code, "remote_permission_denied");
+            }
+        }
+        assert_eq!(source.reads.load(Ordering::SeqCst), 4);
+        assert_eq!(source.mutations.load(Ordering::SeqCst), 0);
+        let auth = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Team controller",
+        );
+        let response = post_agent(
+            router,
+            RemoteAgentRequest::SetSessionAccess(RemoteTeamMutationRequest {
+                auth: auth.clone(),
+                idempotency_key: "trusted-access".into(),
+                request: SessionAccessRequest {
+                    grantee_session_id: session.id,
+                    target_session_id: VibexSessionId::new(),
+                    access: SessionAccess::Read,
+                },
+            }),
+        )
+        .await;
+        assert!(response.error.is_none());
+        assert_eq!(
+            *source.identities.lock().unwrap(),
+            vec![format!("human:device:{}", auth.device_id)]
+        );
+        let audits = RemoteAuditRepository::list(
+            &open_database(&db_path).unwrap(),
+            &RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(100),
+            },
+        )
+        .unwrap();
+        assert!(
+            audits
+                .iter()
+                .all(|record| !record.redacted_summary.contains("secret task text"))
+        );
+        cleanup_db(db_path);
+    }
+
     #[tokio::test]
     async fn remote_agent_read_only_lists_sessions_and_catches_up_timeline() {
         let (db_path, manager) = test_agent_manager("read");
@@ -9331,6 +9813,7 @@ mod tests {
                 composer_commands: None,
                 recovery: None,
                 sidebar_organization: None,
+                team_service: None,
                 workbench: None,
                 provider: None,
             },
@@ -10805,6 +11288,7 @@ mod tests {
         text: &str,
     ) -> SendAgentMessageRequest {
         SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: session.id.clone(),
             message_idempotency_key: idempotency_key.to_string(),
             desired_runtime: remote_test_selection(session),

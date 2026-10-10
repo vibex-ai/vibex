@@ -814,9 +814,8 @@ impl VibexWorkbench {
 
     /// Loads the queue the previous session left behind.
     ///
-    /// The entries are held until the authoritative session list arrives: only
-    /// then can a message whose session was deleted while Vibex was closed be
-    /// told apart from one whose session simply has not loaded yet.
+    /// The entries are held until the overview arrives. Missing owned sessions
+    /// are resolved individually before a restored message can be dispatched.
     pub(super) fn restore_composer_queue(&mut self, queue: Vec<ComposerQueueEntry>) {
         self.composer_queue = queue
             .into_iter()
@@ -831,20 +830,92 @@ impl VibexWorkbench {
         self.composer_queue_restore_pending = !self.composer_queue.is_empty();
     }
 
-    /// Adopts the restored queue once the session list can vouch for it.
+    /// Resolves one queued session absent from the navigation roots.
+    pub(super) fn load_queued_session(
+        &mut self,
+        session_id: VibexSessionId,
+        behavior: ComposerQueueDispatchBehavior,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if !self
+            .composer_queue_session_loads
+            .insert(session_id.to_string())
+        {
+            return;
+        }
+        let authority = self.ui_state.sidebar.active_authority().to_string();
+        let generation = self.delegated_tree_generation;
+        let requested = session_id.clone();
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.agent().open_session(requested).await },
+            );
+        cx.spawn_in(window, async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.delegated_tree_generation != generation
+                    || this.ui_state.sidebar.active_authority() != authority
+                {
+                    return;
+                }
+                this.composer_queue_session_loads
+                    .remove(session_id.as_str());
+                if this
+                    .optimistically_removed_session_ids
+                    .contains(session_id.as_str())
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(session)) if session.id != session_id => {
+                        this.agent_error =
+                            Some("The runtime returned a different conversation.".into());
+                    }
+                    Ok(Ok(session))
+                        if session.deleted_at_ms.is_none() && session.archived_at_ms.is_none() =>
+                    {
+                        this.delegated_sessions
+                            .insert(session.id.to_string(), session.clone());
+                        this.upsert_session_snapshot(session);
+                        this.mark_composer_queue_for_recheck(&session_id);
+                        this.maybe_dispatch_next_composer_queue_message(
+                            &session_id,
+                            behavior,
+                            window,
+                            cx,
+                        );
+                    }
+                    Ok(Ok(_)) => {
+                        this.composer_queue
+                            .retain(|message| message.session_id != session_id);
+                        this.composer_queue_changed();
+                    }
+                    Ok(Err(error)) if error.code == "session_not_found" => {
+                        this.composer_queue
+                            .retain(|message| message.session_id != session_id);
+                        this.composer_queue_changed();
+                    }
+                    Ok(Err(error)) => this.agent_error = Some(error.message),
+                    Err(error) => this.agent_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Adopts the restored queue after root metadata is available.
     ///
     /// A restored message whose session is gone is dropped, a due or ready one
     /// is re-evaluated on the next frame, and the schedule timer is re-armed so
     /// a deadline that passed while Vibex was closed is still honored.
     fn adopt_restored_composer_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_queue_restore_pending = false;
-        let known = self
-            .sessions
-            .iter()
-            .map(|session| session.id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.composer_queue
-            .retain(|message| known.contains(message.session_id.as_str()));
         let session_ids = self
             .composer_queue
             .iter()
@@ -1109,6 +1180,7 @@ fn persisted_composer_queue_entry(message: &ComposerQueueMessage) -> ComposerQue
         desired_runtime: message.desired_runtime.clone(),
         text: message.text.clone(),
         attachments: message.attachments.clone(),
+        mentions: message.mentions.clone(),
         command: message
             .command_invocation
             .as_ref()
@@ -1146,10 +1218,7 @@ fn restored_composer_message(entry: ComposerQueueEntry) -> Option<ComposerQueueM
             prompt_id: command.prompt_id,
         }),
         scheduled_at_ms: entry.scheduled_at_ms,
-        // The persisted queue stores text and attachments. A restored message
-        // re-derives its `@` references from the text it kept, so a reference
-        // whose mention survived a restart still routes.
-        mentions: Vec::new(),
+        mentions: entry.mentions,
     })
 }
 

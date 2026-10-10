@@ -13,10 +13,62 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AppliedGroupLayout, SessionGroupLayoutPreset, VIBEX_USE_MAX_LIVE_PANES, VibexUseRef,
+    AppliedGroupLayout, SessionGroupLayoutIntent, SessionGroupLayoutPreset,
+    VIBEX_USE_MAX_LIVE_PANES, VibexUseRef,
 };
 
 use crate::SplitDirection;
+
+/// Distinct team outcomes; a finished round is not an accepted task.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionGroupTeamStatus {
+    pub running: usize,
+    pub waiting: usize,
+    pub review: usize,
+    pub results_ready: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
+impl SessionGroupTeamStatus {
+    pub fn record(
+        &mut self,
+        node: Option<&vibex_core::SessionTreeNode>,
+        state: vibex_core::AgentSessionState,
+    ) {
+        use vibex_core::{AgentSessionState, DelegationCompletionPolicy, DelegationTaskPhase};
+        match node.and_then(|node| node.task_phase) {
+            Some(DelegationTaskPhase::Completed)
+                if node.and_then(|node| node.completion_policy)
+                    == Some(DelegationCompletionPolicy::SingleTurnLegacy) =>
+            {
+                self.results_ready += 1
+            }
+            Some(DelegationTaskPhase::Completed) => self.completed += 1,
+            Some(DelegationTaskPhase::Failed) => self.failed += 1,
+            Some(DelegationTaskPhase::Cancelled) => self.cancelled += 1,
+            Some(DelegationTaskPhase::AwaitingReview) => self.review += 1,
+            _ if node.is_some_and(|node| node.blocked_on.is_some())
+                || state == AgentSessionState::NeedsInput =>
+            {
+                self.waiting += 1
+            }
+            Some(
+                DelegationTaskPhase::Queued
+                | DelegationTaskPhase::Starting
+                | DelegationTaskPhase::Active
+                | DelegationTaskPhase::Cancelling,
+            ) => self.running += 1,
+            None => match state {
+                AgentSessionState::Initializing | AgentSessionState::Running => self.running += 1,
+                AgentSessionState::Error => self.failed += 1,
+                _ => {}
+            },
+        }
+    }
+}
 
 /// How many groups one sidebar may hold.
 pub const SESSION_GROUP_LIMIT: usize = 500;
@@ -833,6 +885,11 @@ pub struct SessionGroupUiState {
     pub auto_continue: Option<bool>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Agent-requested layout, retained until the user arranges the panes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_layout: Option<SessionGroupLayoutIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_automatic_layout: Option<SessionGroupLayoutIntent>,
 }
 
 impl SessionGroupUiState {
@@ -854,6 +911,8 @@ impl SessionGroupUiState {
             maximized_pane_id: None,
             auto_continue: None,
             pinned: false,
+            automatic_layout: None,
+            applied_automatic_layout: None,
         };
         group.normalize();
         group
@@ -917,63 +976,122 @@ impl SessionGroupUiState {
         }
     }
 
-    /// Arranges the current members into one of the Agent-facing presets.
-    ///
-    /// A group organised by an Agent is still a group the user can rearrange
-    /// afterwards, so this replaces the pane tree once and then leaves it
-    /// alone. Sessions beyond the live-pane budget keep their place as tabs
-    /// instead of being dropped, and the returned shape is what the caller
-    /// reports back: an Agent has to know what a narrow window actually
-    /// rendered rather than what it asked for.
     /// Reports the arrangement the group currently has, without changing it.
     ///
     /// Presenting an existing group uses this: the caller learns what is on
     /// screen, and the user's own arrangement is left exactly as it was.
     pub fn observed_layout(&self) -> AppliedGroupLayout {
-        let preset = match &self.layout {
-            SessionGroupLayout::Pane { .. } => SessionGroupLayoutPreset::Tabs,
-            SessionGroupLayout::Split { direction, .. } => match direction {
-                SplitDirection::Horizontal => SessionGroupLayoutPreset::Columns,
-                SplitDirection::Vertical => SessionGroupLayoutPreset::Grid,
-            },
+        let visible = self.live_session_ids();
+        let preset = if self.maximized_pane_id.is_some() {
+            SessionGroupLayoutPreset::Single
+        } else if let Some(applied) = self.applied_automatic_layout.as_ref() {
+            applied.preset
+        } else {
+            match &self.layout {
+                SessionGroupLayout::Pane { .. } => SessionGroupLayoutPreset::Tabs,
+                SessionGroupLayout::Split { direction, .. } => match direction {
+                    SplitDirection::Horizontal => SessionGroupLayoutPreset::Columns,
+                    SplitDirection::Vertical => SessionGroupLayoutPreset::Grid,
+                },
+            }
         };
-        let pane_ids = self.layout.pane_ids();
-        let mut visible = Vec::new();
-        let mut tabbed = Vec::new();
-        for pane_id in pane_ids.iter().take(VIBEX_USE_MAX_LIVE_PANES) {
-            let Some(pane) = self.layout.find_pane(pane_id) else {
-                continue;
-            };
-            let active = pane
-                .active_session_id
-                .clone()
-                .or_else(|| pane.session_ids.first().cloned());
-            if let Some(active) = active {
-                visible.push(VibexUseRef::new(
-                    vibex_core::VibexUseResourceKind::Session,
-                    active,
-                ));
-            }
-            for session_id in &pane.session_ids {
-                if Some(session_id) == pane.active_session_id.as_ref()
-                    || visible
-                        .last()
-                        .is_some_and(|reference| &reference.id == session_id)
-                {
-                    continue;
-                }
-                tabbed.push(VibexUseRef::new(
-                    vibex_core::VibexUseResourceKind::Session,
-                    session_id.clone(),
-                ));
-            }
-        }
+        let reference =
+            |id: &String| VibexUseRef::new(vibex_core::VibexUseResourceKind::Session, id.clone());
         AppliedGroupLayout {
             preset,
-            visible_session_refs: visible,
-            tabbed_session_refs: tabbed,
-            live_panes: pane_ids.len().min(VIBEX_USE_MAX_LIVE_PANES),
+            live_panes: visible.len(),
+            visible_session_refs: visible.iter().map(reference).collect(),
+            tabbed_session_refs: self
+                .member_session_ids
+                .iter()
+                .filter(|id| !visible.contains(id))
+                .map(reference)
+                .collect(),
         }
+    }
+
+    /// Applies an automatic layout using the conversation column's width in
+    /// rems. Its minimum pane width scales with interface zoom.
+    pub fn set_automatic_layout(
+        &mut self,
+        intent: SessionGroupLayoutIntent,
+        width_rem: f32,
+    ) -> AppliedGroupLayout {
+        self.automatic_layout = Some(intent);
+        self.applied_automatic_layout = None;
+        self.adapt_layout_to_width(width_rem);
+        self.observed_layout()
+    }
+
+    /// Reflows only when a width boundary or the requested layout changes.
+    /// Tab selection remains stable while the window stays in the same band.
+    fn effective_automatic_layout(&self, width_rem: f32) -> Option<SessionGroupLayoutIntent> {
+        let intent = self.automatic_layout.as_ref()?;
+        let budget = intent
+            .preferred_live_panes
+            .unwrap_or(VIBEX_USE_MAX_LIVE_PANES)
+            .clamp(1, VIBEX_USE_MAX_LIVE_PANES)
+            .min(self.member_count().max(1));
+        let columns = if width_rem.is_finite() {
+            (width_rem.max(0.0) / 24.0).floor() as usize
+        } else {
+            1
+        };
+        let preset = match intent.preset {
+            SessionGroupLayoutPreset::Single | SessionGroupLayoutPreset::Tabs => intent.preset,
+            _ if columns < 2 => SessionGroupLayoutPreset::Tabs,
+            SessionGroupLayoutPreset::LeadAndWorkers if budget == 3 && columns >= 3 => {
+                SessionGroupLayoutPreset::Columns
+            }
+            SessionGroupLayoutPreset::LeadAndWorkers if budget >= 4 => {
+                SessionGroupLayoutPreset::Grid
+            }
+            SessionGroupLayoutPreset::Columns if columns < budget => SessionGroupLayoutPreset::Grid,
+            _ => intent.preset,
+        };
+        Some(SessionGroupLayoutIntent {
+            preset,
+            lead_session_ref: intent.lead_session_ref.clone(),
+            preferred_live_panes: Some(budget),
+        })
+    }
+
+    pub fn needs_layout_adaptation(&self, width_rem: f32) -> bool {
+        self.effective_automatic_layout(width_rem).as_ref()
+            != self.applied_automatic_layout.as_ref()
+    }
+
+    pub fn adapt_layout_to_width(&mut self, width_rem: f32) -> bool {
+        let Some(effective) = self.effective_automatic_layout(width_rem) else {
+            return false;
+        };
+        if self.applied_automatic_layout.as_ref() == Some(&effective) {
+            return false;
+        }
+        let focused = self.focused_session_id();
+        let before = self.layout.clone();
+        self.apply_layout_preset(
+            effective.preset,
+            effective
+                .lead_session_ref
+                .as_ref()
+                .map(|reference| reference.id.as_str()),
+            effective.preferred_live_panes,
+        );
+        if let Some(focused) = focused
+            && let Some(pane_id) = self.layout.pane_containing_session(&focused)
+        {
+            self.layout.focus_session(&pane_id, &focused);
+            self.focused_pane_id = pane_id;
+        }
+        self.applied_automatic_layout = Some(effective);
+        before != self.layout
+    }
+
+    /// Manual pane edits take over from the automatic presentation request.
+    pub fn disable_automatic_layout(&mut self) {
+        self.automatic_layout = None;
+        self.applied_automatic_layout = None;
     }
 
     pub fn apply_layout_preset(
@@ -1002,7 +1120,7 @@ impl SessionGroupUiState {
             }
         }
 
-        let (layout, visible, tabbed) = match (preset, ordered.len()) {
+        let (layout, _, _) = match (preset, ordered.len()) {
             (_, 0) => (SessionGroupLayout::default(), Vec::new(), Vec::new()),
             (SessionGroupLayoutPreset::Single | SessionGroupLayoutPreset::Tabs, _) => {
                 let pane = pane_with(SESSION_GROUP_MAIN_PANE_ID, &ordered);
@@ -1032,28 +1150,9 @@ impl SessionGroupUiState {
             .unwrap_or_else(|| SESSION_GROUP_MAIN_PANE_ID.to_string());
         self.normalize();
 
-        AppliedGroupLayout {
-            preset,
-            visible_session_refs: visible
-                .iter()
-                .map(|session_id| {
-                    VibexUseRef::new(
-                        vibex_core::VibexUseResourceKind::Session,
-                        session_id.clone(),
-                    )
-                })
-                .collect(),
-            tabbed_session_refs: tabbed
-                .iter()
-                .map(|session_id| {
-                    VibexUseRef::new(
-                        vibex_core::VibexUseResourceKind::Session,
-                        session_id.clone(),
-                    )
-                })
-                .collect(),
-            live_panes: self.layout.pane_ids().len().min(VIBEX_USE_MAX_LIVE_PANES),
-        }
+        let mut applied = self.observed_layout();
+        applied.preset = preset;
+        applied
     }
 
     /// Appends sessions that are not members yet. Returns whether anything
@@ -1863,8 +1962,8 @@ mod tests {
             group.layout.ordered_session_ids(),
             vec!["lead", "worker-a", "worker-b"]
         );
-        assert_eq!(applied.visible_session_refs.len(), 3);
-        assert!(applied.tabbed_session_refs.is_empty());
+        assert_eq!(applied.visible_session_refs.len(), 1);
+        assert_eq!(applied.tabbed_session_refs.len(), 2);
         assert_eq!(applied.preset, SessionGroupLayoutPreset::Single);
     }
 
@@ -1930,6 +2029,146 @@ mod tests {
             group.apply_layout_preset(SessionGroupLayoutPreset::LeadAndWorkers, None, None);
         assert_eq!(group.layout.pane_count(), 1);
         assert!(applied.visible_session_refs.is_empty());
-        assert_eq!(applied.live_panes, 1);
+        assert_eq!(applied.live_panes, 0);
+    }
+
+    fn automatic_intent() -> SessionGroupLayoutIntent {
+        SessionGroupLayoutIntent {
+            preset: SessionGroupLayoutPreset::LeadAndWorkers,
+            lead_session_ref: None,
+            preferred_live_panes: Some(4),
+        }
+    }
+
+    #[test]
+    fn observed_layout_counts_only_live_panes_and_keeps_all_other_members_reachable() {
+        let mut group = preset_group(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        group.layout = split(
+            "eight-panes",
+            SplitDirection::Horizontal,
+            group
+                .member_session_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| SessionGroupLayout::Pane {
+                    pane: pane_with(&pane_id(index), std::slice::from_ref(id)),
+                })
+                .collect(),
+        );
+        group.focused_pane_id = pane_id(7);
+        let observed = group.observed_layout();
+        assert_eq!(observed.live_panes, 4);
+        assert_eq!(
+            observed
+                .visible_session_refs
+                .iter()
+                .map(|reference| reference.id.as_str())
+                .collect::<Vec<_>>(),
+            ["h", "a", "b", "c"]
+        );
+        assert_eq!(observed.tabbed_session_refs.len(), 4);
+        group.maximized_pane_id = Some(pane_id(7));
+        let observed = group.observed_layout();
+        assert_eq!(observed.live_panes, 1);
+        assert_eq!(observed.visible_session_refs[0].id, "h");
+        assert_eq!(observed.tabbed_session_refs.len(), 7);
+    }
+
+    #[test]
+    fn automatic_team_layout_adapts_to_width_without_losing_the_selected_tab() {
+        let mut group = preset_group(&["lead", "a", "b"]);
+        assert_eq!(
+            group.set_automatic_layout(automatic_intent(), 80.0).preset,
+            SessionGroupLayoutPreset::Columns
+        );
+        assert_eq!(group.layout.pane_count(), 3);
+        assert!(group.adapt_layout_to_width(44.0));
+        assert_eq!(
+            group.observed_layout().preset,
+            SessionGroupLayoutPreset::Tabs
+        );
+        assert_eq!(group.live_session_ids(), ["lead"]);
+        assert!(group.layout.focus_session(SESSION_GROUP_MAIN_PANE_ID, "b"));
+        assert!(!group.adapt_layout_to_width(45.0));
+        assert_eq!(group.live_session_ids(), ["b"]);
+        assert!(group.adapt_layout_to_width(80.0));
+        assert_eq!(group.focused_session_id().as_deref(), Some("b"));
+        group.add_members(&["c".into()]);
+        assert!(group.adapt_layout_to_width(80.0));
+        assert_eq!(
+            group.observed_layout().preset,
+            SessionGroupLayoutPreset::Grid
+        );
+        assert_eq!(group.live_session_ids().len(), 4);
+        assert_eq!(group.focused_session_id().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn automatic_layout_restores_the_selected_tab_and_manual_layout_stays_owned_by_the_user() {
+        let mut group = preset_group(&["lead", "a", "b", "c"]);
+        group.set_automatic_layout(automatic_intent(), 40.0);
+        group.layout.focus_session(SESSION_GROUP_MAIN_PANE_ID, "c");
+        let mut restored: SessionGroupUiState =
+            serde_json::from_str(&serde_json::to_string(&group).unwrap()).unwrap();
+        restored.normalize();
+        assert!(!restored.needs_layout_adaptation(41.0));
+        assert!(!restored.adapt_layout_to_width(41.0));
+        assert_eq!(restored.live_session_ids(), ["c"]);
+        restored.disable_automatic_layout();
+        let manual = restored.layout.clone();
+        assert!(!restored.adapt_layout_to_width(100.0));
+        assert_eq!(restored.layout, manual);
+    }
+
+    #[test]
+    fn review_ready_confirmed_failure_and_cancellation_are_distinct_team_counts() {
+        use vibex_core::{
+            AgentSessionState, DelegationCompletionPolicy, DelegationTaskPhase, SessionTreeNode,
+        };
+        let mut node = SessionTreeNode {
+            session_ref: VibexUseRef::session(&vibex_core::VibexSessionId::new()),
+            parent_session_ref: None,
+            title: "Worker".into(),
+            agent_id: None,
+            agent_label: None,
+            task_ref: None,
+            task_title: None,
+            task_phase: None,
+            completion_policy: Some(DelegationCompletionPolicy::OwnerReview),
+            child_count: 0,
+            has_more_children: false,
+            blocked_on: None,
+            active_descendants: 0,
+            blocked_descendants: 0,
+            current_task_ref: None,
+            updated_at_ms: 0,
+        };
+        let mut status = SessionGroupTeamStatus::default();
+        for phase in [
+            DelegationTaskPhase::AwaitingReview,
+            DelegationTaskPhase::Completed,
+            DelegationTaskPhase::Failed,
+            DelegationTaskPhase::Cancelled,
+        ] {
+            node.task_phase = Some(phase);
+            status.record(Some(&node), AgentSessionState::Idle);
+        }
+        node.task_phase = Some(DelegationTaskPhase::Completed);
+        node.completion_policy = Some(DelegationCompletionPolicy::SingleTurnLegacy);
+        status.record(Some(&node), AgentSessionState::Idle);
+        status.record(None, AgentSessionState::Running);
+        status.record(None, AgentSessionState::NeedsInput);
+        assert_eq!(
+            (
+                status.review,
+                status.results_ready,
+                status.completed,
+                status.failed,
+                status.cancelled,
+                status.running,
+                status.waiting
+            ),
+            (1, 1, 1, 1, 1, 1, 1)
+        );
     }
 }

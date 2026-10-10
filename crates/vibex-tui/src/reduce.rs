@@ -721,10 +721,19 @@ impl App {
                     }
                 } else {
                     self.dock_selection = None;
+                    self.team_confirm_cancel = None;
                 }
-                Outcome::effects(vec![])
+                let effects = if self.dock_open {
+                    self.load_team(false).into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+                Outcome::effects(effects)
             }
             Intent::DockActivate => {
+                if let Some(outcome) = self.activate_team_dock_row() {
+                    return outcome;
+                }
                 self.activate_dock_row();
                 Outcome::effects(vec![])
             }
@@ -3364,6 +3373,7 @@ pub mod payloads {
         desired_runtime: vibex_core::SessionRuntimeSelection,
     ) -> MutationRequest<SendAgentMessageRequest> {
         MutationRequest::new(SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id,
             message_idempotency_key: RequestId::new().as_str().to_string(),
             // The submission is refused when the message's reasoning effort

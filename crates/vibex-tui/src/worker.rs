@@ -54,6 +54,14 @@ pub enum ClipboardContent {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
+    TeamLoaded {
+        ticket: vibex_ui::TeamLoadTicket,
+        result: BackendResult<vibex_core::TeamSnapshot>,
+    },
+    TeamMutated {
+        session_id: VibexSessionId,
+        result: BackendResult<()>,
+    },
     Sessions(BackendResult<Vec<AgentSession>>),
     /// What a session's latest turn did, asked for by auto-continue.
     AutoContinueTurnStatus {
@@ -414,6 +422,34 @@ impl Dispatch {
                     .mutate_sidebar_organization(mutation, expected_revision)
                     .await;
                 self.send(AppMessage::SidebarOrganizationMutated(result));
+            }
+            Effect::LoadTeam { ticket } => {
+                let result = self
+                    .facade
+                    .agent()
+                    .team_snapshot(ticket.request().clone())
+                    .await;
+                self.send(AppMessage::TeamLoaded { ticket, result });
+            }
+            Effect::ControlTeam { request } => {
+                let session_id = request.session_id.clone();
+                let result = self
+                    .facade
+                    .agent()
+                    .control_team_task(MutationRequest::new(request))
+                    .await
+                    .map(|_| ());
+                self.send(AppMessage::TeamMutated { session_id, result });
+            }
+            Effect::AcknowledgeTeam { request } => {
+                let session_id = request.session_id.clone();
+                let result = self
+                    .facade
+                    .agent()
+                    .acknowledge_team_events(MutationRequest::new(request))
+                    .await
+                    .map(|_| ());
+                self.send(AppMessage::TeamMutated { session_id, result });
             }
             Effect::OpenSession { session_id, ticket } => {
                 let result = self.load_session(session_id, ticket.after_sequence).await;

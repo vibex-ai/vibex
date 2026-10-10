@@ -2194,6 +2194,7 @@ mod tests {
                 "60:prompt_usage",
                 "61:computer_use",
                 "62:vibex_use",
+                "63:vibex_use_budget_policy",
             ]
         );
         assert_eq!(

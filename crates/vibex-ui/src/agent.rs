@@ -2444,6 +2444,7 @@ mod tests {
         );
 
         let request = MutationRequest::new(SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: session.id.clone(),
             message_idempotency_key: "pending-message".into(),
             desired_runtime: SessionRuntimeSelection::provider(
@@ -3121,6 +3122,7 @@ mod tests {
             .timeline
             .replace_authoritative(session.id.clone(), Vec::new());
         let request = MutationRequest::new(SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: session.id.clone(),
             message_idempotency_key: "message-1".into(),
             desired_runtime: SessionRuntimeSelection::provider(
@@ -3164,6 +3166,7 @@ mod tests {
             .timeline
             .replace_authoritative(session.id.clone(), Vec::new());
         let request = MutationRequest::new(SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: session.id.clone(),
             message_idempotency_key: "message-2".into(),
             desired_runtime: SessionRuntimeSelection::provider(

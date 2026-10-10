@@ -49,7 +49,10 @@ const MAX_TRANSIENT_DRIVE_FAILURES: usize = 24;
 
 enum PersistedDispatchResult {
     Completed(Vec<TimelineItem>),
-    Failed { error_code: String },
+    Failed {
+        error_code: String,
+        items: Vec<TimelineItem>,
+    },
     Unknown,
 }
 
@@ -214,6 +217,7 @@ pub struct MessageSubmissionCoordinator {
     config: MessageSubmissionCoordinatorConfig,
     observability: Arc<RuntimeObservability>,
     watched_sessions: Mutex<HashSet<VibexSessionId>>,
+    dispatch_gates: Mutex<std::collections::HashMap<VibexSessionId, Weak<tokio::sync::Mutex<()>>>>,
     runtime_lifecycle: Mutex<Option<Arc<RuntimeLifecycleService>>>,
     /// Wakes waiters parked on a submission whose status just moved. Waiting on
     /// this instead of re-reading the record every 25 ms turns a whole turn of
@@ -260,6 +264,7 @@ impl MessageSubmissionCoordinator {
             config,
             observability,
             watched_sessions: Mutex::new(HashSet::new()),
+            dispatch_gates: Mutex::new(std::collections::HashMap::new()),
             runtime_lifecycle: Mutex::new(None),
             progress: tokio::sync::Notify::new(),
         })
@@ -285,6 +290,31 @@ impl MessageSubmissionCoordinator {
         &self.db_path
     }
 
+    /// Holds the next dispatch while a scoped interrupt checks its target.
+    /// It never waits for the current provider turn to finish.
+    pub async fn pause_session_dispatch(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<tokio::sync::OwnedMutexGuard<()>> {
+        let gate = {
+            let mut gates = self.dispatch_gates.lock().map_err(|_| {
+                VibexError::process(
+                    "message_submission_lock_poisoned",
+                    "dispatch gate is unavailable",
+                )
+            })?;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(session_id).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(session_id.clone(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        Ok(gate.lock_owned().await)
+    }
+
     pub async fn submit(
         self: &Arc<Self>,
         request: SendAgentMessageRequest,
@@ -298,7 +328,29 @@ impl MessageSubmissionCoordinator {
     /// then start the worker with `wait_for_submission`.
     pub fn prepare_submission(
         self: &Arc<Self>,
+        request: SendAgentMessageRequest,
+    ) -> VibexResult<MessageSubmissionId> {
+        self.prepare_submission_inner(request, None)
+    }
+
+    /// Persists explicitly selected human mentions and their read grants in
+    /// the enqueue transaction. Replaying an existing submission cannot undo
+    /// a subsequent revocation.
+    pub fn prepare_submission_with_mentions(
+        self: &Arc<Self>,
         mut request: SendAgentMessageRequest,
+        mentions: Vec<vibex_core::VibexUseMention>,
+        granted_by: &str,
+    ) -> VibexResult<MessageSubmissionId> {
+        request.mentions = mentions;
+        request.provenance = vibex_core::MessageProvenance::HumanInput;
+        self.prepare_submission_inner(request, Some(granted_by))
+    }
+
+    fn prepare_submission_inner(
+        self: &Arc<Self>,
+        mut request: SendAgentMessageRequest,
+        granted_by: Option<&str>,
     ) -> VibexResult<MessageSubmissionId> {
         request.message_idempotency_key = request.message_idempotency_key.trim().to_string();
         if request.text.trim().is_empty() && request.attachments.is_empty() {
@@ -317,7 +369,17 @@ impl MessageSubmissionCoordinator {
         let proposed_id = MessageSubmissionId::new();
         let record = {
             let mut conn = self.open_connection()?;
-            MessageSubmissionRepository::enqueue(&mut conn, proposed_id.clone(), &request)?
+            match granted_by {
+                Some(granted_by) => MessageSubmissionRepository::enqueue_with_mentions(
+                    &mut conn,
+                    proposed_id.clone(),
+                    &request,
+                    granted_by,
+                )?,
+                None => {
+                    MessageSubmissionRepository::enqueue(&mut conn, proposed_id.clone(), &request)?
+                }
+            }
         };
         if record.submission_id != proposed_id {
             self.observability.increment(
@@ -349,7 +411,27 @@ impl MessageSubmissionCoordinator {
 
     pub async fn replace_user_message(
         self: &Arc<Self>,
+        request: ReplaceUserMessageRequest,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        self.replace_user_message_inner(request, None).await
+    }
+
+    pub async fn replace_user_message_with_mentions(
+        self: &Arc<Self>,
         mut request: ReplaceUserMessageRequest,
+        granted_by: &str,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        request.message.provenance = vibex_core::MessageProvenance::HumanInput;
+        request.message.prompt_context =
+            vibex_core::vibex_use_route_note(&request.message.mentions);
+        self.replace_user_message_inner(request, Some(granted_by))
+            .await
+    }
+
+    async fn replace_user_message_inner(
+        self: &Arc<Self>,
+        mut request: ReplaceUserMessageRequest,
+        granted_by: Option<&str>,
     ) -> VibexResult<Vec<TimelineItem>> {
         request.message.message_idempotency_key =
             request.message.message_idempotency_key.trim().to_string();
@@ -369,13 +451,25 @@ impl MessageSubmissionCoordinator {
         let proposed_id = MessageSubmissionId::new();
         let record = {
             let mut conn = self.open_connection()?;
-            MessageSubmissionRepository::replace_latest_user_message(
-                &mut conn,
-                proposed_id.clone(),
-                &request.message,
-                request.user_sequence,
-                request.expected_end_sequence,
-            )?
+            match granted_by {
+                Some(granted_by) => {
+                    MessageSubmissionRepository::replace_latest_user_message_with_mentions(
+                        &mut conn,
+                        proposed_id.clone(),
+                        &request.message,
+                        request.user_sequence,
+                        request.expected_end_sequence,
+                        granted_by,
+                    )?
+                }
+                None => MessageSubmissionRepository::replace_latest_user_message(
+                    &mut conn,
+                    proposed_id.clone(),
+                    &request.message,
+                    request.user_sequence,
+                    request.expected_end_sequence,
+                )?,
+            }
         };
         if record.submission_id != proposed_id {
             self.observability.increment(
@@ -504,6 +598,12 @@ impl MessageSubmissionCoordinator {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     self.finish_session_worker(&session_id);
+                    // An enqueue can arrive after the empty read but before
+                    // the registry entry is removed. Recheck after releasing
+                    // ownership so that request cannot lose its wake-up.
+                    if matches!(self.head_non_terminal(&session_id), Ok(Some(_))) {
+                        let _ = self.start_session_worker(session_id.clone());
+                    }
                     return;
                 }
                 Err(_) => {
@@ -859,6 +959,7 @@ impl MessageSubmissionCoordinator {
     }
 
     async fn dispatch(&self, record: &MessageSubmissionRecord) -> VibexResult<()> {
+        let admission = self.pause_session_dispatch(&record.session_id).await?;
         let runtime_state = self
             .runtime_selection
             .get_selection_state(&record.session_id)?;
@@ -935,6 +1036,7 @@ impl MessageSubmissionCoordinator {
             let conn = self.open_connection()?;
             MessageSubmissionRepository::mark_about_to_prompt(&conn, &record.submission_id)?;
         }
+        drop(admission);
         let result = dispatcher
             .dispatch_message(record.submission_id.clone(), payload.request)
             .await;
@@ -955,15 +1057,23 @@ impl MessageSubmissionCoordinator {
                             &items,
                         );
                     }
-                    PersistedDispatchResult::Failed { error_code } => {
-                        let conn = self.open_connection()?;
+                    PersistedDispatchResult::Failed { error_code, items } => {
+                        let mut conn = self.open_connection()?;
                         // Durable terminal provider output exists, so the
                         // prompt was delivered before the turn failed: mark
                         // the delivery boundary instead of a pre-dispatch
                         // failure.
+                        let user_item = &items[0];
                         MessageSubmissionRepository::fail_after_prompt_dispatch(
-                            &conn,
+                            &mut conn,
                             &record.submission_id,
+                            &user_item.id,
+                            vibex_core::ExecutionResultRange {
+                                start_sequence: user_item.sequence,
+                                end_sequence: items
+                                    .last()
+                                    .map_or(user_item.sequence, |item| item.sequence),
+                            },
                             &safe_error_code(&error_code),
                             Some(TERMINAL_PROVIDER_ERROR_DETAIL),
                         )?;
@@ -1050,7 +1160,10 @@ impl MessageSubmissionCoordinator {
                     _ => None,
                 })
                 .unwrap_or_else(|| "agent_retry_exhausted".to_string());
-            return Ok(PersistedDispatchResult::Failed { error_code });
+            return Ok(PersistedDispatchResult::Failed {
+                error_code,
+                items: items[matching_user_index..].to_vec(),
+            });
         }
         if let Some(item) = turn_items.iter().rev().find(|item| match &item.payload {
             TimelinePayload::Error(_) => true,
@@ -1061,6 +1174,7 @@ impl MessageSubmissionCoordinator {
                 TimelinePayload::Error(error) => {
                     return Ok(PersistedDispatchResult::Failed {
                         error_code: error.code.clone(),
+                        items: items[matching_user_index..].to_vec(),
                     });
                 }
                 TimelinePayload::AgentMessage(message) if message.is_final => {
@@ -1847,6 +1961,7 @@ mod tests {
     ) -> SendAgentMessageRequest {
         let reasoning_effort = desired_runtime.reasoning_effort.clone();
         SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: session_id.clone(),
             message_idempotency_key: key.to_string(),
             desired_runtime,

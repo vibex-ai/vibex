@@ -24,6 +24,9 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod budget;
+pub use budget::*;
+
 use crate::{
     AgentDelegationId, AgentId, MessageSubmissionId, ProviderProfileId, SessionRuntimeSelection,
     VibexExecutionId, VibexOperationId, VibexSessionId,
@@ -90,6 +93,7 @@ pub enum VibexUseResourceKind {
     Workspace,
     RuntimeOption,
     Catalog,
+    Resource,
 }
 
 impl VibexUseResourceKind {
@@ -103,6 +107,7 @@ impl VibexUseResourceKind {
             Self::Workspace => "workspace",
             Self::RuntimeOption => "runtime-option",
             Self::Catalog => "catalog",
+            Self::Resource => "resource",
         }
     }
 
@@ -116,6 +121,7 @@ impl VibexUseResourceKind {
             "workspace" => Self::Workspace,
             "runtime-option" => Self::RuntimeOption,
             "catalog" => Self::Catalog,
+            "resource" => Self::Resource,
             _ => return None,
         })
     }
@@ -165,6 +171,22 @@ impl VibexUseRef {
 
     pub fn runtime_option(id: &str) -> Self {
         Self::new(VibexUseResourceKind::RuntimeOption, id)
+    }
+
+    pub fn resource(session_id: &VibexSessionId, sequence: i64) -> Self {
+        Self::new(
+            VibexUseResourceKind::Resource,
+            format!("{}/{sequence}", session_id.as_str()),
+        )
+    }
+
+    pub fn resource_location(&self) -> Option<(VibexSessionId, i64)> {
+        if self.kind != VibexUseResourceKind::Resource {
+            return None;
+        }
+        let (session, sequence) = self.id.rsplit_once('/')?;
+        let sequence = sequence.parse::<i64>().ok()?;
+        (sequence > 0).then_some((VibexSessionId::parse(session).ok()?, sequence))
     }
 
     pub fn catalog(revision: u64) -> Self {
@@ -537,6 +559,12 @@ pub struct VibexUseRuntimeOption {
     pub model_id: Option<String>,
     pub reasoning_effort: Option<String>,
     pub mode_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<crate::SessionConfigValue>,
+    #[serde(default)]
+    pub modes: Vec<crate::SessionConfigValue>,
+    #[serde(default)]
+    pub features: Vec<crate::SessionRuntimeFeature>,
     /// ACP `configOptions` values that the target really supports.
     #[serde(default)]
     pub config_values: BTreeMap<String, String>,
@@ -602,6 +630,10 @@ pub struct VibexUseCapabilitySnapshot {
     pub activation_revision: u64,
     /// Remaining execution slots under the root budget.
     pub remaining_executions: u32,
+    #[serde(default)]
+    pub budget_policy: VibexUseBudgetPolicy,
+    #[serde(default)]
+    pub reported_tokens: Option<u64>,
     pub max_depth: u32,
     pub remaining_depth: u32,
     pub can_delegate: bool,
@@ -944,6 +976,10 @@ fn tool_input_schema(tool: VibexUseTool) -> Value {
             "type": "object",
             "properties": {
                 "sessionRef": string("vibex://session/..."),
+                "executionRef": string("Read only the fixed result range of this execution."),
+                "resourceRef": string("Read the complete product payload referenced by an entry, in bounded pages."),
+                "fromSequence": { "type": "integer", "minimum": 1 },
+                "throughSequence": { "type": "integer", "minimum": 1 },
                 "view": { "type": "string", "enum": ["summary", "conversation", "timeline"] },
                 "latest": { "type": "boolean", "description": "Read the newest window." },
                 "after": { "type": "integer", "description": "Exclusive lower sequence bound." },
@@ -995,9 +1031,13 @@ fn tool_input_schema(tool: VibexUseTool) -> Value {
                         "selectionRef": string("vibex://runtime-option/... from vibex_discover."),
                         "catalogRevision": { "type": "integer" },
                         "agentId": string("Only when no selectionRef is given."),
+                        "providerProfileId": { "type": "string" },
+                        "authSource": { "type": "object" },
+                        "modelSelection": { "type": "object" },
                         "model": { "type": "string" },
-                        "reasoningEffort": { "type": "string" },
-                        "modeId": { "type": "string" }
+                        "reasoningEffort": { "type": ["string", "null"] },
+                        "modeId": { "type": ["string", "null"] },
+                        "configValues": { "type": "object", "additionalProperties": { "type": "string" } }
                     }
                 },
                 "session": {
@@ -1226,6 +1266,32 @@ pub trait VibexUseToolHost: Send + Sync + 'static {
         arguments: Value,
     ) -> VibexUseToolFuture<'_>;
 
+    /// The live delivery revision used when issuing a new scoped credential.
+    fn activation_revision(&self) -> u64 {
+        1
+    }
+
+    /// Revalidates the identity carried by an issued credential. Protocol
+    /// adapters call this for discovery, dispatch, and pending long polls.
+    fn authorize_actor(&self, actor: &VibexUseActor) -> crate::VibexResult<()> {
+        let _ = actor;
+        Ok(())
+    }
+
+    /// Records delivery of the exact result after the final client transport
+    /// has written and flushed it. Reading events or writing an intermediate
+    /// broker response does not establish delivery. Explicit event ACK remains
+    /// a separate operation.
+    fn response_delivered(
+        &self,
+        actor: &VibexUseActor,
+        tool: VibexUseTool,
+        response: &Value,
+    ) -> crate::VibexResult<()> {
+        let _ = (actor, tool, response);
+        Ok(())
+    }
+
     /// The tool catalogue for one activation. The host answers from the live
     /// capability snapshot, so a target disabled after `tools/list` is rejected
     /// on the next call.
@@ -1352,6 +1418,11 @@ impl DelegationBlockedOn {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegationContextRef {
+    /// The exact bounded read used to resolve this declared context window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_cursor: Option<SessionReadCursor>,
+    #[serde(default)]
+    pub max_items: usize,
     pub session_ref: VibexUseRef,
     #[serde(default)]
     pub from_sequence: Option<i64>,
@@ -1423,6 +1494,11 @@ pub struct DelegationResultRef {
     pub artifact_refs: Vec<VibexUseRef>,
     #[serde(default)]
     pub usage: ExecutionUsageState,
+    /// Authoritative per-turn deltas. Missing fields remain unknown.
+    #[serde(default)]
+    pub usage_tokens: crate::AgentUsageTokenValues,
+    #[serde(default)]
+    pub api_requests: Option<u64>,
     #[serde(default)]
     pub truncated: bool,
 }
@@ -1515,6 +1591,8 @@ pub struct DelegationExecution {
     pub execution_ref: VibexUseRef,
     pub task_ref: Option<VibexUseRef>,
     pub session_ref: VibexUseRef,
+    #[serde(default)]
+    pub root_session_ref: Option<VibexUseRef>,
     pub submission_id: MessageSubmissionId,
     pub input_idempotency_key: String,
     pub provenance: MessageProvenance,
@@ -1542,6 +1620,10 @@ pub struct DelegationExecution {
     #[serde(default)]
     pub usage: ExecutionUsageState,
     #[serde(default)]
+    pub usage_tokens: crate::AgentUsageTokenValues,
+    #[serde(default)]
+    pub api_requests: Option<u64>,
+    #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
     pub blocked_on: Option<DelegationBlockedOn>,
@@ -1554,6 +1636,22 @@ pub struct DelegationExecution {
 impl DelegationExecution {
     pub const fn is_settled(&self) -> bool {
         self.outcome.is_settled()
+    }
+
+    pub fn result_ref(&self) -> DelegationResultRef {
+        DelegationResultRef {
+            execution_ref: self.execution_ref.clone(),
+            session_ref: self.session_ref.clone(),
+            outcome: self.outcome,
+            stop_reason: self.stop_reason.clone(),
+            summary: self.summary.clone(),
+            result_ranges: self.result_ranges.clone(),
+            artifact_refs: self.artifact_refs.clone(),
+            usage: self.usage,
+            usage_tokens: self.usage_tokens.clone(),
+            api_requests: self.api_requests,
+            truncated: self.truncated,
+        }
     }
 }
 
@@ -1655,6 +1753,23 @@ pub enum DelegationTaskEventKind {
 }
 
 impl DelegationTaskEventKind {
+    /// Stable fact identity shared by admission, completion and recovery.
+    pub fn stable_id(
+        self,
+        task_id: &AgentDelegationId,
+        execution_id: Option<&VibexExecutionId>,
+    ) -> String {
+        if let Some(execution_id) = execution_id {
+            format!(
+                "event_execution_{}_{}",
+                self.as_str(),
+                execution_id.as_str()
+            )
+        } else {
+            format!("event_terminal_{}_{}", self.as_str(), task_id.as_str())
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TaskAccepted => "task_accepted",
@@ -1776,6 +1891,31 @@ pub struct SessionReadCursor {
     pub session_ref: VibexUseRef,
     pub view: SessionReadView,
     pub anchor: SessionReadAnchor,
+    #[serde(default)]
+    pub range: Option<ExecutionResultRange>,
+    #[serde(default)]
+    pub snapshot_end_sequence: Option<i64>,
+    #[serde(default)]
+    pub character_offset: usize,
+    #[serde(default)]
+    pub execution_ref: Option<VibexUseRef>,
+    #[serde(default)]
+    pub resource_ref: Option<VibexUseRef>,
+}
+
+impl SessionReadCursor {
+    pub fn new(session_ref: VibexUseRef, view: SessionReadView, anchor: SessionReadAnchor) -> Self {
+        Self {
+            session_ref,
+            view,
+            anchor,
+            range: None,
+            snapshot_end_sequence: None,
+            character_offset: 0,
+            execution_ref: None,
+            resource_ref: None,
+        }
+    }
 }
 
 /// One bounded content entry.
@@ -1788,6 +1928,10 @@ pub struct SessionReadEntry {
     /// Already redacted by the product; provider logs and credentials never
     /// travel here.
     pub text: String,
+    #[serde(default)]
+    pub text_offset: usize,
+    #[serde(default)]
+    pub total_chars: usize,
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
@@ -1941,6 +2085,9 @@ pub struct WaitResponse {
     pub events: Vec<DelegationTaskEvent>,
     #[serde(default)]
     pub tasks: Vec<DelegationTaskView>,
+    /// Session-only work has executions without a task wrapper.
+    #[serde(default)]
+    pub executions: Vec<DelegationExecution>,
     pub event_cursor: i64,
     /// Whether a further wait with the same cursor is worth attempting.
     pub more_expected: bool,
@@ -1975,7 +2122,7 @@ pub struct DiscoverResponse {
 // ---------------------------------------------------------------------------
 
 /// Layout presets an Agent may ask for. They are intentions, not coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionGroupLayoutPreset {
     Single,
@@ -1999,7 +2146,7 @@ impl SessionGroupLayoutPreset {
 }
 
 /// The typed layout intention attached to a group request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionGroupLayoutIntent {
     #[serde(default)]
@@ -2514,6 +2661,8 @@ mod tests {
             activation_revision: 1,
             remaining_executions: 4,
             max_depth: VIBEX_USE_MAX_DEPTH,
+            budget_policy: Default::default(),
+            reported_tokens: None,
             remaining_depth: 1,
             can_delegate: true,
             delegation_blocked_by: None,

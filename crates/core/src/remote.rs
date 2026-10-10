@@ -526,6 +526,15 @@ pub struct RemoteAuditListResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAgentOperationKind {
+    GetTeamSnapshot,
+    GetSessionTree,
+    SendMessageWithMentions,
+    SetSessionAccess,
+    DelegateSession,
+    ControlTeamTask,
+    PresentTeam,
+    AcknowledgeTeamEvents,
+
     ListSessions,
     GetSession,
     CreateSession,
@@ -1351,6 +1360,15 @@ pub struct RemoteAgentCatchUpResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteAgentRequest {
+    GetTeamSnapshot(crate::RemoteTeamReadRequest<crate::TeamSnapshotRequest>),
+    GetSessionTree(crate::RemoteTeamReadRequest<crate::SessionTreeRequest>),
+    SendMessageWithMentions(crate::RemoteTeamMutationRequest<crate::HumanAgentMessageRequest>),
+    SetSessionAccess(crate::RemoteTeamMutationRequest<crate::SessionAccessRequest>),
+    DelegateSession(crate::RemoteTeamMutationRequest<crate::HumanDelegationRequest>),
+    ControlTeamTask(crate::RemoteTeamMutationRequest<crate::TeamTaskControlRequest>),
+    PresentTeam(crate::RemoteTeamMutationRequest<crate::TeamPresentationRequest>),
+    AcknowledgeTeamEvents(crate::RemoteTeamMutationRequest<crate::TeamAcknowledgeRequest>),
+
     ListSessions(RemoteAgentSessionListRequest),
     GetSession(RemoteAgentSessionDetailRequest),
     CreateSession(RemoteAgentCreateSessionRequest),
@@ -1404,6 +1422,15 @@ pub enum RemoteAgentRequest {
 impl RemoteAgentRequest {
     pub const fn operation_kind(&self) -> RemoteAgentOperationKind {
         match self {
+            Self::GetTeamSnapshot(_) => RemoteAgentOperationKind::GetTeamSnapshot,
+            Self::GetSessionTree(_) => RemoteAgentOperationKind::GetSessionTree,
+            Self::SendMessageWithMentions(_) => RemoteAgentOperationKind::SendMessageWithMentions,
+            Self::SetSessionAccess(_) => RemoteAgentOperationKind::SetSessionAccess,
+            Self::DelegateSession(_) => RemoteAgentOperationKind::DelegateSession,
+            Self::ControlTeamTask(_) => RemoteAgentOperationKind::ControlTeamTask,
+            Self::PresentTeam(_) => RemoteAgentOperationKind::PresentTeam,
+            Self::AcknowledgeTeamEvents(_) => RemoteAgentOperationKind::AcknowledgeTeamEvents,
+
             Self::ListSessions(_) => RemoteAgentOperationKind::ListSessions,
             Self::GetSession(_) => RemoteAgentOperationKind::GetSession,
             Self::CreateSession(_) => RemoteAgentOperationKind::CreateSession,

@@ -60,6 +60,7 @@ pub mod scramble;
 pub mod search;
 pub mod sessions;
 pub mod settings;
+mod team;
 pub mod terminal;
 pub mod terminal_clipboard;
 pub mod text;

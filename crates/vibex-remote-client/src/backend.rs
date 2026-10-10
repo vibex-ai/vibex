@@ -794,6 +794,250 @@ fn refetch_for_domain(domain: &str) -> BackendRefetch {
 }
 
 impl AgentBackend for WebRemoteBackend {
+    fn team_snapshot(
+        &self,
+        request: vibex_core::TeamSnapshotRequest,
+    ) -> BackendFuture<'_, vibex_core::TeamSnapshot> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::GetTeamSnapshot(vibex_core::RemoteTeamReadRequest {
+                auth: this.auth(),
+                request,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::TeamSnapshot>(value)
+        })
+    }
+
+    fn session_tree(
+        &self,
+        request: vibex_core::SessionTreeRequest,
+    ) -> BackendFuture<'_, vibex_core::SessionTreePage> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::GetSessionTree(vibex_core::RemoteTeamReadRequest {
+                auth: this.auth(),
+                request,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::SessionTreePage>(value)
+        })
+    }
+
+    fn send_message_with_mentions(
+        &self,
+        request: MutationRequest<vibex_core::HumanAgentMessageRequest>,
+    ) -> BackendFuture<'_, Vec<vibex_core::TimelineItem>> {
+        let supports_mentions = self
+            .capability_snapshot()
+            .agent
+            .supports(BackendOperation::AgentSendMessageWithMentions);
+        if !supports_mentions {
+            if request.payload.mentions.is_empty() {
+                return self.send_message(MutationRequest {
+                    request_id: request.request_id,
+                    idempotency_key: request.idempotency_key,
+                    expected_revision: request.expected_revision,
+                    payload: request.payload.message,
+                });
+            }
+            return Box::pin(async {
+                Err(BackendError::unsupported(
+                    "agent_team_unavailable",
+                    "Selected references are unavailable on this backend",
+                ))
+            });
+        }
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let request_id = request.request_id.clone();
+            let query = GetMessageSubmissionRequest {
+                session_id: request.payload.message.session_id.clone(),
+                message_idempotency_key: request.payload.message.message_idempotency_key.clone(),
+            };
+            let payload = RemoteAgentRequest::SendMessageWithMentions(
+                vibex_core::RemoteTeamMutationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                    idempotency_key: key.clone(),
+                },
+            );
+            this.remember_unknown_query(&request_id, UnknownMutationQuery::AgentMessage(query));
+            let value = match this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    if !is_unknown_mutation_error(&error) {
+                        this.clear_unknown_query(&request_id);
+                    }
+                    return Err(error);
+                }
+            };
+            this.clear_unknown_query(&request_id);
+            decode::<Vec<vibex_core::TimelineItem>>(value)
+        })
+    }
+
+    fn set_session_access(
+        &self,
+        request: MutationRequest<vibex_core::SessionAccessRequest>,
+    ) -> BackendFuture<'_, vibex_core::SessionAccessResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::SetSessionAccess(vibex_core::RemoteTeamMutationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                    idempotency_key: key.clone(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::SessionAccessResult>(value)
+        })
+    }
+
+    fn delegate_session(
+        &self,
+        request: MutationRequest<vibex_core::HumanDelegationRequest>,
+    ) -> BackendFuture<'_, vibex_core::HumanDelegationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::DelegateSession(vibex_core::RemoteTeamMutationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                    idempotency_key: key.clone(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::HumanDelegationResult>(value)
+        })
+    }
+
+    fn control_team_task(
+        &self,
+        request: MutationRequest<vibex_core::TeamTaskControlRequest>,
+    ) -> BackendFuture<'_, vibex_core::DelegationTaskView> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::ControlTeamTask(vibex_core::RemoteTeamMutationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                    idempotency_key: key.clone(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::DelegationTaskView>(value)
+        })
+    }
+
+    fn present_team(
+        &self,
+        request: MutationRequest<vibex_core::TeamPresentationRequest>,
+    ) -> BackendFuture<'_, vibex_core::PresentationOutcome> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::PresentTeam(vibex_core::RemoteTeamMutationRequest {
+                auth: this.auth(),
+                request: request.payload,
+                idempotency_key: key.clone(),
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::PresentationOutcome>(value)
+        })
+    }
+
+    fn acknowledge_team_events(
+        &self,
+        request: MutationRequest<vibex_core::TeamAcknowledgeRequest>,
+    ) -> BackendFuture<'_, usize> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::AcknowledgeTeamEvents(vibex_core::RemoteTeamMutationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                    idempotency_key: key.clone(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<usize>(value)
+        })
+    }
+
     fn subscribe(&self) -> BackendResult<Box<dyn BackendEventSubscription>> {
         Ok(Box::new(RemoteEventSubscription {
             transport: self.transport.clone(),
@@ -6436,6 +6680,7 @@ fn remote_capabilities_for_grant(
         })
         .unwrap_or_default();
     let has_agent = features.is_empty() || features.contains("agent");
+    let has_team = features.contains("agent_team");
     let has_agent_account_auth = features.contains("agent_account_auth");
     let has_timeline_display_settings = features.contains("agent_timeline_display_settings");
     let has_workbench = features.is_empty() || features.contains("workspace_file");
@@ -6471,6 +6716,26 @@ fn remote_capabilities_for_grant(
         browser: DomainCapabilities::unavailable(),
         agent: if has_agent {
             available_filtered([
+                (
+                    AgentTeamRead,
+                    has_team && permits(RemoteActionClass::ReadAgentSession),
+                ),
+                (
+                    AgentTeamMutate,
+                    has_team && permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentSessionAccess,
+                    has_team && permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentSendMessageWithMentions,
+                    has_team && permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentTeamPresentation,
+                    has_team && permits(RemoteActionClass::MutateAgentSession),
+                ),
                 (
                     AgentListSessions,
                     permits(RemoteActionClass::ReadAgentSession),
@@ -7202,6 +7467,119 @@ mod tests {
                 .git
                 .supports(BackendOperation::GitWorktreeLifecycleMutate)
         );
+    }
+
+    #[test]
+    fn remote_team_capabilities_require_server_support_and_mutation_permission() {
+        let without = remote_capabilities(Some(&full_control_server_info(&["agent"])));
+        assert!(!without.agent.supports(BackendOperation::AgentTeamRead));
+        for level in [
+            vibex_core::RemoteDevicePermissionLevel::ReadOnly,
+            vibex_core::RemoteDevicePermissionLevel::ApproveOnly,
+            vibex_core::RemoteDevicePermissionLevel::FullControl,
+        ] {
+            let mut info = full_control_server_info(&["agent", "agent_team"]);
+            info.device_permissions = vibex_core::remote_permissions_for_level(level);
+            let capabilities = remote_capabilities(Some(&info));
+            assert!(capabilities.agent.supports(BackendOperation::AgentTeamRead));
+            for operation in [
+                BackendOperation::AgentTeamMutate,
+                BackendOperation::AgentSessionAccess,
+                BackendOperation::AgentSendMessageWithMentions,
+                BackendOperation::AgentTeamPresentation,
+            ] {
+                assert_eq!(
+                    capabilities.agent.supports(operation),
+                    level == vibex_core::RemoteDevicePermissionLevel::FullControl
+                );
+            }
+        }
+    }
+
+    fn team_send_request() -> vibex_core::HumanAgentMessageRequest {
+        vibex_core::HumanAgentMessageRequest {
+            message: SendAgentMessageRequest {
+                session_id: VibexSessionId::new(),
+                message_idempotency_key: "team-message".to_string(),
+                desired_runtime: vibex_core::SessionRuntimeSelection::provider(
+                    vibex_core::AgentId::parse("codex").unwrap(),
+                    vibex_core::ProviderProfileId::parse("provider_test").unwrap(),
+                    "test-model",
+                ),
+                text: "Read selected context".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+                delivery: Default::default(),
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
+            },
+            mentions: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn team_send_falls_back_for_plain_messages_but_never_discards_selected_references() {
+        let transport = Arc::new(MockTransport::new([]));
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test".into(),
+            },
+        );
+        let request =
+            MutationRequest::new(team_send_request()).with_idempotency_key("message-envelope");
+        let request_id = request.request_id.clone();
+        assert_eq!(
+            backend
+                .send_message_with_mentions(request)
+                .await
+                .unwrap_err()
+                .code,
+            "mock_unavailable"
+        );
+        let sent = transport.requests();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].request_id, request_id);
+        assert_eq!(sent[0].payload.as_ref().unwrap()["type"], "send_message");
+        assert_eq!(
+            sent[0].mutation.as_ref().unwrap().idempotency_key,
+            "message-envelope"
+        );
+
+        let mut selected = team_send_request();
+        selected.mentions.push(vibex_core::VibexUseMention::session(
+            &VibexSessionId::new(),
+            None,
+        ));
+        assert_eq!(
+            backend
+                .send_message_with_mentions(MutationRequest::new(selected.clone()))
+                .await
+                .unwrap_err()
+                .code,
+            "agent_team_unavailable"
+        );
+        assert_eq!(transport.requests().len(), 1);
+
+        transport.set_server_info(full_control_server_info(&["agent", "agent_team"]));
+        assert_eq!(
+            backend
+                .send_message_with_mentions(MutationRequest::new(selected))
+                .await
+                .unwrap_err()
+                .code,
+            "mock_unavailable"
+        );
+        let sent = transport.requests();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[1].payload.as_ref().unwrap()["type"],
+            "send_message_with_mentions"
+        );
+        assert!(backend.unknown_mutation_queries.lock().unwrap().is_empty());
     }
 
     #[test]

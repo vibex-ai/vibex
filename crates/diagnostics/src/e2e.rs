@@ -107,6 +107,7 @@ impl vibex_agent::AgentProvider for E2eStubAcpProvider {
         request: vibex_agent::ProviderTurnRequest,
     ) -> VibexResult<vibex_agent::ProviderTurnResult> {
         Ok(vibex_agent::ProviderTurnResult {
+            stop_reason: None,
             events: vec![vibex_agent::ProviderEvent::agent(
                 vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
                     text: format!("e2e-stub reply to: {}", request.text),
@@ -159,6 +160,7 @@ impl vibex_agent::AgentProvider for E2eStubAcpProvider {
         _turn: vibex_agent::ProviderTurnRequest,
     ) -> VibexResult<vibex_agent::ProviderTurnResult> {
         Ok(vibex_agent::ProviderTurnResult {
+            stop_reason: None,
             events: vec![vibex_agent::ProviderEvent::agent(
                 vibex_core::TimelinePayload::Command(vibex_core::CommandPayload {
                     command: request.command_text.clone(),
@@ -830,6 +832,7 @@ async fn remote_agent_protocol(root: &Path) -> VibexResult<E2eRegressionCheck> {
         RemoteAgentRequest::SendMessage(RemoteAgentSendMessageRequest {
             auth: auth.clone(),
             request: SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: session.id.clone(),
                 message_idempotency_key: "e2e-remote-agent-message".to_string(),
                 desired_runtime: selection,

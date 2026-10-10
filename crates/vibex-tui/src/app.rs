@@ -705,6 +705,10 @@ pub struct App {
     pub navigation: CompactNavigation,
 
     pub agent: AgentWorkflowController,
+    pub team: vibex_ui::TeamWorkflowController,
+    pub team_detail: Option<vibex_core::AgentDelegationId>,
+    pub team_confirm_cancel: Option<vibex_core::TeamTaskControlRequest>,
+    pub team_busy: bool,
     pub management: ManagementWorkflowController,
     pub projection: ProjectionState,
     /// The reader's auto-continue preferences and the turns they act on.
@@ -950,16 +954,18 @@ pub const MAX_DOCK_ROWS: usize = 8;
 /// One section of the dock panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DockSection {
+    Team,
     Agents,
     Plan,
     Queue,
 }
 
 impl DockSection {
-    pub const ALL: [DockSection; 3] = [Self::Agents, Self::Plan, Self::Queue];
+    pub const ALL: [DockSection; 4] = [Self::Team, Self::Agents, Self::Plan, Self::Queue];
 
     pub const fn label(self, strings: Strings) -> &'static str {
         match self {
+            DockSection::Team => strings.locale.text("Team", "团队", "團隊"),
             DockSection::Agents => strings.dock_agents(),
             DockSection::Plan => strings.dock_plan(),
             DockSection::Queue => strings.dock_queue(),
@@ -970,6 +976,10 @@ impl DockSection {
 /// One line of the dock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockRow {
+    Team {
+        label: String,
+        action: crate::team::TeamDockAction,
+    },
     /// A section heading, which the cursor steps over.
     Header { section: DockSection, count: usize },
     /// A delegated child agent.
@@ -1316,6 +1326,10 @@ impl App {
         let strings = Strings::with_locale(options.locale);
         let agent =
             AgentWorkflowController::new(facade.agent().clone(), capabilities.agent.clone());
+        let team = vibex_ui::TeamWorkflowController::new(
+            facade.agent().clone(),
+            capabilities.agent.clone(),
+        );
         let management = ManagementWorkflowController::new(
             facade.management().clone(),
             facade.device().clone(),
@@ -1339,6 +1353,10 @@ impl App {
             shell: ShellKind::Wide,
             navigation,
             agent,
+            team,
+            team_detail: None,
+            team_confirm_cancel: None,
+            team_busy: false,
             management,
             auto_continue: crate::auto_continue::AutoContinue::default(),
             projection: ProjectionState {
@@ -2853,10 +2871,17 @@ impl App {
     pub fn dock_rows(&self) -> Vec<DockRow> {
         let items = &self.agent.state.timeline.items;
         let mut rows = Vec::new();
+        rows.extend(self.team_dock_rows());
 
         // Delegated child agents, newest row first and one row per delegation:
         // a child that reports progress must not grow the panel every time.
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen: std::collections::BTreeSet<String> = self
+            .team
+            .snapshot()
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.tasks)
+            .filter_map(|task| task.task_ref.task_id().map(|id| id.to_string()))
+            .collect();
         let mut agents = Vec::new();
         for row in &self.projection.rows {
             let Some(delegation) = vibex_desktop_model::timeline_row_delegation(row, items) else {
@@ -3046,6 +3071,7 @@ impl App {
             return false;
         };
         match rows[index].clone() {
+            DockRow::Team { .. } => false,
             DockRow::Header { section, .. } => {
                 if !self.dock_collapsed.remove(&section) {
                     self.dock_collapsed.insert(section);
@@ -3663,6 +3689,9 @@ impl App {
     }
 
     pub fn open_session(&mut self, session_id: VibexSessionId) {
+        self.team.select_session(session_id.clone());
+        self.team_detail = None;
+        self.team_confirm_cancel = None;
         self.navigation_serial = self.navigation_serial.wrapping_add(1);
         self.cancel_runtime_picker();
         self.switch_composer(ComposerTarget::Session(session_id.clone()));
@@ -5453,6 +5482,15 @@ pub enum ClipboardWanted {
 /// backend handles, which is what keeps the reducer pure.
 #[derive(Debug, Clone)]
 pub enum Effect {
+    LoadTeam {
+        ticket: vibex_ui::TeamLoadTicket,
+    },
+    ControlTeam {
+        request: vibex_core::TeamTaskControlRequest,
+    },
+    AcknowledgeTeam {
+        request: vibex_core::TeamAcknowledgeRequest,
+    },
     ListSessions {
         include_archived: bool,
     },
@@ -5665,6 +5703,9 @@ impl Effect {
     /// Whether the effect is a mutation, so the UI can show a pending marker.
     pub fn key(&self) -> &'static str {
         match self {
+            Effect::LoadTeam { .. } => "team",
+            Effect::ControlTeam { .. } => "team_control",
+            Effect::AcknowledgeTeam { .. } => "team_acknowledge",
             Effect::ListSessions { .. } => "sessions",
             Effect::LoadSidebarOrganization => "sidebar_organization",
             Effect::ProbeAutoContinue { .. } => "auto_continue_probe",

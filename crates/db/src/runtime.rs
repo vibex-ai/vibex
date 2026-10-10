@@ -3813,6 +3813,26 @@ impl MessageSubmissionRepository {
         submission_id: MessageSubmissionId,
         request: &SendAgentMessageRequest,
     ) -> VibexResult<MessageSubmissionRecord> {
+        Self::enqueue_inner(conn, submission_id, request, None)
+    }
+
+    /// Trusted human submission boundary. Ordinary enqueue never reads
+    /// mentions as authorization, including tokens restored from history.
+    pub fn enqueue_with_mentions(
+        conn: &mut Connection,
+        submission_id: MessageSubmissionId,
+        request: &SendAgentMessageRequest,
+        granted_by: &str,
+    ) -> VibexResult<MessageSubmissionRecord> {
+        Self::enqueue_inner(conn, submission_id, request, Some(granted_by))
+    }
+
+    fn enqueue_inner(
+        conn: &mut Connection,
+        submission_id: MessageSubmissionId,
+        request: &SendAgentMessageRequest,
+        granted_by: Option<&str>,
+    ) -> VibexResult<MessageSubmissionRecord> {
         Self::validate_idempotency_key(&request.message_idempotency_key)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3820,13 +3840,97 @@ impl MessageSubmissionRepository {
                 "message_submission_transaction_failed",
                 "failed to start message submission transaction",
             ))?;
-        let record =
-            Self::enqueue_conn(&tx, submission_id, request, RuntimeSwitchPolicy::Automatic)?;
+        let record = Self::enqueue_conn(
+            &tx,
+            submission_id.clone(),
+            request,
+            RuntimeSwitchPolicy::Automatic,
+        )?;
+        // The original payload comparison occurs inside enqueue_conn. A retry
+        // must return that record without restoring a grant the human revoked.
+        if record.submission_id == submission_id
+            && let Some(granted_by) = granted_by
+        {
+            Self::grant_selected_mentions(&tx, request, granted_by)?;
+        }
         tx.commit().map_err(storage_err(
             "message_submission_transaction_failed",
             "failed to commit message submission transaction",
         ))?;
         Ok(record)
+    }
+
+    fn grant_selected_mentions(
+        conn: &Connection,
+        request: &SendAgentMessageRequest,
+        granted_by: &str,
+    ) -> VibexResult<()> {
+        if !granted_by.starts_with("human:")
+            || granted_by.len() > 256
+            || granted_by.chars().any(char::is_control)
+            || request.provenance != vibex_core::MessageProvenance::HumanInput
+            || request.mentions.len() > 32
+        {
+            return Err(VibexError::validation(
+                "team_mentions_invalid",
+                "human mention submission is invalid",
+            ));
+        }
+        let mut targets = std::collections::BTreeSet::new();
+        for mention in &request.mentions {
+            match mention.kind {
+                vibex_core::VibexUseMentionKind::Agent => {
+                    if mention.agent_id.is_none()
+                        || mention.reference.kind != vibex_core::VibexUseResourceKind::RuntimeOption
+                    {
+                        return Err(VibexError::validation(
+                            "team_mentions_invalid",
+                            "Agent mention is invalid",
+                        ));
+                    }
+                }
+                vibex_core::VibexUseMentionKind::Session => {
+                    let target = mention.reference.session_id().ok_or_else(|| {
+                        VibexError::validation(
+                            "team_mentions_invalid",
+                            "session mention is invalid",
+                        )
+                    })?;
+                    let session =
+                        crate::SessionRepository::get(conn, &target)?.ok_or_else(|| {
+                            VibexError::validation(
+                                "session_not_found",
+                                "referenced session was not found",
+                            )
+                        })?;
+                    if session.deleted_at_ms.is_some() {
+                        return Err(VibexError::validation(
+                            "session_not_found",
+                            "referenced session was not found",
+                        ));
+                    }
+                    targets.insert(target);
+                }
+            }
+        }
+        for target in targets {
+            if target == request.session_id {
+                continue;
+            }
+            let existing = crate::SessionGrantRepository::get(conn, &request.session_id, &target)?;
+            // An explicit control grant remains control when the human later
+            // mentions the same session in an ordinary message.
+            if existing.is_none() {
+                crate::SessionGrantRepository::grant(
+                    conn,
+                    &request.session_id,
+                    &target,
+                    "referenced",
+                    granted_by,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Atomically replaces the latest user turn and enqueues its edited
@@ -3838,6 +3942,44 @@ impl MessageSubmissionRepository {
         request: &SendAgentMessageRequest,
         user_sequence: i64,
         expected_end_sequence: i64,
+    ) -> VibexResult<MessageSubmissionRecord> {
+        Self::replace_latest_user_message_inner(
+            conn,
+            submission_id,
+            request,
+            user_sequence,
+            expected_end_sequence,
+            None,
+        )
+    }
+
+    /// The trusted human edit boundary commits selected read grants with the
+    /// replacement and queue entry. Replays never restore a revoked grant.
+    pub fn replace_latest_user_message_with_mentions(
+        conn: &mut Connection,
+        submission_id: MessageSubmissionId,
+        request: &SendAgentMessageRequest,
+        user_sequence: i64,
+        expected_end_sequence: i64,
+        granted_by: &str,
+    ) -> VibexResult<MessageSubmissionRecord> {
+        Self::replace_latest_user_message_inner(
+            conn,
+            submission_id,
+            request,
+            user_sequence,
+            expected_end_sequence,
+            Some(granted_by),
+        )
+    }
+
+    fn replace_latest_user_message_inner(
+        conn: &mut Connection,
+        submission_id: MessageSubmissionId,
+        request: &SendAgentMessageRequest,
+        user_sequence: i64,
+        expected_end_sequence: i64,
+        granted_by: Option<&str>,
     ) -> VibexResult<MessageSubmissionRecord> {
         Self::validate_idempotency_key(&request.message_idempotency_key)?;
         if user_sequence <= 0 || expected_end_sequence < user_sequence {
@@ -4030,6 +4172,9 @@ impl MessageSubmissionRepository {
             request,
             RuntimeSwitchPolicy::ForceFreshSession,
         )?;
+        if let Some(granted_by) = granted_by {
+            Self::grant_selected_mentions(&tx, request, granted_by)?;
+        }
         tx.commit().map_err(storage_err(
             "message_edit_transaction_failed",
             "failed to commit edited message transaction",
@@ -4049,6 +4194,7 @@ impl MessageSubmissionRepository {
             Self::validate_existing(conn, &existing, request, required_runtime_policy)?;
             return Ok(existing);
         }
+        crate::authorize_vibex_use_submission(conn, request, false)?;
         let submission_sequence = conn
             .query_row(
                 "SELECT COALESCE(MAX(submission_sequence), 0) + 1
@@ -4106,6 +4252,7 @@ impl MessageSubmissionRepository {
             "message_submission_payload_insert_failed",
             "failed to persist message submission payload",
         ))?;
+        crate::record_vibex_use_submission(conn, request, &submission_id)?;
         Ok(MessageSubmissionRecord {
             submission_id,
             session_id: request.session_id.clone(),
@@ -4298,7 +4445,19 @@ impl MessageSubmissionRepository {
         conn: &Connection,
         submission_id: &MessageSubmissionId,
     ) -> VibexResult<()> {
-        let changed = conn
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "message_submission_transaction_failed",
+                "failed to reserve prompt admission",
+            ))?;
+        let payload = Self::get_payload_conn(&tx, submission_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "message_submission_payload_missing",
+                "message submission payload was not found",
+            )
+        })?;
+        crate::authorize_vibex_use_submission(&tx, &payload.request, true)?;
+        let changed = tx
             .execute(
                 "UPDATE agent_message_submissions
                  SET status = ?2, dispatch_operation_id = ?1, updated_at_ms = ?3
@@ -4320,6 +4479,38 @@ impl MessageSubmissionRepository {
                 "message submission is not ready for prompt dispatch",
             ));
         }
+        if let Some(execution) =
+            crate::VibexUseExecutionRepository::get_by_submission(&tx, submission_id)?
+        {
+            let start =
+                crate::TimelineRepository::latest_sequence(&tx, &payload.request.session_id)?
+                    .saturating_add(1);
+            crate::VibexUseExecutionRepository::mark_started(&tx, &execution.id, start)?;
+            if let Some(task_id) = execution
+                .task_ref
+                .as_ref()
+                .and_then(vibex_core::VibexUseRef::task_id)
+                && let Some(task) = crate::AgentDelegationRepository::get(&tx, &task_id)?
+            {
+                crate::VibexUseEventRepository::append(
+                    &tx,
+                    &vibex_core::DelegationTaskEventKind::ExecutionStarted
+                        .stable_id(&task.id, Some(&execution.id)),
+                    task.root_session_id
+                        .as_ref()
+                        .or(Some(&task.parent_session_id)),
+                    vibex_core::DelegationTaskEventKind::ExecutionStarted,
+                    Some(&task.id),
+                    task.child_session_id.as_ref(),
+                    task.revision,
+                    &serde_json::json!({"executionRef": execution.execution_ref.as_uri()}),
+                )?;
+            }
+        }
+        tx.commit().map_err(storage_err(
+            "message_submission_transaction_failed",
+            "failed to commit prompt admission",
+        ))?;
         Ok(())
     }
 
@@ -4503,22 +4694,62 @@ impl MessageSubmissionRepository {
     /// `dispatched_at_ms`; clients present such failures through the timeline
     /// (and auto-continue) instead of claiming the message was never sent.
     pub fn fail_after_prompt_dispatch(
-        conn: &Connection,
+        conn: &mut Connection,
         submission_id: &MessageSubmissionId,
+        user_message_timeline_item_id: &TimelineItemId,
+        range: vibex_core::ExecutionResultRange,
         error_code: &str,
         error_detail_redacted: Option<&str>,
     ) -> VibexResult<()> {
         Self::validate_error_fields(error_code, error_detail_redacted)?;
+        if range.start_sequence <= 0 || range.end_sequence < range.start_sequence {
+            return Err(VibexError::validation(
+                "message_submission_result_range_invalid",
+                "message submission result timeline range is invalid",
+            ));
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "message_submission_transaction_failed",
+                "failed to record a failed dispatch",
+            ))?;
+        let valid: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_timeline_items u
+             JOIN agent_message_submissions s ON s.session_id = u.session_id
+             WHERE s.submission_id = ?1 AND u.timeline_item_id = ?2
+               AND u.kind = 'user_message' AND u.sequence = ?3
+               AND EXISTS(SELECT 1 FROM agent_timeline_items e
+                   WHERE e.session_id = u.session_id AND e.sequence = ?4)
+               AND NOT EXISTS(SELECT 1 FROM agent_timeline_items n
+                   WHERE n.session_id = u.session_id AND n.kind = 'user_message'
+                     AND n.sequence > ?3 AND n.sequence <= ?4))",
+                params![
+                    submission_id.as_str(),
+                    user_message_timeline_item_id.as_str(),
+                    range.start_sequence,
+                    range.end_sequence
+                ],
+                |row| row.get(0),
+            )
+            .map_err(storage_err(
+                "message_submission_dispatch_validation_failed",
+                "failed to validate failed dispatch range",
+            ))?;
+        if !valid {
+            return Err(VibexError::validation(
+                "message_submission_dispatch_result_invalid",
+                "failed dispatch range does not belong to this submission",
+            ));
+        }
         let now = unix_timestamp_ms();
-        let changed = conn
+        let changed = tx
             .execute(
                 "UPDATE agent_message_submissions
-                 SET status = ?2,
-                     error_code = ?3,
-                     error_detail_redacted = ?4,
-                     dispatched_at_ms = ?5,
-                     updated_at_ms = ?5
-                 WHERE submission_id = ?1 AND status = ?6",
+             SET status = ?2, error_code = ?3, error_detail_redacted = ?4,
+                 dispatched_at_ms = ?5, updated_at_ms = ?5, user_message_timeline_item_id = ?7
+             WHERE submission_id = ?1 AND status = ?6",
                 params![
                     submission_id.as_str(),
                     enum_to_db(&MessageSubmissionStatus::Failed)?,
@@ -4526,19 +4757,29 @@ impl MessageSubmissionRepository {
                     error_detail_redacted,
                     now,
                     enum_to_db(&MessageSubmissionStatus::AboutToPrompt)?,
+                    user_message_timeline_item_id.as_str()
                 ],
             )
             .map_err(storage_err(
                 "message_submission_update_failed",
-                "failed to update message submission terminal state",
+                "failed to persist terminal dispatch state",
             ))?;
-        if changed == 0 {
+        let payload_changed = tx.execute(
+            "UPDATE agent_message_submission_payloads
+             SET result_first_sequence = ?2, result_last_sequence = ?3, updated_at_ms = ?4
+             WHERE submission_id = ?1 AND result_first_sequence IS NULL AND result_last_sequence IS NULL",
+            params![submission_id.as_str(), range.start_sequence, range.end_sequence, now],
+        ).map_err(storage_err("message_submission_result_update_failed", "failed to persist failed dispatch range"))?;
+        if changed != 1 || payload_changed != 1 {
             return Err(cas_conflict(
                 "message_submission_status_conflict",
-                "message submission is not in the expected status",
+                "message submission is no longer awaiting dispatch",
             ));
         }
-        Ok(())
+        tx.commit().map_err(storage_err(
+            "message_submission_transaction_failed",
+            "failed to commit failed dispatch",
+        ))
     }
 
     pub fn mark_ambiguous(
@@ -4588,6 +4829,23 @@ impl MessageSubmissionRepository {
         conn: &mut Connection,
         session_id: &VibexSessionId,
     ) -> VibexResult<Vec<TimelineItem>> {
+        Self::cancel_before_dispatch(conn, session_id, None)
+    }
+
+    /// Stops one accepted queued round without changing other inputs in its session.
+    pub fn cancel_before_dispatch_for_submission(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        submission_id: &MessageSubmissionId,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        Self::cancel_before_dispatch(conn, session_id, Some(submission_id))
+    }
+
+    fn cancel_before_dispatch(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        submission_id: Option<&MessageSubmissionId>,
+    ) -> VibexResult<Vec<TimelineItem>> {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_err(
@@ -4602,6 +4860,7 @@ impl MessageSubmissionRepository {
                      JOIN agent_message_submission_payloads p
                        ON p.payload_reference = s.message_payload_reference
                      WHERE s.session_id = ?1 AND s.status IN (?2, ?3)
+                       AND (?4 IS NULL OR s.submission_id = ?4)
                      ORDER BY p.submission_sequence ASC",
                 )
                 .map_err(storage_err(
@@ -4614,6 +4873,7 @@ impl MessageSubmissionRepository {
                         session_id.as_str(),
                         enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
                         enum_to_db(&MessageSubmissionStatus::ReadyToDispatch)?,
+                        submission_id.map(MessageSubmissionId::as_str),
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -4644,7 +4904,9 @@ impl MessageSubmissionRepository {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: request.text,
                     attachments: request.attachments,
-                    ..Default::default()
+                    mentions: request.mentions,
+                    provenance: request.provenance,
+                    delivery: request.delivery,
                 }),
                 None,
                 request.correlation_id.as_ref(),
@@ -6120,6 +6382,7 @@ mod tests {
         text: &str,
     ) -> SendAgentMessageRequest {
         SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: session_id.clone(),
             message_idempotency_key: idempotency_key.to_string(),
             desired_runtime: sample_selection(),
@@ -6131,6 +6394,308 @@ mod tests {
             prompt_context: None,
             provenance: vibex_core::MessageProvenance::HumanInput,
         }
+    }
+
+    #[test]
+    fn message_mentions_require_the_trusted_human_boundary() {
+        let temp = temp_db_path("untrusted-mentions");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let sender = seeded_session(&conn, "mention-sender");
+        let target = seeded_session(&conn, "mention-target");
+        let mut request = message_request(
+            &sender,
+            "ordinary-uri",
+            &format!(
+                "Read {}",
+                vibex_core::VibexUseRef::session(&target).as_uri()
+            ),
+        );
+        MessageSubmissionRepository::enqueue(&mut conn, MessageSubmissionId::new(), &request)
+            .unwrap();
+        request.message_idempotency_key = "ordinary-metadata".to_string();
+        request.mentions.push(vibex_core::VibexUseMention::session(
+            &target,
+            Some("Referenced session"),
+        ));
+        MessageSubmissionRepository::enqueue(&mut conn, MessageSubmissionId::new(), &request)
+            .unwrap();
+        assert!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .is_none()
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn human_message_mentions_persist_read_access_and_cancelled_history() {
+        let temp = temp_db_path("trusted-mentions");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let sender = seeded_session(&conn, "trusted-sender");
+        let target = seeded_session(&conn, "trusted-target");
+        let mut request = message_request(&sender, "human-reference", "Use the selected context");
+        request.mentions.push(vibex_core::VibexUseMention::session(
+            &target,
+            Some("Context"),
+        ));
+        let record = MessageSubmissionRepository::enqueue_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            "human:local",
+        )
+        .unwrap();
+        let grant = crate::SessionGrantRepository::get(&conn, &sender, &target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.scope, "referenced");
+        assert_eq!(grant.granted_by, "human:local");
+        let payload = MessageSubmissionRepository::get_payload(&conn, &record.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload.request.mentions, request.mentions);
+        let items =
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(&mut conn, &sender)
+                .unwrap();
+        let TimelinePayload::UserMessage(message) = &items[0].payload else {
+            panic!("expected user message")
+        };
+        assert_eq!(message.mentions, request.mentions);
+        assert_eq!(
+            message.provenance,
+            vibex_core::MessageProvenance::HumanInput
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn human_message_retries_never_restore_revoked_access_or_change_mentions() {
+        let temp = temp_db_path("mention-retry");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let sender = seeded_session(&conn, "retry-sender");
+        let target = seeded_session(&conn, "retry-target");
+        let mut request = message_request(&sender, "retry-reference", "Read selected context");
+        request
+            .mentions
+            .push(vibex_core::VibexUseMention::session(&target, None));
+        crate::SessionGrantRepository::grant(&conn, &sender, &target, "controlled", "human:local")
+            .unwrap();
+        let first = MessageSubmissionRepository::enqueue_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            "human:local",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .unwrap()
+                .scope,
+            "controlled"
+        );
+        crate::SessionGrantRepository::revoke(&conn, &sender, &target).unwrap();
+        let retry = MessageSubmissionRepository::enqueue_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            "human:local",
+        )
+        .unwrap();
+        assert_eq!(retry.submission_id, first.submission_id);
+        assert!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .is_none()
+        );
+        request.mentions.clear();
+        let error = MessageSubmissionRepository::enqueue_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            "human:local",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            "message_submission_idempotency_payload_conflict"
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn invalid_human_mentions_roll_back_submission_and_every_grant() {
+        let temp = temp_db_path("mention-rollback");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let sender = seeded_session(&conn, "rollback-sender");
+        let target = seeded_session(&conn, "rollback-target");
+        let deleted = seeded_session(&conn, "rollback-deleted");
+        conn.execute(
+            "UPDATE agent_sessions SET deleted_at_ms = 1 WHERE session_id = ?1",
+            params![deleted.as_str()],
+        )
+        .unwrap();
+        for (key, invalid) in [("missing", VibexSessionId::new()), ("deleted", deleted)] {
+            let mut request = message_request(&sender, key, "Read selected context");
+            request.mentions = vec![
+                vibex_core::VibexUseMention::session(&target, None),
+                vibex_core::VibexUseMention::session(&invalid, None),
+            ];
+            assert_eq!(
+                MessageSubmissionRepository::enqueue_with_mentions(
+                    &mut conn,
+                    MessageSubmissionId::new(),
+                    &request,
+                    "human:local"
+                )
+                .unwrap_err()
+                .code,
+                "session_not_found"
+            );
+            assert!(
+                MessageSubmissionRepository::get_by_key(&conn, &sender, key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                crate::SessionGrantRepository::get(&conn, &sender, &target)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        cleanup_db(temp);
+    }
+
+    fn mention_edit_source(conn: &mut Connection, session_id: &VibexSessionId) -> TimelineItem {
+        TimelineRepository::append(
+            conn,
+            session_id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Original message".to_string(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn human_edit_mentions_commit_once_and_invalid_edits_preserve_history() {
+        let temp = temp_db_path("mention-edit");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let sender = seeded_session(&conn, "edit-sender");
+        let target = seeded_session(&conn, "edit-target");
+        let source = mention_edit_source(&mut conn, &sender);
+        let mut request = message_request(&sender, "human-edit", "Edited with context");
+        request.mentions = vec![
+            vibex_core::VibexUseMention::session(&target, None),
+            vibex_core::VibexUseMention::session(&VibexSessionId::new(), None),
+        ];
+        let result = MessageSubmissionRepository::replace_latest_user_message_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            source.sequence,
+            source.sequence,
+            "human:local",
+        );
+        assert_eq!(result.unwrap_err().code, "session_not_found");
+        assert_eq!(
+            TimelineRepository::latest_sequence(&conn, &sender).unwrap(),
+            source.sequence
+        );
+        assert!(
+            MessageSubmissionRepository::get_by_key(&conn, &sender, "human-edit")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .is_none()
+        );
+        request.mentions.pop();
+        let first = MessageSubmissionRepository::replace_latest_user_message_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            source.sequence,
+            source.sequence,
+            "human:local",
+        )
+        .unwrap();
+        assert_eq!(
+            first.required_runtime_policy,
+            RuntimeSwitchPolicy::ForceFreshSession
+        );
+        assert_eq!(
+            TimelineRepository::latest_sequence(&conn, &sender).unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .unwrap()
+                .scope,
+            "referenced"
+        );
+        crate::SessionGrantRepository::revoke(&conn, &sender, &target).unwrap();
+        let replay = MessageSubmissionRepository::replace_latest_user_message_with_mentions(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            source.sequence,
+            source.sequence,
+            "human:local",
+        )
+        .unwrap();
+        assert_eq!(replay.submission_id, first.submission_id);
+        assert!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .is_none()
+        );
+        let items =
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(&mut conn, &sender)
+                .unwrap();
+        assert!(
+            matches!(&items[0].payload, TimelinePayload::UserMessage(message) if message.mentions == request.mentions && message.text == request.text)
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn ordinary_edit_mention_metadata_never_grants_access() {
+        let temp = temp_db_path("untrusted-edit-mentions");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let sender = seeded_session(&conn, "ordinary-edit-sender");
+        let target = seeded_session(&conn, "ordinary-edit-target");
+        let source = mention_edit_source(&mut conn, &sender);
+        let mut request = message_request(&sender, "ordinary-edit", "Edited context");
+        request.mentions = vec![vibex_core::VibexUseMention::session(&target, None)];
+        MessageSubmissionRepository::replace_latest_user_message(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &request,
+            source.sequence,
+            source.sequence,
+        )
+        .unwrap();
+        assert!(
+            crate::SessionGrantRepository::get(&conn, &sender, &target)
+                .unwrap()
+                .is_none()
+        );
+        cleanup_db(temp);
     }
 
     fn seed_runtime_selection(

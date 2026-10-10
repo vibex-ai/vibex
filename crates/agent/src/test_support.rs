@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,10 @@ pub(crate) struct TestRuntimeHarness {
 }
 
 impl TestRuntimeHarness {
+    pub(crate) fn manager(&self) -> Arc<AgentManager> {
+        self.manager.clone()
+    }
+
     pub(crate) fn new(db_path: &Path, agent_id: AgentId, provider: Arc<dyn AgentProvider>) -> Self {
         let adapter_id = default_adapter_for_agent(&agent_id);
         let mut manager = AgentManager::new(db_path).unwrap();
@@ -91,7 +95,10 @@ impl TestRuntimeHarness {
             )
             .unwrap();
         let manager = Arc::new(manager);
-        let runtime = Arc::new(TestSwitchRuntime { adapter_id });
+        let runtime = Arc::new(TestSwitchRuntime {
+            adapter_id,
+            db_path: db_path.to_path_buf(),
+        });
         let coordinator = RuntimeSwitchCoordinator::new(
             db_path,
             runtime.clone(),
@@ -152,11 +159,18 @@ impl Deref for TestRuntimeHarness {
 #[derive(Clone)]
 struct TestSwitchRuntime {
     adapter_id: AcpAdapterId,
+    db_path: PathBuf,
 }
 
 impl TestSwitchRuntime {
-    fn attachment(intent: &SwitchIntent) -> PreparedAttachment {
-        let generation = 1;
+    fn attachment(&self, intent: &SwitchIntent) -> PreparedAttachment {
+        let conn = vibex_db::open_database(&self.db_path).unwrap();
+        let generation =
+            vibex_db::AgentSessionRuntimeRepository::get_runtime_state(&conn, &intent.session_id)
+                .unwrap()
+                .expect("the test session exists before materialization")
+                .activation_generation
+                .saturating_add(1);
         let mut config = SessionRuntimeConfigState {
             preferred_model: intent.target_selection.model_id().map(str::to_string),
             effective_model: intent.target_selection.model_id().map(str::to_string),
@@ -266,7 +280,7 @@ impl SwitchTargetExecutor for TestSwitchRuntime {
         _strategy: RuntimeSwitchStrategy,
         _operation: &JournaledOperation,
     ) -> VibexResult<PreparedAttachment> {
-        Ok(Self::attachment(intent))
+        Ok(self.attachment(intent))
     }
 
     async fn recover_attachment(
@@ -274,7 +288,7 @@ impl SwitchTargetExecutor for TestSwitchRuntime {
         intent: &SwitchIntent,
         _operation: &SwitchOperationRecord,
     ) -> VibexResult<PreparedAttachment> {
-        Ok(Self::attachment(intent))
+        Ok(self.attachment(intent))
     }
 
     async fn acquire_prepared(

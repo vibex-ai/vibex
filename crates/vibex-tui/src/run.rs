@@ -1689,6 +1689,26 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 worker.dispatch(crate::app::Effect::LoadSidebarOrganization);
             }
         },
+        AppMessage::TeamLoaded { ticket, result } => {
+            if app.team.apply(&ticket, result)
+                && app.team.has_pending_refresh()
+                && app.dock_open
+                && let Some(effect) = app.load_team(false)
+            {
+                worker.dispatch(effect);
+            }
+        }
+        AppMessage::TeamMutated { session_id, result } => {
+            app.team_busy = false;
+            if app.team.session_id() == Some(&session_id) {
+                if let Err(error) = result {
+                    app.toast(Toast::danger(error.message));
+                }
+                if let Some(effect) = app.load_team(false) {
+                    worker.dispatch(effect);
+                }
+            }
+        }
         AppMessage::SessionOpened { ticket, result } => {
             let failure = result.as_ref().err().map(|error| error.message.clone());
             // The shared controller owns the projection: applying the snapshot
@@ -1701,6 +1721,11 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     None => {
                         app.sync_transcript();
                         app.live = LiveState::Ready;
+                        if app.dock_open
+                            && let Some(effect) = app.load_team(false)
+                        {
+                            worker.dispatch(effect);
+                        }
                     }
                 }
             }
@@ -2094,6 +2119,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::Event(event) => {
+            if app.dock_open
+                && !app.team_busy
+                && let Some(effect) = app.load_team(false)
+            {
+                worker.dispatch(effect);
+            }
             // A sidebar invalidated on the authority means the tree this client
             // is drawing is out of date: the reader rearranged it somewhere
             // else, or another client did.

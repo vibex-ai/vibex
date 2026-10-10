@@ -456,6 +456,7 @@ pub struct ProviderGoalControlResult {
 
 #[derive(Debug, Clone)]
 pub struct ProviderTurnResult {
+    pub stop_reason: Option<String>,
     pub events: Vec<ProviderEvent>,
     pub binding_update: Option<ProviderBinding>,
     pub completed: bool,

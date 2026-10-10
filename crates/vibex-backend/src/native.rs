@@ -208,6 +208,146 @@ fn map_refetch(refetch: AuthoritativeRefetch) -> BackendRefetch {
 }
 
 impl AgentBackend for NativeBackend {
+    fn team_snapshot(
+        &self,
+        request: vibex_core::TeamSnapshotRequest,
+    ) -> BackendFuture<'_, vibex_core::TeamSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .vibex_use()
+                .human_team_snapshot(request)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn session_tree(
+        &self,
+        request: vibex_core::SessionTreeRequest,
+    ) -> BackendFuture<'_, vibex_core::SessionTreePage> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .vibex_use()
+                .human_session_tree(request)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn send_message_with_mentions(
+        &self,
+        request: MutationRequest<vibex_core::HumanAgentMessageRequest>,
+    ) -> BackendFuture<'_, Vec<vibex_core::TimelineItem>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .vibex_use()
+                .human_send_message_with_mentions(request.payload, "human:local".to_string())
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_session_access(
+        &self,
+        request: MutationRequest<vibex_core::SessionAccessRequest>,
+    ) -> BackendFuture<'_, vibex_core::SessionAccessResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let key = request
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| request.request_id.to_string());
+            runtime
+                .vibex_use()
+                .human_set_session_access(request.payload, key, "human:local".to_string())
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn delegate_session(
+        &self,
+        request: MutationRequest<vibex_core::HumanDelegationRequest>,
+    ) -> BackendFuture<'_, vibex_core::HumanDelegationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let key = request
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| request.request_id.to_string());
+            runtime
+                .vibex_use()
+                .human_delegate_session(request.payload, key, "human:local".to_string())
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn control_team_task(
+        &self,
+        request: MutationRequest<vibex_core::TeamTaskControlRequest>,
+    ) -> BackendFuture<'_, vibex_core::DelegationTaskView> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let key = request
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| request.request_id.to_string());
+            runtime
+                .vibex_use()
+                .human_control_team_task(request.payload, key, "human:local".to_string())
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn present_team(
+        &self,
+        request: MutationRequest<vibex_core::TeamPresentationRequest>,
+    ) -> BackendFuture<'_, vibex_core::PresentationOutcome> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let key = request
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| request.request_id.to_string());
+            runtime
+                .vibex_use()
+                .human_present_team(request.payload, key, "human:local".to_string())
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn acknowledge_team_events(
+        &self,
+        request: MutationRequest<vibex_core::TeamAcknowledgeRequest>,
+    ) -> BackendFuture<'_, usize> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .vibex_use()
+                .human_acknowledge_team_events(request.payload, "human:local".to_string())
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn subscribe(&self) -> BackendResult<Box<dyn BackendEventSubscription>> {
         Ok(Box::new(NativeEventSubscription {
             receiver: self.runtime.subscribe(),
@@ -436,8 +576,8 @@ impl AgentBackend for NativeBackend {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
             runtime
-                .agent()
-                .replace_user_message(request.payload)
+                .vibex_use()
+                .human_replace_user_message(request.payload, "human:local".to_string())
                 .await
                 .map_err(Into::into)
         })

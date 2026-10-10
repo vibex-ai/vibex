@@ -233,6 +233,8 @@ impl UserMessageDelivery {
 pub struct UserMessagePayload {
     pub text: String,
     pub attachments: Vec<MessageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::VibexUseMention>,
     #[serde(default, skip_serializing_if = "UserMessageDelivery::is_prompt")]
     pub delivery: UserMessageDelivery,
     /// Who actually authored this message.
@@ -250,6 +252,7 @@ impl Default for UserMessagePayload {
         Self {
             text: String::new(),
             attachments: Vec::new(),
+            mentions: Vec::new(),
             delivery: UserMessageDelivery::Prompt,
             provenance: crate::MessageProvenance::LegacyUnknown,
         }

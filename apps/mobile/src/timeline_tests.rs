@@ -68,7 +68,7 @@ fn open_timeline<'a>(
     let mut handles = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
         let app = cx.new(|cx| {
-            let mut app = MobileApp::new(data_dir.to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.to_path_buf(), window, cx);
             let backend = DisconnectedBackend::facade();
             let mut controller =
                 AgentWorkflowController::new(backend.agent().clone(), backend.capabilities().agent);

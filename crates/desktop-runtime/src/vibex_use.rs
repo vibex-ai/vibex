@@ -14,27 +14,28 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Notify;
 use vibex_agent::AgentManager;
 use vibex_agent::manager::DelegationStartOutcome;
+use vibex_agent::observability::{RuntimeMetricName, RuntimeMetricResult};
 use vibex_core::{
     AgentDelegation, AgentDelegationId, AgentDelegationStatus, AgentId, AgentSession,
     AgentSessionState, CreateAgentDelegationRequest, CreateAgentSessionRequest, DelegationAccepted,
     DelegationBlockedOn, DelegationCompletionPolicy, DelegationContextRef, DelegationExecution,
     DelegationOwnershipKind, DelegationRuntimeSummary, DelegationTaskEventKind,
     DelegationTaskPhase, DelegationTaskView, DiscoverResponse, ErrorCategory, ExecutionOutcome,
-    ExecutionUsageState, GroupPresentationCommand, MessageAccepted, MessageProvenance,
-    MessageSubmissionId, PresentationActivationPolicy, PresentationOutcome, PresentationState,
-    SendAgentMessageRequest, SessionGroupId, SessionGroupLayoutIntent, SessionGroupLayoutPreset,
-    SessionGroupScope, SessionListPage, SessionReadAnchor, SessionReadCursor, SessionReadEntry,
-    SessionReadPage, SessionReadView, SessionRuntimeOption, SessionRuntimeSelection,
-    SessionTreeNode, TaskListPage, TimelineItem, TimelineItemKind, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VIBEX_USE_DEFAULT_READ_CHARS, VIBEX_USE_DEFAULT_READ_ITEMS,
-    VIBEX_USE_IDEMPOTENCY_KEY_CHARS, VIBEX_USE_MAX_BATCH_REFS, VIBEX_USE_MAX_CONTEXT_REFS,
-    VIBEX_USE_MAX_DEPTH, VIBEX_USE_MAX_GROUP_MEMBERS, VIBEX_USE_MAX_LIVE_PANES,
-    VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS, VIBEX_USE_MAX_WAIT_MS,
-    VIBEX_USE_ROOT_EXECUTION_BUDGET, VIBEX_USE_SUMMARY_CHARS, VIBEX_USE_TITLE_CHARS, VibexError,
+    GroupPresentationCommand, MessageAccepted, MessageProvenance, MessageSubmissionId,
+    PresentationActivationPolicy, PresentationOutcome, PresentationState, SendAgentMessageRequest,
+    SessionGroupId, SessionGroupLayoutIntent, SessionGroupLayoutPreset, SessionGroupScope,
+    SessionListPage, SessionReadAnchor, SessionReadCursor, SessionReadEntry, SessionReadPage,
+    SessionReadView, SessionRuntimeOption, SessionRuntimeSelection, SessionTreeNode, TaskListPage,
+    TimelineItem, TimelineItemKind, TimelinePayload, UserMessageDelivery,
+    VIBEX_USE_DEFAULT_READ_CHARS, VIBEX_USE_DEFAULT_READ_ITEMS, VIBEX_USE_IDEMPOTENCY_KEY_CHARS,
+    VIBEX_USE_MAX_BATCH_REFS, VIBEX_USE_MAX_CONTEXT_REFS, VIBEX_USE_MAX_GROUP_MEMBERS,
+    VIBEX_USE_MAX_LIVE_PANES, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
+    VIBEX_USE_MAX_WAIT_MS, VIBEX_USE_SUMMARY_CHARS, VIBEX_USE_TITLE_CHARS, VibexError,
     VibexExecutionId, VibexOperationId, VibexResult, VibexSessionId, VibexUseActor,
     VibexUseCapabilitySnapshot, VibexUseDelivery, VibexUseGroupSummary, VibexUseOperation,
     VibexUseOperationResource, VibexUseOperationState, VibexUsePresentationCapability, VibexUseRef,
@@ -50,12 +51,21 @@ use vibex_db::{
     SessionControllerRepository, SessionGrantRepository, SessionOwnershipRepository,
     SessionRepository, TimelineRepository, VibexUseEventRepository, VibexUseExecutionRepository,
     VibexUseOperationRepository, VibexUseOperationReservation, WorkspaceRepository,
-    apply_migrations, open_database, transition_delegation,
+    apply_migrations, open_database,
 };
 use vibex_remote::RemoteSidebarOrganizationSource;
 
 use crate::catalog::RuntimeOptionCatalogService;
 use crate::sidebar_organization::SessionGroupPresentationBridge;
+
+mod budget;
+mod operations;
+pub(crate) use budget::load_budget_policy;
+#[cfg(test)]
+mod integration_tests;
+mod read;
+mod selection;
+mod team;
 
 /// Where a Vibex-use reference is resolved. Only the authority that minted a
 /// reference may resolve it.
@@ -76,9 +86,12 @@ pub struct VibexUseService {
     /// writer as the group bridge instead of opening a second path.
     #[allow(dead_code)]
     sidebar: Arc<dyn RemoteSidebarOrganizationSource>,
-    activation_revision: u64,
+    activation_revision: AtomicU64,
     /// Wakes a bounded `vibex_wait` when any task fact changes.
     progress: Arc<Notify>,
+    operation_gates: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 impl VibexUseService {
@@ -95,56 +108,110 @@ impl VibexUseService {
         Arc::new(Self {
             db_path: db_path.into(),
             authority: authority.into(),
+            progress: manager.execution_progress(),
             manager,
             runtime_catalog,
             presentation,
             sidebar,
-            activation_revision: activation_revision.max(1),
-            progress: Arc::new(Notify::new()),
+            activation_revision: AtomicU64::new(activation_revision.max(1)),
+            operation_gates: Default::default(),
         })
     }
 
-    /// Offers groups whose display was never confirmed to the attached client.
-    ///
-    /// It runs when a shell connects, not on every frame, and it asks in
-    /// `when_user_returns` mode: recovery must not pull somebody out of the
-    /// workspace they are working in. The request is presentation-only, so it
-    /// can never rewrite a definition the user has since rearranged.
+    /// Restores retained definitions into a connected client's registry. The
+    /// client may recreate a missing group, but never replace its own layout.
     pub async fn recover_presentations(&self) -> VibexResult<usize> {
-        if !self.presentation.is_attached() {
-            return Ok(0);
-        }
-        let pending = {
-            let conn = self.open()?;
-            GroupPresentationRepository::list_unpresented(&conn, 50)?
-        };
+        let mut after = None;
         let mut offered = 0;
-        for record in pending {
-            let mut command = record_group_command(&record, true);
-            command.activation_policy = PresentationActivationPolicy::WhenUserReturns;
-            command.presentation_only = true;
-            let outcome = self.present_record(command).await;
-            if matches!(
-                outcome.state,
-                PresentationState::Applied | PresentationState::Presented
-            ) {
-                let conn = self.open()?;
-                let applied = outcome
-                    .applied_layout
-                    .as_ref()
-                    .and_then(|layout| serde_json::to_value(layout).ok());
-                let _ = GroupPresentationRepository::record_presentation(
-                    &conn,
-                    &record.group_id,
-                    presentation_state_to_db(outcome.state),
-                    applied.as_ref(),
-                    outcome.reason.map(|reason| reason.as_str()),
-                    Some(outcome.revision),
+        while self.presentation.is_attached() {
+            let records = GroupPresentationRepository::list_for_recovery(
+                &self.open()?,
+                after.as_deref(),
+                50,
+            )?;
+            if records.is_empty() {
+                break;
+            }
+            for record in records {
+                after = Some(record.group_id.clone());
+                let present = matches!(
+                    record.state,
+                    GroupPresentationState::Prepared
+                        | GroupPresentationState::Deferred
+                        | GroupPresentationState::Presented
                 );
-                offered += 1;
+                let mut command = record_group_command(&record, present);
+                command.activation_policy = PresentationActivationPolicy::WhenUserReturns;
+                command.presentation_only = true;
+                let outcome = self.present_record(command).await;
+                let outcome = self.record_presentation_outcome(&record, &outcome)?;
+                if matches!(
+                    outcome.state,
+                    PresentationState::Applied | PresentationState::Presented
+                ) {
+                    offered += 1;
+                }
             }
         }
         Ok(offered)
+    }
+
+    /// The local authority UI calls this synchronously after a manual edit.
+    /// A manual edit transfers ownership and invalidates in-flight Agent replies.
+    pub fn sync_user_group(
+        &self,
+        group_id: &str,
+        name: &str,
+        members: &[VibexSessionId],
+        layout: &SessionGroupLayoutIntent,
+        client_revision: u64,
+    ) -> VibexResult<()> {
+        let conn = self.open()?;
+        let Some(record) = GroupPresentationRepository::get(&conn, group_id)? else {
+            return Ok(());
+        };
+        if members.is_empty() {
+            return self.remove_user_group(group_id);
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > VIBEX_USE_TITLE_CHARS {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "group name is invalid",
+            ));
+        }
+        self.validate_group_definition(&conn, None, &record.workspace_id, members, layout)?;
+        if record.client_revision == Some(client_revision) {
+            if record.name != name
+                || record.member_session_ids != members
+                || record.layout != *layout
+            {
+                return Err(group_revision_conflict());
+            }
+            if !record.created_by_caller {
+                return Ok(());
+            }
+        }
+        if !GroupPresentationRepository::sync_user(
+            &conn,
+            &record,
+            name,
+            members,
+            layout,
+            client_revision,
+        )? {
+            return Err(group_revision_conflict());
+        }
+        self.notify_progress();
+        Ok(())
+    }
+
+    /// Removes only the saved presentation; sessions and tasks retain their
+    /// independent lifecycle. Missing definitions are an idempotent success.
+    pub fn remove_user_group(&self, group_id: &str) -> VibexResult<()> {
+        GroupPresentationRepository::delete(&self.open()?, group_id)?;
+        self.notify_progress();
+        Ok(())
     }
 
     /// Settles executions whose prompt crossed the dispatch boundary and whose
@@ -245,7 +312,14 @@ impl VibexUseService {
     }
 
     pub fn activation_revision(&self) -> u64 {
-        self.activation_revision
+        self.activation_revision.load(Ordering::Acquire)
+    }
+
+    /// Revokes every credential from the previous delivery activation.
+    pub fn revoke_activation(&self) -> u64 {
+        let revision = self.activation_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.notify_progress();
+        revision
     }
 
     fn open(&self) -> VibexResult<DbConnection> {
@@ -284,7 +358,7 @@ impl VibexUseService {
         conn: &DbConnection,
         actor: &VibexUseActor,
     ) -> VibexResult<VibexSessionId> {
-        SessionOwnershipRepository::root_of(conn, &actor.session_id)
+        vibex_db::vibex_use_root_session(conn, &actor.session_id)
     }
 
     /// How the caller relates to one target session.
@@ -300,39 +374,7 @@ impl VibexUseService {
         actor: &VibexUseActor,
         target: &VibexSessionId,
     ) -> VibexResult<VibexUseScope> {
-        if target == &actor.session_id {
-            return Ok(VibexUseScope::Owned);
-        }
-        if let Some(grant) = SessionGrantRepository::get(conn, &actor.session_id, target)? {
-            return Ok(if grant.scope == "controlled" {
-                VibexUseScope::Controlled
-            } else {
-                VibexUseScope::Referenced
-            });
-        }
-        let mut current = target.clone();
-        for _ in 0..32 {
-            let Some(parent) = SessionOwnershipRepository::parent_of(conn, &current)? else {
-                break;
-            };
-            if parent == actor.session_id {
-                return Ok(VibexUseScope::Owned);
-            }
-            current = parent;
-        }
-        if SessionOwnershipRepository::root_of(conn, target)? == actor.session_id {
-            return Ok(VibexUseScope::Owned);
-        }
-        // A live `controlled_existing` task is itself an explicit control grant.
-        for task in vibex_db::list_delegations_for_child(conn, target)? {
-            if task.parent_session_id == actor.session_id
-                && task.ownership_kind == DelegationOwnershipKind::ControlledExisting
-                && !task.phase().is_terminal()
-            {
-                return Ok(VibexUseScope::Controlled);
-            }
-        }
-        Ok(VibexUseScope::ReadOnly)
+        vibex_db::vibex_use_session_scope(conn, &actor.session_id, target)
     }
 
     fn require_readable(
@@ -391,16 +433,32 @@ impl VibexUseService {
             )
         })?;
         let root_session_id = self.actor_root(conn, actor)?;
-        let depth = SessionOwnershipRepository::ancestor_depth(conn, &actor.session_id)?;
-        let remaining_depth = VIBEX_USE_MAX_DEPTH.saturating_sub(depth);
+        let budget_policy = vibex_db::VibexUseBudgetRepository::policy(conn)?;
+        let reported_tokens =
+            vibex_db::VibexUseBudgetRepository::reported_tokens(conn, &root_session_id)?;
+        let depth = vibex_db::vibex_use_delegation_depth(conn, &actor.session_id)?;
+        let remaining_depth = budget_policy.max_depth.saturating_sub(depth);
         let active = vibex_db::count_active_executions_for_root(conn, &root_session_id)?;
-        let remaining_executions = VIBEX_USE_ROOT_EXECUTION_BUDGET.saturating_sub(active);
+        let remaining_executions = budget_policy.root_execution_limit.saturating_sub(active);
         let current_task = self.current_task_for_session(conn, &actor.session_id)?;
         let presentation = self.presentation_capability();
         // A cancel that is still being confirmed fences the whole subtree. The
         // catalogue omits the writing tools instead of advertising work that the
         // fence would refuse a moment later.
         let fenced = vibex_db::delegation_cancellation_fence(conn, &actor.session_id)?.is_some();
+        let deadline_reached = match vibex_db::VibexUseBudgetRepository::check_session_deadline(
+            conn,
+            &actor.session_id,
+            unix_timestamp_ms(),
+        ) {
+            Ok(()) => false,
+            Err(error) if error.code == "vibex_use_task_deadline_exceeded" => true,
+            Err(error) => return Err(error),
+        };
+        let tokens_reached = budget_policy
+            .max_reported_tokens
+            .zip(reported_tokens)
+            .is_some_and(|(limit, total)| total >= limit);
         let mut capability = VibexUseCapabilitySnapshot {
             delivery: VibexUseDelivery::Mcp,
             delivery_reason: None,
@@ -414,10 +472,24 @@ impl VibexUseService {
             catalog_revision: 0,
             activation_revision: actor.activation_revision.max(1),
             remaining_executions,
-            max_depth: VIBEX_USE_MAX_DEPTH,
+            max_depth: budget_policy.max_depth,
+            budget_policy,
+            reported_tokens,
             remaining_depth,
-            can_delegate: remaining_depth > 0 && remaining_executions > 0 && !fenced,
-            delegation_blocked_by: fenced.then(|| use_codes::TASK_CANCELLING.to_string()),
+            can_delegate: remaining_depth > 0
+                && remaining_executions > 0
+                && !fenced
+                && !deadline_reached
+                && !tokens_reached,
+            delegation_blocked_by: if fenced {
+                Some(use_codes::TASK_CANCELLING.to_string())
+            } else if deadline_reached {
+                Some("vibex_use_task_deadline_exceeded".to_string())
+            } else if tokens_reached {
+                Some("vibex_use_token_budget_exceeded".to_string())
+            } else {
+                None
+            },
             can_read_any_session: false,
             presentation,
             available_tools: Vec::new(),
@@ -671,6 +743,17 @@ impl VibexUseService {
             }
         };
 
+        let sessions = sessions
+            .into_iter()
+            .filter_map(
+                |session| match self.resolve_scope(&conn, actor, &session.id) {
+                    Ok(scope) if scope.can_read_content() => Some(Ok(session)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<VibexResult<Vec<_>>>()?;
+
         let page: Vec<&AgentSession> = sessions.iter().skip(offset).take(max_items).collect();
         let mut summaries = Vec::new();
         for session in &page {
@@ -767,130 +850,7 @@ impl VibexUseService {
         cursor: SessionReadCursor,
         arguments: &serde_json::Value,
     ) -> VibexResult<SessionReadPage> {
-        let session_id = session_reference(session_ref)?;
-        let view = cursor.view;
-        let max_items = bounded_usize(
-            arguments,
-            "maxItems",
-            VIBEX_USE_DEFAULT_READ_ITEMS,
-            VIBEX_USE_MAX_READ_ITEMS,
-        );
-        let max_chars = bounded_usize(
-            arguments,
-            "maxChars",
-            VIBEX_USE_DEFAULT_READ_CHARS,
-            VIBEX_USE_MAX_READ_CHARS,
-        );
-        let limit = u32::try_from(max_items.saturating_mul(4).clamp(1, 400)).unwrap_or(200);
-        let page: TimelinePage = match cursor.anchor {
-            // `fetch_after(None, n)` is the newest window, not the first n items
-            // of history. The distinction matters for a long session, which is
-            // why the anchor is explicit instead of implied.
-            SessionReadAnchor::Latest => {
-                TimelineRepository::fetch_after(conn, &session_id, None, limit)?
-            }
-            SessionReadAnchor::After { sequence } => {
-                TimelineRepository::fetch_after(conn, &session_id, Some(sequence), limit)?
-            }
-            SessionReadAnchor::Before { sequence } => {
-                TimelineRepository::fetch_before(conn, &session_id, Some(sequence), limit)?
-            }
-        };
-        let snapshot_end_sequence = page
-            .items
-            .last()
-            .map(|item| item.sequence)
-            .or(page.end_sequence)
-            .or(page.start_sequence)
-            .unwrap_or_default();
-
-        let mut items = Vec::new();
-        let mut budget = max_chars;
-        let mut truncated = false;
-        // Whether the window held entries this page did not return. It is what
-        // makes the next cursor necessary, and it is not the same question as
-        // whether any single entry's text had to be cut.
-        let mut entries_dropped = false;
-        let mut notices = Vec::new();
-        for item in page.items.iter() {
-            if !view_includes(view, item) {
-                continue;
-            }
-            if items.len() >= max_items {
-                truncated = true;
-                entries_dropped = true;
-                notices.push(format!(
-                    "at most {max_items} entries are returned per page; continue with the next cursor"
-                ));
-                break;
-            }
-            let Some(text) = item_text(item) else {
-                continue;
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-            let (bounded, cut) = bounded_chars(&text, budget);
-            budget = budget.saturating_sub(bounded.chars().count());
-            truncated |= cut;
-            items.push(SessionReadEntry {
-                sequence: item.sequence,
-                kind: timeline_item_kind_name(item.kind).to_string(),
-                source: timeline_source_name(item.source).to_string(),
-                text: bounded,
-                truncated: cut,
-                artifact_refs: Vec::new(),
-                timestamp_ms: item.timestamp_ms,
-            });
-            if budget == 0 {
-                truncated = true;
-                entries_dropped = true;
-                notices.push("the character budget for this page is used up".to_string());
-                break;
-            }
-        }
-        // The cursor continues from the last entry actually returned and in the
-        // direction the caller was already walking. A `latest` or `before` page
-        // is a step *back* through history, so its continuation points at older
-        // sequences; only an `after` page walks forward. Pointing every page
-        // forward made the older half of a long session unreachable while the
-        // first page honestly reported that more existed.
-        let forward = matches!(cursor.anchor, SessionReadAnchor::After { .. });
-        let more_in_window = if forward {
-            page.has_newer
-        } else {
-            page.has_older
-        };
-        let has_more = more_in_window || entries_dropped;
-        let next_cursor = if has_more {
-            let anchor = if forward {
-                items.last().map(|entry| SessionReadAnchor::After {
-                    sequence: entry.sequence,
-                })
-            } else {
-                items.first().map(|entry| SessionReadAnchor::Before {
-                    sequence: entry.sequence,
-                })
-            };
-            anchor.map(|anchor| SessionReadCursor {
-                session_ref: session_ref.clone(),
-                view,
-                anchor,
-            })
-        } else {
-            None
-        };
-        let has_more = next_cursor.is_some();
-        Ok(SessionReadPage {
-            session_ref: session_ref.clone(),
-            view,
-            items,
-            snapshot_end_sequence,
-            next_cursor,
-            has_more,
-            truncated,
-            notices,
-        })
+        read::session_read_page(conn, session_ref, cursor, arguments)
     }
 
     // -----------------------------------------------------------------------
@@ -909,6 +869,7 @@ impl VibexUseService {
         tool: VibexUseTool,
         caller_key: &str,
         fingerprint: &str,
+        arguments: &serde_json::Value,
     ) -> VibexResult<(VibexUseOperation, bool)> {
         if caller_key.trim().is_empty()
             || caller_key.chars().count() > VIBEX_USE_IDEMPOTENCY_KEY_CHARS
@@ -931,7 +892,10 @@ impl VibexUseService {
             error_message: None,
             retryable: false,
             resources: Vec::new(),
-            checkpoint: BTreeMap::new(),
+            checkpoint: BTreeMap::from([(
+                "request".to_string(),
+                serde_json::to_string(arguments).map_err(internal_encode_error)?,
+            )]),
             created_at_ms: unix_timestamp_ms(),
             updated_at_ms: unix_timestamp_ms(),
         };
@@ -941,7 +905,12 @@ impl VibexUseService {
         };
         match VibexUseOperationRepository::reserve(conn, &operation, caller_key)? {
             VibexUseOperationReservation::Claimed(operation) => Ok((operation, true)),
-            VibexUseOperationReservation::Existing(operation) => Ok((operation, false)),
+            VibexUseOperationReservation::Existing(operation) => {
+                let resume = !operation.state.is_terminal()
+                    || operation.retryable
+                    || tool == VibexUseTool::PresentGroup;
+                Ok((operation, resume))
+            }
             VibexUseOperationReservation::Conflict(existing) => Err(VibexError::conflict(
                 use_codes::IDEMPOTENCY_PAYLOAD_CONFLICT,
                 "this idempotency key was already used for a different request",
@@ -956,15 +925,19 @@ impl VibexUseService {
         operation: &VibexUseOperation,
         kind: &str,
         reference: VibexUseRef,
-    ) {
-        let _ = VibexUseOperationRepository::append_resource(
+    ) -> VibexResult<()> {
+        VibexUseOperationRepository::append_resource(
             conn,
             &operation.id,
             &VibexUseOperationResource {
                 kind: kind.to_string(),
                 reference,
             },
-        );
+        )?
+        .ok_or_else(|| {
+            VibexError::storage("vibex_use_operation_missing", "operation disappeared")
+        })?;
+        Ok(())
     }
 
     fn settle_operation(
@@ -973,15 +946,19 @@ impl VibexUseService {
         operation: &VibexUseOperation,
         state: VibexUseOperationState,
         error: Option<&VibexError>,
-    ) {
-        let _ = VibexUseOperationRepository::update_state(
+    ) -> VibexResult<()> {
+        VibexUseOperationRepository::update_state(
             conn,
             &operation.id,
             state,
             error.map(|error| error.code.as_str()),
             error.map(|error| error.message.as_str()),
             error.is_some_and(|error| error.category == ErrorCategory::Conflict),
-        );
+        )?
+        .ok_or_else(|| {
+            VibexError::storage("vibex_use_operation_missing", "operation disappeared")
+        })?;
+        Ok(())
     }
 
     /// Renders the durable resources of an accepted operation.
@@ -993,6 +970,15 @@ impl VibexUseService {
         conn: &DbConnection,
         operation: &VibexUseOperation,
     ) -> VibexResult<serde_json::Value> {
+        let stored = VibexUseOperationRepository::get(conn, &operation.id)?
+            .unwrap_or_else(|| operation.clone());
+        let stored = self.refresh_cancel_operation(conn, stored)?;
+        let operation = &stored;
+        let actor = VibexUseActor::new(
+            operation.authority.clone(),
+            VibexSessionId::parse(&operation.actor_key)?,
+            self.activation_revision(),
+        );
         let mut tasks = Vec::new();
         let mut sessions = Vec::new();
         let mut groups = Vec::new();
@@ -1003,6 +989,15 @@ impl VibexUseService {
                 VibexUseResourceKind::Task => {
                     if let Some(task_id) = resource.reference.task_id()
                         && let Some(task) = AgentDelegationRepository::get(conn, &task_id)?
+                        && self
+                            .require_readable(
+                                conn,
+                                &actor,
+                                task.child_session_id
+                                    .as_ref()
+                                    .unwrap_or(&task.parent_session_id),
+                            )
+                            .is_ok()
                     {
                         tasks.push(self.task_view(conn, &task)?);
                     }
@@ -1025,7 +1020,7 @@ impl VibexUseService {
                 _ => {}
             }
         }
-        Ok(serde_json::json!({
+        let mut value = serde_json::json!({
             "operationRef": operation.operation_ref.as_uri(),
             "state": operation.state,
             "tool": operation.tool,
@@ -1039,7 +1034,27 @@ impl VibexUseService {
             "errorMessage": operation.error_message,
             "retryable": operation.retryable,
             "replayed": true,
-        }))
+        });
+        if let Some(response) = operation.checkpoint.get("response")
+            && let Ok(serde_json::Value::Object(response)) = serde_json::from_str(response)
+            && let Some(object) = value.as_object_mut()
+        {
+            for (key, value) in response {
+                object.entry(key).or_insert(value);
+            }
+        }
+        if operation.tool == VibexUseTool::CancelTask.name() {
+            value["cancelled"] = serde_json::json!(
+                operation.state == VibexUseOperationState::Succeeded
+                    && operation
+                        .checkpoint
+                        .get("cancellation_noop")
+                        .map(String::as_str)
+                        != Some("true")
+                    && !tasks.is_empty()
+            );
+        }
+        Ok(value)
     }
 
     fn get_operation(
@@ -1112,7 +1127,11 @@ impl VibexUseService {
             .root_session_id
             .clone()
             .unwrap_or_else(|| task.parent_session_id.clone());
-        let _ = conn;
+        let result_refs = VibexUseExecutionRepository::list_for_task(conn, &task.id)?
+            .into_iter()
+            .filter(DelegationExecution::is_settled)
+            .map(|execution| execution.result_ref())
+            .collect();
         Ok(DelegationTaskView {
             task_ref: VibexUseRef::task(&task.id),
             session_ref: task.child_session_id.as_ref().map(VibexUseRef::session),
@@ -1131,7 +1150,7 @@ impl VibexUseService {
                 .current_execution_id
                 .as_ref()
                 .map(VibexUseRef::execution),
-            result_refs: task.result_refs.clone(),
+            result_refs,
             acceptance_criteria: task.acceptance_criteria.clone(),
             requested_runtime: task.requested_runtime.clone(),
             effective_runtime: task.effective_runtime.clone(),
@@ -1181,7 +1200,13 @@ impl VibexUseService {
                 let Some(task) = AgentDelegationRepository::get(&conn, &task_id)? else {
                     continue;
                 };
-                self.require_readable(&conn, actor, &task.parent_session_id)?;
+                self.require_readable(
+                    &conn,
+                    actor,
+                    task.child_session_id
+                        .as_ref()
+                        .unwrap_or(&task.parent_session_id),
+                )?;
                 tasks.push(task);
             }
         } else {
@@ -1204,6 +1229,18 @@ impl VibexUseService {
             .iter()
             .filter(|task| include_finished || !task.phase().is_terminal())
         {
+            if !self
+                .resolve_scope(
+                    &conn,
+                    actor,
+                    task.child_session_id
+                        .as_ref()
+                        .unwrap_or(&task.parent_session_id),
+                )?
+                .can_read_content()
+            {
+                continue;
+            }
             views.push(self.task_view(&conn, task)?);
         }
         // A long-lived root can accumulate far more tasks than one page. The
@@ -1253,6 +1290,7 @@ impl VibexUseService {
                 VibexUseTool::CreateSession,
                 &caller_key,
                 &fingerprint,
+                arguments,
             )?
         };
         if !claimed {
@@ -1269,7 +1307,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
             self.resolve_workspace(&conn, workspace_ref.as_deref(), &capability)?
@@ -1290,13 +1328,15 @@ impl VibexUseService {
                 })?
                 .safety
         };
-        let selection = self.resolve_selection(actor, arguments).await?;
+        let selection = self
+            .operation_selection(&operation, actor, arguments)
+            .await?;
         // A session created with a first message takes the same declared
         // context a delegation would: creating a session and delegating work
         // are one workflow with one context rule, not two.
         let context_refs = {
             let conn = self.open()?;
-            match self.resolve_context(&conn, actor, arguments) {
+            match self.operation_context(&conn, &operation, actor, arguments) {
                 Ok(context_refs) => context_refs,
                 Err(error) => {
                     self.settle_operation(
@@ -1304,27 +1344,31 @@ impl VibexUseService {
                         &operation,
                         VibexUseOperationState::Failed,
                         Some(&error),
-                    );
+                    )?;
                     return Err(error);
                 }
             }
         };
-        let session_id = VibexSessionId::new();
-        let session = self
-            .manager
-            .create_session_deferred_with_id(
-                CreateAgentSessionRequest {
-                    session_id: None,
-                    defer_runtime_materialization: false,
-                    runtime: selection.clone(),
-                    workspace_root: workspace.root_path.clone(),
-                    workspace_mode: workspace.mode,
-                    title: Some(title.unwrap_or_else(|| "New Agent session".to_string())),
-                    safety: Some(parent_safety),
-                },
-                session_id.clone(),
-            )
-            .await;
+        let session_id = self.operation_session_id(&operation)?;
+        let existing = SessionRepository::get(&self.open()?, &session_id)?;
+        let session = if let Some(existing) = existing {
+            Ok(existing)
+        } else {
+            self.manager
+                .create_session_deferred_with_id(
+                    CreateAgentSessionRequest {
+                        session_id: None,
+                        defer_runtime_materialization: false,
+                        runtime: selection.clone(),
+                        workspace_root: workspace.root_path.clone(),
+                        workspace_mode: workspace.mode,
+                        title: Some(title.unwrap_or_else(|| "New Agent session".to_string())),
+                        safety: Some(parent_safety),
+                    },
+                    session_id.clone(),
+                )
+                .await
+        };
         let session = match session {
             Ok(session) => session,
             Err(error) => {
@@ -1334,7 +1378,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
@@ -1348,20 +1392,21 @@ impl VibexUseService {
                 &operation,
                 "session",
                 VibexUseRef::session(&session.id),
-            );
+            )?;
         }
 
         let mut execution_ref = None;
         if let Some(text) = first_message {
             let prompt_context = {
                 let conn = self.open()?;
-                self.render_context_block(&conn, &context_refs)?
+                self.operation_prompt_context(&conn, &operation, &context_refs)?
             };
             let message_key = format!("vibex-use:{}:first", operation.id.as_str());
             let submission_id =
                 match self
                     .require_coordinator()?
                     .prepare_submission(SendAgentMessageRequest {
+                        mentions: Vec::new(),
                         session_id: session.id.clone(),
                         message_idempotency_key: message_key.clone(),
                         desired_runtime: selection.clone(),
@@ -1386,28 +1431,17 @@ impl VibexUseService {
                             &operation,
                             VibexUseOperationState::Failed,
                             Some(&error),
-                        );
+                        )?;
                         return Err(error);
                     }
                 };
             let conn = self.open()?;
-            let execution = self.record_execution(
-                &conn,
-                None,
-                &session.id,
-                &submission_id,
-                &message_key,
-                MessageProvenance::DelegatedInput {
-                    actor_session_ref: VibexUseRef::session(&actor.session_id),
-                    task_ref: None,
-                    operation_ref: operation.operation_ref.clone(),
-                },
-            )?;
+            let execution = self.accepted_execution(&conn, &submission_id)?;
             execution_ref = Some(execution.execution_ref);
         }
         {
             let conn = self.open()?;
-            self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+            self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
         }
         self.notify_progress();
         Ok(serde_json::json!({
@@ -1433,6 +1467,14 @@ impl VibexUseService {
             required_string(arguments, "idempotencyKey", VIBEX_USE_IDEMPOTENCY_KEY_CHARS)?;
         let task_object = arguments.get("task").cloned().unwrap_or_default();
         let prompt = required_string(&task_object, "prompt", 64 * 1024)?;
+        let attachments: Vec<vibex_core::MessageAttachment> = arguments
+            .get("attachments")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| {
+                VibexError::validation(use_codes::REQUEST_INVALID, "attachments are invalid")
+            })?
+            .unwrap_or_default();
         let title = optional_string(&task_object, "title", VIBEX_USE_TITLE_CHARS)
             .unwrap_or_else(|| "Delegated task".to_string());
         let criteria = string_array(&task_object, "acceptanceCriteria", 16, 512);
@@ -1453,22 +1495,28 @@ impl VibexUseService {
             VibexUseTool::Delegate,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
         }
         let capability = self.capability_on(&conn, actor)?;
-        if !capability.can_delegate {
+        let reserved_task = AgentDelegationRepository::get_by_parent_and_idempotency(
+            &conn,
+            &actor.session_id,
+            &format!("{}:{}", operation.id.as_str(), caller_key),
+        )?;
+        if !capability.can_delegate && reserved_task.is_none() {
             let error = budget_error(&capability);
             self.settle_operation(
                 &conn,
                 &operation,
                 VibexUseOperationState::Failed,
                 Some(&error),
-            );
+            )?;
             return Err(error);
         }
-        let selection = match self.resolve_selection(actor, arguments).await {
+        let selection = match self.operation_selection(&operation, actor, arguments).await {
             Ok(selection) => selection,
             Err(error) => {
                 self.settle_operation(
@@ -1476,11 +1524,11 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
-        let context_refs = match self.resolve_context(&conn, actor, arguments) {
+        let context_refs = match self.operation_context(&conn, &operation, actor, arguments) {
             Ok(context_refs) => context_refs,
             Err(error) => {
                 self.settle_operation(
@@ -1488,7 +1536,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
@@ -1533,7 +1581,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         }
@@ -1545,30 +1593,23 @@ impl VibexUseService {
                 let reference =
                     parse_ref(&session_spec, "sessionRef", VibexUseResourceKind::Session)?;
                 let session_id = session_reference(&reference)?;
-                let scope = match self.require_writable(&conn, actor, &session_id) {
-                    Ok(scope) => scope,
+                if session_id == actor.session_id {
+                    return Err(VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "a session cannot delegate a task to itself",
+                    ));
+                }
+                match self.require_writable(&conn, actor, &session_id) {
+                    Ok(_) => {}
                     Err(error) => {
                         self.settle_operation(
                             &conn,
                             &operation,
                             VibexUseOperationState::Failed,
                             Some(&error),
-                        );
+                        )?;
                         return Err(error);
                     }
-                };
-                if scope == VibexUseScope::Owned {
-                    let error = VibexError::validation(
-                        use_codes::REQUEST_INVALID,
-                        "that session already belongs to the caller; delegate a new session instead",
-                    );
-                    self.settle_operation(
-                        &conn,
-                        &operation,
-                        VibexUseOperationState::Failed,
-                        Some(&error),
-                    );
-                    return Err(error);
                 }
                 Some(session_id)
             }
@@ -1583,7 +1624,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
@@ -1595,6 +1636,7 @@ impl VibexUseService {
                 &operation,
                 &session_id,
                 &prompt,
+                &attachments,
                 &title,
                 &selection,
                 completion_policy,
@@ -1609,15 +1651,17 @@ impl VibexUseService {
                         &operation,
                         VibexUseOperationState::Failed,
                         Some(&error),
-                    );
+                    )?;
                     return Err(error);
                 }
             }
         } else {
+            let prompt_context = self.operation_prompt_context(&conn, &operation, &context_refs)?;
             let request = CreateAgentDelegationRequest {
                 parent_session_id: actor.session_id.clone(),
                 idempotency_key: format!("{}:{}", operation.id.as_str(), caller_key),
                 task: prompt,
+                attachments,
                 title: Some(title),
                 agent_id: Some(selection.agent_id.clone()),
                 provider_profile_id: selection.provider_profile_id().cloned(),
@@ -1630,6 +1674,9 @@ impl VibexUseService {
                 acceptance_criteria: criteria,
                 follows_task_id,
                 existing_session_id: None,
+                runtime_selection: Some(selection.clone()),
+                prompt_context,
+                operation_id: Some(operation.id.clone()),
             };
             match self.manager.create_task_delegation(request).await {
                 Ok(started) => started,
@@ -1639,7 +1686,7 @@ impl VibexUseService {
                         &operation,
                         VibexUseOperationState::Failed,
                         Some(&error),
-                    );
+                    )?;
                     return Err(error);
                 }
             }
@@ -1650,18 +1697,28 @@ impl VibexUseService {
             &operation,
             "task",
             VibexUseRef::task(&started.delegation.id),
-        );
+        )?;
         self.record_operation_resource(
             &conn,
             &operation,
             "session",
             VibexUseRef::session(&started.child_session_id),
-        );
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+        )?;
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
         let _ = self.record_accepted_event(&conn, &started.delegation);
-        let presentation = self.apply_presentation(actor, &operation, arguments).await;
+        let (presentation, presentation_error) =
+            match self.apply_presentation(actor, &operation, arguments).await {
+                Ok(outcome) => (outcome, None),
+                Err(error) => (None, Some(error)),
+            };
         self.notify_progress();
-        Ok(self.acceptance_value(&conn, &operation, &started.delegation, presentation))
+        let mut accepted =
+            self.acceptance_value(&conn, &operation, &started.delegation, presentation);
+        if let Some(error) = presentation_error {
+            accepted["presentationError"] =
+                serde_json::json!({"code": error.code, "message": error.message});
+        }
+        Ok(accepted)
     }
 
     /// Registers a task over a session that already exists.
@@ -1677,6 +1734,7 @@ impl VibexUseService {
         operation: &VibexUseOperation,
         session_id: &VibexSessionId,
         prompt: &str,
+        attachments: &[vibex_core::MessageAttachment],
         title: &str,
         selection: &SessionRuntimeSelection,
         completion_policy: DelegationCompletionPolicy,
@@ -1702,7 +1760,12 @@ impl VibexUseService {
         task.child_session_id = Some(session_id.clone());
         task.completion_policy = completion_policy;
         task.phase = DelegationTaskPhase::Active;
-        task.ownership_kind = DelegationOwnershipKind::ControlledExisting;
+        task.ownership_kind =
+            if self.resolve_scope(conn, actor, session_id)? == VibexUseScope::Owned {
+                DelegationOwnershipKind::OwnedChild
+            } else {
+                DelegationOwnershipKind::ControlledExisting
+            };
         task.root_session_id = Some(root);
         task.follows_task_id = follows_task_id;
         task.context_refs = context_refs.clone();
@@ -1715,16 +1778,21 @@ impl VibexUseService {
             vibex_db::AgentDelegationReservation::Claimed(task)
             | vibex_db::AgentDelegationReservation::Existing(task) => task,
         };
-        let prompt_context = self.render_context_block(&self.open()?, &context_refs)?;
+        let prompt_context = vibex_agent::manager::delegation_prompt_context(
+            self.operation_prompt_context(&self.open()?, operation, &context_refs)?
+                .as_deref(),
+            &task.acceptance_criteria,
+        );
         let message_key = format!("vibex-use:{}:first", operation.id.as_str());
         let submission_id =
             self.require_coordinator()?
                 .prepare_submission(SendAgentMessageRequest {
+                    mentions: Vec::new(),
                     session_id: session_id.clone(),
                     message_idempotency_key: message_key.clone(),
                     desired_runtime: selection.clone(),
                     text: prompt.to_string(),
-                    attachments: Vec::new(),
+                    attachments: attachments.to_vec(),
                     reasoning_effort: selection.reasoning_effort.clone(),
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
@@ -1735,25 +1803,7 @@ impl VibexUseService {
                         operation_ref: operation.operation_ref.clone(),
                     },
                 })?;
-        let execution = self.record_execution(
-            conn,
-            Some(&task),
-            session_id,
-            &submission_id,
-            &message_key,
-            MessageProvenance::DelegatedInput {
-                actor_session_ref: VibexUseRef::session(&actor.session_id),
-                task_ref: Some(VibexUseRef::task(&task.id)),
-                operation_ref: operation.operation_ref.clone(),
-            },
-        )?;
-        let _ = SessionControllerRepository::claim(
-            conn,
-            session_id,
-            &task.id,
-            &actor.session_id,
-            None,
-        )?;
+        let execution = self.accepted_execution(conn, &submission_id)?;
         Ok(DelegationStartOutcome {
             delegation: task,
             child_session_id: session_id.clone(),
@@ -1762,58 +1812,21 @@ impl VibexUseService {
         })
     }
 
-    /// Enqueues one execution record for a submission that is already durable.
-    fn record_execution(
+    /// Observes the execution that committed atomically with its submission.
+    fn accepted_execution(
         &self,
         conn: &DbConnection,
-        task: Option<&AgentDelegation>,
-        session_id: &VibexSessionId,
         submission_id: &MessageSubmissionId,
-        input_idempotency_key: &str,
-        provenance: MessageProvenance,
     ) -> VibexResult<DelegationExecution> {
-        let now = unix_timestamp_ms();
-        // The runtime snapshot a message is admitted under is recorded with the
-        // execution, so an execution can be explained later even after the
-        // session has been switched to another configuration.
-        let runtime_selection_revision = self
-            .runtime_catalog_revision(conn, session_id)
-            .unwrap_or_default();
-        let execution = DelegationExecution {
-            id: VibexExecutionId::new(),
-            execution_ref: VibexUseRef::new(VibexUseResourceKind::Execution, ""),
-            task_ref: task.map(|task| VibexUseRef::task(&task.id)),
-            session_ref: VibexUseRef::session(session_id),
-            submission_id: submission_id.clone(),
-            input_idempotency_key: input_idempotency_key.to_string(),
-            provenance,
-            start_sequence: None,
-            end_sequence: None,
-            runtime_selection_revision,
-            outcome: ExecutionOutcome::Queued,
-            error_code: None,
-            stop_reason: None,
-            summary: None,
-            result_ranges: Vec::new(),
-            artifact_refs: Vec::new(),
-            usage: ExecutionUsageState::Unknown,
-            truncated: false,
-            blocked_on: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-            finished_at_ms: None,
-        };
-        let execution = DelegationExecution {
-            execution_ref: VibexUseRef::execution(&execution.id),
-            ..execution
-        };
-        let (stored, _) = VibexUseExecutionRepository::insert_or_get(conn, &execution)?;
-        if let Some(task) = task {
-            let mut task = task.clone();
-            task.current_execution_id = Some(stored.id.clone());
-            vibex_db::update_delegation_vibex_use_fields(conn, &task)?;
-        }
-        Ok(stored)
+        let execution = VibexUseExecutionRepository::get_by_submission(conn, submission_id)?
+            .ok_or_else(|| {
+                VibexError::storage(
+                    "vibex_use_execution_missing",
+                    "accepted input has no execution",
+                )
+            })?;
+        self.manager.start_execution_observer(&execution.id)?;
+        Ok(execution)
     }
 
     fn record_accepted_event(
@@ -1827,7 +1840,7 @@ impl VibexUseService {
             .unwrap_or_else(|| task.parent_session_id.clone());
         VibexUseEventRepository::append(
             conn,
-            &format!("task_accepted_{}", vibex_core::EventId::new().as_str()),
+            &DelegationTaskEventKind::TaskAccepted.stable_id(&task.id, None),
             Some(&root),
             DelegationTaskEventKind::TaskAccepted,
             Some(&task.id),
@@ -1911,118 +1924,243 @@ impl VibexUseService {
     // Presentation
     // -----------------------------------------------------------------------
 
-    /// Applies the optional `presentation` block of one delegate request.
-    ///
-    /// A presentation failure never fails the task. The group reference is kept
-    /// so a caller can retry the display without starting a second team.
+    /// A presentation failure is reported separately from accepted execution.
     async fn apply_presentation(
         &self,
         actor: &VibexUseActor,
         operation: &VibexUseOperation,
         arguments: &serde_json::Value,
-    ) -> Option<PresentationOutcome> {
-        let command = self.presentation_command(actor, operation, arguments)?;
-        Some(self.present_record(command).await)
+    ) -> VibexResult<Option<PresentationOutcome>> {
+        let Some((record, command)) = self.presentation_command(actor, operation, arguments)?
+        else {
+            return Ok(None);
+        };
+        let outcome = self.present_record(command).await;
+        let outcome = self.record_presentation_outcome(&record, &outcome)?;
+        Ok(Some(outcome))
     }
 
-    /// Builds the display request for one delegate call, if it asked for one.
-    ///
-    /// The database work finishes before anything is awaited, so the caller's
-    /// future never holds a connection across the bridge round-trip.
+    fn record_presentation_outcome(
+        &self,
+        record: &GroupPresentationRecord,
+        outcome: &PresentationOutcome,
+    ) -> VibexResult<PresentationOutcome> {
+        let applied = outcome
+            .applied_layout
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(internal_encode_error)?;
+        let conn = self.open()?;
+        let recorded = GroupPresentationRepository::record_presentation(
+            &conn,
+            &record.group_id,
+            record.revision,
+            presentation_state_to_db(outcome.state),
+            applied.as_ref(),
+            outcome.reason.map(|reason| reason.as_str()),
+            matches!(
+                outcome.state,
+                PresentationState::Applied | PresentationState::Presented
+            )
+            .then_some(outcome.revision),
+        )?;
+        let mut outcome = outcome.clone();
+        if recorded.is_none() {
+            outcome.state = PresentationState::Deferred;
+            outcome.reason = None;
+            outcome.applied_layout = None;
+            outcome.message =
+                Some("the group changed while the display request was pending".to_string());
+            if let Some(current) = GroupPresentationRepository::get(&conn, &record.group_id)? {
+                outcome.revision = current.presentation_revision();
+            }
+        }
+        self.manager.observability().increment(
+            RuntimeMetricName::DelegationPresentation,
+            None,
+            match outcome.state {
+                PresentationState::Applied | PresentationState::Presented => {
+                    RuntimeMetricResult::Success
+                }
+                PresentationState::Created | PresentationState::Prepared => {
+                    RuntimeMetricResult::Created
+                }
+                PresentationState::Deferred => RuntimeMetricResult::Waited,
+                PresentationState::Unavailable => RuntimeMetricResult::Unsupported,
+            },
+        );
+        Ok(outcome)
+    }
+
+    /// Reads the operation after acceptance, so automatic membership includes
+    /// the actual worker persisted by the execution path.
     fn presentation_command(
         &self,
         actor: &VibexUseActor,
         operation: &VibexUseOperation,
         arguments: &serde_json::Value,
-    ) -> Option<GroupPresentationCommand> {
-        let conn = self.open().ok()?;
-        let presentation = arguments.get("presentation")?;
-        let group_ref = optional_string(presentation, "groupRef", 256);
+    ) -> VibexResult<Option<(GroupPresentationRecord, GroupPresentationCommand)>> {
+        let Some(presentation) = arguments.get("presentation") else {
+            return Ok(None);
+        };
+        let group_ref = parse_optional_ref(presentation, "groupRef", VibexUseResourceKind::Group)?;
         let group_name = optional_string(presentation, "groupName", VIBEX_USE_TITLE_CHARS);
         let present = optional_bool(presentation, "present", false);
         if group_ref.is_none() && group_name.is_none() {
-            return None;
+            return Ok(None);
         }
+        let conn = self.open()?;
+        let operation =
+            VibexUseOperationRepository::get(&conn, &operation.id)?.ok_or_else(|| {
+                VibexError::storage("vibex_use_operation_missing", "operation not found")
+            })?;
         let mut session_ids = vec![actor.session_id.clone()];
-        if let Some(task_id) = operation
-            .resources
-            .iter()
-            .find(|resource| resource.kind == "task")
-            .and_then(|resource| resource.reference.task_id())
-            && let Ok(Some(task)) = AgentDelegationRepository::get(&conn, &task_id)
-            && let Some(child) = task.child_session_id
-        {
-            session_ids.push(child);
+        for resource in &operation.resources {
+            if let Some(session_id) = resource.reference.session_id()
+                && !session_ids.contains(&session_id)
+            {
+                session_ids.push(session_id);
+            }
         }
-        match group_ref {
-            Some(reference) => {
-                let parsed = VibexUseRef::parse(&reference)?;
-                let group_id = parsed.group_id()?;
-                let record = GroupPresentationRepository::get(&conn, group_id.as_str())
-                    .ok()
-                    .flatten()?;
-                let mut members = record.member_session_ids.clone();
-                for session_id in session_ids {
-                    if !members.contains(&session_id) {
-                        members.push(session_id);
-                    }
+        let record = if let Some(reference) = group_ref {
+            let group_id = reference.group_id().ok_or_else(|| {
+                VibexError::validation(use_codes::REQUEST_INVALID, "groupRef is invalid")
+            })?;
+            let record = GroupPresentationRepository::get(&conn, group_id.as_str())?
+                .ok_or_else(group_not_found)?;
+            if record.actor_key != actor.session_id.as_str() || !record.created_by_caller {
+                return Err(group_not_found());
+            }
+            let mut members = record.member_session_ids.clone();
+            for session_id in session_ids {
+                if !members.contains(&session_id) {
+                    members.push(session_id);
                 }
-                let updated = GroupPresentationRepository::update(
+            }
+            self.validate_group_definition(
+                &conn,
+                Some(actor),
+                &record.workspace_id,
+                &members,
+                &record.layout,
+            )?;
+            let expected = optional_u64(presentation, "expectedRevision")
+                .unwrap_or(record.presentation_revision());
+            if expected != record.presentation_revision() {
+                return Err(group_revision_conflict());
+            }
+            if members == record.member_session_ids {
+                record
+            } else {
+                GroupPresentationRepository::update(
                     &conn,
                     group_id.as_str(),
-                    None,
+                    Some(expected),
                     None,
                     Some(&members),
                     None,
-                )
-                .ok()
-                .flatten()?;
-                Some(record_group_command(&updated, present))
+                )?
+                .ok_or_else(group_revision_conflict)?
             }
-            None => {
-                let name = group_name?;
-                let workspace = self
-                    .capability_on(&conn, actor)
-                    .ok()
-                    .map(|capability| capability.current_workspace_ref)?;
-                let layout = SessionGroupLayoutIntent {
-                    preset: SessionGroupLayoutPreset::LeadAndWorkers,
-                    lead_session_ref: Some(VibexUseRef::session(&actor.session_id)),
-                    preferred_live_panes: Some(session_ids.len().min(VIBEX_USE_MAX_LIVE_PANES)),
-                };
-                let scope = SessionGroupScope::Workspace {
-                    workspace_ref: workspace,
-                };
-                let fingerprint = fingerprint_of(&[
-                    operation.id.as_str(),
-                    &name,
-                    &session_ids
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect::<Vec<String>>()
-                        .join(","),
-                ]);
-                let group_id = SessionGroupId::new();
-                let record = GroupPresentationRepository::reserve_or_get(
-                    &conn,
-                    Some(&operation.id),
-                    &operation.actor_key,
-                    group_id.as_str(),
-                    &scope,
-                    &name,
-                    &session_ids,
-                    &layout,
-                    &fingerprint,
+        } else {
+            let name = group_name.expect("a name or reference was required above");
+            let workspace = self.capability_on(&conn, actor)?.current_workspace_ref;
+            let layout = SessionGroupLayoutIntent {
+                preset: SessionGroupLayoutPreset::LeadAndWorkers,
+                lead_session_ref: Some(VibexUseRef::session(&actor.session_id)),
+                preferred_live_panes: Some(session_ids.len().min(VIBEX_USE_MAX_LIVE_PANES)),
+            };
+            self.validate_group_definition(
+                &conn,
+                Some(actor),
+                &workspace.id,
+                &session_ids,
+                &layout,
+            )?;
+            let scope = SessionGroupScope::Workspace {
+                workspace_ref: workspace,
+            };
+            let fingerprint = fingerprint_of(&[operation.id.as_str(), &name]);
+            let group_id = SessionGroupId::new();
+            match GroupPresentationRepository::reserve_or_get(
+                &conn,
+                Some(&operation.id),
+                &operation.actor_key,
+                group_id.as_str(),
+                &scope,
+                &name,
+                &session_ids,
+                &layout,
+                &fingerprint,
+            )? {
+                GroupPresentationReservation::Claimed(record)
+                | GroupPresentationReservation::Existing(record) => record,
+                GroupPresentationReservation::Conflict(_) => return Err(group_revision_conflict()),
+            }
+        };
+        self.record_operation_resource(
+            &conn,
+            &operation,
+            "group",
+            VibexUseRef::group(&record.group_id),
+        )?;
+        let command = record_group_command(&record, present);
+        Ok(Some((record, command)))
+    }
+
+    fn validate_group_definition(
+        &self,
+        conn: &DbConnection,
+        actor: Option<&VibexUseActor>,
+        workspace_id: &str,
+        members: &[VibexSessionId],
+        layout: &SessionGroupLayoutIntent,
+    ) -> VibexResult<()> {
+        if members.is_empty() || members.len() > VIBEX_USE_MAX_GROUP_MEMBERS {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "group member count is invalid",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for member in members {
+            if !seen.insert(member) {
+                return Err(VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    "group members must be unique",
+                ));
+            }
+            if let Some(actor) = actor {
+                self.require_readable(conn, actor, member)?;
+            }
+            let session = SessionRepository::get(conn, member)?.ok_or_else(group_not_found)?;
+            if session.workspace_id.as_str() != workspace_id {
+                return Err(VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    "every member must belong to the group's workspace",
                 )
-                .ok()?;
-                let record = match record {
-                    GroupPresentationReservation::Claimed(record)
-                    | GroupPresentationReservation::Existing(record) => record,
-                    GroupPresentationReservation::Conflict(existing) => existing,
-                };
-                Some(record_group_command(&record, present))
+                .with_diagnostic("reason", "cross_workspace_unsupported"));
             }
         }
+        if let Some(reference) = &layout.lead_session_ref
+            && !members.contains(&session_reference(reference)?)
+        {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "the lead session must be a group member",
+            ));
+        }
+        if layout
+            .preferred_live_panes
+            .is_some_and(|count| count == 0 || count > VIBEX_USE_MAX_LIVE_PANES)
+        {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "the live pane count is outside the supported range",
+            ));
+        }
+        Ok(())
     }
 
     async fn present_record(&self, command: GroupPresentationCommand) -> PresentationOutcome {
@@ -2140,6 +2278,7 @@ impl VibexUseService {
             VibexUseTool::CreateGroup,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
@@ -2152,7 +2291,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
@@ -2164,11 +2303,18 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
         let layout = parse_layout_intent(arguments)?;
+        let SessionGroupScope::Workspace { workspace_ref } = &scope else {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "group workspace is required",
+            ));
+        };
+        self.validate_group_definition(&conn, Some(actor), &workspace_ref.id, &members, &layout)?;
         let group_id = SessionGroupId::new();
         let reservation = GroupPresentationRepository::reserve_or_get(
             &conn,
@@ -2197,8 +2343,8 @@ impl VibexUseService {
             &operation,
             "group",
             VibexUseRef::group(&record.group_id),
-        );
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+        )?;
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
 
         // Without a display client the definition is still stored: a headless
         // runtime must not claim it drew anything, and it must not lose the
@@ -2218,17 +2364,8 @@ impl VibexUseService {
                 revision: record.revision,
             }
         };
-        let record = GroupPresentationRepository::record_presentation(
-            &conn,
-            &record.group_id,
-            presentation_state_to_db(outcome.state),
-            None,
-            outcome.reason.map(|reason| reason.as_str()),
-            (outcome.state == PresentationState::Applied
-                || outcome.state == PresentationState::Presented)
-                .then_some(outcome.revision),
-        )?
-        .unwrap_or(record);
+        let outcome = self.record_presentation_outcome(&record, &outcome)?;
+        let record = GroupPresentationRepository::get(&conn, &record.group_id)?.unwrap_or(record);
         Ok(serde_json::json!({
             "groupRef": VibexUseRef::group(&record.group_id).as_uri(),
             "state": outcome.state,
@@ -2241,7 +2378,7 @@ impl VibexUseService {
                 .map(|reference| reference.as_uri())
                 .collect::<Vec<String>>(),
             "layout": record.layout,
-            "revision": record.revision,
+            "revision": record.presentation_revision(),
             "operationRef": operation.operation_ref.as_uri(),
         }))
     }
@@ -2262,6 +2399,7 @@ impl VibexUseService {
             VibexUseTool::UpdateGroup,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
@@ -2296,10 +2434,17 @@ impl VibexUseService {
         } else {
             None
         };
+        self.validate_group_definition(
+            &conn,
+            Some(actor),
+            &record.workspace_id,
+            members.as_deref().unwrap_or(&record.member_session_ids),
+            layout.as_ref().unwrap_or(&record.layout),
+        )?;
         let updated = GroupPresentationRepository::update(
             &conn,
             group_id.as_str(),
-            expected_revision,
+            Some(expected_revision.unwrap_or(record.presentation_revision())),
             name.as_deref(),
             members.as_deref(),
             layout.as_ref(),
@@ -2310,22 +2455,24 @@ impl VibexUseService {
                 "the group changed since it was read; read it again before updating",
             )
         })?;
-        if optional_bool(arguments, "releaseOwnership", false) {
-            GroupPresentationRepository::release_to_user(&conn, group_id.as_str())?;
-        }
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
-        let state = if self.presentation.is_attached() {
-            let outcome = self
-                .present_record(record_group_command(&updated, false))
-                .await;
-            outcome.state
+        self.record_operation_resource(&conn, &operation, "group", group_ref)?;
+        let outcome = self
+            .present_record(record_group_command(&updated, false))
+            .await;
+        let outcome = self.record_presentation_outcome(&updated, &outcome)?;
+        let updated = if optional_bool(arguments, "releaseOwnership", false) {
+            GroupPresentationRepository::release_to_user(&conn, group_id.as_str())?
+                .unwrap_or(updated)
         } else {
-            PresentationState::Prepared
+            GroupPresentationRepository::get(&conn, group_id.as_str())?.unwrap_or(updated)
         };
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
         Ok(serde_json::json!({
             "groupRef": VibexUseRef::group(&updated.group_id).as_uri(),
-            "state": state,
-            "revision": updated.revision,
+            "state": outcome.state,
+            "reason": outcome.reason,
+            "appliedLayout": outcome.applied_layout,
+            "revision": updated.presentation_revision(),
             "members": updated
                 .member_session_ids
                 .iter()
@@ -2351,6 +2498,7 @@ impl VibexUseService {
             VibexUseTool::PresentGroup,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
@@ -2401,6 +2549,7 @@ impl VibexUseService {
         GroupPresentationRepository::record_presentation(
             &conn,
             &record.group_id,
+            record.revision,
             presentation_state_to_db(outcome.state),
             applied.as_ref(),
             outcome.reason.map(|reason| reason.as_str()),
@@ -2408,7 +2557,7 @@ impl VibexUseService {
                 || outcome.state == PresentationState::Presented)
                 .then_some(outcome.revision),
         )?;
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
         serde_json::to_value(outcome).map_err(internal_encode_error)
     }
 
@@ -2428,6 +2577,7 @@ impl VibexUseService {
             VibexUseTool::DissolveGroup,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
@@ -2462,7 +2612,7 @@ impl VibexUseService {
         if self.presentation.is_attached() {
             let _ = self.presentation.dissolve(&group_id).await;
         }
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
         Ok(serde_json::json!({
             "groupRef": group_ref.as_uri(),
             "dissolved": true,
@@ -2558,10 +2708,12 @@ impl VibexUseService {
         {
             let mut foreign = Vec::new();
             for entry in members.iter().take(VIBEX_USE_MAX_GROUP_MEMBERS) {
-                let Ok(session_ref) = parse_ref(entry, "sessionRef", VibexUseResourceKind::Session)
-                else {
-                    continue;
-                };
+                let session_ref = entry.as_str().and_then(VibexUseRef::parse).ok_or_else(|| {
+                    VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "group session reference is invalid",
+                    )
+                })?;
                 let Ok(session_id) = session_reference(&session_ref) else {
                     continue;
                 };
@@ -2614,6 +2766,10 @@ impl VibexUseService {
                 && model.is_none()
                 && reasoning_effort.is_none()
                 && mode_id.is_none()
+                && target.get("providerProfileId").is_none()
+                && target.get("authSource").is_none()
+                && target.get("modelSelection").is_none()
+                && target.get("configValues").is_none()
             {
                 // A legacy-shaped call inherits the caller's effective runtime.
                 let conn = self.open()?;
@@ -2669,7 +2825,12 @@ impl VibexUseService {
             )
             .with_diagnostic("reason", reason.as_str()));
         }
-        Ok(option.selection.clone())
+        selection::select_option(option, &target)?.ok_or_else(|| {
+            VibexError::validation(
+                use_codes::TARGET_UNAVAILABLE,
+                "target fields conflict with selectionRef",
+            )
+        })
     }
 
     /// Resolves a selection the caller named field by field.
@@ -2684,8 +2845,8 @@ impl VibexUseService {
         target: &serde_json::Value,
         agent_id: Option<&str>,
         model: Option<&str>,
-        reasoning_effort: Option<&str>,
-        mode_id: Option<&str>,
+        _reasoning_effort: Option<&str>,
+        _mode_id: Option<&str>,
     ) -> VibexResult<SessionRuntimeSelection> {
         let catalog = self.runtime_catalog.list().await?;
         if let Some(expected) = optional_u64(target, "catalogRevision")
@@ -2716,18 +2877,11 @@ impl VibexUseService {
             {
                 continue;
             }
-            if let Some(reasoning) = reasoning_effort
-                && option.selection.reasoning_effort.as_deref() != Some(reasoning)
+            if runtime_option_unavailable(option).is_none()
+                && let Some(selection) = selection::select_option(option, target)?
+                && !candidates.contains(&selection)
             {
-                continue;
-            }
-            if let Some(mode) = mode_id
-                && option.selection.mode_id.as_deref() != Some(mode)
-            {
-                continue;
-            }
-            if runtime_option_unavailable(option).is_none() {
-                candidates.push(option);
+                candidates.push(selection);
             }
         }
         match candidates.len() {
@@ -2736,7 +2890,7 @@ impl VibexUseService {
                 use_codes::TARGET_UNAVAILABLE,
                 "no enabled configuration matches that target",
             )),
-            1 => Ok(candidates[0].selection.clone()),
+            1 => Ok(candidates[0].clone()),
             _ => Err(VibexError::conflict(
                 use_codes::TARGET_UNAVAILABLE,
                 "several configurations match that target; choose one with selectionRef",
@@ -2745,25 +2899,13 @@ impl VibexUseService {
                 "candidates",
                 candidates
                     .iter()
-                    .map(|option| runtime_option_ref(option))
+                    .map(|selection| {
+                        VibexUseRef::runtime_option(&selection_fingerprint(selection)).as_uri()
+                    })
                     .collect::<Vec<String>>()
                     .join(","),
             )),
         }
-    }
-
-    /// The runtime selection revision a session was last resolved to.
-    ///
-    /// It comes from the durable runtime state rather than from a live
-    /// catalogue read: an execution records the revision it actually ran under,
-    /// not whichever revision happens to be current when somebody looks.
-    fn runtime_catalog_revision(
-        &self,
-        conn: &DbConnection,
-        session_id: &VibexSessionId,
-    ) -> Option<u64> {
-        let state = AgentSessionRuntimeRepository::get_runtime_state(conn, session_id).ok()??;
-        Some(u64::try_from(state.selection_revision).unwrap_or_default())
     }
 
     /// The runtime option reference of a session's *effective* configuration.
@@ -2794,66 +2936,37 @@ impl VibexUseService {
         if refs.is_empty() {
             return Ok(None);
         }
-        let mut rendered = vec![
-            "The user declared the context below for this request. It is the whole of what you \
-             were given from those conversations."
-                .to_string(),
-        ];
-        for reference in refs.iter().take(VIBEX_USE_MAX_CONTEXT_REFS) {
-            let session_id = session_reference(&reference.session_ref)?;
-            let session = SessionRepository::get(conn, &session_id)?;
-            let label = session
-                .as_ref()
-                .map(|session| session.title.clone())
-                .unwrap_or_else(|| session_id.as_str().to_string());
-            let window = match (reference.from_sequence, reference.through_sequence) {
-                (Some(from), Some(through)) if through >= from && from > 0 => {
-                    TimelineRepository::fetch_range(conn, &session_id, from, through)?
-                }
-                (Some(from), _) => {
-                    TimelineRepository::fetch_after(conn, &session_id, Some(from), 200)?.items
-                }
-                (None, Some(through)) => {
-                    TimelineRepository::fetch_before(conn, &session_id, Some(through), 200)?.items
-                }
-                (None, None) => TimelineRepository::fetch_after(conn, &session_id, None, 50)?.items,
+        let mut rendered = vec!["Declared context for this task:".to_string()];
+        for reference in refs {
+            if reference.included_chars == 0 {
+                continue;
+            }
+            let cursor = match reference.read_cursor.clone() {
+                Some(cursor) => cursor,
+                None => parse_read_cursor(
+                    conn,
+                    &serde_json::json!({
+                        "fromSequence": reference.from_sequence, "throughSequence": reference.through_sequence,
+                        "view": reference.view.unwrap_or_default(),
+                    }),
+                    &reference.session_ref,
+                )?,
             };
-            let view = reference.view.unwrap_or(SessionReadView::Conversation);
-            rendered.push(format!(
-                "--- {} ({}..{}) ---",
-                label,
-                reference
-                    .from_sequence
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "start".to_string()),
-                reference
-                    .through_sequence
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "end".to_string()),
-            ));
-            let mut budget = VIBEX_USE_MAX_READ_CHARS;
-            for item in window.iter() {
-                if !view_includes(view, item) {
-                    continue;
-                }
-                let Some(text) = item_text(item) else {
-                    continue;
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let (bounded, cut) = bounded_chars(&text, budget.min(8_000));
-                budget = budget.saturating_sub(bounded.chars().count());
-                rendered.push(format!(
-                    "[{}] {}{}",
-                    item.sequence,
-                    bounded,
-                    if cut { " […truncated]" } else { "" }
-                ));
-                if budget == 0 {
-                    rendered.push("[the declared window was truncated]".to_string());
-                    break;
-                }
+            let page = self.session_read_page(
+                conn,
+                &reference.session_ref,
+                cursor,
+                &serde_json::json!({
+                    "maxItems": if reference.max_items == 0 { VIBEX_USE_DEFAULT_READ_ITEMS } else { reference.max_items },
+                    "maxChars": reference.included_chars,
+                }),
+            )?;
+            rendered.push(format!("--- {} ---", reference.session_ref.as_uri()));
+            for item in page.items {
+                rendered.push(format!("[{}] {}", item.sequence, item.text));
+            }
+            if reference.truncated {
+                rendered.push("[Context was truncated to its declared budget.]".to_string());
             }
         }
         Ok(Some(rendered.join("\n")))
@@ -2944,33 +3057,59 @@ impl VibexUseService {
             ));
         }
         let mut refs = Vec::new();
+        let mut remaining = VIBEX_USE_MAX_READ_CHARS;
         for entry in entries {
             let session_ref = parse_ref(entry, "sessionRef", VibexUseResourceKind::Session)?;
             let session_id = session_reference(&session_ref)?;
             self.require_readable(conn, actor, &session_id)?;
-            let cursor = parse_read_cursor(conn, entry, &session_ref)?;
-            let page = self.session_read_page(conn, &session_ref, cursor.clone(), entry)?;
-            let (from, through) = match cursor.anchor {
-                SessionReadAnchor::After { sequence } => {
-                    (Some(sequence), Some(page.snapshot_end_sequence))
-                }
-                SessionReadAnchor::Before { sequence } => (None, Some(sequence)),
-                SessionReadAnchor::Latest => (
-                    page.items.first().map(|item| item.sequence),
-                    page.items.last().map(|item| item.sequence),
-                ),
-            };
+            let mut cursor = parse_read_cursor(conn, entry, &session_ref)?;
+            cursor.snapshot_end_sequence =
+                Some(TimelineRepository::latest_sequence(conn, &session_id)?);
+            let budget = bounded_usize(
+                entry,
+                "maxChars",
+                VIBEX_USE_DEFAULT_READ_CHARS,
+                VIBEX_USE_MAX_READ_CHARS,
+            )
+            .min(remaining);
+            if budget == 0 {
+                refs.push(DelegationContextRef {
+                    session_ref,
+                    read_cursor: Some(cursor.clone()),
+                    max_items: 0,
+                    from_sequence: cursor.range.map(|range| range.start_sequence),
+                    through_sequence: cursor.range.map(|range| range.end_sequence),
+                    view: Some(cursor.view),
+                    included_chars: 0,
+                    truncated: true,
+                });
+                continue;
+            }
+            let mut bounded = entry.clone();
+            bounded["maxChars"] = serde_json::json!(budget);
+            let page = self.session_read_page(conn, &session_ref, cursor.clone(), &bounded)?;
+            let from = page.items.iter().map(|item| item.sequence).min();
+            let through = page.items.iter().map(|item| item.sequence).max();
+            let included_chars = page
+                .items
+                .iter()
+                .map(|item| item.text.chars().count())
+                .sum();
+            remaining = remaining.saturating_sub(included_chars);
             refs.push(DelegationContextRef {
+                read_cursor: Some(cursor.clone()),
+                max_items: bounded_usize(
+                    entry,
+                    "maxItems",
+                    VIBEX_USE_DEFAULT_READ_ITEMS,
+                    VIBEX_USE_MAX_READ_ITEMS,
+                ),
                 session_ref,
                 from_sequence: from,
                 through_sequence: through,
                 view: Some(cursor.view),
-                included_chars: page
-                    .items
-                    .iter()
-                    .map(|item| item.text.chars().count())
-                    .sum(),
-                truncated: page.truncated,
+                included_chars,
+                truncated: page.truncated || page.has_more,
             });
         }
         Ok(refs)
@@ -2998,6 +3137,7 @@ impl VibexUseService {
             VibexUseTool::SendMessage,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
@@ -3008,7 +3148,7 @@ impl VibexUseService {
                 &operation,
                 VibexUseOperationState::Failed,
                 Some(&error),
-            );
+            )?;
             return Err(error);
         }
         let session = SessionRepository::get(&conn, &session_id)?.ok_or_else(|| {
@@ -3031,7 +3171,7 @@ impl VibexUseService {
                 &operation,
                 VibexUseOperationState::Failed,
                 Some(&error),
-            );
+            )?;
             return Err(error);
         }
         let task = match parse_optional_ref(arguments, "taskRef", VibexUseResourceKind::Task)? {
@@ -3071,6 +3211,14 @@ impl VibexUseService {
             }
             None => self.current_task_for_session(&conn, &session_id)?,
         };
+        if let Some(task) = task.as_ref()
+            && (task.phase().is_terminal() || task.phase() == DelegationTaskPhase::Cancelling)
+        {
+            return Err(VibexError::conflict(
+                use_codes::TASK_CANCELLING,
+                "this task no longer accepts messages",
+            ));
+        }
 
         // A caller that names the execution it is answering must be told when
         // that execution is already gone. Silently appending to whatever is
@@ -3108,13 +3256,13 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         }
         // The declared context window is authorized and bounded here exactly as
         // it is for a delegation; a follow-up must not be able to widen it.
-        let context_refs = match self.resolve_context(&conn, actor, arguments) {
+        let context_refs = match self.operation_context(&conn, &operation, actor, arguments) {
             Ok(context_refs) => context_refs,
             Err(error) => {
                 self.settle_operation(
@@ -3122,7 +3270,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
@@ -3153,7 +3301,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         }
@@ -3190,7 +3338,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         }
@@ -3204,11 +3352,11 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
         };
-        let prompt_context = self.render_context_block(&conn, &context_refs)?;
+        let prompt_context = self.operation_prompt_context(&conn, &operation, &context_refs)?;
         let execution_provenance = MessageProvenance::DelegatedInput {
             actor_session_ref: VibexUseRef::session(&actor.session_id),
             task_ref: task.as_ref().map(|task| VibexUseRef::task(&task.id)),
@@ -3219,12 +3367,13 @@ impl VibexUseService {
             match self
                 .require_coordinator()?
                 .prepare_submission(SendAgentMessageRequest {
+                    mentions: Vec::new(),
                     session_id: session_id.clone(),
                     message_idempotency_key: message_key.clone(),
+                    reasoning_effort: desired_runtime.reasoning_effort.clone(),
                     desired_runtime,
                     text,
                     attachments: Vec::new(),
-                    reasoning_effort: None,
                     correlation_id: None,
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context,
@@ -3237,42 +3386,18 @@ impl VibexUseService {
                         &operation,
                         VibexUseOperationState::Failed,
                         Some(&error),
-                    );
+                    )?;
                     return Err(error);
                 }
             };
-        let execution = self.record_execution(
-            &conn,
-            task.as_ref(),
-            &session_id,
-            &submission_id,
-            &message_key,
-            execution_provenance,
-        )?;
-        if let Some(task) = task.as_ref() {
-            let _ = transition_delegation(&conn, &task.id, DelegationTaskPhase::Active, None, None);
-            let root = task
-                .root_session_id
-                .clone()
-                .unwrap_or_else(|| task.parent_session_id.clone());
-            let _ = VibexUseEventRepository::append(
-                &conn,
-                &format!("execution_accepted_{}", execution.id.as_str()),
-                Some(&root),
-                DelegationTaskEventKind::ExecutionAccepted,
-                Some(&task.id),
-                task.child_session_id.as_ref(),
-                task.revision,
-                &serde_json::json!({ "executionRef": execution.execution_ref.as_uri() }),
-            );
-        }
+        let execution = self.accepted_execution(&conn, &submission_id)?;
         self.record_operation_resource(
             &conn,
             &operation,
             "execution",
             execution.execution_ref.clone(),
-        );
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+        )?;
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
         self.notify_progress();
         let queue_position = usize::try_from(
             vibex_db::count_active_executions_for_root(&conn, &self.actor_root(&conn, actor)?)
@@ -3345,15 +3470,8 @@ impl VibexUseService {
     ) -> VibexResult<WaitResponse> {
         let conn = self.open()?;
         let root = self.actor_root(&conn, actor)?;
-        let events = VibexUseEventRepository::unacknowledged_for_root(
-            &conn,
-            consumer_key,
-            &root,
-            after_cursor,
-            50,
-            false,
-        )?;
         let mut tasks = Vec::new();
+        let mut executions = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for reference in session_refs {
             let Some(session_id) = reference.session_id() else {
@@ -3364,6 +3482,14 @@ impl VibexUseService {
             // title, phase and error, which is exactly the disclosure a
             // refused read prevents.
             self.require_readable(&conn, actor, &session_id)?;
+            if let Some(execution) =
+                VibexUseExecutionRepository::latest_for_session(&conn, &session_id)?
+                && !executions
+                    .iter()
+                    .any(|known: &DelegationExecution| known.id == execution.id)
+            {
+                executions.push(execution);
+            }
             if let Some(task) = self.current_task_for_session(&conn, &session_id)?
                 && seen.insert(task.id.as_str().to_string())
             {
@@ -3387,7 +3513,7 @@ impl VibexUseService {
                     tasks.push(self.task_view(&conn, &task)?);
                 }
             }
-        } else if session_refs.is_empty() || tasks.is_empty() {
+        } else if session_refs.is_empty() {
             for task in vibex_db::list_delegations_for_root(&conn, &root, true)? {
                 // The root is the caller's own team, but a task in it may have
                 // been created for a session the caller was only granted a
@@ -3407,46 +3533,117 @@ impl VibexUseService {
             }
         }
 
-        let mut outcome = WaitOutcome::TimedOut;
-        // `Settled` means a watcher reached a phase the caller does not have to
-        // wait through any more. Acceptance events are progress, not settlement;
-        // treating them as settlement woke a caller on its own first request and
-        // then told it nothing had finished.
-        if tasks.iter().any(|task| {
-            matches!(
-                task.phase,
-                DelegationTaskPhase::AwaitingReview
-                    | DelegationTaskPhase::Completed
-                    | DelegationTaskPhase::Failed
-                    | DelegationTaskPhase::Cancelled
-            )
-        }) || events.iter().any(|event| event.kind.settles_a_wait())
-        {
-            outcome = WaitOutcome::Settled;
+        let task_ids: Vec<String> = seen.into_iter().collect();
+        let mut session_ids: Vec<String> = session_refs
+            .iter()
+            .filter_map(VibexUseRef::session_id)
+            .map(|id| id.to_string())
+            .collect();
+        if task_refs.is_empty() && session_refs.is_empty() {
+            session_ids.push(actor.session_id.to_string());
+        } else if task_ids.is_empty() && session_ids.is_empty() {
+            // An explicit empty target resolution must never become a team read.
+            session_ids.push(String::new());
         }
-        if events.iter().any(|event| event.kind.is_attention())
-            || tasks.iter().any(|task| task.blocked_on.is_some())
+        let events = VibexUseEventRepository::events_for_targets(
+            &conn,
+            consumer_key,
+            &root,
+            after_cursor,
+            50,
+            false,
+            &task_ids,
+            &session_ids,
+        )?;
+        // Progress can fill a page while a result is already waiting further
+        // ahead. Find wake-up facts independently, while preserving the first
+        // page and its cursor so no undelivered event is skipped or ACKed.
+        let signals = VibexUseEventRepository::wait_signals_for_targets(
+            &conn,
+            consumer_key,
+            &root,
+            after_cursor,
+            50,
+            false,
+            &task_ids,
+            &session_ids,
+        )?;
+        let initial_snapshot = after_cursor == 0;
+        let attention = signals.iter().any(|event| {
+            if event.kind != DelegationTaskEventKind::TaskBlocked {
+                return event.kind.is_attention();
+            }
+            event
+                .payload
+                .get("executionRef")
+                .and_then(serde_json::Value::as_str)
+                .and_then(VibexUseRef::parse)
+                .and_then(|reference| reference.execution_id())
+                .and_then(|id| VibexUseExecutionRepository::get(&conn, &id).ok().flatten())
+                .is_some_and(|execution| {
+                    !execution.is_settled()
+                        && execution.blocked_on.is_some()
+                        && serde_json::to_value(&execution.blocked_on).ok().as_ref()
+                            == event.payload.get("blockedOn")
+                })
+        });
+        let failed = signals.iter().any(|event| {
+            event.kind == DelegationTaskEventKind::TaskCancelled
+                || event
+                    .payload
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|phase| matches!(phase, "failed" | "cancelled"))
+                || event
+                    .payload
+                    .get("outcome")
+                    .and_then(|value| {
+                        serde_json::from_value::<ExecutionOutcome>(value.clone()).ok()
+                    })
+                    .is_some_and(execution_failed)
+        });
+        let outcome = if attention
+            || (initial_snapshot
+                && (tasks.iter().any(|task| task.blocked_on.is_some())
+                    || executions
+                        .iter()
+                        .any(|execution| execution.blocked_on.is_some())))
         {
-            outcome = WaitOutcome::Attention;
-        } else if outcome == WaitOutcome::TimedOut
-            && tasks.iter().any(|task| {
-                matches!(
-                    task.phase,
-                    DelegationTaskPhase::Failed | DelegationTaskPhase::Cancelled
-                )
-            })
+            WaitOutcome::Attention
+        } else if failed
+            || (initial_snapshot
+                && (tasks.iter().any(|task| {
+                    matches!(
+                        task.phase,
+                        DelegationTaskPhase::Failed | DelegationTaskPhase::Cancelled
+                    )
+                }) || executions
+                    .iter()
+                    .any(|execution| execution_failed(execution.outcome))))
         {
-            outcome = WaitOutcome::Failed;
-        }
+            WaitOutcome::Failed
+        } else if signals.iter().any(|event| event.kind.settles_a_wait())
+            || (initial_snapshot
+                && tasks.iter().any(|task| {
+                    task.phase.is_terminal() || task.phase == DelegationTaskPhase::AwaitingReview
+                })
+                || initial_snapshot && executions.iter().any(DelegationExecution::is_settled))
+        {
+            WaitOutcome::Settled
+        } else {
+            WaitOutcome::TimedOut
+        };
         let event_cursor = events
             .last()
             .map(|event| event.cursor)
             .unwrap_or(after_cursor);
-        let more_expected = tasks.iter().any(|task| task.phase.is_active());
+        let more_expected = tasks.iter().any(|task| task.phase.is_active())
+            || executions.iter().any(|execution| !execution.is_settled());
         Ok(WaitResponse {
             outcome,
             events,
             tasks,
+            executions,
             event_cursor,
             more_expected,
         })
@@ -3465,7 +3662,7 @@ impl VibexUseService {
         let task_id = task_ref.task_id().ok_or_else(|| {
             VibexError::validation(use_codes::REQUEST_INVALID, "taskRef is invalid")
         })?;
-        let conn = self.open()?;
+        let mut conn = self.open()?;
         let task = AgentDelegationRepository::get(&conn, &task_id)?.ok_or_else(|| {
             VibexError::new(
                 ErrorCategory::Permission,
@@ -3503,42 +3700,13 @@ impl VibexUseService {
         }
         let accepted = optional_string(arguments, "outcome", 32).as_deref() != Some("rejected");
         let summary = optional_string(arguments, "summary", VIBEX_USE_SUMMARY_CHARS);
-        let phase = if accepted {
-            DelegationTaskPhase::Completed
-        } else {
-            DelegationTaskPhase::Failed
-        };
-        let finished = transition_delegation(
-            &conn,
+        let finished = vibex_db::finish_delegation_task(
+            &mut conn,
             &task.id,
-            phase,
+            Some(task.revision),
+            accepted,
             summary.as_deref(),
-            (!accepted).then_some("task_rejected"),
-        )?
-        .ok_or_else(|| {
-            VibexError::conflict(use_codes::TASK_TERMINAL, "that task is already terminal")
-        })?;
-        self.close_open_execution(&conn, &finished)?;
-        let root = finished
-            .root_session_id
-            .clone()
-            .unwrap_or_else(|| finished.parent_session_id.clone());
-        VibexUseEventRepository::append(
-            &conn,
-            &format!("task_finished_{}", vibex_core::EventId::new().as_str()),
-            Some(&root),
-            DelegationTaskEventKind::TaskFinished,
-            Some(&finished.id),
-            finished.child_session_id.as_ref(),
-            finished.revision,
-            &serde_json::json!({
-                "taskRef": VibexUseRef::task(&finished.id).as_uri(),
-                "outcome": if accepted { "accepted" } else { "rejected" },
-            }),
         )?;
-        if let Some(child) = finished.child_session_id.as_ref() {
-            let _ = SessionControllerRepository::release(&conn, child, &finished.id);
-        }
         self.notify_progress();
         Ok(serde_json::json!({
             "taskRef": VibexUseRef::task(&finished.id).as_uri(),
@@ -3547,33 +3715,6 @@ impl VibexUseService {
             "completedAtMs": finished.completed_at_ms,
             "resultRefs": finished.result_refs,
         }))
-    }
-
-    /// Closes the execution a task was waiting on when its owner accepts it.
-    fn close_open_execution(&self, conn: &DbConnection, task: &AgentDelegation) -> VibexResult<()> {
-        let Some(execution_id) = task.current_execution_id.as_ref() else {
-            return Ok(());
-        };
-        let Some(execution) = VibexUseExecutionRepository::get(conn, execution_id)? else {
-            return Ok(());
-        };
-        if execution.is_settled() {
-            return Ok(());
-        }
-        VibexUseExecutionRepository::settle(
-            conn,
-            &execution.id,
-            ExecutionOutcome::Completed,
-            Some("task_finished"),
-            execution.summary.as_deref(),
-            &execution.result_ranges,
-            &execution.artifact_refs,
-            execution.usage,
-            execution.truncated,
-            execution.end_sequence,
-            unix_timestamp_ms(),
-        )?;
-        Ok(())
     }
 
     async fn interrupt(
@@ -3587,59 +3728,181 @@ impl VibexUseService {
         let session_id = session_reference(&session_ref)?;
         let expected_execution = optional_string(arguments, "expectedExecutionRef", 512);
         let fingerprint = arguments_fingerprint(arguments);
-        let conn = self.open()?;
+        let mut conn = self.open()?;
         let (operation, claimed) = self.reserve_operation(
             &conn,
             actor,
             VibexUseTool::Interrupt,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
-        if !claimed {
+        if !claimed && operation.state.is_terminal() {
             return self.operation_view(&conn, &operation);
         }
-        if let Err(error) = self.require_writable(&conn, actor, &session_id) {
-            self.settle_operation(
-                &conn,
-                &operation,
-                VibexUseOperationState::Failed,
-                Some(&error),
-            );
-            return Err(error);
-        }
-        if let Some(expected) = expected_execution {
-            let reference = VibexUseRef::parse(&expected).ok_or_else(|| {
-                VibexError::validation(
-                    use_codes::REQUEST_INVALID,
-                    "expectedExecutionRef is invalid",
+        let coordinator = self.manager.message_submission_coordinator();
+        let dispatch_guard = match coordinator {
+            Some(coordinator) => Some(coordinator.pause_session_dispatch(&session_id).await?),
+            None => None,
+        };
+        let selected = (|| -> VibexResult<Option<VibexExecutionId>> {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|_| {
+                    VibexError::storage(
+                        "vibex_use_interrupt_write_failed",
+                        "failed to reserve execution interruption",
+                    )
+                })?;
+            let current_operation = VibexUseOperationRepository::get(&tx, &operation.id)?
+                .ok_or_else(|| {
+                    VibexError::storage(
+                        "vibex_use_operation_missing",
+                        "interrupt operation was not found",
+                    )
+                })?;
+            // An accepted retry resumes its saved target even if the current
+            // execution or task controller has since changed.
+            let selected = if let Some(saved) =
+                current_operation.checkpoint.get("interrupt_execution_id")
+            {
+                Some(VibexExecutionId::parse(saved)?)
+            } else if current_operation.checkpoint.contains_key("interrupt_noop") {
+                None
+            } else {
+                self.require_writable(&tx, actor, &session_id)?;
+                let expected_revision = optional_u64(arguments, "expectedRevision");
+                if arguments
+                    .get("taskRef")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    let task_ref = parse_ref(arguments, "taskRef", VibexUseResourceKind::Task)?;
+                    let task_id = task_ref.task_id().ok_or_else(|| {
+                        VibexError::validation(use_codes::REQUEST_INVALID, "taskRef is invalid")
+                    })?;
+                    let task = AgentDelegationRepository::get(&tx, &task_id)?.ok_or_else(|| {
+                        VibexError::new(
+                            ErrorCategory::Permission,
+                            use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                            "task not found",
+                        )
+                    })?;
+                    if expected_revision.is_some_and(|expected| expected != task.revision) {
+                        return Err(VibexError::conflict(
+                            use_codes::REVISION_CONFLICT,
+                            "the task changed since it was read",
+                        )
+                        .with_diagnostic("revision", task.revision.to_string()));
+                    }
+                    let controller = SessionControllerRepository::get(&tx, &session_id)?;
+                    if task.child_session_id.as_ref() != Some(&session_id)
+                        || controller.as_ref().is_none_or(|controller| {
+                            controller.human_controlled
+                                || controller.owner_task_id.as_ref() != Some(&task_id)
+                        })
+                    {
+                        return Err(VibexError::conflict(
+                            use_codes::CONTROLLER_CHANGED,
+                            "that task no longer controls the session",
+                        ));
+                    }
+                } else if expected_revision.is_some() {
+                    return Err(VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "taskRef is required with expectedRevision",
+                    ));
+                }
+                let execution =
+                    vibex_db::VibexUseInterruptRepository::current_execution(&tx, &session_id)?;
+                if let Some(expected) = expected_execution.as_ref() {
+                    let reference = VibexUseRef::parse(expected)
+                        .filter(|reference| reference.kind == VibexUseResourceKind::Execution)
+                        .ok_or_else(|| {
+                            VibexError::validation(
+                                use_codes::REQUEST_INVALID,
+                                "expectedExecutionRef is invalid",
+                            )
+                        })?;
+                    if execution.as_ref().map(|execution| &execution.execution_ref)
+                        != Some(&reference)
+                    {
+                        return Err(VibexError::conflict(
+                            use_codes::CONTROLLER_CHANGED,
+                            "another execution started in that session",
+                        ));
+                    }
+                }
+                if let Some(execution) = execution {
+                    if !vibex_db::VibexUseInterruptRepository::request(&tx, &execution.id)? {
+                        return Err(VibexError::conflict(
+                            use_codes::CONTROLLER_CHANGED,
+                            "the selected execution has already ended",
+                        ));
+                    }
+                    self.record_operation_resource(
+                        &tx,
+                        &operation,
+                        "execution",
+                        execution.execution_ref,
+                    )?;
+                    VibexUseOperationRepository::set_checkpoint_once(
+                        &tx,
+                        &operation.id,
+                        "interrupt_execution_id",
+                        execution.id.as_str(),
+                    )?;
+                    Some(execution.id)
+                } else {
+                    VibexUseOperationRepository::set_checkpoint_once(
+                        &tx,
+                        &operation.id,
+                        "interrupt_noop",
+                        "true",
+                    )?;
+                    None
+                }
+            };
+            tx.commit().map_err(|_| {
+                VibexError::storage(
+                    "vibex_use_interrupt_write_failed",
+                    "failed to commit execution interruption",
                 )
             })?;
-            let current = self
-                .current_task_for_session(&conn, &session_id)?
-                .and_then(|task| task.current_execution_id);
-            if current.as_ref().map(VibexUseRef::execution) != Some(reference) {
-                let error = VibexError::conflict(
-                    use_codes::CONTROLLER_CHANGED,
-                    "another execution started in that session",
-                );
+            Ok(selected)
+        })();
+        // The marker closes the preparation race before this pause is released.
+        // The manager takes its own pause and rechecks the same captured id.
+        drop(dispatch_guard);
+        let selected = match selected {
+            Ok(selected) => selected,
+            Err(error) => {
                 self.settle_operation(
                     &conn,
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 return Err(error);
             }
-        }
-        match self.manager.interrupt(&session_id).await {
+        };
+        let result = match selected.as_ref() {
+            Some(id) => self.manager.interrupt_execution(id).await,
+            None => Ok(()),
+        };
+        match result {
             Ok(()) => {
-                self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+                self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
                 self.notify_progress();
                 Ok(serde_json::json!({
                     "status": "accepted",
                     "sessionRef": session_ref.as_uri(),
+                    "executionRef": selected.as_ref().map(|id| VibexUseRef::execution(id).as_uri()),
                     "operationRef": operation.operation_ref.as_uri(),
-                    "message": "the current execution was aborted; the task keeps its phase",
+                    "message": if selected.is_some() {
+                        "interrupt requested for the selected execution; the task keeps its phase"
+                    } else {
+                        "there is no active execution to interrupt"
+                    },
                 }))
             }
             Err(error) => {
@@ -3648,7 +3911,7 @@ impl VibexUseService {
                     &operation,
                     VibexUseOperationState::Failed,
                     Some(&error),
-                );
+                )?;
                 Err(error)
             }
         }
@@ -3664,13 +3927,14 @@ impl VibexUseService {
         let task_ref = parse_ref(arguments, "taskRef", VibexUseResourceKind::Task)?;
         let cascade = optional_bool(arguments, "cascade", false);
         let fingerprint = arguments_fingerprint(arguments);
-        let conn = self.open()?;
+        let mut conn = self.open()?;
         let (operation, claimed) = self.reserve_operation(
             &conn,
             actor,
             VibexUseTool::CancelTask,
             &caller_key,
             &fingerprint,
+            arguments,
         )?;
         if !claimed {
             return self.operation_view(&conn, &operation);
@@ -3686,7 +3950,17 @@ impl VibexUseService {
             )
         })?;
         self.require_writable(&conn, actor, &task.parent_session_id)?;
-        if task.phase().is_terminal() {
+        let affected =
+            vibex_db::request_delegation_tree_cancellation(&mut conn, &task.id, cascade)?;
+        self.record_operation_resource(&conn, &operation, "task", VibexUseRef::task(&task.id))?;
+        if affected.is_empty() {
+            VibexUseOperationRepository::set_checkpoint(
+                &conn,
+                &operation.id,
+                "cancellation_noop",
+                "true",
+            )?;
+            self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
             return Ok(serde_json::json!({
                 "taskRef": task_ref.as_uri(),
                 "phase": task.phase(),
@@ -3694,27 +3968,28 @@ impl VibexUseService {
                 "message": "the task had already finished; cancellation is a no-op",
             }));
         }
-        let mut affected = vec![task.id.clone()];
-        if cascade && let Some(child) = task.child_session_id.as_ref() {
-            for descendant_id in SessionOwnershipRepository::descendant_ids(&conn, child)? {
-                for descendant in vibex_db::list_delegations_for_child(&conn, &descendant_id)? {
-                    if !descendant.phase().is_terminal() {
-                        affected.push(descendant.id);
-                    }
+        for task in &affected {
+            self.record_operation_resource(&conn, &operation, "task", VibexUseRef::task(&task.id))?;
+            for execution in
+                vibex_db::VibexUseCancellationRepository::executions_for_task(&conn, &task.id)?
+            {
+                if vibex_db::VibexUseCancellationRepository::is_requested(&conn, &execution.id)? {
+                    self.record_operation_resource(
+                        &conn,
+                        &operation,
+                        "execution",
+                        execution.execution_ref,
+                    )?;
                 }
             }
         }
-        // Descendants first, so a cancelled parent never leaves a child that
-        // still believes it is running.
-        affected.reverse();
-        affected.dedup();
         let mut cancelled = Vec::new();
-        for delegation_id in affected {
+        for affected_task in affected {
             match self
                 .manager
                 .cancel_agent_delegation(vibex_core::CancelAgentDelegationRequest {
-                    parent_session_id: task.parent_session_id.clone(),
-                    delegation_id,
+                    parent_session_id: affected_task.parent_session_id.clone(),
+                    delegation_id: affected_task.id.clone(),
                 })
                 .await
             {
@@ -3725,16 +4000,36 @@ impl VibexUseService {
                         &operation,
                         VibexUseOperationState::Failed,
                         Some(&error),
-                    );
+                    )?;
                     return Err(error);
                 }
             }
         }
-        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None);
+        let mut settled = true;
+        for task in &cancelled {
+            let current =
+                AgentDelegationRepository::get(&conn, &task.id)?.unwrap_or_else(|| task.clone());
+            settled &= current.phase().is_terminal()
+                && vibex_db::VibexUseCancellationRepository::is_confirmed(&conn, &task.id)?;
+        }
+        for task in &cancelled {
+            self.record_operation_resource(&conn, &operation, "task", VibexUseRef::task(&task.id))?;
+        }
+        self.settle_operation(
+            &conn,
+            &operation,
+            if settled {
+                VibexUseOperationState::Succeeded
+            } else {
+                VibexUseOperationState::InProgress
+            },
+            None,
+        )?;
         self.notify_progress();
         Ok(serde_json::json!({
             "taskRef": task_ref.as_uri(),
-            "cancelled": true,
+            "accepted": true,
+            "cancelled": settled,
             "tasks": cancelled
                 .iter()
                 .map(|task| serde_json::json!({
@@ -3758,22 +4053,55 @@ impl VibexUseService {
         let root = self.actor_root(&conn, actor)?;
         let after_cursor = optional_i64(arguments, "afterEventCursor").unwrap_or(0);
         let max_items = bounded_usize(arguments, "maxItems", 50, 200);
-        let events = VibexUseEventRepository::unacknowledged_for_root(
-            &conn,
-            &actor.key(),
-            &root,
-            after_cursor,
-            max_items,
-            optional_bool(arguments, "includeAcknowledged", false),
-        )?;
-        let next_cursor = events
-            .last()
-            .map(|event| event.cursor)
-            .unwrap_or(after_cursor);
+        let mut next_cursor = after_cursor;
+        let mut events = Vec::new();
+        let mut has_more = false;
+        // A page may contain revoked or unrelated branch events. Advance over
+        // them without disclosing their payload or spinning on the same page.
+        'pages: for _ in 0..20 {
+            let page = VibexUseEventRepository::unacknowledged_for_root(
+                &conn,
+                &actor.key(),
+                &root,
+                next_cursor,
+                max_items,
+                optional_bool(arguments, "includeAcknowledged", false),
+            )?;
+            has_more = page.len() == max_items;
+            let page_len = page.len();
+            for (index, event) in page.into_iter().enumerate() {
+                next_cursor = event.cursor;
+                let target = if let Some(session) =
+                    event.session_ref.as_ref().and_then(VibexUseRef::session_id)
+                {
+                    Some(session)
+                } else if let Some(task_id) = event.task_ref.as_ref().and_then(VibexUseRef::task_id)
+                {
+                    AgentDelegationRepository::get(&conn, &task_id)?
+                        .map(|task| task.child_session_id.unwrap_or(task.parent_session_id))
+                } else {
+                    None
+                };
+                if let Some(target) = target
+                    && self
+                        .resolve_scope(&conn, actor, &target)?
+                        .can_read_content()
+                {
+                    events.push(event);
+                }
+                if events.len() == max_items {
+                    has_more |= index + 1 < page_len;
+                    break 'pages;
+                }
+            }
+            if !has_more {
+                break;
+            }
+        }
         Ok(serde_json::json!({
             "events": events,
             "nextEventCursor": next_cursor,
-            "hasMore": events.len() >= max_items,
+            "hasMore": has_more,
             "message": "events repeat until acknowledged; deduplicate by eventId",
         }))
     }
@@ -3927,27 +4255,29 @@ impl VibexUseService {
         conn: &DbConnection,
         session_id: &VibexSessionId,
     ) -> VibexResult<(usize, usize)> {
-        let mut active = 0;
-        let mut blocked = 0;
-        let mut stack = vec![session_id.clone()];
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current.as_str().to_string()) {
-                continue;
-            }
-            if let Some(task) = self.current_task_for_session(conn, &current)?
-                && task.phase() == DelegationTaskPhase::Active
-            {
-                active += 1;
-            }
-            if self.pending_attention(conn, &current).is_some() {
-                blocked += 1;
-            }
-            for child in SessionOwnershipRepository::child_ids(conn, &current)? {
-                stack.push(child);
-            }
-        }
-        Ok((active, blocked))
+        // Aggregate in SQLite rather than loading each descendant's task and
+        // permission payloads. UNION deduplicates corrupt cycles; ownership
+        // traversal never decodes a transcript or allocates a Rust forest.
+        conn.query_row(
+            "WITH RECURSIVE subtree(session_id) AS (
+                SELECT ?1 UNION
+                SELECT edge.child_session_id FROM session_ownership_edges edge
+                JOIN subtree parent ON edge.parent_session_id = parent.session_id
+             ) SELECT
+                COALESCE(SUM(EXISTS(SELECT 1 FROM agent_delegations task
+                    WHERE task.child_session_id = s.session_id AND task.task_phase = 'active')), 0),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM permission_requests permission
+                    WHERE permission.session_id = s.session_id AND permission.status = 'pending')
+                  OR EXISTS(SELECT 1 FROM elicitation_requests question
+                    WHERE question.session_id = s.session_id AND question.status = 'pending')), 0)
+             FROM subtree JOIN agent_sessions s USING(session_id)
+             WHERE s.deleted_at_ms IS NULL",
+            rusqlite::params![session_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            VibexError::storage("team_activity_read_failed", "failed to read team activity")
+        })
     }
 
     /// Sessions a group needs the shell's own registry to know about.
@@ -3975,12 +4305,12 @@ impl VibexUseService {
     /// This is the product's own discovery, not an Agent tool: the user can
     /// reference any session they can see, and referencing one grants read
     /// scope rather than control.
-    pub fn referenceable_sessions(&self, limit: usize) -> VibexResult<Vec<AgentSession>> {
-        let conn = self.open()?;
-        let mut sessions = SessionRepository::list_root_sessions(&conn, false)?;
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
-        sessions.truncate(limit);
-        Ok(sessions)
+    pub fn referenceable_sessions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> VibexResult<Vec<AgentSession>> {
+        self.human_referenceable_sessions(query, limit)
     }
 
     /// Grants a caller read or control access to a session it did not create.
@@ -4018,6 +4348,62 @@ impl VibexUseService {
 // ---------------------------------------------------------------------------
 
 impl VibexUseToolHost for VibexUseService {
+    fn activation_revision(&self) -> u64 {
+        VibexUseService::activation_revision(self)
+    }
+
+    fn authorize_actor(&self, actor: &VibexUseActor) -> VibexResult<()> {
+        if actor.authority != self.authority
+            || actor.activation_revision != self.activation_revision()
+        {
+            return Err(VibexError::capability(
+                use_codes::CAPABILITY_UNAVAILABLE,
+                "this tool delivery has been revoked; restart the session",
+            ));
+        }
+        if !SessionRepository::get(&self.open()?, &actor.session_id)?
+            .is_some_and(|session| session.deleted_at_ms.is_none())
+        {
+            return Err(VibexError::capability(
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "caller session is unavailable",
+            ));
+        }
+        Ok(())
+    }
+
+    fn response_delivered(
+        &self,
+        actor: &VibexUseActor,
+        tool: VibexUseTool,
+        response: &serde_json::Value,
+    ) -> VibexResult<()> {
+        self.authorize_actor(actor)?;
+        if matches!(tool, VibexUseTool::Wait | VibexUseTool::GetEvents) {
+            let ids: Vec<String> = response
+                .get("events")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|event| event.get("eventId")?.as_str().map(str::to_owned))
+                .collect();
+            let first_deliveries =
+                VibexUseEventRepository::mark_delivered(&self.open()?, &actor.key(), &ids)?;
+            for index in 0..ids.len() {
+                self.manager.observability().increment(
+                    RuntimeMetricName::DelegationDelivery,
+                    None,
+                    if index < first_deliveries {
+                        RuntimeMetricResult::Success
+                    } else {
+                        RuntimeMetricResult::Reused
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn call(
         &self,
         actor: VibexUseActor,
@@ -4028,13 +4414,9 @@ impl VibexUseToolHost for VibexUseService {
             // The activation the sidecar was launched under must still be the
             // live one, so a revoked delivery stops working without waiting for
             // the Agent to restart.
-            if actor.activation_revision < self.activation_revision {
-                return Err(VibexError::capability(
-                    use_codes::CAPABILITY_UNAVAILABLE,
-                    "this tool delivery has been superseded; restart the session",
-                ));
-            }
-            match tool {
+            self.authorize_actor(&actor)?;
+            let _operation_guard = self.lock_operation(&actor, tool, &arguments).await?;
+            let result = match tool {
                 VibexUseTool::Discover => self.discover(&actor, &arguments).await,
                 VibexUseTool::ListSessions => self.list_sessions(&actor, &arguments),
                 VibexUseTool::GetSession => self.get_session(&actor, &arguments),
@@ -4055,11 +4437,35 @@ impl VibexUseToolHost for VibexUseService {
                 VibexUseTool::UpdateGroup => self.update_group(&actor, &arguments).await,
                 VibexUseTool::PresentGroup => self.present_group(&actor, &arguments).await,
                 VibexUseTool::DissolveGroup => self.dissolve_group(&actor, &arguments).await,
+            };
+            self.record_operation_response(&actor, tool, &arguments, &result)?;
+            if matches!(
+                tool,
+                VibexUseTool::Delegate | VibexUseTool::CreateSession | VibexUseTool::SendMessage
+            ) {
+                self.manager.observability().increment(
+                    RuntimeMetricName::DelegationAdmission,
+                    None,
+                    match &result {
+                        Ok(value)
+                            if value.get("replayed").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            RuntimeMetricResult::Reused
+                        }
+                        Ok(_) => RuntimeMetricResult::Success,
+                        Err(_) => RuntimeMetricResult::Rejected,
+                    },
+                );
             }
+            result
         })
     }
 
     fn tool_definitions(&self, actor: &VibexUseActor) -> Vec<VibexUseToolDefinition> {
+        if self.authorize_actor(actor).is_err() {
+            return Vec::new();
+        }
         let Ok(capability) = self.capability(actor) else {
             // Without a readable caller there is no honest catalogue to offer.
             return Vec::new();
@@ -4080,6 +4486,14 @@ fn internal_encode_error(error: serde_json::Error) -> VibexError {
     .with_diagnostic("error", error.to_string())
 }
 
+fn execution_failed(outcome: ExecutionOutcome) -> bool {
+    outcome.is_settled()
+        && !matches!(
+            outcome,
+            ExecutionOutcome::Completed | ExecutionOutcome::ActionsOnly
+        )
+}
+
 /// The reference of one catalogue entry.
 ///
 /// It is derived from the typed selection rather than from the catalogue's
@@ -4096,6 +4510,7 @@ fn selection_fingerprint(selection: &SessionRuntimeSelection) -> String {
         selection.model_id().unwrap_or("agent-default"),
         selection.reasoning_effort.as_deref().unwrap_or_default(),
         selection.mode_id.as_deref().unwrap_or_default(),
+        &serde_json::to_string(&selection.config_values).unwrap_or_default(),
     ])
 }
 
@@ -4117,6 +4532,9 @@ fn runtime_option(
         model_id: option.selection.model_id().map(ToString::to_string),
         reasoning_effort: option.selection.reasoning_effort.clone(),
         mode_id: option.selection.mode_id.clone(),
+        reasoning_efforts: option.reasoning_efforts.clone(),
+        modes: option.modes.clone(),
+        features: option.features.clone(),
         config_values: option.selection.config_values.clone(),
         unavailable_reason: unavailable,
         selection: option.selection.clone(),
@@ -4142,7 +4560,7 @@ fn group_summary(
     VibexUseGroupSummary {
         group_ref: VibexUseRef::group(&record.group_id),
         name: record.name.clone(),
-        revision: record.revision,
+        revision: record.presentation_revision(),
         member_session_refs: record
             .member_session_ids
             .iter()
@@ -4165,6 +4583,21 @@ fn group_summary(
     }
 }
 
+fn group_not_found() -> VibexError {
+    VibexError::new(
+        ErrorCategory::Permission,
+        use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+        "group not found",
+    )
+}
+
+fn group_revision_conflict() -> VibexError {
+    VibexError::conflict(
+        use_codes::PRESENTATION_LAYOUT_CONFLICT,
+        "the group changed since it was read; read it again before updating",
+    )
+}
+
 fn record_group_command(
     record: &GroupPresentationRecord,
     present: bool,
@@ -4185,7 +4618,7 @@ fn record_group_command(
         // The client compares this against the layout it is actually showing, so
         // a request written before the user rearranged the panes is deferred
         // instead of overwriting the new arrangement.
-        expected_revision: Some(record.presentation_revision()),
+        expected_revision: record.client_revision,
         activation_policy: PresentationActivationPolicy::IfCurrentTeam,
         focus_session_ref: None,
         present,
@@ -4432,7 +4865,7 @@ fn parse_read_cursor(
     // A cursor is bound to the session and view that produced it, so a caller
     // cannot carry one across sessions and quietly read the wrong range.
     if let Some(cursor) = arguments.get("cursor") {
-        let parsed: SessionReadCursor = serde_json::from_value(cursor.clone())
+        let mut parsed: SessionReadCursor = serde_json::from_value(cursor.clone())
             .map_err(|_| VibexError::validation(use_codes::REQUEST_INVALID, "cursor is invalid"))?;
         if &parsed.session_ref != session_ref {
             return Err(VibexError::validation(
@@ -4448,6 +4881,28 @@ fn parse_read_cursor(
                 "session not found",
             ));
         }
+        if [
+            "after",
+            "before",
+            "latest",
+            "fromSequence",
+            "throughSequence",
+        ]
+        .iter()
+        .any(|key| arguments.get(*key).is_some())
+        {
+            return Err(VibexError::validation(
+                use_codes::READ_ANCHOR_AMBIGUOUS,
+                "a cursor cannot be combined with another anchor",
+            ));
+        }
+        if arguments.get("view").is_some() && parse_read_view(arguments)? != parsed.view {
+            return Err(VibexError::validation(
+                use_codes::CURSOR_SCOPE_MISMATCH,
+                "cursor belongs to another read view",
+            ));
+        }
+        read::bind_cursor(conn, arguments, &mut parsed)?;
         return Ok(parsed);
     }
     let view = parse_read_view(arguments)?;
@@ -4468,11 +4923,39 @@ fn parse_read_cursor(
         (_, _, Some(sequence)) => SessionReadAnchor::Before { sequence },
         _ => SessionReadAnchor::Latest,
     };
-    Ok(SessionReadCursor {
-        session_ref: session_ref.clone(),
-        view,
-        anchor,
-    })
+    let from = optional_i64(arguments, "fromSequence");
+    let through = optional_i64(arguments, "throughSequence");
+    let mut cursor = SessionReadCursor::new(session_ref.clone(), view, anchor);
+    if from.is_some() || through.is_some() {
+        if after.is_some() || before.is_some() || latest {
+            return Err(VibexError::validation(
+                use_codes::READ_ANCHOR_AMBIGUOUS,
+                "a range cannot be combined with another anchor",
+            ));
+        }
+        let start_sequence = from.unwrap_or(1);
+        let end_sequence = through.unwrap_or(TimelineRepository::latest_sequence(
+            conn,
+            &session_reference(session_ref)?,
+        )?);
+        if start_sequence < 1 || end_sequence < start_sequence {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "context sequence range is invalid",
+            ));
+        }
+        cursor.range = Some(vibex_core::ExecutionResultRange {
+            start_sequence,
+            end_sequence,
+        });
+        if from.is_some() {
+            cursor.anchor = SessionReadAnchor::After {
+                sequence: start_sequence.saturating_sub(1),
+            };
+        }
+    }
+    read::bind_cursor(conn, arguments, &mut cursor)?;
+    Ok(cursor)
 }
 
 fn parse_read_view(arguments: &serde_json::Value) -> VibexResult<SessionReadView> {
@@ -4838,11 +5321,11 @@ mod tests {
         // A cursor minted for another session is refused instead of reading the
         // wrong range.
         let other = VibexUseRef::session(&VibexSessionId::new());
-        let cursor = serde_json::to_value(SessionReadCursor {
-            session_ref: other.clone(),
-            view: SessionReadView::Conversation,
-            anchor: SessionReadAnchor::Latest,
-        })
+        let cursor = serde_json::to_value(SessionReadCursor::new(
+            other.clone(),
+            SessionReadView::Conversation,
+            SessionReadAnchor::Latest,
+        ))
         .unwrap();
         let error = parse_read_cursor(
             &conn,
@@ -4876,6 +5359,7 @@ mod tests {
         let user = item(
             TimelineItemKind::UserMessage,
             TimelinePayload::UserMessage(UserMessagePayload {
+                mentions: Vec::new(),
                 text: "Please review".to_string(),
                 attachments: Vec::new(),
                 delivery: UserMessageDelivery::Prompt,

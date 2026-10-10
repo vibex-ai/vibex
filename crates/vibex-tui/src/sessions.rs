@@ -937,6 +937,7 @@ mod tests {
         assert_eq!(
             session_echo(&echo_item(TimelinePayload::UserMessage(
                 vibex_core::UserMessagePayload {
+                    mentions: Vec::new(),
                     text: "do the thing".to_string(),
                     attachments: Vec::new(),
                     delivery: Default::default(),

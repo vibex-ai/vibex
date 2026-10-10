@@ -1,3 +1,5 @@
+#[path = "team.rs"]
+mod team;
 #[path = "timeline.rs"]
 mod timeline;
 
@@ -8,6 +10,7 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, ElementId, Entity,
@@ -518,6 +521,7 @@ enum InputField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobileOverlay {
+    Team,
     /// The pairing page opened over the existing connection and session.
     Pairing,
     /// The read-only runtime detail page.
@@ -915,6 +919,36 @@ pub fn bind_keys(cx: &mut App) {
 type TimelineMarkdownViews =
     RefCell<BTreeMap<String, (Entity<markdown::MarkdownView>, u64, Arc<str>)>>;
 
+/// Native callbacks are process-wide, but their receivers belong to one app.
+/// Keeping that boundary explicit lets headless windows own independent streams.
+struct PlatformEventStreams {
+    scanner_results: UnboundedReceiver<String>,
+    notification_actions: UnboundedReceiver<notifications::NotificationAction>,
+    lan_discovery_events: UnboundedReceiver<LanDiscoveryEvent>,
+    lifecycle_events: UnboundedReceiver<MobileLifecycleEvent>,
+}
+
+impl PlatformEventStreams {
+    fn subscribe() -> Self {
+        Self {
+            scanner_results: scanner::subscribe(),
+            notification_actions: notifications::subscribe_actions(),
+            lan_discovery_events: crate::discovery::subscribe(),
+            lifecycle_events: crate::lifecycle::subscribe(),
+        }
+    }
+
+    #[cfg(test)]
+    fn disconnected() -> Self {
+        Self {
+            scanner_results: futures_channel::mpsc::unbounded().1,
+            notification_actions: futures_channel::mpsc::unbounded().1,
+            lan_discovery_events: futures_channel::mpsc::unbounded().1,
+            lifecycle_events: futures_channel::mpsc::unbounded().1,
+        }
+    }
+}
+
 pub struct MobileApp {
     storage: CredentialStorage,
     /// Mobile-owned appearance and language preferences. Mobile settings take
@@ -926,6 +960,11 @@ pub struct MobileApp {
     mode: RootMode,
     backend: Option<Arc<WebRemoteBackend>>,
     controller: Option<AgentWorkflowController>,
+    team_controller: Option<vibex_ui::TeamWorkflowController>,
+    team_busy: bool,
+    team_error: Option<String>,
+    team_cancel_confirmation: Option<(vibex_core::AgentDelegationId, u64)>,
+    team_scroll: UniformListScrollHandle,
     workbench: Option<Entity<MobileWorkbench>>,
     pending_workbench_surface: Option<WorkbenchSurface>,
     workbench_open: bool,
@@ -1169,6 +1208,20 @@ impl MobileApp {
     }
 
     pub fn new(data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_platform_events(data_dir, PlatformEventStreams::subscribe(), window, cx)
+    }
+
+    #[cfg(test)]
+    fn new_for_test(data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_platform_events(data_dir, PlatformEventStreams::disconnected(), window, cx)
+    }
+
+    fn with_platform_events(
+        data_dir: PathBuf,
+        events: PlatformEventStreams,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let storage = CredentialStorage::new(data_dir);
         let stored = storage.load();
         let app_settings = storage
@@ -1233,6 +1286,11 @@ impl MobileApp {
             mode,
             backend: None,
             controller: None,
+            team_controller: None,
+            team_busy: false,
+            team_error: None,
+            team_cancel_confirmation: None,
+            team_scroll: UniformListScrollHandle::new(),
             workbench: None,
             pending_workbench_surface: None,
             workbench_open: false,
@@ -1413,10 +1471,10 @@ impl MobileApp {
             // hosts entry for this runtime keeps whatever it already stored.
             app.defer_bundle_install(bundle, RemoteServerKind::Unknown, cx);
         }
-        app.start_scanner_result_stream(cx);
-        app.start_notification_action_stream(cx);
-        app.start_lan_discovery_event_stream(cx);
-        app.start_lifecycle_stream(cx);
+        app.start_scanner_result_stream(events.scanner_results, cx);
+        app.start_notification_action_stream(events.notification_actions, cx);
+        app.start_lan_discovery_event_stream(events.lan_discovery_events, cx);
+        app.start_lifecycle_stream(events.lifecycle_events, cx);
         app.watch_host_reachability(cx);
         // A phone that starts on the first screen with runtimes already saved
         // has to say which of them answer before the user asks.
@@ -1430,8 +1488,11 @@ impl MobileApp {
         app
     }
 
-    fn start_lifecycle_stream(&mut self, cx: &mut Context<Self>) {
-        let mut events = crate::lifecycle::subscribe();
+    fn start_lifecycle_stream(
+        &mut self,
+        mut events: UnboundedReceiver<MobileLifecycleEvent>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(event) = events.next().await {
                 if entity
@@ -1548,8 +1609,11 @@ impl MobileApp {
         self.event_consumer_task = None;
     }
 
-    fn start_scanner_result_stream(&mut self, cx: &mut Context<Self>) {
-        let mut results = scanner::subscribe();
+    fn start_scanner_result_stream(
+        &mut self,
+        mut results: UnboundedReceiver<String>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(link) = results.next().await {
                 if entity
@@ -1565,8 +1629,11 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
-    fn start_notification_action_stream(&mut self, cx: &mut Context<Self>) {
-        let mut sessions = notifications::subscribe_actions();
+    fn start_notification_action_stream(
+        &mut self,
+        mut sessions: UnboundedReceiver<notifications::NotificationAction>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(action) = sessions.next().await {
                 if entity
@@ -1890,6 +1957,10 @@ impl MobileApp {
                 match outcome {
                     Ok(Ok(_)) => {
                         let capabilities = backend.capability_snapshot().agent;
+                        this.team_controller = Some(vibex_ui::TeamWorkflowController::new(
+                            backend.clone(),
+                            capabilities.clone(),
+                        ));
                         this.controller =
                             Some(AgentWorkflowController::new(backend.clone(), capabilities));
                         this.mode = RootMode::Workspace;
@@ -1969,6 +2040,9 @@ impl MobileApp {
     }
 
     fn apply_event_batch(&mut self, events: Vec<BackendEvent>, cx: &mut Context<Self>) -> bool {
+        if self.overlay == Some(MobileOverlay::Team) && !self.team_busy {
+            self.refresh_team(false, cx);
+        }
         let should_follow = self.timeline_is_near_bottom();
         let mut timeline_changed = false;
         let mut sidebar_needs_refresh = false;
@@ -2080,8 +2154,11 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn start_lan_discovery_event_stream(&mut self, cx: &mut Context<Self>) {
-        let mut events = crate::discovery::subscribe();
+    fn start_lan_discovery_event_stream(
+        &mut self,
+        mut events: UnboundedReceiver<LanDiscoveryEvent>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(event) = events.next().await {
                 if entity
@@ -3673,6 +3750,7 @@ impl MobileApp {
                 Some(
                     backend
                         .send_message(MutationRequest::new(SendAgentMessageRequest {
+                            mentions: Vec::new(),
                             session_id: session.id.clone(),
                             message_idempotency_key: RequestId::new().into_string(),
                             desired_runtime: runtime.clone(),
@@ -3981,6 +4059,10 @@ impl MobileApp {
     }
 
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if let Some(team) = self.team_controller.as_mut() {
+            team.select_session(session_id.clone());
+        }
+        self.team_cancel_confirmation = None;
         self.reset_runtime_options();
         self.pending_user_message = None;
         self.timeline_metadata_tip = None;
@@ -4990,6 +5072,9 @@ impl MobileApp {
     }
 
     fn dismiss_overlay(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.overlay == Some(MobileOverlay::Team) {
+            self.team_cancel_confirmation = None;
+        }
         crate::platform::hide_keyboard();
         if let Some(window) = window.as_deref_mut() {
             self.root_focus.focus(window, cx);
@@ -5192,6 +5277,8 @@ impl MobileApp {
         crate::background_connection::disconnect();
         self.backend = None;
         self.controller = None;
+        self.team_controller = None;
+        self.team_busy = false;
         self.timeline_markdown_views.borrow_mut().clear();
         self.pending_workbench_surface = None;
         if let Some(workbench) = self.workbench.take() {
@@ -5539,6 +5626,7 @@ impl MobileApp {
             attachments: attachments.clone(),
         };
         let request = MutationRequest::new(SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id,
             message_idempotency_key: RequestId::new().into_string(),
             desired_runtime: runtime.desired.clone(),
@@ -6322,6 +6410,8 @@ impl MobileApp {
             workbench.update(cx, |workbench, _| workbench.suspend());
         }
         self.controller = None;
+        self.team_controller = None;
+        self.team_busy = false;
         self.timeline_markdown_views.borrow_mut().clear();
         self.mode = RootMode::Pairing;
         self.timeline_turns = Arc::new(Vec::new());
@@ -9589,6 +9679,22 @@ impl MobileApp {
                             .size(px(theme::ICON_SM))
                             .text_color(theme::text_muted()),
                     ),
+            )
+            .when(
+                self.team_controller
+                    .as_ref()
+                    .is_some_and(|team| team.is_supported()),
+                |header| {
+                    header.child(
+                        Button::new("open-team")
+                            .ghost()
+                            .h_10()
+                            .label(locale::text("Team…", "团队…", "團隊…"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_team(window, cx)),
+                            ),
+                    )
+                },
             )
     }
 
@@ -15244,6 +15350,7 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match overlay {
+            MobileOverlay::Team => self.render_team(cx),
             MobileOverlay::Pairing => self
                 .render_pairing(
                     pairing_runtimes_max_height(window),
@@ -18384,6 +18491,61 @@ mod tests {
         cx.update(gpui_component::init);
     }
 
+    #[gpui::test]
+    fn platform_event_streams_update_only_their_own_app(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let first_dir = tempfile::tempdir().expect("first mobile data directory");
+        let second_dir = tempfile::tempdir().expect("second mobile data directory");
+        let (first_sender, first_events) = futures_channel::mpsc::unbounded();
+        let (second_sender, second_events) = futures_channel::mpsc::unbounded();
+        let (first, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::with_platform_events(
+                first_dir.path().to_path_buf(),
+                PlatformEventStreams {
+                    lifecycle_events: first_events,
+                    ..PlatformEventStreams::disconnected()
+                },
+                window,
+                cx,
+            )
+        });
+        let second = cx.update(|window, cx| {
+            cx.new(|cx| {
+                MobileApp::with_platform_events(
+                    second_dir.path().to_path_buf(),
+                    PlatformEventStreams {
+                        lifecycle_events: second_events,
+                        ..PlatformEventStreams::disconnected()
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        first_sender
+            .unbounded_send(MobileLifecycleEvent::Backgrounded)
+            .unwrap();
+        cx.run_until_parked();
+        assert!(first.read_with(cx, |app, _| app.app_backgrounded));
+        assert!(!second.read_with(cx, |app, _| app.app_backgrounded));
+
+        first_sender
+            .unbounded_send(MobileLifecycleEvent::Resumed)
+            .unwrap();
+        second_sender
+            .unbounded_send(MobileLifecycleEvent::Backgrounded)
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!first.read_with(cx, |app, _| app.app_backgrounded));
+        assert!(second.read_with(cx, |app, _| app.app_backgrounded));
+
+        drop(first_sender);
+        drop(second_sender);
+        cx.run_until_parked();
+    }
+
     fn click_mobile_control(cx: &mut gpui::VisualTestContext, selector: &'static str) {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -18415,7 +18577,7 @@ mod tests {
         let (app, cx) = cx.add_window_view(|window, cx| {
             theme::apply_component_theme(Some(window), cx);
             window.set_rem_size(gpui_component::Theme::global(cx).font_size);
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app.backend = Some(backend.clone());
             let mut controller =
@@ -18556,7 +18718,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app.remember_host(
                 &host_bundle("runtime-a", "studio"),
@@ -18625,7 +18787,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app
         });
@@ -18659,7 +18821,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -18747,7 +18909,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
 
@@ -18785,7 +18947,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
 
@@ -19013,7 +19175,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
 
@@ -19216,7 +19378,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
         app.update(cx, |app, cx| {
@@ -19242,7 +19404,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app
         });
@@ -19313,7 +19475,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app
         });
@@ -19387,7 +19549,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app
         });
@@ -20061,7 +20223,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
         app.update(cx, |app, _| {
@@ -20103,7 +20265,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app
         });
@@ -20119,6 +20281,7 @@ mod tests {
 
         for overlay in [
             MobileOverlay::Pairing,
+            MobileOverlay::Team,
             MobileOverlay::HostActions,
             MobileOverlay::HostDetail,
             MobileOverlay::HostRename,
@@ -20271,7 +20434,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
         let bundle = host_bundle("studio-desktop", "studio.local");
@@ -20310,7 +20473,7 @@ mod tests {
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.mode = RootMode::Workspace;
             app
         });

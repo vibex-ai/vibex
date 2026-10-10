@@ -2330,6 +2330,7 @@ impl DesktopRuntime {
         let runtime_probe = acp_runtime.runtime_probe_service();
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
+        let team_budget = vibex_use::load_budget_policy(&config.home_dir, &db_path)?;
         let usage = AgentUsageService::new(db_path.clone())?;
         let (usage_sender, usage_receiver) = mpsc::unbounded_channel();
         manager.install_usage_telemetry_sender(usage_sender)?;
@@ -2346,9 +2347,14 @@ impl DesktopRuntime {
             observability.clone(),
         )?;
         let runtime_lifecycle = Arc::new(RuntimeLifecycleService::new(
-            Arc::new(AcpRuntimeLifecycleBackend::new(
-                runtime_switch_bridge.clone(),
-            )),
+            Arc::new(
+                AcpRuntimeLifecycleBackend::new(runtime_switch_bridge.clone()).with_limits(
+                    std::time::Duration::from_millis(team_budget.idle_worker_retention_ms),
+                    team_budget.warm_worker_limit,
+                    AcpRuntimeLifecycleBackend::DEFAULT_PROCESS_IDLE_TIMEOUT,
+                    usize::try_from(team_budget.root_execution_limit).unwrap_or(8),
+                )?,
+            ),
             RuntimeLifecycleConfig::default(),
         )?);
         manager.install_runtime_lifecycle(&runtime_lifecycle)?;
@@ -2505,6 +2511,7 @@ impl DesktopRuntime {
                 lifecycle: runtime_lifecycle.clone(),
             }))
             .with_sidebar_organization_source(sidebar_organization.clone())
+            .with_team_service(vibex_use.clone())
             .with_timeline_display_settings_source(timeline_display_settings.clone());
         // The broker is started here, after the service it forwards to. A
         // session that is offered the tools is therefore always a session the
@@ -2846,6 +2853,24 @@ impl DesktopRuntime {
                 "desktop runtime task ownership is unavailable",
             )
         })?;
+        let deadline_manager = Arc::downgrade(&self.agent.manager);
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(manager) = deadline_manager.upgrade() else {
+                    break;
+                };
+                if let Err(error) = manager
+                    .enforce_delegation_deadlines(vibex_core::unix_timestamp_ms())
+                    .await
+                {
+                    tracing::warn!(target: "vibex_desktop", error_code = %error.code,
+                        "team deadline maintenance failed");
+                }
+            }
+        }));
         let runtime_selection = self.agent.runtime_selection.clone();
         let message_submission = self.agent.message_submission.clone();
         let manager = self.agent.manager.clone();
@@ -2872,6 +2897,10 @@ impl DesktopRuntime {
                     error_code = %error.code,
                     "message submission background reconciliation failed"
                 );
+            }
+            if let Err(error) = vibex_use.recover_operations().await {
+                tracing::warn!(target: "vibex_desktop", error_code = %error.code,
+                    "Vibex-use operation recovery failed");
             }
             if let Err(error) = manager.reconcile_agent_delegations() {
                 tracing::warn!(
@@ -3932,7 +3961,7 @@ fn build_agent_manager(
 ) -> VibexResult<(AgentManager, ProviderConfigService, Arc<AcpRuntimeClient>)> {
     let db_path = config.database_path.clone();
     let bootstrap_config_service = ProviderConfigService::new(&db_path);
-    let mut manager = AgentManager::new(&db_path)?;
+    let mut manager = AgentManager::new_with_observability(&db_path, observability.clone())?;
     let acp_runtime = Arc::new(AcpRuntimeClient::with_terminal_host_and_observability(
         bootstrap_config_service,
         terminal_host,

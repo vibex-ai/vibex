@@ -580,6 +580,8 @@ pub use terminal::{
     TerminalSwitchShellRequest, TerminalWriteRequest,
 };
 pub use time::unix_timestamp_ms;
+pub mod team;
+pub use team::*;
 pub use timeline::{
     AgentEventContentBlock, AgentEventLocation, AgentEventRawExtension, AgentEventRawOutput,
     AgentEventRawOutputMode, AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase,
@@ -622,15 +624,15 @@ pub use vibex_use::{
     VIBEX_USE_MAX_MENTIONS, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
     VIBEX_USE_MAX_WAIT_MS, VIBEX_USE_MENTION_PREFIX, VIBEX_USE_REF_SCHEME,
     VIBEX_USE_ROOT_EXECUTION_BUDGET, VIBEX_USE_SERVER_NAME, VIBEX_USE_SUMMARY_CHARS,
-    VIBEX_USE_TITLE_CHARS, VIBEX_USE_WIRE_SERVER_ID, VibexUseActor, VibexUseCapabilitySnapshot,
-    VibexUseDelivery, VibexUseGroupSummary, VibexUseMention, VibexUseMentionKind,
-    VibexUseOperation, VibexUseOperationResource, VibexUseOperationState,
-    VibexUsePresentationCapability, VibexUseRef, VibexUseResourceKind, VibexUseRuntimeOption,
-    VibexUseScope, VibexUseSessionSummary, VibexUseTool, VibexUseToolDefinition,
-    VibexUseToolFuture, VibexUseToolHost, VibexUseUnavailableReason, VibexUseWorkspaceOption,
-    WaitOutcome, WaitResponse, bounded_chars, codes as vibex_use_codes, optional_bool,
-    optional_string, parse_optional_ref, parse_ref, required_string, vibex_use_route_note,
-    vibex_use_tool_definitions,
+    VIBEX_USE_TITLE_CHARS, VIBEX_USE_WIRE_SERVER_ID, VibexUseActor, VibexUseBudgetPolicy,
+    VibexUseBudgetPreset, VibexUseBudgetSettings, VibexUseCapabilitySnapshot, VibexUseDelivery,
+    VibexUseGroupSummary, VibexUseMention, VibexUseMentionKind, VibexUseOperation,
+    VibexUseOperationResource, VibexUseOperationState, VibexUsePresentationCapability, VibexUseRef,
+    VibexUseResourceKind, VibexUseRuntimeOption, VibexUseScope, VibexUseSessionSummary,
+    VibexUseTool, VibexUseToolDefinition, VibexUseToolFuture, VibexUseToolHost,
+    VibexUseUnavailableReason, VibexUseWorkspaceOption, WaitOutcome, WaitResponse, bounded_chars,
+    codes as vibex_use_codes, optional_bool, optional_string, parse_optional_ref, parse_ref,
+    required_string, vibex_use_route_note, vibex_use_tool_definitions,
 };
 pub use workbench::{WorkbenchPanel, WorkbenchTabKind};
 pub use workspace::{

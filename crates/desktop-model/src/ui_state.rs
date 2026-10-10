@@ -574,9 +574,7 @@ pub struct SidebarUiState {
     pub pinned_session_ids: BTreeSet<String>,
     /// Delegated-ownership branches the user closed.
     ///
-    /// Expansion is client navigation state: it is keyed by session id (which
-    /// is already authority-scoped), it grants nothing, and losing it only
-    /// means the tree opens fully again.
+    /// Expansion is client navigation state, parked with its runtime authority.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub collapsed_delegated_session_ids: BTreeSet<String>,
     pub collapsed_project_ids: BTreeSet<String>,
@@ -627,6 +625,8 @@ pub struct SidebarAuthorityArrangement {
     pub workspace_order: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub pinned_session_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub collapsed_delegated_session_ids: BTreeSet<String>,
     #[serde(default)]
     pub collapsed_project_ids: BTreeSet<String>,
     #[serde(default)]
@@ -647,6 +647,7 @@ impl SidebarAuthorityArrangement {
             && self.session_order.is_empty()
             && self.workspace_order.is_empty()
             && self.pinned_session_ids.is_empty()
+            && self.collapsed_delegated_session_ids.is_empty()
             && self.collapsed_project_ids.is_empty()
             && self.collapsed_workspace_ids.is_empty()
             && self.project_location_preferences.is_empty()
@@ -655,6 +656,7 @@ impl SidebarAuthorityArrangement {
             && self.organization.folders.is_empty()
             && self.organization.placements.is_empty()
             && self.organization.collapsed_folder_ids.is_empty()
+            && self.organization.groups.is_empty()
     }
 }
 
@@ -714,6 +716,7 @@ impl SidebarUiState {
             session_order_anchored_at_ms: self.session_order_anchored_at_ms,
             workspace_order: self.workspace_order.clone(),
             pinned_session_ids: self.pinned_session_ids.clone(),
+            collapsed_delegated_session_ids: self.collapsed_delegated_session_ids.clone(),
             collapsed_project_ids: self.collapsed_project_ids.clone(),
             collapsed_workspace_ids: self.collapsed_workspace_ids.clone(),
             project_location_preferences: self.project_location_preferences.clone(),
@@ -730,6 +733,7 @@ impl SidebarUiState {
         self.session_order_anchored_at_ms = arrangement.session_order_anchored_at_ms;
         self.workspace_order = arrangement.workspace_order;
         self.pinned_session_ids = arrangement.pinned_session_ids;
+        self.collapsed_delegated_session_ids = arrangement.collapsed_delegated_session_ids;
         self.collapsed_project_ids = arrangement.collapsed_project_ids;
         self.collapsed_workspace_ids = arrangement.collapsed_workspace_ids;
         self.project_location_preferences = arrangement.project_location_preferences;
@@ -769,6 +773,7 @@ impl SidebarUiState {
             .take(1_000)
             .collect();
         normalize_set(&mut arrangement.pinned_session_ids, 2_000);
+        normalize_set(&mut arrangement.collapsed_delegated_session_ids, 2_000);
         normalize_set(&mut arrangement.collapsed_project_ids, 1_000);
         normalize_set(&mut arrangement.collapsed_workspace_ids, 2_000);
         arrangement.project_location_preferences =
@@ -1007,6 +1012,10 @@ pub struct ComposerQueueEntry {
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+    /// Typed references selected by the user. Plain prompt text never creates
+    /// an access grant when a queue is restored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<vibex_core::VibexUseMention>,
     #[serde(default)]
     pub command: Option<ComposerQueueCommand>,
     /// The local deadline of a scheduled message. `None` is an ordinary queued
@@ -1972,6 +1981,16 @@ fn normalize_composer_queue(queue: &mut Vec<ComposerQueueEntry>) {
                 .take(COMPOSER_QUEUE_TEXT_MAX_CHARS)
                 .collect();
             entry.attachments.truncate(COMPOSER_QUEUE_ATTACHMENT_LIMIT);
+            entry.mentions.truncate(vibex_core::VIBEX_USE_MAX_MENTIONS);
+            for mention in &mut entry.mentions {
+                mention.label = bounded_optional(mention.label.take(), 256);
+            }
+            let mut seen_mentions = BTreeSet::new();
+            entry.mentions.retain(|mention| {
+                let encoded = mention.encode();
+                vibex_core::VibexUseMention::parse(&encoded).is_some()
+                    && seen_mentions.insert(encoded)
+            });
             for attachment in &mut entry.attachments {
                 attachment.label = attachment.label.chars().take(4_096).collect();
                 attachment.mime_type = bounded_optional(attachment.mime_type.take(), 256);
@@ -2297,6 +2316,7 @@ mod tests {
                 uri: Some("file:///tmp/notes.md".to_string()),
                 inline_text_offset: None,
             }],
+            mentions: Vec::new(),
             command: None,
             scheduled_at_ms,
         };
@@ -3867,5 +3887,67 @@ mod tests {
         let serialized = serde_json::to_string(&metadata).unwrap();
         assert!(!serialized.contains("prompt"));
         assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn delegated_collapse_state_isolated_by_authority_survives_a_restart() {
+        let mut state = DesktopUiStateV1::default();
+        state
+            .sidebar
+            .collapsed_delegated_session_ids
+            .insert("shared-session-id".into());
+        state.sidebar.switch_authority("server:team");
+        assert!(state.sidebar.collapsed_delegated_session_ids.is_empty());
+        state
+            .sidebar
+            .collapsed_delegated_session_ids
+            .insert("remote-parent".into());
+        state.normalize().unwrap();
+        let mut restored: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        restored
+            .sidebar
+            .switch_authority(SidebarUiState::LOCAL_AUTHORITY);
+        assert_eq!(
+            restored.sidebar.collapsed_delegated_session_ids,
+            BTreeSet::from(["shared-session-id".into()])
+        );
+        restored.sidebar.switch_authority("server:team");
+        assert_eq!(
+            restored.sidebar.collapsed_delegated_session_ids,
+            BTreeSet::from(["remote-parent".into()])
+        );
+    }
+
+    #[test]
+    fn a_scheduled_message_round_trips_selected_mentions_without_inventing_them_from_text() {
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::new(),
+            "model",
+        );
+        let mention = vibex_core::VibexUseMention::session(
+            &vibex_core::VibexSessionId::new(),
+            Some("Reviewer"),
+        );
+        let mut state = DesktopUiStateV1::default();
+        state.composer.queue.push(ComposerQueueEntry {
+            id: 1,
+            session_id: vibex_core::VibexSessionId::new().to_string(),
+            desired_runtime: selection,
+            text: "Ask @Reviewer and @TypedName".into(),
+            attachments: Vec::new(),
+            mentions: vec![mention.clone(), mention.clone()],
+            command: None,
+            scheduled_at_ms: Some(1_800_000_000_000),
+        });
+        state.normalize().unwrap();
+        let restored: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.composer.queue[0].mentions, [mention]);
+        assert_eq!(
+            restored.composer.queue[0].text,
+            "Ask @Reviewer and @TypedName"
+        );
     }
 }

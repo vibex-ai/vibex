@@ -232,6 +232,8 @@ pub struct CreateAgentDelegationRequest {
     pub parent_session_id: VibexSessionId,
     pub idempotency_key: String,
     pub task: String,
+    #[serde(default)]
+    pub attachments: Vec<crate::MessageAttachment>,
     pub title: Option<String>,
     pub agent_id: Option<AgentId>,
     pub provider_profile_id: Option<ProviderProfileId>,
@@ -262,6 +264,15 @@ pub struct CreateAgentDelegationRequest {
     /// recovery path that already committed to a specific child.
     #[serde(default)]
     pub existing_session_id: Option<VibexSessionId>,
+    /// Complete authority-resolved selection. Legacy callers may omit it.
+    #[serde(default)]
+    pub runtime_selection: Option<crate::SessionRuntimeSelection>,
+    /// Authorized, bounded context rendered by the domain service.
+    #[serde(default)]
+    pub prompt_context: Option<String>,
+    /// Durable operation that accepted this delegation.
+    #[serde(default)]
+    pub operation_id: Option<crate::VibexOperationId>,
 }
 
 impl CreateAgentDelegationRequest {
@@ -273,6 +284,8 @@ impl CreateAgentDelegationRequest {
     pub fn payload_fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.task.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(&self.attachments).unwrap_or_default());
         hasher.update([0]);
         hasher.update(self.title.as_deref().unwrap_or_default().as_bytes());
         hasher.update([0]);
@@ -304,6 +317,26 @@ impl CreateAgentDelegationRequest {
         hasher.update(self.mode_id.as_deref().unwrap_or_default().as_bytes());
         hasher.update([0]);
         hasher.update(self.completion_policy.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(
+            serde_json::to_vec(&(
+                self.ownership_kind,
+                &self.follows_task_id,
+                &self.existing_session_id,
+            ))
+            .unwrap_or_default(),
+        );
+        hasher.update([0]);
+        if let Some(selection) = &self.runtime_selection {
+            hasher.update(serde_json::to_vec(selection).unwrap_or_default());
+        }
+        hasher.update([0]);
+        hasher.update(
+            self.prompt_context
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         hasher.update([0]);
         for criterion in &self.acceptance_criteria {
             hasher.update(criterion.as_bytes());
@@ -482,5 +515,28 @@ mod tests {
                 assert_eq!(projected, status);
             }
         }
+    }
+
+    #[test]
+    fn delegation_fingerprint_distinguishes_target_ownership_and_followed_work() {
+        let request: CreateAgentDelegationRequest = serde_json::from_value(serde_json::json!({
+            "parentSessionId": VibexSessionId::new(),
+            "idempotencyKey": "same-intent",
+            "task": "Continue the implementation"
+        }))
+        .unwrap();
+        let fingerprint = request.payload_fingerprint();
+        let mut controlled = request.clone();
+        controlled.ownership_kind = DelegationOwnershipKind::ControlledExisting;
+        assert_ne!(controlled.payload_fingerprint(), fingerprint);
+        let mut followed = request.clone();
+        followed.follows_task_id = Some(AgentDelegationId::new());
+        assert_ne!(followed.payload_fingerprint(), fingerprint);
+        let mut target = request.clone();
+        target.existing_session_id = Some(VibexSessionId::new());
+        assert_ne!(target.payload_fingerprint(), fingerprint);
+        let mut recovered = request;
+        recovered.operation_id = Some(crate::VibexOperationId::new());
+        assert_eq!(recovered.payload_fingerprint(), fingerprint);
     }
 }

@@ -90,7 +90,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 62;
+pub const CURRENT_SCHEMA_VERSION: i64 = 63;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -2743,7 +2743,7 @@ impl SessionRepository {
             "
             SELECT EXISTS(
                 SELECT 1
-                FROM agent_delegations
+                FROM session_ownership_edges
                 WHERE child_session_id = ?1
             )
             ",
@@ -2766,8 +2766,8 @@ impl SessionRepository {
             "
             AND NOT EXISTS (
                 SELECT 1
-                FROM agent_delegations
-                WHERE agent_delegations.child_session_id = agent_sessions.session_id
+                FROM session_ownership_edges
+                WHERE session_ownership_edges.child_session_id = agent_sessions.session_id
             )
             ",
         );
@@ -3246,6 +3246,52 @@ impl AgentDelegationRepository {
                 "the parent session already has the maximum number of active child tasks",
             ));
         }
+        if crate::delegation_cancellation_fence(&tx, &delegation.parent_session_id)?.is_some() {
+            return Err(VibexError::conflict(
+                "vibex_use_task_cancelling",
+                "the parent task tree is stopping",
+            ));
+        }
+        let root = crate::vibex_use_root_session(&tx, &delegation.parent_session_id)?;
+        crate::VibexUseBudgetRepository::check_session_deadline(
+            &tx,
+            &delegation.parent_session_id,
+            unix_timestamp_ms(),
+        )?;
+        let parent = SessionRepository::get(&tx, &delegation.parent_session_id)?;
+        let agent = delegation
+            .requested_runtime
+            .as_ref()
+            .map(|runtime| &runtime.agent_id)
+            .or(delegation.requested_agent_id.as_ref())
+            .or(delegation.effective_agent_id.as_ref())
+            .or(parent.as_ref().map(|parent| &parent.agent_id));
+        crate::VibexUseBudgetRepository::check_admission(&tx, &root, agent, 0)?;
+        if crate::vibex_use_delegation_depth(&tx, &delegation.parent_session_id)?
+            >= crate::VibexUseBudgetRepository::policy(&tx)?.max_depth
+        {
+            return Err(VibexError::conflict(
+                "delegation_depth_exceeded",
+                "Agent delegation nesting depth is limited",
+            ));
+        }
+        if delegation.child_session_id.as_ref() == Some(&delegation.parent_session_id) {
+            return Err(VibexError::conflict(
+                "delegation_hierarchy_invalid",
+                "a session cannot delegate a task to itself",
+            ));
+        }
+        if let Some(child) = delegation.child_session_id.as_ref()
+            && crate::list_delegations_for_child(&tx, child)?
+                .iter()
+                .any(|task| !task.phase().is_terminal())
+        {
+            return Err(VibexError::conflict(
+                "vibex_use_controller_changed",
+                "the session already has an unfinished task",
+            ));
+        }
+        let parent_task_id = crate::vibex_use_origin_task(&tx, &delegation.parent_session_id)?;
         tx.execute(
             "
             INSERT INTO agent_delegations (
@@ -3258,11 +3304,11 @@ impl AgentDelegationRepository {
                 current_execution_id, blocked_on_json, context_refs_json,
                 acceptance_criteria_json, requested_runtime_json, effective_runtime_json,
                 result_refs_json, cancellation_requested_at_ms, finished_at_ms,
-                payload_fingerprint
+                payload_fingerprint, parent_task_id
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-                ?32, ?33)
+                ?32, ?33, ?34)
             ",
             params![
                 delegation.id.as_str(),
@@ -3324,12 +3370,14 @@ impl AgentDelegationRepository {
                 delegation.cancellation_requested_at_ms,
                 delegation.finished_at_ms,
                 delegation.payload_fingerprint,
+                parent_task_id.as_ref().map(AgentDelegationId::as_str),
             ],
         )
         .map_err(storage_err(
             "agent_delegation_insert_failed",
             "failed to persist Agent delegation",
         ))?;
+        crate::VibexUseBudgetRepository::reserve_task(&tx, delegation)?;
         let persisted = Self::get_by_parent_and_idempotency(
             &tx,
             &delegation.parent_session_id,
@@ -3341,6 +3389,23 @@ impl AgentDelegationRepository {
                 "Agent delegation was not found after it was persisted",
             )
         })?;
+        if let Some(child) = persisted.child_session_id.as_ref()
+            && !matches!(
+                crate::SessionControllerRepository::claim(
+                    &tx,
+                    child,
+                    &persisted.id,
+                    &persisted.parent_session_id,
+                    None
+                )?,
+                crate::SessionControllerClaim::Claimed(_)
+            )
+        {
+            return Err(VibexError::conflict(
+                "vibex_use_controller_changed",
+                "the session controller changed before task admission",
+            ));
+        }
         tx.commit().map_err(storage_err(
             "agent_delegation_reservation_commit_failed",
             "failed to commit Agent delegation reservation",
@@ -3621,7 +3686,7 @@ impl AgentDelegationRepository {
     }
 
     /// Children of one session as recorded by the ownership edges plus, for
-    /// compatibility, the delegation rows that still name it as parent.
+    /// compatibility, owned delegation rows that still name it as parent.
     fn direct_child_session_ids(
         conn: &Connection,
         parent_session_id: &VibexSessionId,
@@ -3634,6 +3699,7 @@ impl AgentDelegationRepository {
                 UNION
                 SELECT child_session_id FROM agent_delegations
                 WHERE parent_session_id = ?1 AND child_session_id IS NOT NULL
+                  AND ownership_kind = 'owned_child'
                 ORDER BY child_session_id ASC
                 ",
             )
@@ -3676,7 +3742,7 @@ impl AgentDelegationRepository {
                     updated_at_ms = ?4
                 WHERE delegation_id = ?1
                   AND child_session_id IS NULL
-                  AND status = ?5
+                  AND (status = ?5 OR task_phase = 'cancelling')
                 ",
                 params![
                     delegation_id.as_str(),
@@ -3756,6 +3822,7 @@ impl AgentDelegationRepository {
                     END
                 WHERE delegation_id = ?1
                   AND status NOT IN (?8, ?9, ?10)
+                  AND (task_phase != 'cancelling' OR ?2 = ?10)
                 ",
                 params![
                     delegation_id.as_str(),
@@ -11577,6 +11644,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_prompt_usage_table(conn, &mut applied)?;
     apply_computer_use(conn, &mut applied)?;
     apply_vibex_use(conn, &mut applied)?;
+    vibex_use::budget::migrate(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -15608,9 +15676,24 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+            SessionOwnershipRepository::upsert(conn, &child.id, &parent.id, Some(&delegation.id))
+                .unwrap();
         };
         attach_child(&mut conn, &parent, &child, "parent-child");
         attach_child(&mut conn, &child, &grandchild, "child-grandchild");
+        let mut controlled = AgentDelegation::single_turn_legacy(
+            parent.id.clone(),
+            "controlled",
+            "Existing collaborator",
+            "Delegate work",
+            Some(agent_id.clone()),
+            AgentDelegationStatus::Starting,
+            now,
+        );
+        controlled.child_session_id = Some(unrelated.id.clone());
+        controlled.ownership_kind = vibex_core::DelegationOwnershipKind::ControlledExisting;
+        controlled.root_session_id = Some(parent.id.clone());
+        AgentDelegationRepository::reserve_or_get(&mut conn, &controlled, 8).unwrap();
 
         let root_ids = SessionRepository::list_root_sessions(&conn, false)
             .unwrap()
@@ -15846,7 +15929,8 @@ mod tests {
                 "59:browser_origin_grants",
                 "60:prompt_usage",
                 "61:computer_use",
-                "62:vibex_use"
+                "62:vibex_use",
+                "63:vibex_use_budget_policy",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -15993,6 +16077,7 @@ mod tests {
                 "60:prompt_usage",
                 "61:computer_use",
                 "62:vibex_use",
+                "63:vibex_use_budget_policy",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -16119,7 +16204,8 @@ mod tests {
                 "59:browser_origin_grants",
                 "60:prompt_usage",
                 "61:computer_use",
-                "62:vibex_use"
+                "62:vibex_use",
+                "63:vibex_use_budget_policy",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -16284,7 +16370,8 @@ mod tests {
                 "59:browser_origin_grants",
                 "60:prompt_usage",
                 "61:computer_use",
-                "62:vibex_use"
+                "62:vibex_use",
+                "63:vibex_use_budget_policy",
             ]
         );
         assert_eq!(
@@ -16491,6 +16578,7 @@ mod tests {
             &SendAgentMessageRequest {
                 session_id: session.id.clone(),
                 message_idempotency_key: "message:cutover".to_string(),
+                mentions: Vec::new(),
                 desired_runtime: selection,
                 text: "cutover message".to_string(),
                 attachments: Vec::new(),
@@ -17708,7 +17796,8 @@ mod tests {
                 "59:browser_origin_grants",
                 "60:prompt_usage",
                 "61:computer_use",
-                "62:vibex_use"
+                "62:vibex_use",
+                "63:vibex_use_budget_policy",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -20637,7 +20726,10 @@ mod tests {
         // migration row is already recorded.
         let second = apply_migrations(&mut conn).unwrap();
         assert!(second.is_empty(), "second run applied {second:?}");
-        assert_eq!(current_schema_version(&conn).unwrap(), 62);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             CURRENT_SCHEMA_VERSION

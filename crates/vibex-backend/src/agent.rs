@@ -86,6 +86,110 @@ pub trait BackendEventSubscription: BackendBound {
 }
 
 pub trait AgentBackend: BackendBound {
+    fn team_snapshot(
+        &self,
+        _request: vibex_core::TeamSnapshotRequest,
+    ) -> BackendFuture<'_, vibex_core::TeamSnapshot> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Team views are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn session_tree(
+        &self,
+        _request: vibex_core::SessionTreeRequest,
+    ) -> BackendFuture<'_, vibex_core::SessionTreePage> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Session trees are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn send_message_with_mentions(
+        &self,
+        request: MutationRequest<vibex_core::HumanAgentMessageRequest>,
+    ) -> BackendFuture<'_, Vec<TimelineItem>> {
+        if request.payload.mentions.is_empty() {
+            return self.send_message(MutationRequest {
+                request_id: request.request_id,
+                idempotency_key: request.idempotency_key,
+                expected_revision: request.expected_revision,
+                payload: request.payload.message,
+            });
+        }
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Selected references are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_session_access(
+        &self,
+        _request: MutationRequest<vibex_core::SessionAccessRequest>,
+    ) -> BackendFuture<'_, vibex_core::SessionAccessResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Session access changes are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn delegate_session(
+        &self,
+        _request: MutationRequest<vibex_core::HumanDelegationRequest>,
+    ) -> BackendFuture<'_, vibex_core::HumanDelegationResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Delegation is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn control_team_task(
+        &self,
+        _request: MutationRequest<vibex_core::TeamTaskControlRequest>,
+    ) -> BackendFuture<'_, vibex_core::DelegationTaskView> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Task controls are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn present_team(
+        &self,
+        _request: MutationRequest<vibex_core::TeamPresentationRequest>,
+    ) -> BackendFuture<'_, vibex_core::PresentationOutcome> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Team presentation is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn acknowledge_team_events(
+        &self,
+        _request: MutationRequest<vibex_core::TeamAcknowledgeRequest>,
+    ) -> BackendFuture<'_, usize> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_team_unavailable",
+                "Team inbox acknowledgement is unavailable on this backend",
+            ))
+        })
+    }
+
     fn subscribe(&self) -> BackendResult<Box<dyn BackendEventSubscription>>;
 
     fn list_sessions(&self, include_archived: bool) -> BackendFuture<'_, Vec<AgentSession>>;

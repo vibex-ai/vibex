@@ -162,6 +162,21 @@ impl SidebarOrganizationState {
         ordered_project_ids: &[String],
         ordered_session_projects: &[(String, String)],
     ) {
+        self.reconcile_with_group_members(
+            ordered_project_ids,
+            ordered_session_projects,
+            &BTreeSet::new(),
+        );
+    }
+
+    /// Keeps group membership independent of the loaded navigation roots.
+    /// Owned sessions may be absent from a lazily loaded ownership tree.
+    pub fn reconcile_with_group_members(
+        &mut self,
+        ordered_project_ids: &[String],
+        ordered_session_projects: &[(String, String)],
+        retained_member_ids: &BTreeSet<String>,
+    ) {
         self.normalize();
         let valid_project_ids = ordered_project_ids.iter().cloned().collect::<BTreeSet<_>>();
         let session_projects = ordered_session_projects
@@ -184,9 +199,10 @@ impl SidebarOrganizationState {
             .retain(|_, group| valid_project_ids.contains(&group.project_id));
         for group in self.groups.values_mut() {
             let before = group.member_session_ids.len();
-            group
-                .member_session_ids
-                .retain(|session_id| session_projects.contains_key(session_id));
+            group.member_session_ids.retain(|session_id| {
+                session_projects.contains_key(session_id)
+                    || retained_member_ids.contains(session_id)
+            });
             if group.member_session_ids.len() != before {
                 group.normalize();
             }
@@ -3058,6 +3074,32 @@ mod tests {
         );
         let group = state.group("group-1").expect("group should survive");
         assert_eq!(group.member_session_ids, group_members(&["session-b"]));
+    }
+
+    #[test]
+    fn reconcile_retains_owned_group_members_without_creating_root_rows() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "Team",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        state.reconcile_with_group_members(
+            &["project-a".into()],
+            &[("session-a".into(), "project-a".into())],
+            &BTreeSet::from(["session-b".into()]),
+        );
+        assert_eq!(
+            state.group("group-1").unwrap().member_session_ids,
+            group_members(&["session-a", "session-b"])
+        );
+        assert!(!state.placements.iter().any(|placement| {
+            placement.item == SidebarOrganizationItem::Session("session-b".into())
+        }));
     }
 
     #[test]

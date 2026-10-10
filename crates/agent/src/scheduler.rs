@@ -236,6 +236,7 @@ impl<'a> ScheduledTaskRunner<'a> {
         match self
             .manager
             .send_message(SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: session.id.clone(),
                 message_idempotency_key: format!(
                     "scheduled-task:{}:{}",
@@ -680,6 +681,7 @@ mod tests {
 
             if request.text.to_ascii_lowercase().contains("permission") {
                 return Ok(ProviderTurnResult {
+                    stop_reason: None,
                     events: vec![ProviderEvent {
                         source: TimelineSource::Provider,
                         payload: TimelinePayload::PermissionRequest(PermissionRequest {
@@ -713,6 +715,7 @@ mod tests {
             }
 
             Ok(ProviderTurnResult {
+                stop_reason: None,
                 events: vec![ProviderEvent::agent(TimelinePayload::AgentMessage(
                     vibex_core::AgentMessagePayload {
                         text: format!("Test response to: {}", request.text),

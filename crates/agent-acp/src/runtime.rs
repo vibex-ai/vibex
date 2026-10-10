@@ -18511,6 +18511,7 @@ impl AcpClient for AcpRuntimeClient {
                 // append a contradictory failure after it.
                 let events = turn_guard.complete(true, AgentUsageExecutionStatus::Completed)?;
                 return Ok(AcpTurn {
+                    stop_reason: None,
                     events,
                     binding_update: Some(payload.acp_session()),
                     completed: true,
@@ -18622,6 +18623,7 @@ impl AcpClient for AcpRuntimeClient {
         }
 
         Ok(AcpTurn {
+            stop_reason: Some(stop_reason),
             events,
             binding_update: Some(payload.acp_session()),
             completed: !has_pending_permissions,
@@ -28538,6 +28540,7 @@ for line in sys.stdin:
         fixture
             .message_submission
             .submit(vibex_core::SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: key.to_string(),
                 reasoning_effort: selection.reasoning_effort.clone(),
@@ -28645,6 +28648,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: format!("{key_prefix}-history"),
                 desired_runtime: fixture.selection.clone(),
@@ -30907,6 +30911,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "durable-source-history".to_string(),
                 desired_runtime: fixture.selection.clone(),
@@ -30984,6 +30989,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "durable-send-after-force-fresh".to_string(),
                 desired_runtime: target_selection.clone(),
@@ -31091,6 +31097,7 @@ for line in sys.stdin:
         desired.model = RuntimeModelSelection::explicit("mock/model-2");
         desired.mode_id = Some("review".to_string());
         let request = SendAgentMessageRequest {
+            mentions: Vec::new(),
             session_id: fixture.session.id.clone(),
             message_idempotency_key: "shared-observer-message".to_string(),
             desired_runtime: desired,
@@ -31251,6 +31258,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "historical-a-turn".to_string(),
                 desired_runtime: fixture.selection.clone(),
@@ -31320,6 +31328,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "historical-b-turn".to_string(),
                 desired_runtime: selection_b.clone(),
@@ -31407,6 +31416,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "historical-a-resumed-turn".to_string(),
                 desired_runtime: fixture.selection.clone(),
@@ -31459,6 +31469,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "failed-target-turn".to_string(),
                 desired_runtime: fixture.selection.clone(),
@@ -31554,6 +31565,7 @@ for line in sys.stdin:
             fixture.manager.as_ref(),
             MessageSubmissionId::new(),
             SendAgentMessageRequest {
+                mentions: Vec::new(),
                 session_id: fixture.session.id.clone(),
                 message_idempotency_key: "incomplete-target-turn".to_string(),
                 desired_runtime: fixture.selection.clone(),
@@ -37455,6 +37467,7 @@ for line in sys.stdin:
         let send_task = tokio::spawn(async move {
             send_manager
                 .send_message(SendAgentMessageRequest {
+                    mentions: Vec::new(),
                     session_id: send_session_id,
                     message_idempotency_key: "acp-runtime-permission".to_string(),
                     desired_runtime: send_runtime,
