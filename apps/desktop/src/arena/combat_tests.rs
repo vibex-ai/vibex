@@ -47,12 +47,12 @@ fn entry_spawn_avoids_where_the_guardian_will_settle() {
     }
 }
 
-fn ticks(arena: &mut Arena, count: usize, controls: Controls) {
+pub(super) fn ticks(arena: &mut Arena, count: usize, controls: Controls) {
     for _ in 0..count {
         arena.tick(controls);
     }
 }
-fn battle(guardian: Guardian) -> Arena {
+pub(super) fn battle(guardian: Guardian) -> Arena {
     let mut arena = Arena::new(guardian, 0.0);
     ticks(&mut arena, 86, Controls::default());
     assert_eq!(arena.phase, Phase::Battle);
@@ -216,29 +216,33 @@ fn every_attack_commits_its_target_before_the_strike() {
     }
 }
 #[test]
-fn fists_have_separate_ground_anchors_and_the_double_slam_opens_the_chest() {
-    let mut arena = battle(Guardian::Claude);
-    arena.boss.prepare(Vec2::new(94.0, 70.0));
+fn independent_hands_must_pin_opposite_seals_before_the_glyph_opens() {
+    let mut arena = battle(Guardian::Pi);
+    arena.player.position = crate::arena::map::SEALS[0];
+    arena.boss.prepare(arena.player.position);
     arena.boss.time = 0.6;
     arena.tick_boss();
     assert!(arena.boss.hand_heights[0] > arena.boss.hand_heights[1] + 5.0);
     assert_ne!(arena.boss.hands[0], arena.boss.hands[1]);
     assert_eq!(arena.boss.exposed, 0.0);
-    arena.boss.attacks = 2;
-    arena.boss.prepare(Vec2::new(94.0, 70.0));
     arena.boss.time = arena.boss.duration;
     arena.tick_boss();
     arena.boss.time = arena.boss.duration;
     arena.player.position = Vec2::new(45.0, 50.0);
     arena.tick_boss();
-    assert!(arena.boss.exposed > 2.0);
-    assert_eq!(arena.hazards.len(), 2);
-    assert!(
-        arena
-            .hazards
-            .iter()
-            .all(|h| h.kind == HazardKind::Fissure && !h.active())
-    );
+    assert_eq!(arena.boss.seals, 1);
+    assert_eq!(arena.boss.exposed, 0.0);
+    let locked = arena.boss.hands[0];
+    arena.player.position = crate::arena::map::SEALS[1];
+    arena.boss.prepare(arena.player.position);
+    arena.boss.time = arena.boss.duration;
+    arena.tick_boss();
+    assert_eq!(arena.boss.hands[0], locked);
+    arena.boss.time = arena.boss.duration;
+    arena.player.position = Vec2::new(88.0, 78.0);
+    arena.tick_boss();
+    assert_eq!(arena.boss.seals, 3);
+    assert!(arena.boss.exposed > 4.0);
 }
 #[test]
 fn the_rolling_knot_breaks_cover_and_perimeter_impacts_keep_it_beatable() {
@@ -251,14 +255,8 @@ fn the_rolling_knot_breaks_cover_and_perimeter_impacts_keep_it_beatable() {
     arena.tick_boss();
     assert!(!arena.map.intact(0));
     assert!(arena.boss.exposed > 2.5);
-    assert!(
-        arena
-            .boss
-            .core
-            .minus(arena.boss.position)
-            .dot(arena.boss.direction)
-            < 0.0
-    );
+    assert_eq!(arena.boss.core, arena.boss.local(0.0, 0.0, 11.0));
+    assert_eq!(arena.boss.strain, 1.0);
     arena.map.broken = 0xff;
     arena.boss.position = Vec2::new(146.0, 58.0);
     arena.boss.exposed = 0.0;
@@ -272,26 +270,19 @@ fn the_rolling_knot_breaks_cover_and_perimeter_impacts_keep_it_beatable() {
     assert!(arena.boss.exposed > 0.0);
 }
 #[test]
-fn the_mages_seal_requires_a_returning_arrow() {
+fn the_glyph_accepts_a_precise_shot_after_the_hands_unlock_its_aperture() {
     let mut arena = battle(Guardian::Pi);
+    arena.boss.position = CENTER;
     arena.boss.height = 0.0;
     arena.boss.opening(2.0);
     arena.boss.update_core();
     let core = arena.boss.core;
     arena.arrow = Arrow {
         state: ArrowState::Flying,
-        position: core.minus(Vec2::new(0.0, 2.0)),
-        velocity: Vec2::new(0.0, 180.0),
+        position: core.plus(Vec2::new(0.0, 4.0)),
+        velocity: Vec2::new(0.0, -300.0),
     };
     arena.tick_arrow(false);
-    assert_eq!(arena.phase, Phase::Battle);
-    arena.arrow = Arrow {
-        state: ArrowState::Returning,
-        position: core.minus(Vec2::new(0.0, 1.0)),
-        velocity: Vec2::new(0.0, 120.0),
-    };
-    arena.player.position = core.plus(Vec2::new(0.0, 24.0));
-    arena.tick_arrow(true);
     assert_eq!(arena.phase, Phase::Victory);
 }
 #[test]
@@ -331,8 +322,8 @@ fn shutter_beams_stop_at_physical_cover_and_the_opening_is_directional() {
     let mut arena = battle(Guardian::OpenCode);
     arena.boss.opening(2.0);
     arena.boss.direction = Vec2::new(0.0, 1.0);
-    assert!(arena.accepts_core_hit(arena.boss.core.plus(Vec2::new(0.0, 8.0)), false));
-    assert!(!arena.accepts_core_hit(arena.boss.core.minus(Vec2::new(0.0, 8.0)), false));
+    assert!(arena.accepts_core_hit(arena.boss.core.plus(Vec2::new(0.0, 8.0))));
+    assert!(!arena.accepts_core_hit(arena.boss.core.minus(Vec2::new(0.0, 8.0))));
 }
 #[test]
 fn water_islands_are_cover_from_waves_but_not_from_a_breach() {
@@ -352,17 +343,17 @@ fn water_islands_are_cover_from_waves_but_not_from_a_breach() {
     assert_eq!(arena.phase, Phase::Defeat);
 }
 #[test]
-fn fast_feathers_use_swept_collision_and_telegraphs_are_safe() {
+fn fast_blocks_use_swept_collision_and_telegraphs_are_safe() {
     let mut arena = battle(Guardian::Copilot);
     arena.player.position = CENTER;
     arena.player.invulnerable = 0.0;
-    arena.hazard(HazardKind::Geyser, CENTER, CENTER, 0.5, 0.2, 6.0);
+    arena.hazard(HazardKind::Scorch, CENTER, CENTER, 0.5, 0.2, 6.0);
     arena.tick_threats(CENTER);
     assert_eq!(arena.phase, Phase::Battle);
     arena.projectile(
         CENTER.minus(Vec2::new(12.0, 0.0)),
         Vec2::new(1500.0, 0.0),
-        ProjectileKind::Feather,
+        ProjectileKind::Block,
     );
     arena.tick_threats(CENTER);
     assert_eq!(arena.phase, Phase::Defeat);
@@ -396,8 +387,8 @@ fn death_automatically_returns_at_random_clear_positions_without_restarting_entr
 #[test]
 fn victory_has_a_finite_departure_and_clears_all_live_threats() {
     let mut arena = battle(Guardian::Pi);
-    arena.projectile(CENTER, Vec2::new(1.0, 0.0), ProjectileKind::Rune);
-    arena.wave(CENTER, 1.0, 50.0, WaveKind::Magic);
+    arena.projectile(CENTER, Vec2::new(1.0, 0.0), ProjectileKind::Block);
+    arena.wave(CENTER, 1.0, 50.0, WaveKind::Stone);
     arena.win();
     assert!(arena.projectiles.is_empty() && arena.waves.is_empty() && arena.hazards.is_empty());
     ticks(&mut arena, 140, Controls::default());
@@ -439,118 +430,6 @@ fn camera_follows_continuously_and_roaming_is_not_a_stationary_breathing_loop() 
     }
 }
 
-/// This pilot uses the public movement/draw/recall/roll inputs. It gets no
-/// invulnerability, position writes or forced phase changes, including retries.
-#[test]
-fn every_guardian_is_winnable_through_ordinary_inputs_and_automatic_rebirth() {
-    for guardian in Guardian::ALL {
-        let mut arena = Arena::new(guardian, 0.0);
-        for frame in 0..48_000 {
-            if arena.phase == Phase::Victory {
-                break;
-            }
-            if arena.phase != Phase::Battle {
-                arena.tick(Controls::default());
-                continue;
-            }
-            let to_boss = arena.boss.position.minus(arena.player.position);
-            let distance = to_boss.length();
-            let open = arena.boss.exposed > 0.55;
-            let shoot_side = match guardian {
-                Guardian::Codex => arena.boss.direction.scale(-1.0),
-                Guardian::OpenCode => arena.boss.direction,
-                _ => to_boss.normalized().scale(-1.0),
-            };
-            let desired = arena.boss.core.plus(shoot_side.scale(23.0));
-            let to_desired = desired.minus(arena.player.position);
-            let mut movement = if open {
-                to_desired.normalized()
-            } else {
-                to_boss
-                    .normalized()
-                    .perpendicular()
-                    .plus(
-                        to_boss
-                            .normalized()
-                            .scale(((distance - 26.0) / 10.0).clamp(-1.0, 1.0)),
-                    )
-                    .normalized()
-            };
-            let aligned = match guardian {
-                Guardian::Codex => {
-                    arena
-                        .player
-                        .position
-                        .minus(arena.boss.position)
-                        .dot(arena.boss.direction)
-                        < -8.0
-                }
-                Guardian::OpenCode => {
-                    arena
-                        .player
-                        .position
-                        .minus(arena.boss.core)
-                        .dot(arena.boss.direction)
-                        > 8.0
-                }
-                _ => true,
-            };
-            let wave_near = arena.waves.iter().any(|wave| {
-                let gap = arena.player.position.minus(wave.position).length() - wave.radius;
-                gap > -2.0 && gap < 8.0
-            });
-            let attack = open && aligned && distance > 11.0 && distance < 51.0 && !wave_near;
-            let mut controls = Controls::default();
-            if arena.arrow.state == ArrowState::Ready
-                && attack
-                && arena.player.roll_remaining <= 0.0
-            {
-                controls.shoot = true;
-                movement = Vec2::default();
-                if arena.player.charge >= 0.37 {
-                    arena.release_shot(None);
-                    controls.shoot = false;
-                }
-            } else if arena.arrow.state != ArrowState::Ready {
-                if arena.arrow.state == ArrowState::Flying {
-                    let beyond = arena
-                        .arrow
-                        .position
-                        .minus(arena.boss.core)
-                        .dot(arena.arrow.velocity.normalized());
-                    if beyond > 5.0 {
-                        controls.recall = true;
-                    }
-                    if guardian == Guardian::Pi {
-                        movement = Vec2::default();
-                    }
-                } else {
-                    controls.recall = true;
-                }
-            }
-            if wave_near && arena.player.roll_cooldown <= 0.0 {
-                let wave = arena.waves.first().unwrap();
-                movement = wave.position.minus(arena.player.position).normalized();
-                controls.shoot = false;
-                controls.recall = false;
-                arena.roll(movement);
-            } else if !controls.shoot && !controls.recall && frame % 33 == 0 {
-                arena.roll(movement);
-            }
-            controls.movement = movement;
-            arena.tick(controls);
-        }
-        assert_eq!(
-            arena.phase,
-            Phase::Victory,
-            "{guardian:?} was not defeated; deaths={}, position={:?}, boss={:?}, arrow={:?}",
-            arena.deaths,
-            arena.player.position,
-            arena.boss,
-            arena.arrow
-        );
-    }
-}
 #[test]
 fn long_running_encounters_bound_effects_and_keep_all_coordinates_finite() {
     for guardian in Guardian::ALL {

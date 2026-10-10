@@ -71,3 +71,44 @@ pub(super) fn segment_distance(point: Vec2, from: Vec2, to: Vec2) -> f32 {
     };
     point.minus(from.plus(segment.scale(progress))).length()
 }
+
+/// Earliest contact along a swept segment. Starting inside counts as contact,
+/// which also makes this useful for relative-motion projectile collisions.
+pub(super) fn circle_hit(point: Vec2, from: Vec2, to: Vec2, radius: f32) -> Option<f32> {
+    let relative = from.minus(point);
+    let delta = to.minus(from);
+    let c = relative.dot(relative) - radius * radius;
+    if c <= 0.0 {
+        return Some(0.0);
+    }
+    let a = delta.dot(delta);
+    if a <= f32::EPSILON {
+        return None;
+    }
+    let b = relative.dot(delta);
+    let discriminant = b * b - a * c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let time = (-b - discriminant.sqrt()) / a;
+    (0.0..=1.0).contains(&time).then_some(time)
+}
+
+pub(super) fn segments_distance(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> f32 {
+    let cross = |u: Vec2, v: Vec2| u.x * v.y - u.y * v.x;
+    let ab = b.minus(a);
+    let cd = d.minus(c);
+    let determinant = cross(ab, cd);
+    if determinant.abs() > f32::EPSILON {
+        let offset = c.minus(a);
+        let t = cross(offset, cd) / determinant;
+        let u = cross(offset, ab) / determinant;
+        if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+            return 0.0;
+        }
+    }
+    segment_distance(a, c, d)
+        .min(segment_distance(b, c, d))
+        .min(segment_distance(c, a, b))
+        .min(segment_distance(d, a, b))
+}

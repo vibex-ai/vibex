@@ -66,6 +66,30 @@ pub(super) struct PixelRect {
     pub ink: u8,
 }
 
+/// Depth storage is local to a sculpture's projected bounds. A small model
+/// never needs a depth surface the size of the entire arena.
+pub(super) struct DepthBuffer {
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+    values: Vec<f32>,
+}
+
+impl DepthBuffer {
+    pub fn new(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        let width = (right - left).max(0) as usize;
+        let height = (bottom - top).max(0) as usize;
+        Self {
+            left,
+            top,
+            width,
+            height,
+            values: vec![f32::NEG_INFINITY; width * height],
+        }
+    }
+}
+
 impl Raster {
     pub fn new(width: usize, height: usize) -> Self {
         Self::with_offset(width, height, 0, 0)
@@ -191,6 +215,66 @@ impl Raster {
         }
     }
 
+    /// Interpolated depth keeps interwoven and overlapping faces correct even
+    /// when no single back-to-front ordering exists for the whole polygons.
+    pub fn polygon_depth(&mut self, points: &[(f32, f32, f32)], ink: u8, depth: &mut DepthBuffer) {
+        if points.len() < 3 || depth.width == 0 || depth.height == 0 {
+            return;
+        }
+        for edge in points[1..].windows(2) {
+            let [a, b, c] = [points[0], edge[0], edge[1]];
+            let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+            if area.abs() < 0.0001 {
+                continue;
+            }
+            let left = (a.0.min(b.0).min(c.0).floor() as i32)
+                .max(depth.left)
+                .max(-self.offset_x);
+            let right = (a.0.max(b.0).max(c.0).ceil() as i32)
+                .min(depth.left + depth.width as i32)
+                .min(self.width as i32 - self.offset_x);
+            let top = (a.1.min(b.1).min(c.1).floor() as i32)
+                .max(depth.top)
+                .max(-self.offset_y);
+            let bottom = (a.1.max(b.1).max(c.1).ceil() as i32)
+                .min(depth.top + depth.height as i32)
+                .min(self.height as i32 - self.offset_y);
+            if left >= right || top >= bottom {
+                continue;
+            }
+            let weight = |p: (f32, f32), u: (f32, f32, f32), v: (f32, f32, f32)| {
+                ((v.0 - u.0) * (p.1 - u.1) - (v.1 - u.1) * (p.0 - u.0)) / area
+            };
+            let da = (b.1 - c.1) / area;
+            let db = (c.1 - a.1) / area;
+            for y in top..bottom {
+                let sample = (left as f32 + 0.5, y as f32 + 0.5);
+                let mut wa = weight(sample, b, c);
+                let mut wb = weight(sample, c, a);
+                let depth_ix =
+                    (y - depth.top) as usize * depth.width + (left - depth.left) as usize;
+                let pixel_ix =
+                    (y + self.offset_y) as usize * self.width + (left + self.offset_x) as usize;
+                let width = (right - left) as usize;
+                for (stored, pixel) in depth.values[depth_ix..depth_ix + width]
+                    .iter_mut()
+                    .zip(&mut self.pixels[pixel_ix..pixel_ix + width])
+                {
+                    let wc = 1.0 - wa - wb;
+                    if wa >= -0.0001 && wb >= -0.0001 && wc >= -0.0001 {
+                        let z = wa * a.2 + wb * b.2 + wc * c.2;
+                        if z >= *stored - 0.0001 {
+                            *stored = z;
+                            *pixel = ink;
+                        }
+                    }
+                    wa += da;
+                    wb += db;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn blit(&mut self, sprite: &Self, left: i32, top: i32) {
         for (ix, color) in sprite.pixels.iter().enumerate() {
@@ -286,6 +370,50 @@ pub(super) fn dither(x: i32, y: i32, visibility: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersecting_surfaces_occlude_per_pixel_in_either_draw_order() {
+        let sloped = [(1., 1., 0.), (9., 1., 4.), (9., 9., 4.), (1., 9., 0.)];
+        let flat = [(1., 1., 2.), (9., 1., 2.), (9., 9., 2.), (1., 9., 2.)];
+        let render = |reverse| {
+            let mut frame = Raster::new(12, 12);
+            let mut depth = DepthBuffer::new(1, 1, 9, 9);
+            let faces = if reverse {
+                [(&flat, ink::GOLD), (&sloped, ink::BODY)]
+            } else {
+                [(&sloped, ink::BODY), (&flat, ink::GOLD)]
+            };
+            for (points, color) in faces {
+                frame.polygon_depth(points, color, &mut depth);
+            }
+            frame
+        };
+        let frame = render(false);
+        assert_eq!(frame.pixels, render(true).pixels);
+        assert_eq!(frame.get(2, 4), ink::GOLD);
+        assert_eq!(frame.get(7, 4), ink::BODY);
+        for y in 1..9 {
+            for x in 1..9 {
+                assert_ne!(frame.get(x, y), ink::CLEAR);
+            }
+        }
+    }
+
+    #[test]
+    fn raised_depth_surfaces_clip_to_the_raster_without_losing_the_top_offset() {
+        let mut frame = Raster::with_offset(8, 12, 0, 4);
+        let mut depth = DepthBuffer::new(-3, -8, 10, 5);
+        frame.polygon_depth(
+            &[(-3., -8., 1.), (10., -8., 1.), (10., 5., 1.), (-3., 5., 1.)],
+            ink::IVORY,
+            &mut depth,
+        );
+        assert_eq!(frame.get(0, -4), ink::IVORY);
+        assert_eq!(frame.get(7, 4), ink::IVORY);
+        assert_eq!(frame.get(7, 5), ink::CLEAR);
+        frame.polygon_depth(&[(0., 0., 2.); 4], ink::GOLD, &mut depth);
+        assert_eq!(frame.get(0, 0), ink::IVORY);
+    }
 
     #[test]
     fn centered_transforms_preserve_odd_sprites_and_single_pixels() {

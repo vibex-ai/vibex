@@ -5,7 +5,7 @@ use super::{
     art::{HEIGHT, SCALE, TOP_PAD, WIDTH, pixel},
     geometry::Vec2,
     guardian::Guardian,
-    map::{CENTER, DAIS, ISLANDS, Map, Pillar},
+    map::{CENTER, DAIS, ISLANDS, Map, Pillar, ScarKind},
     raster::{Raster, hash, ink::*},
 };
 use std::{f32::consts::TAU, sync::OnceLock};
@@ -13,6 +13,67 @@ use std::{f32::consts::TAU, sync::OnceLock};
 pub(super) fn floor(guardian: Guardian) -> &'static Raster {
     static FLOORS: OnceLock<[Raster; 6]> = OnceLock::new();
     &FLOORS.get_or_init(|| Guardian::ALL.map(build))[guardian as usize]
+}
+
+/// Mutable terrain is painted over the cached architecture. The collision map
+/// owns destruction, so a submerged platform cannot keep looking walkable.
+pub(super) fn damage(frame: &mut Raster, map: &Map) {
+    if map.guardian == Guardian::DeepSeek {
+        for (ix, (position, radius)) in ISLANDS.into_iter().enumerate() {
+            if map.sunken & (1 << ix) == 0 {
+                continue;
+            }
+            let c = pixel(position);
+            let r = (radius * SCALE) as i32;
+            frame.ellipse((c.0 + 1, c.1), (r + 9, r * 2 / 3 + 10), WATER_DARK);
+            frame.ring(c, (r + 3, r * 2 / 3 + 3), WATER, true);
+            for n in 0..7 {
+                let a = n as f32 * TAU / 7.0;
+                let x = c.0 + (a.cos() * r as f32 * 0.75) as i32;
+                let y = c.1 + (a.sin() * r as f32 * 0.5) as i32;
+                frame.polygon(&[(x - 2, y), (x + 1, y - 2), (x + 4, y), (x, y + 2)], WATER);
+                frame.line((x - 3, y + 3), (x + 5, y + 3), WATER_LIGHT);
+            }
+        }
+    }
+    for scar in &map.scars {
+        let c = pixel(scar.position);
+        let radius = scar.radius * SCALE;
+        if scar.kind == ScarKind::Scorch {
+            frame.ellipse(
+                c,
+                ((radius * 0.85) as i32, (radius * 0.52) as i32),
+                FLOOR_SHADE,
+            );
+            frame.ring(
+                c,
+                ((radius * 0.8) as i32, (radius * 0.48) as i32),
+                SEAM,
+                true,
+            );
+        }
+        for n in 0..7 {
+            let seed = hash(n, c.0 + c.1 * 7);
+            let a = n as f32 * TAU / 7.0 + (seed % 7) as f32 * 0.04;
+            let length = radius * (0.55 + (seed % 13) as f32 * 0.035);
+            let mid = (
+                c.0 + (a.cos() * length * 0.4) as i32 + 2,
+                c.1 + (a.sin() * length * 0.26) as i32,
+            );
+            let end = (
+                c.0 + (a.cos() * length) as i32,
+                c.1 + (a.sin() * length * 0.62) as i32,
+            );
+            frame.line(c, mid, SEAM);
+            frame.line(mid, end, SEAM);
+            if scar.kind == ScarKind::Crack {
+                frame.line((mid.0, mid.1 + 1), (end.0, end.1 + 1), FLOOR_LIGHT);
+                frame.line(mid, (mid.0 - 3, mid.1 + 4), FLOOR_SHADE);
+                frame.rect(end.0 + 2, end.1, 3, 2, WALL);
+                frame.put(end.0 + 2, end.1, FLOOR_LIGHT);
+            }
+        }
+    }
 }
 
 fn build(guardian: Guardian) -> Raster {
@@ -35,7 +96,11 @@ fn build(guardian: Guardian) -> Raster {
             if !map.inside(p, 0.0) {
                 let above = Vec2::new(p.x, p.y - 3.5);
                 let color = if map.inside(above, 0.0) {
-                    if y % 5 == 0 { OUTLINE } else { WALL }
+                    if y % 7 == 0 || (x + (y / 7 % 2) * 12) % 29 == 0 {
+                        SEAM
+                    } else {
+                        WALL
+                    }
                 } else {
                     DEPTH
                 };
@@ -307,28 +372,58 @@ pub(super) fn pillar(frame: &mut Raster, pillar: Pillar, broken: bool) {
     let r = (pillar.radius * 4.0) as i32;
     let h = (pillar.height * 4.0) as i32;
     if broken {
+        frame.ellipse((x + 2, y + 1), (r + 6, r / 2 + 4), FLOOR_SHADE);
         for n in 0..7 {
             let a = n as f32 * TAU / 7.0;
             let q = (
                 x + (a.cos() * r as f32) as i32,
                 y + (a.sin() * r as f32 * 0.6) as i32,
             );
-            frame.rect(q.0, q.1 - 5, 7, 7, WALL);
-            frame.rect(q.0, q.1 - 5, 7, 2, WALL_LIGHT);
+            let width = 4 + n % 3;
+            frame.polygon(
+                &[
+                    (q.0 - width, q.1),
+                    (q.0 - width, q.1 - 4),
+                    (q.0 + 1, q.1 - 7),
+                    (q.0 + width, q.1 - 3),
+                    (q.0 + width, q.1 + 2),
+                ],
+                WALL,
+            );
+            frame.polygon(
+                &[
+                    (q.0 - width, q.1 - 4),
+                    (q.0 + 1, q.1 - 7),
+                    (q.0 + width, q.1 - 3),
+                    (q.0, q.1 - 1),
+                ],
+                WALL_LIGHT,
+            );
+            frame.line((q.0, q.1 - 1), (q.0, q.1 + 2), SEAM);
         }
         return;
     }
-    frame.ellipse((x + 9, y + 7), (r + 10, 7), SHADOW);
+    frame.polygon(
+        &[
+            (x - r, y),
+            (x + r, y),
+            (x + r + h / 2, y + h / 4),
+            (x + h / 2, y + h / 4 + 3),
+        ],
+        SHADOW,
+    );
     frame.rect(x - r - 3, y - 5, r * 2 + 7, 7, WALL);
     frame.ellipse((x, y - 5), (r + 3, r / 2 + 1), FLOOR_LIGHT);
     frame.rect(x - r, y - h, r * 2, h, WALL);
     frame.rect(x - r + 1, y - h, 4, h, WALL_LIGHT);
+    frame.rect(x - r + 5, y - h, 2, h, FLOOR_LIGHT);
     frame.rect(x + r - 5, y - h, 5, h, DEPTH);
     for dy in (8..h).step_by(11) {
         frame.line((x - r + 2, y - dy), (x + r - 1, y - dy), SEAM);
     }
     frame.ellipse((x, y - h), (r, r / 2), WALL_LIGHT);
     frame.ellipse((x, y - h - 1), (r - 3, r / 2 - 2), FLOOR_LIGHT);
+    frame.line((x - r + 2, y - h + 2), (x, y - h + r / 2), DUST);
     frame.line((x + 1, y - h + 7), (x - 3, y - h + 17), DEPTH);
     frame.line((x - 3, y - h + 17), (x + 1, y - h + 26), DEPTH);
 }
@@ -340,6 +435,9 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
     match map.guardian {
         Guardian::DeepSeek => {
             for (ix, (p, r)) in ISLANDS.iter().enumerate() {
+                if map.sunken & (1 << ix) != 0 {
+                    continue;
+                }
                 let c = pixel(*p);
                 let spread = ((time * 0.35 + ix as f32 * 0.2).fract() * 8.0) as i32;
                 frame.ring(

@@ -13,12 +13,12 @@ const MATERIALS: [u32; ink::COUNT] = [
 pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
     let mut colors = MATERIALS.map(|value| rgb(value).into());
     let body = match guardian {
-        Guardian::Claude => [0x593b38, 0x8a493b, 0xbc6449, 0xe18a63, 0xf2b88a],
-        Guardian::Codex => [0x254039, 0x3d6250, 0x648975, 0x9ebca1, 0xd3dfbc],
-        Guardian::Pi => [0x454051, 0x766978, 0xb8ac9c, 0xe6d6b3, 0xf7ebcb],
-        Guardian::OpenCode => [0x26353b, 0x485963, 0x7d9194, 0xb9cdca, 0xe2e9d8],
-        Guardian::DeepSeek => [0x203451, 0x355785, 0x507daf, 0x7daed0, 0xb5d5de],
-        Guardian::Copilot => [0x30394c, 0x515e75, 0x8295a8, 0xb7c6cc, 0xe4e0d2],
+        Guardian::Claude => [0x582c3d, 0x993b38, 0xd55b39, 0xf7884d, 0xffbd76],
+        Guardian::Codex => [0x2c2927, 0x564b3d, 0x8f7958, 0xc3aa79, 0xecdaa3],
+        Guardian::Pi => [0x0c1119, 0x1a222a, 0x303a42, 0x4d5860, 0x747d80],
+        Guardian::OpenCode => [0x141420, 0x292938, 0x444555, 0x676a78, 0x94979f],
+        Guardian::DeepSeek => [0x142854, 0x253f8d, 0x385ac4, 0x5588e3, 0x89c6f4],
+        Guardian::Copilot => [0x11393e, 0x155958, 0x228e80, 0x5ac8a4, 0xa3e8bd],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -58,15 +58,28 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         colors[ix as usize] = rgb(color).into();
     }
     let core = match guardian {
-        Guardian::Claude => [0x683630, 0xeaaa69, 0xffddb2],
-        Guardian::Codex => [0x224d4d, 0x7de1c0, 0xd8ffe1],
-        Guardian::Pi => [0x673f68, 0xd789c1, 0xffd6eb],
-        Guardian::OpenCode => [0x25455d, 0x79d2e6, 0xd9ffff],
-        Guardian::DeepSeek => [0x663c61, 0xe488ac, 0xffdaed],
-        Guardian::Copilot => [0x645337, 0xedc77a, 0xffedb8],
+        Guardian::Claude => [0xa34837, 0xffb951, 0xffe7ac],
+        Guardian::Codex => [0x9c7944, 0xffd58a, 0xffefc5],
+        Guardian::Pi => [0x8c8a77, 0xeee5c7, 0xfffae8],
+        Guardian::OpenCode => [0x747384, 0xdcdbe9, 0xfffff4],
+        Guardian::DeepSeek => [0x275dc4, 0x59c7ff, 0xc5f8ff],
+        Guardian::Copilot => [0x1460a5, 0x42bbef, 0xc2f5ff],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
+    }
+    if matches!(guardian, Guardian::DeepSeek | Guardian::Copilot) {
+        for (ix, value) in [0x17376e, 0x2b88cf, 0x81dce9].into_iter().enumerate() {
+            colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
+        }
+        colors[ink::GOLD_DARK as usize] = rgb(0x607a88).into();
+        colors[ink::DUST as usize] = rgb(0xa4b4bc).into();
+        colors[ink::IVORY as usize] = rgb(0xe0eae5).into();
+        colors[ink::WHITE as usize] = rgb(0xf3fff8).into();
+    }
+    if guardian == Guardian::OpenCode {
+        colors[ink::WHITE as usize] = rgb(0xfffef5).into();
+        colors[ink::IVORY as usize] = rgb(0xe9e7e9).into();
     }
     colors
 }
