@@ -3,9 +3,9 @@
 //! The text view only decodes `data:` URLs by itself; every other destination
 //! is handed to GPUI's asset loader as a URI, which fetches over HTTP. A
 //! transcript that points at a file in the session workspace therefore needs a
-//! resolver: this plugin claims those image nodes, renders them from the
-//! canonical workspace path, and turns a click into the full-window image
-//! preview the attachment surfaces already use.
+//! resolver: this plugin claims those image nodes, draws them from the
+//! canonical workspace path as a bounded thumbnail, and turns a click into the
+//! full-window image preview the attachment surfaces already use.
 
 use std::{
     hash::{Hash as _, Hasher as _},
@@ -14,13 +14,15 @@ use std::{
 };
 
 use gpui::{
-    App, ElementId, ImageSource, InteractiveElement as _, ObjectFit, Resource, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, img, relative,
+    App, ElementId, ImageSource, InteractiveElement as _, ObjectFit, ParentElement as _, Pixels,
+    Resource, Role, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Window, div, img, px, relative, size,
 };
 use gpui_base::text::{
     InlineElement, InlineRenderContext, MarkdownNode, MarkdownParseContext, MarkdownPlugin,
     markdown_ast::Node as MarkdownAst,
 };
+use gpui_component::{ActiveTheme as _, tooltip::Tooltip};
 use percent_encoding::percent_decode_str;
 
 /// Opens a workspace image in the full-window preview.
@@ -30,10 +32,40 @@ pub(super) type SessionImageOpen =
 const NAME: &str = "vibex-session-image";
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The largest a transcript thumbnail may draw, in rem.
+///
+/// A transcript is prose, and a screenshot pasted into it is evidence rather
+/// than the subject: at its intrinsic 1432×928 the README capture filled most
+/// of the session column and pushed the surrounding answer off screen. These
+/// two caps keep every thumbnail the size of a figure — big enough to recognize,
+/// small enough that the words around it stay the reading surface. They are
+/// rem-based so interface zoom scales the figure with the text beside it, and
+/// the ratio is applied rather than a fixed box so tall and wide images keep
+/// their shape.
+const THUMBNAIL_MAX_WIDTH_REMS: f32 = 20.0;
+const THUMBNAIL_MAX_HEIGHT_REMS: f32 = 12.0;
+
+/// The smallest edge a thumbnail may draw, in rem.
+///
+/// A 16 px icon is already its own best preview and would still have to carry
+/// a click target. The floor keeps that target reachable (40 px at the default
+/// scale); the picture itself stays its intrinsic size inside the card, so a
+/// small mark is not blown up into a blurry tile.
+const THUMBNAIL_MIN_EDGE_REMS: f32 = 2.5;
+
+/// The shape an image with no readable header falls back to, so an undecodable
+/// SVG or a corrupt file cannot collapse its slot to a hairline.
+const THUMBNAIL_FALLBACK_ASPECT_RATIO: f32 = 4.0 / 3.0;
+
 /// A local image claimed from a Markdown `Image` node.
 struct SessionImage {
     path: PathBuf,
     label: String,
+    /// Pixel dimensions after EXIF orientation, read from the file header when
+    /// the document is parsed. `None` when the format keeps its size only in
+    /// the payload (an SVG without a viewBox), in which case the thumbnail
+    /// falls back to a 4:3 slot.
+    intrinsic_size: Option<(u32, u32)>,
 }
 
 /// Claims workspace image nodes in a session's Markdown surface.
@@ -42,12 +74,21 @@ pub(super) struct SessionImagePlugin {
     /// Canonicalized on the first image the parser resolves, not on every
     /// frame: the plugin is rebuilt for every Markdown view render.
     canonical_root: OnceLock<Option<PathBuf>>,
+    /// The width the transcript column currently offers, in pixels. The
+    /// thumbnail cap is the smaller of this and its own rem-based limit, so a
+    /// figure in a narrow pane shrinks with the column instead of overflowing
+    /// it. Render-time only: a pane resize must not reparse the document.
+    available_width: f32,
     open: SessionImageOpen,
     parser_revision: u64,
 }
 
 impl SessionImagePlugin {
-    pub(super) fn new(workspace_root: PathBuf, open: SessionImageOpen) -> Self {
+    pub(super) fn new(
+        workspace_root: PathBuf,
+        available_width: f32,
+        open: SessionImageOpen,
+    ) -> Self {
         let parser_revision = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             workspace_root.hash(&mut hasher);
@@ -56,6 +97,7 @@ impl SessionImagePlugin {
         Self {
             workspace_root,
             canonical_root: OnceLock::new(),
+            available_width,
             open,
             parser_revision,
         }
@@ -168,6 +210,7 @@ impl MarkdownPlugin for SessionImagePlugin {
             .map(str::to_string)
             .unwrap_or_else(|| format!("![{}]({})", image.alt, image.url));
         let data = SessionImage {
+            intrinsic_size: intrinsic_image_size(&path),
             path,
             label: label.clone(),
         };
@@ -182,9 +225,9 @@ impl MarkdownPlugin for SessionImagePlugin {
     fn render_inline(
         &self,
         node: &MarkdownNode,
-        _context: &InlineRenderContext,
+        context: &InlineRenderContext,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<InlineElement> {
         let image = node.data::<SessionImage>()?;
         let source_path: Arc<Path> = Arc::from(image.path.clone().into_boxed_path());
@@ -192,20 +235,137 @@ impl MarkdownPlugin for SessionImagePlugin {
         let open = self.open.clone();
         let path = image.path.clone();
         let label = image.label.clone();
+        let theme = cx.theme();
+        let thumbnail = thumbnail_size(
+            image.intrinsic_size,
+            self.available_width,
+            f32::from(context.rem_size()),
+        );
+        let border = theme.border;
+        let hover_border = theme.ring;
+        let plate = theme.muted;
         let start = node.source_range().map(|range| range.start).unwrap_or(0);
         let id = SharedString::from(format!("session-image:{start}:{}", image.path.display()));
-        let element = img(source)
+        let action_label = format!(
+            "{}: {label}",
+            crate::locale::text("Preview image", "预览图片", "預覽圖片")
+        );
+        let tooltip_label = action_label.clone();
+        let element = div()
             .id(ElementId::Name(id))
             .debug_selector(|| "vibex-session-image".to_string())
-            .object_fit(ObjectFit::Contain)
+            .flex_none()
+            .w(thumbnail.width)
+            .h(thumbnail.height)
+            // The session column is the cap above, but a figure can also sit in
+            // a table cell or a narrower block, where the immediate container
+            // is tighter than the column. Never paint past it.
             .max_w(relative(1.0))
+            .overflow_hidden()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(border)
+            .bg(plate)
             .cursor_pointer()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(action_label)
+            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .hover(move |style| style.border_color(hover_border))
+            .focus_visible(move |style| style.border_color(hover_border))
+            .active(|style| style.opacity(0.85))
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 open(path.clone(), label.clone(), window, cx);
-            });
+            })
+            .child(
+                // `ScaleDown` keeps a small mark crisp at its own size rather
+                // than growing it into the card; a large screenshot is bounded
+                // by the card, which is already the fitted size.
+                img(source).size_full().object_fit(ObjectFit::ScaleDown),
+            );
         Some(InlineElement::new(element))
     }
+}
+
+/// The card a transcript thumbnail occupies.
+///
+/// `available_width` is the transcript column the figure sits in, so a narrow
+/// pane shrinks the card instead of overflowing it; the rem caps keep it the
+/// size of a figure at any interface zoom. The result preserves the image's
+/// aspect ratio, never exceeds its intrinsic size, and grows a tiny picture's
+/// card up to a clickable target while leaving the picture itself centred at its
+/// own resolution.
+fn thumbnail_size(
+    intrinsic_size: Option<(u32, u32)>,
+    available_width: f32,
+    rem_size: f32,
+) -> Size<Pixels> {
+    let rem_size = if rem_size.is_finite() && rem_size > 0.0 {
+        rem_size
+    } else {
+        16.0
+    };
+    let max_width = (rem_size * THUMBNAIL_MAX_WIDTH_REMS).min(if available_width.is_finite() {
+        available_width
+    } else {
+        f32::INFINITY
+    });
+    let max_width = max_width.max(rem_size * THUMBNAIL_MIN_EDGE_REMS);
+    let max_height = rem_size * THUMBNAIL_MAX_HEIGHT_REMS;
+    let min_edge = rem_size * THUMBNAIL_MIN_EDGE_REMS;
+
+    let Some((intrinsic_width, intrinsic_height)) = intrinsic_size
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .map(|(width, height)| (width as f32, height as f32))
+    else {
+        // No header to read: an SVG without a viewBox, or a file the decoder
+        // cannot open. A 4:3 plate the size of the figure is a better guess
+        // than a one-pixel card, and the fallback card never pretends to be
+        // the picture's exact shape.
+        let width = max_width.min(max_height * THUMBNAIL_FALLBACK_ASPECT_RATIO);
+        return size(px(width), px(width / THUMBNAIL_FALLBACK_ASPECT_RATIO));
+    };
+    let scale = (max_width / intrinsic_width)
+        .min(max_height / intrinsic_height)
+        .min(1.0);
+    // The two axes are floored independently: a tiny mark gets a target large
+    // enough to click, and a panorama's hairline card gets a usable height. The
+    // picture inside keeps its aspect ratio and is centred, so the floor widens
+    // the card around it rather than stretching it.
+    let card_width = (intrinsic_width * scale).clamp(min_edge.min(max_width), max_width);
+    let card_height = (intrinsic_height * scale).clamp(min_edge.min(max_height), max_height);
+    size(px(card_width), px(card_height))
+}
+
+/// Pixel dimensions of an image file, after the EXIF orientation it declares.
+///
+/// Read from the header only, so the parser never decodes the pixels it is
+/// about to hand to the renderer. Formats whose size lives in the payload
+/// (an SVG without a viewBox) and unreadable files return `None`, and the
+/// thumbnail falls back to its default shape.
+fn intrinsic_image_size(path: &Path) -> Option<(u32, u32)> {
+    use image::ImageDecoder as _;
+
+    let mut decoder = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(match orientation {
+        image::metadata::Orientation::Rotate90
+        | image::metadata::Orientation::Rotate270
+        | image::metadata::Orientation::Rotate90FlipH
+        | image::metadata::Orientation::Rotate270FlipH => (height, width),
+        _ => (width, height),
+    })
 }
 
 #[cfg(test)]
@@ -215,7 +375,7 @@ mod tests {
     use std::fs;
 
     fn plugin(root: &Path) -> SessionImagePlugin {
-        SessionImagePlugin::new(root.to_path_buf(), Arc::new(|_, _, _, _| {}))
+        SessionImagePlugin::new(root.to_path_buf(), 720.0, Arc::new(|_, _, _, _| {}))
     }
 
     fn write_image(root: &Path, relative: &str) -> PathBuf {
@@ -229,6 +389,54 @@ mod tests {
 
     fn canonical(path: &Path) -> PathBuf {
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn thumbnails_keep_transcript_figures_bounded_and_in_shape() {
+        // The README capture, 1432×928, must fit the 20rem × 12rem figure at
+        // the default 16 px rem instead of taking its intrinsic pixel size.
+        // Height is the binding cap here, and the ratio decides the width.
+        let showcase = thumbnail_size(Some((1432, 928)), 720.0, 16.0);
+        assert_eq!(showcase, size(px(296.27588), px(192.0)));
+        assert!(showcase.width < px(320.0));
+
+        // A portrait screenshot is capped by height and keeps its ratio.
+        let tall = thumbnail_size(Some((900, 1600)), 720.0, 16.0);
+        assert_eq!(tall.height, px(192.0));
+        assert!(tall.width < px(192.0));
+
+        // A narrow transcript column, not the rem cap, decides there.
+        let narrow = thumbnail_size(Some((1432, 928)), 240.0, 16.0);
+        assert_eq!(narrow.width, px(240.0));
+        assert!((f32::from(narrow.height) - 155.5).abs() < 0.1);
+
+        // An icon keeps its shape and gets a click target, but is not blown up.
+        let icon = thumbnail_size(Some((16, 16)), 720.0, 16.0);
+        assert_eq!(icon, size(px(40.0), px(40.0)));
+
+        // An unreadable header falls back to a 4:3 slot rather than nothing.
+        let unknown = thumbnail_size(None, 720.0, 16.0);
+        assert_eq!(unknown, size(px(256.0), px(192.0)));
+    }
+
+    #[test]
+    fn thumbnail_caps_follow_interface_zoom() {
+        let base = thumbnail_size(Some((1432, 928)), 720.0, 16.0);
+        let zoomed = thumbnail_size(Some((1432, 928)), 720.0, 24.0);
+        assert_eq!(zoomed.height, px(288.0));
+        assert_eq!(zoomed.width, px(444.4138));
+        assert!(zoomed.width > base.width);
+    }
+
+    #[test]
+    fn intrinsic_size_reads_the_file_header_without_decoding_pixels() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("one.png");
+        fs::write(&path, STANDARD.decode(ONE_PIXEL_PNG).unwrap()).unwrap();
+        assert_eq!(intrinsic_image_size(&path), Some((1, 1)));
+        assert_eq!(intrinsic_image_size(&root.path().join("missing.png")), None);
     }
 
     #[test]
@@ -386,6 +594,7 @@ mod tests {
         let clicked_flag = clicked.clone();
         let plugin = SessionImagePlugin::new(
             root.path().to_path_buf(),
+            720.0,
             Arc::new(move |_, _, _, _| {
                 clicked_flag.store(true, Ordering::SeqCst);
             }),
@@ -411,6 +620,9 @@ mod tests {
         let bounds = cx
             .debug_bounds("vibex-session-image")
             .expect("the local image should be claimed by the session plugin");
+        // A 1×1 image draws as a bounded, clickable card rather than at its
+        // intrinsic size or at whatever the text line happened to offer.
+        assert_eq!(bounds.size, size(px(40.0), px(40.0)), "{bounds:?}");
         cx.simulate_click(bounds.center(), Modifiers::none());
         assert!(
             clicked.load(Ordering::SeqCst),
