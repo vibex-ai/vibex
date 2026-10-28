@@ -11,8 +11,10 @@ pub mod environment;
 pub mod error;
 pub mod host_key;
 pub mod install;
+pub mod launch;
 pub mod profile;
 pub mod provisioning;
+pub mod supervisor;
 
 pub use artifact::{
     ArtifactError, LocalArtifact, download_server_artifact, select_server_artifact, verify_file,
@@ -29,6 +31,7 @@ pub use environment::{
 pub use error::{SshFailure, SshFailureKind};
 pub use host_key::{default_known_hosts_path, known_hosts_contains};
 pub use install::{INSTALL_SCRIPT, InstallError, InstallOutcome, install_artifact};
+pub use launch::{LaunchConfig, LaunchError, LaunchState, StartOutcome, start, write_env};
 pub use profile::{
     SCHEMA_VERSION, STORE_FILE_NAME, SshConnectionProfile, SshProfileStore, SshRuntimeChannel,
 };
@@ -36,4 +39,8 @@ pub use provisioning::{
     ProvisioningBegin, ProvisioningControlError, ProvisioningCoordinator, ProvisioningEvent,
     ProvisioningFailure, ProvisioningMachine, ProvisioningProgress, ProvisioningSnapshot,
     ProvisioningStatus, ProvisioningStep, ProvisioningUpdate,
+};
+pub use supervisor::{
+    PORT_SCRIPT, ServerStatus, StopOutcome, SupervisorError, ensure_started, ensure_stopped,
+    parse_status, select_free_port, status, stop,
 };
