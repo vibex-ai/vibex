@@ -10943,13 +10943,27 @@ impl VibexWorkbench {
                     enabled,
                 } => this.set_agent_tool_enabled(agent_id.clone(), *tool, *enabled, cx),
                 ManagementEvent::OpenComputerSettings => this.open_computer_settings(window, cx),
+                ManagementEvent::RouteGroupOrderChanged {
+                    agent_id,
+                    ordered_route_ids,
+                } => {
+                    for (index, route_id) in ordered_route_ids.iter().enumerate() {
+                        this.ui_state.composer.route_group_order.insert(
+                            format!("{agent_id}:{route_id}"),
+                            i64::try_from(index).expect("route group order index fits in i64"),
+                        );
+                    }
+                    this.queue_ui_state();
+                    cx.notify();
+                }
             },
         ));
         // The cards render the persisted answers from the first frame; the
         // runtime learns them when the local authority is installed, and a
         // remote seat simply has no authority to tell.
         management_view.update(cx, |management, cx| {
-            management.set_agent_tools(ui_state.agent_tools.clone(), false, cx)
+            management.set_agent_tools(ui_state.agent_tools.clone(), false, cx);
+            management.set_route_group_order(ui_state.composer.route_group_order.clone(), cx);
         });
         agent_subscriptions.push(cx.observe_in(&usage_view, window, |this, usage, _, cx| {
             let next_in_flight = usage.read(cx).is_loading();
@@ -51321,6 +51335,7 @@ impl VibexWorkbench {
             &favorites,
             preferred.as_ref(),
             &self.ui_state.composer.runtime_selections_by_model,
+            &self.ui_state.composer.route_group_order,
         );
         let choices = runtime_provider_group_choices(&groups);
         if choices.is_empty() {
@@ -51655,6 +51670,7 @@ impl VibexWorkbench {
             &favorites,
             preferred,
             &self.ui_state.composer.runtime_selections_by_model,
+            &self.ui_state.composer.route_group_order,
         );
         let provider_scroll = self.runtime_provider_scroll.clone();
         let workbench = cx.weak_entity();
@@ -73988,7 +74004,9 @@ struct RuntimeProviderGroup {
 /// Build the visible provider groups for one query.
 ///
 /// `agent_ids` is the Agent filter — one id normally, every enabled Agent in
-/// the favorites view. `favorites_only` keeps just the starred models.
+/// the favorites view. `favorites_only` keeps just the starred models. Route
+/// group headings follow `route_group_order`, the order the Agent page's cards
+/// were dragged into; the other source kinds keep their existing order.
 #[allow(clippy::too_many_arguments)]
 fn runtime_provider_groups_for_query(
     catalog: &SessionRuntimeOptionCatalog,
@@ -73998,6 +74016,7 @@ fn runtime_provider_groups_for_query(
     favorites: &[RuntimeModelFavorite],
     preferred: Option<&SessionRuntimeSelection>,
     remembered: &[SessionRuntimeSelection],
+    route_group_order: &BTreeMap<String, i64>,
 ) -> Vec<RuntimeProviderGroup> {
     let query = normalized_session_search_query(query);
     let is_favorite = |agent_id: &AgentId, model_key: &str| {
@@ -74096,7 +74115,35 @@ fn runtime_provider_groups_for_query(
             });
         }
     }
+    // The source list already puts Agent accounts and Provider profiles before
+    // route groups, and each kind in name order. Only the route-group band is
+    // reordered, so dragging on the Agent page cannot shuffle a Provider
+    // heading. `sort_by_key` is stable, which leaves every other band intact.
+    groups.sort_by_key(|group| runtime_provider_group_sort_key(group, route_group_order));
     groups
+}
+
+/// The sort rank of one provider group.
+///
+/// Agent accounts and Providers keep `i64::MIN`, so they stay ahead of route
+/// groups and keep their existing relative order. A route group with a saved
+/// drag index uses it; one without an entry sorts last in name order.
+fn runtime_provider_group_sort_key(
+    group: &RuntimeProviderGroup,
+    route_group_order: &BTreeMap<String, i64>,
+) -> i64 {
+    if group.source.kind == RuntimeAuthSourceKind::ModelRoute {
+        route_group_order
+            .get(&format!(
+                "{}:{}",
+                group.agent_id.as_str(),
+                group.source.source.id()
+            ))
+            .copied()
+            .unwrap_or(i64::MAX)
+    } else {
+        i64::MIN
+    }
 }
 
 /// Flatten the groups into the order the keyboard cursor walks.
@@ -95641,6 +95688,7 @@ mod tests {
                 &[],
                 None,
                 remembered,
+                &BTreeMap::new(),
             )
             .into_iter()
             .flat_map(|group| {
@@ -103292,6 +103340,7 @@ mod tests {
             &[],
             None,
             &[],
+            &BTreeMap::new(),
         );
         assert!(
             groups.is_empty(),
@@ -112939,6 +112988,66 @@ mod route_picker_tests {
         }
     }
 
+    /// Dragging a route group on the Agent page moves its heading here.
+    ///
+    /// Providers keep their band ahead of route groups; only the route-group
+    /// band follows the saved drag order. A group with no saved index keeps
+    /// the name order, so a newly bound group arrives at the bottom.
+    #[test]
+    fn route_group_drag_order_reorders_only_route_headings() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let source = |route_id: vibex_core::ModelRouteId, label: &str| RuntimeAuthSourceSummary {
+            source: RuntimeAuthSource::model_route(route_id),
+            auth_source_revision: 0,
+            agent_id: agent_id.clone(),
+            label: label.to_string(),
+            kind: RuntimeAuthSourceKind::ModelRoute,
+            availability: RuntimeAuthSourceAvailability::Available,
+            account_hint: None,
+            model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Unknown,
+            supported_actions: Vec::new(),
+        };
+        let group = |source: RuntimeAuthSourceSummary| RuntimeProviderGroup {
+            agent_id: source.agent_id.clone(),
+            source,
+            source_label: String::new(),
+            status: String::new(),
+            can_authenticate: false,
+            choices: Vec::new(),
+        };
+        let provider = group(RuntimeAuthSourceSummary {
+            source: RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new()),
+            auth_source_revision: 0,
+            agent_id: agent_id.clone(),
+            label: "Vibex Gateway".to_string(),
+            kind: RuntimeAuthSourceKind::ProviderProfile,
+            availability: RuntimeAuthSourceAvailability::Available,
+            account_hint: None,
+            model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Unknown,
+            supported_actions: Vec::new(),
+        });
+        let alpha_id = vibex_core::ModelRouteId::new();
+        let zulu_id = vibex_core::ModelRouteId::new();
+        let mut groups = vec![
+            provider,
+            group(source(alpha_id.clone(), "Alpha")),
+            group(source(zulu_id.clone(), "Zulu")),
+            group(source(vibex_core::ModelRouteId::new(), "Unplaced")),
+        ];
+        let order = BTreeMap::from([
+            (format!("{agent_id}:{}", zulu_id.as_str()), 0),
+            (format!("{agent_id}:{}", alpha_id.as_str()), 1),
+        ]);
+
+        groups.sort_by_key(|group| runtime_provider_group_sort_key(group, &order));
+
+        let labels = groups
+            .iter()
+            .map(|group| group.source.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Vibex Gateway", "Zulu", "Alpha", "Unplaced"]);
+    }
+
     /// A route's subtitle says how many sources back it.
     #[test]
     fn a_route_subtitle_names_its_source_count() {
@@ -113050,8 +113159,16 @@ mod route_picker_tests {
             }],
         };
 
-        let groups =
-            runtime_provider_groups_for_query(&catalog, &[agent_id], "", false, &[], None, &[]);
+        let groups = runtime_provider_groups_for_query(
+            &catalog,
+            &[agent_id],
+            "",
+            false,
+            &[],
+            None,
+            &[],
+            &BTreeMap::new(),
+        );
         assert_eq!(
             groups.len(),
             1,

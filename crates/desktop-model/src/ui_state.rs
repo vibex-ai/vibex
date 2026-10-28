@@ -1308,6 +1308,13 @@ pub struct ComposerUiState {
     /// session that was not ready, including those waiting for a schedule.
     #[serde(default)]
     pub queue: Vec<ComposerQueueEntry>,
+    /// The order the Agent page's route-group cards were dragged into,
+    /// keyed by `agent_id:model_route_id`.
+    ///
+    /// The model menu draws the same sources in this order, so the two
+    /// surfaces cannot disagree about which route group comes first.
+    #[serde(default)]
+    pub route_group_order: BTreeMap<String, i64>,
 }
 
 impl ComposerUiState {
