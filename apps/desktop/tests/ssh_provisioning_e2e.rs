@@ -12,14 +12,16 @@
 //! cargo test -p vibex-desktop --test ssh_provisioning_e2e -- --ignored --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest as _, Sha256};
 use vibex_desktop::ssh_connection::{
-    LaunchConfig, LocalArtifact, ProvisioningCoordinator, ProvisioningRunOutcome, RemoteArch,
-    RunCancellation, SshCommand, SshDestination, SshProvisioningEffects, run_provisioning,
-    select_local_port, supervisor,
+    LaunchConfig, LocalArtifact, MIN_FREE_KB, ProvisioningCoordinator, ProvisioningRunOutcome,
+    RemoteArch, RunCancellation, SshCommand, SshDestination, SshProvisioningEffects, probe,
+    run_provisioning, select_local_port, supervisor,
 };
 
 fn now_ms() -> i64 {
@@ -27,6 +29,118 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_millis() as i64
+}
+
+fn fixture_config() -> Option<PathBuf> {
+    std::env::var_os("VIBEX_SSH_E2E")?;
+    Some(PathBuf::from(
+        std::env::var("VIBEX_SSH_E2E_CONFIG").expect("VIBEX_SSH_E2E_CONFIG"),
+    ))
+}
+
+fn command_for(config: &Path) -> SshCommand {
+    SshCommand::for_destination(
+        "ssh",
+        &SshDestination {
+            host: "vibex-e2e".to_string(),
+            user: None,
+            port: 2222,
+        },
+        Some(config),
+    )
+    .expect("build SSH command")
+}
+
+fn write_config(
+    dir: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+    strict_host_key_checking: &str,
+) -> PathBuf {
+    let config = dir.join("config");
+    let mut text = String::new();
+    writeln!(text, "Host vibex-e2e").unwrap();
+    writeln!(text, "  HostName 127.0.0.1").unwrap();
+    writeln!(text, "  Port 2222").unwrap();
+    writeln!(text, "  User dev").unwrap();
+    writeln!(text, "  IdentityFile {}", identity.display()).unwrap();
+    writeln!(text, "  IdentitiesOnly yes").unwrap();
+    writeln!(text, "  StrictHostKeyChecking {strict_host_key_checking}").unwrap();
+    writeln!(text, "  UserKnownHostsFile {}", known_hosts.display()).unwrap();
+    std::fs::write(&config, text).unwrap();
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the Docker sshd fixture"]
+async fn probe_classifies_authentication_failure() {
+    let Some(fixture) = fixture_config() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("auth fixture");
+    let known_hosts = fixture.with_file_name("known_hosts");
+    let wrong_identity = dir.path().join("wrong-id");
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&wrong_identity)
+        .status()
+        .expect("ssh-keygen");
+    assert!(status.success(), "generate wrong identity");
+    let config = write_config(dir.path(), &wrong_identity, &known_hosts, "yes");
+    let error = probe(&command_for(&config), 8765, MIN_FREE_KB).expect_err("wrong key must fail");
+    assert_eq!(error.code(), "ssh_auth_failed", "{}", error.message());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the Docker sshd fixture"]
+async fn probe_classifies_a_busy_remote_port() {
+    let Some(fixture) = fixture_config() else {
+        return;
+    };
+    let command = command_for(&fixture);
+    let mut start = command.clone();
+    start
+        .remote_script("python3 -m http.server 8766 --bind 127.0.0.1 >/dev/null 2>&1 & echo $!")
+        .unwrap();
+    let output = start.run().expect("start port holder");
+    let pid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(!pid.is_empty(), "port holder pid");
+    let result = probe(&command, 8766, MIN_FREE_KB);
+    let mut kill = command.clone();
+    kill.remote_script("kill \"$1\"").unwrap();
+    kill.args.push(pid.into());
+    let _ = kill.run();
+    let error = result.expect_err("busy port must fail");
+    assert_eq!(
+        error.code(),
+        "ssh_environment_port_busy",
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the Docker sshd fixture"]
+async fn probe_classifies_a_changed_host_key() {
+    let Some(_fixture) = fixture_config() else {
+        return;
+    };
+    let identity =
+        PathBuf::from(std::env::var("VIBEX_SSH_E2E_IDENTITY").expect("VIBEX_SSH_E2E_IDENTITY"));
+    let public = std::fs::read_to_string(identity.with_extension("pub")).expect("identity public");
+    let mut parts = public.split_whitespace();
+    let key_type = parts.next().expect("key type");
+    let key = parts.next().expect("key body");
+    let dir = tempfile::tempdir().expect("host key fixture");
+    let known_hosts = dir.path().join("known_hosts");
+    std::fs::write(
+        &known_hosts,
+        format!("[127.0.0.1]:2222 {key_type} {key} wrong-host\n"),
+    )
+    .unwrap();
+    let config = write_config(dir.path(), &identity, &known_hosts, "yes");
+    let error = probe(&command_for(&config), 8765, MIN_FREE_KB).expect_err("host key must fail");
+    assert_eq!(error.code(), "ssh_host_key_changed", "{}", error.message());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
