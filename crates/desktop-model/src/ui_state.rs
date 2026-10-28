@@ -1359,11 +1359,12 @@ pub struct SessionUiState {
     pub enhanced_file_operation_display: bool,
     /// Whether automatic continuation is the default for every project.
     ///
-    /// The settings switch writes this one flag, so turning it on covers the
-    /// projects that exist now and every project created later — including the
-    /// sessions the reader has not created yet. Per-project defaults and
-    /// per-session overrides still layer on top of it.
-    #[serde(default)]
+    /// It ships on: a session keeps itself going until the reader turns the
+    /// shell-wide default off. The settings switch writes this one flag, so
+    /// turning it off covers the projects that exist now and every project
+    /// created later, while per-project defaults and per-session overrides
+    /// still layer on top of it.
+    #[serde(default = "default_auto_continue_enabled_by_default")]
     pub auto_continue_enabled_by_default: bool,
     /// Projects explicitly opted out while the global default is on. A project
     /// override is the stronger statement, so it wins over this set.
@@ -1405,7 +1406,7 @@ impl Default for SessionUiState {
             show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
-            auto_continue_enabled_by_default: false,
+            auto_continue_enabled_by_default: true,
             auto_continue_disabled_project_ids: BTreeSet::new(),
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
@@ -1421,6 +1422,10 @@ const fn default_enhanced_command_execution_display() -> bool {
 }
 
 const fn default_show_agent_generation_status() -> bool {
+    true
+}
+
+const fn default_auto_continue_enabled_by_default() -> bool {
     true
 }
 
@@ -3398,9 +3403,9 @@ mod tests {
             ReasoningExpansionMode::Window
         );
         assert_eq!(SessionUiState::default().auto_archive_after_days, None);
-        // Auto-continue stays opt-in until the reader turns the shell-wide
-        // default on; an older file without the field reads as off.
-        assert!(!SessionUiState::default().auto_continue_enabled_by_default);
+        // Auto-continue ships on; an older file without the field reads as on
+        // too, while an explicit saved value still wins.
+        assert!(SessionUiState::default().auto_continue_enabled_by_default);
         assert!(
             SessionUiState::default()
                 .auto_continue_disabled_project_ids
@@ -3418,6 +3423,7 @@ mod tests {
         session.remove("reasoningDisplayMode");
         session.remove("reasoningExpandedByDefault");
         session.remove("reasoningExpansionMode");
+        session.remove("autoContinueEnabledByDefault");
         session.remove("autoContinueProjectIds");
         session.remove("autoContinueSessionOverrides");
         session.remove("autoContinuePausedSessionIds");
@@ -3438,7 +3444,7 @@ mod tests {
             decoded.session.reasoning_expansion_mode,
             ReasoningExpansionMode::Window
         );
-        assert!(!decoded.session.auto_continue_enabled_by_default);
+        assert!(decoded.session.auto_continue_enabled_by_default);
         assert!(
             decoded
                 .session
@@ -3457,6 +3463,12 @@ mod tests {
         persisted.session.auto_archive_after_days = Some(30);
         let round_tripped = decode_and_migrate(&serde_json::to_vec(&persisted).unwrap()).unwrap();
         assert_eq!(round_tripped.session.auto_archive_after_days, Some(30));
+
+        // An explicit saved "off" is the reader's decision, not a missing
+        // field, so it must survive the default changing to on.
+        persisted.session.auto_continue_enabled_by_default = false;
+        let round_tripped = decode_and_migrate(&serde_json::to_vec(&persisted).unwrap()).unwrap();
+        assert!(!round_tripped.session.auto_continue_enabled_by_default);
     }
 
     #[test]

@@ -2060,7 +2060,7 @@ mod tests {
         );
         assert!(!view.auto_continue_session_ids.contains("session-b"));
         assert!(view.auto_continue_paused_session_ids.contains("session-a"));
-        assert!(!view.auto_continue_enabled_by_default);
+        assert!(view.auto_continue_enabled_by_default);
         // And writing it back is the same translation in reverse, so a shell
         // that owns the runtime persists a tree the next read reconstructs
         // exactly — the revision included.

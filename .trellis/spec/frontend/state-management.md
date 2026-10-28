@@ -2400,22 +2400,24 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   `Injected` outcome removes the queued row, while `PromptRequired` or any
   transport failure falls back to the universal interrupt + resend path. Never
   gate the affordance on an Agent id or version string.
-- Auto-continue is a safe local preference persisted in `DesktopUiStateV1`.
-  The settings switch writes one shell-wide default,
-  `auto_continue_enabled_by_default`, which covers every project — including
-  projects and sessions created later — so a reader never has to repeat the
-  choice per project. Store project defaults separately from per-session boolean
-  overrides so an explicit session disable survives restart even when the
-  shell-wide default is enabled. A project the reader turns off while the
-  default is on is recorded in `auto_continue_disabled_project_ids`; an explicit
-  project opt-in is recorded in `auto_continue_project_ids` and wins over the
-  default, while a session override wins over both. Flipping the shell-wide
-  switch re-derives the effective set and clears the project opt-in/opt-out
-  lists, but it must not write per-session overrides: the rows that follow the
-  default have to keep following it, or the switch could never be turned back
-  off. Normalize and bound every collection, remove stale project/session ids
-  during authoritative UI-state cleanup, and keep countdown/handled-turn
-  bookkeeping transient. The default travels on the sidebar snapshot as
+- Auto-continue is a safe local preference persisted in `DesktopUiStateV1`,
+  and it ships enabled. The settings switch writes one shell-wide default,
+  `auto_continue_enabled_by_default`, which is on for a fresh state and for a
+  file written before the field existed; an explicit saved `false` is the
+  reader's own choice and stays off. The default covers every project —
+  including projects and sessions created later — so a reader never has to
+  repeat the choice per project. Store project defaults separately from
+  per-session boolean overrides so an explicit session disable survives restart
+  even when the shell-wide default is enabled. A project the reader turns off
+  while the default is on is recorded in `auto_continue_disabled_project_ids`;
+  an explicit project opt-in is recorded in `auto_continue_project_ids` and
+  wins over the default, while a session override wins over both. Flipping the
+  shell-wide switch re-derives the effective set and clears the project
+  opt-in/opt-out lists, but it must not write per-session overrides: the rows
+  that follow the default have to keep following it, or the switch could never
+  be turned back off. Normalize and bound every collection, remove stale
+  project/session ids during authoritative UI-state cleanup, and keep
+  countdown/handled-turn bookkeeping transient. The default travels on the sidebar snapshot as
   `autoContinueDefaultEnabled`, and compact clients derive a row's mark and a
   new project's starting state from the same rules through the shared
   `SidebarOrganizationView` predicates rather than from the effective id list
