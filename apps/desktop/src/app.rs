@@ -74532,7 +74532,7 @@ fn runtime_model_selection_label(model: &RuntimeModelSelection) -> String {
         RuntimeModelSelection::Explicit { model_id } => {
             // A route model is addressed as `group/<id>/<model>`; only the
             // model part is a name.
-            vibex_core::provider_group_model_ref(model_id)
+            vibex_core::route_group_model_ref(model_id)
                 .map(|parsed| parsed.model_id.to_string())
                 .unwrap_or_else(|| model_id.clone())
         }
