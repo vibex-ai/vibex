@@ -112,6 +112,13 @@ pub fn window_icon() -> Result<Arc<image::RgbaImage>, String> {
 
 const VIBEX_ASSETS: &[(&str, &[u8])] = &[
     (
+        "icons/vibex/settings.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/settings.svg"
+        )),
+    ),
+    (
         "icons/vibex/vibex-mark.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

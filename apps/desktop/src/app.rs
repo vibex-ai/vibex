@@ -48,9 +48,9 @@ use gpui::{
 };
 use gpui_base::text::MarkdownExtensions;
 use gpui_component::{
-    ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
-    InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
-    ThemeStyled as _, TitleBar, VirtualListScrollHandle, WindowExt as _,
+    ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
+    IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
+    Theme, ThemeStyled as _, TitleBar, VirtualListScrollHandle, WindowExt as _,
     animation::EffectTransition as Transition,
     avatar::Avatar,
     bubble::{Bubble, BubbleContent, BubbleReactions},
@@ -61,6 +61,7 @@ use gpui_component::{
     empty::{
         Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
     },
+    group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
     input::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
@@ -993,7 +994,7 @@ const SETTINGS_DIALOG_RADIUS: f32 = 12.0;
 const SETTINGS_DIALOG_CONTENT_RADIUS: f32 = SETTINGS_DIALOG_RADIUS - 1.0;
 /// Leading and trailing inset of every settings page. The appearance preview
 /// cards measure their row from the same value, so they line up with the panel.
-const SETTINGS_PAGE_PADDING_X: f32 = 70.0;
+const SETTINGS_PAGE_PADDING_X: f32 = 16.0;
 
 /// A route's failover prompt, with the seconds it has left.
 ///
@@ -31006,6 +31007,11 @@ impl VibexWorkbench {
 
     /// The Markdown plugin that lets one session's transcript show images from
     /// its workspace. `None` when there is no workspace to resolve against.
+    ///
+    /// The column width the thumbnail may use comes from the session's own
+    /// content box, so a figure shrinks with the pane rather than overflowing a
+    /// narrow one. Before the first layout it falls back to the cap, which is
+    /// what the renderer will settle on for a comfortable pane.
     fn session_image_plugin(
         &self,
         entity: WeakEntity<Self>,
@@ -31021,6 +31027,7 @@ impl VibexWorkbench {
         });
         Some(session_images::SessionImagePlugin::new(
             PathBuf::from(workspace_root),
+            self.estimated_timeline_content_width(),
             open,
         ))
     }
@@ -57762,15 +57769,14 @@ impl VibexWorkbench {
             })
     }
 
-    fn render_child_agent_status_badge(status: vibex_core::ToolCallStatus, cx: &App) -> AnyElement {
+    fn render_child_agent_status_badge(status: vibex_core::ToolCallStatus) -> AnyElement {
         let (label, color) = match status {
-            vibex_core::ToolCallStatus::Started => ("Starting", cx.theme().warning),
-            vibex_core::ToolCallStatus::Progress => ("Working", cx.theme().warning),
-            vibex_core::ToolCallStatus::Completed => ("Completed", cx.theme().success),
-            vibex_core::ToolCallStatus::Failed => ("Failed", cx.theme().danger),
+            vibex_core::ToolCallStatus::Started => ("Starting", ColorName::Amber),
+            vibex_core::ToolCallStatus::Progress => ("Working", ColorName::Amber),
+            vibex_core::ToolCallStatus::Completed => ("Completed", ColorName::Green),
+            vibex_core::ToolCallStatus::Failed => ("Failed", ColorName::Red),
         };
-        let surface = color.opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 });
-        Tag::custom(surface, color, surface)
+        Tag::color(color)
             .xsmall()
             .rounded(px(5.0))
             .child(label)
@@ -57905,7 +57911,7 @@ impl VibexWorkbench {
                     .font_medium()
                     .child(title.clone()),
             )
-            .child(Self::render_child_agent_status_badge(delegation.status, cx));
+            .child(Self::render_child_agent_status_badge(delegation.status));
         if !delegation.action.trim().is_empty() && delegation.action != title {
             header = header.child(
                 div()
@@ -61826,7 +61832,6 @@ impl VibexWorkbench {
                     },
                     failed,
                     waiting_for_confirmation,
-                    cx,
                 ))
             })
             .child(
@@ -62290,7 +62295,6 @@ impl VibexWorkbench {
                         agent_activity_status_label(image.status).to_string(),
                         failed,
                         in_progress,
-                        cx,
                     )),
             )
             .when(expanded, |this| {
@@ -62486,36 +62490,18 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    fn render_process_status_badge(
-        label: String,
-        failed: bool,
-        in_progress: bool,
-        cx: &App,
-    ) -> AnyElement {
-        // shadcn Badge parity: a compact, rounded-full status pill. `Tag::custom`
-        // keeps the app's translucent-surface/opaque-text color pair while the
-        // kit owns the pill's metrics and structure.
-        let badge = if failed {
-            let alpha = if cx.theme().is_dark() { 0.20 } else { 0.10 };
-            Tag::custom(
-                cx.theme().danger.opacity(alpha),
-                cx.theme().danger,
-                cx.theme().danger.opacity(alpha),
-            )
+    fn render_process_status_badge(label: String, failed: bool, in_progress: bool) -> AnyElement {
+        // shadcn Badge parity: a compact, rounded-full status pill with an
+        // explicit palette color, so the kit owns the metrics and the state
+        // stays legible in every theme.
+        let color = if failed {
+            ColorName::Red
         } else if in_progress {
-            Tag::custom(
-                cx.theme().secondary,
-                cx.theme().secondary_foreground,
-                cx.theme().secondary,
-            )
+            ColorName::Neutral
         } else {
-            Tag::custom(
-                cx.theme().input.opacity(0.20),
-                cx.theme().foreground,
-                cx.theme().border,
-            )
+            ColorName::Gray
         };
-        badge
+        Tag::color(color)
             .xsmall()
             .rounded_full()
             .h(px(20.0))
@@ -63555,7 +63541,7 @@ impl VibexWorkbench {
                                         .items_center()
                                         .gap_1()
                                         .children(answer.choices.iter().map(|choice| {
-                                            Tag::secondary()
+                                            Tag::color(ColorName::Neutral)
                                                 .xsmall()
                                                 .rounded_full()
                                                 .child(choice.clone())
@@ -80195,10 +80181,10 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_dark = cx.theme().is_dark();
-        let foreground = theme::semantic_color("foreground", is_dark);
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
         let border = theme::semantic_color("border", is_dark);
         let sidebar_accent = theme::semantic_color("sidebar-accent", is_dark);
+        let sidebar_accent_foreground = theme::semantic_color("sidebar-accent-foreground", is_dark);
         // Groups own their members, so a section can only change groups by
         // moving between these lists. Ordering by a `split_off` index instead
         // let a section drift into a group whose label did not describe it.
@@ -80243,16 +80229,24 @@ impl FoundationSettings {
                         let icon = Icon::new(icon.clone())
                             .size(px(16.0))
                             .mr(px(2.0))
-                            .text_color(if active { foreground } else { muted_foreground });
+                            .text_color(if active {
+                                sidebar_accent_foreground
+                            } else {
+                                muted_foreground
+                            });
                         Button::new(SharedString::from(format!("settings-{section:?}")))
                             .small()
                             .ghost()
                             .h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))
                             .px_3()
-                            .rounded(px(6.0))
+                            .rounded(cx.theme().radius)
                             .selected(active)
-                            .text_color(if active { foreground } else { muted_foreground })
-                            .when(active, |this| this.bg(sidebar_accent.opacity(0.34)))
+                            .text_color(if active {
+                                sidebar_accent_foreground
+                            } else {
+                                muted_foreground
+                            })
+                            .when(active, |this| this.bg(sidebar_accent))
                             .when(wide, |this| this.w_full())
                             .when(!wide, |this| this.min_w(px(112.0)).flex_1())
                             .icon(icon)
@@ -80433,7 +80427,7 @@ impl FoundationSettings {
         stacked: bool,
         strings: &'static Strings,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let language_select = settings_select(
             &self.language_modes,
             Some(px(160.0)),
@@ -80710,7 +80704,7 @@ impl FoundationSettings {
         cards_width: f32,
         strings: &'static Strings,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let mode_cards = appearance_theme::theme_mode_picker(
             &appearance.theme_selection,
             appearance.theme,
@@ -81083,7 +81077,7 @@ impl FoundationSettings {
         stacked: bool,
         strings: &'static Strings,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let turn_preview_rail_switch =
             Switch::new("session-turn-preview-rail")
                 .small()
@@ -81507,7 +81501,7 @@ impl FoundationSettings {
     /// Archiving is the reversible half of removal, so the page is built around
     /// restoring: the list is loaded when the page opens, each row keeps its own
     /// pending state, and the policy control sits above the list it acts on.
-    fn render_archived_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_archived_page(&self, stacked: bool, cx: &mut Context<Self>) -> SettingsPage {
         let auto_archive_after_days = self
             .workbench
             .read_with(cx, |this, _| this.ui_state.session.auto_archive_after_days)
@@ -81886,7 +81880,7 @@ impl FoundationSettings {
         workbench: &vibex_desktop_model::WorkbenchUiState,
         stacked: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let hierarchy = self
             .workbench
             .read_with(cx, |this, _| this.ui_state.sidebar.hierarchy_mode)
@@ -82248,7 +82242,7 @@ impl FoundationSettings {
         preferences: &vibex_desktop_model::TerminalPreferencesUiState,
         stacked: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let shell_select = settings_select(
             &self.terminal_shells,
             Some(px(240.0)),
@@ -82403,12 +82397,22 @@ impl FoundationSettings {
     /// never disagree about what is on. Everything lives on the page — a
     /// settings surface that hides half its switches behind a modal is a
     /// settings surface people stop reading.
-    fn render_computer_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_computer_page(&self, stacked: bool, cx: &mut Context<Self>) -> SettingsPage {
         let (settings, status) = match self.workbench.read_with(cx, |workbench, _| {
             (workbench.computer_settings(), workbench.computer_status())
         }) {
             Ok(pair) => pair,
-            Err(_) => return div().into_any_element(),
+            Err(_) => {
+                return SettingsPage {
+                    title: locale::text("Computer use", "电脑操作", "電腦操作"),
+                    description: locale::text(
+                        "An Agent can act on this machine's desktop.",
+                        "Agent 可以操作本机桌面。",
+                        "Agent 可以操作本機桌面。",
+                    ),
+                    body: div().into_any_element(),
+                };
+            }
         };
         // Only the window that owns the local runtime can install anything: a
         // paired remote seat has no driver of its own to manage, and a button
@@ -82769,7 +82773,7 @@ impl FoundationSettings {
         )
     }
 
-    fn render_browser_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_browser_page(&self, stacked: bool, cx: &mut Context<Self>) -> SettingsPage {
         let browser = self.browser_preferences(cx);
         let start_page_select = settings_select(
             &self.browser_start_pages,
@@ -83070,7 +83074,7 @@ impl FoundationSettings {
         stacked: bool,
         strings: &'static Strings,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let overrides = self.keyboard_shortcuts(cx);
         let mut rows = Vec::new();
         for (action, default) in FOUNDATION_SHORTCUTS {
@@ -83165,7 +83169,7 @@ impl FoundationSettings {
         )
     }
 
-    fn render_data_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_data_page(&self, stacked: bool, cx: &mut Context<Self>) -> SettingsPage {
         let home = self
             .workbench
             .read_with(cx, |this, _| {
@@ -83429,7 +83433,7 @@ impl FoundationSettings {
         stacked: bool,
         resolved_locale: locale::ResolvedLocale,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> SettingsPage {
         let channel = release_channel()
             .map(|channel| format!("{channel:?}"))
             .unwrap_or_else(|_| "Preview".into());
@@ -84046,7 +84050,7 @@ impl FoundationSettings {
             .into_any_element()
     }
 
-    fn render_developer_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_developer_page(&self, stacked: bool, cx: &mut Context<Self>) -> SettingsPage {
         let developer = self.developer(cx);
         let fps_monitor_switch = Switch::new("developer-fps-monitor")
             .small()
@@ -84125,26 +84129,10 @@ impl Render for FoundationSettings {
             SettingsSection::Developer => self.render_developer_page(stacked_rows, cx),
             SettingsSection::About => self.render_about_page(stacked_rows, resolved_locale, cx),
         };
+        let page_header = settings_page_header(page.title, page.description, cx);
+        let page_body = page.body;
         let has_changes = self.has_changes(cx);
         let undo_label = strings.undo_changes;
-        let page = div()
-            .relative()
-            .w_full()
-            .min_w_0()
-            .child(page)
-            .when(has_changes, |this| {
-                this.child(
-                    Button::new("undo-settings-changes")
-                        .small()
-                        .ghost()
-                        .icon(IconName::Undo2)
-                        .absolute()
-                        .top(px(20.0))
-                        .right(px(64.0))
-                        .tooltip(undo_label)
-                        .on_click(cx.listener(|this, _, window, cx| this.undo_changes(window, cx))),
-                )
-            });
         let target_anchor = self
             .settings_render_context
             .target_anchor
@@ -84181,26 +84169,57 @@ impl Render for FoundationSettings {
             .child(navigation)
             .child(
                 div()
-                    .id("foundation-settings-page-scroll")
-                    .h_full()
+                    .relative()
+                    .flex()
+                    .flex_col()
                     .min_w_0()
                     .min_h_0()
                     .flex_1()
-                    .track_scroll(&self.settings_render_context.scroll)
                     .bg(theme::semantic_color("background", cx.theme().is_dark()))
-                    // The page viewport owns the dialog's right (or bottom)
-                    // corners, so it rounds them instead of painting over the
-                    // dialog's outline.
                     .when(vertical_tabs, |this| {
-                        this.rounded_tr(px(SETTINGS_DIALOG_CONTENT_RADIUS))
-                            .rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                        this.h_full().rounded_tr(px(SETTINGS_DIALOG_CONTENT_RADIUS))
                     })
-                    .when(!vertical_tabs, |this| {
-                        this.rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))
-                            .rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))
-                    })
-                    .overflow_y_scroll()
-                    .child(page),
+                    .when(!vertical_tabs, |this| this.flex_1())
+                    .child(page_header)
+                    .child(
+                        div()
+                            .id("foundation-settings-page-scroll")
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .track_scroll(&self.settings_render_context.scroll)
+                            .bg(theme::semantic_color("background", cx.theme().is_dark()))
+                            // The page viewport owns the dialog's right (or
+                            // bottom) corners, so it rounds them instead of
+                            // painting over the dialog's outline.
+                            .when(vertical_tabs, |this| {
+                                this.rounded_tr(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                                    .rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                            })
+                            .when(!vertical_tabs, |this| {
+                                this.rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                                    .rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                            })
+                            .overflow_y_scroll()
+                            .child(page_body),
+                    )
+                    .when(has_changes, |this| {
+                        this.child(
+                            Button::new("undo-settings-changes")
+                                .small()
+                                .ghost()
+                                .icon(IconName::Undo2)
+                                .absolute()
+                                .top(px(20.0))
+                                .right(px(64.0))
+                                .tooltip(undo_label)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.undo_changes(window, cx)
+                                    }),
+                                ),
+                        )
+                    }),
             )
     }
 }
@@ -85867,20 +85886,21 @@ impl SettingsGroup {
     }
 }
 
+struct SettingsPage {
+    title: &'static str,
+    description: &'static str,
+    body: AnyElement,
+}
+
 fn settings_page(
     title: &'static str,
     description: &'static str,
     groups: Vec<SettingsGroup>,
     cx: &App,
-) -> AnyElement {
-    let is_dark = cx.theme().is_dark();
-    let foreground = theme::semantic_color("foreground", is_dark);
-    let border = theme::semantic_color("border", is_dark);
-    let card = theme::semantic_color("card", is_dark);
-    let muted = theme::semantic_color("muted", is_dark);
-    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+) -> SettingsPage {
+    let foreground = theme::semantic_color("foreground", cx.theme().is_dark());
 
-    v_flex()
+    let body = v_flex()
         .w_full()
         .min_w_0()
         .overflow_hidden()
@@ -85892,84 +85912,97 @@ fn settings_page(
         // those corners again while the page is scrolled.
         .text_color(foreground)
         .px(px(SETTINGS_PAGE_PADDING_X))
-        .py_8()
-        .child(
-            v_flex()
-                .gap_1()
-                .child(div().text_lg().font_semibold().child(title))
-                .child(
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .text_color(muted_foreground)
-                        .child(description),
-                ),
-        )
-        .children(
-            groups
-                .into_iter()
-                .map(|group| settings_group(group, is_dark, border, card, muted, muted_foreground)),
-        )
-        .into_any_element()
+        .py_6()
+        .children(groups.into_iter().map(|group| settings_group(group, cx)))
+        .into_any_element();
+
+    SettingsPage {
+        title,
+        description,
+        body,
+    }
 }
 
-/// One group: its label, an optional full-width control, then its panel.
+/// The page header, outside the page's scroll viewport.
 ///
-/// Rows sit in a rounded panel with inset separators so a group reads as one
-/// calm list instead of a stack of dividers, and the labels are what tell the
-/// reader where one subject ends and the next begins.
-fn settings_group(
-    group: SettingsGroup,
-    is_dark: bool,
-    border: Hsla,
-    card: Hsla,
-    muted: Hsla,
-    muted_foreground: Hsla,
-) -> AnyElement {
-    let mut panel_rows = Vec::with_capacity(group.rows.len().saturating_mul(2));
-    for (index, row) in group.rows.into_iter().enumerate() {
-        if index > 0 {
-            panel_rows.push(
-                div()
-                    .flex_none()
-                    .h(px(1.0))
-                    .bg(border.opacity(0.5))
-                    .into_any_element(),
-            );
-        }
-        panel_rows.push(row);
-    }
+/// gpui-component's settings panel keeps the page title fixed while its groups
+/// scroll, so the reader always knows which page the controls belong to.
+fn settings_page_header(title: &'static str, description: &'static str, cx: &App) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let border = theme::semantic_color("border", is_dark);
+    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
 
     v_flex()
         .w_full()
         .min_w_0()
-        .gap_3()
-        .when_some(group.label, |this, label| {
-            this.child(
+        .flex_none()
+        .gap_1()
+        .px(px(SETTINGS_PAGE_PADDING_X))
+        .py_4()
+        .border_b_1()
+        .border_color(border.opacity(0.72))
+        .child(div().text_base().font_semibold().child(title))
+        .child(
+            div()
+                .text_sm()
+                .whitespace_normal()
+                .text_color(muted_foreground)
+                .child(description),
+        )
+        .into_any_element()
+}
+
+/// One settings group in the gpui-component settings style: a muted group
+/// label over a filled `GroupBox` surface, with the items separated by the
+/// surface's own gap rather than by inset dividers.
+fn settings_group(group: SettingsGroup, cx: &App) -> AnyElement {
+    let SettingsGroup {
+        label,
+        leading,
+        rows,
+    } = group;
+    let muted_foreground = theme::semantic_color("muted-foreground", cx.theme().is_dark());
+
+    if leading.is_some() {
+        return v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .when_some(label, |this, label| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .text_color(muted_foreground)
+                        .child(label),
+                )
+            })
+            .when_some(leading, |this, leading| this.child(leading))
+            .when(!rows.is_empty(), |this| {
+                this.child(GroupBox::new().fill().children(rows))
+            })
+            .into_any_element();
+    }
+
+    if rows.is_empty() {
+        return label
+            .map(|label| {
                 div()
                     .text_sm()
-                    .font_semibold()
+                    .font_medium()
                     .text_color(muted_foreground)
-                    .child(label),
-            )
+                    .child(label)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| div().into_any_element());
+    }
+
+    GroupBox::new()
+        .fill()
+        .when_some(label, |this, label| {
+            this.title(div().text_sm().font_medium().child(label))
         })
-        .when_some(group.leading, |this, leading| this.child(leading))
-        .when(!panel_rows.is_empty(), |this| {
-            this.child(
-                v_flex()
-                    .rounded(px(10.0))
-                    .border_1()
-                    .border_color(border.opacity(0.55))
-                    .bg(if is_dark {
-                        card.opacity(0.35)
-                    } else {
-                        muted.opacity(0.45)
-                    })
-                    .px_4()
-                    .py_1()
-                    .children(panel_rows),
-            )
-        })
+        .children(rows)
         .into_any_element()
 }
 
@@ -86014,8 +86047,8 @@ fn setting_row(
         .when(!stacked, |this| {
             this.flex_row().items_center().justify_between()
         })
-        .gap_4()
-        .py(px(14.0))
+        .gap_3()
+        .py_1()
         .anchor_scroll(target_anchor)
         .when(is_highlighted, |this| {
             this.rounded(px(6.0))
@@ -86035,7 +86068,7 @@ fn setting_row(
                 .child(div().text_sm().font_medium().child(title))
                 .child(
                     div()
-                        .text_xs()
+                        .text_sm()
                         .whitespace_normal()
                         .text_color(muted_foreground)
                         .child(description),
@@ -86364,7 +86397,7 @@ fn local_clients_state_label(
 }
 
 fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
-    Tag::secondary()
+    Tag::color(ColorName::Neutral)
         .whitespace_normal()
         .max_w_full()
         .font_medium()
@@ -104881,7 +104914,7 @@ mod tests {
             .expect("settings page should own a dedicated scroll viewport");
         assert!(navigation < page_scroll);
         let page_viewport = &settings[page_scroll..];
-        assert!(page_viewport.contains(".h_full()"));
+        assert!(page_viewport.contains(".flex_1()"));
         assert!(page_viewport.contains(".overflow_y_scroll()"));
         assert!(!page_viewport.contains(".on_scroll_wheel(|_, _, cx| cx.stop_propagation()"));
         assert!(!page_viewport.contains(".overflow_y_scrollbar()"));

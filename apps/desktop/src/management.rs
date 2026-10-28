@@ -21,8 +21,8 @@ use gpui::{
     rems, size as gpui_size,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
-    StyledExt as _, Theme, WindowExt as _,
+    ActiveTheme as _, ColorName, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    Size, StyledExt as _, Theme, WindowExt as _,
     alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _, Toggle},
@@ -12893,7 +12893,7 @@ impl ManagementCenter {
                                             .child(row.route.display_name.clone()),
                                     )
                                     .when(row.route.is_model_group(), |this| {
-                                        this.child(Tag::secondary().xsmall().child(
+                                        this.child(Tag::color(ColorName::Neutral).xsmall().child(
                                             management_route_group_kind_label(row.route.kind),
                                         ))
                                     }),
@@ -12901,7 +12901,7 @@ impl ManagementCenter {
                             .when(
                                 row.route.status != vibex_core::RouteStatus::Enabled,
                                 |this| {
-                                    this.child(Tag::secondary().xsmall().child(
+                                    this.child(Tag::color(ColorName::Neutral).xsmall().child(
                                         management_locale_text("Disabled", "已停用", "已停用"),
                                     ))
                                 },
@@ -13236,7 +13236,7 @@ impl ManagementCenter {
                             )
                         }))
                         .child(
-                            Tag::secondary().child(
+                            Tag::color(ColorName::Neutral).child(
                                 h_flex()
                                     .items_center()
                                     .gap_1()
@@ -13329,7 +13329,7 @@ impl ManagementCenter {
                                 // An outline pill is the offer: the filled
                                 // pills above are the Agents that already use
                                 // this Provider.
-                                Tag::secondary().outline().child(
+                                Tag::color(ColorName::Neutral).outline().child(
                                     h_flex()
                                         .items_center()
                                         .gap_1()
@@ -13717,7 +13717,7 @@ impl ManagementCenter {
                         .items_center()
                         .gap_2()
                         .child(
-                            Tag::secondary()
+                            Tag::color(ColorName::Neutral)
                                 .xsmall()
                                 .child(format!("{:?}", endpoint.kind)),
                         )
@@ -14118,7 +14118,7 @@ impl ManagementCenter {
                         )
                         .when(route.status != vibex_core::RouteStatus::Enabled, |this| {
                             this.child(
-                                Tag::secondary()
+                                Tag::color(ColorName::Neutral)
                                     .xsmall()
                                     .child(management_locale_text("Disabled", "已停用", "已停用")),
                             )
@@ -14306,7 +14306,7 @@ impl ManagementCenter {
                             )
                         }))
                         .child(
-                            Tag::secondary().child(
+                            Tag::color(ColorName::Neutral).child(
                                 h_flex()
                                     .items_center()
                                     .gap_1()
@@ -14381,7 +14381,7 @@ impl ManagementCenter {
                                 // Outline marks an Agent that could reference
                                 // the group, next to the filled pills of the
                                 // ones that already do.
-                                Tag::secondary().outline().child(
+                                Tag::color(ColorName::Neutral).outline().child(
                                     h_flex()
                                         .items_center()
                                         .gap_1()
@@ -14459,14 +14459,14 @@ impl ManagementCenter {
                                 .child(member.model_id.clone()),
                         )
                         .when(!member.enabled, |row| {
-                            row.child(Tag::secondary().xsmall().child(management_locale_text(
-                                "Disabled",
-                                "已停用",
-                                "已停用",
-                            )))
+                            row.child(
+                                Tag::color(ColorName::Neutral)
+                                    .xsmall()
+                                    .child(management_locale_text("Disabled", "已停用", "已停用")),
+                            )
                         })
                         .when_some(member.reasoning_effort.clone(), |row, effort| {
-                            row.child(Tag::secondary().xsmall().child(effort))
+                            row.child(Tag::color(ColorName::Neutral).xsmall().child(effort))
                         }),
                 );
             }
@@ -15864,7 +15864,11 @@ impl ManagementCenter {
                     .items_center()
                     .gap_2()
                     .py_1()
-                    .child(Tag::secondary().xsmall().child(format!("{:?}", probe.kind)))
+                    .child(
+                        Tag::color(ColorName::Neutral)
+                            .xsmall()
+                            .child(format!("{:?}", probe.kind)),
+                    )
                     .child(
                         div()
                             .min_w_0()
@@ -17486,11 +17490,11 @@ impl ManagementCenter {
                     if action == &format!("key-test:{}", credential.id.as_str())
             );
             let state = match credential.status {
-                vibex_core::AgentCredentialStatus::Ready => Tag::success()
+                vibex_core::AgentCredentialStatus::Ready => Tag::color(ColorName::Green)
                     .xsmall()
                     .child(management_locale_text("Active", "正常", "正常"))
                     .into_any_element(),
-                vibex_core::AgentCredentialStatus::Missing => Tag::warning()
+                vibex_core::AgentCredentialStatus::Missing => Tag::color(ColorName::Amber)
                     .xsmall()
                     .child(management_locale_text(
                         "Needs a key",
@@ -17498,11 +17502,11 @@ impl ManagementCenter {
                         "需要 Key",
                     ))
                     .into_any_element(),
-                vibex_core::AgentCredentialStatus::Expired => Tag::danger()
+                vibex_core::AgentCredentialStatus::Expired => Tag::color(ColorName::Red)
                     .xsmall()
                     .child(management_locale_text("Expired", "已过期", "已過期"))
                     .into_any_element(),
-                _ => Tag::secondary()
+                _ => Tag::color(ColorName::Neutral)
                     .xsmall()
                     .child(management_locale_text("Not ready", "未就绪", "未就緒"))
                     .into_any_element(),
@@ -19204,19 +19208,19 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let outcome = match request.outcome {
-            vibex_core::GatewayRequestOutcome::Ok => Tag::success()
+            vibex_core::GatewayRequestOutcome::Ok => Tag::color(ColorName::Green)
                 .xsmall()
                 .child(management_locale_text("ok", "成功", "成功"))
                 .into_any_element(),
-            vibex_core::GatewayRequestOutcome::Failover => Tag::info()
+            vibex_core::GatewayRequestOutcome::Failover => Tag::color(ColorName::Blue)
                 .xsmall()
                 .child(management_locale_text("failover", "已切换", "已切換"))
                 .into_any_element(),
-            vibex_core::GatewayRequestOutcome::Cooldown => Tag::warning()
+            vibex_core::GatewayRequestOutcome::Cooldown => Tag::color(ColorName::Amber)
                 .xsmall()
                 .child(management_locale_text("cooling", "冷却中", "冷卻中"))
                 .into_any_element(),
-            _ => Tag::danger()
+            _ => Tag::color(ColorName::Red)
                 .xsmall()
                 .child(management_locale_text("failed", "失败", "失敗"))
                 .into_any_element(),
@@ -21407,11 +21411,9 @@ impl ManagementCenter {
                                         .child(key.display_name.clone()),
                                 )
                                 .children(preferred_key.then(|| {
-                                    Tag::info().xsmall().child(management_locale_text(
-                                        "Preferred",
-                                        "优先",
-                                        "優先",
-                                    ))
+                                    Tag::color(ColorName::Blue)
+                                        .xsmall()
+                                        .child(management_locale_text("Preferred", "优先", "優先"))
                                 })),
                         )
                         .child(
@@ -25999,7 +26001,7 @@ impl ManagementCenter {
                             ),
                     )
                     .child(
-                        Tag::secondary()
+                        Tag::color(ColorName::Neutral)
                             .xsmall()
                             .child(management_locale_text("Use", "使用", "使用")),
                     ),
@@ -26137,7 +26139,7 @@ impl ManagementCenter {
                                 ),
                         )
                         .child(
-                            Tag::secondary()
+                            Tag::color(ColorName::Neutral)
                                 .xsmall()
                                 .child(management_locale_text("Use", "使用", "使用")),
                         ),
@@ -26190,7 +26192,7 @@ impl ManagementCenter {
                         ),
                 )
                 .child(
-                    Tag::secondary()
+                    Tag::color(ColorName::Neutral)
                         .xsmall()
                         .child(management_locale_text("New", "新建", "新增")),
                 ),
@@ -26327,59 +26329,62 @@ impl ManagementCenter {
                     })
                     .unwrap_or_else(|| management_locale_text("Preset", "预设", "預設").to_string())
             };
-            tile_grid = tile_grid.child(
-                v_flex()
-                    .id(SharedString::from(format!(
-                        "management-provider-preset-{}",
-                        preset.id
-                    )))
-                    .w(px(172.0))
-                    .min_h(px(88.0))
-                    .gap_1p5()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_2()
-                    .when(!pending, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.choose_provider_preset(&preset_id, window, cx)
-                            }))
-                    })
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_2()
-                            .child(provider_preset_logo(preset, cx))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(preset.display_name.clone()),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(detail),
-                            )
-                            .children(badge.map(|badge| Tag::secondary().xsmall().child(badge))),
-                    ),
-            );
+            tile_grid =
+                tile_grid.child(
+                    v_flex()
+                        .id(SharedString::from(format!(
+                            "management-provider-preset-{}",
+                            preset.id
+                        )))
+                        .w(px(172.0))
+                        .min_h(px(88.0))
+                        .gap_1p5()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p_2()
+                        .when(!pending, |this| {
+                            this.cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.choose_provider_preset(&preset_id, window, cx)
+                                }))
+                        })
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_2()
+                                .child(provider_preset_logo(preset, cx))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(preset.display_name.clone()),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(detail),
+                                )
+                                .children(badge.map(|badge| {
+                                    Tag::color(ColorName::Neutral).xsmall().child(badge)
+                                })),
+                        ),
+                );
         }
         let _ = window;
 
@@ -30069,12 +30074,12 @@ impl ManagementCenter {
                                     ))
                                 })
                                 .when(route.is_model_group(), |header| {
-                                    header.child(Tag::secondary().xsmall().child(
+                                    header.child(Tag::color(ColorName::Neutral).xsmall().child(
                                         management_route_group_kind_label(route.kind),
                                     ))
                                 })
                                 .when(route.status != vibex_core::RouteStatus::Enabled, |header| {
-                                    header.child(Tag::secondary().xsmall().child(
+                                    header.child(Tag::color(ColorName::Neutral).xsmall().child(
                                         management_locale_text("Disabled", "已停用", "已停用"),
                                     ))
                                 })
@@ -30082,7 +30087,7 @@ impl ManagementCenter {
                                     // A group several Agents reference is not
                                     // this Agent's to delete, so the row says so
                                     // before the reader looks for a delete.
-                                    header.child(Tag::secondary().xsmall().child(
+                                    header.child(Tag::color(ColorName::Neutral).xsmall().child(
                                         management_route_group_users_label(users),
                                     ))
                                 }),
@@ -37900,7 +37905,10 @@ fn management_route_group_glyph(is_default: bool, cx: &App) -> AnyElement {
 }
 
 fn management_status_badge(label: String, _cx: &App) -> AnyElement {
-    Tag::secondary().xsmall().child(label).into_any_element()
+    Tag::color(ColorName::Neutral)
+        .xsmall()
+        .child(label)
+        .into_any_element()
 }
 
 /// Groups shared Provider Profiles by identity and resolves the Agents that
@@ -38521,11 +38529,11 @@ fn gateway_provider_status_badge(
     _cx: &App,
 ) -> AnyElement {
     match profile.status {
-        vibex_core::ModelProviderProfileStatus::Enabled => Tag::success()
+        vibex_core::ModelProviderProfileStatus::Enabled => Tag::color(ColorName::Green)
             .xsmall()
             .child(management_locale_text("Enabled", "已启用", "已啟用"))
             .into_any_element(),
-        vibex_core::ModelProviderProfileStatus::Disabled => Tag::secondary()
+        vibex_core::ModelProviderProfileStatus::Disabled => Tag::color(ColorName::Neutral)
             .xsmall()
             .child(management_locale_text("Disabled", "已停用", "已停用"))
             .into_any_element(),
@@ -38540,26 +38548,26 @@ fn gateway_status_badge(state: &vibex_core::ModelGatewayRuntimeState, _cx: &App)
     let (label, tag) = match state.status {
         vibex_core::ModelGatewayStatus::Running => (
             management_locale_text("Running", "运行中", "執行中"),
-            Tag::success(),
+            Tag::color(ColorName::Green),
         ),
         vibex_core::ModelGatewayStatus::Starting => (
             management_locale_text("Starting", "启动中", "啟動中"),
-            Tag::info(),
+            Tag::color(ColorName::Blue),
         ),
         vibex_core::ModelGatewayStatus::Unavailable => (
             management_locale_text("Not running", "未运行", "未執行"),
-            Tag::warning(),
+            Tag::color(ColorName::Amber),
         ),
         // A degraded gateway is not a stopped one: the port is still bound and
         // the groups that did not step aside keep serving. The counts that make
         // that legible live beside the badge, so the label only says so much.
         vibex_core::ModelGatewayStatus::Degraded => (
             management_locale_text("Degraded", "已降级", "已降級"),
-            Tag::warning(),
+            Tag::color(ColorName::Amber),
         ),
         vibex_core::ModelGatewayStatus::Disabled => (
             management_locale_text("Off", "已关闭", "已關閉"),
-            Tag::secondary(),
+            Tag::color(ColorName::Neutral),
         ),
     };
     tag.xsmall().child(label).into_any_element()
@@ -38910,22 +38918,22 @@ fn shared_provider_key_summary(
 /// One Key's state, labelled so colour is never the only signal.
 fn gateway_key_state_badge(key: &vibex_core::GatewayKeySummary, _cx: &App) -> AnyElement {
     match key.state {
-        vibex_core::GatewayKeyState::Ready => Tag::success()
+        vibex_core::GatewayKeyState::Ready => Tag::color(ColorName::Green)
             .xsmall()
             .child(management_locale_text("Active", "正常", "正常"))
             .into_any_element(),
         // A cooldown is the one state with a deadline, so it says when the Key
         // comes back. "Cooling down" alone leaves the user unable to tell a
         // 30-second rate limit from an hour-long credit problem.
-        vibex_core::GatewayKeyState::Cooling { until_ms, .. } => Tag::warning()
+        vibex_core::GatewayKeyState::Cooling { until_ms, .. } => Tag::color(ColorName::Amber)
             .xsmall()
             .child(gateway_cooldown_label(until_ms))
             .into_any_element(),
-        vibex_core::GatewayKeyState::Invalid => Tag::danger()
+        vibex_core::GatewayKeyState::Invalid => Tag::color(ColorName::Red)
             .xsmall()
             .child(management_locale_text("Invalid", "已失效", "已失效"))
             .into_any_element(),
-        vibex_core::GatewayKeyState::Disabled => Tag::secondary()
+        vibex_core::GatewayKeyState::Disabled => Tag::color(ColorName::Neutral)
             .xsmall()
             .child(management_locale_text("Off", "已停用", "已停用"))
             .into_any_element(),
@@ -38950,27 +38958,27 @@ fn projection_auth_state_badge(state: vibex_core::ProjectionAuthState, _cx: &App
     let (label, tag) = match state {
         State::Ready => (
             management_locale_text("Ready", "已就绪", "已就緒"),
-            Tag::success(),
+            Tag::color(ColorName::Green),
         ),
         State::Missing => (
             management_locale_text("Not configured", "未配置", "未設定"),
-            Tag::warning(),
+            Tag::color(ColorName::Amber),
         ),
         State::AgentManaged => (
             management_locale_text("Managed by Agent", "由 Agent 管理", "由 Agent 管理"),
-            Tag::secondary(),
+            Tag::color(ColorName::Neutral),
         ),
         State::NotApplicable => (
             management_locale_text("Not required", "无需配置", "無需設定"),
-            Tag::secondary(),
+            Tag::color(ColorName::Neutral),
         ),
         State::Unsupported => (
             management_locale_text("Unsupported", "暂不支持", "暫不支援"),
-            Tag::warning(),
+            Tag::color(ColorName::Amber),
         ),
         State::Unknown => (
             management_locale_text("Unknown", "未知", "未知"),
-            Tag::secondary(),
+            Tag::color(ColorName::Neutral),
         ),
     };
     tag.xsmall().child(label).into_any_element()
@@ -39407,11 +39415,10 @@ fn management_market_glyph(icon_path: &str, cx: &App) -> AnyElement {
 ///
 /// Outline-only and muted on purpose. A card carries at most one of these, so
 /// the tag that reports state is the only thing on it allowed to be loud.
-fn management_market_chip(label: impl Into<SharedString>, cx: &App) -> AnyElement {
-    Tag::secondary()
+fn management_market_chip(label: impl Into<SharedString>) -> AnyElement {
+    Tag::color(ColorName::Neutral)
         .outline()
         .xsmall()
-        .text_color(cx.theme().muted_foreground)
         .child(label.into())
         .into_any_element()
 }
@@ -39421,9 +39428,9 @@ fn management_market_state_tag(state: &MarketEntryState, _cx: &App) -> AnyElemen
     let tag = match state {
         // "You already have this" is information, not a warning, so it keeps
         // the quieter outline treatment.
-        MarketEntryState::Installed => Tag::success().outline(),
-        MarketEntryState::Deprecated => Tag::warning(),
-        MarketEntryState::Removed => Tag::danger(),
+        MarketEntryState::Installed => Tag::color(ColorName::Green).outline(),
+        MarketEntryState::Deprecated => Tag::color(ColorName::Amber),
+        MarketEntryState::Removed => Tag::color(ColorName::Red),
     };
     tag.xsmall().child(state.label()).into_any_element()
 }
@@ -39546,7 +39553,7 @@ fn management_market_card(
     if chip.is_some() || endpoint.is_some() {
         let mut endpoint_row = h_flex().w_full().min_w_0().items_center().gap_2();
         if let Some(chip) = chip {
-            endpoint_row = endpoint_row.child(management_market_chip(chip, cx));
+            endpoint_row = endpoint_row.child(management_market_chip(chip));
         }
         if let Some(endpoint) = endpoint {
             endpoint_row = endpoint_row
@@ -40839,7 +40846,7 @@ fn management_resource_row(
     // cannot be used says so. The label is localized: the row used to print the
     // projection's own `enabled`/`disabled` key.
     let status_tag = (!enabled).then(|| {
-        Tag::warning()
+        Tag::color(ColorName::Amber)
             .xsmall()
             .child(management_locale_text("Disabled", "已停用", "已停用"))
     });

@@ -6,8 +6,8 @@ use gpui::{
     px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _, Theme,
-    WindowExt as _,
+    ActiveTheme as _, ColorName, Disableable as _, Icon, IconName, Sizable as _, Size,
+    StyledExt as _, Theme, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogButtonProps, DialogClose, DialogFooter},
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
@@ -2234,7 +2234,7 @@ impl RemoteAccessPairing {
     }
 
     fn render_hero_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (status, color) = self.remote_access_status(cx);
+        let (status, color) = self.remote_access_status();
         h_flex()
             .w_full()
             .min_w_0()
@@ -2275,11 +2275,11 @@ impl RemoteAccessPairing {
             .into_any_element()
     }
 
-    fn remote_access_status(&self, cx: &App) -> (SharedString, gpui::Hsla) {
+    fn remote_access_status(&self) -> (SharedString, ColorName) {
         let Some(snapshot) = self.state.connectivity.as_ref() else {
             return (
                 locale::text("Checking…", "检查中…", "檢查中…").into(),
-                cx.theme().muted_foreground,
+                ColorName::Neutral,
             );
         };
         let online = snapshot
@@ -2293,17 +2293,17 @@ impl RemoteAccessPairing {
                 locale::ResolvedLocale::ZhCn => format!("{online} 项在线"),
                 locale::ResolvedLocale::ZhTw => format!("{online} 項上線"),
             };
-            return (label.into(), cx.theme().success);
+            return (label.into(), ColorName::Green);
         }
         if snapshot.desired_enabled {
             return (
                 locale::text("Checking…", "检查中…", "檢查中…").into(),
-                cx.theme().warning,
+                ColorName::Amber,
             );
         }
         (
             locale::text("Not enabled", "未启用", "未啟用").into(),
-            cx.theme().muted_foreground,
+            ColorName::Neutral,
         )
     }
 
@@ -2574,7 +2574,7 @@ impl RemoteAccessPairing {
         let restoring = self.state.restoring_device.as_deref() == Some(device.device_id.as_str());
         let deleting = self.state.deleting_device.as_deref() == Some(device.device_id.as_str());
         let renaming = self.state.renaming_device.as_deref() == Some(device.device_id.as_str());
-        let status_color = device_status_color(device.status, cx);
+        let status_color = device_status_color(device.status);
         let device_key = device.device_id.as_str().to_string();
         // Presence is a live connection, so it replaces the stored last-seen
         // sentence rather than sitting beside a stale one.
@@ -2795,7 +2795,7 @@ impl RemoteAccessPairing {
         let keyboard_entity = entity.clone();
         let action = RemoteAccessAction::SelectConnectionEntry(entry);
         let keyboard_action = action.clone();
-        let (status, status_color) = self.connection_entry_status(entry, cx);
+        let (status, status_color) = self.connection_entry_status(entry);
         let row_id: SharedString = connection_entry_id(entry).into();
         let accessibility_label = format!(
             "{}: {}",
@@ -2864,7 +2864,7 @@ impl RemoteAccessPairing {
                             .when(entry == RemoteAccessEntry::TailscaleServe, |row| {
                                 row.child(status_pill(
                                     locale::text("Recommended", "推荐", "建議"),
-                                    cx.theme().primary,
+                                    ColorName::Blue,
                                 ))
                             }),
                     )
@@ -2931,27 +2931,23 @@ impl RemoteAccessPairing {
                 .is_some_and(|offer| !offer.is_terminal(unix_timestamp_ms()))
     }
 
-    fn connection_entry_status(
-        &self,
-        entry: RemoteAccessEntry,
-        cx: &App,
-    ) -> (&'static str, gpui::Hsla) {
+    fn connection_entry_status(&self, entry: RemoteAccessEntry) -> (&'static str, ColorName) {
         if entry == RemoteAccessEntry::LocalNetwork {
             if self.state.active_zero_config_window.is_some() {
                 return (
                     locale::text("Discovering", "发现中", "發現中"),
-                    cx.theme().success,
+                    ColorName::Green,
                 );
             }
             return (
                 locale::text("On demand", "按需开启", "按需開啟"),
-                cx.theme().muted_foreground,
+                ColorName::Neutral,
             );
         }
         let Some(method) = entry.remote_method() else {
             return (
                 method_state_label(RemoteMethodState::Disabled),
-                cx.theme().muted_foreground,
+                ColorName::Neutral,
             );
         };
         let state = self
@@ -2960,7 +2956,7 @@ impl RemoteAccessPairing {
             .as_ref()
             .and_then(|connectivity| connectivity.method(method))
             .map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
-        (method_state_label(state), method_state_color(state, cx))
+        (method_state_label(state), method_state_color(state))
     }
 
     fn render_connection_detail_panel(
@@ -2983,7 +2979,7 @@ impl RemoteAccessPairing {
         let pending = self.state.pending.is_some();
         let desired_enabled = snapshot.is_some_and(|snapshot| snapshot.desired_enabled);
         let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
-        let status_color = method_state_color(state, cx);
+        let status_color = method_state_color(state);
         let recovery = snapshot.map_or(RemoteRecoveryAction::None, |snapshot| {
             snapshot.recovery_action
         });
@@ -3214,7 +3210,7 @@ impl RemoteAccessPairing {
             self.state.pending,
             Some(RemoteAccessMutation::StartZeroConfigPairing)
         );
-        let (_, status_color) = self.connection_entry_status(RemoteAccessEntry::LocalNetwork, cx);
+        let (_, status_color) = self.connection_entry_status(RemoteAccessEntry::LocalNetwork);
 
         v_flex()
             .w_full()
@@ -3832,27 +3828,25 @@ impl RemoteAccessPairing {
             let (state_label, state_color) = match request.state {
                 RemoteLanPairingRequestState::Pending => (
                     locale::text("Awaiting confirmation", "等待确认", "等待確認"),
-                    cx.theme().warning,
+                    ColorName::Amber,
                 ),
                 RemoteLanPairingRequestState::Approved => (
                     locale::text("Approved", "已允许", "已允許"),
-                    cx.theme().success,
+                    ColorName::Green,
                 ),
-                RemoteLanPairingRequestState::Rejected => (
-                    locale::text("Rejected", "已拒绝", "已拒絕"),
-                    cx.theme().danger,
-                ),
+                RemoteLanPairingRequestState::Rejected => {
+                    (locale::text("Rejected", "已拒绝", "已拒絕"), ColorName::Red)
+                }
                 RemoteLanPairingRequestState::Expired => (
                     locale::text("Expired", "已过期", "已過期"),
-                    cx.theme().muted_foreground,
+                    ColorName::Neutral,
                 ),
-                RemoteLanPairingRequestState::Claimed => (
-                    locale::text("Paired", "已配对", "已配對"),
-                    cx.theme().success,
-                ),
+                RemoteLanPairingRequestState::Claimed => {
+                    (locale::text("Paired", "已配对", "已配對"), ColorName::Green)
+                }
                 RemoteLanPairingRequestState::Unknown => (
                     locale::text("Unavailable", "不可用", "不可用"),
-                    cx.theme().muted_foreground,
+                    ColorName::Neutral,
                 ),
             };
             column = column.child(
@@ -4575,9 +4569,8 @@ fn icon_tile(icon: IconName, tile: gpui::Pixels, glyph: gpui::Pixels, cx: &App) 
         .child(Icon::new(icon).size(glyph).text_color(cx.theme().primary))
 }
 
-fn status_pill(label: impl Into<SharedString>, color: gpui::Hsla) -> gpui::AnyElement {
-    let surface = color.opacity(0.12);
-    Tag::custom(surface, color, surface)
+fn status_pill(label: impl Into<SharedString>, color: ColorName) -> gpui::AnyElement {
+    Tag::color(color)
         .xsmall()
         .rounded_full()
         .px_2()
@@ -4792,11 +4785,11 @@ fn device_status_label(status: RemoteDeviceStatus) -> &'static str {
     }
 }
 
-fn device_status_color(status: RemoteDeviceStatus, cx: &App) -> gpui::Hsla {
+fn device_status_color(status: RemoteDeviceStatus) -> ColorName {
     match status {
-        RemoteDeviceStatus::Pending => cx.theme().warning,
-        RemoteDeviceStatus::Active => cx.theme().success,
-        RemoteDeviceStatus::Revoked => cx.theme().muted_foreground,
+        RemoteDeviceStatus::Pending => ColorName::Amber,
+        RemoteDeviceStatus::Active => ColorName::Green,
+        RemoteDeviceStatus::Revoked => ColorName::Neutral,
     }
 }
 
@@ -4895,18 +4888,18 @@ fn method_state_label(state: RemoteMethodState) -> &'static str {
     }
 }
 
-fn method_state_color(state: RemoteMethodState, cx: &App) -> gpui::Hsla {
+fn method_state_color(state: RemoteMethodState) -> ColorName {
     match state {
-        RemoteMethodState::Online => cx.theme().success,
+        RemoteMethodState::Online => ColorName::Green,
         RemoteMethodState::Checking
         | RemoteMethodState::ConfirmationNeeded
         | RemoteMethodState::Enabling
-        | RemoteMethodState::Stopping => cx.theme().warning,
-        RemoteMethodState::Disabled => cx.theme().muted_foreground,
+        | RemoteMethodState::Stopping => ColorName::Amber,
+        RemoteMethodState::Disabled => ColorName::Neutral,
         RemoteMethodState::Degraded
         | RemoteMethodState::RepairRequired
         | RemoteMethodState::Conflict
-        | RemoteMethodState::Error => cx.theme().danger,
+        | RemoteMethodState::Error => ColorName::Red,
     }
 }
 
