@@ -20,8 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest as _, Sha256};
 use vibex_desktop::ssh_connection::{
     LaunchConfig, LocalArtifact, MIN_FREE_KB, ProvisioningCoordinator, ProvisioningRunOutcome,
-    RemoteArch, RunCancellation, SshCommand, SshDestination, SshProvisioningEffects, probe,
-    run_provisioning, select_local_port, supervisor,
+    RemoteArch, RunCancellation, SshCommand, SshDestination, SshProvisioningEffects,
+    SshRuntimeChannel, install::install_artifact, probe, run_provisioning, select_local_port,
+    supervisor, upgrade::upgrade_runtime,
 };
 
 fn now_ms() -> i64 {
@@ -141,6 +142,95 @@ async fn probe_classifies_a_changed_host_key() {
     let config = write_config(dir.path(), &identity, &known_hosts, "yes");
     let error = probe(&command_for(&config), 8765, MIN_FREE_KB).expect_err("host key must fail");
     assert_eq!(error.code(), "ssh_host_key_changed", "{}", error.message());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the Docker sshd fixture and a server tarball"]
+async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
+    let Some(fixture) = fixture_config() else {
+        return;
+    };
+    let artifact_path =
+        PathBuf::from(std::env::var("VIBEX_SSH_E2E_ARTIFACT").expect("VIBEX_SSH_E2E_ARTIFACT"));
+    let old_bytes = std::fs::read(&artifact_path).expect("read old artifact");
+    let old_sha = format!("{:x}", Sha256::digest(&old_bytes));
+    let command = command_for(&fixture);
+    let launch = LaunchConfig::new(
+        "/home/dev/upgrade-home",
+        "/home/dev/upgrade-server",
+        &["/home/dev/upgrade-home".to_string()],
+        8767,
+    )
+    .expect("launch config");
+    let mut prepare = command.clone();
+    prepare
+        .remote_script("mkdir -p /home/dev/upgrade-home /home/dev/upgrade-server")
+        .unwrap();
+    prepare.run().expect("prepare upgrade dirs");
+
+    let old = LocalArtifact {
+        path: artifact_path.clone(),
+        version: "0.1.0-rc.8".to_string(),
+        arch: RemoteArch::X86_64,
+        size: old_bytes.len() as u64,
+        sha256: old_sha.clone(),
+    };
+    install_artifact(&command, &old, "/home/dev/upgrade-server", |_, _| {})
+        .expect("install old runtime");
+    supervisor::ensure_started(&command, &launch).expect("start old runtime");
+
+    let dir = tempfile::tempdir().expect("upgrade artifacts");
+    let new_path = dir.path().join("new.tar.gz");
+    std::fs::copy(&artifact_path, &new_path).expect("copy new artifact");
+    let new = LocalArtifact {
+        path: new_path,
+        version: "0.1.0-rc.9".to_string(),
+        arch: RemoteArch::X86_64,
+        size: old_bytes.len() as u64,
+        sha256: old_sha,
+    };
+    upgrade_runtime(&command, &launch, &new, SshRuntimeChannel::Rc, |_, _| {})
+        .expect("upgrade to rc.9");
+
+    let bad_binary = dir.path().join("vibex-server");
+    std::fs::write(&bad_binary, b"#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&bad_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bad_path = dir.path().join("bad.tar.gz");
+    assert!(
+        Command::new("tar")
+            .args(["-czf", bad_path.to_str().unwrap(), "-C"])
+            .arg(dir.path())
+            .arg("vibex-server")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bad_bytes = std::fs::read(&bad_path).unwrap();
+    let bad = LocalArtifact {
+        path: bad_path,
+        version: "0.1.0-rc.10".to_string(),
+        arch: RemoteArch::X86_64,
+        size: bad_bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bad_bytes)),
+    };
+    let error = upgrade_runtime(&command, &launch, &bad, SshRuntimeChannel::Rc, |_, _| {})
+        .expect_err("bad runtime must fail and roll back");
+    assert!(
+        error
+            .rollback
+            .as_deref()
+            .is_some_and(|steps| steps.contains("old_started")),
+        "rollback: {:?} ({})",
+        error.rollback,
+        error.message
+    );
+    let status = supervisor::status(&command, &launch).expect("status after rollback");
+    assert!(
+        status.is_healthy(),
+        "runtime should be healthy after rollback"
+    );
+    supervisor::ensure_stopped(&command, &launch).expect("stop upgraded runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
