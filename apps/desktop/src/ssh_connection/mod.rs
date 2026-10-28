@@ -12,6 +12,7 @@ pub mod error;
 pub mod host_key;
 pub mod install;
 pub mod launch;
+pub mod pairing;
 pub mod profile;
 pub mod provisioning;
 pub mod supervisor;
@@ -35,6 +36,10 @@ pub use error::{SshFailure, SshFailureKind};
 pub use host_key::{default_known_hosts_path, known_hosts_contains};
 pub use install::{INSTALL_SCRIPT, InstallError, InstallOutcome, install_artifact};
 pub use launch::{LaunchConfig, LaunchError, LaunchState, StartOutcome, start, write_env};
+pub use pairing::{
+    PAIRING_CODE_SCRIPT, PAIRING_SCHEMA_VERSION, PairingError, PairingOutcome, PairingPayload,
+    claim_and_register, fetch_pairing_code, parse_pairing_payload,
+};
 pub use profile::{
     SCHEMA_VERSION, STORE_FILE_NAME, SshConnectionProfile, SshProfileStore, SshRuntimeChannel,
 };
