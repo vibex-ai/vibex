@@ -23,6 +23,7 @@ pub mod supervisor;
 #[cfg(test)]
 mod test_support;
 pub mod tunnel;
+pub mod upgrade;
 
 pub use artifact::{
     ArtifactError, LocalArtifact, download_server_artifact, select_server_artifact, verify_file,

@@ -57,6 +57,7 @@ serde.workspace = true
 sys-locale.workspace = true
 sysinfo.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 sha2.workspace = true
 similar = "3.1.1"
 tray-icon.workspace = true
