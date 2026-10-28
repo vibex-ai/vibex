@@ -22436,67 +22436,69 @@ impl ManagementCenter {
                                             }),
                                         ),
                                     )
-                                })
-                                .when(!added, |actions| {
-                                    actions.child(button_with_aria_label(
-                                        Button::new(SharedString::from(format!(
-                                            "management-agent-add-{add_id}"
-                                        )))
-                                        .small()
-                                        .outline()
-                                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
-                                        .icon(IconName::Plus)
-                                        .tooltip(management_add_label())
-                                        .loading(
-                                            managed_installing
-                                                || matches!(
-                                                    mutation,
-                                                    Some(ManagementMutation::AgentToggle(action))
-                                                        if action == &format!("add:{add_id}")
-                                                ),
-                                        )
-                                        .disabled(pending)
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.set_agent_added(add_id.clone(), true, cx)
-                                            }),
-                                        ),
-                                        management_add_label(),
-                                    ))
                                 }),
                         )
-                        .child({
-                            // One footer band: the built-in tool glyphs on the
-                            // left, the profile count (or the status sentence) on
-                            // the right. The two panels used to be a second text
-                            // line; a glyph says the same thing without costing a
-                            // line per card.
-                            let mut footer = h_flex().w_full().min_w_0().items_center().gap_1();
-                            if added && enabled {
-                                footer = footer.child(management_agent_tool_icons(
-                                    &id,
-                                    &self.agent_tools,
-                                    self.computer_tools_ready,
-                                    cx,
-                                ));
-                            }
-                            footer.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_right()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if added && model_provider_configuration_supported {
-                                        management_profile_count(profile_count)
-                                    } else {
-                                        status_label.to_string()
-                                    }),
-                            )
+                        .when(added, |content| {
+                            content.child({
+                                // One footer band: the built-in tool glyphs on the
+                                // left, the profile count (or the status sentence) on
+                                // the right. The two panels used to be a second text
+                                // line; a glyph says the same thing without costing a
+                                // line per card.
+                                let mut footer = h_flex().w_full().min_w_0().items_center().gap_1();
+                                if enabled {
+                                    footer = footer.child(management_agent_tool_icons(
+                                        &id,
+                                        &self.agent_tools,
+                                        self.computer_tools_ready,
+                                        cx,
+                                    ));
+                                }
+                                footer.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_right()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if model_provider_configuration_supported {
+                                            management_profile_count(profile_count)
+                                        } else {
+                                            status_label.to_string()
+                                        }),
+                                )
+                            })
                         }),
-                );
+                )
+                // The add action is a trailing column of the card rather than a
+                // cell of the title row: the row is vertically centred, so the
+                // button centres on the card instead of riding the title line
+                // with a "Not added" sentence underneath it.
+                .when(!added, |row| {
+                    row.child(button_with_aria_label(
+                        Button::new(SharedString::from(format!("management-agent-add-{add_id}")))
+                            .small()
+                            .outline()
+                            .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                            .icon(IconName::Plus)
+                            .tooltip(management_add_label())
+                            .loading(
+                                managed_installing
+                                    || matches!(
+                                        mutation,
+                                        Some(ManagementMutation::AgentToggle(action))
+                                            if action == &format!("add:{add_id}")
+                                    ),
+                            )
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_agent_added(add_id.clone(), true, cx)
+                            })),
+                        management_add_label(),
+                    ))
+                });
             agent_rows = agent_rows.child(row);
         }
 
@@ -46510,7 +46512,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Agent sidebar renderer should remain inspectable");
         assert!(sidebar.contains("model_provider_configuration_supported"));
-        assert!(sidebar.contains("added && model_provider_configuration_supported"));
+        assert!(
+            sidebar.contains(".when(added, |content|"),
+            "only an added Agent's card carries the profile/status footer"
+        );
     }
 
     #[test]
