@@ -44,6 +44,7 @@ use gpui_component::{
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
+    toolbar::Toolbar,
     tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
@@ -537,7 +538,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skill",
             prompts: "Prompt",
-            providers: "供应商",
+            providers: "Provider",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索 Skill",
@@ -557,7 +558,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skill",
             prompts: "Prompt",
-            providers: "供應商",
+            providers: "Provider",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋 Skill",
@@ -12412,8 +12413,9 @@ impl ManagementCenter {
                             .iter()
                             .any(|model| model.enabled)
                 }
+                // Sharing is a Provider used by more than one Agent; a
+                // single-Agent Provider needs no filter of its own.
                 ProviderListFilter::Shared => row.agents.len() > 1,
-                ProviderListFilter::AgentOnly => row.agents.len() == 1,
             })
             .collect::<Vec<_>>();
         let mut rows = rows;
@@ -12453,14 +12455,18 @@ impl ManagementCenter {
         // it is not allowed to hide behind a second navigation item.
         let gateway_selected = selected.as_deref() == Some(GATEWAY_ROW_ID);
         let gateway = &self.gateway;
-        let enabled = gateway.settings.policy.enabled;
+        // The state reads as one compact mark at the row's trailing edge: a
+        // coloured dot and the word for what the dot means. Colour never
+        // carries the state on its own, and the row keeps the same height in
+        // every state because the mark replaces text rather than being added
+        // beside it.
         let (gateway_state, gateway_state_color) = match gateway.runtime.status {
             vibex_core::ModelGatewayStatus::Running => (
-                management_locale_text("Gateway · on", "网关 · 开", "閘道 · 開"),
+                management_locale_text("Running", "运行中", "執行中"),
                 cx.theme().success,
             ),
             vibex_core::ModelGatewayStatus::Disabled => (
-                management_locale_text("Gateway · off", "网关 · 关", "閘道 · 關"),
+                management_locale_text("Off", "已关闭", "已關閉"),
                 cx.theme().muted_foreground,
             ),
             // Starting is a normal moment on first load, not a fallback: saying
@@ -12472,15 +12478,11 @@ impl ManagementCenter {
             // A degraded gateway is still listening: some groups stepped aside
             // and the rest keep serving, so this is a warning, never "down".
             vibex_core::ModelGatewayStatus::Degraded => (
-                management_locale_text("Gateway · degraded", "网关 · 已降级", "閘道 · 已降級"),
+                management_locale_text("Degraded", "已降级", "已降級"),
                 cx.theme().warning,
             ),
             vibex_core::ModelGatewayStatus::Unavailable => (
-                management_locale_text(
-                    "Gateway unavailable · route groups unusable",
-                    "网关不可用，路由组无法使用",
-                    "閘道無法使用，路由組無法使用",
-                ),
+                management_locale_text("Unavailable", "不可用", "無法使用"),
                 cx.theme().warning,
             ),
         };
@@ -12555,34 +12557,25 @@ impl ManagementCenter {
                         .justify_between()
                         .gap_2()
                         .child(
-                            h_flex()
+                            div()
                                 .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_medium()
+                                .child(gateway_display_name(&gateway.settings)),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_none()
                                 .items_center()
-                                .gap_2()
+                                .gap_1p5()
+                                .child(div().size(px(6.0)).rounded_full().bg(gateway_state_color))
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(if enabled {
-                                            cx.theme().primary
-                                        } else {
-                                            cx.theme().muted_foreground
-                                        })
-                                        .child("●"),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_sm()
-                                        .font_medium()
-                                        .child(gateway_display_name(&gateway.settings)),
+                                        .text_color(gateway_state_color)
+                                        .child(gateway_state),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(gateway_state_color)
-                                .child(gateway_state),
                         ),
                 )
                 .child(
@@ -12758,16 +12751,19 @@ impl ManagementCenter {
                             .items_center()
                             .gap_1()
                             .children(agent_stack.into_iter().map(|(agent_id, label)| {
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
+                                let tooltip = SharedString::from(label);
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "management-provider-agent-logo-{id}-{agent_id}"
+                                    )))
+                                    .role(Role::Image)
+                                    .aria_label(tooltip.clone())
+                                    .flex_none()
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                            .build(window, cx)
+                                    })
                                     .child(agent_brand_icon(&agent_id, px(14.0), None))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(label),
-                                    )
                             }))
                             .when(agent_count > 5, |stack| {
                                 stack.child(
@@ -12984,17 +12980,15 @@ impl ManagementCenter {
                 }
             }));
 
-        let provider_search_row = (active_tab == ProviderSidebarTab::Providers)
-            .then(|| management_search_input(&self.provider_search, cx));
+        let provider_controls = (active_tab == ProviderSidebarTab::Providers)
+            .then(|| self.render_provider_controls_toolbar(cx));
         let catalog_row = (active_tab == ProviderSidebarTab::Providers)
             .then(|| self.render_catalog_status_row(cx));
-        let provider_filter_row = (active_tab == ProviderSidebarTab::Providers)
-            .then(|| self.render_provider_filter_row(cx));
         let import_report_row = (active_tab == ProviderSidebarTab::Providers)
             .then(|| self.render_native_import_report(cx));
         let (section_title, actions, section_body) = match active_tab {
             ProviderSidebarTab::Providers => (
-                management_locale_text("Providers", "供应商", "供應商"),
+                management_locale_text("Providers", "Provider", "Provider"),
                 vec![
                     Button::new("management-provider-page-add")
                         .xsmall()
@@ -13067,8 +13061,7 @@ impl ManagementCenter {
                         actions,
                         cx,
                     ))
-                    .children(provider_search_row)
-                    .children(provider_filter_row)
+                    .children(provider_controls)
                     .children(import_report_row)
                     .children(catalog_row)
                     .child(
@@ -13288,6 +13281,18 @@ impl ManagementCenter {
                 .filter(|agent| configurable.contains(&agent.id))
                 .filter(|agent| !row.agents.contains(agent.id.as_str()))
                 .collect::<Vec<_>>();
+            // One card answers both halves of "who uses this Provider": the
+            // Agents that already do, and the ones that could. Reporting the
+            // sharing in one card and offering it in a second made the reader
+            // match two lists against each other, while this list already has
+            // every Agent in it — bound ones as removable pills, the rest as
+            // pills that bind on click. The Agent page remains the other place
+            // to do the same thing, not a separate capability.
+            let bind_profile = profile
+                .legacy_provider_profile_id
+                .clone()
+                .unwrap_or_else(vibex_core::ProviderProfileId::new);
+            let bind_shared = Some(profile.id.clone());
             if !unbound.is_empty() {
                 agent_rows = agent_rows.child(
                     div()
@@ -13296,18 +13301,15 @@ impl ManagementCenter {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(management_locale_text(
-                            "Available to enable from the Agent page",
-                            "可在 Agent 页面启用",
-                            "可在 Agent 頁面啟用",
+                            "Select an Agent to let it use this Provider",
+                            "点击 Agent 即可让它使用该供应商",
+                            "點擊 Agent 即可讓它使用該供應商",
                         )),
                 );
                 for agent in &unbound {
                     let bind_agent = agent.id.clone();
-                    let bind_profile = profile
-                        .legacy_provider_profile_id
-                        .clone()
-                        .unwrap_or_else(vibex_core::ProviderProfileId::new);
-                    let bind_shared = Some(profile.id.clone());
+                    let bind_profile = bind_profile.clone();
+                    let bind_shared = bind_shared.clone();
                     agent_rows = agent_rows.child(
                         div()
                             .id(SharedString::from(format!(
@@ -13324,7 +13326,10 @@ impl ManagementCenter {
                                 )
                             }))
                             .child(
-                                Tag::secondary().child(
+                                // An outline pill is the offer: the filled
+                                // pills above are the Agents that already use
+                                // this Provider.
+                                Tag::secondary().outline().child(
                                     h_flex()
                                         .items_center()
                                         .gap_1()
@@ -13339,124 +13344,23 @@ impl ManagementCenter {
                 agent_rows =
                     agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
                         management_locale_text(
-                            "No Agent uses this Provider yet. Point one at it from its own page.",
-                            "还没有 Agent 使用该供应商，请到 Agent 页让它接入。",
-                            "還沒有 Agent 使用該供應商，請到 Agent 頁讓它接入。",
+                            "No Agent uses this Provider yet. Enable it from an Agent's page.",
+                            "还没有 Agent 使用该供应商，可在 Agent 页面启用。",
+                            "還沒有 Agent 使用該供應商，可在 Agent 頁面啟用。",
                         ),
                     ));
             }
             body = body.child(management_card_with_icon(
                 management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
                 management_locale_text(
-                    "Deleting this Provider would remove the model source of these Agents.",
-                    "删除该供应商会让这些 Agent 失去模型来源。",
-                    "刪除該供應商會讓這些 Agent 失去模型來源。",
+                    "Select an Agent to remove it, or to let it use this Provider. Deleting the Provider would remove the model source of every Agent listed here.",
+                    "点击 Agent 可移除它或让它使用该供应商；删除该供应商会让这里列出的 Agent 失去模型来源。",
+                    "點擊 Agent 可移除它或讓它使用該供應商；刪除該供應商會讓這裡列出的 Agent 失去模型來源。",
                 ),
                 "icons/vibex/cpu.svg",
                 agent_rows.into_any_element(),
                 cx,
             ));
-
-            // The other half of "used by": letting a further Agent use it. Without
-            // this the page could only report the sharing, and the user had to go
-            // to the Agent's own page and re-enter the address, the protocol and
-            // the Key to get the same Provider there.
-            //
-            // An Agent that already has it is not offered again, and one that
-            // manages its own provider cannot be pointed at this one at all.
-            let configurable =
-                vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
-            let bindable = self
-                .snapshot
-                .agents
-                .iter()
-                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-                .filter(|agent| configurable.contains(&agent.id))
-                .filter(|agent| !row.agents.contains(agent.id.as_str()))
-                .map(|agent| (agent.id.clone(), agent.label.clone()))
-                .collect::<Vec<_>>();
-            // Binding needs a source: either the legacy Profile that already exists
-            // for this shared record, or the shared record itself, which the
-            // authority can materialise into one. A Provider created on this page
-            // has only the latter, and it is exactly the one that most needs the
-            // offer.
-            let bind_profile = profile.legacy_provider_profile_id.clone();
-            let bind_shared = Some(profile.id.clone());
-            let bindable = if bind_profile.is_some() || profile.legacy_provider_profile_id.is_none()
-            {
-                bindable
-            } else {
-                Vec::new()
-            };
-            let bind_count = bindable.len();
-            let mut bind_rows = v_flex().w_full().gap_1();
-            for (agent_id, label) in bindable {
-                let bind_agent = agent_id.clone();
-                let bind_profile = bind_profile
-                    .clone()
-                    .unwrap_or_else(vibex_core::ProviderProfileId::new);
-                let bind_shared = bind_shared.clone();
-                bind_rows = bind_rows.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .py_1()
-                        .child(div().min_w_0().truncate().text_sm().child(label))
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "management-provider-bind-{}",
-                                agent_id.as_str()
-                            )))
-                            .xsmall()
-                            .outline()
-                            .label(management_locale_text(
-                                "Use for this Agent",
-                                "让此 Agent 使用",
-                                "讓此 Agent 使用",
-                            ))
-                            .disabled(self.mutation.is_some())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.bind_provider_to_agent(
-                                        bind_agent.clone(),
-                                        bind_profile.clone(),
-                                        bind_shared.clone(),
-                                        cx,
-                                    )
-                                },
-                            )),
-                        ),
-                );
-            }
-            if bind_count == 0 {
-                bind_rows = bind_rows.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "Every Agent that can use a Provider already uses this one.",
-                            "所有能使用供应商的 Agent 都已经在使用该供应商。",
-                            "所有能使用供應商的 Agent 都已經在使用該供應商。",
-                        )),
-                );
-            }
-            body = body.child(management_card_with_icon(
-            management_locale_text(
-                "Use for another Agent",
-                "让其他 Agent 使用",
-                "讓其他 Agent 使用",
-            ),
-            management_locale_text(
-                "Each Agent keeps its own protocol and launch settings; the address, the models and the keys come from this Provider.",
-                "每个 Agent 保留自己的协议与启动设置；地址、模型和 Key 来自该供应商。",
-                "每個 Agent 保留自己的協定與啟動設定；位址、模型和 Key 來自該供應商。",
-            ),
-            "icons/vibex/file-plus.svg",
-            bind_rows.into_any_element(),
-            cx,
-        ));
         }
         // Deletion lives at the bottom of the page, apart from the editing
         // controls: it is the one action here that cannot be undone, and putting
@@ -14455,9 +14359,9 @@ impl ManagementCenter {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(management_locale_text(
-                            "Available to reference from the Agent page",
-                            "可在 Agent 页面引用",
-                            "可在 Agent 頁面引用",
+                            "Select an Agent to let it reference this group",
+                            "点击 Agent 即可让它引用该路由组",
+                            "點擊 Agent 即可讓它引用該路由組",
                         )),
                 );
                 for agent in &unbound {
@@ -14474,7 +14378,10 @@ impl ManagementCenter {
                                 this.bind_route_group(bind_agent.clone(), bind_route.clone(), cx)
                             }))
                             .child(
-                                Tag::secondary().child(
+                                // Outline marks an Agent that could reference
+                                // the group, next to the filled pills of the
+                                // ones that already do.
+                                Tag::secondary().outline().child(
                                     h_flex()
                                         .items_center()
                                         .gap_1()
@@ -14495,97 +14402,19 @@ impl ManagementCenter {
                         ),
                     ));
             }
+            // One card lists every Agent and what clicking it does, exactly as
+            // the Provider overview does: the bound ones remove the reference,
+            // the rest add one. Two cards made the reader diff two lists that
+            // describe the same relationship.
             body = body.child(management_card_with_icon(
                 management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
                 management_locale_text(
-                    "Deleting this group would remove these models from the Agents listed here.",
-                    "删除该路由组会让下面这些 Agent 失去这些模型。",
-                    "刪除該路由組會讓下面這些 Agent 失去這些模型。",
+                    "Select an Agent to remove its reference, or to let it use this group. Deleting the group would remove these models from every Agent listed here.",
+                    "点击 Agent 可移除引用或让它使用该路由组；删除该路由组会让这里列出的 Agent 失去这些模型。",
+                    "點擊 Agent 可移除引用或讓它使用該路由組；刪除該路由組會讓這裡列出的 Agent 失去這些模型。",
                 ),
                 "icons/vibex/cpu.svg",
                 agent_rows.into_any_element(),
-                cx,
-            ));
-
-            // Offering it to a further Agent, the same way a shared Provider does.
-            let offered = row.agents.clone();
-            let configurable = vibex_core::model_provider_configurable_agent_ids().ok();
-            let bindable = self
-                .snapshot
-                .agents
-                .iter()
-                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-                .filter(|agent| {
-                    configurable
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(&agent.id))
-                })
-                .filter(|agent| !offered.contains(agent.id.as_str()))
-                .map(|agent| (agent.id.clone(), agent.label.clone()))
-                .collect::<Vec<_>>();
-            let bindable_count = bindable.len();
-            let mut bind_rows = v_flex().w_full().gap_1();
-            for (agent_id, label) in bindable {
-                let bind_agent = agent_id.clone();
-                let bind_route = route.id.clone();
-                bind_rows = bind_rows.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .py_1()
-                        .child(div().min_w_0().truncate().text_sm().child(label))
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "management-route-group-bind-{}",
-                                agent_id.as_str()
-                            )))
-                            .xsmall()
-                            .outline()
-                            .label(management_locale_text(
-                                "Use for this Agent",
-                                "让此 Agent 使用",
-                                "讓此 Agent 使用",
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.bind_route_group(
-                                        bind_agent.clone(),
-                                        bind_route.clone(),
-                                        cx,
-                                    )
-                                },
-                            )),
-                        ),
-                );
-            }
-            if bindable_count == 0 {
-                bind_rows = bind_rows.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "Every Agent that can use a route group already does.",
-                            "所有能使用路由组的 Agent 都已在使用。",
-                            "所有能使用路由組的 Agent 都已在使用。",
-                        )),
-                );
-            }
-            body = body.child(management_card_with_icon(
-                management_locale_text(
-                    "Use for another Agent",
-                    "让其他 Agent 使用",
-                    "讓其他 Agent 使用",
-                ),
-                management_locale_text(
-                    "The group stays one record; each Agent gets a reference to it.",
-                    "路由组仍然只有一份记录，每个 Agent 获得一条对它的引用。",
-                    "路由組仍然只有一份記錄，每個 Agent 獲得一條對它的引用。",
-                ),
-                "icons/vibex/file-plus.svg",
-                bind_rows.into_any_element(),
                 cx,
             ));
         }
@@ -15468,53 +15297,93 @@ impl ManagementCenter {
         }
     }
 
-    fn render_provider_filter_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut filters = h_flex().w_full().flex_wrap().gap_1();
-        for filter in ProviderListFilter::ALL {
-            let selected = filter == self.provider_list_filter;
-            filters = filters.child(
-                Button::new(SharedString::from(format!(
-                    "management-provider-filter-{:?}",
-                    filter
-                )))
-                .xsmall()
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.ghost())
-                .label(filter.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.provider_list_filter = filter;
-                    cx.notify();
-                })),
-            );
-        }
-        let mut sorts = h_flex().w_full().items_center().flex_wrap().gap_1().child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text("Sort", "排序", "排序")),
-        );
-        for sort in ProviderSort::ALL {
-            let selected = sort == self.provider_sort;
-            sorts = sorts.child(
-                Button::new(SharedString::from(format!(
-                    "management-provider-sort-{:?}",
-                    sort
-                )))
-                .xsmall()
-                .when(selected, |button| button.secondary())
-                .when(!selected, |button| button.ghost())
-                .label(sort.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.provider_sort = sort;
-                    cx.notify();
-                })),
-            );
-        }
-        v_flex()
+    /// The Providers list's search, filter, and sort, as one mixed-controls
+    /// toolbar.
+    ///
+    /// They act on the same list, so they share one band: a search field that
+    /// takes the surplus, a filter menu that names the current subset, and an
+    /// icon menu for the order. Two stacked rows of chips spent the narrow
+    /// column's height on repeated words and made the filter and the sort look
+    /// like separate tools.
+    fn render_provider_controls_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let search = management_search_input_compact(&self.provider_search, cx);
+        let active_filter = self.provider_list_filter;
+        let active_sort = self.provider_sort;
+
+        let filter_center = cx.weak_entity();
+        let filter_label = management_locale_text("Filter", "筛选", "篩選");
+        let filter_button = Button::new("management-provider-filter")
+            .small()
+            .outline()
+            .label(active_filter.label())
+            .dropdown_caret(true)
+            .tooltip(filter_label)
+            .accessibility_label(filter_label)
+            .dropdown_menu(move |mut menu, _, _| {
+                for filter in ProviderListFilter::ALL {
+                    let center = filter_center.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(filter.label())
+                            .checked(filter == active_filter)
+                            .on_click(move |_, _, cx| {
+                                center
+                                    .update(cx, |this, cx| {
+                                        this.provider_list_filter = filter;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }),
+                    );
+                }
+                menu
+            });
+
+        // Sorting is a familiar icon command and the narrowest thing in the
+        // band, so it carries its current value in the tooltip and a check mark
+        // in its menu; the filter keeps a visible label because which subset is
+        // showing changes what the list means.
+        let sort_center = cx.weak_entity();
+        let sort_tooltip = SharedString::from(format!(
+            "{} · {}",
+            management_locale_text("Sort", "排序", "排序"),
+            active_sort.label()
+        ));
+        let sort_button = Button::new("management-provider-sort")
+            .small()
+            .outline()
+            .icon(IconName::ChevronsUpDown)
+            .tooltip(sort_tooltip.clone())
+            .accessibility_label(sort_tooltip)
+            .dropdown_menu(move |mut menu, _, _| {
+                for sort in ProviderSort::ALL {
+                    let center = sort_center.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(sort.label())
+                            .checked(sort == active_sort)
+                            .on_click(move |_, _, cx| {
+                                center
+                                    .update(cx, |this, cx| {
+                                        this.provider_sort = sort;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }),
+                    );
+                }
+                menu
+            });
+
+        Toolbar::new("management-provider-controls")
+            .small()
             .w_full()
-            .gap_1()
-            .child(filters)
-            .child(sorts)
+            .content(
+                // The search field takes the surplus; the two menus keep their
+                // content width, so the band stays inside the sidebar even when
+                // the longest filter label is current.
+                div().flex_1().min_w_0().child(search),
+            )
+            .content(filter_button.into_any_element())
+            .content(sort_button.into_any_element())
             .into_any_element()
     }
 
@@ -15611,11 +15480,20 @@ impl ManagementCenter {
                 cx.theme().muted_foreground,
             ),
         };
+        // The command sits beside the sentence it acts on, not at the far edge
+        // of the column: it refreshes this catalogue, and an icon keeps the
+        // caption from wrapping on a narrow sidebar. The tooltip carries the
+        // verb the icon cannot.
+        let refresh_label = management_locale_text(
+            "Refresh models.dev",
+            "刷新 models.dev",
+            "重新整理 models.dev",
+        );
+        let refresh_tooltip = SharedString::from(refresh_label);
         h_flex()
             .w_full()
             .items_center()
-            .justify_between()
-            .gap_2()
+            .gap_1()
             .px_1()
             .child(
                 div()
@@ -15625,14 +15503,16 @@ impl ManagementCenter {
                     .text_color(color)
                     .child(label),
             )
-            .child(
+            .child(button_with_aria_label(
                 Button::new("management-provider-catalog-refresh")
                     .xsmall()
                     .ghost()
-                    .label(management_locale_text("Refresh", "刷新", "重新整理"))
+                    .icon(IconName::RefreshCw)
+                    .tooltip(refresh_tooltip.clone())
                     .disabled(self.mutation.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.refresh_catalog(cx))),
-            )
+                refresh_tooltip,
+            ))
             .into_any_element()
     }
 
@@ -15648,13 +15528,31 @@ impl ManagementCenter {
         ));
         self.error = None;
         self.notice = None;
+        // The catalogue is the one management read that really awaits: reqwest
+        // needs a Tokio reactor, and a GPUI task is polled by GPUI's own
+        // executor, where `Handle::current()` panics with "there is no reactor
+        // running". Handing the future to the Tokio bridge keeps the fetch on
+        // the runtime that owns it; the UI task only waits for its result.
         let this = cx.entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.management().refresh_model_catalog().await
+        });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend.management().refresh_model_catalog().await;
+            let outcome = runner.await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
-                    Ok(status) => {
+                    Err(error) => {
+                        this.error = Some(format!(
+                            "{}: {error}",
+                            management_locale_text(
+                                "models.dev catalogue refresh failed",
+                                "models.dev 目录刷新失败",
+                                "models.dev 目錄重新整理失敗",
+                            )
+                        ));
+                    }
+                    Ok(Ok(status)) => {
                         this.catalog_status = Some(status);
                         this.notice = Some(
                             management_locale_text(
@@ -15665,7 +15563,7 @@ impl ManagementCenter {
                             .to_string(),
                         );
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message));
                     }
                 }
@@ -32828,7 +32726,7 @@ impl ManagementCenter {
                             .text_xs()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text("Providers", "供应商", "供應商")),
+                            .child(management_locale_text("Providers", "Provider", "Provider")),
                     )
                     .child(providers),
             )
@@ -38536,18 +38434,16 @@ enum ProviderListFilter {
     NeedsKey,
     Warning,
     Shared,
-    AgentOnly,
 }
 
 impl ProviderListFilter {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 6] = [
         Self::All,
         Self::Enabled,
         Self::Disabled,
         Self::NeedsKey,
         Self::Warning,
         Self::Shared,
-        Self::AgentOnly,
     ];
 
     fn label(self) -> &'static str {
@@ -38558,7 +38454,6 @@ impl ProviderListFilter {
             Self::NeedsKey => management_locale_text("Needs key", "缺 Key", "缺 Key"),
             Self::Warning => management_locale_text("Needs attention", "需关注", "需關注"),
             Self::Shared => management_locale_text("Shared", "共享", "共用"),
-            Self::AgentOnly => management_locale_text("One Agent", "仅一个 Agent", "僅一個 Agent"),
         }
     }
 }
@@ -38568,7 +38463,7 @@ impl ProviderSidebarTab {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Providers => management_locale_text("Providers", "供应商", "供應商"),
+            Self::Providers => management_locale_text("Providers", "Provider", "Provider"),
             Self::RouteGroups => management_locale_text("Route groups", "路由组", "路由組"),
         }
     }
@@ -41203,6 +41098,23 @@ fn management_resource_discovery_status_label(
             management_locale_text("Error", "错误", "錯誤")
         }
     }
+}
+
+/// The search field for a toolbar band, sized to the controls beside it.
+///
+/// The standalone [`management_search_input`] stays a size larger because a
+/// sidebar's search field is that column's primary control; inside a toolbar it
+/// has to match the menu buttons it shares the row with.
+fn management_search_input_compact(
+    state: &Entity<InputState>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    Input::new(state)
+        .small()
+        .w_full()
+        .cleanable(true)
+        .prefix(Icon::new(IconName::Search).text_color(cx.theme().muted_foreground))
+        .into_any_element()
 }
 
 fn management_search_input(
@@ -47596,6 +47508,50 @@ mod gateway_surface_tests {
         );
     }
 
+    /// The Provider controls toolbar draws, and its menus keep the list's
+    /// current filter and sort.
+    ///
+    /// The band mixes a search input with two menu buttons; hosting an input
+    /// inside the kit toolbar is the one composition the toolbar's own
+    /// keyboard contract warns about, so a real frame is worth drawing here.
+    #[gpui::test]
+    fn the_provider_controls_toolbar_draws_with_an_input_and_two_menus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_list_filter = ProviderListFilter::NeedsKey;
+                center.provider_sort = ProviderSort::Health;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_list_filter = ProviderListFilter::All;
+                center.provider_sort = ProviderSort::Name;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            cx.update(|_, cx| center.read(cx).provider_list_filter),
+            ProviderListFilter::All,
+            "the filter survives a draw with the toolbar in place"
+        );
+        assert_eq!(
+            cx.update(|_, cx| center.read(cx).provider_sort),
+            ProviderSort::Name,
+            "the sort survives a draw with the toolbar in place"
+        );
+    }
+
     /// A group saved as a model group must have a row and a detail pane.
     ///
     /// New groups open as model groups, so this is the shape a reader sees
@@ -48527,6 +48483,158 @@ mod gateway_surface_tests {
         }
     }
 
+    /// The Providers surface is named the same way in every locale.
+    ///
+    /// The Chinese caption used to be the translated record name while MCP and
+    /// Skill kept their product nouns, so one tab bar read as two vocabularies.
+    #[test]
+    fn the_providers_surface_keeps_its_product_noun_in_every_locale() {
+        let source = include_str!("management.rs");
+        assert!(
+            source.contains("providers: \"Provider\""),
+            "the Chinese Providers caption is the product noun, not a translation"
+        );
+        assert!(
+            !source.contains("providers: \"供应商\"") && !source.contains("providers: \"供應商\""),
+            "the caption must not fall back to the translated record name"
+        );
+    }
+
+    /// A Provider's card names its Agents by logo only.
+    ///
+    /// The names turned each card's footer into a second line of text
+    /// competing with the Provider's own name; the accessible name and tooltip
+    /// still carry them.
+    #[test]
+    fn provider_cards_stack_agent_logos_without_names() {
+        let source = include_str!("management.rs");
+        let stack = source
+            .split_once("let agent_stack = row")
+            .and_then(|(_, tail)| tail.split_once("// The gateway row is always there"))
+            .map(|(body, _)| body)
+            .expect("the Agent stack should remain inspectable");
+        assert!(
+            stack.contains("management-provider-agent-logo-"),
+            "the footer draws one logo per Agent"
+        );
+        assert!(
+            !stack.contains(".child(label)"),
+            "the footer must not draw the Agent name"
+        );
+    }
+
+    /// The gateway row reports its state as a dot plus a word, not a dot glyph
+    /// inside the title and a separate label elsewhere.
+    #[test]
+    fn the_gateway_row_pairs_a_state_dot_with_its_label() {
+        let source = include_str!("management.rs");
+        let row = source
+            .split_once("let gateway_selected = selected.as_deref()")
+            .and_then(|(_, tail)| tail.split_once(".on_click(cx.listener(|this, _, _, cx| {"))
+            .map(|(body, _)| body)
+            .expect("the gateway row should remain inspectable");
+        assert!(
+            row.contains(".rounded_full().bg(gateway_state_color)"),
+            "the state dot is drawn from the theme's state colour"
+        );
+        assert!(
+            row.contains("gateway_state_color") && row.contains(".child(gateway_state)"),
+            "the dot and its description share one trailing mark"
+        );
+        assert!(
+            !row.contains("child(\"●\")"),
+            "the gateway title must not keep a second, unlabelled state glyph"
+        );
+    }
+
+    /// The catalogue refresh is the one management command that needs a Tokio
+    /// reactor, so it must run on the Tokio bridge rather than a GPUI task.
+    ///
+    /// It used to be spawned with `cx.spawn` and await reqwest there, which
+    /// panicked with "there is no reactor running" and took the process down.
+    #[test]
+    fn the_catalogue_refresh_runs_on_the_tokio_bridge() {
+        let source = include_str!("management.rs");
+        let refresh = source
+            .split_once("    fn refresh_catalog(")
+            .and_then(|(_, tail)| tail.split_once("    fn test_shared_provider("))
+            .map(|(body, _)| body)
+            .expect("the catalogue refresh should remain inspectable");
+        assert!(
+            refresh.contains("gpui_tokio::Tokio::spawn(cx, async move {"),
+            "the network await belongs on a Tokio worker"
+        );
+        assert!(
+            refresh.find("gpui_tokio::Tokio::spawn").unwrap()
+                < refresh.find("refresh_model_catalog().await").unwrap(),
+            "the request must be spawned, not awaited on the UI task"
+        );
+    }
+
+    /// One card owns a Provider's Agent list: bound Agents remove, the rest bind.
+    #[test]
+    fn the_provider_overview_has_one_agent_card() {
+        let source = include_str!("management.rs");
+        let overview = source
+            .split_once("if self.provider_detail_tab == ProviderDetailTab::Overview {")
+            .and_then(|(_, tail)| tail.split_once("// Deletion lives at the bottom of the page"))
+            .map(|(body, _)| body)
+            .expect("the Provider overview should remain inspectable");
+        assert_eq!(
+            overview.matches("management_card_with_icon(").count(),
+            1,
+            "the Agent list is one card, not a report plus an offer"
+        );
+        assert!(overview.contains("management-provider-agent-pill-"));
+        assert!(overview.contains("management-provider-unbound-agent-"));
+        assert!(
+            !overview.contains("Use for another Agent"),
+            "the second offer card is gone"
+        );
+    }
+
+    /// Search, filter, and sort share one gpui-component toolbar.
+    ///
+    /// They act on the same list and used to be two stacked chip rows, which
+    /// made the filter and the sort read as separate tools and doubled the
+    /// labels in a narrow column. The toolbar is what gives them one band, one
+    /// keyboard order, and one accessible grouping.
+    #[test]
+    fn the_provider_controls_are_one_mixed_toolbar() {
+        let source = include_str!("management.rs");
+        let controls = source
+            .split_once("    fn render_provider_controls_toolbar(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_native_import_report("))
+            .map(|(body, _)| body)
+            .expect("the Provider controls should remain inspectable");
+        assert!(
+            controls.contains("Toolbar::new(\"management-provider-controls\")"),
+            "the kit toolbar owns the band's layout and keyboard order"
+        );
+        assert!(
+            controls.contains("management-provider-filter")
+                && controls.contains("management-provider-sort"),
+            "both menus stay in the toolbar"
+        );
+        assert!(
+            controls.contains(".checked(filter == active_filter)"),
+            "the filter menu reports the current choice"
+        );
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        assert!(
+            !sidebar.contains("render_provider_filter_row"),
+            "the chip rows are replaced by the toolbar"
+        );
+        assert!(
+            sidebar.contains(".children(provider_controls)"),
+            "the toolbar is what the column renders"
+        );
+    }
+
     #[test]
     fn the_provider_list_can_favorite_filter_and_sort() {
         let source = include_str!("management.rs");
@@ -48536,8 +48644,7 @@ mod gateway_surface_tests {
             "ProviderSort::MostAgents",
             "ProviderSort::Health",
             "ProviderListFilter::Shared",
-            "ProviderListFilter::AgentOnly",
-            "management-provider-sort-",
+            "management-provider-sort",
             "management-provider-favorites.json",
         ] {
             assert!(
