@@ -74,6 +74,7 @@ use gpui_component::{
     marker::{Marker, MarkerIcon},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     message::MessageAlignment,
+    message_scroller::{MessageScroller, MessageScrollerState},
     notification::NotificationType,
     popover::Popover,
     progress::{Progress, ProgressCircle},
@@ -4598,6 +4599,7 @@ fn child_agent_snapshot_from_state(
         loading: state.loading,
         loaded: state.loaded,
         error: state.error.clone(),
+        revision: state.timeline.revision,
         rows,
         turns,
     }
@@ -4613,6 +4615,12 @@ struct ChildAgentTimelineSnapshot {
     loading: bool,
     loaded: bool,
     error: Option<String>,
+    /// The timeline revision the turns were projected from.
+    ///
+    /// The rail remeasures its virtual rows when this moves, so a streamed
+    /// body that grew without changing the turn count is still laid out at its
+    /// new height.
+    revision: u64,
     /// Empty unless the caller asked for rows.
     rows: Rc<Vec<ChildAgentTimelineRowProjection>>,
     /// Empty unless the caller asked for turns; shared with the cache, so a
@@ -9637,7 +9645,17 @@ pub struct VibexWorkbench {
     child_agent_tabs: Vec<VibexSessionId>,
     child_agent_active_tab: Option<VibexSessionId>,
     child_agent_panel_active: bool,
-    child_agent_timeline_scroll: ScrollHandle,
+    /// The scroller state of each child Agent transcript the rail has drawn.
+    ///
+    /// Keyed by child session so a tab switch returns to the place that tab
+    /// was left at. The rail is read-only and has no per-turn anchor table, so
+    /// `MessageScroller` owns its virtualization and scroll position.
+    child_agent_timeline_scrollers: BTreeMap<String, Entity<MessageScrollerState>>,
+    /// The child timeline revision each scroller last laid out.
+    ///
+    /// A revision change with an unchanged row count is a body that grew; the
+    /// rows have to be remeasured or the list keeps the height it saw first.
+    child_agent_timeline_scroller_revisions: BTreeMap<String, u64>,
     child_agent_render_session: Option<VibexSessionId>,
     agent_streaming_surface_visible: Arc<AtomicBool>,
     /// The runtime option catalog, shared rather than owned.
@@ -11158,7 +11176,8 @@ impl VibexWorkbench {
             child_agent_tabs: Vec::new(),
             child_agent_active_tab: None,
             child_agent_panel_active: false,
-            child_agent_timeline_scroll: ScrollHandle::new(),
+            child_agent_timeline_scrollers: BTreeMap::new(),
+            child_agent_timeline_scroller_revisions: BTreeMap::new(),
             child_agent_render_session: None,
             agent_streaming_surface_visible,
             runtime_catalog: None,
@@ -23949,6 +23968,8 @@ impl VibexWorkbench {
     fn clear_child_agent_context(&mut self) {
         self.child_agent_timelines.clear();
         self.child_agent_markdown_states.clear();
+        self.child_agent_timeline_scrollers.clear();
+        self.child_agent_timeline_scroller_revisions.clear();
         self.child_agent_expanded_delegations.clear();
         self.child_agent_tabs.clear();
         self.child_agent_active_tab = None;
@@ -40882,10 +40903,15 @@ impl VibexWorkbench {
             return;
         };
         self.child_agent_tabs.remove(index);
-        // The tab's retained text views go with it: nothing paints those
-        // surfaces again until the child is reopened, and a rail that keeps
-        // every child it ever showed pays for timelines nobody reads.
+        // The tab's retained text views and scroll state go with it: nothing
+        // paints those surfaces again until the child is reopened, and a rail
+        // that keeps every child it ever showed pays for timelines nobody
+        // reads.
         self.child_agent_markdown_states.remove(session_id.as_str());
+        self.child_agent_timeline_scrollers
+            .remove(session_id.as_str());
+        self.child_agent_timeline_scroller_revisions
+            .remove(session_id.as_str());
         if self.child_agent_active_tab.as_ref() == Some(session_id) {
             self.child_agent_active_tab = self
                 .child_agent_tabs
@@ -54471,6 +54497,12 @@ impl VibexWorkbench {
                             }
                         }))
                         .child(
+                            // The transcript keeps the per-turn virtual list
+                            // rather than `MessageScroller`: this list needs
+                            // pixel anchors and reveal inside turns taller than
+                            // the viewport, and the published scroller state
+                            // exposes only row-level navigation. See
+                            // `.trellis/spec/frontend/timeline-scrolling.md`.
                             v_virtual_list(
                                 cx.entity().clone(),
                                 // Element state is keyed by this id, and the
@@ -58194,7 +58226,7 @@ impl VibexWorkbench {
         &mut self,
         session_id: &VibexSessionId,
         snapshot: ChildAgentTimelineSnapshot,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if snapshot.error.is_some() || snapshot.turns.is_empty() {
@@ -58205,24 +58237,119 @@ impl VibexWorkbench {
             let snapshot = self
                 .child_agent_timeline_snapshot(session_id, ChildAgentSnapshotParts::Rows)
                 .unwrap_or(snapshot);
-            return self.render_child_agent_timeline_content(snapshot, &surface_id, false, 0, cx);
+            return div()
+                .w_full()
+                .min_w_0()
+                .p_3()
+                .child(self.render_child_agent_timeline_content(
+                    snapshot,
+                    &surface_id,
+                    false,
+                    0,
+                    cx,
+                ))
+                .into_any_element();
         }
         let turns = snapshot.turns;
         let turn_count = turns.len();
-        let previous = self.child_agent_render_session.replace(session_id.clone());
-        let mut content = v_flex().w_full().min_w_0().gap_0();
-        for (index, turn) in turns.iter().enumerate() {
-            content = content.child(self.render_timeline_turn(
-                turn,
-                index,
-                index == 0,
-                index + 1 == turn_count,
-                window,
-                cx,
-            ));
-        }
-        self.child_agent_render_session = previous;
-        content.into_any_element()
+        let revision = snapshot.revision;
+        let scroller =
+            self.ensure_child_agent_timeline_scroller(session_id, turn_count, revision, cx);
+        let weak = cx.weak_entity();
+        let row_session_id = session_id.clone();
+        let row_turns = turns.clone();
+        MessageScroller::new(
+            format!("child-agent-timeline:{}", session_id.as_str()),
+            scroller,
+            move |index, window, cx| {
+                let turns = row_turns.clone();
+                let session_id = row_session_id.clone();
+                weak.update(cx, |this, cx| {
+                    let Some(turn) = turns.get(index) else {
+                        return div().into_any_element();
+                    };
+                    let previous = this.child_agent_render_session.replace(session_id);
+                    let element = this.render_timeline_turn(
+                        turn,
+                        index,
+                        index == 0,
+                        index + 1 == turns.len(),
+                        window,
+                        cx,
+                    );
+                    this.child_agent_render_session = previous;
+                    element
+                })
+                .unwrap_or_else(|_| div().into_any_element())
+            },
+        )
+        .size_full()
+        .with_list_style(StyleRefinement::default().py_3())
+        .with_row_style(StyleRefinement::default().pb_0())
+        .into_any_element()
+    }
+
+    /// Creates or advances the virtual-list state behind one child Agent tab's
+    /// transcript.
+    ///
+    /// The rail is a live read-only conversation: it opens at the top like the
+    /// plain scroll area it replaces, keeps each tab's place, and lets
+    /// `MessageScroller` own the virtualization, scrollbar and jump-to-latest
+    /// affordance. A growing snapshot appends rows; a shorter one resets and
+    /// returns to the row the reader was on. A revision that changed without a
+    /// row-count change is a streamed body that needs remeasuring.
+    fn ensure_child_agent_timeline_scroller(
+        &mut self,
+        session_id: &VibexSessionId,
+        turn_count: usize,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) -> Entity<MessageScrollerState> {
+        let key = session_id.as_str().to_string();
+        let scroller = self
+            .child_agent_timeline_scrollers
+            .entry(key.clone())
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut state = MessageScrollerState::new(turn_count, cx);
+                    // The rail starts at the top of the conversation, as the
+                    // scroll area did before it was virtualized. Moving the
+                    // logical top also leaves tail following off, so later
+                    // child output does not pull a reader away from history.
+                    let _ = state.scroll_to_item(0, cx);
+                    state
+                })
+            })
+            .clone();
+        let previous_revision = self
+            .child_agent_timeline_scroller_revisions
+            .insert(key, revision);
+        scroller.update(cx, |state, cx| {
+            let current = state.item_count();
+            if current != turn_count {
+                if turn_count > current {
+                    let was_empty = current == 0;
+                    let _ = state.append(turn_count - current, cx);
+                    if was_empty {
+                        // The state was created before the first snapshot
+                        // landed. `new` follows the tail, so the first append
+                        // would otherwise open a live child at its newest row;
+                        // the rail has always opened at the top.
+                        let _ = state.scroll_to_item(0, cx);
+                    }
+                } else {
+                    let top = state
+                        .logical_scroll_top()
+                        .item_ix
+                        .min(turn_count.saturating_sub(1));
+                    state.reset(turn_count, cx);
+                    let _ = state.scroll_to_item(top, cx);
+                }
+            } else if previous_revision.is_some_and(|previous| previous != revision) {
+                state.remeasure(cx);
+            }
+        });
+        scroller
     }
 
     fn render_child_agent_timeline_panel(
@@ -58377,10 +58504,6 @@ impl VibexWorkbench {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .p_3()
-                    .track_scroll(&self.child_agent_timeline_scroll)
-                    .scrollbar(&self.child_agent_timeline_scroll, ScrollbarAxis::Vertical)
                     .child(body),
             )
             .into_any_element()
