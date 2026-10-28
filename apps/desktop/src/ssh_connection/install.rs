@@ -94,9 +94,9 @@ pub fn install_artifact(
     upload.args.extend([
         "sh".into(),
         "-c".into(),
-        "set -eu; umask 077; cat > \"$1\"".into(),
+        shell_quote(UPLOAD_SCRIPT).into(),
         "sh".into(),
-        incoming.clone().into(),
+        shell_quote(&incoming).into(),
     ]);
     upload.stdin = Some(bytes);
     if let Err(error) = upload.run_with_progress(UPLOAD_TIMEOUT, progress) {
@@ -109,9 +109,9 @@ pub fn install_artifact(
         .remote_script(INSTALL_SCRIPT)
         .map_err(|error| InstallError::new("ssh_install_script_invalid", error.to_string()))?;
     install.args.extend([
+        incoming.clone().into(),
         remote_root.into(),
         artifact.version.clone().into(),
-        incoming.clone().into(),
         artifact.sha256.clone().into(),
     ]);
     if let Err(error) = install.run_with_timeout(INSTALL_TIMEOUT) {
@@ -177,6 +177,12 @@ fn cleanup_incoming(command: &SshCommand, incoming: &str) {
     }
 }
 
+const UPLOAD_SCRIPT: &str = r#"set -eu; umask 077; mkdir -p "$(dirname "$1")"; cat > "$1""#;
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn incoming_path(remote_root: &str, version: &str) -> String {
     format!("{remote_root}/.incoming-{version}.tar.gz")
 }
@@ -214,10 +220,16 @@ fn validate_version(version: &str) -> Result<(), InstallError> {
 }
 
 fn map_ssh_failure(failure: SshFailure) -> InstallError {
-    if failure.is_retryable() {
-        InstallError::retryable("ssh_install_failed", failure.message)
+    let retryable = failure.is_retryable();
+    let message = if failure.stderr_tail.is_empty() {
+        failure.message
     } else {
-        InstallError::new("ssh_install_failed", failure.message)
+        format!("{}: {}", failure.message, failure.stderr_tail)
+    };
+    if retryable {
+        InstallError::retryable("ssh_install_failed", message)
+    } else {
+        InstallError::new("ssh_install_failed", message)
     }
 }
 

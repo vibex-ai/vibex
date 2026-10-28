@@ -145,11 +145,13 @@ impl std::error::Error for LaunchError {}
 
 /// Writes the runtime env file with mode 0600.
 pub fn write_env(command: &SshCommand, config: &LaunchConfig) -> Result<(), LaunchError> {
-    let args = config
-        .env_pairs()
-        .into_iter()
-        .map(|(key, value)| format!("{key}={}", shell_quote(&value)))
-        .collect::<Vec<_>>();
+    let mut args = vec![config.env_file.clone()];
+    args.extend(
+        config
+            .env_pairs()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", shell_quote(&value))),
+    );
     run_script(command, ENV_SCRIPT, &args, ENV_TIMEOUT).map(|_| ())
 }
 
@@ -187,10 +189,16 @@ pub(crate) fn run_script(
 }
 
 pub(crate) fn map_ssh_failure(failure: SshFailure) -> LaunchError {
-    if failure.is_retryable() {
-        LaunchError::retryable("ssh_launch_failed", failure.message)
+    let retryable = failure.is_retryable();
+    let message = if failure.stderr_tail.is_empty() {
+        failure.message
     } else {
-        LaunchError::new("ssh_launch_failed", failure.message)
+        format!("{}: {}", failure.message, failure.stderr_tail)
+    };
+    if retryable {
+        LaunchError::retryable("ssh_launch_failed", message)
+    } else {
+        LaunchError::new("ssh_launch_failed", message)
     }
 }
 
@@ -202,6 +210,7 @@ pub const ENV_SCRIPT: &str = r#"set -eu
 file=$1
 shift
 umask 077
+mkdir -p "$(dirname "$file")"
 : > "$file"
 chmod 600 "$file"
 printf '%s\n' "$@" > "$file"
@@ -406,6 +415,36 @@ mod tests {
             parse_start_output("noise\n").unwrap_err().code,
             "ssh_launch_unexpected"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_env_passes_the_file_path_as_the_first_script_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("args.txt");
+        let ssh = dir.path().join("fake-ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat >/dev/null\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = SshCommand::new(&ssh);
+        let config = config(8765);
+        write_env(&command, &config).unwrap();
+        let args = fs::read_to_string(&capture).unwrap();
+        let lines = args.lines().collect::<Vec<_>>();
+        assert!(
+            lines
+                .windows(2)
+                .any(|pair| pair == ["-s", config.env_file.as_str()]),
+            "env file must follow sh -s: {args}"
+        );
+        assert!(args.contains("VIBEX_HOME='"));
     }
 
     #[cfg(unix)]
