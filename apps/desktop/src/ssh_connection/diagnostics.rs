@@ -92,17 +92,34 @@ pub fn diagnose(
     host_alias: Option<&str>,
     log_path: Option<&str>,
 ) -> SshDiagnostic {
-    let kind = classify(code);
+    diagnose_with_platform(code, message, stderr_tail, host_alias, log_path, None)
+}
+
+/// Like [`diagnose`], but uses a known remote OS to disambiguate a refused
+/// connection. On macOS a closed port usually means Remote Login is off, while
+/// on Linux it usually means sshd is not installed/running.
+pub fn diagnose_with_platform(
+    code: &str,
+    message: &str,
+    stderr_tail: &str,
+    host_alias: Option<&str>,
+    log_path: Option<&str>,
+    remote_os: Option<&str>,
+) -> SshDiagnostic {
+    let kind = classify_with_platform(code, remote_os);
     let host_key_fingerprints = fingerprints(stderr_tail);
     let mut actions = match kind {
         SshDiagnosticKind::MissingClient => vec![
             SshDiagnosticAction::InstallClient,
             SshDiagnosticAction::CopyDiagnostics,
         ],
-        SshDiagnosticKind::MissingSshd
-        | SshDiagnosticKind::ConnectionRefused
-        | SshDiagnosticKind::RemoteLoginDisabled => vec![
+        SshDiagnosticKind::MissingSshd | SshDiagnosticKind::ConnectionRefused => vec![
             SshDiagnosticAction::BootstrapSshd,
+            SshDiagnosticAction::Retry,
+            SshDiagnosticAction::CopyDiagnostics,
+        ],
+        SshDiagnosticKind::RemoteLoginDisabled => vec![
+            SshDiagnosticAction::EnableRemoteLogin,
             SshDiagnosticAction::Retry,
             SshDiagnosticAction::CopyDiagnostics,
         ],
@@ -191,6 +208,20 @@ pub fn diagnose(
         diagnostics,
         log_command,
     }
+}
+
+pub fn classify_with_platform(code: &str, remote_os: Option<&str>) -> SshDiagnosticKind {
+    if code == "ssh_connection_refused" && remote_os.is_some_and(is_macos) {
+        return SshDiagnosticKind::RemoteLoginDisabled;
+    }
+    classify(code)
+}
+
+fn is_macos(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "macos" | "mac" | "osx" | "darwin"
+    )
 }
 
 pub fn classify(code: &str) -> SshDiagnosticKind {
@@ -329,6 +360,34 @@ New key fingerprint is SHA256:newNewNewNewNew.\n";
         assert_eq!(card.kind, SshDiagnosticKind::MissingSshd);
         assert!(card.actions.contains(&SshDiagnosticAction::BootstrapSshd));
         assert!(card.actions.contains(&SshDiagnosticAction::Retry));
+    }
+
+    #[test]
+    fn a_known_macos_host_classifies_a_refused_connection_as_remote_login() {
+        let card = diagnose_with_platform(
+            "ssh_connection_refused",
+            "refused",
+            "",
+            Some("mac-mini"),
+            None,
+            Some("macOS"),
+        );
+        assert_eq!(card.kind, SshDiagnosticKind::RemoteLoginDisabled);
+        assert!(
+            card.actions
+                .contains(&SshDiagnosticAction::EnableRemoteLogin)
+        );
+        assert!(!card.actions.contains(&SshDiagnosticAction::BootstrapSshd));
+
+        let linux = diagnose_with_platform(
+            "ssh_connection_refused",
+            "refused",
+            "",
+            Some("build-box"),
+            None,
+            Some("linux"),
+        );
+        assert_eq!(linux.kind, SshDiagnosticKind::MissingSshd);
     }
 
     #[test]

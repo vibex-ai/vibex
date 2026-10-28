@@ -83141,6 +83141,7 @@ impl FoundationSettings {
                 proxy_jump: effective.proxy_jump,
                 remote_install_root,
                 remote_home: environment.home.clone(),
+                remote_os: Some(environment.os.clone()),
                 workspace_roots: vec![environment.home.clone()],
                 remote_port,
                 local_tunnel_port,
@@ -83512,12 +83513,13 @@ impl FoundationSettings {
         });
         let diagnostic =
             if let Some(failure) = snapshot.and_then(|snapshot| snapshot.failure.as_ref()) {
-                Some(crate::ssh_connection::diagnostics::diagnose(
+                Some(crate::ssh_connection::diagnostics::diagnose_with_platform(
                     &failure.code,
                     &failure.message,
                     &failure.log_tail,
                     host_alias,
                     log_path.as_deref(),
+                    profile.and_then(|profile| profile.remote_os.as_deref()),
                 ))
             } else {
                 error.map(|error| {
@@ -83525,12 +83527,13 @@ impl FoundationSettings {
                         .split_once(':')
                         .map(|(code, message)| (code.trim(), message.trim()))
                         .unwrap_or(("ssh_unknown", error));
-                    crate::ssh_connection::diagnostics::diagnose(
+                    crate::ssh_connection::diagnostics::diagnose_with_platform(
                         code,
                         message,
                         "",
                         host_alias,
                         log_path.as_deref(),
+                        profile.and_then(|profile| profile.remote_os.as_deref()),
                     )
                 })
             };
@@ -107559,6 +107562,8 @@ mod tests {
         assert!(source.contains("connections-diagnostic-copy"));
         assert!(source.contains("connections-diagnostic-log-command"));
         assert!(source.contains("connection_diagnostic_title"));
+        assert!(source.contains("remote_os"));
+        assert!(source.contains("diagnose_with_platform"));
     }
 
     #[test]

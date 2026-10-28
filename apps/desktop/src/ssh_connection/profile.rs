@@ -58,6 +58,9 @@ pub struct SshConnectionProfile {
     pub proxy_jump: Option<String>,
     pub remote_install_root: String,
     pub remote_home: String,
+    /// OS reported by the environment probe when known (linux/macos/...).
+    #[serde(default)]
+    pub remote_os: Option<String>,
     pub workspace_roots: Vec<String>,
     pub remote_port: u16,
     pub local_tunnel_port: u16,
@@ -113,6 +116,9 @@ impl SshConnectionProfile {
         }
         validate_remote_path("remoteInstallRoot", &self.remote_install_root)?;
         validate_remote_path("remoteHome", &self.remote_home)?;
+        if let Some(remote_os) = &self.remote_os {
+            validate_text("remoteOs", remote_os, 32)?;
+        }
         if self.workspace_roots.len() > MAX_WORKSPACE_ROOTS {
             return Err(invalid(
                 "workspaceRoots",
@@ -565,6 +571,7 @@ mod tests {
             proxy_jump: Some("bastion.example.com".to_string()),
             remote_install_root: "~/.local/share/vibex".to_string(),
             remote_home: "~/.local/share/vibex/server/home".to_string(),
+            remote_os: None,
             workspace_roots: vec!["$HOME".to_string(), "/srv/src".to_string()],
             remote_port: 8765,
             local_tunnel_port: 18765,
