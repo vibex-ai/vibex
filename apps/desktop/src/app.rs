@@ -9184,6 +9184,10 @@ pub struct VibexWorkbench {
     ssh_provisioning_error: Option<String>,
     #[allow(dead_code)]
     ssh_tunnel: Option<TunnelProcess>,
+    ssh_tunnel_spec: Option<TunnelSpec>,
+    ssh_tunnel_generation: u64,
+    #[allow(dead_code)]
+    ssh_tunnel_task: Option<Task<()>>,
     /// Every runtime this desktop can drive, plus the id of the active one.
     /// Client-side state, so it stays readable while another authority is
     /// displayed — that is what makes switching non-destructive.
@@ -10981,6 +10985,9 @@ impl VibexWorkbench {
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
             ssh_tunnel: None,
+            ssh_tunnel_spec: None,
+            ssh_tunnel_generation: 0,
+            ssh_tunnel_task: None,
             runtime_registry,
             runtime_registry_store,
             runtime_manager_open: false,
@@ -14223,7 +14230,12 @@ impl VibexWorkbench {
                     .runtime_status()
                     .map(|status| status.version.clone());
                 let profile_id = snapshot.profile_id.clone();
-                self.ssh_tunnel = effects.take_tunnel_process();
+                let tunnel_spec = self.ssh_tunnel_spec_for_profile(&profile_id);
+                let tunnel = effects.take_tunnel_process();
+                match (tunnel, tunnel_spec) {
+                    (Some(tunnel), Some(spec)) => self.adopt_ssh_tunnel(tunnel, spec, cx),
+                    (tunnel, _) => self.ssh_tunnel = tunnel,
+                }
                 self.ssh_provisioning_snapshot = Some(snapshot);
                 self.install_remote_client(
                     DesktopRemoteClient {
@@ -14360,6 +14372,115 @@ impl VibexWorkbench {
             .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
     }
 
+    fn ssh_tunnel_spec_for_profile(&self, profile_id: &str) -> Option<TunnelSpec> {
+        let config = self.config.as_ref()?;
+        let profile = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .ok()?
+            .into_iter()
+            .find(|profile| profile.id == profile_id)?;
+        let program = profile
+            .ssh_client_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ssh"));
+        let destination = SshDestination {
+            host: profile.host.clone(),
+            user: profile.user.clone(),
+            port: profile.port,
+        };
+        let command =
+            SshCommand::for_destination(program, &destination, profile.ssh_config_path.as_deref())
+                .ok()?;
+        TunnelSpec::new(
+            command.program,
+            destination,
+            profile.ssh_config_path.clone(),
+            profile.local_tunnel_port,
+            profile.remote_port,
+        )
+        .ok()
+    }
+
+    /// Adopts a tunnel and watches it for exit. A dead tunnel is rebuilt once
+    /// with the same loopback port; if that fails, the error is surfaced for a
+    /// manual runtime switch.
+    fn adopt_ssh_tunnel(
+        &mut self,
+        tunnel: TunnelProcess,
+        spec: TunnelSpec,
+        cx: &mut Context<Self>,
+    ) {
+        self.ssh_tunnel = Some(tunnel);
+        self.ssh_tunnel_spec = Some(spec);
+        self.ssh_tunnel_generation = self.ssh_tunnel_generation.wrapping_add(1);
+        let generation = self.ssh_tunnel_generation;
+        let task = cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    let exited = entity.update(cx, |this, _| {
+                        if this.ssh_tunnel_generation != generation {
+                            return None;
+                        }
+                        Some(
+                            this.ssh_tunnel
+                                .as_mut()
+                                .is_none_or(|tunnel| tunnel.try_wait().ok().flatten().is_some()),
+                        )
+                    });
+                    match exited {
+                        Ok(Some(false)) => continue,
+                        Ok(Some(true)) => {
+                            let restarted = entity.update(cx, |this, cx| {
+                                if this.ssh_tunnel_generation != generation {
+                                    return None;
+                                }
+                                let Some(spec) = this.ssh_tunnel_spec.clone() else {
+                                    return Some(false);
+                                };
+                                match TunnelProcess::spawn(&spec) {
+                                    Ok(tunnel) => {
+                                        this.ssh_tunnel = Some(tunnel);
+                                        this.runtime_note = Some(
+                                            locale::text(
+                                                "SSH tunnel restarted",
+                                                "SSH 隧道已重启",
+                                                "SSH 通道已重新啟動",
+                                            )
+                                            .to_string(),
+                                        );
+                                        cx.notify();
+                                        Some(true)
+                                    }
+                                    Err(error) => {
+                                        let message = format!("{}: {}", error.code, error.message);
+                                        let active =
+                                            this.runtime_registry.active_runtime_id().to_string();
+                                        if active != LOCAL_RUNTIME_ID {
+                                            this.runtime_connect_errors
+                                                .insert(active, message.clone());
+                                        }
+                                        this.runtime_note = Some(message);
+                                        cx.notify();
+                                        Some(false)
+                                    }
+                                }
+                            });
+                            match restarted {
+                                Ok(Some(true)) => continue,
+                                _ => break,
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            },
+        );
+        self.ssh_tunnel_task = Some(task);
+    }
+
     /// Restores the SSH tunnel and remote runtime before booting the client.
     /// The pairing credential points at the loopback tunnel, so a stale or
     /// missing tunnel must be rebuilt first.
@@ -14447,10 +14568,12 @@ impl VibexWorkbench {
             )
             .to_string(),
         );
+        let spawn_spec = spec.clone();
+        let monitor_spec = spec;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             supervisor::ensure_started(&command, &launch)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let tunnel = TunnelProcess::spawn(&spec)
+            let tunnel = TunnelProcess::spawn(&spawn_spec)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             tokio::time::sleep(Duration::from_millis(250)).await;
             Ok::<TunnelProcess, String>(tunnel)
@@ -14462,7 +14585,7 @@ impl VibexWorkbench {
                     match outcome {
                         Ok(Ok(tunnel)) => {
                             this.runtime_switch_pending = None;
-                            this.ssh_tunnel = Some(tunnel);
+                            this.adopt_ssh_tunnel(tunnel, monitor_spec, cx);
                             this.begin_remote_connect(runtime, origin, cx);
                         }
                         Ok(Err(error)) => {
@@ -106273,6 +106396,9 @@ mod tests {
         assert!(source.contains("fn ssh_profile_for_runtime("));
         assert!(source.contains("supervisor::ensure_started"));
         assert!(source.contains("TunnelProcess::spawn"));
+        assert!(source.contains("fn adopt_ssh_tunnel("));
+        assert!(source.contains("ssh_tunnel_generation"));
+        assert!(source.contains("SSH tunnel restarted"));
     }
 
     #[test]
