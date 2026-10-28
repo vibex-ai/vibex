@@ -23,12 +23,24 @@ use gpui_base::text::{
     InlineElement, InlineRenderContext, MarkdownNode, MarkdownParseContext, MarkdownPlugin,
     markdown_ast::Node as MarkdownAst,
 };
-use gpui_component::{ActiveTheme as _, tooltip::Tooltip};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName,
+    menu::{ContextMenuExt as _, PopupMenuItem},
+    tooltip::Tooltip,
+};
 use percent_encoding::percent_decode_str;
 
 /// Opens a workspace image in the full-window preview.
 pub(super) type SessionImageOpen =
     Arc<dyn Fn(PathBuf, String, &mut Window, &mut App) + Send + Sync>;
+
+/// Opens the session's Files rail with the image selected.
+///
+/// The path is workspace-relative, which is what the rail's tree addresses:
+/// the plugin resolves it once, in the same place that decided the
+/// destination named a file in this workspace, so a `file://` URL, a percent
+/// escape and a root-relative path all reveal the same file.
+pub(super) type SessionImageReveal = Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>;
 
 const NAME: &str = "vibex-session-image";
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
@@ -81,6 +93,7 @@ pub(super) struct SessionImagePlugin {
     /// it. Render-time only: a pane resize must not reparse the document.
     available_width: f32,
     open: SessionImageOpen,
+    reveal: SessionImageReveal,
     parser_revision: u64,
 }
 
@@ -89,6 +102,7 @@ impl SessionImagePlugin {
         workspace_root: PathBuf,
         available_width: f32,
         open: SessionImageOpen,
+        reveal: SessionImageReveal,
     ) -> Self {
         let parser_revision = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -100,6 +114,7 @@ impl SessionImagePlugin {
             canonical_root: OnceLock::new(),
             available_width,
             open,
+            reveal,
             parser_revision,
         }
     }
@@ -187,6 +202,21 @@ impl SessionImagePlugin {
         super::attachment_preview_image_format(&canonical, None)?;
         Some(canonical)
     }
+
+    /// The Files-tree address of an image this plugin resolved.
+    ///
+    /// [`Self::resolve`] hands back a canonical absolute path so the preview can
+    /// open the file no matter what the Markdown wrote; the right rail indexes
+    /// the workspace instead. A path outside the root has no row to select, so
+    /// it has no address.
+    fn workspace_relative_path(&self, path: &Path) -> Option<String> {
+        let root = self
+            .canonical_root
+            .get_or_init(|| self.workspace_root.canonicalize().ok());
+        let relative = path.strip_prefix(root.as_deref()?).ok()?;
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        (!relative.is_empty()).then_some(relative)
+    }
 }
 
 impl MarkdownPlugin for SessionImagePlugin {
@@ -234,6 +264,7 @@ impl MarkdownPlugin for SessionImagePlugin {
         let source_path: Arc<Path> = Arc::from(image.path.clone().into_boxed_path());
         let source = ImageSource::Resource(Resource::Path(source_path));
         let open = self.open.clone();
+        let reveal = self.reveal.clone();
         let path = image.path.clone();
         let label = image.label.clone();
         let theme = cx.theme();
@@ -252,6 +283,12 @@ impl MarkdownPlugin for SessionImagePlugin {
             crate::locale::text("Preview image", "预览图片", "預覽圖片")
         );
         let tooltip_label = action_label.clone();
+        // A file outside the workspace has no row in its tree, so the menu
+        // shows the preview alone rather than an action that cannot resolve.
+        let reveal_address = self.workspace_relative_path(&image.path);
+        let menu_open = open.clone();
+        let menu_label = label.clone();
+        let menu_path = path.clone();
         let element = div()
             .id(ElementId::Name(id))
             .debug_selector(|| "vibex-session-image".to_string())
@@ -291,6 +328,43 @@ impl MarkdownPlugin for SessionImagePlugin {
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 open(path.clone(), label.clone(), window, cx);
+            })
+            // The press belongs to the card's own menu. `ContextMenu` claims
+            // the right button on this element; a handler here would run
+            // first and take the press away from it, so the card registers
+            // none. Selection needs none either: the window layer only anchors
+            // on the left button.
+            .context_menu(move |menu, _, _| {
+                let open = menu_open.clone();
+                let open_path = menu_path.clone();
+                let open_label = menu_label.clone();
+                let reveal = reveal.clone();
+                let reveal_path = reveal_address.clone();
+                let menu = menu.item(
+                    PopupMenuItem::new(crate::locale::text(
+                        "Preview image",
+                        "预览图片",
+                        "預覽圖片",
+                    ))
+                    .icon(Icon::new(IconName::Eye))
+                    .on_click(move |_, window, cx| {
+                        (open)(open_path.clone(), open_label.clone(), window, cx);
+                    }),
+                );
+                match reveal_path {
+                    Some(reveal_path) => menu.item(
+                        PopupMenuItem::new(crate::locale::text(
+                            "Reveal in Files",
+                            "定位文件",
+                            "定位檔案",
+                        ))
+                        .icon(Icon::default().path("icons/vibex/files.svg"))
+                        .on_click(move |_, window, cx| {
+                            (reveal)(reveal_path.clone(), window, cx);
+                        }),
+                    ),
+                    None => menu,
+                }
             })
             .child(
                 // `ScaleDown` keeps a small mark crisp at its own size rather
@@ -385,10 +459,40 @@ fn intrinsic_image_size(path: &Path) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use gpui_base::text::MarkdownExtensions;
-    use std::fs;
+    use std::{fs, sync::Mutex};
 
     fn plugin(root: &Path) -> SessionImagePlugin {
-        SessionImagePlugin::new(root.to_path_buf(), 720.0, Arc::new(|_, _, _, _| {}))
+        SessionImagePlugin::new(
+            root.to_path_buf(),
+            720.0,
+            Arc::new(|_, _, _, _| {}),
+            Arc::new(|_, _, _| {}),
+        )
+    }
+
+    /// A plugin whose menu actions record what they were handed.
+    ///
+    /// The two closures are the card's menu: a structural test can assert the
+    /// items exist, but only running one shows that the path the reader sees
+    /// selected is the file the transcript pointed at.
+    fn recording_plugin(root: &Path) -> (SessionImagePlugin, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let opened = calls.clone();
+        let revealed = calls.clone();
+        let plugin = SessionImagePlugin::new(
+            root.to_path_buf(),
+            720.0,
+            Arc::new(move |path, _, _, _| {
+                opened
+                    .lock()
+                    .unwrap()
+                    .push(format!("open:{}", path.display()));
+            }),
+            Arc::new(move |path, _, _| {
+                revealed.lock().unwrap().push(format!("reveal:{path}"));
+            }),
+        );
+        (plugin, calls)
     }
 
     fn write_image(root: &Path, relative: &str) -> PathBuf {
@@ -482,6 +586,56 @@ mod tests {
         );
         let url = url::Url::from_file_path(&image).unwrap();
         assert_eq!(plugin.resolve(url.as_str()), Some(image));
+    }
+
+    /// The reveal address is the row the Files tree can select.
+    ///
+    /// The preview opens the canonical absolute path, but the rail indexes the
+    /// workspace, so the card must hand it the relative form. Whatever
+    /// destination the Markdown wrote, the address is the same one, and a file
+    /// the workspace does not contain has none.
+    #[test]
+    fn reveal_addresses_the_workspace_relative_form_of_the_resolved_image() {
+        let root = tempfile::tempdir().unwrap();
+        let image = write_image(root.path(), "docs/assets/shot.png");
+        let plugin = plugin(root.path());
+
+        let absolute = plugin
+            .resolve("docs/assets/shot.png")
+            .expect("the workspace image resolves");
+        assert_eq!(
+            plugin.workspace_relative_path(&absolute).as_deref(),
+            Some("docs/assets/shot.png")
+        );
+        // The other spellings of the same destination reach the same row.
+        let root_relative = plugin
+            .resolve("/docs/assets/shot.png")
+            .expect("a root-relative destination resolves");
+        assert_eq!(
+            plugin.workspace_relative_path(&root_relative).as_deref(),
+            Some("docs/assets/shot.png")
+        );
+        let url = url::Url::from_file_path(canonical(&image)).unwrap();
+        let file_url = plugin
+            .resolve(url.as_str())
+            .expect("a file URL inside the workspace resolves");
+        assert_eq!(
+            plugin.workspace_relative_path(&file_url).as_deref(),
+            Some("docs/assets/shot.png")
+        );
+
+        // A picture the workspace does not hold has no row to select.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_image = write_image(outside.path(), "elsewhere.png");
+        assert_eq!(
+            plugin.workspace_relative_path(&canonical(&outside_image)),
+            None
+        );
+        // The workspace root itself is not a file row either.
+        assert_eq!(
+            plugin.workspace_relative_path(&canonical(root.path())),
+            None
+        );
     }
 
     #[test]
@@ -611,6 +765,7 @@ mod tests {
             Arc::new(move |_, _, _, _| {
                 clicked_flag.store(true, Ordering::SeqCst);
             }),
+            Arc::new(|_, _, _| {}),
         );
         let extensions = MarkdownExtensions::default()
             .plugin(plugin)
@@ -687,8 +842,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bytes = STANDARD.decode(ONE_PIXEL_PNG).unwrap();
         fs::write(root.path().join("shot.png"), bytes).unwrap();
-        let plugin =
-            SessionImagePlugin::new(root.path().to_path_buf(), 720.0, Arc::new(|_, _, _, _| {}));
+        let plugin = SessionImagePlugin::new(
+            root.path().to_path_buf(),
+            720.0,
+            Arc::new(|_, _, _, _| {}),
+            Arc::new(|_, _, _| {}),
+        );
         let extensions = MarkdownExtensions::default()
             .plugin(plugin)
             .parser_revision(1);
@@ -740,6 +899,112 @@ mod tests {
         assert_eq!(
             selected, "",
             "opening a thumbnail must not select the transcript behind it",
+        );
+    }
+
+    /// A thumbnail's right-click menu offers the preview and the reveal.
+    ///
+    /// Both are the actions the card already answers with its left click and
+    /// its neighbours in the rail, so the menu is where a reader looks for them
+    /// without leaving the figure. The reveal is handed the workspace-relative
+    /// address, because that is what the Files tree selects rows by.
+    #[gpui::test]
+    fn a_thumbnail_right_click_offers_the_preview_and_the_reveal(cx: &mut gpui::TestAppContext) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use gpui::{
+            AppContext as _, Context, Entity, IntoElement, Modifiers, MouseButton, Render, Window,
+        };
+
+        use crate::markdown::{TextView, TextViewState};
+
+        struct Host {
+            state: Entity<TextViewState>,
+            extensions: MarkdownExtensions,
+        }
+
+        impl Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                TextView::new(&self.state)
+                    .markdown_extensions(self.extensions.clone())
+                    .text_sm()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let bytes = STANDARD.decode(ONE_PIXEL_PNG).unwrap();
+        fs::create_dir_all(root.path().join("docs/assets")).unwrap();
+        fs::write(root.path().join("docs/assets/shot.png"), bytes).unwrap();
+        let (plugin, calls) = recording_plugin(root.path());
+        let extensions = MarkdownExtensions::default()
+            .plugin(plugin)
+            .parser_revision(1);
+        let source = "![the figure](docs/assets/shot.png)";
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(source, cx)));
+        let state_for_host = state.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| Host {
+            state: state_for_host,
+            extensions,
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+        cx.run_until_parked();
+        let card = cx
+            .debug_bounds("vibex-session-image")
+            .expect("the local image should be claimed by the session plugin")
+            .center();
+
+        cx.simulate_mouse_down(card, MouseButton::Right, Modifiers::none());
+        for _ in 0..6 {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+        cx.run_until_parked();
+
+        // "Preview image" leads the menu, so one Down and Enter confirms it
+        // through the same path a click takes.
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|call| call.starts_with("open:") && call.ends_with("shot.png")),
+            "the menu's preview item should open the picture, got {recorded:?}",
+        );
+
+        // "Reveal in Files" follows it, and the address it reveals is the
+        // workspace-relative one the Files tree selects rows by — not the
+        // canonical absolute path the preview opens.
+        cx.simulate_mouse_down(card, MouseButton::Right, Modifiers::none());
+        for _ in 0..6 {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down down enter");
+        cx.run_until_parked();
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|call| call == "reveal:docs/assets/shot.png"),
+            "the reveal item should hand the rail a workspace-relative path, got {recorded:?}",
         );
     }
 }

@@ -7316,7 +7316,11 @@ impl CodeWorkbench {
     /// A nested file only becomes selectable once every directory above it is
     /// expanded and loaded, so the request is parked and walked down the chain
     /// the same way the file-search reveal does.
-    fn reveal_file_in_right_rail(&mut self, path: String, cx: &mut Context<Self>) {
+    ///
+    /// The reveal runs here rather than on a copy of the tree at the call site:
+    /// only this entity holds the loaded tree and the directory chain a nested
+    /// path needs opened before it can be selected.
+    pub(crate) fn reveal_file_in_right_rail(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(path) = normalized_relative_path(&path) else {
             return;
         };

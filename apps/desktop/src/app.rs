@@ -31738,16 +31738,53 @@ impl VibexWorkbench {
         if workspace_root.is_empty() {
             return None;
         }
+        let reveal_entity = entity.clone();
         let open: session_images::SessionImageOpen = Arc::new(move |path, label, window, cx| {
             let _ = entity.update(cx, |this, cx| {
                 this.open_session_image_preview(path, label, window, cx);
             });
         });
+        let reveal: session_images::SessionImageReveal =
+            Arc::new(move |relative_path, window, cx| {
+                let _ = reveal_entity.update(cx, |this, cx| {
+                    this.reveal_session_image_in_files(&relative_path, window, cx);
+                });
+            });
         Some(session_images::SessionImagePlugin::new(
             PathBuf::from(workspace_root),
             self.estimated_timeline_content_width(),
             open,
+            reveal,
         ))
+    }
+
+    /// Opens the right rail's Files tree on a transcript image and selects it.
+    ///
+    /// The rail is the workbench's own surface, so the reveal runs on the
+    /// workbench entity rather than on a copy of its state here: only it owns
+    /// the loaded tree and the chain of directories a nested path needs opened
+    /// before the file can be selected.
+    fn reveal_session_image_in_files(
+        &mut self,
+        relative_path: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The tree can only select a row it has, and it only has rows for a
+        // workspace whose files are on this machine.
+        let Some(workspace_root) = self
+            .view_session()
+            .map(|session| PathBuf::from(session.workspace_root.trim()))
+        else {
+            return;
+        };
+        if !workspace_root.is_dir() {
+            return;
+        }
+        self.reveal_file_in_right_rail(cx);
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.reveal_file_in_right_rail(relative_path.to_string(), cx);
+        });
     }
 
     fn toggle_attachment_editor(&mut self, cx: &mut Context<Self>) {
