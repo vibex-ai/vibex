@@ -13962,6 +13962,23 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn cancel_ssh_provisioning(&mut self, cx: &mut Context<Self>) {
+        let Some(service) = self.ssh_provisioning.as_ref() else {
+            return;
+        };
+        service.cancel();
+        self.ssh_provisioning_error = Some(
+            locale::text(
+                "Cancelling SSH provisioning…",
+                "正在取消 SSH 配置…",
+                "正在取消 SSH 設定…",
+            )
+            .to_string(),
+        );
+        self.sync_ssh_provisioning_settings(cx);
+        cx.notify();
+    }
+
     /// Loads a saved profile, resolves the server artifact, downloads it, and
     /// starts the provisioning worker. The add flow calls this after saving a
     /// probed profile.
@@ -82165,7 +82182,7 @@ impl FoundationSettings {
         if self.connections_snapshot.is_some() || self.connections_error.is_some() {
             groups.push(SettingsGroup::new(
                 locale::text("Provisioning", "配置进度", "設定進度"),
-                vec![Self::connections_progress_panel(
+                vec![self.connections_progress_panel(
                     self.connections_snapshot.as_ref(),
                     self.connections_error.as_deref(),
                     cx,
@@ -82290,9 +82307,10 @@ impl FoundationSettings {
     }
 
     fn connections_progress_panel(
+        &self,
         snapshot: Option<&ProvisioningSnapshot>,
         error: Option<&str>,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_dark = cx.theme().is_dark();
         let muted = theme::semantic_color("muted-foreground", is_dark);
@@ -82318,6 +82336,53 @@ impl FoundationSettings {
         let detail = snapshot
             .and_then(|snapshot| snapshot.detail.clone())
             .or_else(|| error.map(str::to_string));
+        let mut actions = Vec::new();
+        if let Some(snapshot) = snapshot {
+            let workbench = self.workbench.clone();
+            match snapshot.status {
+                ProvisioningStatus::Running
+                | ProvisioningStatus::Cancelling
+                | ProvisioningStatus::Pending => {
+                    let cancel_workbench = workbench.clone();
+                    actions.push(
+                        Button::new("connections-provisioning-cancel")
+                            .small()
+                            .outline()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                let workbench = cancel_workbench.clone();
+                                cx.defer(move |cx| {
+                                    let _ = workbench.update(cx, |workbench, cx| {
+                                        workbench.cancel_ssh_provisioning(cx)
+                                    });
+                                });
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                ProvisioningStatus::Failed | ProvisioningStatus::Cancelled => {
+                    let profile_id = snapshot.profile_id.clone();
+                    let retry_workbench = workbench.clone();
+                    actions.push(
+                        Button::new("connections-provisioning-retry")
+                            .small()
+                            .outline()
+                            .label(locale::text("Retry", "重试", "重試"))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                let workbench = retry_workbench.clone();
+                                let profile_id = profile_id.clone();
+                                cx.defer(move |cx| {
+                                    let _ = workbench.update(cx, |workbench, cx| {
+                                        workbench.start_ssh_profile_provisioning(profile_id, cx)
+                                    });
+                                });
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                ProvisioningStatus::Ready => {}
+            }
+        }
         v_flex()
             .w_full()
             .min_w_0()
@@ -82368,6 +82433,9 @@ impl FoundationSettings {
                         .text_color(if error.is_some() { danger } else { muted })
                         .child(detail),
                 )
+            })
+            .when(!actions.is_empty(), |this| {
+                this.child(h_flex().w_full().justify_end().gap_2().children(actions))
             })
             .into_any_element()
     }
@@ -106050,6 +106118,9 @@ mod tests {
         assert!(source.contains("start_ssh_profile_provisioning"));
         assert!(source.contains("latest_verified_manifest"));
         assert!(source.contains("download_server_artifact"));
+        assert!(source.contains("cancel_ssh_provisioning"));
+        assert!(source.contains("connections-provisioning-cancel"));
+        assert!(source.contains("connections-provisioning-retry"));
         let id = connections_profile_id("dev@host.example", 42);
         assert!(id.len() <= 64);
         assert!(id.chars().all(|character| {
