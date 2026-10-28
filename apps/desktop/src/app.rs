@@ -14345,7 +14345,7 @@ impl VibexWorkbench {
     /// without an authority.
     fn begin_active_remote_start(&mut self, runtime: RegisteredRuntime, cx: &mut Context<Self>) {
         if let Some(profile) = self.ssh_profile_for_runtime(&runtime.id) {
-            self.begin_ssh_remote_boot(runtime, profile, cx);
+            self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Boot, cx);
         } else {
             self.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
         }
@@ -14363,10 +14363,11 @@ impl VibexWorkbench {
     /// Restores the SSH tunnel and remote runtime before booting the client.
     /// The pairing credential points at the loopback tunnel, so a stale or
     /// missing tunnel must be rebuilt first.
-    fn begin_ssh_remote_boot(
+    fn begin_ssh_restore(
         &mut self,
         runtime: RegisteredRuntime,
         profile: SshConnectionProfile,
+        origin: RuntimeConnectOrigin,
         cx: &mut Context<Self>,
     ) {
         if self.runtime_switch_pending.is_some() {
@@ -14391,7 +14392,7 @@ impl VibexWorkbench {
                             "ssh_boot_command_invalid",
                             format!("{}: {}", error.code, error.message),
                         ),
-                        RuntimeConnectOrigin::Boot,
+                        origin,
                         cx,
                     );
                     return;
@@ -14410,7 +14411,7 @@ impl VibexWorkbench {
                         "ssh_boot_launch_invalid",
                         format!("{}: {}", error.code, error.message),
                     ),
-                    RuntimeConnectOrigin::Boot,
+                    origin,
                     cx,
                 );
                 return;
@@ -14430,7 +14431,7 @@ impl VibexWorkbench {
                         "ssh_boot_tunnel_invalid",
                         format!("{}: {}", error.code, error.message),
                     ),
-                    RuntimeConnectOrigin::Boot,
+                    origin,
                     cx,
                 );
                 return;
@@ -14462,12 +14463,12 @@ impl VibexWorkbench {
                         Ok(Ok(tunnel)) => {
                             this.runtime_switch_pending = None;
                             this.ssh_tunnel = Some(tunnel);
-                            this.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
+                            this.begin_remote_connect(runtime, origin, cx);
                         }
                         Ok(Err(error)) => {
                             this.finish_runtime_connect_failure(
                                 BackendError::offline("ssh_boot_failed", error),
-                                RuntimeConnectOrigin::Boot,
+                                origin,
                                 cx,
                             );
                             this.runtime_switch_pending = None;
@@ -14478,7 +14479,7 @@ impl VibexWorkbench {
                                     "ssh_boot_task_failed",
                                     "the SSH boot task stopped unexpectedly",
                                 ),
-                                RuntimeConnectOrigin::Boot,
+                                origin,
                                 cx,
                             );
                             this.runtime_switch_pending = None;
@@ -14762,7 +14763,11 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime_registry.remote(&id).cloned() else {
             return;
         };
-        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+        if let Some(profile) = self.ssh_profile_for_runtime(&id) {
+            self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
+        } else {
+            self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+        }
     }
 
     /// Records which runtime is authoritative and persists the registry.
@@ -106264,7 +106269,7 @@ mod tests {
         assert!(finish.contains("take_tunnel_process"));
         assert!(source.contains("ssh_tunnel: Option<TunnelProcess>"));
         assert!(source.contains("registered_runtime_id"));
-        assert!(source.contains("fn begin_ssh_remote_boot("));
+        assert!(source.contains("fn begin_ssh_restore("));
         assert!(source.contains("fn ssh_profile_for_runtime("));
         assert!(source.contains("supervisor::ensure_started"));
         assert!(source.contains("TunnelProcess::spawn"));
