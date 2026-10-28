@@ -271,8 +271,6 @@ mod tests {
     use super::*;
     use crate::ssh_connection::command::SshCommand;
     use crate::ssh_connection::launch::LaunchConfig;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
 
     fn config() -> LaunchConfig {
         LaunchConfig::new(
@@ -315,9 +313,11 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_ssh(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-        let path = dir.join("fake-ssh");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = crate::ssh_connection::test_support::unique_path(dir, "fake-ssh");
+        crate::ssh_connection::test_support::write_executable(
+            &path,
+            &format!("#!/bin/sh\n{body}\n"),
+        );
         path
     }
 

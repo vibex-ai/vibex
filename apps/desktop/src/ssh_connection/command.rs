@@ -156,6 +156,8 @@ impl SshCommand {
     }
 
     pub fn run_with_timeout(&self, timeout: Duration) -> Result<SshOutput, SshFailure> {
+        #[cfg(test)]
+        let _process_guard = crate::ssh_connection::test_support::process_guard();
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         command.env("LC_ALL", "C");
@@ -258,6 +260,8 @@ impl SshCommand {
         timeout: Duration,
         mut progress: impl FnMut(u64, u64) + Send + 'static,
     ) -> Result<SshOutput, SshFailure> {
+        #[cfg(test)]
+        let _process_guard = crate::ssh_connection::test_support::process_guard();
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         command.env("LC_ALL", "C");
@@ -394,7 +398,6 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::ssh_connection::error::SshFailureKind;
-    use std::fs;
 
     fn has_pair(args: &[String], left: &str, right: &str) -> bool {
         args.windows(2)
@@ -496,11 +499,11 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_ssh(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let path = dir.join("fake-ssh");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = crate::ssh_connection::test_support::unique_path(dir, "fake-ssh");
+        crate::ssh_connection::test_support::write_executable(
+            &path,
+            &format!("#!/bin/sh\n{body}\n"),
+        );
         path
     }
 
@@ -523,8 +526,15 @@ mod tests {
             dir.path(),
             "printf 'dev@host: Permission denied (publickey).\\n' >&2; exit 255",
         );
-        let failure = SshCommand::new(&auth).run().unwrap_err();
-        assert_eq!(failure.kind, SshFailureKind::Authentication);
+        let Err(failure) = SshCommand::new(&auth).run() else {
+            panic!("expected an authentication failure");
+        };
+        assert_eq!(
+            failure.kind,
+            SshFailureKind::Authentication,
+            "auth detail: {}",
+            failure.stderr_tail
+        );
 
         let remote = fake_ssh(
             dir.path(),
@@ -543,7 +553,12 @@ mod tests {
         let failure = SshCommand::new(&ssh)
             .run_with_timeout(Duration::from_millis(100))
             .unwrap_err();
-        assert_eq!(failure.kind, SshFailureKind::Timeout);
+        assert_eq!(
+            failure.kind,
+            SshFailureKind::Timeout,
+            "spawn detail: {}",
+            failure.stderr_tail
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

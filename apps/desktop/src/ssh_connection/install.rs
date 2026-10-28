@@ -224,10 +224,8 @@ fn map_ssh_failure(failure: SshFailure) -> InstallError {
 /// Writes the install script to a file, for local script tests.
 #[cfg(test)]
 fn write_script(dir: &Path) -> std::path::PathBuf {
-    use std::io::Write as _;
-    let path = dir.join("install.sh");
-    let mut file = fs::File::create(&path).unwrap();
-    file.write_all(INSTALL_SCRIPT.as_bytes()).unwrap();
+    let path = crate::ssh_connection::test_support::unique_path(dir, "install.sh");
+    crate::ssh_connection::test_support::write_executable(&path, INSTALL_SCRIPT);
     path
 }
 
@@ -237,29 +235,14 @@ mod tests {
     use crate::ssh_connection::command::SshDestination;
     use crate::ssh_connection::environment::RemoteArch;
 
-    fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vibex-install-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[cfg(unix)]
     fn fake_ssh(dir: &Path, capture: &Path, fail_upload: bool) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let path = dir.join("fake-ssh");
+        let path = crate::ssh_connection::test_support::unique_path(dir, "fake-ssh");
         let capture = capture.display();
         let fail = if fail_upload { "exit 255" } else { "exit 0" };
-        fs::write(
+        crate::ssh_connection::test_support::write_executable(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\n\
                  for arg in \"$@\"; do\n\
                    if [ \"$arg\" = \"-c\" ]; then\n\
@@ -275,9 +258,7 @@ mod tests {
                  cat >/dev/null\n\
                  exit 0\n"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
@@ -336,12 +317,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn uploads_the_exact_tarball_then_runs_the_install_script() {
-        let dir = temp_dir();
-        let capture = dir.join("upload.bin");
-        let ssh = fake_ssh(&dir, &capture, false);
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("upload.bin");
+        let ssh = fake_ssh(dir.path(), &capture, false);
         let command = SshCommand::for_destination(&ssh, &destination(), None).unwrap();
         let body = b"tarball bytes";
-        let artifact = local_artifact(&dir, body);
+        let artifact = local_artifact(dir.path(), body);
         use std::sync::{Arc, Mutex};
         let progress = Arc::new(Mutex::new(Vec::new()));
         let progress_seen = progress.clone();
@@ -351,8 +332,12 @@ mod tests {
             "/home/dev/.local/share/vibex/server",
             move |done, total| progress_seen.lock().unwrap().push((done, total)),
         )
-        .unwrap();
-        assert_eq!(fs::read(&capture).unwrap(), body);
+        .unwrap_or_else(|error| panic!("install should succeed: {error:?}"));
+        assert_eq!(
+            fs::read(&capture)
+                .unwrap_or_else(|error| panic!("upload capture should exist: {error:?}")),
+            body
+        );
         assert_eq!(outcome.version, "0.1.0-rc.8");
         assert!(
             progress
@@ -361,17 +346,16 @@ mod tests {
                 .iter()
                 .any(|(done, total)| *done == *total)
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn an_upload_failure_stops_before_install() {
-        let dir = temp_dir();
-        let capture = dir.join("upload.bin");
-        let ssh = fake_ssh(&dir, &capture, true);
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("upload.bin");
+        let ssh = fake_ssh(dir.path(), &capture, true);
         let command = SshCommand::for_destination(&ssh, &destination(), None).unwrap();
-        let artifact = local_artifact(&dir, b"tarball bytes");
+        let artifact = local_artifact(dir.path(), b"tarball bytes");
         let error = install_artifact(
             &command,
             &artifact,
@@ -380,7 +364,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "ssh_install_failed");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -389,15 +372,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;
 
-        let dir = temp_dir();
-        let root = dir.join("server");
+        let _process_guard = crate::ssh_connection::test_support::process_guard();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("server");
         fs::create_dir_all(&root).unwrap();
-        let stage = dir.join("stage");
+        let stage = dir.path().join("stage");
         fs::create_dir_all(&stage).unwrap();
         let old_binary = stage.join("vibex-server");
         fs::write(&old_binary, "#!/bin/sh\necho old\n").unwrap();
         fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o755)).unwrap();
-        let old_tar = dir.join("old.tar.gz");
+        let old_tar = dir.path().join("old.tar.gz");
         let status = Command::new("tar")
             .args([
                 "-czf",
@@ -412,7 +397,7 @@ mod tests {
         let old_sha = hex_digest(&fs::read(&old_tar).unwrap());
 
         let run = |incoming: &Path, version: &str, sha: &str| {
-            let script = write_script(&dir);
+            let script = write_script(dir.path());
             let child = Command::new("sh")
                 .arg(script)
                 .args([
@@ -443,7 +428,7 @@ mod tests {
         assert!(!root.join("previous").exists());
 
         fs::write(&old_binary, "#!/bin/sh\necho new\n").unwrap();
-        let new_tar = dir.join("new.tar.gz");
+        let new_tar = dir.path().join("new.tar.gz");
         let status = Command::new("tar")
             .args([
                 "-czf",
@@ -472,6 +457,5 @@ mod tests {
         );
         assert!(root.join("0.1.0/vibex-server").is_file());
         assert!(root.join("0.2.0/vibex-server").is_file());
-        let _ = fs::remove_dir_all(dir);
     }
 }

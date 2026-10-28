@@ -341,6 +341,7 @@ mod tests {
 
     #[test]
     fn env_script_writes_mode_0600_and_quotes_values_as_arguments() {
+        let _process_guard = crate::ssh_connection::test_support::process_guard();
         let dir = tempfile::tempdir().unwrap();
         let env_file = dir.path().join("runtime.env");
         let home = format!("VIBEX_HOME={}", shell_quote("/home/dev/a b"));

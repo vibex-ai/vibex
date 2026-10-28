@@ -347,19 +347,6 @@ mod tests {
         hex_lower(&Sha256::digest(bytes))
     }
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vibex-artifact-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn selects_the_linux_artifact_for_both_architectures() {
         let verified = manifest("a".repeat(64), 10);
@@ -390,8 +377,8 @@ mod tests {
 
     #[test]
     fn verify_file_checks_size_and_digest() {
-        let dir = temp_dir();
-        let path = dir.join("artifact.tar.gz");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.tar.gz");
         fs::write(&path, b"artifact bytes").unwrap();
         verify_file(&path, 14, &digest(b"artifact bytes")).unwrap();
         assert_eq!(
@@ -406,7 +393,6 @@ mod tests {
                 .code,
             "ssh_artifact_size_mismatch"
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -429,7 +415,7 @@ mod tests {
             let _ = stream.write_all(&server_body);
         });
 
-        let dir = temp_dir();
+        let dir = tempfile::tempdir().unwrap();
         let artifact = ServerArtifact {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
@@ -443,7 +429,7 @@ mod tests {
             &artifact,
             "0.1.0-rc.8",
             RemoteArch::X86_64,
-            &dir,
+            dir.path(),
             move |done, total| progress_seen.lock().unwrap().push((done, total)),
         )
         .await
@@ -454,12 +440,16 @@ mod tests {
         assert!(!progress.lock().unwrap().is_empty());
 
         // The second call must resolve from the verified cache without a server.
-        let cached =
-            download_server_artifact(&artifact, "0.1.0-rc.8", RemoteArch::X86_64, &dir, |_, _| {})
-                .await
-                .unwrap();
+        let cached = download_server_artifact(
+            &artifact,
+            "0.1.0-rc.8",
+            RemoteArch::X86_64,
+            dir.path(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(cached.path, local.path);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -480,7 +470,7 @@ mod tests {
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(&server_body);
         });
-        let dir = temp_dir();
+        let dir = tempfile::tempdir().unwrap();
         let artifact = ServerArtifact {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
@@ -488,13 +478,17 @@ mod tests {
             size: expected_size,
             sha256: "b".repeat(64),
         };
-        let error =
-            download_server_artifact(&artifact, "0.1.0-rc.8", RemoteArch::X86_64, &dir, |_, _| {})
-                .await
-                .unwrap_err();
+        let error = download_server_artifact(
+            &artifact,
+            "0.1.0-rc.8",
+            RemoteArch::X86_64,
+            dir.path(),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, "ssh_artifact_hash_mismatch");
-        let remains = fs::read_dir(&dir).unwrap().count();
+        let remains = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(remains, 0, "partial download should be removed");
-        let _ = fs::remove_dir_all(dir);
     }
 }

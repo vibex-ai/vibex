@@ -15,6 +15,9 @@ pub mod launch;
 pub mod profile;
 pub mod provisioning;
 pub mod supervisor;
+#[cfg(test)]
+mod test_support;
+pub mod tunnel;
 
 pub use artifact::{
     ArtifactError, LocalArtifact, download_server_artifact, select_server_artifact, verify_file,
@@ -43,4 +46,8 @@ pub use provisioning::{
 pub use supervisor::{
     PORT_SCRIPT, ServerStatus, StopOutcome, SupervisorError, ensure_started, ensure_stopped,
     parse_status, select_free_port, status, stop,
+};
+pub use tunnel::{
+    TunnelBackoff, TunnelError, TunnelProcess, TunnelSpec, TunnelState, TunnelSupervisor,
+    select_local_port,
 };

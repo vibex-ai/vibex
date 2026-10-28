@@ -644,6 +644,8 @@ runtime=present\n";
         use std::io::Write as _;
         use std::process::{Command, Stdio};
 
+        let _process_guard = crate::ssh_connection::test_support::process_guard();
+
         let mut child = Command::new("sh")
             .arg("-s")
             .stdin(Stdio::piped())
@@ -674,25 +676,12 @@ runtime=present\n";
     #[cfg(unix)]
     #[test]
     fn probe_runs_the_fixed_script_through_the_ssh_command() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = std::env::temp_dir().join(format!(
-            "vibex-probe-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let ssh = dir.join("fake-ssh");
-        fs::write(
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = crate::ssh_connection::test_support::unique_path(dir.path(), "fake-ssh");
+        crate::ssh_connection::test_support::write_executable(
             &ssh,
             "#!/bin/sh\ncat >/dev/null\ncat <<'OUT'\nprobe=ok\nos=Linux\narch=x86_64\nhome=/home/dev\nshell=/bin/bash\ngit=yes\nsha256sum=yes\nfree_kb=1048576\nglibc=2.36\nhome_writable=yes\nport=free\nruntime=absent\nOUT\n",
-        )
-        .unwrap();
-        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let command = SshCommand {
             program: ssh,
@@ -703,6 +692,5 @@ runtime=present\n";
         assert_eq!(environment.arch, RemoteArch::X86_64);
         assert_eq!(environment.port_state, PortState::Free);
         assert!(!environment.runtime_present);
-        let _ = fs::remove_dir_all(dir);
     }
 }

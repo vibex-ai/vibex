@@ -30,6 +30,8 @@ pub fn known_hosts_contains(
     known_hosts: &Path,
     host: &str,
 ) -> Result<bool, SshFailure> {
+    #[cfg(test)]
+    let _process_guard = crate::ssh_connection::test_support::process_guard();
     validate_host(host)?;
     let output = Command::new(ssh_keygen)
         .args(["-F", host, "-f"])
@@ -62,7 +64,6 @@ fn validate_host(host: &str) -> Result<(), SshFailure> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
     use super::*;
@@ -70,11 +71,11 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_keygen(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let path = dir.join("fake-keygen");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = crate::ssh_connection::test_support::unique_path(dir, "fake-keygen");
+        crate::ssh_connection::test_support::write_executable(
+            &path,
+            &format!("#!/bin/sh\n{body}\n"),
+        );
         path
     }
 
