@@ -12836,18 +12836,7 @@ impl ManagementCenter {
             let id = row.route.id.as_str().to_string();
             let is_selected = self.selected_global_route_id.as_deref() == Some(id.as_str());
             let select_id = id.clone();
-            let models = vibex_core::provider_group_models(&row.route, &self.providers);
-            let provider_names = row
-                .route
-                .enabled_members()
-                .filter_map(|member| {
-                    self.providers
-                        .iter()
-                        .find(|profile| profile.id == member.model_provider_profile_id)
-                        .map(|profile| profile.display_name.clone())
-                })
-                .collect::<Vec<_>>()
-                .join(" + ");
+            let summary = management_route_group_member_summary(&row.route, &self.providers);
             let used = if row.agents.is_empty() {
                 management_locale_text("not used yet", "未被使用", "未被使用").to_string()
             } else {
@@ -12906,7 +12895,12 @@ impl ManagementCenter {
                                             .text_sm()
                                             .font_medium()
                                             .child(row.route.display_name.clone()),
-                                    ),
+                                    )
+                                    .when(row.route.is_model_group(), |this| {
+                                        this.child(Tag::secondary().xsmall().child(
+                                            management_route_group_kind_label(row.route.kind),
+                                        ))
+                                    }),
                             )
                             .when(
                                 row.route.status != vibex_core::RouteStatus::Enabled,
@@ -12923,11 +12917,7 @@ impl ManagementCenter {
                             .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · {} · {used}",
-                                provider_names,
-                                management_route_group_model_count(models.len()),
-                            )),
+                            .child(format!("{summary} · {used}")),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_route_id = Some(select_id.clone());
@@ -12940,9 +12930,9 @@ impl ManagementCenter {
             route_group_list = route_group_list.child(compact_empty_state(
                 management_locale_text("No route groups yet", "还没有路由组", "還沒有路由組"),
                 management_locale_text(
-                    "A group combines Providers, and its models are the ones they all serve.",
-                    "路由组把若干供应商组合起来，可用模型是它们共同提供的部分。",
-                    "路由組把若干供應商組合起來，可用模型是它們共同提供的部分。",
+                    "A group combines whole Providers or specific models into one source for Agents.",
+                    "路由组把若干供应商或具体模型组合成一个 Agent 可用的来源。",
+                    "路由組把若干供應商或具體模型組合成一個 Agent 可用的來源。",
                 ),
                 cx,
             ));
@@ -14182,25 +14172,27 @@ impl ManagementCenter {
         };
         let pending = self.mutation.is_some();
         let route = &row.route;
-        let models = vibex_core::provider_group_models(route, &self.providers);
-        let providers = route
-            .enabled_members()
-            .filter_map(|member| {
-                self.providers
-                    .iter()
-                    .find(|profile| profile.id == member.model_provider_profile_id)
-                    .cloned()
-            })
-            .collect::<Vec<_>>();
-
-        let mut body = v_flex().w_full().min_w_0().gap_3();
-        body = body.child(management_card_with_icon(
-            management_locale_text("Route group", "路由组", "路由組"),
+        let models = management_route_group_models(route, &self.providers);
+        let provider_names = management_route_group_provider_names(route, &self.providers);
+        let title = management_route_group_kind_label(route.kind);
+        let description = if route.is_model_group() {
+            management_locale_text(
+                "A model group exposes one model name Agents ask for, and may fall back across different upstream models.",
+                "模型组对外暴露一个 Agent 请求的模型名，可在不同的上游模型之间回退。",
+                "模型組對外暴露一個 Agent 請求的模型名，可在不同的上游模型之間回退。",
+            )
+        } else {
             management_locale_text(
                 "A route group composes Providers: its models are the ones they all serve, and its policy picks which one answers.",
                 "路由组把供应商组合起来：可用模型是它们共同提供的部分，由路由策略决定哪个供应商回答。",
                 "路由組把供應商組合起來：可用模型是它們共同提供的部分，由路由策略決定哪個供應商回答。",
-            ),
+            )
+        };
+
+        let mut body = v_flex().w_full().min_w_0().gap_3();
+        body = body.child(management_card_with_icon(
+            title,
+            description,
             "icons/vibex/git-branch.svg",
             v_flex()
                 .w_full()
@@ -14304,7 +14296,7 @@ impl ManagementCenter {
                         .w_full()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(if providers.is_empty() {
+                        .child(if provider_names.is_empty() {
                             management_locale_text(
                                 "This group names no Provider that still exists.",
                                 "该路由组所引用的供应商都已不存在。",
@@ -14312,11 +14304,7 @@ impl ManagementCenter {
                             )
                             .to_string()
                         } else {
-                            providers
-                                .iter()
-                                .map(|profile| profile.display_name.clone())
-                                .collect::<Vec<_>>()
-                                .join(" + ")
+                            provider_names.join(" + ")
                         }),
                 )
                 .child(
@@ -14329,18 +14317,23 @@ impl ManagementCenter {
                             cx.theme().muted_foreground
                         })
                         .child(if models.is_empty() {
-                            management_locale_text(
-                                "These Providers share no enabled model, so the group cannot answer.",
-                                "这些供应商没有共同启用的模型，路由组无法工作。",
-                                "這些供應商沒有共同啟用的模型，路由組無法運作。",
-                            )
-                            .to_string()
+                            if route.is_model_group() {
+                                management_locale_text(
+                                    "This model group names no model Agents can ask for.",
+                                    "这个模型组没有 Agent 可请求的模型名。",
+                                    "這個模型組沒有 Agent 可請求的模型名。",
+                                )
+                                .to_string()
+                            } else {
+                                management_locale_text(
+                                    "These Providers share no enabled model, so the group cannot answer.",
+                                    "这些供应商没有共同启用的模型，路由组无法工作。",
+                                    "這些供應商沒有共同啟用的模型，路由組無法運作。",
+                                )
+                                .to_string()
+                            }
                         } else {
-                            models
-                                .iter()
-                                .map(|model| model.model_id.clone())
-                                .collect::<Vec<_>>()
-                                .join(" · ")
+                            models.join(" · ")
                         }),
                 )
                 .into_any_element(),
@@ -26161,6 +26154,10 @@ impl ManagementCenter {
                         || row.route.display_name.to_lowercase().contains(&normalized)
                         || row
                             .route
+                            .agent_model()
+                            .is_some_and(|model| model.to_lowercase().contains(&normalized))
+                        || row
+                            .route
                             .enabled_members()
                             .filter_map(|member| {
                                 self.providers
@@ -26194,7 +26191,7 @@ impl ManagementCenter {
             );
             for row in available_groups {
                 let route_id = row.route.id.clone();
-                let models = vibex_core::provider_group_models(&row.route, &self.providers);
+                let summary = management_route_group_member_summary(&row.route, &self.providers);
                 group_rows = group_rows.child(
                     h_flex()
                         .id(SharedString::from(format!(
@@ -26238,23 +26235,7 @@ impl ManagementCenter {
                                         .truncate()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(format!(
-                                            "{} · {}",
-                                            management_route_group_model_count(models.len()),
-                                            row.route
-                                                .enabled_members()
-                                                .filter_map(|member| {
-                                                    self.providers
-                                                        .iter()
-                                                        .find(|profile| {
-                                                            profile.id
-                                                                == member.model_provider_profile_id
-                                                        })
-                                                        .map(|profile| profile.display_name.clone())
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(" + "),
-                                        )),
+                                        .child(summary),
                                 ),
                         )
                         .child(
@@ -30113,7 +30094,7 @@ impl ManagementCenter {
         let mut groups = self
             .model_routes
             .iter()
-            .filter(|route| route.is_provider_group())
+            .filter(|route| route.kind.via_gateway())
             .filter(|route| referenced.contains(&route.id))
             .cloned()
             .collect::<Vec<_>>();
@@ -30128,16 +30109,8 @@ impl ManagementCenter {
             let route_id = route.id.clone();
             let hover_group: SharedString =
                 format!("route-group-row-hover-{}", route_id.as_str()).into();
-            let models = vibex_core::provider_group_models(&route, &self.providers);
-            let providers = route
-                .enabled_members()
-                .filter_map(|member| {
-                    self.providers
-                        .iter()
-                        .find(|profile| profile.id == member.model_provider_profile_id)
-                        .map(|profile| profile.display_name.clone())
-                })
-                .collect::<Vec<_>>();
+            let models = management_route_group_models(&route, &self.providers);
+            let provider_names = management_route_group_provider_names(&route, &self.providers);
             let users = self
                 .agent_model_route_bindings
                 .iter()
@@ -30197,6 +30170,11 @@ impl ManagementCenter {
                                         cx,
                                     ))
                                 })
+                                .when(route.is_model_group(), |header| {
+                                    header.child(Tag::secondary().xsmall().child(
+                                        management_route_group_kind_label(route.kind),
+                                    ))
+                                })
                                 .when(route.status != vibex_core::RouteStatus::Enabled, |header| {
                                     header.child(Tag::secondary().xsmall().child(
                                         management_locale_text("Disabled", "已停用", "已停用"),
@@ -30229,25 +30207,30 @@ impl ManagementCenter {
                                     cx.theme().muted_foreground
                                 })
                                 .child(if models.is_empty() {
-                                    management_locale_text(
-                                        "These Providers share no enabled model, so the group cannot answer.",
-                                        "这些供应商没有共同启用的模型，路由组无法工作。",
-                                        "這些供應商沒有共同啟用的模型，路由組無法運作。",
-                                    )
-                                    .to_string()
+                                    if route.is_model_group() {
+                                        management_locale_text(
+                                            "This model group names no model Agents can ask for.",
+                                            "这个模型组没有 Agent 可请求的模型名。",
+                                            "這個模型組沒有 Agent 可請求的模型名。",
+                                        )
+                                        .to_string()
+                                    } else {
+                                        management_locale_text(
+                                            "These Providers share no enabled model, so the group cannot answer.",
+                                            "这些供应商没有共同启用的模型，路由组无法工作。",
+                                            "這些供應商沒有共同啟用的模型，路由組無法運作。",
+                                        )
+                                        .to_string()
+                                    }
                                 } else {
-                                    models
-                                        .iter()
-                                        .map(|model| model.model_id.clone())
-                                        .collect::<Vec<_>>()
-                                        .join(" · ")
+                                    models.join(" · ")
                                 }),
                         ),
                 )
                 .tooltip({
                     let detail = format!(
                         "{} · {} · {}",
-                        if providers.is_empty() {
+                        if provider_names.is_empty() {
                             management_locale_text(
                                 "no Provider left",
                                 "供应商已不存在",
@@ -30255,7 +30238,7 @@ impl ManagementCenter {
                             )
                             .to_string()
                         } else {
-                            providers.join(" + ")
+                            provider_names.join(" + ")
                         },
                         management_route_group_model_count(models.len()),
                         management_route_strategy_label(route.strategy),
@@ -38600,10 +38583,11 @@ struct SharedRouteGroupRow {
 
 /// The live route groups the Providers page lists, each with its users.
 ///
-/// Only `ProviderGroup` routes are groups; a plain gateway route and a
-/// materialised `Direct` route are different records that the same tables hold,
-/// and listing them here would put a row on this page that the page cannot
-/// compose or edit.
+/// Both gateway-served kinds are groups: a provider group composes whole
+/// Providers, and a model group composes `(Provider, model)` pairs behind one
+/// Agent-facing model id. A materialised `Direct` route is a Provider
+/// projection rather than a group, so listing it here would put a row on this
+/// page that the page cannot compose or edit.
 fn shared_route_group_rows(
     routes: &[vibex_core::ModelRoute],
     bindings: &[vibex_core::AgentModelRouteBinding],
@@ -38611,7 +38595,7 @@ fn shared_route_group_rows(
     let mut rows = routes
         .iter()
         .filter(|route| route.deleted_at_ms.is_none())
-        .filter(|route| route.is_provider_group())
+        .filter(|route| route.kind.via_gateway())
         .map(|route| {
             let agents = bindings
                 .iter()
@@ -41942,6 +41926,106 @@ fn management_route_group_model_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} model{}", if count == 1 { "" } else { "s" }),
         ResolvedLocale::ZhCn => format!("{count} 个模型"),
         ResolvedLocale::ZhTw => format!("{count} 個模型"),
+    }
+}
+
+/// The model ids a route group exposes to Agents.
+///
+/// A provider group publishes the intersection of its Providers' catalogues.
+/// A model group publishes exactly the one Agent-facing id it was authored
+/// with, even when its members name different upstream models; reading the
+/// intersection there would show models the group never routes to.
+fn management_route_group_models(
+    route: &vibex_core::ModelRoute,
+    providers: &[vibex_core::ModelProviderProfile],
+) -> Vec<String> {
+    if route.is_model_group() {
+        route
+            .agent_model()
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    } else {
+        vibex_core::provider_group_models(route, providers)
+            .into_iter()
+            .map(|model| model.model_id)
+            .collect()
+    }
+}
+
+/// The Providers a group names, in member order and without repeated names.
+///
+/// A model group may hold several models at one Provider; the row names the
+/// source once rather than repeating the same Provider for each member.
+fn management_route_group_provider_names(
+    route: &vibex_core::ModelRoute,
+    providers: &[vibex_core::ModelProviderProfile],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for member in route.enabled_members() {
+        let Some(profile) = providers
+            .iter()
+            .find(|profile| profile.id == member.model_provider_profile_id)
+        else {
+            continue;
+        };
+        if !names.contains(&profile.display_name) {
+            names.push(profile.display_name.clone());
+        }
+    }
+    names
+}
+
+/// How many members back a route group.
+fn management_route_group_member_count(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{count} member{}", if count == 1 { "" } else { "s" }),
+        ResolvedLocale::ZhCn => format!("{count} 个成员"),
+        ResolvedLocale::ZhTw => format!("{count} 個成員"),
+    }
+}
+
+/// The compact second line that describes a group's sources in a list.
+///
+/// A provider group names the Providers and how many shared models they
+/// expose. A model group names the virtual model Agents ask for and how many
+/// `(Provider, model)` members can answer it; its upstream model ids belong in
+/// the detail view, where each member has a row.
+fn management_route_group_member_summary(
+    route: &vibex_core::ModelRoute,
+    providers: &[vibex_core::ModelProviderProfile],
+) -> String {
+    let names = management_route_group_provider_names(route, providers);
+    let provider_names = if names.is_empty() {
+        management_locale_text("No Provider left", "供应商已不存在", "供應商已不存在").to_string()
+    } else {
+        names.join(" + ")
+    };
+    if route.is_model_group() {
+        let model = route
+            .agent_model()
+            .unwrap_or_else(|| management_locale_text("No model name", "没有模型名", "沒有模型名"));
+        format!(
+            "{model} · {}",
+            management_route_group_member_count(route.enabled_members().count())
+        )
+    } else {
+        format!(
+            "{provider_names} · {}",
+            management_route_group_model_count(
+                management_route_group_models(route, providers).len()
+            )
+        )
+    }
+}
+
+/// The label for the two shapes a route group can take.
+fn management_route_group_kind_label(kind: vibex_core::RouteKind) -> &'static str {
+    match kind {
+        vibex_core::RouteKind::ModelGroup => {
+            management_locale_text("Model group", "模型组", "模型組")
+        }
+        _ => management_locale_text("Route group", "路由组", "路由組"),
     }
 }
 
@@ -47512,39 +47596,202 @@ mod gateway_surface_tests {
         );
     }
 
-    /// A group's users are counted from live bindings only.
+    /// A group saved as a model group must have a row and a detail pane.
+    ///
+    /// New groups open as model groups, so this is the shape a reader sees
+    /// right after pressing Create. Filtering the list to provider groups left
+    /// the page looking empty while the gateway counted the saved record.
+    #[gpui::test]
+    fn the_route_group_tab_renders_a_model_group(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "DeepSeek".to_string(),
+            ..Default::default()
+        };
+        let route = vibex_core::ModelRoute {
+            display_name: "Route group".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("deepseek-flash".to_string()),
+            members: vec![vibex_core::ModelRouteMember::new(
+                provider.id.clone(),
+                "deepseek-v4.1-flash",
+                0,
+            )],
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        let selected = route.id.to_string();
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
+                center.selected_global_route_id = Some(selected);
+                center.providers = vec![provider];
+                center.model_routes = vec![route];
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            cx.update(|_, cx| center.read(cx).providers_sidebar_tab),
+            ProviderSidebarTab::RouteGroups,
+            "the model group renders on the route-group tab"
+        );
+    }
+
+    /// The list holds both gateway-served group kinds, and a group's users are
+    /// counted from live bindings only.
     #[test]
-    fn shared_route_group_rows_count_live_bindings_only() {
+    fn shared_route_group_rows_list_both_gateway_kinds_and_count_live_bindings_only() {
         let provider = vibex_core::ModelProviderProfileId::new();
-        let mut route = vibex_core::ModelRoute {
-            display_name: "Group".to_string(),
+        let mut provider_group = vibex_core::ModelRoute {
+            display_name: "Provider group".to_string(),
             kind: vibex_core::RouteKind::ProviderGroup,
             status: vibex_core::RouteStatus::Enabled,
             members: vec![vibex_core::ModelRouteMember::provider(provider.clone(), 0)],
             ..Default::default()
         };
-        route.revision = 1;
+        provider_group.revision = 1;
         let live = vibex_core::AgentModelRouteBinding::new(
             AgentId::parse("codex").unwrap(),
-            route.id.clone(),
+            provider_group.id.clone(),
         );
         let mut dropped = vibex_core::AgentModelRouteBinding::new(
             AgentId::parse("claude").unwrap(),
-            route.id.clone(),
+            provider_group.id.clone(),
         );
         dropped.deleted_at_ms = Some(1);
+        // The model group is the kind a new group opens as; it belongs in the
+        // same left column, or a save would report success and leave the page
+        // looking empty.
+        let mut model_group = provider_group.clone();
+        model_group.id = vibex_core::ModelRouteId::new();
+        model_group.display_name = "Model group".to_string();
+        model_group.kind = vibex_core::RouteKind::ModelGroup;
+        model_group.agent_model_id = Some("agent-facing".to_string());
+        model_group.members = vec![vibex_core::ModelRouteMember::new(
+            provider.clone(),
+            "upstream",
+            0,
+        )];
+        let model_live = vibex_core::AgentModelRouteBinding::new(
+            AgentId::parse("claude").unwrap(),
+            model_group.id.clone(),
+        );
         // A direct route is not a group and must not appear in the group tab.
-        let mut plain = route.clone();
-        plain.id = vibex_core::ModelRouteId::new();
-        plain.kind = vibex_core::RouteKind::Direct;
-        plain.members = vec![vibex_core::ModelRouteMember::new(provider, "m", 0)];
+        let mut direct = provider_group.clone();
+        direct.id = vibex_core::ModelRouteId::new();
+        direct.kind = vibex_core::RouteKind::Direct;
+        direct.members = vec![vibex_core::ModelRouteMember::new(provider, "m", 0)];
 
-        let rows = shared_route_group_rows(&[route, plain], &[live, dropped]);
-        assert_eq!(rows.len(), 1, "only the provider group is listed");
+        let rows = shared_route_group_rows(
+            &[provider_group, model_group, direct],
+            &[live, dropped, model_live],
+        );
+        assert_eq!(rows.len(), 2, "both gateway group kinds are listed");
+        assert!(
+            rows.iter()
+                .any(|row| row.route.kind == vibex_core::RouteKind::ProviderGroup),
+            "the provider group is listed"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.route.kind == vibex_core::RouteKind::ModelGroup),
+            "the model group is listed"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.route.kind != vibex_core::RouteKind::Direct),
+            "a direct route is not a group"
+        );
+        let provider_row = rows
+            .iter()
+            .find(|row| row.route.kind == vibex_core::RouteKind::ProviderGroup)
+            .expect("the provider group row");
         assert_eq!(
-            rows[0].agents.iter().cloned().collect::<Vec<_>>(),
+            provider_row.agents.iter().cloned().collect::<Vec<_>>(),
             vec!["codex".to_string()],
             "a released binding is not a user"
+        );
+        let model_row = rows
+            .iter()
+            .find(|row| row.route.kind == vibex_core::RouteKind::ModelGroup)
+            .expect("the model group row");
+        assert_eq!(
+            model_row.agents.iter().cloned().collect::<Vec<_>>(),
+            vec!["claude".to_string()],
+            "the model group keeps its own live bindings"
+        );
+    }
+
+    /// A provider group exposes its Providers' shared models; a model group
+    /// exposes only the one model Agents ask it for.
+    #[test]
+    fn a_route_group_lists_the_models_it_actually_exposes() {
+        let model = |id: &str| vibex_core::ModelProviderCatalogEntry {
+            id: id.to_string(),
+            display_name: None,
+            enabled: true,
+            metadata: Vec::new(),
+            capabilities: Default::default(),
+        };
+        let first = vibex_core::ModelProviderProfile {
+            display_name: "First".to_string(),
+            configured_models: vec![model("shared"), model("first-only")],
+            ..Default::default()
+        };
+        let second = vibex_core::ModelProviderProfile {
+            display_name: "Second".to_string(),
+            configured_models: vec![model("shared"), model("second-only")],
+            ..Default::default()
+        };
+        let providers = vec![first.clone(), second.clone()];
+        let provider_group = vibex_core::ModelRoute {
+            kind: vibex_core::RouteKind::ProviderGroup,
+            members: vec![
+                vibex_core::ModelRouteMember::provider(first.id.clone(), 0),
+                vibex_core::ModelRouteMember::provider(second.id.clone(), 1),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            management_route_group_models(&provider_group, &providers),
+            vec!["shared".to_string()],
+            "a provider group offers the intersection, not the union"
+        );
+        assert_eq!(
+            management_route_group_provider_names(&provider_group, &providers),
+            vec!["First".to_string(), "Second".to_string()]
+        );
+
+        let model_group = vibex_core::ModelRoute {
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("agent-facing".to_string()),
+            members: vec![
+                vibex_core::ModelRouteMember::new(first.id.clone(), "first-only", 0),
+                // The same Provider serving a second upstream model must not
+                // add a second source line to the row.
+                vibex_core::ModelRouteMember::new(first.id.clone(), "shared", 1),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            management_route_group_models(&model_group, &providers),
+            vec!["agent-facing".to_string()],
+            "a model group exposes its virtual id, never its upstream ids"
+        );
+        assert_eq!(
+            management_route_group_provider_names(&model_group, &providers),
+            vec!["First".to_string()],
+            "a Provider named twice is listed once"
+        );
+        let summary = management_route_group_member_summary(&model_group, &providers);
+        assert!(summary.contains("agent-facing"), "{summary}");
+        assert!(
+            summary.contains(&management_route_group_member_count(2)),
+            "the row names how many members can answer: {summary}"
         );
     }
 
