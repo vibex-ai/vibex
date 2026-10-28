@@ -111,6 +111,10 @@ impl SshProvisioningEffects {
     pub fn tunnel_process(&mut self) -> Option<&mut TunnelProcess> {
         self.tunnel.as_mut()
     }
+
+    pub fn take_tunnel_process(&mut self) -> Option<TunnelProcess> {
+        self.tunnel.take()
+    }
 }
 
 #[allow(async_fn_in_trait)]

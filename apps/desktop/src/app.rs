@@ -247,6 +247,10 @@ use crate::remote_client::{
 use crate::responsive::WorkbenchVisibility;
 use crate::skeleton;
 use crate::spinner::Spinner;
+use crate::ssh_connection::{
+    ProvisioningRunOutcome, ProvisioningService, ProvisioningServiceEvent, ProvisioningSnapshot,
+    SshProvisioningEffects, TunnelProcess,
+};
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
 use crate::usage::UsageView;
@@ -9163,6 +9167,17 @@ pub struct VibexWorkbench {
     open_settings_on_start: bool,
     settings_view: Entity<FoundationSettings>,
     remote_client: Option<DesktopRemoteClient>,
+    /// Background SSH provisioning, its progress snapshots, and the tunnel it
+    /// owns after Ready. The tunnel lives here so it survives the service.
+    ssh_provisioning: Option<ProvisioningService<SshProvisioningEffects>>,
+    #[allow(dead_code)]
+    ssh_provisioning_task: Option<Task<()>>,
+    #[allow(dead_code)]
+    ssh_provisioning_snapshot: Option<ProvisioningSnapshot>,
+    #[allow(dead_code)]
+    ssh_provisioning_error: Option<String>,
+    #[allow(dead_code)]
+    ssh_tunnel: Option<TunnelProcess>,
     /// Every runtime this desktop can drive, plus the id of the active one.
     /// Client-side state, so it stays readable while another authority is
     /// displayed — that is what makes switching non-destructive.
@@ -10954,6 +10969,11 @@ impl VibexWorkbench {
             open_settings_on_start: settings_open_on_start,
             settings_view,
             remote_client: None,
+            ssh_provisioning: None,
+            ssh_provisioning_task: None,
+            ssh_provisioning_snapshot: None,
+            ssh_provisioning_error: None,
+            ssh_tunnel: None,
             runtime_registry,
             runtime_registry_store,
             runtime_manager_open: false,
@@ -13933,6 +13953,125 @@ impl VibexWorkbench {
     fn confirm_remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
         self.runtime_remove_pending = Some(id);
         cx.notify();
+    }
+
+    /// Starts a background SSH provisioning run. The Connections UI calls this
+    /// once it has a resolved profile and a verified local artifact.
+    #[allow(dead_code)]
+    fn start_ssh_provisioning(
+        &mut self,
+        effects: SshProvisioningEffects,
+        profile_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ssh_provisioning.is_some() {
+            return;
+        }
+        let service =
+            match ProvisioningService::start(effects, profile_id, unix_timestamp_ms(), false) {
+                Ok(service) => service,
+                Err(error) => {
+                    self.ssh_provisioning_error = Some(error.message);
+                    cx.notify();
+                    return;
+                }
+            };
+        self.ssh_provisioning = Some(service);
+        self.ssh_provisioning_error = None;
+        self.ssh_provisioning_snapshot = None;
+        self.ssh_provisioning_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    let event = entity.update(cx, |this, _| {
+                        this.ssh_provisioning
+                            .as_ref()
+                            .map(ProvisioningService::try_recv)
+                    });
+                    match event {
+                        Ok(None)
+                        | Ok(Some(Err(std::sync::mpsc::TryRecvError::Disconnected)))
+                        | Err(_) => break,
+                        Ok(Some(Err(std::sync::mpsc::TryRecvError::Empty))) => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(40))
+                                .await;
+                        }
+                        Ok(Some(Ok(ProvisioningServiceEvent::Update(snapshot)))) => {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.ssh_provisioning_snapshot = Some(snapshot);
+                                cx.notify();
+                            });
+                        }
+                        Ok(Some(Ok(ProvisioningServiceEvent::Finished { outcome, effects }))) => {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.finish_ssh_provisioning(outcome, effects, cx);
+                            });
+                            break;
+                        }
+                    }
+                }
+            },
+        ));
+        cx.notify();
+    }
+
+    fn finish_ssh_provisioning(
+        &mut self,
+        outcome: Result<ProvisioningRunOutcome, crate::ssh_connection::ProvisioningControlError>,
+        mut effects: SshProvisioningEffects,
+        cx: &mut Context<Self>,
+    ) {
+        self.ssh_provisioning = None;
+        match outcome {
+            Ok(ProvisioningRunOutcome::Ready(snapshot)) => {
+                let Some(backend) = effects.backend() else {
+                    self.ssh_provisioning_error =
+                        Some("the provisioned runtime has no connected backend".to_string());
+                    cx.notify();
+                    return;
+                };
+                let Some(credential) = effects.credential().cloned() else {
+                    self.ssh_provisioning_error =
+                        Some("the provisioned runtime has no credential".to_string());
+                    cx.notify();
+                    return;
+                };
+                let Some(runtime_id) = effects.runtime_id().map(str::to_string) else {
+                    self.ssh_provisioning_error =
+                        Some("the provisioned runtime has no id".to_string());
+                    cx.notify();
+                    return;
+                };
+                self.ssh_tunnel = effects.take_tunnel_process();
+                self.ssh_provisioning_snapshot = Some(snapshot);
+                self.install_remote_client(
+                    DesktopRemoteClient {
+                        runtime_id: runtime_id.clone(),
+                        credential,
+                        backend,
+                    },
+                    cx,
+                );
+                self.mark_runtime_active(&runtime_id, cx);
+                cx.notify();
+            }
+            Ok(ProvisioningRunOutcome::Failed(snapshot)) => {
+                self.ssh_provisioning_snapshot = Some(snapshot.clone());
+                self.ssh_provisioning_error = snapshot
+                    .failure
+                    .map(|failure| format!("{}: {}", failure.code, failure.message));
+                cx.notify();
+            }
+            Ok(ProvisioningRunOutcome::Cancelled(snapshot))
+            | Ok(ProvisioningRunOutcome::AlreadyExists(snapshot)) => {
+                self.ssh_provisioning_snapshot = Some(snapshot);
+                cx.notify();
+            }
+            Err(error) => {
+                self.ssh_provisioning_error = Some(error.to_string());
+                cx.notify();
+            }
+        }
     }
 
     /// Attaches the workbench to a remote runtime, parks the embedded one, and
@@ -105331,6 +105470,30 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.section == SettingsSection::Browser)
         );
+    }
+
+    #[test]
+    fn ssh_provisioning_worker_is_wired_into_the_workbench() {
+        let source = include_str!("app.rs");
+        let start = source
+            .split_once("    fn start_ssh_provisioning(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_ssh_provisioning("))
+            .map(|(body, _)| body)
+            .expect("the SSH provisioning start path should remain inspectable");
+        assert!(start.contains("ProvisioningService::start"));
+        assert!(start.contains("ProvisioningServiceEvent::Update"));
+        assert!(start.contains("ProvisioningServiceEvent::Finished"));
+        let finish = source
+            .split_once("    fn finish_ssh_provisioning(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Attaches the workbench to a remote runtime")
+            })
+            .map(|(body, _)| body)
+            .expect("the SSH provisioning finish path should remain inspectable");
+        assert!(finish.contains("install_remote_client"));
+        assert!(finish.contains("mark_runtime_active"));
+        assert!(finish.contains("take_tunnel_process"));
+        assert!(source.contains("ssh_tunnel: Option<TunnelProcess>"));
     }
 
     #[test]
