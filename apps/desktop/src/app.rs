@@ -78208,6 +78208,113 @@ fn connections_profile_id(alias: &str, now_ms: i64) -> String {
     id
 }
 
+fn connection_diagnostic_title(
+    kind: crate::ssh_connection::diagnostics::SshDiagnosticKind,
+) -> &'static str {
+    use crate::ssh_connection::diagnostics::SshDiagnosticKind;
+    match kind {
+        SshDiagnosticKind::MissingClient => locale::text(
+            "SSH client not installed",
+            "未安装 SSH 客户端",
+            "未安裝 SSH 用戶端",
+        ),
+        SshDiagnosticKind::MissingSshd | SshDiagnosticKind::ConnectionRefused => {
+            locale::text("SSH server unavailable", "SSH 服务不可用", "SSH 服務不可用")
+        }
+        SshDiagnosticKind::RemoteLoginDisabled => {
+            locale::text("Remote Login is off", "远程登录未开启", "遠端登入未開啟")
+        }
+        SshDiagnosticKind::Authentication => {
+            locale::text("SSH authentication failed", "SSH 认证失败", "SSH 驗證失敗")
+        }
+        SshDiagnosticKind::HostKeyUnknown => locale::text(
+            "Host key is not trusted",
+            "主机密钥未信任",
+            "主機金鑰未信任",
+        ),
+        SshDiagnosticKind::HostKeyChanged => {
+            locale::text("Host key changed", "主机密钥已变更", "主機金鑰已變更")
+        }
+        SshDiagnosticKind::Timeout => locale::text("SSH timed out", "SSH 超时", "SSH 逾時"),
+        SshDiagnosticKind::Dns => locale::text("Host not found", "找不到主机", "找不到主機"),
+        SshDiagnosticKind::Permission => {
+            locale::text("Remote permission denied", "远端权限不足", "遠端權限不足")
+        }
+        SshDiagnosticKind::Disk => {
+            locale::text("Not enough disk space", "磁盘空间不足", "磁碟空間不足")
+        }
+        SshDiagnosticKind::Glibc => locale::text(
+            "Linux version is too old",
+            "Linux 版本过旧",
+            "Linux 版本過舊",
+        ),
+        SshDiagnosticKind::Port => locale::text(
+            "Runtime port is busy",
+            "运行时端口被占用",
+            "執行階段連接埠被占用",
+        ),
+        SshDiagnosticKind::Start => {
+            locale::text("Runtime did not start", "运行时未启动", "執行階段未啟動")
+        }
+        SshDiagnosticKind::Version => locale::text(
+            "Runtime version is incompatible",
+            "运行时版本不兼容",
+            "執行階段版本不相容",
+        ),
+        SshDiagnosticKind::Tunnel => {
+            locale::text("SSH tunnel failed", "SSH 隧道失败", "SSH 通道失敗")
+        }
+        SshDiagnosticKind::Pairing => locale::text("Pairing failed", "配对失败", "配對失敗"),
+        SshDiagnosticKind::Upgrade => locale::text(
+            "Runtime upgrade failed",
+            "运行时升级失败",
+            "執行階段升級失敗",
+        ),
+        SshDiagnosticKind::Unknown => {
+            locale::text("SSH setup failed", "SSH 配置失败", "SSH 設定失敗")
+        }
+    }
+}
+
+fn connection_diagnostic_action_label(
+    action: crate::ssh_connection::diagnostics::SshDiagnosticAction,
+) -> &'static str {
+    use crate::ssh_connection::diagnostics::SshDiagnosticAction;
+    match action {
+        SshDiagnosticAction::Retry => locale::text("Retry", "重试", "重試"),
+        SshDiagnosticAction::InstallClient => {
+            locale::text("Install OpenSSH", "安装 OpenSSH", "安裝 OpenSSH")
+        }
+        SshDiagnosticAction::BootstrapSshd => {
+            locale::text("Bootstrap SSH", "初始化 SSH", "初始化 SSH")
+        }
+        SshDiagnosticAction::EnableRemoteLogin => {
+            locale::text("Enable Remote Login", "开启远程登录", "開啟遠端登入")
+        }
+        SshDiagnosticAction::ReviewHostKey => {
+            locale::text("Review host key", "检查主机密钥", "檢查主機金鑰")
+        }
+        SshDiagnosticAction::CheckPermissions => {
+            locale::text("Check permissions", "检查权限", "檢查權限")
+        }
+        SshDiagnosticAction::CheckDisk => {
+            locale::text("Free disk space", "清理磁盘空间", "清理磁碟空間")
+        }
+        SshDiagnosticAction::UpdateRuntime => {
+            locale::text("Update runtime", "更新运行时", "更新執行階段")
+        }
+        SshDiagnosticAction::UpdateVibex => {
+            locale::text("Update Vibex", "更新 Vibex", "更新 Vibex")
+        }
+        SshDiagnosticAction::CopyDiagnostics => {
+            locale::text("Copy diagnostics", "复制诊断", "複製診斷")
+        }
+        SshDiagnosticAction::CopyLogCommand => {
+            locale::text("Copy log command", "复制日志命令", "複製日誌命令")
+        }
+    }
+}
+
 fn settings_section_label(section: SettingsSection) -> &'static str {
     match section {
         SettingsSection::General => locale::text("General", "常规", "一般"),
@@ -83383,6 +83490,50 @@ impl FoundationSettings {
         let detail = snapshot
             .and_then(|snapshot| snapshot.detail.clone())
             .or_else(|| error.map(str::to_string));
+        let profile = snapshot.and_then(|snapshot| {
+            self.connections_profiles
+                .iter()
+                .find(|profile| profile.id == snapshot.profile_id)
+        });
+        let host_alias = profile
+            .map(|profile| {
+                if profile.ssh_alias.is_empty() {
+                    profile.host.as_str()
+                } else {
+                    profile.ssh_alias.as_str()
+                }
+            })
+            .or_else(|| snapshot.map(|_| "the remote host"));
+        let log_path = profile.map(|profile| {
+            format!(
+                "{}/.local/state/vibex/server/server.log",
+                profile.remote_home
+            )
+        });
+        let diagnostic =
+            if let Some(failure) = snapshot.and_then(|snapshot| snapshot.failure.as_ref()) {
+                Some(crate::ssh_connection::diagnostics::diagnose(
+                    &failure.code,
+                    &failure.message,
+                    &failure.log_tail,
+                    host_alias,
+                    log_path.as_deref(),
+                ))
+            } else {
+                error.map(|error| {
+                    let (code, message) = error
+                        .split_once(':')
+                        .map(|(code, message)| (code.trim(), message.trim()))
+                        .unwrap_or(("ssh_unknown", error));
+                    crate::ssh_connection::diagnostics::diagnose(
+                        code,
+                        message,
+                        "",
+                        host_alias,
+                        log_path.as_deref(),
+                    )
+                })
+            };
         let mut actions = Vec::new();
         if let Some(snapshot) = snapshot {
             let workbench = self.workbench.clone();
@@ -83479,6 +83630,111 @@ impl FoundationSettings {
                         .whitespace_normal()
                         .text_color(if error.is_some() { danger } else { muted })
                         .child(detail),
+                )
+            })
+            .when_some(diagnostic, |this, diagnostic| {
+                let diagnostic_text = diagnostic.diagnostics.clone();
+                let log_command = diagnostic.log_command.clone();
+                let hints = diagnostic
+                    .actions
+                    .iter()
+                    .filter(|action| {
+                        !matches!(
+                            action,
+                            crate::ssh_connection::diagnostics::SshDiagnosticAction::CopyDiagnostics
+                                | crate::ssh_connection::diagnostics::SshDiagnosticAction::CopyLogCommand
+                        )
+                    })
+                    .map(|action| connection_diagnostic_action_label(*action))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(danger)
+                        .p_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_medium()
+                                .text_color(danger)
+                                .child(connection_diagnostic_title(diagnostic.kind)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(muted)
+                                .child(diagnostic.message.clone()),
+                        )
+                        .when(!diagnostic.host_key_fingerprints.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(danger)
+                                    .child(format!(
+                                        "{}: {}",
+                                        locale::text(
+                                            "Host key fingerprints",
+                                            "主机密钥指纹",
+                                            "主機金鑰指紋"
+                                        ),
+                                        diagnostic.host_key_fingerprints.join(" / ")
+                                    )),
+                            )
+                        })
+                        .when(!hints.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!(
+                                        "{}: {hints}",
+                                        locale::text("Next", "下一步", "下一步")
+                                    )),
+                            )
+                        })
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("connections-diagnostic-copy")
+                                        .small()
+                                        .ghost()
+                                        .label(locale::text(
+                                            "Copy diagnostics",
+                                            "复制诊断",
+                                            "複製診斷"
+                                        ))
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                diagnostic_text.clone(),
+                                            ));
+                                        })),
+                                )
+                                .when_some(log_command, |this, command| {
+                                    this.child(
+                                        Button::new("connections-diagnostic-log-command")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text(
+                                                "Copy log command",
+                                                "复制日志命令",
+                                                "複製日誌命令",
+                                            ))
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    command.clone(),
+                                                ));
+                                            })),
+                                    )
+                                }),
+                        ),
                 )
             })
             .when(!actions.is_empty(), |this| {
@@ -107300,6 +107556,9 @@ mod tests {
         assert!(source.contains("runtime-upgrade-policy-notify"));
         assert!(source.contains("runtime-upgrade-confirm"));
         assert!(source.contains("SshUpgradePolicy"));
+        assert!(source.contains("connections-diagnostic-copy"));
+        assert!(source.contains("connections-diagnostic-log-command"));
+        assert!(source.contains("connection_diagnostic_title"));
     }
 
     #[test]
