@@ -29090,8 +29090,13 @@ for line in sys.stdin:
             id: vibex_core::ModelRouteId::new(),
             display_name: "Team".to_string(),
             description: None,
-            kind: vibex_core::RouteKind::ProviderGroup,
-            members: vec![vibex_core::ModelRouteMember::provider(provider_id, 0)],
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("Team".to_string()),
+            members: vec![vibex_core::ModelRouteMember::new(
+                provider_id,
+                models.first().copied().unwrap_or("mock/model-1"),
+                0,
+            )],
             strategy: vibex_core::RouteStrategy::Ordered,
             first_token_timeout_ms: None,
             context_tokens: None,
@@ -29103,6 +29108,7 @@ for line in sys.stdin:
             created_at_ms: unix_timestamp_ms().max(1),
             updated_at_ms: unix_timestamp_ms().max(1),
             deleted_at_ms: None,
+            ..Default::default()
         };
         vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
         let binding = vibex_core::AgentModelRouteBinding::new(agent_id.clone(), route.id.clone());
@@ -29117,10 +29123,7 @@ for line in sys.stdin:
         let mut config = service
             .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
-        config.models = models
-            .iter()
-            .map(|model| route.group_model_id(model))
-            .collect();
+        config.models = route.gateway_model_id().into_iter().collect();
         // A gateway Profile declares a coarse mode list of its own — the real
         // ones carry little more than `default` — while the Agent advertises the
         // modes it actually supports per Model. Keeping the two apart here is
@@ -29190,8 +29193,8 @@ for line in sys.stdin:
         );
         let mut selection = SessionRuntimeSelection::model_route(agent_id, route_id);
         selection.model = RuntimeModelSelection::explicit(format!(
-            "{}{}/mock/model-1",
-            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            "{}{}/Team",
+            vibex_core::ROUTE_GROUP_MODEL_PREFIX,
             selection
                 .auth_source
                 .model_route_id()
@@ -29255,8 +29258,8 @@ for line in sys.stdin:
         );
         let mut selection = SessionRuntimeSelection::model_route(agent_id, route_id.clone());
         selection.model = RuntimeModelSelection::explicit(format!(
-            "{}{}/mock/model-1",
-            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            "{}{}/Team",
+            vibex_core::ROUTE_GROUP_MODEL_PREFIX,
             route_id.as_str()
         ));
 
@@ -29329,9 +29332,11 @@ for line in sys.stdin:
             id: vibex_core::ModelRouteId::new(),
             display_name: "Nowhere".to_string(),
             description: None,
-            kind: vibex_core::RouteKind::ProviderGroup,
-            members: vec![vibex_core::ModelRouteMember::provider(
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("Nowhere".to_string()),
+            members: vec![vibex_core::ModelRouteMember::new(
                 provider.id.clone(),
+                "mock/model-1",
                 0,
             )],
             strategy: vibex_core::RouteStrategy::Ordered,
@@ -29345,6 +29350,7 @@ for line in sys.stdin:
             created_at_ms: unix_timestamp_ms().max(1),
             updated_at_ms: unix_timestamp_ms().max(1),
             deleted_at_ms: None,
+            ..Default::default()
         };
         vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
         let binding = vibex_core::AgentModelRouteBinding::new(agent_id.clone(), route.id.clone());
@@ -29353,8 +29359,8 @@ for line in sys.stdin:
 
         let mut selection = SessionRuntimeSelection::model_route(agent_id, route.id.clone());
         selection.model = RuntimeModelSelection::explicit(format!(
-            "{}{}/mock/model-1",
-            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            "{}{}/Team",
+            vibex_core::ROUTE_GROUP_MODEL_PREFIX,
             route.id.as_str()
         ));
         let error = fixture

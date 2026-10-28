@@ -783,7 +783,7 @@ impl SessionRuntimeSelection {
             auth_source: RuntimeAuthSource::model_route(model_route_id.clone()),
             model: RuntimeModelSelection::explicit(format!(
                 "{}{}/",
-                crate::PROVIDER_GROUP_MODEL_PREFIX,
+                crate::ROUTE_GROUP_MODEL_PREFIX,
                 model_route_id.as_str()
             )),
             reasoning_effort: None,

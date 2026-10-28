@@ -118,16 +118,14 @@ pub struct GatewaySnapshot {
     pub upstreams: Vec<GatewayUpstream>,
     pub gateway_used_tokens: u64,
     /// Enabled groups, by id. Every gateway model is addressed through one.
-    pub groups: BTreeMap<String, GatewayProviderGroup>,
+    pub groups: BTreeMap<String, GatewayRouteGroup>,
 }
 
-/// One provider group as the gateway serves it.
+/// One route group as the gateway serves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayProviderGroup {
+pub struct GatewayRouteGroup {
     pub group_id: String,
     pub display_name: String,
-    /// Whether this is a whole-Provider group or a model-level group.
-    pub kind: vibex_core::RouteKind,
     pub strategy: vibex_core::RouteStrategy,
     /// How this group wants one Provider's Keys tried.
     ///
@@ -143,13 +141,12 @@ pub struct GatewayProviderGroup {
     pub token_limit: Option<vibex_core::GatewayTokenLimit>,
     /// The members in attempt order, already filtered to the ones that exist.
     ///
-    /// A provider-group member carries an empty model because the model is
-    /// chosen per request. A model-group member carries the upstream model it
-    /// calls, so two members of one Provider may name different models.
+    /// A member carries the upstream model it calls, so two members of one
+    /// Provider may name different models.
     pub providers: Vec<crate::route::RouteMemberRef>,
-    /// The models the group offers, and which Providers serve each.
+    /// The one Agent-facing model the group publishes.
     pub models: Vec<GatewayGroupModel>,
-    /// The single Agent-facing id of a model group.
+    /// The single Agent-facing id of the group.
     pub agent_model_id: Option<String>,
     /// Ordered rules that may override the member order for one turn.
     pub rules: Vec<vibex_core::ModelRouteRule>,
@@ -172,12 +169,12 @@ pub struct GatewayGroupModel {
     pub providers: Vec<ModelProviderProfileId>,
 }
 
-impl GatewayProviderGroup {
+impl GatewayRouteGroup {
     /// The id a request names for one of this group's models.
     pub fn model_id(&self, model: &str) -> String {
         format!(
             "{}{}/{}",
-            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            vibex_core::ROUTE_GROUP_MODEL_PREFIX,
             self.group_id,
             model
         )
@@ -185,7 +182,7 @@ impl GatewayProviderGroup {
 
     /// The model this request names, when the request names this group.
     pub fn model_of<'a>(&self, requested: &'a str) -> Option<&'a str> {
-        vibex_core::provider_group_model_ref(requested)
+        vibex_core::route_group_model_ref(requested)
             .filter(|parsed| parsed.group_id == self.group_id)
             .map(|parsed| parsed.model_id)
     }
@@ -210,8 +207,8 @@ impl GatewaySnapshot {
     pub fn group_for_model<'a>(
         &'a self,
         requested: &'a str,
-    ) -> Option<(&'a GatewayProviderGroup, &'a str)> {
-        let parsed = vibex_core::provider_group_model_ref(requested)?;
+    ) -> Option<(&'a GatewayRouteGroup, &'a str)> {
+        let parsed = vibex_core::route_group_model_ref(requested)?;
         let group = self.groups.get(parsed.group_id)?;
         if let Some(model) = group
             .models
@@ -659,12 +656,10 @@ impl ModelGatewayService {
                 keys,
             });
         }
-        // A provider group offers the intersection of its Providers'
-        // catalogues. The models are computed here, once, from the same
-        // profiles the request will be prepared against: computing them at
-        // request time would let the catalogue and the router disagree about
-        // which model is available.
-        let group_profiles = profiles.values().cloned().collect::<Vec<_>>();
+        // A model group publishes one Agent-facing model. The members are
+        // filtered here, once, from the same profiles the request will be
+        // prepared against: computing them at request time would let the
+        // catalogue and the router disagree about which member is reachable.
         let groups = enabled_routes
             .iter()
             .filter(|route| route.kind.via_gateway())
@@ -682,76 +677,33 @@ impl ModelGatewayService {
                             first_token_timeout_ms: member.first_token_timeout_ms,
                         })
                 };
-                let (providers, models, agent_model_id) = if route.is_provider_group() {
-                    let providers = route
-                        .enabled_members()
-                        .filter_map(|member| {
-                            // A group member names a Provider, so the router
-                            // substitutes the model per request.
-                            member_ref(member, "")
-                        })
-                        .collect::<Vec<_>>();
-                    if providers.is_empty() {
-                        // A group with no reachable Provider has nothing to
-                        // serve. One Provider *is* useful, though: a group of
-                        // one is how a single upstream gets the gateway's
-                        // protocol translation.
-                        return None;
+                let agent_model_id = route.agent_model()?.to_string();
+                let providers = route
+                    .enabled_members()
+                    .filter(|member| {
+                        profiles
+                            .get(&member.model_provider_profile_id)
+                            .map(|profile| member_is_served(profile, &member.model_id))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|member| member_ref(member, member.model_id.trim()))
+                    .collect::<Vec<_>>();
+                if providers.is_empty() {
+                    return None;
+                }
+                // The catalogue names each source once, while the router keeps
+                // two entries of the same Provider distinct.
+                let mut serving = Vec::new();
+                for member in &providers {
+                    if !serving.contains(&member.profile) {
+                        serving.push(member.profile.clone());
                     }
-                    let models = vibex_core::provider_group_models(route, &group_profiles)
-                        .into_iter()
-                        .map(|model| GatewayGroupModel {
-                            model: model.model_id,
-                            providers: model.provider_profile_ids,
-                        })
-                        .collect::<Vec<_>>();
-                    if models.is_empty() {
-                        // No shared model means the group cannot answer
-                        // anything, which is a broken composition.
-                        return None;
-                    }
-                    (providers, models, None)
-                } else {
-                    let agent_model_id = route.agent_model()?.to_string();
-                    let providers = route
-                        .enabled_members()
-                        .filter(|member| {
-                            profiles
-                                .get(&member.model_provider_profile_id)
-                                .map(|profile| member_is_served(profile, &member.model_id))
-                                .unwrap_or(false)
-                        })
-                        .filter_map(|member| member_ref(member, member.model_id.trim()))
-                        .collect::<Vec<_>>();
-                    if providers.is_empty() {
-                        return None;
-                    }
-                    // A model group offers exactly one virtual model. Its
-                    // providers are listed for the catalogue and for the
-                    // request's "which sources back this" line; the router
-                    // still uses the member list above so two entries of the
-                    // same Provider stay distinct.
-                    let mut serving = Vec::new();
-                    for member in &providers {
-                        if !serving.contains(&member.profile) {
-                            serving.push(member.profile.clone());
-                        }
-                    }
-                    (
-                        providers,
-                        vec![GatewayGroupModel {
-                            model: agent_model_id.clone(),
-                            providers: serving,
-                        }],
-                        Some(agent_model_id),
-                    )
-                };
+                }
                 Some((
                     route.id.as_str().to_string(),
-                    GatewayProviderGroup {
+                    GatewayRouteGroup {
                         group_id: route.id.as_str().to_string(),
                         display_name: route.display_name.clone(),
-                        kind: route.kind,
                         strategy: route.strategy,
                         // The group's own strategy, applied to its Keys as well
                         // as to its members.
@@ -771,8 +723,11 @@ impl ModelGatewayService {
                         failover: route.failover,
                         token_limit: route.token_limit,
                         providers,
-                        models,
-                        agent_model_id,
+                        models: vec![GatewayGroupModel {
+                            model: agent_model_id.clone(),
+                            providers: serving,
+                        }],
+                        agent_model_id: Some(agent_model_id),
                         rules: route.rules.clone(),
                         classifier: route.classifier.clone(),
                         effort: route.effort.clone(),
@@ -1555,8 +1510,8 @@ impl ModelGatewayService {
         intent: Option<&str>,
         forced_effort: Option<&str>,
     ) -> GatewayResult<(Vec<ResolvedMember>, vibex_core::GatewayRouteDecisionTrace)> {
-        let Some((group, model)) = snapshot.group_for_model(&request.model) else {
-            let parsed = vibex_core::provider_group_model_ref(&request.model);
+        let Some((group, _model)) = snapshot.group_for_model(&request.model) else {
+            let parsed = vibex_core::route_group_model_ref(&request.model);
             let closest = parsed
                 .filter(|parsed| snapshot.groups.contains_key(parsed.group_id))
                 .map(|parsed| {
@@ -1585,25 +1540,8 @@ impl ModelGatewayService {
             });
         };
         // A model group names its members directly: every enabled member is a
-        // candidate, and the upstream model is the member's own. A provider
-        // group derives the candidates from the shared model's intersection,
-        // which is why the two branches do not share their filter.
-        let shared_model = model.to_string();
-        let mut candidates = if group.kind == vibex_core::RouteKind::ModelGroup {
-            group.providers.clone()
-        } else {
-            group
-                .providers
-                .iter()
-                .filter(|provider| {
-                    group
-                        .providers_for(&shared_model)
-                        .iter()
-                        .any(|serving| serving == &provider.profile)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
+        // candidate, and the upstream model is the member's own.
+        let mut candidates = group.providers.clone();
         if candidates.is_empty() {
             return Err(GatewayError::ModelNotFound {
                 model: request.model.clone(),
@@ -1674,14 +1612,7 @@ impl ModelGatewayService {
                 .into_iter()
                 .map(|member| ResolvedMember {
                     profile: member.profile,
-                    // A model group's member names the upstream model; a
-                    // provider group's member names only the Provider, so the
-                    // shared model is the one to call.
-                    model: if member.model.is_empty() {
-                        shared_model.clone()
-                    } else {
-                        member.model.clone()
-                    },
+                    model: member.model,
                     reasoning_effort: member
                         .reasoning_effort
                         .or_else(|| forced_effort.map(str::to_string)),
@@ -1705,7 +1636,7 @@ impl ModelGatewayService {
     async fn classify_turn(
         &self,
         snapshot: &GatewaySnapshot,
-        group: &GatewayProviderGroup,
+        group: &GatewayRouteGroup,
         request: &CanonicalRequest,
     ) -> ClassifierOutcome {
         let Some(classifier) = group
@@ -3162,7 +3093,7 @@ pub(crate) fn reasoning_variant_base(model: &str) -> Option<&str> {
 /// A gateway model is always `group/<id>/<model>`; anything else is not a
 /// model this listener serves.
 fn resolved_group_id(model: &str) -> Option<&str> {
-    vibex_core::provider_group_model_ref(model).map(|parsed| parsed.group_id)
+    vibex_core::route_group_model_ref(model).map(|parsed| parsed.group_id)
 }
 
 /// A request that has been resolved but not yet sent.
@@ -3275,7 +3206,7 @@ pub struct MemberCall {
 /// The prompt and the switch notice name the model, so they strip the routing
 /// prefix: `group/abc/deepseek-chat` reads as `deepseek-chat`.
 fn bare_model_name(requested: &str) -> String {
-    vibex_core::provider_group_model_ref(requested)
+    vibex_core::route_group_model_ref(requested)
         .map(|parsed| parsed.model_id.to_string())
         .unwrap_or_else(|| requested.to_string())
 }
@@ -3848,7 +3779,7 @@ fn classifier_provider(
 /// name different models, and the id is the only unambiguous handle.
 fn resolve_classifier_target(
     snapshot: &GatewaySnapshot,
-    group: &GatewayProviderGroup,
+    group: &GatewayRouteGroup,
     classifier: &str,
 ) -> Option<(ModelProviderProfileId, String)> {
     let classifier = classifier.trim();
@@ -4812,10 +4743,9 @@ mod tests {
             gateway_used_tokens: 0,
             groups: BTreeMap::from([(
                 "g1".to_string(),
-                GatewayProviderGroup {
+                GatewayRouteGroup {
                     group_id: "g1".to_string(),
                     display_name: "Team".to_string(),
-                    kind: vibex_core::RouteKind::ProviderGroup,
                     strategy: vibex_core::RouteStrategy::Ordered,
                     key_strategy: GatewayRoutingStrategy::Ordered,
                     first_token_timeout_ms: None,
@@ -4827,7 +4757,7 @@ mod tests {
                         model: "deepseek-chat".to_string(),
                         providers: Vec::new(),
                     }],
-                    agent_model_id: None,
+                    agent_model_id: Some("deepseek-chat".to_string()),
                     rules: Vec::new(),
                     classifier: None,
                     effort: None,

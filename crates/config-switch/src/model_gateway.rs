@@ -410,7 +410,7 @@ impl ProviderConfigService {
                 // Every gateway model belongs to a group and publishes
                 // `group/<id>/<model>`, so its capabilities come from the
                 // Providers that serve that one model.
-                let Some(parsed) = vibex_core::provider_group_model_ref(&model.id) else {
+                let Some(parsed) = vibex_core::route_group_model_ref(&model.id) else {
                     return model;
                 };
                 let Some(route) = routes
@@ -419,28 +419,20 @@ impl ProviderConfigService {
                 else {
                     return model;
                 };
-                let caps = if route.is_model_group() {
-                    // A model group's upstream models may differ, so the
-                    // capabilities of its virtual model are what every
-                    // reachable member promises.
-                    let caps = route
-                        .enabled_members()
-                        .filter_map(|member| {
-                            profiles
-                                .iter()
-                                .find(|profile| profile.id == member.model_provider_profile_id)
-                                .and_then(|profile| member_catalog_entry(profile, &member.model_id))
-                                .map(|entry| entry.capabilities.clone())
-                        })
-                        .collect::<Vec<_>>();
-                    vibex_core::intersect_route_capabilities(caps)
-                } else {
-                    vibex_core::provider_group_models(route, &profiles)
-                        .into_iter()
-                        .find(|entry| entry.model_id == parsed.model_id)
-                        .map(|entry| entry.capabilities)
-                        .unwrap_or_default()
-                };
+                // A model group's upstream models may differ, so the
+                // capabilities of its virtual model are what every reachable
+                // member promises.
+                let caps = route
+                    .enabled_members()
+                    .filter_map(|member| {
+                        profiles
+                            .iter()
+                            .find(|profile| profile.id == member.model_provider_profile_id)
+                            .and_then(|profile| member_catalog_entry(profile, &member.model_id))
+                            .map(|entry| entry.capabilities.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let caps = vibex_core::intersect_route_capabilities(caps);
                 ProviderConfiguredModel {
                     capabilities: vibex_core::ProviderModelCapabilities {
                         context_tokens: route.context_tokens.or(caps.context_tokens),
@@ -527,48 +519,30 @@ impl ProviderConfigService {
             if route.unlists || route.sink {
                 continue;
             }
-            if route.is_model_group() {
-                let Some(agent_model) = route.agent_model() else {
-                    continue;
-                };
-                let source_count = route
-                    .enabled_members()
-                    .filter(|member| {
-                        profiles.iter().any(|profile| {
-                            profile.id == member.model_provider_profile_id
-                                && (profile.configured_models.is_empty()
-                                    || member_catalog_entry(profile, &member.model_id).is_some())
-                        })
+            let Some(agent_model) = route.agent_model() else {
+                continue;
+            };
+            let source_count = route
+                .enabled_members()
+                .filter(|member| {
+                    profiles.iter().any(|profile| {
+                        profile.id == member.model_provider_profile_id
+                            && (profile.configured_models.is_empty()
+                                || member_catalog_entry(profile, &member.model_id).is_some())
                     })
-                    .count();
-                if source_count == 0 {
-                    continue;
-                }
-                catalog.push(GatewayCatalogModel {
-                    route_id: Some(route.id.as_str().to_string()),
-                    display_name: route.display_name.clone(),
-                    model: route.group_model_id(agent_model),
-                    kind: route.kind,
-                    source_count,
-                    model_count: 1,
-                });
+                })
+                .count();
+            if source_count == 0 {
                 continue;
             }
-            let models = vibex_core::provider_group_models(&route, &profiles);
-            if models.is_empty() {
-                continue;
-            }
-            let model_count = models.len();
-            for model in models {
-                catalog.push(GatewayCatalogModel {
-                    route_id: Some(route.id.as_str().to_string()),
-                    display_name: route.display_name.clone(),
-                    model: route.group_model_id(&model.model_id),
-                    kind: route.kind,
-                    source_count: model.provider_profile_ids.len(),
-                    model_count,
-                });
-            }
+            catalog.push(GatewayCatalogModel {
+                route_id: Some(route.id.as_str().to_string()),
+                display_name: route.display_name.clone(),
+                model: route.group_model_id(agent_model),
+                kind: route.kind,
+                source_count,
+                model_count: 1,
+            });
         }
         Ok(catalog)
     }
@@ -652,7 +626,7 @@ fn gateway_route_members_in(
 /// the group id followed by a non-empty model. The slash matters: without it
 /// `group/abc` would match `group/abcdef/model`.
 fn group_catalog_belongs_to(model: &str, route: &vibex_core::ModelRoute) -> bool {
-    let Some(parsed) = vibex_core::provider_group_model_ref(model) else {
+    let Some(parsed) = vibex_core::route_group_model_ref(model) else {
         return false;
     };
     parsed.group_id == route.id.as_str()
@@ -903,13 +877,13 @@ mod tests {
         let route = service
             .create_model_route(vibex_core::ModelRoute {
                 display_name: name.to_string(),
-                kind: vibex_core::RouteKind::ProviderGroup,
+                kind: vibex_core::RouteKind::ModelGroup,
                 status: vibex_core::RouteStatus::Enabled,
                 members: providers
                     .into_iter()
                     .enumerate()
                     .map(|(index, provider)| {
-                        vibex_core::ModelRouteMember::provider(provider, index as i64)
+                        vibex_core::ModelRouteMember::new(provider, "deepseek-chat", index as i64)
                     })
                     .collect(),
                 ..Default::default()
@@ -1059,7 +1033,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             models,
-            vec![format!("group/{}/deepseek-chat", claude_group.as_str()).as_str()],
+            vec![format!("group/{}/Claude group", claude_group.as_str()).as_str()],
             "a Profile carries only the groups its Agent is bound to"
         );
         assert!(
@@ -1419,19 +1393,20 @@ mod tests {
         let group = service
             .create_model_route(vibex_core::ModelRoute {
                 display_name: "Team".to_string(),
-                kind: vibex_core::RouteKind::ProviderGroup,
+                kind: vibex_core::RouteKind::ModelGroup,
                 status: vibex_core::RouteStatus::Enabled,
-                members: vec![vibex_core::ModelRouteMember::provider(deepseek, 0)],
+                members: vec![vibex_core::ModelRouteMember::new(
+                    deepseek,
+                    "deepseek-chat",
+                    0,
+                )],
                 ..Default::default()
             })
             .unwrap();
 
         // The group is in the catalogue the gateway would serve...
         let published = catalog(&service);
-        assert_eq!(
-            published,
-            vec![format!("group/{}/deepseek-chat", group.id.as_str())]
-        );
+        assert_eq!(published, vec![format!("group/{}/Team", group.id.as_str())]);
 
         // ...but until it is bound and republished, the Agent has no Profile at
         // all, which is exactly what made the picker look empty.
@@ -1463,7 +1438,7 @@ mod tests {
             after
                 .configured_models
                 .iter()
-                .any(|model| model.id == format!("group/{}/deepseek-chat", group.id.as_str())),
+                .any(|model| model.id == format!("group/{}/Team", group.id.as_str())),
             "the republished Profile is what a session reads its models from"
         );
         let _ = std::fs::remove_file(path);
@@ -1488,9 +1463,10 @@ mod tests {
 
         for agent_id in ["claude", "codex", "deepseek-harness"] {
             let agent_id = agent(agent_id);
+            let group_name = format!("Team {}", agent_id.as_str());
             group_for(
                 &service,
-                "Team",
+                &group_name,
                 vec![deepseek.clone()],
                 &[agent_id.as_str()],
             );
@@ -1542,7 +1518,7 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![format!("group/{}/deepseek-chat", first.as_str()).as_str()],
+            vec![format!("group/{}/First", first.as_str()).as_str()],
             "the gateway Profile starts with what was published"
         );
 
@@ -1667,9 +1643,13 @@ mod fingerprint_tests {
         service
             .create_model_route(vibex_core::ModelRoute {
                 display_name: "Team".to_string(),
-                kind: vibex_core::RouteKind::ProviderGroup,
+                kind: vibex_core::RouteKind::ModelGroup,
                 status: vibex_core::RouteStatus::Enabled,
-                members: vec![vibex_core::ModelRouteMember::provider(shared.clone(), 0)],
+                members: vec![vibex_core::ModelRouteMember::new(
+                    shared.clone(),
+                    "deepseek-chat",
+                    0,
+                )],
                 ..Default::default()
             })
             .map(|route| {

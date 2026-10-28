@@ -155,10 +155,9 @@ impl ProviderConfigService {
                 let profile = vibex_db::ProviderProfileRepository::get(&conn, &legacy_id)?;
                 Ok(profile.filter(|profile| &profile.agent_id == agent_id))
             }
-            vibex_core::RouteKind::ProviderGroup | vibex_core::RouteKind::ModelGroup => {
-                // A group contributes one catalogue entry per shared model (or
-                // one virtual model for a model group), so the Profile carries
-                // the group's prefix rather than one id.
+            vibex_core::RouteKind::ModelGroup => {
+                // A model group contributes one catalogue entry, so the
+                // Profile carries the group's prefix rather than one id.
                 let prefix = route.model_id();
                 Ok(self.gateway_legacy_profile(agent_id)?.filter(|profile| {
                     profile
@@ -203,6 +202,7 @@ impl ProviderConfigService {
         route.created_at_ms = now;
         route.updated_at_ms = now;
         route.deleted_at_ms = None;
+        route.sync_agent_model_id();
         route.sort_members();
         route.validate()?;
         let conn = self.open_connection()?;
@@ -233,6 +233,7 @@ impl ProviderConfigService {
         mut route: ModelRoute,
         expected_revision: i64,
     ) -> VibexResult<ModelRoute> {
+        route.sync_agent_model_id();
         route.sort_members();
         route.validate()?;
         let conn = self.open_connection()?;
@@ -362,10 +363,9 @@ impl ProviderConfigService {
     /// a 404 from the gateway at request time, long after the route was saved
     /// and attributed to a Provider that never had the model.
     ///
-    /// A provider-group member names a Provider and no model, which `validate`
-    /// already requires, so there is no model to look up: the group's models are
-    /// the intersection of its Providers' catalogues and are derived later. Only
-    /// the Provider has to exist.
+    /// Every group member names a model its Provider serves; a member whose
+    /// Provider has no catalogue is treated as open, because the catalogue may
+    /// not have been fetched yet.
     fn require_members_are_served(
         &self,
         conn: &vibex_db::DbConnection,
@@ -449,19 +449,31 @@ mod tests {
         name: &str,
         models: &[&str],
     ) -> ModelProviderProfileId {
+        let mut configured_models = models
+            .iter()
+            .map(|model| ModelProviderCatalogEntry {
+                id: (*model).to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        if !configured_models.is_empty()
+            && !configured_models.iter().any(|entry| entry.id == "model")
+        {
+            configured_models.push(ModelProviderCatalogEntry {
+                id: "model".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            });
+        }
         let profile = ModelProviderProfile {
             display_name: name.to_string(),
             status: ModelProviderProfileStatus::Enabled,
-            configured_models: models
-                .iter()
-                .map(|model| ModelProviderCatalogEntry {
-                    id: (*model).to_string(),
-                    display_name: None,
-                    enabled: true,
-                    metadata: Vec::new(),
-                    capabilities: Default::default(),
-                })
-                .collect(),
+            configured_models,
             ..Default::default()
         };
         service
@@ -480,14 +492,15 @@ mod tests {
             .id
     }
 
-    /// A route group naming one Provider.
+    /// A model group naming one Provider and the shared test model.
     fn group(provider: ModelProviderProfileId) -> ModelRoute {
         ModelRoute {
             display_name: "Standard".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Standard".to_string()),
             strategy: RouteStrategy::Ordered,
             status: RouteStatus::Enabled,
-            members: vec![ModelRouteMember::provider(provider, 0)],
+            members: vec![ModelRouteMember::new(provider, "model", 0)],
             ..Default::default()
         }
     }
@@ -517,21 +530,15 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// A group names Providers, so its members carry no model at all.
-    ///
-    /// The models it offers are the intersection of the Providers' catalogues,
-    /// computed at read time; storing one on the member would be a second,
-    /// conflicting way to say which models the group offers.
+    /// A group member names the upstream model it calls.
     #[test]
-    fn a_group_member_naming_a_model_is_refused() {
+    fn a_group_member_must_name_a_model() {
         let (path, service) = service();
         let deepseek = provider(&service, "DeepSeek", &["deepseek-chat"]);
-        let mut route = group(deepseek.clone());
-        route.members[0].model_id = "deepseek-chat".to_string();
+        let mut route = group(deepseek);
+        route.members[0].model_id = String::new();
         let error = service.create_model_route(route).unwrap_err();
-        assert_eq!(error.code, "route_group_member_model_unexpected");
-
-        let _ = deepseek;
+        assert_eq!(error.code, "route_member_model_invalid");
         let _ = std::fs::remove_file(path);
     }
 
@@ -588,8 +595,12 @@ mod tests {
         let (path, service) = service();
         let deepseek = provider(&service, "DeepSeek", &["a"]);
         let kimi = provider(&service, "Kimi", &["a"]);
-        let first = service.create_model_route(group(deepseek)).unwrap();
-        let second = service.create_model_route(group(kimi)).unwrap();
+        let mut first = group(deepseek);
+        first.display_name = "First".to_string();
+        let first = service.create_model_route(first).unwrap();
+        let mut second = group(kimi);
+        second.display_name = "Second".to_string();
+        let second = service.create_model_route(second).unwrap();
         let agent = AgentId::parse("codex").unwrap();
 
         service.bind_model_route(&agent, &first.id, true).unwrap();
@@ -613,7 +624,7 @@ mod tests {
         let mut route = group(deepseek.clone());
         route
             .members
-            .push(ModelRouteMember::provider(kimi.clone(), 1));
+            .push(ModelRouteMember::new(kimi.clone(), "model", 1));
         let route = service.create_model_route(route).unwrap();
 
         let mut next = route.clone();
@@ -635,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn updating_to_a_model_member_is_refused_and_the_route_is_untouched() {
+    fn updating_to_an_unknown_model_is_refused_and_the_route_is_untouched() {
         let (path, service) = service();
         let deepseek = provider(&service, "DeepSeek", &["a"]);
         let route = service.create_model_route(group(deepseek)).unwrap();
@@ -645,11 +656,11 @@ mod tests {
         let error = service
             .update_model_route(next, route.revision)
             .unwrap_err();
-        assert_eq!(error.code, "route_group_member_model_unexpected");
+        assert_eq!(error.code, "model_route_member_model_unknown");
 
         // The rejected write must not have landed.
         let stored = service.get_model_route(&route.id).unwrap().unwrap();
-        assert!(stored.members[0].model_id.is_empty());
+        assert_eq!(stored.members[0].model_id, "model");
         assert_eq!(stored.revision, route.revision);
         let _ = std::fs::remove_file(path);
     }
@@ -733,7 +744,7 @@ mod tests {
         route_a.display_name = "Standard".to_string();
         route_a
             .members
-            .push(ModelRouteMember::provider(kimi.clone(), 1));
+            .push(ModelRouteMember::new(kimi.clone(), "model", 1));
         let route_a = service.create_model_route(route_a).unwrap();
 
         // Route B: Kimi first, DeepSeek second.
@@ -741,7 +752,7 @@ mod tests {
         route_b.display_name = "Kimi first".to_string();
         route_b
             .members
-            .push(ModelRouteMember::provider(deepseek.clone(), 1));
+            .push(ModelRouteMember::new(deepseek.clone(), "model", 1));
         let route_b = service.create_model_route(route_b).unwrap();
 
         let codex = AgentId::parse("codex").unwrap();
@@ -794,16 +805,21 @@ mod tests {
 
         let mut at_limit = group(providers[0].clone());
         for (index, provider) in providers.iter().enumerate().skip(1).take(15) {
-            at_limit
-                .members
-                .push(ModelRouteMember::provider(provider.clone(), index as i64));
+            at_limit.members.push(ModelRouteMember::new(
+                provider.clone(),
+                "model",
+                index as i64,
+            ));
         }
         assert!(service.create_model_route(at_limit).is_ok());
 
         let mut over = group(providers[0].clone());
         for (index, provider) in providers.iter().enumerate().skip(1) {
-            over.members
-                .push(ModelRouteMember::provider(provider.clone(), index as i64));
+            over.members.push(ModelRouteMember::new(
+                provider.clone(),
+                "model",
+                index as i64,
+            ));
         }
         over.display_name = "Too many".to_string();
         let error = service.create_model_route(over).unwrap_err();
@@ -836,29 +852,25 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// A group is not refused for its empty member model.
-    ///
-    /// `require_members_are_served` used to run the catalogue check on the empty
-    /// model id a group member carries, which refused every group once the route
-    /// budget stopped refusing it first.
+    /// A group saves when its members name the same model.
     #[test]
-    fn a_provider_group_is_not_refused_for_its_empty_member_model() {
+    fn a_model_group_accepts_one_model_at_two_providers() {
         let (path, service) = service();
         let left = provider(&service, "DeepSeek", &["shared", "left-only"]);
         let right = provider(&service, "Kimi", &["shared"]);
         let group = ModelRoute {
             display_name: "Team".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
             strategy: RouteStrategy::RoundRobin,
             status: RouteStatus::Enabled,
             members: vec![
-                ModelRouteMember::provider(left, 0),
-                ModelRouteMember::provider(right, 1),
+                ModelRouteMember::new(left, "shared", 0),
+                ModelRouteMember::new(right, "shared", 1),
             ],
             ..Default::default()
         };
         let created = service.create_model_route(group).unwrap();
-        assert!(created.is_provider_group());
+        assert!(created.is_model_group());
         assert_eq!(created.members.len(), 2);
         let _ = std::fs::remove_file(path);
     }
@@ -919,7 +931,7 @@ mod tests {
         let mut mixed = group(deepseek.clone());
         mixed
             .members
-            .push(ModelRouteMember::provider(kimi.clone(), 1));
+            .push(ModelRouteMember::new(kimi.clone(), "model", 1));
         mixed.display_name = "Mixed".to_string();
         service.create_model_route(mixed).unwrap();
 
@@ -998,12 +1010,12 @@ mod catalog_tests {
         service
             .create_model_route(ModelRoute {
                 display_name: "Standard".to_string(),
-                kind: RouteKind::ProviderGroup,
+                kind: RouteKind::ModelGroup,
                 strategy: RouteStrategy::Ordered,
                 status: RouteStatus::Enabled,
                 members: vec![
-                    ModelRouteMember::provider(first.clone(), 0),
-                    ModelRouteMember::provider(second.clone(), 1),
+                    ModelRouteMember::new(first.clone(), "flash", 0),
+                    ModelRouteMember::new(second.clone(), "flash", 1),
                 ],
                 ..Default::default()
             })
@@ -1066,10 +1078,10 @@ mod catalog_tests {
         service
             .create_model_route(ModelRoute {
                 display_name: "Off".to_string(),
-                kind: RouteKind::ProviderGroup,
+                kind: RouteKind::ModelGroup,
                 strategy: RouteStrategy::Ordered,
                 status: RouteStatus::Disabled,
-                members: vec![ModelRouteMember::provider(provider_id, 0)],
+                members: vec![ModelRouteMember::new(provider_id, "flash", 0)],
                 ..Default::default()
             })
             .unwrap();
@@ -1162,12 +1174,12 @@ mod capability_tests {
         service
             .create_model_route(ModelRoute {
                 display_name: "Mixed".to_string(),
-                kind: RouteKind::ProviderGroup,
+                kind: RouteKind::ModelGroup,
                 strategy: RouteStrategy::Ordered,
                 status: RouteStatus::Enabled,
                 members: vec![
-                    ModelRouteMember::provider(wide, 0),
-                    ModelRouteMember::provider(narrow, 1),
+                    ModelRouteMember::new(wide, "m", 0),
+                    ModelRouteMember::new(narrow, "m", 1),
                 ],
                 ..Default::default()
             })
@@ -1178,11 +1190,20 @@ mod capability_tests {
         let route = vibex_db::ModelRouteRepository::list(&conn)
             .unwrap()
             .remove(0);
-        let merged = vibex_core::provider_group_models(&route, &profiles)
-            .into_iter()
-            .find(|model| model.model_id == "m")
-            .expect("both Providers serve m")
-            .capabilities;
+        let merged = vibex_core::intersect_route_capabilities(route.enabled_members().filter_map(
+            |member| {
+                profiles
+                    .iter()
+                    .find(|profile| profile.id == member.model_provider_profile_id)
+                    .and_then(|profile| {
+                        profile
+                            .configured_models
+                            .iter()
+                            .find(|entry| entry.enabled && entry.id == member.model_id)
+                    })
+                    .map(|entry| entry.capabilities.clone())
+            },
+        ));
         assert_eq!(
             merged.context_tokens,
             Some(32_000),
@@ -1209,11 +1230,11 @@ mod capability_tests {
         service
             .create_model_route(ModelRoute {
                 display_name: "Declared".to_string(),
-                kind: RouteKind::ProviderGroup,
+                kind: RouteKind::ModelGroup,
                 strategy: RouteStrategy::Ordered,
                 status: RouteStatus::Enabled,
                 context_tokens: Some(64_000),
-                members: vec![ModelRouteMember::provider(small, 0)],
+                members: vec![ModelRouteMember::new(small, "m", 0)],
                 ..Default::default()
             })
             .unwrap();
@@ -1225,11 +1246,20 @@ mod capability_tests {
             .remove(0);
         // A group's explicit window overrides the smallest-member rule when the
         // group is projected into an Agent's Profile.
-        let merged = vibex_core::provider_group_models(&route, &profiles)
-            .into_iter()
-            .find(|model| model.model_id == "m")
-            .expect("the Provider serves m")
-            .capabilities;
+        let merged = vibex_core::intersect_route_capabilities(route.enabled_members().filter_map(
+            |member| {
+                profiles
+                    .iter()
+                    .find(|profile| profile.id == member.model_provider_profile_id)
+                    .and_then(|profile| {
+                        profile
+                            .configured_models
+                            .iter()
+                            .find(|entry| entry.enabled && entry.id == member.model_id)
+                    })
+                    .map(|entry| entry.capabilities.clone())
+            },
+        ));
         let declared = route.context_tokens.or(merged.context_tokens);
         assert_eq!(declared, Some(64_000));
         let _ = std::fs::remove_file(path);
@@ -1326,7 +1356,7 @@ mod model_group_tests {
             ))
             .unwrap();
         assert_eq!(route.kind, RouteKind::ModelGroup);
-        assert_eq!(route.agent_model_id.as_deref(), Some("vibex-fast"));
+        assert_eq!(route.agent_model_id.as_deref(), Some("Fast"));
         assert_eq!(route.members.len(), 2);
         let _ = std::fs::remove_file(path);
     }

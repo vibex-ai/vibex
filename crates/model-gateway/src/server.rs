@@ -230,7 +230,7 @@ fn patience_delay(retries: u32) -> Option<std::time::Duration> {
 fn model_group_id(body: &axum::body::Bytes) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let model = value.get("model")?.as_str()?;
-    vibex_core::provider_group_model_ref(model).map(|parsed| parsed.group_id.to_string())
+    vibex_core::route_group_model_ref(model).map(|parsed| parsed.group_id.to_string())
 }
 
 async fn serve(

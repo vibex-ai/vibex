@@ -5975,7 +5975,7 @@ fn route_model_display_label(
     model_route_id: &vibex_core::ModelRouteId,
     model_id: &str,
 ) -> String {
-    let Some(parsed) = vibex_core::provider_group_model_ref(model_id) else {
+    let Some(parsed) = vibex_core::route_group_model_ref(model_id) else {
         return model_id.to_string();
     };
     // The route the selection names decides whose catalogue to ask. An id that
@@ -6912,10 +6912,13 @@ mod tests {
                 id: route_id.clone(),
                 display_name: "route group".to_string(),
                 description: None,
-                kind: RouteKind::ProviderGroup,
-                // A provider group names Providers, not models: its models are
-                // the intersection of their catalogues.
-                members: vec![ModelRouteMember::new(provider.id.clone(), "", 0)],
+                kind: RouteKind::ModelGroup,
+                agent_model_id: Some("deepseek-v4.1-flash".to_string()),
+                members: vec![ModelRouteMember::new(
+                    provider.id.clone(),
+                    "deepseek-v4.1-flash",
+                    0,
+                )],
                 strategy: RouteStrategy::Ordered,
                 first_token_timeout_ms: None,
                 context_tokens: None,
@@ -6927,6 +6930,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
                 deleted_at_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();

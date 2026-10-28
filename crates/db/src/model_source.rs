@@ -1147,10 +1147,11 @@ mod tests {
         let now = unix_timestamp_ms().max(1);
         let route = ModelRoute {
             display_name: "Route".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Route".to_string()),
             strategy: RouteStrategy::Ordered,
             status: RouteStatus::Enabled,
-            members: vec![ModelRouteMember::provider(provider_id.clone(), 0)],
+            members: vec![ModelRouteMember::new(provider_id.clone(), "m", 0)],
             created_at_ms: now,
             updated_at_ms: now,
             ..Default::default()

@@ -1025,10 +1025,10 @@ pub fn legacy_profile_for_route(
             let profile = super::ProviderProfileRepository::get(conn, &legacy_id)?;
             Ok(profile.filter(|profile| &profile.agent_id == agent_id))
         }
-        vibex_core::RouteKind::ProviderGroup | vibex_core::RouteKind::ModelGroup => {
+        vibex_core::RouteKind::ModelGroup => {
             // A gateway Profile is per Agent and lists exactly the groups that
-            // Agent is bound to. A group contributes one entry per shared
-            // model, so the check is by prefix rather than by a single id.
+            // Agent is bound to. A group contributes one entry, so the check is
+            // by prefix rather than by a single id.
             let prefix = route.model_id();
             let profiles = super::ProviderProfileRepository::list_by_agent(conn, agent_id, true)?;
             Ok(profiles
@@ -1174,39 +1174,40 @@ mod tests {
         profile.id
     }
 
-    /// A provider group naming one Provider.
+    /// A model group naming one Provider and the given upstream models.
     ///
     /// Groups are the only gateway shape, so the test helper builds one; a test
     /// that needs the direct shape sets `kind` itself.
-    fn route(provider: &ModelProviderProfileId, _models: &[&str]) -> ModelRoute {
+    fn route(provider: &ModelProviderProfileId, models: &[&str]) -> ModelRoute {
         ModelRoute {
             display_name: "Standard".to_string(),
             status: RouteStatus::Enabled,
-            kind: RouteKind::ProviderGroup,
-            members: vec![ModelRouteMember::provider(provider.clone(), 0)],
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Standard".to_string()),
+            members: models
+                .iter()
+                .enumerate()
+                .map(|(index, model)| ModelRouteMember::new(provider.clone(), *model, index as i64))
+                .collect(),
             ..Default::default()
         }
     }
 
-    /// A provider group stores Providers rather than models, and reads back
-    /// with the empty model ids intact.
-    ///
-    /// This is the one part of the group shape storage has to tolerate: the
-    /// member table's `model_id` is NOT NULL, so the empty string is what says
-    /// "this member is a Provider, not a model".
+    /// A model group round-trips its members and their upstream models.
     #[test]
-    fn a_provider_group_round_trips_its_providers() {
+    fn a_model_group_round_trips_its_members() {
         let conn = migrated_connection();
         let left = seed_provider(&conn, "DeepSeek");
         let right = seed_provider(&conn, "Kimi");
         let route = ModelRoute {
             display_name: "Team".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Team".to_string()),
             status: RouteStatus::Enabled,
             strategy: RouteStrategy::RoundRobin,
             members: vec![
-                ModelRouteMember::provider(left.clone(), 0),
-                ModelRouteMember::provider(right.clone(), 1),
+                ModelRouteMember::new(left.clone(), "deepseek-chat", 0),
+                ModelRouteMember::new(right.clone(), "kimi-k2", 1),
             ],
             ..Default::default()
         };
@@ -1214,20 +1215,23 @@ mod tests {
         let loaded = ModelRouteRepository::get(&conn, &route.id)
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.kind, RouteKind::ProviderGroup);
+        assert_eq!(loaded.kind, RouteKind::ModelGroup);
+        assert_eq!(loaded.agent_model(), Some("Team"));
         assert_eq!(loaded.strategy, RouteStrategy::RoundRobin);
         assert_eq!(
             loaded
                 .members
                 .iter()
-                .map(|member| member.model_provider_profile_id.clone())
+                .map(|member| (
+                    member.model_provider_profile_id.clone(),
+                    member.model_id.clone()
+                ))
                 .collect::<Vec<_>>(),
-            vec![left, right],
-            "provider order is the attempt order"
-        );
-        assert!(
-            loaded.members.iter().all(|member| !member.names_model()),
-            "a group member names a Provider, not a model"
+            vec![
+                (left, "deepseek-chat".to_string()),
+                (right, "kimi-k2".to_string())
+            ],
+            "member order and upstream models are the attempt order"
         );
     }
 
@@ -1259,9 +1263,10 @@ mod tests {
 
         let group = ModelRoute {
             display_name: "Group".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Group".to_string()),
             status: RouteStatus::Enabled,
-            members: vec![ModelRouteMember::provider(provider, 0)],
+            members: vec![ModelRouteMember::new(provider, "m", 0)],
             ..Default::default()
         };
         ModelRouteRepository::insert(&conn, &group).unwrap();
@@ -1498,10 +1503,14 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.display_name, "Standard");
         assert_eq!(loaded.strategy, RouteStrategy::LeastUsed);
-        assert_eq!(loaded.kind, RouteKind::ProviderGroup);
-        assert!(
-            loaded.members.iter().all(|member| !member.names_model()),
-            "a group names Providers, not models"
+        assert_eq!(loaded.kind, RouteKind::ModelGroup);
+        assert_eq!(
+            loaded
+                .members
+                .iter()
+                .map(|member| member.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
         );
     }
 
@@ -1512,11 +1521,12 @@ mod tests {
         let second = seed_provider(&conn, "Kimi");
         let mut route = ModelRoute {
             display_name: "Group".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Group".to_string()),
             status: RouteStatus::Enabled,
             members: vec![
-                ModelRouteMember::provider(first.clone(), 0),
-                ModelRouteMember::provider(second.clone(), 1),
+                ModelRouteMember::new(first.clone(), "a", 0),
+                ModelRouteMember::new(second.clone(), "b", 1),
             ],
             ..Default::default()
         };
@@ -1576,8 +1586,10 @@ mod tests {
         let agent = AgentId::parse("codex").unwrap();
         let mut first = route(&provider, &["a"]);
         first.display_name = "First".to_string();
+        first.agent_model_id = Some("First".to_string());
         let mut second = route(&provider, &["b"]);
         second.display_name = "Second".to_string();
+        second.agent_model_id = Some("Second".to_string());
         ModelRouteRepository::insert(&conn, &first).unwrap();
         ModelRouteRepository::insert(&conn, &second).unwrap();
 
@@ -1610,7 +1622,9 @@ mod tests {
         let provider = seed_provider(&conn, "DeepSeek");
         let agent = AgentId::parse("codex").unwrap();
         let first = route(&provider, &["a"]);
-        let second = route(&provider, &["b"]);
+        let mut second = route(&provider, &["b"]);
+        second.display_name = "Second".to_string();
+        second.agent_model_id = Some("Second".to_string());
         ModelRouteRepository::insert(&conn, &first).unwrap();
         ModelRouteRepository::insert(&conn, &second).unwrap();
 
@@ -1666,7 +1680,9 @@ mod tests {
         let provider = seed_provider(&conn, "DeepSeek");
         let agent = AgentId::parse("claude").unwrap();
         let first = route(&provider, &["a"]);
-        let second = route(&provider, &["b"]);
+        let mut second = route(&provider, &["b"]);
+        second.display_name = "Second".to_string();
+        second.agent_model_id = Some("Second".to_string());
         ModelRouteRepository::insert(&conn, &first).unwrap();
         ModelRouteRepository::insert(&conn, &second).unwrap();
 
@@ -1748,10 +1764,13 @@ mod tests {
         let provider = seed_provider(&conn, "DeepSeek");
         let mut beta = route(&provider, &["a"]);
         beta.display_name = "Beta".to_string();
+        beta.agent_model_id = Some("Beta".to_string());
         let mut alpha = route(&provider, &["b"]);
         alpha.display_name = "Alpha".to_string();
+        alpha.agent_model_id = Some("Alpha".to_string());
         let mut off = route(&provider, &["c"]);
         off.display_name = "Zeta".to_string();
+        off.agent_model_id = Some("Zeta".to_string());
         off.status = RouteStatus::Disabled;
         for route in [&beta, &alpha, &off] {
             ModelRouteRepository::insert(&conn, route).unwrap();
@@ -1774,11 +1793,12 @@ mod tests {
         let kimi = seed_provider(&conn, "Kimi");
         let naming_both = ModelRoute {
             display_name: "Both".to_string(),
-            kind: RouteKind::ProviderGroup,
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("Both".to_string()),
             status: RouteStatus::Enabled,
             members: vec![
-                ModelRouteMember::provider(deepseek.clone(), 0),
-                ModelRouteMember::provider(kimi.clone(), 1),
+                ModelRouteMember::new(deepseek.clone(), "a", 0),
+                ModelRouteMember::new(kimi.clone(), "b", 1),
             ],
             ..Default::default()
         };
@@ -1902,8 +1922,9 @@ mod route_policy_tests {
 
         let route = ModelRoute {
             display_name: "Standard".to_string(),
-            kind: vibex_core::RouteKind::ProviderGroup,
-            members: vec![vibex_core::ModelRouteMember::provider(provider, 0)],
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("Standard".to_string()),
+            members: vec![vibex_core::ModelRouteMember::new(provider, "m", 0)],
             status: vibex_core::RouteStatus::Enabled,
             pin: vibex_core::GatewayPinScope::Conversation,
             failover: vibex_core::GatewayFailover::Ask,
@@ -1969,7 +1990,7 @@ mod route_policy_tests {
         let route = ModelRoute {
             display_name: "Fast".to_string(),
             kind: RouteKind::ModelGroup,
-            agent_model_id: Some("vibex-fast".to_string()),
+            agent_model_id: Some("Fast".to_string()),
             strategy: RouteStrategy::Weighted,
             members: vec![first.clone(), second],
             rules: vec![ModelRouteRule {
@@ -1996,7 +2017,7 @@ mod route_policy_tests {
             .unwrap()
             .expect("the model group must exist");
         assert_eq!(read.kind, RouteKind::ModelGroup);
-        assert_eq!(read.agent_model_id.as_deref(), Some("vibex-fast"));
+        assert_eq!(read.agent_model_id.as_deref(), Some("Fast"));
         assert_eq!(read.strategy, RouteStrategy::Weighted);
         assert_eq!(read.rules.len(), 1);
         assert_eq!(read.rules[0].id, "rule-1");
@@ -2059,9 +2080,9 @@ mod route_policy_tests {
             status: RouteStatus::Enabled,
             ..Default::default()
         };
-        ModelRouteRepository::insert(&conn, &route("One")).unwrap();
+        ModelRouteRepository::insert(&conn, &route("Shared model")).unwrap();
         assert!(
-            ModelRouteRepository::insert(&conn, &route("Two")).is_err(),
+            ModelRouteRepository::insert(&conn, &route("Shared model")).is_err(),
             "the database must refuse a second live group with the same virtual model"
         );
     }

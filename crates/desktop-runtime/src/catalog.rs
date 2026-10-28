@@ -306,25 +306,14 @@ impl RuntimeOptionCatalogService {
         let Ok(routes) = self.provider_config.list_enabled_model_routes() else {
             return BTreeMap::new();
         };
-        // A provider group's models are the intersection of its Providers'
-        // catalogues, so the facts need the Providers themselves.
-        let providers = self.provider_config.list_model_provider_profiles().ok();
         routes
             .into_iter()
             .map(|route| {
-                let models = match (&providers, route.kind) {
-                    (Some(providers), vibex_core::RouteKind::ProviderGroup) => {
-                        vibex_core::provider_group_models(&route, providers)
-                            .into_iter()
-                            .map(|model| model.model_id)
-                            .collect::<Vec<_>>()
-                    }
-                    _ => route
-                        .distinct_models()
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
-                };
+                let models = route
+                    .distinct_models()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
                 let facts = RuntimeRouteFacts {
                     display_name: route.display_name.clone(),
                     agent_ids: self.route_agents(&route.id).unwrap_or_default(),

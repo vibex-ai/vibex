@@ -276,10 +276,10 @@ mod tests {
         service
             .create_model_route(ModelRoute {
                 display_name: "Route".to_string(),
-                kind: RouteKind::ProviderGroup,
+                kind: RouteKind::ModelGroup,
                 strategy: RouteStrategy::Ordered,
                 status: RouteStatus::Enabled,
-                members: vec![ModelRouteMember::provider(provider.id.clone(), 0)],
+                members: vec![ModelRouteMember::new(provider.id.clone(), "route-model", 0)],
                 ..Default::default()
             })
             .unwrap()

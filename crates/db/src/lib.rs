@@ -97,7 +97,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 83;
+pub const CURRENT_SCHEMA_VERSION: i64 = 84;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12506,6 +12506,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // itself is column-by-column, so a rewound version row over an existing
     // schema is safe to re-run.
     apply_model_group_routing(conn, &mut applied)?;
+    apply_retire_provider_groups(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -13384,6 +13385,269 @@ fn apply_route_failover(conn: &mut Connection, applied: &mut Vec<String>) -> Vib
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
+}
+
+/// Retires the whole-Provider group shape.
+///
+/// A group now names models, not Providers, so every surviving row keeps its
+/// identity and policy but gains an Agent-facing model id and one model per
+/// member. A member whose Provider has no enabled model is dropped: it cannot
+/// answer a request for a model group, and keeping it would make the group look
+/// larger than it is. A group left with no members is disabled rather than
+/// deleted, so a reader can still see and repair what they saved.
+///
+/// `provider_group` rows already load as model groups through
+/// `RouteKind::from_id`; this migration is what gives them a callable shape.
+fn apply_retire_provider_groups(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 84;
+    const NAME: &str = "retire_provider_groups";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start provider group retirement transaction",
+    ))?;
+    // Including soft-deleted rows: a restore would otherwise meet a kind the
+    // reader no longer recognises.
+    tx.execute(
+        "UPDATE model_routes SET kind = 'model_group' WHERE kind = 'provider_group'",
+        [],
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to rewrite the retired provider group kind",
+    ))?;
+
+    let routes = {
+        let mut statement = tx
+            .prepare(
+                "SELECT model_route_id, display_name, agent_model_id
+                 FROM model_routes
+                 WHERE kind = 'model_group' AND deleted_at_ms IS NULL",
+            )
+            .map_err(storage_err(
+                "migration_prepare_failed",
+                "failed to read the routes to retire",
+            ))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(storage_err(
+                "migration_read_failed",
+                "failed to read the routes to retire",
+            ))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_err(
+                "migration_read_failed",
+                "failed to read the routes to retire",
+            ))?
+    };
+    let mut taken = {
+        let mut statement = tx
+            .prepare(
+                "SELECT agent_model_id FROM model_routes
+                 WHERE agent_model_id IS NOT NULL AND deleted_at_ms IS NULL",
+            )
+            .map_err(storage_err(
+                "migration_prepare_failed",
+                "failed to read the group model ids",
+            ))?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_err(
+                "migration_read_failed",
+                "failed to read the group model ids",
+            ))?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(storage_err(
+                "migration_read_failed",
+                "failed to read the group model ids",
+            ))?
+    };
+
+    for (route_id, display_name, agent_model_id) in routes {
+        let members = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT model_route_member_id, model_provider_profile_id, model_id
+                     FROM model_route_members
+                     WHERE model_route_id = ?1
+                     ORDER BY order_index",
+                )
+                .map_err(storage_err(
+                    "migration_prepare_failed",
+                    "failed to read a retired group member",
+                ))?;
+            statement
+                .query_map(params![route_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(storage_err(
+                    "migration_read_failed",
+                    "failed to read a retired group member",
+                ))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage_err(
+                    "migration_read_failed",
+                    "failed to read a retired group member",
+                ))?
+        };
+        let mut changed = false;
+        for (member_id, provider_id, model_id) in members {
+            if !model_id.trim().is_empty() {
+                continue;
+            }
+            changed = true;
+            let profile = tx
+                .query_row(
+                    "SELECT configured_models_json, default_model_id
+                     FROM model_provider_profiles
+                     WHERE model_provider_profile_id = ?1 AND deleted_at_ms IS NULL",
+                    params![provider_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(storage_err(
+                    "migration_read_failed",
+                    "failed to read a retired group's Provider",
+                ))?;
+            let picked = profile.and_then(|(configured, default)| {
+                let entries =
+                    serde_json::from_str::<Vec<vibex_core::ModelProviderCatalogEntry>>(&configured)
+                        .unwrap_or_default();
+                default
+                    .filter(|id| entries.iter().any(|entry| entry.enabled && &entry.id == id))
+                    .or_else(|| {
+                        entries
+                            .iter()
+                            .find(|entry| entry.enabled)
+                            .map(|entry| entry.id.clone())
+                    })
+            });
+            match picked {
+                Some(model) => {
+                    tx.execute(
+                        "UPDATE model_route_members SET model_id = ?1
+                         WHERE model_route_member_id = ?2",
+                        params![model, member_id],
+                    )
+                    .map_err(storage_err(
+                        "migration_apply_failed",
+                        "failed to give a retired group member its model",
+                    ))?;
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM model_route_members WHERE model_route_member_id = ?1",
+                        params![member_id],
+                    )
+                    .map_err(storage_err(
+                        "migration_apply_failed",
+                        "failed to drop a retired group member with no model",
+                    ))?;
+                }
+            }
+        }
+        if changed {
+            let remaining: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM model_route_members WHERE model_route_id = ?1",
+                    params![route_id],
+                    |row| row.get(0),
+                )
+                .map_err(storage_err(
+                    "migration_read_failed",
+                    "failed to count a retired group's members",
+                ))?;
+            if remaining == 0 {
+                tx.execute(
+                    "UPDATE model_routes SET status = 'disabled' WHERE model_route_id = ?1",
+                    params![route_id],
+                )
+                .map_err(storage_err(
+                    "migration_apply_failed",
+                    "failed to disable a retired group with no members",
+                ))?;
+            }
+        }
+        if agent_model_id.is_none() {
+            // The retired shape had a name but no callable id. The name is the
+            // model the Agent now asks for, made unique because the gateway
+            // catalogue is keyed by it.
+            let base = route_group_model_id_from_name(&display_name);
+            let unique = unique_route_group_model_id(&base, &taken);
+            taken.insert(unique.clone());
+            tx.execute(
+                "UPDATE model_routes SET agent_model_id = ?1, display_name = ?2
+                 WHERE model_route_id = ?3",
+                params![unique, unique, route_id],
+            )
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to name a retired group's model",
+            ))?;
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the provider group retirement migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the provider group retirement migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// The Agent-facing id a group name becomes.
+///
+/// A model group publishes one model, and its name is that model. The slash is
+/// the one character the `group/<route>/<model>` address cannot carry, so it is
+/// replaced rather than refusing a name a reader already saved.
+fn route_group_model_id_from_name(name: &str) -> String {
+    let replaced = name.trim().replace('/', "-");
+    let bounded: String = replaced.chars().take(160).collect();
+    if bounded.trim().is_empty() {
+        "Group".to_string()
+    } else {
+        bounded
+    }
+}
+
+/// Appends a suffix until the Agent-facing id is unique among live groups.
+fn unique_route_group_model_id(base: &str, taken: &BTreeSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    for number in 2..1000 {
+        let suffix = format!(" ({number})");
+        let keep = 160usize.saturating_sub(suffix.chars().count());
+        let stem: String = base.chars().take(keep).collect();
+        let candidate = format!("{stem}{suffix}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{}-{}", base, unix_timestamp_ms())
 }
 
 /// Adds the model-level routing columns to the reusable route tables.
@@ -18914,6 +19178,7 @@ mod tests {
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
                 "83:model_group_routing",
+                "84:retire_provider_groups",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19081,6 +19346,7 @@ mod tests {
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
                 "83:model_group_routing",
+                "84:retire_provider_groups",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19229,6 +19495,7 @@ mod tests {
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
                 "83:model_group_routing",
+                "84:retire_provider_groups",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19415,6 +19682,7 @@ mod tests {
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
                 "83:model_group_routing",
+                "84:retire_provider_groups",
             ]
         );
         assert_eq!(
@@ -20861,6 +21129,7 @@ mod tests {
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
                 "83:model_group_routing",
+                "84:retire_provider_groups",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

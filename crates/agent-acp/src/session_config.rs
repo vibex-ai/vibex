@@ -903,23 +903,17 @@ pub struct RuntimeRouteFacts {
 impl RuntimeRouteFacts {
     /// The model id a session selects for one of this route's models.
     ///
-    /// A group is many models, so each carries the model in the id. A direct
+    /// A group publishes one model, and the model id carries it. A direct
     /// route never reaches the gateway, so it has no gateway id at all: the
     /// id it returns here only labels the option, and the launch path resolves
     /// it through the direct Provider instead.
     pub fn option_model_id(&self, route_id: &vibex_core::ModelRouteId, model: &str) -> String {
-        match self.kind {
-            vibex_core::RouteKind::ProviderGroup
-            | vibex_core::RouteKind::ModelGroup
-            | vibex_core::RouteKind::Direct => {
-                format!(
-                    "{}{}/{}",
-                    vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
-                    route_id.as_str(),
-                    model
-                )
-            }
-        }
+        format!(
+            "{}{}/{}",
+            vibex_core::ROUTE_GROUP_MODEL_PREFIX,
+            route_id.as_str(),
+            model
+        )
     }
 }
 
@@ -959,7 +953,7 @@ fn route_fact_maps(
 /// Groups are the only gateway shape, so a model id either names one or is a
 /// Provider model; there is no other gateway prefix to recognise.
 fn route_model_ids(model_id: &str) -> Option<(vibex_core::ModelRouteId, Option<&str>)> {
-    let parsed = vibex_core::provider_group_model_ref(model_id)?;
+    let parsed = vibex_core::route_group_model_ref(model_id)?;
     let id = vibex_core::ModelRouteId::parse(parsed.group_id).ok()?;
     Some((id, Some(parsed.model_id)))
 }
@@ -1124,7 +1118,7 @@ pub fn build_runtime_option_catalog_for_agents(
                         SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
                     selection.model = RuntimeModelSelection::explicit(format!(
                         "{}{}/{}",
-                        vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+                        vibex_core::ROUTE_GROUP_MODEL_PREFIX,
                         route_id.as_str(),
                         group_model
                     ));
@@ -1347,7 +1341,7 @@ pub fn build_runtime_option_catalog(
                         SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
                     selection.model = RuntimeModelSelection::explicit(format!(
                         "{}{}/{}",
-                        vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+                        vibex_core::ROUTE_GROUP_MODEL_PREFIX,
                         route_id.as_str(),
                         group_model
                     ));
@@ -3738,7 +3732,7 @@ mod route_catalog_tests {
 
     fn route_facts(agent_id: &str, name: &str, count: usize) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
-            kind: vibex_core::RouteKind::ProviderGroup,
+            kind: vibex_core::RouteKind::ModelGroup,
             display_name: name.to_string(),
             agent_ids: vec![AgentId::parse(agent_id).unwrap()],
             member_count: count,
@@ -3902,7 +3896,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["m".to_string()],
                 via_gateway: true,
-                kind: vibex_core::RouteKind::ProviderGroup,
+                kind: vibex_core::RouteKind::ModelGroup,
             },
         )]
         .into_iter()
@@ -3932,38 +3926,27 @@ mod selector_route_priority_tests {
     /// A provider group publishes one option per shared model, and each option
     /// names the model in its id.
     ///
-    /// A group is not a model. Collapsing its entries into one option would
-    /// give the session a selection the gateway cannot resolve, because the
-    /// group's id alone says nothing about which model to serve.
+    /// A model group publishes one selectable option, named by its model.
     #[test]
-    fn a_provider_group_publishes_one_option_per_shared_model() {
+    fn a_model_group_publishes_one_option_for_its_model() {
         let group_id = vibex_core::ModelRouteId::new();
         let mut profile = acp_profile("codex", &[]);
-        profile.configured_models = vec![
-            ProviderConfiguredModel {
-                id: format!("group/{}/deepseek-chat", group_id.as_str()),
-                display_name: None,
-                enabled: true,
-                wire_api: None,
-                capabilities: Default::default(),
-            },
-            ProviderConfiguredModel {
-                id: format!("group/{}/kimi-k3", group_id.as_str()),
-                display_name: None,
-                enabled: true,
-                wire_api: None,
-                capabilities: Default::default(),
-            },
-        ];
+        profile.configured_models = vec![ProviderConfiguredModel {
+            id: format!("group/{}/deepseek-chat", group_id.as_str()),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        }];
         let routes = [(
             group_id.clone(),
             RuntimeRouteFacts {
                 display_name: "Team".to_string(),
                 agent_ids: vec![AgentId::parse("codex").unwrap()],
                 member_count: 2,
-                models: vec!["deepseek-chat".to_string(), "kimi-k3".to_string()],
+                models: vec!["deepseek-chat".to_string()],
                 via_gateway: true,
-                kind: vibex_core::RouteKind::ProviderGroup,
+                kind: vibex_core::RouteKind::ModelGroup,
             },
         )]
         .into_iter()
@@ -3974,44 +3957,20 @@ mod selector_route_priority_tests {
             &BTreeMap::new(),
             &routes,
         );
-        let mut labels = catalog
+        let options = catalog
             .options
             .iter()
-            .filter_map(|option| {
-                option
-                    .selection
-                    .auth_source
-                    .model_route_id()
-                    .filter(|id| **id == group_id)
-                    .map(|_| {
-                        (
-                            option.selection.model_id().unwrap_or_default().to_string(),
-                            option.model_label.clone(),
-                        )
-                    })
-            })
+            .filter(|option| option.selection.auth_source.model_route_id() == Some(&group_id))
             .collect::<Vec<_>>();
-        labels.sort();
+        assert_eq!(options.len(), 1, "a group publishes one model");
         assert_eq!(
-            labels,
-            vec![
-                (
-                    format!("group/{}/deepseek-chat", group_id.as_str()),
-                    "deepseek-chat".to_string()
-                ),
-                (
-                    format!("group/{}/kimi-k3", group_id.as_str()),
-                    "kimi-k3".to_string()
-                ),
-            ],
-            "each shared model is its own selectable option"
+            options[0].selection.model_id(),
+            Some(format!("group/{}/deepseek-chat", group_id.as_str()).as_str())
         );
-        assert!(
-            catalog
-                .options
-                .iter()
-                .all(|option| option.auth_source_label == "Team"),
-            "every group model is filed under the group's name"
+        assert_eq!(options[0].model_label, "deepseek-chat");
+        assert_eq!(
+            options[0].auth_source_label, "Team",
+            "the group's own name files the option"
         );
     }
 
@@ -4043,7 +4002,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["deepseek-chat".to_string()],
                 via_gateway: true,
-                kind: vibex_core::RouteKind::ProviderGroup,
+                kind: vibex_core::RouteKind::ModelGroup,
             },
         )]
         .into_iter()
@@ -4131,7 +4090,7 @@ mod direct_route_option_tests {
     fn facts(agent_id: &str, name: &str, via_gateway: bool) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
             kind: if via_gateway {
-                vibex_core::RouteKind::ProviderGroup
+                vibex_core::RouteKind::ModelGroup
             } else {
                 vibex_core::RouteKind::Direct
             },
