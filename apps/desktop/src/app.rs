@@ -83689,6 +83689,15 @@ impl FoundationSettings {
                                     )),
                             )
                         })
+                        .when_some(diagnostic.guidance.clone(), |this, guidance| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(muted)
+                                    .child(guidance),
+                            )
+                        })
                         .when(!hints.is_empty(), |this| {
                             this.child(
                                 div()

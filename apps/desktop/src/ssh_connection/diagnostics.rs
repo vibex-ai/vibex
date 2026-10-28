@@ -78,6 +78,8 @@ pub struct SshDiagnostic {
     pub message: String,
     pub actions: Vec<SshDiagnosticAction>,
     pub host_key_fingerprints: Vec<String>,
+    /// Short recovery instructions specific to the classified error.
+    pub guidance: Option<String>,
     pub diagnostics: String,
     pub log_command: Option<String>,
 }
@@ -172,6 +174,31 @@ pub fn diagnose_with_platform(
     };
     actions.dedup();
 
+    let guidance = match kind {
+        SshDiagnosticKind::RemoteLoginDisabled => Some(
+            "On the Mac, open System Settings → General → Sharing → Remote Login, or run `sudo systemsetup -setremotelogin on`."
+                .to_string(),
+        ),
+        SshDiagnosticKind::MissingClient => Some(
+            "Install OpenSSH: `sudo apt install openssh-client` on Debian/Ubuntu, or `brew install openssh` on macOS."
+                .to_string(),
+        ),
+        SshDiagnosticKind::MissingSshd | SshDiagnosticKind::ConnectionRefused => Some(
+            "Install and start an SSH server, or use the provider console to bootstrap it."
+                .to_string(),
+        ),
+        SshDiagnosticKind::Disk => Some(
+            "Free space under the remote home or install root, then retry.".to_string(),
+        ),
+        SshDiagnosticKind::Permission => Some(
+            "Check ownership and write permission on the remote home and install root."
+                .to_string(),
+        ),
+        SshDiagnosticKind::Port => Some(
+            "Free the runtime port or retry so the next free port is selected.".to_string(),
+        ),
+        _ => None,
+    };
     let log_command = log_path
         .zip(host_alias)
         .map(|(path, alias)| format!("ssh {alias} 'tail -n 200 {path}'"));
@@ -205,6 +232,7 @@ pub fn diagnose_with_platform(
         message: message.to_string(),
         actions,
         host_key_fingerprints,
+        guidance,
         diagnostics,
         log_command,
     }
