@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod command;
 pub mod config;
+pub mod effects;
 pub mod environment;
 pub mod error;
 pub mod host_key;
@@ -30,6 +31,7 @@ pub use config::{
     SshDiscovery, SshEffectiveConfig, SshHostEntry, default_ssh_config_path,
     discover_default_hosts, discover_hosts, resolve_effective, resolve_effective_default,
 };
+pub use effects::SshProvisioningEffects;
 pub use environment::{
     EnvironmentError, EnvironmentWarning, GlibcVersion, MIN_FREE_KB, MIN_GLIBC, PortState,
     RemoteArch, RemoteEnvironment, parse_probe_output, probe, probe_script,
