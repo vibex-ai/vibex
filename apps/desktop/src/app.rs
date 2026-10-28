@@ -14662,6 +14662,37 @@ impl VibexWorkbench {
         }
     }
 
+    #[allow(dead_code)]
+    fn ssh_runtime_compatibility(
+        &self,
+        profile_id: &str,
+    ) -> Option<crate::ssh_connection::compat::CompatibilityReport> {
+        let config = self.config.as_ref()?;
+        let profile = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .ok()?
+            .into_iter()
+            .find(|profile| profile.id == profile_id)?;
+        let runtime_id = profile.registered_runtime_id.as_deref()?;
+        if self.runtime_registry.active_runtime_id() != runtime_id {
+            return None;
+        }
+        let info = self
+            .remote_client
+            .as_ref()?
+            .backend
+            .transport()
+            .server_info()?;
+        Some(crate::ssh_connection::compat::evaluate(
+            env!("CARGO_PKG_VERSION"),
+            &info.desktop_version,
+            &info.protocol_range,
+            &info.capabilities,
+            &[],
+            profile.channel,
+        ))
+    }
+
     fn ssh_profile_for_runtime(&self, runtime_id: &str) -> Option<SshConnectionProfile> {
         let config = self.config.as_ref()?;
         SshProfileStore::at_home(&config.home_dir)
@@ -106995,6 +107026,8 @@ mod tests {
         assert!(source.contains("upgrade_runtime("));
         assert!(source.contains("reconnect_after_ssh_upgrade"));
         assert!(source.contains("channel_for_version_str"));
+        assert!(source.contains("fn ssh_runtime_compatibility("));
+        assert!(source.contains("compat::evaluate"));
     }
 
     #[test]
