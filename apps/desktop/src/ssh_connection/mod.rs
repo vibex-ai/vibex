@@ -49,6 +49,7 @@ pub use pairing::{
 };
 pub use profile::{
     SCHEMA_VERSION, STORE_FILE_NAME, SshConnectionProfile, SshProfileStore, SshRuntimeChannel,
+    SshUpgradePolicy,
 };
 pub use provisioning::{
     ProvisioningBegin, ProvisioningControlError, ProvisioningCoordinator, ProvisioningEvent,

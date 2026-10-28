@@ -31,6 +31,15 @@ pub enum SshRuntimeChannel {
     Preview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SshUpgradePolicy {
+    #[default]
+    Notify,
+    WhenIdle,
+    Pinned,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshConnectionProfile {
@@ -54,6 +63,8 @@ pub struct SshConnectionProfile {
     pub local_tunnel_port: u16,
     pub channel: SshRuntimeChannel,
     pub runtime_version: Option<String>,
+    #[serde(default)]
+    pub upgrade_policy: SshUpgradePolicy,
     /// The registry id this profile produced, when it has been provisioned.
     /// Optional so stores written before runtime binding remain valid.
     #[serde(default)]
@@ -559,6 +570,7 @@ mod tests {
             local_tunnel_port: 18765,
             channel: SshRuntimeChannel::Rc,
             runtime_version: Some("0.1.0-rc.8".to_string()),
+            upgrade_policy: SshUpgradePolicy::Notify,
             registered_runtime_id: None,
             created_at_ms: 1_700_000_000_000,
             last_connected_at_ms: Some(1_700_000_100_000),

@@ -252,9 +252,9 @@ use crate::ssh_connection::{
     LaunchConfig, MIN_FREE_KB, ProvisioningRunOutcome, ProvisioningService,
     ProvisioningServiceEvent, ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep,
     SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshProfileStore,
-    SshProvisioningEffects, SshRuntimeChannel, TunnelProcess, TunnelSpec, default_ssh_config_path,
-    discover_default_hosts, download_server_artifact, probe, resolve_effective_default,
-    select_local_port, select_server_artifact, supervisor,
+    SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess, TunnelSpec,
+    default_ssh_config_path, discover_default_hosts, download_server_artifact, probe,
+    resolve_effective_default, select_local_port, select_server_artifact, supervisor,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -9316,6 +9316,8 @@ pub struct VibexWorkbench {
     runtime_add_busy: bool,
     /// The runtime a removal is confirming.
     runtime_remove_pending: Option<String>,
+    /// The SSH profile whose upgrade is waiting for confirmation.
+    runtime_upgrade_pending: Option<String>,
     /// Why a runtime last refused to connect, keyed by runtime id. A failed
     /// boot falls back to the embedded runtime, so the panel is the only place
     /// that can still explain what happened.
@@ -11135,6 +11137,7 @@ impl VibexWorkbench {
             runtime_add_link_input,
             runtime_add_busy: false,
             runtime_remove_pending: None,
+            runtime_upgrade_pending: None,
             runtime_connect_errors: BTreeMap::new(),
             local_runtime_name: None,
             local_runtime_name_task: None,
@@ -15738,6 +15741,11 @@ impl VibexWorkbench {
             runtime_state_label(state).to_string(),
             cx,
         ));
+        let upgrade_profile = if is_local {
+            None
+        } else {
+            self.ssh_profile_for_runtime(&id)
+        };
         let compatibility = self.runtime_compatibility.get(id.as_str()).cloned();
         if let Some(report) = compatibility.as_ref() {
             let mut detail = runtime_compatibility_label(report.state).to_string();
@@ -15756,6 +15764,20 @@ impl VibexWorkbench {
                     cx,
                 ));
             }
+        }
+        if let Some(profile) = upgrade_profile.as_ref() {
+            rows.push(self.render_runtime_upgrade_policy(profile, cx));
+        }
+        if self
+            .runtime_upgrade_pending
+            .as_deref()
+            .zip(upgrade_profile.as_ref())
+            .is_some_and(|(pending, profile)| pending == profile.id)
+        {
+            rows.push(self.render_runtime_upgrade_confirmation(
+                upgrade_profile.as_ref().expect("profile checked above"),
+                cx,
+            ));
         }
         if let Some(runtime) = runtime.as_ref() {
             rows.push(runtime_detail_row(
@@ -15817,12 +15839,8 @@ impl VibexWorkbench {
                     move |this, _, _, cx| this.switch_to_runtime(id.clone(), cx)
                 })),
         );
-        let upgrade_profile = if is_local {
-            None
-        } else {
-            self.ssh_profile_for_runtime(&id)
-        };
         if let (Some(profile), Some(report)) = (upgrade_profile.as_ref(), compatibility.as_ref())
+            && profile.upgrade_policy != SshUpgradePolicy::Pinned
             && matches!(
                 report.state,
                 crate::ssh_connection::compat::RuntimeCompatibility::UpdateRecommended
@@ -15837,7 +15855,8 @@ impl VibexWorkbench {
                     .label(locale::text("Update runtime", "更新运行时", "更新執行階段"))
                     .disabled(switching || self.ssh_upgrade_running)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.start_ssh_runtime_upgrade(profile_id.clone(), cx)
+                        this.runtime_upgrade_pending = Some(profile_id.clone());
+                        cx.notify();
                     })),
             );
         }
@@ -15942,6 +15961,7 @@ impl VibexWorkbench {
                                 this.runtime_manager_target = None;
                                 this.runtime_rename_active = false;
                                 this.runtime_remove_pending = None;
+                                this.runtime_upgrade_pending = None;
                                 cx.notify();
                             })),
                     )
@@ -15966,6 +15986,151 @@ impl VibexWorkbench {
             )
             .child(divider_lane(cx))
             .child(actions)
+            .into_any_element()
+    }
+
+    fn set_ssh_upgrade_policy(
+        &mut self,
+        profile_id: &str,
+        policy: SshUpgradePolicy,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
+            return;
+        };
+        if profile.upgrade_policy == policy {
+            return;
+        }
+        profile.upgrade_policy = policy;
+        if store.save(&profiles).is_ok() {
+            cx.notify();
+        }
+    }
+
+    fn render_runtime_upgrade_policy(
+        &self,
+        profile: &SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let profile_id = profile.id.clone();
+        let options = [
+            (
+                "runtime-upgrade-policy-notify",
+                SshUpgradePolicy::Notify,
+                locale::text("Notify", "通知", "通知"),
+            ),
+            (
+                "runtime-upgrade-policy-idle",
+                SshUpgradePolicy::WhenIdle,
+                locale::text("When idle", "空闲时", "閒置時"),
+            ),
+            (
+                "runtime-upgrade-policy-pin",
+                SshUpgradePolicy::Pinned,
+                locale::text("Pin", "固定", "固定"),
+            ),
+        ];
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text("Upgrade policy", "升级策略", "升級策略")),
+            )
+            .child(h_flex().w_full().gap_1().children(options.into_iter().map(
+                |(id, policy, label)| {
+                    let profile_id = profile_id.clone();
+                    Button::new(id)
+                        .small()
+                        .when(profile.upgrade_policy == policy, |button| button.primary())
+                        .when(profile.upgrade_policy != policy, |button| button.ghost())
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_ssh_upgrade_policy(&profile_id, policy, cx)
+                        }))
+                        .into_any_element()
+                },
+            )))
+            .into_any_element()
+    }
+
+    fn render_runtime_upgrade_confirmation(
+        &self,
+        profile: &SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let profile_id = profile.id.clone();
+        let warning = match profile.upgrade_policy {
+            SshUpgradePolicy::Notify => locale::text(
+                "Active turns and terminals will be interrupted while the runtime restarts.",
+                "运行时重启会中断进行中的 turn 和终端。",
+                "執行階段重新啟動會中斷進行中的 turn 與終端機。",
+            ),
+            SshUpgradePolicy::WhenIdle => locale::text(
+                "The idle preference is saved. Confirm to start now; active turns and terminals will be interrupted.",
+                "已保存空闲偏好。确认后立即开始；进行中的 turn 和终端会中断。",
+                "已儲存閒置偏好。確認後立即開始；進行中的 turn 與終端機會中斷。",
+            ),
+            SshUpgradePolicy::Pinned => locale::text(
+                "Updates are pinned for this connection.",
+                "此连接已固定版本，不自动升级。",
+                "此連線已固定版本，不會自動升級。",
+            ),
+        };
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(div().text_sm().font_medium().child(locale::text(
+                "Upgrade runtime?",
+                "升级运行时？",
+                "升級執行階段？",
+            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(warning),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .pt_1()
+                    .child(
+                        Button::new("runtime-upgrade-confirm")
+                            .small()
+                            .outline()
+                            .label(locale::text("Upgrade now", "立即升级", "立即升級"))
+                            .disabled(self.ssh_upgrade_running)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.runtime_upgrade_pending = None;
+                                this.start_ssh_runtime_upgrade(profile_id.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("runtime-upgrade-cancel")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.runtime_upgrade_pending = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -82874,6 +83039,7 @@ impl FoundationSettings {
                 local_tunnel_port,
                 channel: SshRuntimeChannel::Stable,
                 runtime_version: None,
+                upgrade_policy: crate::ssh_connection::profile::SshUpgradePolicy::Notify,
                 registered_runtime_id: None,
                 created_at_ms: now,
                 last_connected_at_ms: None,
@@ -107131,6 +107297,9 @@ mod tests {
         assert!(source.contains("runtime_compatibility"));
         assert!(source.contains("runtime-detail-update"));
         assert!(source.contains("start_ssh_runtime_upgrade(profile_id.clone()"));
+        assert!(source.contains("runtime-upgrade-policy-notify"));
+        assert!(source.contains("runtime-upgrade-confirm"));
+        assert!(source.contains("SshUpgradePolicy"));
     }
 
     #[test]
