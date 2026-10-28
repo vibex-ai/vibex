@@ -75508,6 +75508,7 @@ enum SettingsSection {
     General,
     Appearance,
     Workbench,
+    Connections,
     Session,
     Archived,
     Terminal,
@@ -75526,6 +75527,58 @@ struct SettingsSearchCandidate {
     description: &'static str,
     keywords: &'static [&'static str],
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionFixtureStatus {
+    Connected,
+    Offline,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionFixtureRow {
+    id: &'static str,
+    name: &'static str,
+    alias: &'static str,
+    user: &'static str,
+    host: &'static str,
+    port: u16,
+    version: Option<&'static str>,
+    status: ConnectionFixtureStatus,
+}
+
+const CONNECTION_FIXTURES: [ConnectionFixtureRow; 3] = [
+    ConnectionFixtureRow {
+        id: "build",
+        name: "Build server",
+        alias: "build-box",
+        user: "dev",
+        host: "build.example.com",
+        port: 22,
+        version: Some("0.1.0-rc.8"),
+        status: ConnectionFixtureStatus::Connected,
+    },
+    ConnectionFixtureRow {
+        id: "mac-mini",
+        name: "Mac mini",
+        alias: "mac-mini",
+        user: "peatboy",
+        host: "192.168.1.20",
+        port: 22,
+        version: None,
+        status: ConnectionFixtureStatus::Offline,
+    },
+    ConnectionFixtureRow {
+        id: "lab-vm",
+        name: "Lab VM",
+        alias: "lab-vm",
+        user: "ubuntu",
+        host: "10.0.0.42",
+        port: 2222,
+        version: Some("0.1.0-rc.7"),
+        status: ConnectionFixtureStatus::NeedsAttention,
+    },
+];
 
 #[derive(Clone)]
 struct SettingsRenderContext {
@@ -75865,6 +75918,20 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "側欄",
     ]) {
         Some(SettingsSection::Workbench)
+    } else if matches(&[
+        "connection",
+        "connections",
+        "ssh",
+        "remote",
+        "host",
+        "连接",
+        "連線",
+        "远程",
+        "遠端",
+        "主机",
+        "主機",
+    ]) {
+        Some(SettingsSection::Connections)
     } else if matches(&[
         "archived", "archive", "restore", "归档", "封存", "復原", "复原",
     ]) {
@@ -76553,6 +76620,28 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             &["autosave", "delay", "idle", "延迟", "延遲"],
         ),
         settings_search_candidate(
+            SettingsSection::Connections,
+            locale::text("SSH connections", "SSH 连接", "SSH 連線"),
+            locale::text(
+                "Connect Vibex to a runtime on another machine over SSH.",
+                "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
+                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段。",
+            ),
+            &[
+                "ssh",
+                "connection",
+                "remote",
+                "host",
+                "server",
+                "连接",
+                "連線",
+                "远程",
+                "遠端",
+                "主机",
+                "主機",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::Terminal,
             locale::text("Default shell", "默认 Shell", "預設 Shell"),
             locale::text(
@@ -76793,6 +76882,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::General => locale::text("General", "常规", "一般"),
         SettingsSection::Appearance => locale::text("Appearance", "外观", "外觀"),
         SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
+        SettingsSection::Connections => locale::text("Connections", "连接", "連線"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Archived => locale::text("Archived sessions", "已归档会话", "已封存會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
@@ -77708,6 +77798,8 @@ struct FoundationSettings {
     /// itself, so the reason is visible where the input is. Every other settings
     /// result is a light hint and rides the workbench's notification layer.
     shortcut_note: Option<String>,
+    /// Whether the Connections page is showing its fixture add panel.
+    connections_add_preview: bool,
     active_section: SettingsSection,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
@@ -78160,6 +78252,7 @@ impl FoundationSettings {
                 browser_import_task: None,
                 browser_clear_task: None,
                 shortcut_note: None,
+                connections_add_preview: false,
                 active_section: SettingsSection::General,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
@@ -80215,6 +80308,7 @@ impl FoundationSettings {
                 locale::text("WORKSPACE", "工作区", "工作區"),
                 &[
                     (SettingsSection::Workbench, IconName::LayoutDashboard),
+                    (SettingsSection::Connections, IconName::Network),
                     (SettingsSection::Session, IconName::Bot),
                     (SettingsSection::Archived, IconName::Inbox),
                     (SettingsSection::Terminal, IconName::SquareTerminal),
@@ -81507,6 +81601,281 @@ impl FoundationSettings {
     /// Archiving is the reversible half of removal, so the page is built around
     /// restoring: the list is loaded when the page opens, each row keeps its own
     /// pending state, and the policy control sits above the list it acts on.
+    fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let muted = theme::semantic_color("muted-foreground", is_dark);
+        let add_button = Button::new("connections-add")
+            .small()
+            .outline()
+            .icon(IconName::Plus)
+            .label(locale::text(
+                "Add SSH connection",
+                "添加 SSH 连接",
+                "新增 SSH 連線",
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.connections_add_preview = true;
+                cx.notify();
+            }));
+
+        let mut groups = Vec::new();
+        if self.connections_add_preview {
+            let close = Button::new("connections-add-close")
+                .small()
+                .ghost()
+                .label(locale::text("Close", "关闭", "關閉"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.connections_add_preview = false;
+                    cx.notify();
+                }));
+            groups.push(SettingsGroup::new(
+                locale::text("Add SSH connection", "添加 SSH 连接", "新增 SSH 連線"),
+                vec![div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .when(stacked, |this| this.flex_col().items_start())
+                    .when(!stacked, |this| {
+                        this.flex_row().items_center().justify_between()
+                    })
+                    .gap_4()
+                    .py(px(14.0))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(div().text_sm().font_medium().child(locale::text(
+                                "Connection setup",
+                                "连接设置",
+                                "連線設定",
+                            )))
+                            .child(div().text_xs().text_color(muted).child(locale::text(
+                                "The guided flow will choose a host, install the runtime, and pair it over SSH. This layout preview stops here.",
+                                "引导流程会在这里选择主机、安装运行时并通过 SSH 完成配对。当前骨架到这一步为止。",
+                                "引導流程會在這裡選擇主機、安裝執行階段並透過 SSH 完成配對。目前骨架到這一步為止。",
+                            ))),
+                    )
+                    .child(close)
+                    .into_any_element()],
+            ));
+        }
+
+        let rows = &CONNECTION_FIXTURES;
+        let list_rows = if rows.is_empty() {
+            vec![self.render_connections_empty_state(cx)]
+        } else {
+            rows.iter()
+                .map(|row| Self::connection_row(row, stacked, cx))
+                .collect()
+        };
+        let leading = h_flex()
+            .w_full()
+            .items_center()
+            .justify_end()
+            .child(add_button)
+            .into_any_element();
+        groups.push(SettingsGroup::with_leading(
+            locale::text("SSH connections", "SSH 连接", "SSH 連線"),
+            leading,
+            list_rows,
+        ));
+
+        settings_page(
+            locale::text("Connections", "连接", "連線"),
+            locale::text(
+                "Connect Vibex to a runtime on another machine over SSH.",
+                "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
+                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段。",
+            ),
+            groups,
+            cx,
+        )
+    }
+
+    fn render_connections_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let muted = theme::semantic_color("muted-foreground", is_dark);
+        let add = Button::new("connections-empty-add")
+            .small()
+            .outline()
+            .icon(IconName::Plus)
+            .label(locale::text(
+                "Add SSH connection",
+                "添加 SSH 连接",
+                "新增 SSH 連線",
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.connections_add_preview = true;
+                cx.notify();
+            }));
+        v_flex()
+            .w_full()
+            .items_center()
+            .gap_3()
+            .py_8()
+            .child(
+                Icon::new(IconName::Network)
+                    .size(px(28.0))
+                    .text_color(muted),
+            )
+            .child(div().text_sm().font_semibold().child(locale::text(
+                "No SSH connections yet",
+                "还没有 SSH 连接",
+                "還沒有 SSH 連線",
+            )))
+            .child(
+                div()
+                    .max_w(px(420.0))
+                    .text_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(locale::text(
+                        "Add a host to install, start, and pair a runtime over SSH.",
+                        "添加主机后，Vibex 会通过 SSH 安装、启动并配对运行时。",
+                        "新增主機後，Vibex 會透過 SSH 安裝、啟動並配對執行階段。",
+                    )),
+            )
+            .child(add)
+            .into_any_element()
+    }
+
+    fn connection_row(row: &ConnectionFixtureRow, stacked: bool, cx: &App) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let foreground = theme::semantic_color("foreground", is_dark);
+        let muted = theme::semantic_color("muted-foreground", is_dark);
+        let status_color = Self::connection_status_color(row.status, is_dark);
+        let identity = v_flex()
+            .min_w_0()
+            .flex_1()
+            .gap_1()
+            .child(div().text_sm().font_medium().truncate().child(row.name))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .truncate()
+                    .child(Self::connection_detail(row)),
+            );
+        let status = h_flex()
+            .items_center()
+            .gap_2()
+            .child(div().size(px(6.0)).rounded_full().bg(status_color))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(foreground)
+                    .child(Self::connection_status_label(row.status)),
+            );
+        let version = div().text_xs().text_color(muted).child(match row.version {
+            Some(version) => format!("v{version}"),
+            None => locale::text("Not installed", "未安装", "未安裝").to_string(),
+        });
+        let primary = Button::new(SharedString::from(format!(
+            "connections-{}-primary",
+            row.id
+        )))
+        .small()
+        .outline()
+        .label(Self::connection_primary_label(row.status))
+        .disabled(true)
+        .tooltip(locale::text(
+            "Connection actions are not wired yet.",
+            "连接操作尚未接入。",
+            "連線操作尚未接入。",
+        ));
+        let menu = Button::new(SharedString::from(format!("connections-{}-menu", row.id)))
+            .small()
+            .ghost()
+            .compact()
+            .size(px(24.0))
+            .px_0()
+            .tooltip(locale::text("Connection actions", "连接操作", "連線操作"))
+            .icon(IconName::Ellipsis)
+            .dropdown_menu(|menu, _, _| {
+                menu.item(PopupMenuItem::new(locale::text("Edit", "编辑", "編輯")).disabled(true))
+                    .item(
+                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                            .disabled(true),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new(locale::text("Remove", "移除", "移除")).disabled(true))
+            })
+            .anchor(Anchor::TopRight);
+        let actions = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .child(primary)
+            .child(menu);
+
+        if stacked {
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .py(px(14.0))
+                .child(identity)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .flex_wrap()
+                        .child(h_flex().items_center().gap_4().child(status).child(version))
+                        .child(actions),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_4()
+                .py(px(14.0))
+                .child(identity)
+                .child(div().w(px(120.0)).flex_none().child(status))
+                .child(div().w(px(96.0)).flex_none().child(version))
+                .child(actions)
+                .into_any_element()
+        }
+    }
+
+    fn connection_detail(row: &ConnectionFixtureRow) -> String {
+        if row.alias.is_empty() {
+            format!("{}@{}:{}", row.user, row.host, row.port)
+        } else {
+            format!("{} · {}@{}:{}", row.alias, row.user, row.host, row.port)
+        }
+    }
+
+    fn connection_status_label(status: ConnectionFixtureStatus) -> &'static str {
+        match status {
+            ConnectionFixtureStatus::Connected => locale::text("Connected", "已连接", "已連線"),
+            ConnectionFixtureStatus::Offline => locale::text("Offline", "离线", "離線"),
+            ConnectionFixtureStatus::NeedsAttention => {
+                locale::text("Needs attention", "需要处理", "需要處理")
+            }
+        }
+    }
+
+    fn connection_status_color(status: ConnectionFixtureStatus, is_dark: bool) -> Hsla {
+        match status {
+            ConnectionFixtureStatus::Connected => theme::semantic_color("success", is_dark),
+            ConnectionFixtureStatus::Offline => theme::semantic_color("muted-foreground", is_dark),
+            ConnectionFixtureStatus::NeedsAttention => theme::semantic_color("danger", is_dark),
+        }
+    }
+
+    fn connection_primary_label(status: ConnectionFixtureStatus) -> &'static str {
+        match status {
+            ConnectionFixtureStatus::Connected => locale::text("Manage", "管理", "管理"),
+            ConnectionFixtureStatus::Offline => locale::text("Connect", "连接", "連線"),
+            ConnectionFixtureStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
+        }
+    }
+
     fn render_archived_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let auto_archive_after_days = self
             .workbench
@@ -84117,6 +84486,7 @@ impl Render for FoundationSettings {
             }
             SettingsSection::Archived => self.render_archived_page(stacked_rows, cx),
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
+            SettingsSection::Connections => self.render_connections_page(stacked_rows, cx),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
             SettingsSection::Browser => self.render_browser_page(stacked_rows, cx),
             SettingsSection::Computer => self.render_computer_page(stacked_rows, cx),
@@ -104963,6 +105333,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn connections_section_is_discoverable_and_covers_fixture_states() {
+        assert_eq!(
+            settings_section_for_query("ssh"),
+            Some(SettingsSection::Connections)
+        );
+        assert_eq!(
+            settings_section_label(SettingsSection::Connections),
+            locale::text("Connections", "连接", "連線")
+        );
+        let english = locale::strings(locale::ResolvedLocale::En);
+        assert!(
+            settings_search_candidates_for_query("ssh", english)
+                .iter()
+                .any(|candidate| candidate.section == SettingsSection::Connections)
+        );
+        assert_eq!(
+            CONNECTION_FIXTURES.len(),
+            3,
+            "the skeleton should show connected, offline, and attention states"
+        );
+        for status in [
+            ConnectionFixtureStatus::Connected,
+            ConnectionFixtureStatus::Offline,
+            ConnectionFixtureStatus::NeedsAttention,
+        ] {
+            assert!(CONNECTION_FIXTURES.iter().any(|row| row.status == status));
+        }
+        for row in &CONNECTION_FIXTURES {
+            assert!(!row.name.is_empty());
+            assert!(!row.host.is_empty());
+            assert!(row.port > 0);
+        }
+    }
+
+    #[test]
+    fn connections_page_keeps_the_empty_and_stacked_list_scaffolding() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        assert!(page.contains("render_connections_empty_state"));
+        assert!(page.contains("SettingsGroup::with_leading"));
+        assert!(page.contains("Button::new(\"connections-add\")"));
+        assert!(page.contains("connections_add_preview"));
+
+        let row = source
+            .split_once("    fn connection_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn connection_detail("))
+            .map(|(body, _)| body)
+            .expect("the Connections row should remain inspectable");
+        assert!(row.contains("if stacked"));
+        assert!(row.contains("h_flex()"));
+        assert!(row.contains("IconName::Ellipsis"));
+        assert!(row.contains("connection_primary_label"));
+        assert!(row.contains("semantic_color(\"muted-foreground\""));
+    }
+
     /// The import button lives on the settings page, and the settings page is
     /// itself a dialog, so `has_active_dialog` is always true where this handler
     /// runs: bailing out on it made "Choose profile…" do nothing at all. The
@@ -106218,7 +106648,11 @@ mod tests {
         });
         let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
 
-        for section in [SettingsSection::Archived, SettingsSection::Data] {
+        for section in [
+            SettingsSection::Archived,
+            SettingsSection::Data,
+            SettingsSection::Connections,
+        ] {
             workbench.update(cx, |workbench, cx| {
                 workbench.settings_view.update(cx, |settings, cx| {
                     settings.activate_settings_section(section, cx);
