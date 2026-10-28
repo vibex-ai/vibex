@@ -1744,10 +1744,22 @@ struct RuntimeMenuPlacement {
     trigger_offset: f32,
 }
 
+/// Where the `/` popup hangs from the window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ComposerSuggestionMenuAnchor {
+    /// Above the composer surface, measured from the window's bottom.
+    AboveSurface { bottom_offset: f32 },
+    /// Above the caret line, measured from the window's bottom.
+    AboveCaret { bottom_offset: f32 },
+    /// Below the caret line, or below the surface's top when no caret has been
+    /// measured yet, measured from the window's top.
+    BelowAnchor { top_offset: f32 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ComposerSuggestionMenuPlacement {
     max_height: f32,
-    window_edge_offset: f32,
+    anchor: ComposerSuggestionMenuAnchor,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -1973,26 +1985,101 @@ fn composer_suggestion_menu_height(row_count: usize, row_height: f32, footer_hei
     (content_height + footer_height).min(COMPOSER_SUGGESTION_MENU_MAX_HEIGHT)
 }
 
+/// Places the `/` popup above the composer, or inside it when the composer
+/// fills the page.
+///
+/// The popup normally hangs above the surface, where it covers the queue and
+/// plan extensions instead of the draft. A fullscreen composer starts at the
+/// window's top, leaving less room above it than the popup's own header, so
+/// that anchor clamped the popup to a sliver. When the surface cannot hold the
+/// popup above it, the popup opens from the caret line instead: the text being
+/// typed to filter the list stays visible, and the list expands over the empty
+/// part of the draft. A caret near the window's bottom flips the popup back
+/// above itself, so the current line is never covered.
 fn composer_suggestion_menu_placement(
     surface_bounds: Bounds<Pixels>,
+    caret_line: Option<(f32, f32)>,
     viewport_height: f32,
     row_count: usize,
     row_height: f32,
     footer_height: f32,
 ) -> ComposerSuggestionMenuPlacement {
-    // Suggestions belong to the composer surface, rather than the caret. Keeping
-    // the overlay above the whole surface lets it cover queue/plan extensions
-    // without changing their normal-flow layout.
     let surface_top = f32::from(surface_bounds.origin.y);
+    let desired_height = composer_suggestion_menu_height(row_count, row_height, footer_height);
+    // One row (or the empty-state sentence when there are no rows) plus the
+    // popup's own chrome is the least that reads as an expanded list.
+    let minimum_height = if row_count == 0 {
+        COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT + footer_height
+    } else {
+        COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+            + COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+            + row_height
+            + footer_height
+    };
     let available_above =
         (surface_top - RUNTIME_MENU_VIEWPORT_MARGIN - COMPOSER_SUGGESTION_MENU_TRIGGER_GAP)
             .max(1.0);
-    let window_edge_offset = viewport_height - surface_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP;
-    ComposerSuggestionMenuPlacement {
-        max_height: composer_suggestion_menu_height(row_count, row_height, footer_height)
-            .min(available_above),
-        window_edge_offset,
+    let available_below_surface = (viewport_height
+        - surface_top
+        - RUNTIME_MENU_VIEWPORT_MARGIN
+        - COMPOSER_SUGGESTION_MENU_TRIGGER_GAP)
+        .max(1.0);
+    if available_above >= minimum_height || available_below_surface <= available_above {
+        return ComposerSuggestionMenuPlacement {
+            max_height: desired_height.min(available_above),
+            anchor: ComposerSuggestionMenuAnchor::AboveSurface {
+                bottom_offset: viewport_height - surface_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP,
+            },
+        };
     }
+
+    let Some((caret_top, line_height)) = caret_line else {
+        return ComposerSuggestionMenuPlacement {
+            max_height: desired_height.min(available_below_surface),
+            anchor: ComposerSuggestionMenuAnchor::BelowAnchor {
+                top_offset: surface_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP,
+            },
+        };
+    };
+
+    let caret_bottom = caret_top + line_height;
+    let available_below_caret = (viewport_height
+        - caret_bottom
+        - RUNTIME_MENU_VIEWPORT_MARGIN
+        - COMPOSER_SUGGESTION_MENU_TRIGGER_GAP)
+        .max(1.0);
+    let available_above_caret =
+        (caret_top - RUNTIME_MENU_VIEWPORT_MARGIN - COMPOSER_SUGGESTION_MENU_TRIGGER_GAP).max(1.0);
+    // Prefer the space below the caret so the line being typed stays above the
+    // popup; use the space above it when the caret is near the window's bottom.
+    if available_below_caret >= minimum_height || available_below_caret >= available_above_caret {
+        ComposerSuggestionMenuPlacement {
+            max_height: desired_height.min(available_below_caret),
+            anchor: ComposerSuggestionMenuAnchor::BelowAnchor {
+                top_offset: caret_bottom + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP,
+            },
+        }
+    } else {
+        ComposerSuggestionMenuPlacement {
+            max_height: desired_height.min(available_above_caret),
+            anchor: ComposerSuggestionMenuAnchor::AboveCaret {
+                bottom_offset: viewport_height - caret_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP,
+            },
+        }
+    }
+}
+
+/// The caret's current line as `(top, line height)` in window coordinates.
+///
+/// The last prepaint's caret geometry is unscrolled, so its scroll offset has
+/// to be added before comparing it with the popup's window-space anchor.
+fn composer_caret_line(input: &Entity<TextareaState>, cx: &App) -> Option<(f32, f32)> {
+    let geometry = input.read(cx).prepaint_caret_geometry()?;
+    let caret = geometry.cursor_bounds();
+    Some((
+        f32::from(caret.origin.y) + f32::from(geometry.scroll_offset().y),
+        f32::from(geometry.line_height()),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64109,6 +64196,13 @@ impl VibexWorkbench {
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
+        let caret_line = match target {
+            ComposerTarget::Session => self
+                .composer_input
+                .as_ref()
+                .and_then(|input| composer_caret_line(input, cx)),
+            ComposerTarget::NewSession => composer_caret_line(&self.new_session_input, cx),
+        };
         let viewport_menu_width =
             (viewport_width - COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN * 2.0).max(1.0);
         let menu_width = f32::from(surface_bounds.size.width)
@@ -64135,6 +64229,7 @@ impl VibexWorkbench {
         let visible_row_count = visible_entries.len().min(10);
         let menu_placement = composer_suggestion_menu_placement(
             surface_bounds,
+            caret_line,
             viewport_height,
             visible_row_count,
             composer_suggestion_row_height(phrase_layout),
@@ -64330,29 +64425,32 @@ impl VibexWorkbench {
 
         // Quick opacity pop on mount; stays mounted while typing so the fade
         // does not replay per keystroke.
-        motion::fade_quick(
-            "composer-command-menu-enter",
-            v_flex()
-                .id(format!("composer-command-menu:{}", target.id()))
-                .role(Role::ListBox)
-                .aria_label("Composer commands")
-                .absolute()
-                .left(px(menu_left))
-                .w(px(menu_width))
-                .max_h(px(menu_placement.max_height))
-                .occlude()
-                .overflow_hidden()
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().popover.opacity(0.985))
-                .shadow_xl()
-                .child(menu_header)
-                .child(scroll_content)
-                .when_some(quick_phrase_footer, |this, footer| this.child(footer))
-                .bottom(px(menu_placement.window_edge_offset)),
-        )
-        .into_any_element()
+        let menu = v_flex()
+            .id(format!("composer-command-menu:{}", target.id()))
+            .role(Role::ListBox)
+            .aria_label("Composer commands")
+            .absolute()
+            .left(px(menu_left))
+            .w(px(menu_width))
+            .max_h(px(menu_placement.max_height))
+            .occlude()
+            .overflow_hidden()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover.opacity(0.985))
+            .shadow_xl()
+            .child(menu_header)
+            .child(scroll_content)
+            .when_some(quick_phrase_footer, |this, footer| this.child(footer));
+        let menu = match menu_placement.anchor {
+            ComposerSuggestionMenuAnchor::AboveSurface { bottom_offset }
+            | ComposerSuggestionMenuAnchor::AboveCaret { bottom_offset } => {
+                menu.bottom(px(bottom_offset))
+            }
+            ComposerSuggestionMenuAnchor::BelowAnchor { top_offset } => menu.top(px(top_offset)),
+        };
+        motion::fade_quick("composer-command-menu-enter", menu).into_any_element()
     }
 
     /// One tab of the `/` popup header.
@@ -102702,13 +102800,18 @@ mod tests {
                 };
                 let placement = composer_suggestion_menu_placement(
                     surface_bounds,
+                    Some((860.0, 22.0)),
                     viewport_height,
                     row_count,
                     row_height,
                     footer_height,
                 );
 
-                let menu_bottom = viewport_height - placement.window_edge_offset;
+                let ComposerSuggestionMenuAnchor::AboveSurface { bottom_offset } = placement.anchor
+                else {
+                    panic!("a composer with room above it keeps the popup above");
+                };
+                let menu_bottom = viewport_height - bottom_offset;
                 let gap = f32::from(surface_bounds.origin.y) - menu_bottom;
                 assert_eq!(gap, COMPOSER_SUGGESTION_MENU_TRIGGER_GAP);
                 assert_eq!(
@@ -102717,6 +102820,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A fullscreen composer starts at the window's top, leaving no room above
+    /// it for the popup. It must open from the caret instead of collapsing to
+    /// the height of its own header.
+    #[test]
+    fn fullscreen_composer_opens_the_suggestion_menu_below_the_caret() {
+        let surface_bounds = Bounds {
+            origin: gpui::Point {
+                x: px(12.0),
+                y: px(56.0),
+            },
+            size: Size {
+                width: px(720.0),
+                height: px(900.0),
+            },
+        };
+        let caret_top = 74.0;
+        let line_height = 22.0;
+        let placement = composer_suggestion_menu_placement(
+            surface_bounds,
+            Some((caret_top, line_height)),
+            1000.0,
+            4,
+            COMPOSER_SUGGESTION_MENU_ROW_HEIGHT,
+            0.0,
+        );
+        assert_eq!(
+            placement.anchor,
+            ComposerSuggestionMenuAnchor::BelowAnchor {
+                top_offset: caret_top + line_height + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP
+            }
+        );
+        assert_eq!(
+            placement.max_height,
+            composer_suggestion_menu_height(4, COMPOSER_SUGGESTION_MENU_ROW_HEIGHT, 0.0)
+        );
+        // The list gets the rows it asked for, not the sliver the old
+        // above-the-surface anchor left once it was clamped to the window top.
+        assert!(
+            placement.max_height
+                > COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT + COMPOSER_SUGGESTION_MENU_ROW_HEIGHT
+        );
+    }
+
+    /// A caret near the window's bottom has no room beneath it, so the popup
+    /// flips above the caret rather than being clamped against the window edge.
+    #[test]
+    fn fullscreen_composer_flips_the_suggestion_menu_above_a_low_caret() {
+        let surface_bounds = Bounds {
+            origin: gpui::Point {
+                x: px(12.0),
+                y: px(56.0),
+            },
+            size: Size {
+                width: px(720.0),
+                height: px(900.0),
+            },
+        };
+        let viewport_height = 1000.0;
+        let caret_top = 940.0;
+        let line_height = 22.0;
+        let placement = composer_suggestion_menu_placement(
+            surface_bounds,
+            Some((caret_top, line_height)),
+            viewport_height,
+            4,
+            COMPOSER_SUGGESTION_MENU_ROW_HEIGHT,
+            0.0,
+        );
+        let ComposerSuggestionMenuAnchor::AboveCaret { bottom_offset } = placement.anchor else {
+            panic!("a caret near the bottom flips the popup above itself");
+        };
+        assert_eq!(
+            bottom_offset,
+            viewport_height - caret_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP
+        );
+        assert!(viewport_height - bottom_offset <= caret_top);
+        assert_eq!(
+            placement.max_height,
+            composer_suggestion_menu_height(4, COMPOSER_SUGGESTION_MENU_ROW_HEIGHT, 0.0)
+        );
+    }
+
+    /// The first frame after mounting has no caret geometry yet; the popup
+    /// still opens inside the fullscreen composer instead of collapsing.
+    #[test]
+    fn fullscreen_composer_opens_below_the_surface_top_without_caret_geometry() {
+        let surface_bounds = Bounds {
+            origin: gpui::Point {
+                x: px(12.0),
+                y: px(56.0),
+            },
+            size: Size {
+                width: px(720.0),
+                height: px(900.0),
+            },
+        };
+        let placement = composer_suggestion_menu_placement(
+            surface_bounds,
+            None,
+            1000.0,
+            4,
+            COMPOSER_SUGGESTION_MENU_ROW_HEIGHT,
+            0.0,
+        );
+        assert_eq!(
+            placement.anchor,
+            ComposerSuggestionMenuAnchor::BelowAnchor {
+                top_offset: 56.0 + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP
+            }
+        );
+        assert_eq!(
+            placement.max_height,
+            composer_suggestion_menu_height(4, COMPOSER_SUGGESTION_MENU_ROW_HEIGHT, 0.0)
+        );
     }
 
     /// The list is only as tall as the popup minus its chrome, so a height that
