@@ -4,14 +4,19 @@
 //! user, and the ports, but never carries a private key, password, pairing
 //! code, or auth token.
 
+pub mod artifact;
 pub mod command;
 pub mod config;
 pub mod environment;
 pub mod error;
 pub mod host_key;
+pub mod install;
 pub mod profile;
 pub mod provisioning;
 
+pub use artifact::{
+    ArtifactError, LocalArtifact, download_server_artifact, select_server_artifact, verify_file,
+};
 pub use command::{SshCommand, SshDestination, SshOutput};
 pub use config::{
     SshDiscovery, SshEffectiveConfig, SshHostEntry, default_ssh_config_path,
@@ -23,6 +28,7 @@ pub use environment::{
 };
 pub use error::{SshFailure, SshFailureKind};
 pub use host_key::{default_known_hosts_path, known_hosts_contains};
+pub use install::{INSTALL_SCRIPT, InstallError, InstallOutcome, install_artifact};
 pub use profile::{
     SCHEMA_VERSION, STORE_FILE_NAME, SshConnectionProfile, SshProfileStore, SshRuntimeChannel,
 };

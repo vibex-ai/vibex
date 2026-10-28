@@ -247,6 +247,116 @@ impl SshCommand {
             ))
         }
     }
+
+    /// Same execution contract as `run_with_timeout`, but reports stdin bytes
+    /// written so a large artifact upload can drive a progress surface.
+    ///
+    /// The callback runs on the stdin writer thread; callers that update UI
+    /// must forward it to their own thread.
+    pub fn run_with_progress(
+        &self,
+        timeout: Duration,
+        mut progress: impl FnMut(u64, u64) + Send + 'static,
+    ) -> Result<SshOutput, SshFailure> {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        command.env("LC_ALL", "C");
+        command.stdin(if self.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SshFailure::client_missing(&error.to_string())
+            } else {
+                SshFailure::spawn(&error.to_string())
+            }
+        })?;
+
+        let stdin_thread = match &self.stdin {
+            Some(input) => {
+                let Some(mut stdin) = child.stdin.take() else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SshFailure::spawn("the SSH stdin pipe is unavailable"));
+                };
+                let input = input.clone();
+                Some(thread::spawn(move || {
+                    let total = input.len() as u64;
+                    let mut written = 0;
+                    for chunk in input.chunks(64 * 1024) {
+                        if stdin.write_all(chunk).is_err() {
+                            break;
+                        }
+                        written += chunk.len() as u64;
+                        progress(written, total);
+                    }
+                }))
+            }
+            None => None,
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SshFailure::spawn("the SSH stdout pipe is unavailable"));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SshFailure::spawn("the SSH stderr pipe is unavailable"));
+        };
+        let stdout_reader = thread::spawn(move || read_all(stdout));
+        let stderr_reader = thread::spawn(move || read_all(stderr));
+
+        let started = Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SshFailure::spawn(&error.to_string()));
+                }
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break None;
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        if let Some(handle) = stdin_thread {
+            let _ = handle.join();
+        }
+        if timed_out {
+            return Err(SshFailure::timeout(&String::from_utf8_lossy(&stderr)));
+        }
+        let Some(status) = status else {
+            return Err(SshFailure::spawn("the SSH process status is unavailable"));
+        };
+        if status.success() {
+            Ok(SshOutput {
+                status,
+                stdout,
+                stderr,
+            })
+        } else {
+            Err(SshFailure::from_parts(
+                status.code(),
+                &String::from_utf8_lossy(&stderr),
+            ))
+        }
+    }
 }
 
 /// Hostnames are DNS labels; bracketed IPv6 literals are the one exception.
@@ -435,6 +545,27 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.kind, SshFailureKind::Timeout);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_upload_progress_for_stdin() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = fake_ssh(dir.path(), "cat >/dev/null");
+        let mut command = SshCommand::new(&ssh);
+        command.stdin = Some(vec![0; 200 * 1024]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let progress_seen = seen.clone();
+        command
+            .run_with_progress(Duration::from_secs(5), move |done, total| {
+                progress_seen.lock().unwrap().push((done, total));
+            })
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert_eq!(seen.last().copied(), Some((200 * 1024, 200 * 1024)));
     }
 
     #[test]
