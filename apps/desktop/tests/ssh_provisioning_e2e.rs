@@ -52,6 +52,18 @@ fn command_for(config: &Path) -> SshCommand {
     .expect("build SSH command")
 }
 
+fn remote_file_sha(command: &SshCommand, path: &str) -> String {
+    let mut read = command.clone();
+    read.remote_script("sha256sum \"$1\" | awk '{print $1}'")
+        .unwrap();
+    read.args.push(path.into());
+    read.run()
+        .expect("hash remote file")
+        .stdout_lossy()
+        .trim()
+        .to_string()
+}
+
 fn write_config(
     dir: &Path,
     identity: &Path,
@@ -187,6 +199,8 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
     install_artifact(&command, &old, "/home/dev/upgrade-server", |_, _| {})
         .expect("install old runtime");
     supervisor::ensure_started(&command, &launch).expect("start old runtime");
+    let identity_path = "/home/dev/upgrade-server/home/relay/desktop-identity.json";
+    let identity_before = remote_file_sha(&command, identity_path);
 
     let dir = tempfile::tempdir().expect("upgrade artifacts");
     let (new_path, real_new_binary) = match std::env::var_os("VIBEX_SSH_E2E_NEW_ARTIFACT") {
@@ -208,6 +222,11 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
     let outcome = upgrade_runtime(&command, &launch, &new, SshRuntimeChannel::Rc, |_, _| {})
         .expect("upgrade to rc.9");
     assert!(outcome.cleaned_versions >= 1, "rc.7 should be cleaned");
+    assert_eq!(
+        remote_file_sha(&command, identity_path),
+        identity_before,
+        "upgrade must preserve the runtime identity"
+    );
     let mut check = command.clone();
     check
         .remote_script("test ! -d \"$1\"")
