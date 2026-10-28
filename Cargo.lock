@@ -10063,6 +10063,7 @@ dependencies = [
  "chrono",
  "embed-resource",
  "futures-channel",
+ "glob",
  "gpui-base",
  "gpui-component",
  "gpui-fps",
