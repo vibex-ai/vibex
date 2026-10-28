@@ -38553,7 +38553,11 @@ impl ProviderSidebarTab {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Providers => management_locale_text("Providers", "Provider", "Provider"),
+            // This switch sits under the gateway row and chooses between the
+            // records below it, so it names those records the way the heading
+            // beneath it does. Only the top-level destination takes the product
+            // noun.
+            Self::Providers => management_locale_text("Providers", "供应商", "供應商"),
             Self::RouteGroups => management_locale_text("Route groups", "路由组", "路由組"),
         }
     }
@@ -48709,17 +48713,24 @@ mod gateway_surface_tests {
             !source.contains("providers: \"供应商\"") && !source.contains("providers: \"供應商\""),
             "the destination must not fall back to the translated record name"
         );
-        // The destination is the only place that takes the product noun. A
-        // record name — the sub-heading inside an Agent's Provider card, and
-        // the heading above the list on this page — stays in the reader's
-        // language, or the card would read "Provider" where it means "the
-        // Providers this Agent has".
+        // Only the top-level destination takes the product noun. Every name
+        // below it describes records — the heading above the list, the
+        // Providers/Route groups switch under the gateway row, and the
+        // sub-heading inside an Agent's Provider card — so they stay in the
+        // reader's language, or one page would call the same thing two names.
         assert!(
             source.contains("// A record name inside a card, not a destination:"),
             "the Agent page's sub-heading documents why it stays translated"
         );
-        // The tab and the navigation item are destinations and keep the noun;
-        // the list heading and the in-card sub-heading are not.
+        let tab_labels = source
+            .split_once("impl ProviderSidebarTab {")
+            .and_then(|(_, tail)| tail.split_once("/// One row of the global route-group list."))
+            .map(|(body, _)| body)
+            .expect("the Provider tab labels should remain inspectable");
+        assert!(
+            tab_labels.contains("management_locale_text(\"Providers\", \"供应商\", \"供應商\")"),
+            "the switch under the gateway row names the records it chooses between"
+        );
         let sidebar_heading = source
             .split_once("let (section_title, actions, section_body) = match active_tab {")
             .and_then(|(_, tail)| tail.split_once("management_resource_sidebar_actions("))
