@@ -114578,7 +114578,7 @@ mod route_picker_tests {
         });
         let alpha_id = vibex_core::ModelRouteId::new();
         let zulu_id = vibex_core::ModelRouteId::new();
-        let mut groups = vec![
+        let mut groups = [
             provider,
             group(source(alpha_id.clone(), "Alpha")),
             group(source(zulu_id.clone(), "Zulu")),
