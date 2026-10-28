@@ -239,7 +239,11 @@ if [ -f "$pidfile" ]; then
   rm -f "$pidfile"
 fi
 mkdir -p "$(dirname "$log")"
-nohup setsid "$binary" serve --no-pairing >> "$log" 2>&1 < /dev/null &
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid "$binary" serve --no-pairing >> "$log" 2>&1 < /dev/null &
+else
+  nohup "$binary" serve --no-pairing >> "$log" 2>&1 < /dev/null &
+fi
 pid=$!
 umask 077
 echo "$pid" > "$pidfile"
@@ -383,6 +387,8 @@ mod tests {
     #[test]
     fn start_script_keeps_detach_and_idempotence_markers() {
         assert!(START_SCRIPT.contains("nohup setsid"));
+        assert!(START_SCRIPT.contains("command -v setsid"));
+        assert!(START_SCRIPT.contains("nohup \"$binary\" serve"));
         assert!(START_SCRIPT.contains("status --json"));
         assert!(START_SCRIPT.contains("launch=already_running"));
         assert!(START_SCRIPT.contains("launch=pid_alive"));

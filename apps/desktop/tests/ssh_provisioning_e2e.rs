@@ -10,6 +10,10 @@
 //! VIBEX_SSH_E2E_CONFIG=/tmp/vibex-ssh-e2e/config \
 //! VIBEX_SSH_E2E_ARTIFACT=target/server-artifacts-2.8/vibex-server-0.1.0-rc.8-linux-x86_64.tar.gz \
 //! cargo test -p vibex-desktop --test ssh_provisioning_e2e -- --ignored --nocapture
+//!
+//! For macOS set VIBEX_SSH_E2E_ALIAS, PORT=22, REMOTE_HOME=/Users/<user>,
+//! REMOTE_ROOT=/Users/<user>/.local/share/vibex/server, ARCH=aarch64, and
+//! ARTIFACT_VERSION to the Mac-built server version.
 //! ```
 
 use std::fmt::Write as _;
@@ -39,17 +43,22 @@ fn fixture_config() -> Option<PathBuf> {
     ))
 }
 
+fn fixture_destination() -> SshDestination {
+    let alias = std::env::var("VIBEX_SSH_E2E_ALIAS").unwrap_or_else(|_| "vibex-e2e".to_string());
+    let port = std::env::var("VIBEX_SSH_E2E_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2222);
+    SshDestination {
+        host: alias,
+        user: None,
+        port,
+    }
+}
+
 fn command_for(config: &Path) -> SshCommand {
-    SshCommand::for_destination(
-        "ssh",
-        &SshDestination {
-            host: "vibex-e2e".to_string(),
-            user: None,
-            port: 2222,
-        },
-        Some(config),
-    )
-    .expect("build SSH command")
+    SshCommand::for_destination("ssh", &fixture_destination(), Some(config))
+        .expect("build SSH command")
 }
 
 fn remote_file_sha(command: &SshCommand, path: &str) -> String {
@@ -283,7 +292,7 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the Docker sshd fixture and a server tarball"]
-async fn provisioning_reaches_ready_over_docker_sshd() {
+async fn provisioning_reaches_ready_over_sshd() {
     if std::env::var_os("VIBEX_SSH_E2E").is_none() {
         return;
     }
@@ -293,17 +302,26 @@ async fn provisioning_reaches_ready_over_docker_sshd() {
         PathBuf::from(std::env::var("VIBEX_SSH_E2E_ARTIFACT").expect("VIBEX_SSH_E2E_ARTIFACT"));
     let bytes = std::fs::read(&artifact_path).expect("read server artifact");
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let destination = SshDestination {
-        host: "vibex-e2e".to_string(),
-        user: None,
-        port: 2222,
-    };
-    let command = SshCommand::for_destination("ssh", &destination, Some(&config_path))
-        .expect("build SSH command");
+    let destination = fixture_destination();
+    let command = command_for(&config_path);
+    let remote_home =
+        std::env::var("VIBEX_SSH_E2E_REMOTE_HOME").unwrap_or_else(|_| "/home/dev".to_string());
+    let remote_root = std::env::var("VIBEX_SSH_E2E_REMOTE_ROOT")
+        .unwrap_or_else(|_| format!("{remote_home}/.local/share/vibex/server"));
+    let arch = std::env::var("VIBEX_SSH_E2E_ARCH")
+        .ok()
+        .and_then(|value| match value.as_str() {
+            "aarch64" | "arm64" => Some(RemoteArch::Aarch64),
+            "x86_64" => Some(RemoteArch::X86_64),
+            _ => None,
+        })
+        .unwrap_or(RemoteArch::X86_64);
+    let version = std::env::var("VIBEX_SSH_E2E_ARTIFACT_VERSION")
+        .unwrap_or_else(|_| "0.1.0-rc.8".to_string());
     let launch = LaunchConfig::new(
-        "/home/dev",
-        "/home/dev/.local/share/vibex/server",
-        &["/home/dev".to_string()],
+        &remote_home,
+        &remote_root,
+        std::slice::from_ref(&remote_home),
         8765,
     )
     .expect("launch config");
@@ -311,8 +329,8 @@ async fn provisioning_reaches_ready_over_docker_sshd() {
     let desktop_home = tempfile::tempdir().expect("desktop home");
     let artifact = LocalArtifact {
         path: artifact_path,
-        version: "0.1.0-rc.8".to_string(),
-        arch: RemoteArch::X86_64,
+        version,
+        arch,
         size: bytes.len() as u64,
         sha256,
     };

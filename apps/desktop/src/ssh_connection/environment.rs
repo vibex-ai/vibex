@@ -100,7 +100,7 @@ pub struct RemoteEnvironment {
     pub arch: RemoteArch,
     pub home: String,
     pub shell: String,
-    pub glibc: GlibcVersion,
+    pub glibc: Option<GlibcVersion>,
     pub free_kb: u64,
     pub git_available: bool,
     pub sha256sum_available: bool,
@@ -114,8 +114,11 @@ impl RemoteEnvironment {
     /// Blocking checks. Git and an unknown port are warnings; a non-writable
     /// home, missing sha256sum, old glibc, low disk and a busy port are errors.
     pub fn validate(&self, min_free_kb: u64) -> Result<(), EnvironmentError> {
-        if self.glibc < MIN_GLIBC {
-            return Err(EnvironmentError::GlibcTooOld { found: self.glibc });
+        if self.os == "Linux" {
+            let glibc = self.glibc.ok_or(EnvironmentError::MissingGlibc)?;
+            if glibc < MIN_GLIBC {
+                return Err(EnvironmentError::GlibcTooOld { found: glibc });
+            }
         }
         if self.free_kb < min_free_kb {
             return Err(EnvironmentError::InsufficientDisk {
@@ -245,11 +248,17 @@ pub fn probe_script(remote_port: u16) -> String {
     format!(
         r#"set -eu
 printf 'os=%s\n' "$(uname -s)"
-printf 'arch=%s\n' "$(uname -m)"
+arch=$(uname -m)
+if [ "$arch" = arm64 ]; then arch=aarch64; fi
+printf 'arch=%s\n' "$arch"
 printf 'home=%s\n' "$HOME"
 printf 'shell=%s\n' "${{SHELL:-}}"
 if command -v git >/dev/null 2>&1; then echo git=yes; else echo git=no; fi
-if command -v sha256sum >/dev/null 2>&1; then echo sha256sum=yes; else echo sha256sum=no; fi
+if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
+  echo sha256sum=yes
+else
+  echo sha256sum=no
+fi
 df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {{print "free_kb=" $4}}' || true
 glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
 glibc="${{glibc#glibc }}"
@@ -263,6 +272,12 @@ if command -v ss >/dev/null 2>&1; then
     else
       port=free
     fi
+  fi
+elif command -v lsof >/dev/null 2>&1; then
+  if lsof -nP -iTCP:{remote_port} -sTCP:LISTEN >/dev/null 2>&1; then
+    port=busy
+  else
+    port=free
   fi
 fi
 printf 'port=%s\n' "$port"
@@ -375,12 +390,14 @@ pub fn parse_probe_output(stdout: &str) -> Result<RemoteEnvironment, Environment
         return Err(EnvironmentError::ProbeIncomplete);
     }
     let os = os.ok_or(EnvironmentError::ProbeIncomplete)?;
-    if os != "Linux" {
+    if os != "Linux" && os != "Darwin" {
         return Err(EnvironmentError::UnsupportedOs { found: os });
     }
     let arch = arch.ok_or(EnvironmentError::ProbeIncomplete)?;
     let home = home.ok_or(EnvironmentError::ProbeIncomplete)?;
-    let glibc = glibc.ok_or(EnvironmentError::MissingGlibc)?;
+    if os == "Linux" && glibc.is_none() {
+        return Err(EnvironmentError::MissingGlibc);
+    }
     let free_kb = free_kb.ok_or(EnvironmentError::ProbeIncomplete)?;
 
     let mut warnings = Vec::new();
@@ -469,10 +486,10 @@ runtime=present\n";
         assert_eq!(environment.shell, "/bin/bash");
         assert_eq!(
             environment.glibc,
-            GlibcVersion {
+            Some(GlibcVersion {
                 major: 2,
                 minor: 36
-            }
+            })
         );
         assert_eq!(environment.free_kb, 1_048_576);
         assert!(environment.git_available);
@@ -485,14 +502,25 @@ runtime=present\n";
     }
 
     #[test]
-    fn rejects_a_non_linux_host() {
-        let output = CANONICAL.replace("os=Linux", "os=Darwin");
+    fn rejects_a_non_linux_or_macos_host() {
+        let output = CANONICAL.replace("os=Linux", "os=FreeBSD");
         assert_eq!(
             parse_probe_output(&output),
             Err(EnvironmentError::UnsupportedOs {
-                found: "Darwin".to_string()
+                found: "FreeBSD".to_string()
             })
         );
+    }
+
+    #[test]
+    fn parses_a_complete_macos_environment_without_glibc() {
+        let output = CANONICAL
+            .replace("os=Linux", "os=Darwin")
+            .replace("glibc=2.36\n", "glibc=\n");
+        let environment = parse_probe_output(&output).unwrap();
+        assert_eq!(environment.os, "Darwin");
+        assert_eq!(environment.glibc, None);
+        environment.validate(MIN_FREE_KB).unwrap();
     }
 
     #[test]
@@ -667,7 +695,7 @@ runtime=present\n";
         );
         let environment = parse_probe_output(&String::from_utf8_lossy(&output.stdout)).unwrap();
         assert_eq!(environment.os, "Linux");
-        assert!(environment.glibc >= MIN_GLIBC);
+        assert!(environment.glibc.unwrap() >= MIN_GLIBC);
         assert!(environment.free_kb > 0);
         // Port 8765 may legitimately be in use on the test host; the script's
         // detection is covered by the parser fixture instead.

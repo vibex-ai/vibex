@@ -133,7 +133,15 @@ incoming=$1
 root=$2
 version=$3
 expected=$4
-actual=$(sha256sum "$incoming" | awk '{print $1}')
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$incoming" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "$incoming" | awk '{print $1}')
+else
+  rm -f "$incoming"
+  echo "install=sha_tool_missing"
+  exit 2
+fi
 if [ "$actual" != "$expected" ]; then
   rm -f "$incoming"
   echo "install=hash_mismatch"
@@ -165,7 +173,10 @@ else
 fi
 rm -f "$root/.current.tmp"
 ln -s "$version" "$root/.current.tmp"
-mv -Tf "$root/.current.tmp" "$root/current"
+if ! mv -Tf "$root/.current.tmp" "$root/current" 2>/dev/null; then
+  rm -f "$root/current"
+  mv -f "$root/.current.tmp" "$root/current"
+fi
 echo "install=ok version=$version"
 "#;
 
@@ -302,6 +313,7 @@ mod tests {
     #[test]
     fn script_is_fixed_and_swaps_current_only_after_extracting() {
         assert!(INSTALL_SCRIPT.contains("sha256sum"));
+        assert!(INSTALL_SCRIPT.contains("shasum -a 256"));
         assert!(INSTALL_SCRIPT.contains("tar -xzf"));
         assert!(INSTALL_SCRIPT.contains("mv -Tf"));
         assert!(INSTALL_SCRIPT.contains("previous"));
