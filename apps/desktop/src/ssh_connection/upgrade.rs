@@ -88,6 +88,8 @@ pub struct UpgradeOutcome {
     pub to_version: String,
     pub install: InstallOutcome,
     pub snapshot_dir: String,
+    /// Version directories removed after the new runtime became healthy.
+    pub cleaned_versions: usize,
 }
 
 /// Installs `artifact`, switches the runtime to it, and rolls back on failure.
@@ -168,11 +170,14 @@ pub fn upgrade_runtime(
         ));
     }
 
+    let cleaned_versions = cleanup_old_versions(command, launch).unwrap_or_default();
+
     Ok(UpgradeOutcome {
         from_version: before.version,
         to_version: artifact.version.clone(),
         install,
         snapshot_dir: snapshot,
+        cleaned_versions,
     })
 }
 
@@ -278,6 +283,44 @@ fn restore_database(
     Ok(())
 }
 
+/// Removes version directories other than `current` and `previous`. The
+/// runtime home, backups, and symlinks are preserved. Best effort: cleanup
+/// failure never turns a healthy upgrade into a failed one.
+pub fn cleanup_old_versions(
+    command: &SshCommand,
+    launch: &LaunchConfig,
+) -> Result<usize, UpgradeError> {
+    let mut cleanup = command.clone();
+    cleanup.remote_script(CLEANUP_SCRIPT).map_err(|error| {
+        UpgradeError::new(
+            "ssh_upgrade_cleanup_script",
+            UpgradePhase::Starting,
+            error.to_string(),
+        )
+    })?;
+    cleanup.args.push(launch.remote_install_root.clone().into());
+    let output = cleanup.run_with_timeout(SWITCH_TIMEOUT).map_err(|error| {
+        UpgradeError::new(
+            "ssh_upgrade_cleanup_failed",
+            UpgradePhase::Starting,
+            ssh_message(error),
+        )
+    })?;
+    let stdout = output.stdout_lossy();
+    let count = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("cleanup="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            UpgradeError::new(
+                "ssh_upgrade_cleanup_unconfirmed",
+                UpgradePhase::Starting,
+                "the version cleanup did not confirm",
+            )
+        })?;
+    Ok(count)
+}
+
 fn switch_to_previous(command: &SshCommand, root: &str) -> Result<(), UpgradeError> {
     let mut switch = command.clone();
     switch.remote_script(SWITCH_SCRIPT).map_err(|error| {
@@ -331,6 +374,29 @@ rm -f "$home/vibex.db" "$home/vibex.db-wal" "$home/vibex.db-shm"
 tar -xzf "$dir/db.tar.gz" -C "$home"
 chmod 600 "$home/vibex.db"
 echo "restore=ok"
+"#;
+
+pub const CLEANUP_SCRIPT: &str = r#"set -eu
+root=$1
+current=$(readlink "$root/current" 2>/dev/null || true)
+previous=$(readlink "$root/previous" 2>/dev/null || true)
+removed=0
+for entry in "$root"/*; do
+  if [ ! -d "$entry" ]; then
+    continue
+  fi
+  name=$(basename "$entry")
+  case "$name" in
+    backups|home|current|previous) continue ;;
+    *[!0-9A-Za-z._-]*) continue ;;
+  esac
+  if [ "$name" = "$current" ] || [ "$name" = "$previous" ]; then
+    continue
+  fi
+  rm -rf "$entry"
+  removed=$((removed + 1))
+done
+echo "cleanup=$removed"
 "#;
 
 pub const SWITCH_SCRIPT: &str = r#"set -eu
@@ -504,6 +570,7 @@ case "$script" in
     ;;
   *" stop"*) echo 0 > "$state"; echo stopped=true;;
   *"snapshot=ok"*) echo snapshot=ok;;
+  *"cleanup="*) echo cleanup=2;;
   *"restore=ok"*) echo restore=ok;;
   *"current="*) echo current=0.1.0-rc.8;;
   *) echo install=ok;;
@@ -558,6 +625,7 @@ esac
         assert_eq!(outcome.from_version, "0.1.0-rc.8");
         assert_eq!(outcome.to_version, "0.1.0-rc.9");
         assert!(outcome.snapshot_dir.contains("/backups/upgrade-"));
+        assert_eq!(outcome.cleaned_versions, 2);
         assert_eq!(fs::read_to_string(&state).unwrap().trim(), "1");
 
         fs::write(dir.path().join("fail-start"), b"1").unwrap();
@@ -579,12 +647,18 @@ esac
 
     #[test]
     fn fixed_scripts_do_not_interpolate_user_values() {
-        for script in [SNAPSHOT_SCRIPT, RESTORE_SCRIPT, SWITCH_SCRIPT] {
+        for script in [
+            SNAPSHOT_SCRIPT,
+            RESTORE_SCRIPT,
+            SWITCH_SCRIPT,
+            CLEANUP_SCRIPT,
+        ] {
             assert!(script.starts_with("set -eu"));
             assert!(!script.contains("${"));
         }
         assert!(SNAPSHOT_SCRIPT.contains("vibex.db-wal"));
         assert!(RESTORE_SCRIPT.contains("tar -xzf"));
         assert!(SWITCH_SCRIPT.contains("previous"));
+        assert!(CLEANUP_SCRIPT.contains("backups|home"));
     }
 }

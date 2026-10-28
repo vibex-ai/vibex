@@ -168,29 +168,58 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
         .unwrap();
     prepare.run().expect("prepare upgrade dirs");
 
+    let old7 = LocalArtifact {
+        path: artifact_path.clone(),
+        version: "0.1.0-rc.7".to_string(),
+        arch: RemoteArch::X86_64,
+        size: old_bytes.len() as u64,
+        sha256: old_sha.clone(),
+    };
+    install_artifact(&command, &old7, "/home/dev/upgrade-server", |_, _| {})
+        .expect("install rc.7 runtime");
     let old = LocalArtifact {
         path: artifact_path.clone(),
         version: "0.1.0-rc.8".to_string(),
         arch: RemoteArch::X86_64,
         size: old_bytes.len() as u64,
-        sha256: old_sha.clone(),
+        sha256: old_sha,
     };
     install_artifact(&command, &old, "/home/dev/upgrade-server", |_, _| {})
         .expect("install old runtime");
     supervisor::ensure_started(&command, &launch).expect("start old runtime");
 
     let dir = tempfile::tempdir().expect("upgrade artifacts");
-    let new_path = dir.path().join("new.tar.gz");
-    std::fs::copy(&artifact_path, &new_path).expect("copy new artifact");
+    let (new_path, real_new_binary) = match std::env::var_os("VIBEX_SSH_E2E_NEW_ARTIFACT") {
+        Some(path) => (PathBuf::from(path), true),
+        None => {
+            let path = dir.path().join("new.tar.gz");
+            std::fs::copy(&artifact_path, &path).expect("copy new artifact");
+            (path, false)
+        }
+    };
+    let new_bytes = std::fs::read(&new_path).expect("read new artifact");
     let new = LocalArtifact {
         path: new_path,
         version: "0.1.0-rc.9".to_string(),
         arch: RemoteArch::X86_64,
-        size: old_bytes.len() as u64,
-        sha256: old_sha,
+        size: new_bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&new_bytes)),
     };
-    upgrade_runtime(&command, &launch, &new, SshRuntimeChannel::Rc, |_, _| {})
+    let outcome = upgrade_runtime(&command, &launch, &new, SshRuntimeChannel::Rc, |_, _| {})
         .expect("upgrade to rc.9");
+    assert!(outcome.cleaned_versions >= 1, "rc.7 should be cleaned");
+    let mut check = command.clone();
+    check
+        .remote_script("test ! -d \"$1\"")
+        .expect("cleanup check script");
+    check
+        .args
+        .push("/home/dev/upgrade-server/0.1.0-rc.7".into());
+    check.run().expect("rc.7 directory should be removed");
+    if real_new_binary {
+        let status = supervisor::status(&command, &launch).expect("new binary status");
+        assert_eq!(status.version, "0.1.0-rc.9");
+    }
 
     let bad_binary = dir.path().join("vibex-server");
     std::fs::write(&bad_binary, b"#!/bin/sh\nexit 1\n").unwrap();
