@@ -41,6 +41,7 @@ use gpui_component::{
     notification::NotificationType,
     pagination::Pagination,
     scroll::ScrollableElement as _,
+    separator::Separator,
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -165,6 +166,12 @@ const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_milli
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "sk-…";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
+/// The mutation id a models.dev catalogue refresh holds while it runs.
+///
+/// The refresh button reads it back to show its spinner, and the action string
+/// is otherwise only meaningful to the mutation that owns it.
+const MANAGEMENT_CATALOG_REFRESH_ACTION: &str = "models-catalog-refresh";
+
 const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
 const PROVIDER_OPTION_CC_SWITCH_APP_TYPE: &str = "ccSwitchAppType";
 const PROVIDER_OPTION_NATIVE_SOURCE: &str = "nativeSource";
@@ -12526,9 +12533,10 @@ impl ManagementCenter {
                 .min_w_0()
                 .gap_1()
                 // The same card the Agent sidebar draws: an 8px surface, a
-                // hairline border, and a filled background. Selection is a
-                // primary wash rather than an outline, so the row does not
-                // change thickness when it becomes current.
+                // hairline border, and a filled background. Selection takes the
+                // solid accent plate and hover the light primary wash, so
+                // pointing at a row previews a weaker emphasis than the one a
+                // click commits to instead of outshining it.
                 .rounded(px(8.0))
                 .border_1()
                 .border_color(if gateway_selected {
@@ -12537,7 +12545,7 @@ impl ManagementCenter {
                     cx.theme().border.opacity(0.65)
                 })
                 .bg(if gateway_selected {
-                    cx.theme().primary.opacity(0.08)
+                    cx.theme().accent
                 } else {
                     cx.theme().background.opacity(0.70)
                 })
@@ -12545,9 +12553,9 @@ impl ManagementCenter {
                 .cursor_pointer()
                 .hover(|style| {
                     style.bg(if gateway_selected {
-                        cx.theme().primary.opacity(0.08)
-                    } else {
                         cx.theme().accent
+                    } else {
+                        cx.theme().primary.opacity(0.08)
                     })
                 })
                 .child(
@@ -12594,8 +12602,6 @@ impl ManagementCenter {
         for row in &rows {
             let id = row.profile.id.as_str().to_string();
             let is_selected = selected.as_deref() == Some(id.as_str());
-            let key_summary =
-                shared_provider_key_summary(&row.profile, &self.gateway.upstreams, locale);
             let is_favorite = self.provider_favorites.contains(id.as_str());
             let enabled_models = row
                 .profile
@@ -12603,12 +12609,15 @@ impl ManagementCenter {
                 .iter()
                 .filter(|model| model.enabled)
                 .count();
-            let ready_keys = row
-                .profile
-                .credentials
-                .iter()
-                .filter(|credential| credential.status == vibex_core::AgentCredentialStatus::Ready)
-                .count();
+            // Two counts, and nothing else: on a card the question is how much
+            // this Provider offers, not how many of its Keys are momentarily
+            // cooling. The Key states and the health verdict belong to the
+            // detail pane, where there is room to say what each one means.
+            let summary = management_provider_card_summary(
+                enabled_models,
+                row.profile.credentials.len(),
+                locale,
+            );
             let (health_label, health_status) = self.shared_provider_health_label(&row.profile);
             let health_color = match health_status {
                 vibex_core::ProviderHealthStatus::Fail => cx.theme().danger,
@@ -12617,6 +12626,10 @@ impl ManagementCenter {
                 _ => cx.theme().muted_foreground,
             };
             let agent_count = row.agents.len();
+            // The card's footer names the Agents by their logos only. The
+            // shapes are recognizable at a glance and the names made every row
+            // compete with the Provider's own name above them; the full list,
+            // with names and their default marker, is the detail pane's job.
             let agent_stack = row
                 .agents
                 .iter()
@@ -12649,7 +12662,7 @@ impl ManagementCenter {
                         cx.theme().border.opacity(0.65)
                     })
                     .bg(if is_selected {
-                        cx.theme().primary.opacity(0.08)
+                        cx.theme().accent
                     } else {
                         cx.theme().background.opacity(0.70)
                     })
@@ -12657,9 +12670,9 @@ impl ManagementCenter {
                     .cursor_pointer()
                     .hover(|style| {
                         style.bg(if is_selected {
-                            cx.theme().primary.opacity(0.08)
-                        } else {
                             cx.theme().accent
+                        } else {
+                            cx.theme().primary.opacity(0.08)
                         })
                     })
                     .child(
@@ -12732,16 +12745,7 @@ impl ManagementCenter {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "{enabled_models} {} · {ready_keys}/{} {} · {key_summary}",
-                                        management_locale_text("models", "个模型", "個模型"),
-                                        row.profile.credentials.len(),
-                                        management_locale_text(
-                                            "keys ready",
-                                            "Key 就绪",
-                                            "Key 就緒"
-                                        ),
-                                    )),
+                                    .child(summary),
                             )
                             .child(div().text_xs().text_color(health_color).child(health_label)),
                     )
@@ -12838,6 +12842,25 @@ impl ManagementCenter {
             } else {
                 management_route_group_users_label(row.agents.len())
             };
+            // The card names the Agents that reference it by their logos, the
+            // same way a Provider card does. The count above says how many use
+            // it; the logos say which, without a second line of names.
+            let agent_count = row.agents.len();
+            let agent_stack = row
+                .agents
+                .iter()
+                .take(5)
+                .map(|agent_id| {
+                    let label = self
+                        .snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id.as_str() == agent_id)
+                        .map(|agent| agent.label.clone())
+                        .unwrap_or_else(|| agent_id.clone());
+                    (agent_id.clone(), label)
+                })
+                .collect::<Vec<_>>();
             route_group_list = route_group_list.child(
                 v_flex()
                     .id(SharedString::from(format!(
@@ -12854,7 +12877,7 @@ impl ManagementCenter {
                         cx.theme().border.opacity(0.65)
                     })
                     .bg(if is_selected {
-                        cx.theme().primary.opacity(0.08)
+                        cx.theme().accent
                     } else {
                         cx.theme().background.opacity(0.70)
                     })
@@ -12862,9 +12885,9 @@ impl ManagementCenter {
                     .cursor_pointer()
                     .hover(|style| {
                         style.bg(if is_selected {
-                            cx.theme().primary.opacity(0.08)
-                        } else {
                             cx.theme().accent
+                        } else {
+                            cx.theme().primary.opacity(0.08)
                         })
                     })
                     .child(
@@ -12908,12 +12931,43 @@ impl ManagementCenter {
                             ),
                     )
                     .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{summary} · {used}")),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{summary} · {used}")),
+                            )
+                            .children(agent_stack.into_iter().map(|(agent_id, label)| {
+                                let tooltip = SharedString::from(label);
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "management-route-agent-logo-{id}-{agent_id}"
+                                    )))
+                                    .role(Role::Image)
+                                    .aria_label(tooltip.clone())
+                                    .flex_none()
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                            .build(window, cx)
+                                    })
+                                    .child(agent_brand_icon(&agent_id, px(14.0), None))
+                            }))
+                            .when(agent_count > 5, |stack| {
+                                stack.child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("+{}", agent_count - 5)),
+                                )
+                            }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_route_id = Some(select_id.clone());
@@ -12988,7 +13042,8 @@ impl ManagementCenter {
             .then(|| self.render_native_import_report(cx));
         let (section_title, actions, section_body) = match active_tab {
             ProviderSidebarTab::Providers => (
-                management_locale_text("Providers", "Provider", "Provider"),
+                // The list heading, not the tab: it names the records below it.
+                management_locale_text("Providers", "供应商", "供應商"),
                 vec![
                     Button::new("management-provider-page-add")
                         .xsmall()
@@ -13294,18 +13349,23 @@ impl ManagementCenter {
                 .unwrap_or_else(vibex_core::ProviderProfileId::new);
             let bind_shared = Some(profile.id.clone());
             if !unbound.is_empty() {
-                agent_rows = agent_rows.child(
-                    div()
-                        .w_full()
-                        .pt_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "Select an Agent to let it use this Provider",
-                            "点击 Agent 即可让它使用该供应商",
-                            "點擊 Agent 即可讓它使用該供應商",
-                        )),
-                );
+                // A rule, not another blank line: the pills above are the
+                // Agents that use this Provider and the ones below are the ones
+                // that could, and the two lists answer different questions.
+                agent_rows = agent_rows
+                    .child(Separator::horizontal().my_1().h(px(1.0)))
+                    .child(
+                        div()
+                            .w_full()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Select an Agent to let it use this Provider",
+                                "点击 Agent 即可让它使用该供应商",
+                                "點擊 Agent 即可讓它使用該供應商",
+                            )),
+                    );
                 for agent in &unbound {
                     let bind_agent = agent.id.clone();
                     let bind_profile = bind_profile.clone();
@@ -13351,11 +13411,11 @@ impl ManagementCenter {
                     ));
             }
             body = body.child(management_card_with_icon(
-                management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
+                management_locale_text("Agent usage", "Agent 使用", "Agent 使用"),
                 management_locale_text(
-                    "Select an Agent to remove it, or to let it use this Provider. Deleting the Provider would remove the model source of every Agent listed here.",
-                    "点击 Agent 可移除它或让它使用该供应商；删除该供应商会让这里列出的 Agent 失去模型来源。",
-                    "點擊 Agent 可移除它或讓它使用該供應商；刪除該供應商會讓這裡列出的 Agent 失去模型來源。",
+                    "Select an Agent in the first list to remove it, or one below to let it use this Provider. Deleting the Provider would remove the model source of every Agent listed here.",
+                    "点击第一组中的 Agent 可移除它，点击下方 Agent 可让它使用该供应商；删除该供应商会让这里列出的 Agent 失去模型来源。",
+                    "點擊第一組中的 Agent 可移除它，點擊下方 Agent 可讓它使用該供應商；刪除該供應商會讓這裡列出的 Agent 失去模型來源。",
                 ),
                 "icons/vibex/cpu.svg",
                 agent_rows.into_any_element(),
@@ -14352,18 +14412,22 @@ impl ManagementCenter {
                 .filter(|agent| !row.agents.contains(agent.id.as_str()))
                 .collect::<Vec<_>>();
             if !unbound.is_empty() {
-                agent_rows = agent_rows.child(
-                    div()
-                        .w_full()
-                        .pt_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "Select an Agent to let it reference this group",
-                            "点击 Agent 即可让它引用该路由组",
-                            "點擊 Agent 即可讓它引用該路由組",
-                        )),
-                );
+                // The rule answers "where does the used list end?", the same
+                // way it does on a Provider's page.
+                agent_rows = agent_rows
+                    .child(Separator::horizontal().my_1().h(px(1.0)))
+                    .child(
+                        div()
+                            .w_full()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Select an Agent to let it reference this group",
+                                "点击 Agent 即可让它引用该路由组",
+                                "點擊 Agent 即可讓它引用該路由組",
+                            )),
+                    );
                 for agent in &unbound {
                     let bind_agent = agent.id.clone();
                     let bind_route = route.id.clone();
@@ -14407,11 +14471,11 @@ impl ManagementCenter {
             // the rest add one. Two cards made the reader diff two lists that
             // describe the same relationship.
             body = body.child(management_card_with_icon(
-                management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
+                management_locale_text("Agent usage", "Agent 使用", "Agent 使用"),
                 management_locale_text(
-                    "Select an Agent to remove its reference, or to let it use this group. Deleting the group would remove these models from every Agent listed here.",
-                    "点击 Agent 可移除引用或让它使用该路由组；删除该路由组会让这里列出的 Agent 失去这些模型。",
-                    "點擊 Agent 可移除引用或讓它使用該路由組；刪除該路由組會讓這裡列出的 Agent 失去這些模型。",
+                    "Select an Agent in the first list to remove its reference, or one below to let it use this group. Deleting the group would remove these models from every Agent listed here.",
+                    "点击第一组中的 Agent 可移除引用，点击下方 Agent 可让它使用该路由组；删除该路由组会让这里列出的 Agent 失去这些模型。",
+                    "點擊第一組中的 Agent 可移除引用，點擊下方 Agent 可讓它使用該路由組；刪除該路由組會讓這裡列出的 Agent 失去這些模型。",
                 ),
                 "icons/vibex/cpu.svg",
                 agent_rows.into_any_element(),
@@ -15301,24 +15365,22 @@ impl ManagementCenter {
     /// toolbar.
     ///
     /// They act on the same list, so they share one band: a search field that
-    /// takes the surplus, a filter menu that names the current subset, and an
-    /// icon menu for the order. Two stacked rows of chips spent the narrow
-    /// column's height on repeated words and made the filter and the sort look
-    /// like separate tools.
+    /// takes the surplus and two menu buttons that name their current value.
+    /// Two stacked rows of chips spent the narrow column's height on repeated
+    /// words and made the filter and the sort look like separate tools.
     fn render_provider_controls_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let search = management_search_input_compact(&self.provider_search, cx);
         let active_filter = self.provider_list_filter;
         let active_sort = self.provider_sort;
 
         let filter_center = cx.weak_entity();
-        let filter_label = management_locale_text("Filter", "筛选", "篩選");
         let filter_button = Button::new("management-provider-filter")
             .small()
             .outline()
             .label(active_filter.label())
             .dropdown_caret(true)
-            .tooltip(filter_label)
-            .accessibility_label(filter_label)
+            .tooltip(management_locale_text("Filter", "筛选", "篩選"))
+            .accessibility_label(management_locale_text("Filter", "筛选", "篩選"))
             .dropdown_menu(move |mut menu, _, _| {
                 for filter in ProviderListFilter::ALL {
                     let center = filter_center.clone();
@@ -15339,8 +15401,8 @@ impl ManagementCenter {
             });
 
         // Sorting is a familiar icon command and the narrowest thing in the
-        // band, so it carries its current value in the tooltip and a check mark
-        // in its menu; the filter keeps a visible label because which subset is
+        // band, so it carries its value in the tooltip and a checked mark in
+        // its menu; the filter keeps a visible label because which subset is
         // showing changes what the list means.
         let sort_center = cx.weak_entity();
         let sort_tooltip = SharedString::from(format!(
@@ -15490,6 +15552,23 @@ impl ManagementCenter {
             "重新整理 models.dev",
         );
         let refresh_tooltip = SharedString::from(refresh_label);
+        // A fetch can take seconds, so the button says it is working: the kit's
+        // spinner replaces the arrow and the tooltip named the state. A disabled
+        // arrow alone reads as "not allowed" rather than "already running".
+        let refreshing = matches!(
+            &self.mutation,
+            Some(ManagementMutation::ProviderProbe(action))
+                if action == MANAGEMENT_CATALOG_REFRESH_ACTION
+        );
+        let refresh_tooltip = if refreshing {
+            SharedString::from(management_locale_text(
+                "Refreshing models.dev…",
+                "正在刷新 models.dev…",
+                "正在重新整理 models.dev…",
+            ))
+        } else {
+            refresh_tooltip
+        };
         h_flex()
             .w_full()
             .items_center()
@@ -15508,6 +15587,7 @@ impl ManagementCenter {
                     .xsmall()
                     .ghost()
                     .icon(IconName::RefreshCw)
+                    .loading(refreshing)
                     .tooltip(refresh_tooltip.clone())
                     .disabled(self.mutation.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.refresh_catalog(cx))),
@@ -15524,7 +15604,7 @@ impl ManagementCenter {
             return;
         }
         self.mutation = Some(ManagementMutation::ProviderProbe(
-            "models-catalog-refresh".to_string(),
+            MANAGEMENT_CATALOG_REFRESH_ACTION.to_string(),
         ));
         self.error = None;
         self.notice = None;
@@ -21908,7 +21988,7 @@ impl ManagementCenter {
                 .border_1()
                 .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
                 .bg(if selected {
-                    cx.theme().primary.opacity(0.08)
+                    cx.theme().accent
                 } else {
                     cx.theme().background.opacity(0.70)
                 })
@@ -21916,9 +21996,9 @@ impl ManagementCenter {
                 .py_2()
                 .hover(|style| {
                     style.bg(if selected {
-                        cx.theme().primary.opacity(0.08)
-                    } else {
                         cx.theme().accent
+                    } else {
+                        cx.theme().primary.opacity(0.08)
                     })
                 })
                 .when(added, |row| {
@@ -22106,11 +22186,11 @@ impl ManagementCenter {
             .border_1()
             .border_color(cx.theme().border.opacity(0.70))
             .bg(if self.custom_agent_editor_open {
-                cx.theme().primary.opacity(0.08)
+                cx.theme().accent
             } else {
                 cx.theme().background.opacity(0.70)
             })
-            .hover(|style| style.bg(cx.theme().accent))
+            .hover(|style| style.bg(cx.theme().primary.opacity(0.08)))
             .child(
                 div()
                     .size(px(32.0))
@@ -30258,15 +30338,15 @@ impl ManagementCenter {
                         cx.theme().border.opacity(0.65)
                     })
                     .bg(if active {
-                        cx.theme().primary.opacity(0.08)
+                        cx.theme().accent
                     } else {
                         cx.theme().background.opacity(0.90)
                     })
                     .hover(|style| {
                         style.bg(if active {
-                            cx.theme().primary.opacity(0.08)
-                        } else {
                             cx.theme().accent
+                        } else {
+                            cx.theme().primary.opacity(0.08)
                         })
                     })
                     .cursor_pointer()
@@ -32547,7 +32627,7 @@ impl ManagementCenter {
                 .bg(if active_drop_after.is_some() {
                     cx.theme().tokens.drop_target.into()
                 } else if active {
-                    cx.theme().primary.opacity(0.08)
+                    cx.theme().accent
                 } else {
                     cx.theme().background.opacity(0.90)
                 })
@@ -32555,9 +32635,9 @@ impl ManagementCenter {
                     style.bg(if active_drop_after.is_some() {
                         cx.theme().tokens.drop_target.into()
                     } else if active {
-                        cx.theme().primary.opacity(0.08)
-                    } else {
                         cx.theme().accent
+                    } else {
+                        cx.theme().primary.opacity(0.08)
                     })
                 })
                 .when(
@@ -32731,7 +32811,9 @@ impl ManagementCenter {
                             .text_xs()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text("Providers", "Provider", "Provider")),
+                            // A record name inside a card, not a destination:
+                            // this one stays translated.
+                            .child(management_locale_text("Providers", "供应商", "供應商")),
                     )
                     .child(providers),
             )
@@ -38787,37 +38869,6 @@ impl GatewayTranslation {
     }
 }
 
-fn gateway_key_summary_text(
-    upstream: &vibex_core::GatewayUpstreamSummary,
-    locale: ResolvedLocale,
-) -> String {
-    let cooling = upstream
-        .keys
-        .iter()
-        .filter(|key| matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. }))
-        .count();
-    let soonest_recovery = upstream
-        .keys
-        .iter()
-        .filter_map(|key| match key.state {
-            vibex_core::GatewayKeyState::Cooling { until_ms, .. } => until_ms,
-            _ => None,
-        })
-        .min();
-    let invalid = upstream
-        .keys
-        .iter()
-        .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
-        .count();
-    gateway_key_counts_text(
-        upstream.keys.len(),
-        cooling,
-        soonest_recovery,
-        invalid,
-        locale,
-    )
-}
-
 /// The gateway's own row summary: every upstream Key in one line.
 fn gateway_overall_key_summary(
     snapshot: &vibex_core::GatewaySnapshot,
@@ -38896,22 +38947,17 @@ fn gateway_key_counts_text(
 /// A Provider that is one of the gateway's upstreams borrows the gateway's
 /// richer summary (cooling, invalid, soonest recovery); every other Provider
 /// only knows how many Keys it has.
-fn shared_provider_key_summary(
-    profile: &vibex_core::ModelProviderProfile,
-    upstreams: &[vibex_core::GatewayUpstreamSummary],
+/// The one metadata line a Provider card carries: how many models it offers
+/// and how many Keys it holds.
+fn management_provider_card_summary(
+    enabled_models: usize,
+    keys: usize,
     locale: ResolvedLocale,
 ) -> String {
-    if let Some(upstream) = upstreams
-        .iter()
-        .find(|upstream| upstream.model_provider_profile_id == profile.id)
-    {
-        return gateway_key_summary_text(upstream, locale);
-    }
-    let count = profile.credentials.len();
     match locale {
-        ResolvedLocale::En => format!("{count} keys"),
-        ResolvedLocale::ZhCn => format!("{count} 个 Key"),
-        ResolvedLocale::ZhTw => format!("{count} 個 Key"),
+        ResolvedLocale::En => format!("{enabled_models} models · {keys} keys"),
+        ResolvedLocale::ZhCn => format!("{enabled_models} 个模型 · {keys} 个 Key"),
+        ResolvedLocale::ZhTw => format!("{enabled_models} 個模型 · {keys} 個 Key"),
     }
 }
 
@@ -40886,8 +40932,10 @@ fn management_resource_row(
         } else {
             cx.theme().border.opacity(0.65)
         })
+        // Selection takes the solid accent plate and hover the light primary
+        // wash, the same pairing every list in this column uses.
         .bg(if selected {
-            cx.theme().primary.opacity(0.12)
+            cx.theme().accent
         } else {
             cx.theme().background.opacity(0.70)
         })
@@ -40895,9 +40943,9 @@ fn management_resource_row(
         .py_2()
         .hover(|style| {
             style.bg(if selected {
-                cx.theme().primary.opacity(0.12)
-            } else {
                 cx.theme().accent
+            } else {
+                cx.theme().primary.opacity(0.08)
             })
         })
         .on_click(cx.listener(move |this, _, window, cx| click(this, window, cx)))
@@ -47929,58 +47977,151 @@ mod gateway_surface_tests {
         assert_eq!(next_gateway_cooldown_expiry(&snapshot, 1_000), None);
     }
 
-    /// The global Providers list borrows the gateway's Key summary.
+    /// Hover is the light wash and selection the solid plate.
+    ///
+    /// The two used to be the other way round, so pointing at a card painted a
+    /// stronger surface than the one the current selection held, and the
+    /// selected row receded exactly when the pointer left it.
     #[test]
-    fn a_provider_row_summary_names_cooling_and_invalid_keys() {
-        let profile = vibex_core::ModelProviderProfile {
-            id: vibex_core::ModelProviderProfileId::new(),
-            display_name: "DeepSeek".to_string(),
-            ..Default::default()
-        };
-        let key = |state| vibex_core::GatewayKeySummary {
-            credential_id: vibex_core::RequestId::new(),
-            display_name: "Key".to_string(),
-            state,
-            used_tokens: 0,
-            limits: None,
-
-            models: Vec::new(),
-            proxy_url: None,
-        };
-        let upstream = vibex_core::GatewayUpstreamSummary {
-            model_provider_profile_id: profile.id.clone(),
-            display_name: profile.display_name.clone(),
-            model_count: 1,
-            keys: vec![
-                key(vibex_core::GatewayKeyState::Ready),
-                key(vibex_core::GatewayKeyState::Cooling {
-                    kind: vibex_core::GatewayFailureKind::Rate,
-                    until_ms: Some(vibex_core::unix_timestamp_ms() + 60_000),
-                }),
-                key(vibex_core::GatewayKeyState::Invalid),
-            ],
-        };
-        let chinese = shared_provider_key_summary(
-            &profile,
-            std::slice::from_ref(&upstream),
-            ResolvedLocale::ZhCn,
+    fn sidebar_cards_preview_a_weaker_surface_than_selection() {
+        let source = include_str!("management.rs");
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        // Whitespace-insensitive: the card builders are wrapped differently at
+        // each nesting depth, and the point is the pairing, not the indent.
+        let flat = sidebar.split_whitespace().collect::<Vec<_>>().join(" ");
+        let selected_plate = ".bg(if is_selected { cx.theme().accent } else";
+        let selected_plate_gateway = ".bg(if gateway_selected { cx.theme().accent } else";
+        let hover_wash = "cx.theme().primary.opacity(0.08)";
+        assert!(
+            flat.contains(selected_plate) && flat.contains(selected_plate_gateway),
+            "both the Provider and the route-group cards paint selection with the accent plate"
         );
-        assert!(chinese.contains("3 个 Key"), "{chinese}");
-        assert!(chinese.contains("1 个冷却中"), "{chinese}");
-        assert!(chinese.contains("1 个已失效"), "{chinese}");
-        let english = shared_provider_key_summary(
-            &profile,
-            std::slice::from_ref(&upstream),
-            ResolvedLocale::En,
+        assert!(
+            flat.matches(hover_wash).count() >= 3,
+            "every card keeps the light wash for its hover preview"
         );
-        assert!(english.contains("3 keys"), "{english}");
-        assert!(english.contains("1 cooling"), "{english}");
-        assert!(english.contains("1 invalid"), "{english}");
+        assert!(
+            !flat.contains(".bg(if is_selected { cx.theme().primary.opacity(0.08)"),
+            "the light wash is not the selected surface any more"
+        );
+    }
 
-        // A Provider that is not an upstream only knows its Key count.
+    /// The Agent list on both overviews is titled "Agent usage" and separates
+    /// the Agents that already use the record from the ones that could.
+    #[test]
+    fn agent_usage_cards_separate_bound_agents_with_a_rule() {
+        let source = include_str!("management.rs");
+        for (name, start, end) in [
+            (
+                "provider",
+                "if self.provider_detail_tab == ProviderDetailTab::Overview {",
+                "// Deletion lives at the bottom of the page",
+            ),
+            (
+                "route group",
+                "if self.route_group_detail_tab == RouteGroupDetailTab::Overview {",
+                "if self.route_group_detail_tab == RouteGroupDetailTab::Members {",
+            ),
+        ] {
+            let card = source
+                .split_once(start)
+                .and_then(|(_, tail)| tail.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("the {name} overview should remain inspectable"));
+            assert!(
+                card.contains(
+                    "management_locale_text(\"Agent usage\", \"Agent 使用\", \"Agent 使用\")"
+                ),
+                "the {name} card is titled Agent usage"
+            );
+            assert!(
+                !card.contains("被哪些 Agent 使用"),
+                "the {name} card no longer says which Agents use it"
+            );
+            assert!(
+                card.contains("Separator::horizontal()"),
+                "the {name} card draws a rule between the two Agent groups"
+            );
+            assert!(
+                card.find("Separator::horizontal()").unwrap()
+                    < card.find("management-provider-unbound-agent-").map_or(
+                        card.find("management-route-group-unbound-agent-")
+                            .unwrap_or(usize::MAX),
+                        |index| index,
+                    ),
+                "the rule is where the bound list ends in the {name} card"
+            );
+        }
+    }
+
+    /// Route-group cards name their Agents by logo, as Provider cards do.
+    #[test]
+    fn route_group_cards_stack_agent_logos() {
+        let source = include_str!("management.rs");
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        let card = sidebar
+            .split_once("for row in &route_rows {")
+            .and_then(|(_, tail)| tail.split_once("if route_rows.is_empty() {"))
+            .map(|(body, _)| body)
+            .expect("the route-group card should remain inspectable");
+        assert!(
+            card.contains("management-route-agent-logo-"),
+            "the card draws one logo per Agent"
+        );
+        assert!(
+            !card.contains(".child(label)"),
+            "the card must not draw the Agent name"
+        );
+        assert!(
+            card.contains("agent_count > 5"),
+            "the overflow count matches the Provider card's"
+        );
+    }
+
+    /// A Provider card states only how much the Provider offers.
+    ///
+    /// The line used to append the gateway's per-Key states and a "ready" ratio,
+    /// which read as three counts of three different things in a card whose job
+    /// is to be scannable. Key states live on the Keys tab, where each one has
+    /// room to say what it means.
+    #[test]
+    fn a_provider_card_summary_names_models_and_keys_only() {
         assert_eq!(
-            shared_provider_key_summary(&profile, &[], ResolvedLocale::ZhCn),
-            format!("{} 个 Key", profile.credentials.len())
+            management_provider_card_summary(4, 2, ResolvedLocale::ZhCn),
+            "4 个模型 · 2 个 Key"
+        );
+        assert_eq!(
+            management_provider_card_summary(4, 2, ResolvedLocale::ZhTw),
+            "4 個模型 · 2 個 Key"
+        );
+        assert_eq!(
+            management_provider_card_summary(4, 2, ResolvedLocale::En),
+            "4 models · 2 keys"
+        );
+        // A Provider with nothing configured still says so, rather than
+        // dropping the counts and leaving an empty line.
+        assert_eq!(
+            management_provider_card_summary(0, 0, ResolvedLocale::ZhCn),
+            "0 个模型 · 0 个 Key"
+        );
+
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("let summary = management_provider_card_summary(")
+            .and_then(|(_, tail)| tail.split_once("let agent_count = row.agents.len();"))
+            .map(|(body, _)| body)
+            .expect("the Provider card summary should remain inspectable");
+        assert!(
+            !card.contains("shared_provider_key_summary("),
+            "the card must not borrow the gateway's per-Key states"
         );
     }
 
@@ -48490,20 +48631,116 @@ mod gateway_surface_tests {
         }
     }
 
+    #[test]
+    fn the_provider_list_can_favorite_filter_and_sort() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-favorite-",
+            "ProviderSort::RecentlyUpdated",
+            "ProviderSort::MostAgents",
+            "ProviderSort::Health",
+            "ProviderListFilter::Shared",
+            "management-provider-sort",
+            "management-provider-favorites.json",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the Providers list must keep {marker}"
+            );
+        }
+    }
+
+    /// Search, filter, and sort share one gpui-component toolbar.
+    ///
+    /// They act on the same list and used to be two stacked chip rows, which
+    /// made the filter and the sort read as separate tools and doubled the
+    /// labels in a narrow column. The toolbar is what gives them one band, one
+    /// keyboard order, and one accessible grouping.
+    #[test]
+    fn the_provider_controls_are_one_mixed_toolbar() {
+        let source = include_str!("management.rs");
+        let controls = source
+            .split_once("    fn render_provider_controls_toolbar(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_native_import_report("))
+            .map(|(body, _)| body)
+            .expect("the Provider controls should remain inspectable");
+        assert!(
+            controls.contains("Toolbar::new(\"management-provider-controls\")"),
+            "the kit toolbar owns the band's layout and keyboard order"
+        );
+        assert!(
+            controls.contains("management-provider-filter")
+                && controls.contains("management-provider-sort"),
+            "both menus stay in the toolbar"
+        );
+        assert!(
+            !controls.contains("filter.label())")
+                || controls.contains(".checked(filter == active_filter)"),
+            "the filter menu reports the current choice"
+        );
+        // The old stacked chip rows are gone from the Provider column.
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        assert!(
+            !sidebar.contains("render_provider_filter_row"),
+            "the chip rows are replaced by the toolbar"
+        );
+        assert!(
+            sidebar.contains(".children(provider_controls)"),
+            "the toolbar is what the column renders"
+        );
+    }
+
     /// The Providers surface is named the same way in every locale.
     ///
     /// The Chinese caption used to be the translated record name while MCP and
     /// Skill kept their product nouns, so one tab bar read as two vocabularies.
     #[test]
-    fn the_providers_surface_keeps_its_product_noun_in_every_locale() {
+    fn the_providers_destination_keeps_its_product_noun_in_every_locale() {
         let source = include_str!("management.rs");
         assert!(
             source.contains("providers: \"Provider\""),
-            "the Chinese Providers caption is the product noun, not a translation"
+            "the navigation destination is the product noun in Chinese too"
         );
         assert!(
             !source.contains("providers: \"供应商\"") && !source.contains("providers: \"供應商\""),
-            "the caption must not fall back to the translated record name"
+            "the destination must not fall back to the translated record name"
+        );
+        // The destination is the only place that takes the product noun. A
+        // record name — the sub-heading inside an Agent's Provider card, and
+        // the heading above the list on this page — stays in the reader's
+        // language, or the card would read "Provider" where it means "the
+        // Providers this Agent has".
+        assert!(
+            source.contains("// A record name inside a card, not a destination:"),
+            "the Agent page's sub-heading documents why it stays translated"
+        );
+        // The tab and the navigation item are destinations and keep the noun;
+        // the list heading and the in-card sub-heading are not.
+        let sidebar_heading = source
+            .split_once("let (section_title, actions, section_body) = match active_tab {")
+            .and_then(|(_, tail)| tail.split_once("management_resource_sidebar_actions("))
+            .map(|(body, _)| body)
+            .expect("the sidebar heading should remain inspectable");
+        assert!(
+            sidebar_heading
+                .contains("management_locale_text(\"Providers\", \"供应商\", \"供應商\")"),
+            "the heading above the list names the records, in the reader's language"
+        );
+        let agent_card_heading = source
+            .split_once("let default_source = self.render_agent_default_source_summary(")
+            .and_then(|(_, tail)| {
+                tail.split_once("let provider_configuration = management_card_with_icon(")
+            })
+            .map(|(body, _)| body)
+            .expect("the Agent page's Provider card should remain inspectable");
+        assert!(
+            agent_card_heading
+                .contains("management_locale_text(\"Providers\", \"供应商\", \"供應商\")"),
+            "the sub-heading inside an Agent's card stays translated"
         );
     }
 
@@ -48576,6 +48813,10 @@ mod gateway_surface_tests {
                 < refresh.find("refresh_model_catalog().await").unwrap(),
             "the request must be spawned, not awaited on the UI task"
         );
+        assert!(
+            !refresh.contains("self.mutation_task = Some(cx.spawn(async move |_, cx| {\n            let outcome = backend"),
+            "the UI task waits for the bridge, it does not perform the fetch"
+        );
     }
 
     /// One card owns a Provider's Agent list: bound Agents remove, the rest bind.
@@ -48598,67 +48839,6 @@ mod gateway_surface_tests {
             !overview.contains("Use for another Agent"),
             "the second offer card is gone"
         );
-    }
-
-    /// Search, filter, and sort share one gpui-component toolbar.
-    ///
-    /// They act on the same list and used to be two stacked chip rows, which
-    /// made the filter and the sort read as separate tools and doubled the
-    /// labels in a narrow column. The toolbar is what gives them one band, one
-    /// keyboard order, and one accessible grouping.
-    #[test]
-    fn the_provider_controls_are_one_mixed_toolbar() {
-        let source = include_str!("management.rs");
-        let controls = source
-            .split_once("    fn render_provider_controls_toolbar(")
-            .and_then(|(_, tail)| tail.split_once("    fn render_native_import_report("))
-            .map(|(body, _)| body)
-            .expect("the Provider controls should remain inspectable");
-        assert!(
-            controls.contains("Toolbar::new(\"management-provider-controls\")"),
-            "the kit toolbar owns the band's layout and keyboard order"
-        );
-        assert!(
-            controls.contains("management-provider-filter")
-                && controls.contains("management-provider-sort"),
-            "both menus stay in the toolbar"
-        );
-        assert!(
-            controls.contains(".checked(filter == active_filter)"),
-            "the filter menu reports the current choice"
-        );
-        let sidebar = source
-            .split_once("    fn render_provider_page_sidebar(")
-            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
-            .map(|(body, _)| body)
-            .expect("the Providers sidebar should remain inspectable");
-        assert!(
-            !sidebar.contains("render_provider_filter_row"),
-            "the chip rows are replaced by the toolbar"
-        );
-        assert!(
-            sidebar.contains(".children(provider_controls)"),
-            "the toolbar is what the column renders"
-        );
-    }
-
-    #[test]
-    fn the_provider_list_can_favorite_filter_and_sort() {
-        let source = include_str!("management.rs");
-        for marker in [
-            "management-provider-favorite-",
-            "ProviderSort::RecentlyUpdated",
-            "ProviderSort::MostAgents",
-            "ProviderSort::Health",
-            "ProviderListFilter::Shared",
-            "management-provider-sort",
-            "management-provider-favorites.json",
-        ] {
-            assert!(
-                source.contains(marker),
-                "the Providers list must keep {marker}"
-            );
-        }
     }
 
     #[test]
@@ -49022,7 +49202,11 @@ mod gateway_surface_tests {
                 },
             ],
         };
-        let summary = gateway_key_summary_text(&upstream, ResolvedLocale::En);
+        // The gateway row is the only surface left that summarises Key states:
+        // a Provider's card says how many Keys it holds and nothing more.
+        let mut snapshot = vibex_core::GatewaySnapshot::default();
+        snapshot.upstreams.push(upstream);
+        let summary = gateway_overall_key_summary(&snapshot, ResolvedLocale::En);
         assert!(summary.contains("3 keys"), "{summary}");
         assert!(summary.contains("1 cooling"), "{summary}");
         assert!(summary.contains("1 invalid"), "{summary}");
