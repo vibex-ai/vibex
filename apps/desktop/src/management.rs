@@ -1002,6 +1002,21 @@ impl ManagedDeleteTarget {
     }
 }
 
+/// Which stage of a Config Center refresh is in flight.
+///
+/// A refresh paints the sections in three stages: the Agent list, the content
+/// snapshot, and finally the authoritative probe that refreshes Agent versions.
+/// Only the middle stage is needed to show a mutation's result, so the stage is
+/// tracked explicitly: a user action must be able to pre-empt the slow probe
+/// instead of queueing behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagementRefreshStage {
+    Idle,
+    Agents,
+    Content,
+    Authoritative,
+}
+
 pub struct ManagementCenter {
     runtime: Option<Arc<DesktopRuntime>>,
     /// Authority-agnostic handle for the sections whose Remote v2 contract is
@@ -1295,6 +1310,10 @@ pub struct ManagementCenter {
     generation: u64,
     refresh_task: Option<Task<()>>,
     refresh_pending: bool,
+    refresh_stage: ManagementRefreshStage,
+    /// Whether the content stage that is running or starts next belongs to the
+    /// first-load chain and should continue into the authoritative probe.
+    refresh_full_after_content: bool,
     agent_install_refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     agent_mutation_tasks: BTreeMap<String, Task<()>>,
@@ -2343,6 +2362,8 @@ impl ManagementCenter {
             generation: 0,
             refresh_task: None,
             refresh_pending: false,
+            refresh_stage: ManagementRefreshStage::Idle,
+            refresh_full_after_content: false,
             agent_install_refresh_task: None,
             mutation_task: None,
             agent_mutation_tasks: BTreeMap::new(),
@@ -2702,6 +2723,8 @@ impl ManagementCenter {
         if runtime_changed {
             self.generation = self.generation.saturating_add(1);
             self.refresh_pending = false;
+            self.refresh_stage = ManagementRefreshStage::Idle;
+            self.refresh_full_after_content = false;
             self.loading = false;
             self.details_ready = false;
             self.refresh_task = None;
@@ -2866,6 +2889,8 @@ impl ManagementCenter {
         self.loading = false;
         self.details_ready = false;
         self.refresh_pending = false;
+        self.refresh_stage = ManagementRefreshStage::Idle;
+        self.refresh_full_after_content = false;
         self.agent_install_refresh_task = None;
         self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
         self.agent_auth_loading = false;
@@ -4829,10 +4854,33 @@ impl ManagementCenter {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // Once the first snapshot is on screen, every later refresh is a
+        // content update: it only has to repaint what a mutation changed, so
+        // it skips the Agent probe and the version probe. The content stage
+        // still carries every section of the Config Center.
+        if self.details_ready {
+            match self.refresh_stage {
+                ManagementRefreshStage::Idle | ManagementRefreshStage::Authoritative => {
+                    // A user action must not wait for the version probe. Start
+                    // the content read now; starting it bumps the generation,
+                    // so the older authoritative pass drops its result.
+                    self.refresh_pending = false;
+                    self.refresh_full_after_content = false;
+                    self.start_fast_snapshot(cx);
+                }
+                ManagementRefreshStage::Agents | ManagementRefreshStage::Content => {
+                    // A content read is already in flight; the pass that
+                    // follows it will carry this request too.
+                    self.refresh_pending = true;
+                }
+            }
+            return;
+        }
         if self.loading {
             self.refresh_pending = true;
             return;
         }
+        self.refresh_pending = false;
         self.start_agent_refresh(cx);
     }
 
@@ -4862,6 +4910,8 @@ impl ManagementCenter {
             self.note_management_reads_unavailable(cx);
             return;
         };
+        self.refresh_stage = ManagementRefreshStage::Agents;
+        self.refresh_full_after_content = true;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         self.loading = true;
@@ -4886,10 +4936,7 @@ impl ManagementCenter {
                         this.loading = false;
                         this.error = Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
-                        if this.refresh_pending {
-                            this.refresh_pending = false;
-                            this.refresh(cx);
-                        }
+                        this.finish_failed_refresh(cx);
                     }
                     Err(error) => {
                         this.loading = false;
@@ -4902,14 +4949,21 @@ impl ManagementCenter {
                             )
                         ));
                         cx.notify();
-                        if this.refresh_pending {
-                            this.refresh_pending = false;
-                            this.refresh(cx);
-                        }
+                        this.finish_failed_refresh(cx);
                     }
                 }
             });
         }));
+    }
+
+    /// Returns a failed refresh to idle and runs the request that arrived while
+    /// it was in flight.
+    fn finish_failed_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_stage = ManagementRefreshStage::Idle;
+        self.refresh_full_after_content = false;
+        if std::mem::take(&mut self.refresh_pending) {
+            self.refresh(cx);
+        }
     }
 
     fn start_fast_snapshot(&mut self, cx: &mut Context<Self>) {
@@ -4917,6 +4971,7 @@ impl ManagementCenter {
             self.note_management_reads_unavailable(cx);
             return;
         };
+        self.refresh_stage = ManagementRefreshStage::Content;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         self.loading = true;
@@ -4924,15 +4979,15 @@ impl ManagementCenter {
         let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let snapshot = load_snapshot(backend.clone(), default_scope, false).await;
-            // The ledger is a separate, small read: it changes per request and
-            // must not hold up the Config Center's own snapshot.
-            let requests = backend.management().model_gateway_requests().await;
-            // The live table is read on first paint as well as subscribed to:
-            // a request that started before this page opened is still running,
-            // and its events have already gone by.
-            let inflight = backend.management().model_gateway_inflight().await;
-            (snapshot, requests, inflight)
+            // The ledger and the live table are separate, small reads. Run
+            // them beside the snapshot instead of after it: they change per
+            // request and must not add their latency to the Config Center's
+            // own content.
+            tokio::join!(
+                load_snapshot(backend.clone(), default_scope, false),
+                backend.management().model_gateway_requests(),
+                backend.management().model_gateway_inflight(),
+            )
         });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -4941,17 +4996,28 @@ impl ManagementCenter {
                     return;
                 }
                 this.loading = false;
-                let success = matches!(&outcome, Ok((Ok(_), _, _)));
                 match outcome {
                     Ok((Ok(snapshot), requests, inflight)) => {
                         this.gateway_requests = requests.unwrap_or_default();
                         this.gateway_inflight = inflight.unwrap_or_default();
                         this.apply_snapshot(snapshot, cx);
                         cx.notify();
-                        this.start_full_refresh(cx);
+                        let authoritative = std::mem::take(&mut this.refresh_full_after_content);
+                        this.refresh_stage = ManagementRefreshStage::Idle;
+                        if std::mem::take(&mut this.refresh_pending) {
+                            // A mutation landed while this read was in flight.
+                            // Re-read the content, but do not follow it with
+                            // the slow probe: the request is about what just
+                            // changed, not about Agent versions.
+                            this.refresh(cx);
+                        } else if authoritative {
+                            this.start_full_refresh(cx);
+                        }
                     }
                     Ok((Err(error), _, _)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message))
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                        this.finish_failed_refresh(cx);
                     }
                     Err(error) => {
                         this.error = Some(format!(
@@ -4961,14 +5027,9 @@ impl ManagementCenter {
                                 "配置中心刷新失败",
                                 "配置中心重新整理失敗",
                             )
-                        ))
-                    }
-                }
-                if !success {
-                    cx.notify();
-                    if this.refresh_pending {
-                        this.refresh_pending = false;
-                        this.refresh(cx);
+                        ));
+                        cx.notify();
+                        this.finish_failed_refresh(cx);
                     }
                 }
             });
@@ -4980,6 +5041,8 @@ impl ManagementCenter {
             self.note_management_reads_unavailable(cx);
             return;
         };
+        self.refresh_stage = ManagementRefreshStage::Authoritative;
+        self.refresh_full_after_content = false;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         self.loading = true;
@@ -4996,6 +5059,7 @@ impl ManagementCenter {
                     return;
                 }
                 this.loading = false;
+                this.refresh_stage = ManagementRefreshStage::Idle;
                 match outcome {
                     Ok(Ok(snapshot)) => this.apply_snapshot(snapshot, cx),
                     Ok(Err(error)) => {
@@ -5013,8 +5077,7 @@ impl ManagementCenter {
                     }
                 }
                 cx.notify();
-                if this.refresh_pending {
-                    this.refresh_pending = false;
+                if std::mem::take(&mut this.refresh_pending) {
                     this.refresh(cx);
                 }
             });
@@ -5167,6 +5230,34 @@ impl ManagementCenter {
         if std::mem::take(&mut self.discover_agents_after_refresh) {
             self.discover_local_agents(cx);
         }
+    }
+
+    /// Puts one Prompt the authority just returned into the list the sidebar
+    /// draws.
+    ///
+    /// The mutation response is authoritative, so waiting for the next
+    /// snapshot would only delay the row and the editor behind an unrelated
+    /// read.
+    fn apply_prompt_success(&mut self, prompt: &vibex_core::Prompt) {
+        upsert_prompt(&mut self.snapshot.prompts, prompt);
+    }
+
+    fn remove_prompt(&mut self, prompt_id: &str) {
+        self.snapshot
+            .prompts
+            .retain(|prompt| prompt.id.as_str() != prompt_id);
+        if self.selected_prompt_id.as_deref() == Some(prompt_id) {
+            self.selected_prompt_id = None;
+        }
+    }
+
+    /// Puts one shared Provider the authority just returned into the list the
+    /// global Providers page draws.
+    ///
+    /// Like a Prompt, the mutation response is the authoritative record; the
+    /// refresh that follows only reconciles the data derived from it.
+    fn apply_shared_provider_success(&mut self, provider: vibex_core::ModelProviderProfile) {
+        upsert_shared_provider(&mut self.providers, provider);
     }
 
     fn apply_provider_profile_success(
@@ -7106,6 +7197,12 @@ impl ManagementCenter {
                 this.mutation = None;
                 match outcome {
                     Ok(profile) => {
+                        let display_name = profile.display_name.clone();
+                        let profile_id = profile.id.as_str().to_string();
+                        // Apply the created record before the refresh runs so
+                        // the sidebar and the detail pane change with the
+                        // toast instead of waiting for another backend read.
+                        this.apply_shared_provider_success(profile);
                         this.notice = Some(format!(
                             "{} · {}",
                             management_locale_text_for(
@@ -7114,9 +7211,9 @@ impl ManagementCenter {
                                 "供应商已创建",
                                 "供應商已建立",
                             ),
-                            profile.display_name
+                            display_name
                         ));
-                        this.selected_global_provider_id = Some(profile.id.as_str().to_string());
+                        this.selected_global_provider_id = Some(profile_id);
                         this.profile_editor_open = false;
                         this.editing_profile_id = None;
                         this.provider_editor_shared = false;
@@ -7126,6 +7223,7 @@ impl ManagementCenter {
                         this.projection_editor.set_secret_intent(false, false);
                         this.navigation
                             .mark_dirty(ManagementSection::Providers, false);
+                        cx.notify();
                         this.refresh(cx);
                     }
                     Err(error) => {
@@ -9255,6 +9353,13 @@ impl ManagementCenter {
                                 this.navigation
                                     .mark_dirty(ManagementSection::PromptsHooks, dirty);
                             }
+                            ManagementMutation::PromptAction(action)
+                                if action.starts_with("delete:") =>
+                            {
+                                if let Some(prompt_id) = action.strip_prefix("delete:") {
+                                    this.remove_prompt(prompt_id);
+                                }
+                            }
                             ManagementMutation::HookAction(action)
                                 if action.starts_with("create") =>
                             {
@@ -9310,6 +9415,10 @@ impl ManagementCenter {
                             this.native_import_preview = Some(preview);
                         }
                         if let Some(prompt) = success.prompt.as_ref() {
+                            // The mutation response is authoritative, so the
+                            // row and the editor update with the toast rather
+                            // than after the refresh reads the list again.
+                            this.apply_prompt_success(prompt);
                             // The editor keeps the text the user just saved and
                             // the sidebar selects what it belongs to, so the
                             // next Save updates that record instead of creating
@@ -11201,16 +11310,15 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         let prompt_id = prompt.id.clone();
-        let display_name = prompt.display_name.clone();
         let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
-        self.begin_simple_task(
+        self.begin_task_with_success(
             ManagementMutation::PromptAction(format!("status:{}", prompt_id.as_str())),
             cx,
             async move {
-                backend
+                let prompt = backend
                     .management()
                     .update_prompt(MutationRequest::new(vibex_core::PromptUpdateRequest {
                         prompt_id,
@@ -11226,20 +11334,21 @@ impl ManagementCenter {
                     }))
                     .await
                     .map_err(crate::app::remote_error_into_vibex)?;
-                Ok(match (active_locale, status) {
+                let message = match (active_locale, prompt.status) {
                     (ResolvedLocale::En, vibex_core::PromptStatus::Enabled) => {
-                        format!("Enabled {display_name}")
+                        format!("Enabled {}", prompt.display_name)
                     }
-                    (ResolvedLocale::En, _) => format!("Disabled {display_name}"),
+                    (ResolvedLocale::En, _) => format!("Disabled {}", prompt.display_name),
                     (ResolvedLocale::ZhCn, vibex_core::PromptStatus::Enabled) => {
-                        format!("已启用 {display_name}")
+                        format!("已启用 {}", prompt.display_name)
                     }
-                    (ResolvedLocale::ZhCn, _) => format!("已停用 {display_name}"),
+                    (ResolvedLocale::ZhCn, _) => format!("已停用 {}", prompt.display_name),
                     (ResolvedLocale::ZhTw, vibex_core::PromptStatus::Enabled) => {
-                        format!("已啟用 {display_name}")
+                        format!("已啟用 {}", prompt.display_name)
                     }
-                    (ResolvedLocale::ZhTw, _) => format!("已停用 {display_name}"),
-                })
+                    (ResolvedLocale::ZhTw, _) => format!("已停用 {}", prompt.display_name),
+                };
+                Ok(ManagementTaskSuccess::with_prompt(message, prompt))
             },
         );
     }
@@ -14926,8 +15035,14 @@ impl ManagementCenter {
                     Ok(()) => {
                         // The page's subject is gone, so fall back to the pinned
                         // gateway row rather than leaving a detail pane that
-                        // describes nothing.
+                        // describes nothing. Drop the row and its bindings now;
+                        // the refresh reconciles everything derived from them.
+                        this.providers.retain(|provider| provider.id != provider_id);
+                        this.provider_bindings.retain(|binding| {
+                            binding.model_provider_profile_id.as_ref() != Some(&provider_id)
+                        });
                         this.selected_global_provider_id = None;
+                        cx.notify();
                         this.refresh(cx);
                     }
                     Err(error) => {
@@ -18205,12 +18320,17 @@ impl ManagementCenter {
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
-                    Ok(_) => {
+                    Ok(profile) => {
+                        // The response is the new authoritative record. Apply
+                        // it now; the refresh only reconciles the projections
+                        // derived from it.
+                        this.apply_shared_provider_success(profile);
                         if this.shared_provider_edit_target.as_ref() == Some(&updated_id) {
                             this.shared_provider_edit_target = None;
                             this.shared_provider_edit_error = None;
                         }
                         this.notice = Some(message.to_string());
+                        cx.notify();
                         this.refresh(cx);
                     }
                     Err(error) => {
@@ -37997,6 +38117,33 @@ fn management_status_badge(label: String, _cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// Replaces one Prompt in place, or appends the new one.
+///
+/// The authority returns the record a mutation wrote, so the list can show it
+/// before the next snapshot read reaches the view.
+fn upsert_prompt(prompts: &mut Vec<vibex_core::Prompt>, prompt: &vibex_core::Prompt) {
+    if let Some(existing) = prompts.iter_mut().find(|existing| existing.id == prompt.id) {
+        *existing = prompt.clone();
+    } else {
+        prompts.push(prompt.clone());
+    }
+}
+
+/// Replaces one shared Provider in place, or appends the new one.
+fn upsert_shared_provider(
+    providers: &mut Vec<vibex_core::ModelProviderProfile>,
+    provider: vibex_core::ModelProviderProfile,
+) {
+    if let Some(existing) = providers
+        .iter_mut()
+        .find(|existing| existing.id == provider.id)
+    {
+        *existing = provider;
+    } else {
+        providers.push(provider);
+    }
+}
+
 /// Groups shared Provider Profiles by identity and resolves the Agents that
 /// bind each one.
 ///
@@ -44550,6 +44697,68 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Skills"));
         assert!(renderer.contains("ManagementSection::PromptsHooks"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    /// A mutation response is a complete record, so the list can show it
+    /// immediately instead of waiting for the next snapshot.
+    #[test]
+    fn a_mutation_result_is_upserted_into_the_visible_list() {
+        let mut prompts = Vec::new();
+        let mut prompt = vibex_core::Prompt {
+            id: vibex_core::PromptId::parse("prompt_upsert_probe").expect("fixture id"),
+            display_name: "Reusable prompt".into(),
+            kind: vibex_core::PromptKind::ReusablePrompt,
+            status: vibex_core::PromptStatus::Enabled,
+            scope_kind: vibex_core::PromptScopeKind::User,
+            project_id: None,
+            workspace_id: None,
+            body: "Review this workspace.".into(),
+            description: None,
+            tags: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            deleted_at_ms: None,
+        };
+        upsert_prompt(&mut prompts, &prompt);
+        prompt.display_name = "Edited prompt".into();
+        upsert_prompt(&mut prompts, &prompt);
+        assert_eq!(prompts.len(), 1, "the same record must not be duplicated");
+        assert_eq!(prompts[0].display_name, "Edited prompt");
+
+        let mut providers = Vec::new();
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "DeepSeek".into(),
+            ..Default::default()
+        };
+        upsert_shared_provider(&mut providers, provider.clone());
+        upsert_shared_provider(&mut providers, provider);
+        assert_eq!(providers.len(), 1, "the Provider is replaced in place");
+        assert_eq!(providers[0].display_name, "DeepSeek");
+    }
+
+    /// A mutation refresh must not sit behind the version probe that the first
+    /// load runs. Once the content is on screen, the fast stage is enough.
+    #[test]
+    fn a_config_center_refresh_preempts_the_authoritative_probe() {
+        let source = include_str!("management.rs");
+        let refresh = source
+            .split_once("    pub fn refresh(")
+            .and_then(|(_, tail)| tail.split_once("    /// Reports that this authority"))
+            .map(|(body, _)| body)
+            .expect("Config Center refresh should remain inspectable");
+        assert!(refresh.contains("if self.details_ready"));
+        assert!(refresh.contains("ManagementRefreshStage::Authoritative"));
+        assert!(refresh.contains("self.start_fast_snapshot(cx)"));
+        assert!(refresh.contains("self.refresh_pending = true"));
+
+        let content = source
+            .split_once("    fn start_fast_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("    fn start_full_refresh("))
+            .map(|(body, _)| body)
+            .expect("the content stage should remain inspectable");
+        assert!(content.contains("this.refresh(cx)"));
+        assert!(content.contains("this.start_full_refresh(cx)"));
+        assert!(content.contains("refresh_full_after_content"));
     }
 
     /// Saving a Prompt has to leave its tab clean, so the editor compares the
