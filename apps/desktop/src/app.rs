@@ -9272,6 +9272,11 @@ pub struct VibexWorkbench {
     #[allow(dead_code)]
     ssh_provisioning_start_task: Option<Task<()>>,
     #[allow(dead_code)]
+    ssh_upgrade_task: Option<Task<()>>,
+    ssh_upgrade_running: bool,
+    #[allow(dead_code)]
+    ssh_upgrade_error: Option<String>,
+    #[allow(dead_code)]
     ssh_provisioning_task: Option<Task<()>>,
     #[allow(dead_code)]
     ssh_provisioning_snapshot: Option<ProvisioningSnapshot>,
@@ -11100,6 +11105,9 @@ impl VibexWorkbench {
             remote_client: None,
             ssh_provisioning: None,
             ssh_provisioning_start_task: None,
+            ssh_upgrade_task: None,
+            ssh_upgrade_running: false,
+            ssh_upgrade_error: None,
             ssh_provisioning_task: None,
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
@@ -14089,6 +14097,173 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    #[allow(dead_code)]
+    fn start_ssh_runtime_upgrade(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if self.ssh_upgrade_running || self.ssh_provisioning.is_some() {
+            return;
+        }
+        let Some(config) = self.config.clone() else {
+            self.ssh_upgrade_error = Some("the runtime configuration is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            self.ssh_upgrade_error = Some("the local runtime is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.ssh_upgrade_error = Some("the SSH profile was not found".to_string());
+            cx.notify();
+            return;
+        };
+        let home = config.home_dir.clone();
+        self.ssh_upgrade_running = true;
+        self.ssh_upgrade_error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let destination = SshDestination {
+                host: profile.host.clone(),
+                user: profile.user.clone(),
+                port: profile.port,
+            };
+            let program = profile
+                .ssh_client_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("ssh"));
+            let command = SshCommand::for_destination(
+                program,
+                &destination,
+                profile.ssh_config_path.as_deref(),
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let environment = probe(&command, profile.remote_port, MIN_FREE_KB)
+                .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+            let verified = runtime
+                .app_update()
+                .latest_verified_manifest()
+                .await
+                .map_err(|error| format!("{}: {}", error.code, error.message))?
+                .ok_or_else(|| "the release manifest is unavailable".to_string())?;
+            let target = verified.manifest.version.clone();
+            let artifact = select_server_artifact(&verified, environment.arch)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let local = download_server_artifact(
+                artifact,
+                &target.to_string(),
+                environment.arch,
+                &home.join("ssh-artifacts"),
+                |_, _| {},
+            )
+            .await
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let launch = LaunchConfig::new(
+                &profile.remote_home,
+                &profile.remote_install_root,
+                &profile.workspace_roots,
+                profile.remote_port,
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let channel = profile
+                .runtime_version
+                .as_deref()
+                .and_then(crate::ssh_connection::upgrade::channel_for_version_str)
+                .unwrap_or(profile.channel);
+            crate::ssh_connection::upgrade::upgrade_runtime(
+                &command,
+                &launch,
+                &local,
+                channel,
+                |_, _| {},
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            Ok::<(String, String), String>((profile.id, target.to_string()))
+        });
+        self.ssh_upgrade_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.ssh_upgrade_running = false;
+                    match result {
+                        Ok(Ok((profile_id, version))) => {
+                            this.ssh_upgrade_error = None;
+                            this.update_profile_runtime_version(&profile_id, &version);
+                            this.runtime_note = Some(
+                                locale::text(
+                                    "SSH runtime upgraded",
+                                    "SSH 运行时已升级",
+                                    "SSH 執行階段已升級",
+                                )
+                                .to_string(),
+                            );
+                            this.reconnect_after_ssh_upgrade(&profile_id, cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.ssh_upgrade_error = Some(error);
+                            this.reconnect_after_ssh_upgrade(&profile_id, cx);
+                        }
+                        Err(_) => {
+                            this.ssh_upgrade_error =
+                                Some("the SSH upgrade task stopped unexpectedly".to_string());
+                            this.reconnect_after_ssh_upgrade(&profile_id, cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
+    fn update_profile_runtime_version(&self, profile_id: &str, version: &str) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
+            return;
+        };
+        profile.runtime_version = Some(version.to_string());
+        if let Some(channel) = crate::ssh_connection::upgrade::channel_for_version_str(version) {
+            profile.channel = channel;
+        }
+        profile.last_connected_at_ms = Some(unix_timestamp_ms());
+        let _ = store.save(&profiles);
+    }
+
+    fn reconnect_after_ssh_upgrade(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let Some(runtime_id) = profile.registered_runtime_id else {
+            return;
+        };
+        if self.runtime_registry.active_runtime_id() != runtime_id {
+            return;
+        }
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            return;
+        };
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+    }
+
     fn cancel_ssh_provisioning(&mut self, cx: &mut Context<Self>) {
         let Some(service) = self.ssh_provisioning.as_ref() else {
             return;
@@ -14301,6 +14476,10 @@ impl VibexWorkbench {
         profile.registered_runtime_id = Some(runtime_id.to_string());
         profile.last_connected_at_ms = Some(unix_timestamp_ms());
         if let Some(version) = version {
+            if let Some(channel) = crate::ssh_connection::upgrade::channel_for_version_str(&version)
+            {
+                profile.channel = channel;
+            }
             profile.runtime_version = Some(version);
         }
         let _ = store.save(&profiles);
@@ -106812,6 +106991,10 @@ mod tests {
         assert!(source.contains("fn adopt_ssh_tunnel("));
         assert!(source.contains("ssh_tunnel_generation"));
         assert!(source.contains("SSH tunnel restarted"));
+        assert!(source.contains("fn start_ssh_runtime_upgrade("));
+        assert!(source.contains("upgrade_runtime("));
+        assert!(source.contains("reconnect_after_ssh_upgrade"));
+        assert!(source.contains("channel_for_version_str"));
     }
 
     #[test]

@@ -348,6 +348,20 @@ fn parse_version(value: &str) -> Option<Version> {
     Version::parse(value).ok()
 }
 
+pub fn channel_for_version_str(value: &str) -> Option<SshRuntimeChannel> {
+    parse_version(value).map(|version| channel_for_version(&version))
+}
+
+fn channel_for_version(version: &Version) -> SshRuntimeChannel {
+    if version.pre.is_empty() {
+        SshRuntimeChannel::Stable
+    } else if version.pre.starts_with("rc") {
+        SshRuntimeChannel::Rc
+    } else {
+        SshRuntimeChannel::Preview
+    }
+}
+
 /// Validates monotonicity and channel. Stable never accepts a prerelease and
 /// RC/Preview never accept a stable artifact; this is stricter than semver's
 /// ordering because the channel is a product boundary.
@@ -359,14 +373,7 @@ pub fn validate_upgrade(
     if target <= current {
         return Err("the target runtime is not newer than the installed runtime".to_string());
     }
-    let target_channel = if target.pre.is_empty() {
-        SshRuntimeChannel::Stable
-    } else if target.pre.starts_with("rc") {
-        SshRuntimeChannel::Rc
-    } else {
-        SshRuntimeChannel::Preview
-    };
-    if target_channel != channel {
+    if channel_for_version(target) != channel {
         return Err("the target runtime channel does not match the connection".to_string());
     }
     Ok(())
