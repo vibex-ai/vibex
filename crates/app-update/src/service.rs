@@ -416,6 +416,42 @@ impl AppUpdateService {
         self.inner.config.installation.restart()
     }
 
+    /// Fetches and verifies the latest signed release manifest without applying
+    /// the desktop-update version filter. SSH provisioning uses this to find
+    /// server artifacts for the current release, including releases that are
+    /// not newer than the installed desktop.
+    pub async fn latest_verified_manifest(
+        &self,
+    ) -> AppUpdateResult<Option<crate::VerifiedManifest>> {
+        let public_key = self
+            .inner
+            .config
+            .public_key_base64
+            .as_deref()
+            .ok_or_else(|| {
+                AppUpdateError::new(
+                    "app_update_verification_key_unavailable",
+                    "this Vibex build does not contain an update verification key",
+                )
+            })?;
+        let Some(signed) = self
+            .inner
+            .source
+            .latest_signed_manifest(self.inner.config.channel)
+            .await?
+        else {
+            return Ok(None);
+        };
+        verify_manifest(
+            &signed.manifest,
+            &signed.signature_base64,
+            public_key,
+            self.inner.config.channel,
+            &signed.tag,
+        )
+        .map(Some)
+    }
+
     async fn check_inner(&self) -> AppUpdateResult<CheckOutcome> {
         let public_key = self
             .inner
@@ -991,6 +1027,19 @@ mod tests {
 
     fn release_of(state: &UpdateState) -> &UpdateRelease {
         state.release().expect("state should carry a release")
+    }
+
+    #[tokio::test]
+    async fn latest_verified_manifest_ignores_the_update_version_filter() {
+        let (config, source) = fixture_for("0.1.0", "0.1.0", Ok(None));
+        let service = AppUpdateService::with_source(config, source).unwrap();
+        let verified = service
+            .latest_verified_manifest()
+            .await
+            .unwrap()
+            .expect("the release manifest should be returned");
+        assert_eq!(verified.manifest.version, Version::parse("0.1.0").unwrap());
+        assert_eq!(verified.manifest.tag, "v0.1.0");
     }
 
     #[tokio::test]

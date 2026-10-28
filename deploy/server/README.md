@@ -32,6 +32,16 @@ The gateway never logs secrets, pairing codes, or auth tokens; provider
 credential values are never returned to clients after storage (they are
 write-only), and device permissions gate every management operation.
 
+## Runtime prerequisites
+
+- Linux x86_64/aarch64 with glibc 2.35 or newer (Ubuntu 22.04+); the release
+  tarball is built on Debian 12 and checked against that floor.
+- `ca-certificates` for outbound HTTPS used by managed Agent installs. Stock
+  Ubuntu hosts include it; minimal container images may not. Without it,
+  `serve` currently fails at startup with `agent_install_http_client_failed`
+  even when `VIBEX_INSTALL_MANAGED_ADAPTERS=false`.
+- No `libdbus` or `libsystemd` is required by the headless keychain split.
+
 ## Quick Start (local smoke)
 
 The image is published for every release, so the common path is a pull:

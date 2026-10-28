@@ -11,6 +11,7 @@ default = []
 e2e-test-support = []
 
 [dependencies]
+glob = "0.3"
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
@@ -68,6 +69,7 @@ tracing.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 rfd = { version = "0.17.2", default-features = false, features = ["wayland", "xdg-portal"] }
+reqwest.workspace = true
 vibex-agent = { path = "../../crates/agent" }
 vibex-browser = { path = "../../crates/browser" }
 vibex-computer = { path = "../../crates/computer" }

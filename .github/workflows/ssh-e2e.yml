@@ -1,0 +1,52 @@
+name: SSH provisioning E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/desktop/src/ssh_connection/**"
+      - "apps/desktop/tests/ssh_provisioning_e2e.rs"
+      - "scripts/e2e-ssh-docker.sh"
+      - ".github/workflows/ssh-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/desktop/src/ssh_connection/**"
+      - "apps/desktop/tests/ssh_provisioning_e2e.rs"
+      - "scripts/e2e-ssh-docker.sh"
+      - ".github/workflows/ssh-e2e.yml"
+
+jobs:
+  docker-sshd:
+    name: Docker sshd provisioning
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang g++ gcc pkg-config libssl-dev \
+            libfontconfig1-dev libglib2.0-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libzstd-dev patchelf
+      - name: Build and package the server
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./package.json').version")
+          cargo build -p vibex-server --release --locked
+          node scripts/package-server-release.mjs \
+            --version "$VERSION" \
+            --arch x86_64 \
+            --binary target/release/vibex-server \
+            --output target/server-artifacts
+      - name: Run the Docker SSH E2E
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./package.json').version")
+          scripts/e2e-ssh-docker.sh \
+            "target/server-artifacts/vibex-server-${VERSION}-linux-x86_64.tar.gz"

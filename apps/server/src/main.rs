@@ -836,6 +836,7 @@ fn process_matches(pid: u32) -> bool {
 
 /// A bare `vibex-server` starts `serve` by default; every other subcommand is
 /// a client, a sidecar, or a one-shot command that must never be signalled.
+#[cfg(target_os = "linux")]
 fn command_is_serve(arguments: &[&[u8]]) -> bool {
     let Some(executable) = arguments.first() else {
         return false;
@@ -866,10 +867,14 @@ fn process_matches(pid: u32) -> bool {
         return false;
     }
     let command = String::from_utf8_lossy(&output.stdout);
-    command.contains("vibex-server")
-        && command
-            .split_whitespace()
-            .any(|argument| argument == "serve")
+    let mut arguments = command.split_whitespace();
+    let Some(executable) = arguments.next() else {
+        return false;
+    };
+    if !executable.ends_with("vibex-server") {
+        return false;
+    }
+    arguments.next().is_none_or(|argument| argument == "serve")
 }
 
 #[cfg(not(unix))]
@@ -1094,6 +1099,7 @@ mod tests {
         assert_eq!(value["health"], "ok");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_bare_server_process_counts_as_serve() {
         assert!(command_is_serve(&[b"vibex-server".as_slice()]));

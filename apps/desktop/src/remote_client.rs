@@ -197,6 +197,34 @@ pub async fn claim_server_pairing_code(
     DesktopRemoteCredential::from_parts(bundle, allow_insecure_local_dev, None)
 }
 
+/// Pair with a headless runtime over a route whose certificate was learned out
+/// of band, such as the SSH-created loopback tunnel.
+///
+/// The certificate is pinned before the first request, and the returned
+/// credential records that same pin so a later reconnect cannot silently
+/// accept a different server certificate.
+pub async fn claim_server_pairing_code_with_certificate(
+    server_url: String,
+    pairing_code: String,
+    pinned_tls_certificate_base64: Option<String>,
+    allow_insecure_local_dev: bool,
+) -> BackendResult<DesktopRemoteCredential> {
+    let bundle = vibex_remote_client::claim_pairing_code_with_identity_and_certificate(
+        server_url,
+        pairing_code,
+        "Vibex Desktop".to_string(),
+        allow_insecure_local_dev,
+        pinned_tls_certificate_base64.clone(),
+        None,
+    )
+    .await?;
+    DesktopRemoteCredential::from_parts(
+        bundle,
+        allow_insecure_local_dev,
+        pinned_tls_certificate_base64,
+    )
+}
+
 /// Pair from the connection link a `vibex-server` operator printed.
 ///
 /// The link carries the address, the one-time code, and — when the runtime
