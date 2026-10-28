@@ -14,9 +14,10 @@ use std::{
 };
 
 use gpui::{
-    App, ElementId, ImageSource, InteractiveElement as _, ObjectFit, ParentElement as _, Pixels,
-    Resource, Role, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, Window, div, img, px, relative, size,
+    App, ElementId, ImageSource, InteractiveElement as _, MouseButton, ObjectFit,
+    ParentElement as _, Pixels, Resource, Role, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px, relative,
+    size,
 };
 use gpui_base::text::{
     InlineElement, InlineRenderContext, MarkdownNode, MarkdownParseContext, MarkdownPlugin,
@@ -275,6 +276,18 @@ impl MarkdownPlugin for SessionImagePlugin {
             .hover(move |style| style.border_color(hover_border))
             .focus_visible(move |style| style.border_color(hover_border))
             .active(|style| style.opacity(0.85))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                // The press belongs to this card, the way it belongs to a
+                // button. Text selection in this stack is window-level, so a
+                // press that is not claimed here anchors a selection in the
+                // transcript behind the preview; the card's click then stops
+                // the release from reaching the selection layer, which leaves
+                // that anchor live. Every move over the opened preview drags it
+                // — selecting the transcript nobody touched — and the drag
+                // auto-scrolls the pane the anchor is in, which the preview
+                // reads as a wheel and shrinks the picture with.
+                gpui_base::GlobalState::suppress_text_selection(cx);
+            })
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 open(path.clone(), label.clone(), window, cx);
@@ -629,5 +642,104 @@ mod tests {
             "clicking the inline image should open its preview",
         );
         assert!(host.read_with(cx, |host, _| host.state.entity_id() == state.entity_id()));
+    }
+
+    /// Opening a thumbnail must not arm the transcript's text selection.
+    ///
+    /// The card answers a click, and its click stops the release from
+    /// reaching the window-level selection layer. If the card does not also
+    /// claim the press, the layer still anchors a selection at the press — in
+    /// the transcript, behind the overlay the click just opened — and nothing
+    /// ever ends that gesture. The pointer moves over the preview then extend
+    /// it, and the drag auto-scrolls the transcript underneath, which the
+    /// preview reads as a wheel and shrinks the picture with.
+    #[gpui::test]
+    fn opening_a_thumbnail_does_not_arm_the_transcript_selection(cx: &mut gpui::TestAppContext) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use gpui::{
+            AppContext as _, Context, Entity, IntoElement, Modifiers, MouseButton, Render, Window,
+            point,
+        };
+        use gpui_base::{Root, TextSelection};
+
+        use crate::markdown::{TextView, TextViewState};
+        use crate::selection_guard;
+
+        struct Host {
+            state: Entity<TextViewState>,
+            extensions: MarkdownExtensions,
+        }
+
+        impl Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                TextView::new(&self.state)
+                    .markdown_extensions(self.extensions.clone())
+                    .text_sm()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        cx.update(selection_guard::init);
+        let root = tempfile::tempdir().unwrap();
+        let bytes = STANDARD.decode(ONE_PIXEL_PNG).unwrap();
+        fs::write(root.path().join("shot.png"), bytes).unwrap();
+        let plugin =
+            SessionImagePlugin::new(root.path().to_path_buf(), 720.0, Arc::new(|_, _, _, _| {}));
+        let extensions = MarkdownExtensions::default()
+            .plugin(plugin)
+            .parser_revision(1);
+        let source = "The paragraph beside the figure is the text a \
+                      stray selection would take.\n\n![alt](shot.png)\n";
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(source, cx)));
+        let state_for_host = state.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let host = cx.new(|_| Host {
+                state: state_for_host,
+                extensions,
+            });
+            Root::new(host, window, cx)
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+        cx.run_until_parked();
+        let card = cx
+            .debug_bounds("vibex-session-image")
+            .expect("the local image should be claimed by the session plugin")
+            .center();
+
+        // Press and release the card the way the preview opens, then travel
+        // back over the transcript body with the button up.
+        cx.simulate_mouse_down(card, MouseButton::Left, Modifiers::none());
+        assert!(
+            cx.update(|_, cx| gpui_base::GlobalState::is_text_selection_suppressed(cx)),
+            "the card must claim its press so the transcript is not anchored",
+        );
+        cx.simulate_mouse_up(card, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(
+            point(card.x - px(80.0), card.y - px(40.0)),
+            None,
+            Modifiers::none(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(TextSelection::selected_text);
+        assert_eq!(
+            selected, "",
+            "opening a thumbnail must not select the transcript behind it",
+        );
     }
 }
