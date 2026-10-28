@@ -339,6 +339,12 @@ mod tests {
     }
 
     #[test]
+    fn effects_can_move_to_the_provisioning_worker_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SshProvisioningEffects>();
+    }
+
+    #[test]
     fn rejects_zero_local_port() {
         let dir = tempfile::tempdir().unwrap();
         let error = match SshProvisioningEffects::new(

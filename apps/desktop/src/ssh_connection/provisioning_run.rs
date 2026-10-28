@@ -118,32 +118,76 @@ pub async fn run_provisioning<E: ProvisioningEffects>(
     cancellation: &RunCancellation,
     retry_failed: bool,
 ) -> Result<ProvisioningRunOutcome, ProvisioningControlError> {
-    match coordinator.begin(profile_id, now_ms)? {
-        super::provisioning::ProvisioningBegin::Started(_) => {}
-        super::provisioning::ProvisioningBegin::Existing(snapshot) => {
-            if snapshot.status == ProvisioningStatus::Failed && retry_failed {
-                coordinator.retry(profile_id, now_ms)?;
-            } else {
-                return Ok(ProvisioningRunOutcome::AlreadyExists(snapshot));
-            }
-        }
-    }
-    if cancellation.is_cancelled() {
-        return Ok(stop_cancelled(coordinator, profile_id, now_ms));
-    }
-    drive(coordinator, profile_id, now_ms, effects, cancellation).await
+    run_provisioning_with_updates(
+        coordinator,
+        profile_id,
+        now_ms,
+        effects,
+        cancellation,
+        retry_failed,
+        |_| {},
+    )
+    .await
 }
 
-async fn drive<E: ProvisioningEffects>(
+/// Same as [`run_provisioning`], but emits each snapshot after a step begins or
+/// ends. The callback runs on the caller's thread/task.
+pub async fn run_provisioning_with_updates<E, F>(
     coordinator: &mut ProvisioningCoordinator,
     profile_id: &str,
     now_ms: i64,
     effects: &mut E,
     cancellation: &RunCancellation,
+    retry_failed: bool,
+    mut on_update: F,
+) -> Result<ProvisioningRunOutcome, ProvisioningControlError>
+where
+    E: ProvisioningEffects,
+    F: FnMut(ProvisioningSnapshot),
+{
+    match coordinator.begin(profile_id, now_ms)? {
+        super::provisioning::ProvisioningBegin::Started(update) => {
+            on_update(update.snapshot);
+        }
+        super::provisioning::ProvisioningBegin::Existing(snapshot) => {
+            if snapshot.status == ProvisioningStatus::Failed && retry_failed {
+                let update = coordinator.retry(profile_id, now_ms)?;
+                on_update(update.snapshot);
+            } else {
+                on_update(snapshot.clone());
+                return Ok(ProvisioningRunOutcome::AlreadyExists(snapshot));
+            }
+        }
+    }
+    if cancellation.is_cancelled() {
+        let outcome = stop_cancelled(coordinator, profile_id, now_ms);
+        on_update(outcome.snapshot().clone());
+        return Ok(outcome);
+    }
+    drive(
+        coordinator,
+        profile_id,
+        now_ms,
+        effects,
+        cancellation,
+        &mut on_update,
+    )
+    .await
+}
+
+async fn drive<E: ProvisioningEffects, F: FnMut(ProvisioningSnapshot)>(
+    coordinator: &mut ProvisioningCoordinator,
+    profile_id: &str,
+    now_ms: i64,
+    effects: &mut E,
+    cancellation: &RunCancellation,
+    on_update: &mut F,
 ) -> Result<ProvisioningRunOutcome, ProvisioningControlError> {
     loop {
         if cancellation.is_cancelled() {
-            return Ok(stop_cancelled(coordinator, profile_id, now_ms));
+            let outcome = stop_cancelled(coordinator, profile_id, now_ms);
+            on_update(outcome.snapshot().clone());
+            return Ok(outcome);
         }
         let step = current_step(coordinator, profile_id);
         if step == ProvisioningStep::Ready {
@@ -153,9 +197,14 @@ async fn drive<E: ProvisioningEffects>(
                         .attempt_mut(profile_id)
                         .expect("provisioning attempt disappeared");
                     let update = machine.ready(runtime_id, now_ms)?;
+                    on_update(update.snapshot.clone());
                     Ok(ProvisioningRunOutcome::Ready(update.snapshot))
                 }
-                Err(error) => step_error(coordinator, profile_id, error, now_ms),
+                Err(error) => {
+                    let outcome = step_error(coordinator, profile_id, error, now_ms)?;
+                    on_update(outcome.snapshot().clone());
+                    Ok(outcome)
+                }
             };
         }
 
@@ -171,12 +220,17 @@ async fn drive<E: ProvisioningEffects>(
             ProvisioningStep::Ready => unreachable!("ready is handled above"),
         };
         if let Err(error) = result {
-            return step_error(coordinator, profile_id, error, now_ms);
+            let outcome = step_error(coordinator, profile_id, error, now_ms)?;
+            on_update(outcome.snapshot().clone());
+            return Ok(outcome);
         }
         if cancellation.is_cancelled() {
-            return Ok(stop_cancelled(coordinator, profile_id, now_ms));
+            let outcome = stop_cancelled(coordinator, profile_id, now_ms);
+            on_update(outcome.snapshot().clone());
+            return Ok(outcome);
         }
         let update = complete(coordinator, profile_id, now_ms)?;
+        on_update(update.snapshot.clone());
         if cancelled(&update) {
             return Ok(outcome(coordinator, profile_id));
         }
