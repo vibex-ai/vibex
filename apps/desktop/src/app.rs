@@ -248,9 +248,11 @@ use crate::responsive::WorkbenchVisibility;
 use crate::skeleton;
 use crate::spinner::Spinner;
 use crate::ssh_connection::{
-    ProvisioningRunOutcome, ProvisioningService, ProvisioningServiceEvent, ProvisioningSnapshot,
-    ProvisioningStatus, ProvisioningStep, SshConnectionProfile, SshProfileStore,
-    SshProvisioningEffects, TunnelProcess,
+    MIN_FREE_KB, ProvisioningRunOutcome, ProvisioningService, ProvisioningServiceEvent,
+    ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep, SshCommand, SshConnectionProfile,
+    SshDestination, SshHostEntry, SshProfileStore, SshProvisioningEffects, SshRuntimeChannel,
+    TunnelProcess, default_ssh_config_path, discover_default_hosts, probe,
+    resolve_effective_default, select_local_port,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -75696,6 +75698,14 @@ enum ConnectionRowStatus {
     Connecting,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectionsProbeState {
+    Idle,
+    Probing(String),
+    Added(String),
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionDisplayRow {
     id: String,
@@ -77005,6 +77015,20 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
     candidates
 }
 
+fn connections_profile_id(alias: &str, now_ms: i64) -> String {
+    let mut id = String::from("ssh-");
+    for character in alias.chars().take(32) {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+            id.push(character);
+        } else {
+            id.push('_');
+        }
+    }
+    id.push('-');
+    id.push_str(&now_ms.to_string());
+    id
+}
+
 fn settings_section_label(section: SettingsSection) -> &'static str {
     match section {
         SettingsSection::General => locale::text("General", "常规", "一般"),
@@ -77933,6 +77957,12 @@ struct FoundationSettings {
     /// The active provisioning snapshot/error mirrored from the workbench.
     connections_snapshot: Option<ProvisioningSnapshot>,
     connections_error: Option<String>,
+    /// Hosts discovered from the user's OpenSSH config for the add panel.
+    connections_hosts: Vec<SshHostEntry>,
+    connections_host_warnings: Vec<String>,
+    connections_selected_host: Option<String>,
+    connections_probe_state: ConnectionsProbeState,
+    connections_probe_task: Option<Task<()>>,
     active_section: SettingsSection,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
@@ -78389,6 +78419,11 @@ impl FoundationSettings {
                 connections_profiles: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
+                connections_hosts: Vec::new(),
+                connections_host_warnings: Vec::new(),
+                connections_selected_host: None,
+                connections_probe_state: ConnectionsProbeState::Idle,
+                connections_probe_task: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
@@ -81745,6 +81780,132 @@ impl FoundationSettings {
     /// Archiving is the reversible half of removal, so the page is built around
     /// restoring: the list is loaded when the page opens, each row keeps its own
     /// pending state, and the policy control sits above the list it acts on.
+    fn reload_connections_profiles(&mut self) {
+        self.connections_profiles = self
+            .home_dir
+            .as_deref()
+            .map(SshProfileStore::at_home)
+            .and_then(|store| store.load().ok())
+            .unwrap_or_default();
+    }
+
+    fn load_connections_discovery(&mut self, cx: &mut Context<Self>) {
+        let discovery = discover_default_hosts();
+        self.connections_hosts = discovery.hosts;
+        self.connections_host_warnings = discovery.warnings;
+        self.connections_selected_host = None;
+        self.connections_probe_state = ConnectionsProbeState::Idle;
+        self.connections_add_preview = true;
+        cx.notify();
+    }
+
+    fn probe_connections_host(&mut self, alias: String, cx: &mut Context<Self>) {
+        if matches!(
+            self.connections_probe_state,
+            ConnectionsProbeState::Probing(_)
+        ) {
+            return;
+        }
+        let Some(home_dir) = self.home_dir.clone() else {
+            self.connections_probe_state =
+                ConnectionsProbeState::Failed("the desktop home is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        self.connections_probe_state = ConnectionsProbeState::Probing(alias.clone());
+        let config_path = default_ssh_config_path();
+        let now = unix_timestamp_ms();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let effective = resolve_effective_default(config_path.as_deref(), &alias)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let destination = SshDestination {
+                host: effective.hostname.clone().unwrap_or_else(|| alias.clone()),
+                user: effective.user.clone(),
+                port: effective.port.unwrap_or(22),
+            };
+            let command = SshCommand::for_destination("ssh", &destination, config_path.as_deref())
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let mut remote_port = 8765u16;
+            let environment = loop {
+                match probe(&command, remote_port, MIN_FREE_KB) {
+                    Ok(environment) => break environment,
+                    Err(error)
+                        if error.code() == "ssh_environment_port_busy" && remote_port < 8775 =>
+                    {
+                        remote_port += 1;
+                    }
+                    Err(error) => {
+                        return Err(format!("{}: {}", error.code(), error.message()));
+                    }
+                }
+            };
+            let local_tunnel_port = select_local_port(0, 1)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let remote_install_root = format!("{}/.local/share/vibex/server", environment.home);
+            let profile = SshConnectionProfile {
+                id: connections_profile_id(&alias, now),
+                display_name: alias.clone(),
+                ssh_alias: alias.clone(),
+                host: destination.host.clone(),
+                user: destination.user.clone(),
+                port: destination.port,
+                ssh_client_path: None,
+                ssh_config_path: config_path.clone(),
+                identity_file: effective.identity_file,
+                proxy_jump: effective.proxy_jump,
+                remote_install_root,
+                remote_home: environment.home.clone(),
+                workspace_roots: vec![environment.home.clone()],
+                remote_port,
+                local_tunnel_port,
+                channel: SshRuntimeChannel::Stable,
+                runtime_version: None,
+                created_at_ms: now,
+                last_connected_at_ms: None,
+            };
+            profile
+                .validate()
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let store = SshProfileStore::at_home(&home_dir);
+            let mut profiles = store
+                .load()
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            profiles.retain(|existing| {
+                existing.id != profile.id && existing.ssh_alias != profile.ssh_alias
+            });
+            profiles.push(profile);
+            store
+                .save(&profiles)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            Ok::<String, String>(alias)
+        });
+        self.connections_probe_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match result {
+                        Ok(Ok(alias)) => {
+                            this.reload_connections_profiles();
+                            this.connections_probe_state = ConnectionsProbeState::Added(alias);
+                            this.connections_add_preview = false;
+                            this.connections_selected_host = None;
+                        }
+                        Ok(Err(error)) => {
+                            this.connections_probe_state = ConnectionsProbeState::Failed(error);
+                        }
+                        Err(_) => {
+                            this.connections_probe_state = ConnectionsProbeState::Failed(
+                                "the SSH probe task stopped unexpectedly".to_string(),
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
     fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let is_dark = cx.theme().is_dark();
         let muted = theme::semantic_color("muted-foreground", is_dark);
@@ -81758,8 +81919,7 @@ impl FoundationSettings {
                 "新增 SSH 連線",
             ))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.connections_add_preview = true;
-                cx.notify();
+                this.load_connections_discovery(cx);
             }));
 
         let mut groups = Vec::new();
@@ -81772,39 +81932,112 @@ impl FoundationSettings {
                     this.connections_add_preview = false;
                     cx.notify();
                 }));
+            let mut children = vec![div()
+                .text_xs()
+                .text_color(muted)
+                .child(locale::text(
+                    "Choose a host from ~/.ssh/config. Probe and add records it before provisioning.",
+                    "从 ~/.ssh/config 选择主机。探测并添加后会先保存连接资料。",
+                    "從 ~/.ssh/config 選擇主機。探測並新增後會先儲存連線資料。",
+                ))
+                .into_any_element()];
+            if self.connections_hosts.is_empty() {
+                children.push(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(locale::text(
+                            "No concrete hosts were found in your OpenSSH config.",
+                            "OpenSSH 配置中没有找到具体主机。",
+                            "OpenSSH 設定中沒有找到具體主機。",
+                        ))
+                        .into_any_element(),
+                );
+            } else {
+                children.push(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .children(self.connections_hosts.iter().take(50).enumerate().map(
+                            |(index, host)| {
+                                let alias = host.alias.clone();
+                                let selected = self.connections_selected_host.as_deref()
+                                    == Some(alias.as_str());
+                                Button::new(SharedString::from(format!("connections-host-{index}")))
+                                    .small()
+                                    .when(selected, |button| button.primary())
+                                    .when(!selected, |button| button.outline())
+                                    .label(alias.clone())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.connections_selected_host = Some(alias.clone());
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            },
+                        ))
+                        .into_any_element(),
+                );
+            }
+            for warning in &self.connections_host_warnings {
+                children.push(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(warning.clone())
+                        .into_any_element(),
+                );
+            }
+            let probe_label = match &self.connections_probe_state {
+                ConnectionsProbeState::Idle => None,
+                ConnectionsProbeState::Probing(alias) => Some(format!(
+                    "{} {alias}…",
+                    locale::text("Probing", "正在探测", "正在探測")
+                )),
+                ConnectionsProbeState::Added(alias) => Some(format!(
+                    "{} {alias}",
+                    locale::text("Added", "已添加", "已新增")
+                )),
+                ConnectionsProbeState::Failed(error) => Some(error.clone()),
+            };
+            if let Some(label) = probe_label {
+                children.push(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(label)
+                        .into_any_element(),
+                );
+            }
+            let probing = matches!(
+                self.connections_probe_state,
+                ConnectionsProbeState::Probing(_)
+            );
+            let add = Button::new("connections-add-probe")
+                .small()
+                .outline()
+                .icon(IconName::Plus)
+                .label(locale::text("Probe and add", "探测并添加", "探測並新增"))
+                .disabled(self.connections_selected_host.is_none() || probing)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(alias) = this.connections_selected_host.clone() {
+                        this.probe_connections_host(alias, cx);
+                    }
+                }));
+            children.push(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_4()
+                    .child(close)
+                    .child(add)
+                    .into_any_element(),
+            );
             groups.push(SettingsGroup::new(
                 locale::text("Add SSH connection", "添加 SSH 连接", "新增 SSH 連線"),
-                vec![div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .when(stacked, |this| this.flex_col().items_start())
-                    .when(!stacked, |this| {
-                        this.flex_row().items_center().justify_between()
-                    })
-                    .gap_4()
-                    .py(px(14.0))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .gap_1()
-                            .child(div().text_sm().font_medium().child(locale::text(
-                                "Connection setup",
-                                "连接设置",
-                                "連線設定",
-                            )))
-                            .child(div().text_xs().text_color(muted).child(locale::text(
-                                "The guided flow will choose a host, install the runtime, and pair it over SSH. This layout preview stops here.",
-                                "引导流程会在这里选择主机、安装运行时并通过 SSH 完成配对。当前骨架到这一步为止。",
-                                "引導流程會在這裡選擇主機、安裝執行階段並透過 SSH 完成配對。目前骨架到這一步為止。",
-                            ))),
-                    )
-                    .child(close)
-                    .into_any_element()],
+                children,
             ));
         }
-
         if self.connections_snapshot.is_some() || self.connections_error.is_some() {
             groups.push(SettingsGroup::new(
                 locale::text("Provisioning", "配置进度", "設定進度"),
@@ -81861,8 +82094,7 @@ impl FoundationSettings {
                 "新增 SSH 連線",
             ))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.connections_add_preview = true;
-                cx.notify();
+                this.load_connections_discovery(cx);
             }));
         v_flex()
             .w_full()
@@ -105688,6 +105920,15 @@ mod tests {
         assert!(source.contains("SshProfileStore::at_home"));
         assert!(source.contains("fn connections_rows("));
         assert!(source.contains("fn connections_progress_panel("));
+        assert!(source.contains("fn load_connections_discovery("));
+        assert!(source.contains("fn probe_connections_host("));
+        assert!(source.contains("connections-host-"));
+        let id = connections_profile_id("dev@host.example", 42);
+        assert!(id.len() <= 64);
+        assert!(id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+        }));
+        assert!(id.ends_with("-42"));
         for status in [
             "ConnectionRowStatus::Connected",
             "ConnectionRowStatus::Offline",
