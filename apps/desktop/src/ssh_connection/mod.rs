@@ -15,6 +15,7 @@ pub mod launch;
 pub mod pairing;
 pub mod profile;
 pub mod provisioning;
+pub mod reconnect;
 pub mod supervisor;
 #[cfg(test)]
 mod test_support;
@@ -47,6 +48,10 @@ pub use provisioning::{
     ProvisioningBegin, ProvisioningControlError, ProvisioningCoordinator, ProvisioningEvent,
     ProvisioningFailure, ProvisioningMachine, ProvisioningProgress, ProvisioningSnapshot,
     ProvisioningStatus, ProvisioningStep, ProvisioningUpdate,
+};
+pub use reconnect::{
+    ReconnectBackoff, ReconnectContext, ReconnectError, ReconnectFailureAction, ReconnectPlan,
+    ReconnectReason, ReconnectStage, failure_action,
 };
 pub use supervisor::{
     PORT_SCRIPT, ServerStatus, StopOutcome, SupervisorError, ensure_started, ensure_stopped,
