@@ -249,6 +249,7 @@ use crate::skeleton;
 use crate::spinner::Spinner;
 use crate::ssh_connection::{
     ProvisioningRunOutcome, ProvisioningService, ProvisioningServiceEvent, ProvisioningSnapshot,
+    ProvisioningStatus, ProvisioningStep, SshConnectionProfile, SshProfileStore,
     SshProvisioningEffects, TunnelProcess,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
@@ -13972,6 +13973,7 @@ impl VibexWorkbench {
                 Ok(service) => service,
                 Err(error) => {
                     self.ssh_provisioning_error = Some(error.message);
+                    self.sync_ssh_provisioning_settings(cx);
                     cx.notify();
                     return;
                 }
@@ -13979,6 +13981,7 @@ impl VibexWorkbench {
         self.ssh_provisioning = Some(service);
         self.ssh_provisioning_error = None;
         self.ssh_provisioning_snapshot = None;
+        self.sync_ssh_provisioning_settings(cx);
         self.ssh_provisioning_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 loop {
@@ -13999,6 +14002,7 @@ impl VibexWorkbench {
                         Ok(Some(Ok(ProvisioningServiceEvent::Update(snapshot)))) => {
                             let _ = entity.update(cx, |this, cx| {
                                 this.ssh_provisioning_snapshot = Some(snapshot);
+                                this.sync_ssh_provisioning_settings(cx);
                                 cx.notify();
                             });
                         }
@@ -14015,6 +14019,16 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn sync_ssh_provisioning_settings(&self, cx: &mut Context<Self>) {
+        let snapshot = self.ssh_provisioning_snapshot.clone();
+        let error = self.ssh_provisioning_error.clone();
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_snapshot = snapshot;
+            settings.connections_error = error;
+            cx.notify();
+        });
+    }
+
     fn finish_ssh_provisioning(
         &mut self,
         outcome: Result<ProvisioningRunOutcome, crate::ssh_connection::ProvisioningControlError>,
@@ -14027,18 +14041,21 @@ impl VibexWorkbench {
                 let Some(backend) = effects.backend() else {
                     self.ssh_provisioning_error =
                         Some("the provisioned runtime has no connected backend".to_string());
+                    self.sync_ssh_provisioning_settings(cx);
                     cx.notify();
                     return;
                 };
                 let Some(credential) = effects.credential().cloned() else {
                     self.ssh_provisioning_error =
                         Some("the provisioned runtime has no credential".to_string());
+                    self.sync_ssh_provisioning_settings(cx);
                     cx.notify();
                     return;
                 };
                 let Some(runtime_id) = effects.runtime_id().map(str::to_string) else {
                     self.ssh_provisioning_error =
                         Some("the provisioned runtime has no id".to_string());
+                    self.sync_ssh_provisioning_settings(cx);
                     cx.notify();
                     return;
                 };
@@ -14053,6 +14070,7 @@ impl VibexWorkbench {
                     cx,
                 );
                 self.mark_runtime_active(&runtime_id, cx);
+                self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
             Ok(ProvisioningRunOutcome::Failed(snapshot)) => {
@@ -14060,15 +14078,18 @@ impl VibexWorkbench {
                 self.ssh_provisioning_error = snapshot
                     .failure
                     .map(|failure| format!("{}: {}", failure.code, failure.message));
+                self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
             Ok(ProvisioningRunOutcome::Cancelled(snapshot))
             | Ok(ProvisioningRunOutcome::AlreadyExists(snapshot)) => {
                 self.ssh_provisioning_snapshot = Some(snapshot);
+                self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
             Err(error) => {
                 self.ssh_provisioning_error = Some(error.to_string());
+                self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
         }
@@ -75668,56 +75689,24 @@ struct SettingsSearchCandidate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionFixtureStatus {
+enum ConnectionRowStatus {
     Connected,
     Offline,
     NeedsAttention,
+    Connecting,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ConnectionFixtureRow {
-    id: &'static str,
-    name: &'static str,
-    alias: &'static str,
-    user: &'static str,
-    host: &'static str,
+#[derive(Debug, Clone)]
+struct ConnectionDisplayRow {
+    id: String,
+    name: String,
+    alias: String,
+    user: String,
+    host: String,
     port: u16,
-    version: Option<&'static str>,
-    status: ConnectionFixtureStatus,
+    version: Option<String>,
+    status: ConnectionRowStatus,
 }
-
-const CONNECTION_FIXTURES: [ConnectionFixtureRow; 3] = [
-    ConnectionFixtureRow {
-        id: "build",
-        name: "Build server",
-        alias: "build-box",
-        user: "dev",
-        host: "build.example.com",
-        port: 22,
-        version: Some("0.1.0-rc.8"),
-        status: ConnectionFixtureStatus::Connected,
-    },
-    ConnectionFixtureRow {
-        id: "mac-mini",
-        name: "Mac mini",
-        alias: "mac-mini",
-        user: "peatboy",
-        host: "192.168.1.20",
-        port: 22,
-        version: None,
-        status: ConnectionFixtureStatus::Offline,
-    },
-    ConnectionFixtureRow {
-        id: "lab-vm",
-        name: "Lab VM",
-        alias: "lab-vm",
-        user: "ubuntu",
-        host: "10.0.0.42",
-        port: 2222,
-        version: Some("0.1.0-rc.7"),
-        status: ConnectionFixtureStatus::NeedsAttention,
-    },
-];
 
 #[derive(Clone)]
 struct SettingsRenderContext {
@@ -77937,8 +77926,13 @@ struct FoundationSettings {
     /// itself, so the reason is visible where the input is. Every other settings
     /// result is a light hint and rides the workbench's notification layer.
     shortcut_note: Option<String>,
-    /// Whether the Connections page is showing its fixture add panel.
+    /// Whether the Connections page is showing its add panel.
     connections_add_preview: bool,
+    /// Profiles loaded when Connections is activated.
+    connections_profiles: Vec<SshConnectionProfile>,
+    /// The active provisioning snapshot/error mirrored from the workbench.
+    connections_snapshot: Option<ProvisioningSnapshot>,
+    connections_error: Option<String>,
     active_section: SettingsSection,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
@@ -78392,6 +78386,9 @@ impl FoundationSettings {
                 browser_clear_task: None,
                 shortcut_note: None,
                 connections_add_preview: false,
+                connections_profiles: Vec::new(),
+                connections_snapshot: None,
+                connections_error: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
@@ -78420,6 +78417,14 @@ impl FoundationSettings {
         }
         if section == SettingsSection::General {
             self.request_local_clients_refresh(cx);
+        }
+        if section == SettingsSection::Connections {
+            self.connections_profiles = self
+                .home_dir
+                .as_deref()
+                .map(SshProfileStore::at_home)
+                .and_then(|store| store.load().ok())
+                .unwrap_or_default();
         }
     }
 
@@ -81800,7 +81805,18 @@ impl FoundationSettings {
             ));
         }
 
-        let rows = &CONNECTION_FIXTURES;
+        if self.connections_snapshot.is_some() || self.connections_error.is_some() {
+            groups.push(SettingsGroup::new(
+                locale::text("Provisioning", "配置进度", "設定進度"),
+                vec![Self::connections_progress_panel(
+                    self.connections_snapshot.as_ref(),
+                    self.connections_error.as_deref(),
+                    cx,
+                )],
+            ));
+        }
+
+        let rows = self.connections_rows();
         let list_rows = if rows.is_empty() {
             vec![self.render_connections_empty_state(cx)]
         } else {
@@ -81879,7 +81895,150 @@ impl FoundationSettings {
             .into_any_element()
     }
 
-    fn connection_row(row: &ConnectionFixtureRow, stacked: bool, cx: &App) -> AnyElement {
+    fn connections_rows(&self) -> Vec<ConnectionDisplayRow> {
+        self.connections_profiles
+            .iter()
+            .map(|profile| {
+                let status = match self
+                    .connections_snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.profile_id == profile.id)
+                {
+                    Some(snapshot) => match snapshot.status {
+                        ProvisioningStatus::Ready => ConnectionRowStatus::Connected,
+                        ProvisioningStatus::Failed => ConnectionRowStatus::NeedsAttention,
+                        ProvisioningStatus::Cancelled | ProvisioningStatus::Pending => {
+                            ConnectionRowStatus::Offline
+                        }
+                        ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
+                            ConnectionRowStatus::Connecting
+                        }
+                    },
+                    None if profile.last_connected_at_ms.is_some() => {
+                        ConnectionRowStatus::Connected
+                    }
+                    None => ConnectionRowStatus::Offline,
+                };
+                ConnectionDisplayRow {
+                    id: profile.id.clone(),
+                    name: profile.display_name.clone(),
+                    alias: profile.ssh_alias.clone(),
+                    user: profile.user.clone().unwrap_or_default(),
+                    host: profile.host.clone(),
+                    port: profile.port,
+                    version: profile.runtime_version.clone(),
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    fn connections_progress_panel(
+        snapshot: Option<&ProvisioningSnapshot>,
+        error: Option<&str>,
+        cx: &App,
+    ) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let muted = theme::semantic_color("muted-foreground", is_dark);
+        let border = theme::semantic_color("border", is_dark);
+        let success = theme::semantic_color("success", is_dark);
+        let danger = theme::semantic_color("danger", is_dark);
+        let step = snapshot
+            .map(|snapshot| snapshot.step)
+            .unwrap_or(ProvisioningStep::ResolvingHost);
+        let status = snapshot
+            .map(|snapshot| snapshot.status)
+            .map(|status| match status {
+                ProvisioningStatus::Pending => locale::text("Waiting", "等待中", "等待中"),
+                ProvisioningStatus::Running => locale::text("Running", "进行中", "進行中"),
+                ProvisioningStatus::Cancelling => {
+                    locale::text("Cancelling", "正在取消", "正在取消")
+                }
+                ProvisioningStatus::Ready => locale::text("Ready", "已就绪", "已就緒"),
+                ProvisioningStatus::Failed => locale::text("Failed", "失败", "失敗"),
+                ProvisioningStatus::Cancelled => locale::text("Cancelled", "已取消", "已取消"),
+            })
+            .unwrap_or_else(|| locale::text("Waiting", "等待中", "等待中"));
+        let detail = snapshot
+            .and_then(|snapshot| snapshot.detail.clone())
+            .or_else(|| error.map(str::to_string));
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .py(px(14.0))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(format!(
+                                "{}/9 · {}",
+                                step.index() + 1,
+                                Self::connection_step_label(step)
+                            )),
+                    )
+                    .child(div().text_xs().text_color(muted).child(status)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .children(ProvisioningStep::ALL.iter().map(|candidate| {
+                        div().h(px(4.0)).flex_1().rounded_full().bg(
+                            if candidate.index() <= step.index() {
+                                success
+                            } else {
+                                border
+                            },
+                        )
+                    })),
+            )
+            .when_some(detail, |this, detail| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .whitespace_normal()
+                        .text_color(if error.is_some() { danger } else { muted })
+                        .child(detail),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn connection_step_label(step: ProvisioningStep) -> &'static str {
+        match step {
+            ProvisioningStep::ResolvingHost => locale::text("Resolve host", "解析主机", "解析主機"),
+            ProvisioningStep::CheckingEnvironment => {
+                locale::text("Check environment", "检查环境", "檢查環境")
+            }
+            ProvisioningStep::UploadingRuntime => {
+                locale::text("Upload runtime", "上传运行时", "上傳執行階段")
+            }
+            ProvisioningStep::InstallingRuntime => {
+                locale::text("Install runtime", "安装运行时", "安裝執行階段")
+            }
+            ProvisioningStep::StartingRuntime => {
+                locale::text("Start runtime", "启动运行时", "啟動執行階段")
+            }
+            ProvisioningStep::OpeningTunnel => locale::text("Open tunnel", "建立隧道", "建立通道"),
+            ProvisioningStep::Pairing => locale::text("Pair", "配对", "配對"),
+            ProvisioningStep::Connecting => locale::text("Connect", "连接", "連線"),
+            ProvisioningStep::Ready => locale::text("Ready", "就绪", "就緒"),
+        }
+    }
+
+    fn connection_row(row: &ConnectionDisplayRow, stacked: bool, cx: &App) -> AnyElement {
         let is_dark = cx.theme().is_dark();
         let foreground = theme::semantic_color("foreground", is_dark);
         let muted = theme::semantic_color("muted-foreground", is_dark);
@@ -81888,7 +82047,13 @@ impl FoundationSettings {
             .min_w_0()
             .flex_1()
             .gap_1()
-            .child(div().text_sm().font_medium().truncate().child(row.name))
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .truncate()
+                    .child(row.name.clone()),
+            )
             .child(
                 div()
                     .text_xs()
@@ -81906,10 +82071,13 @@ impl FoundationSettings {
                     .text_color(foreground)
                     .child(Self::connection_status_label(row.status)),
             );
-        let version = div().text_xs().text_color(muted).child(match row.version {
-            Some(version) => format!("v{version}"),
-            None => locale::text("Not installed", "未安装", "未安裝").to_string(),
-        });
+        let version = div()
+            .text_xs()
+            .text_color(muted)
+            .child(match row.version.as_deref() {
+                Some(version) => format!("v{version}"),
+                None => locale::text("Not installed", "未安装", "未安裝").to_string(),
+            });
         let primary = Button::new(SharedString::from(format!(
             "connections-{}-primary",
             row.id
@@ -81981,7 +82149,7 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_detail(row: &ConnectionFixtureRow) -> String {
+    fn connection_detail(row: &ConnectionDisplayRow) -> String {
         if row.alias.is_empty() {
             format!("{}@{}:{}", row.user, row.host, row.port)
         } else {
@@ -81989,29 +82157,32 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_status_label(status: ConnectionFixtureStatus) -> &'static str {
+    fn connection_status_label(status: ConnectionRowStatus) -> &'static str {
         match status {
-            ConnectionFixtureStatus::Connected => locale::text("Connected", "已连接", "已連線"),
-            ConnectionFixtureStatus::Offline => locale::text("Offline", "离线", "離線"),
-            ConnectionFixtureStatus::NeedsAttention => {
+            ConnectionRowStatus::Connected => locale::text("Connected", "已连接", "已連線"),
+            ConnectionRowStatus::Offline => locale::text("Offline", "离线", "離線"),
+            ConnectionRowStatus::NeedsAttention => {
                 locale::text("Needs attention", "需要处理", "需要處理")
             }
+            ConnectionRowStatus::Connecting => locale::text("Connecting", "连接中", "連線中"),
         }
     }
 
-    fn connection_status_color(status: ConnectionFixtureStatus, is_dark: bool) -> Hsla {
+    fn connection_status_color(status: ConnectionRowStatus, is_dark: bool) -> Hsla {
         match status {
-            ConnectionFixtureStatus::Connected => theme::semantic_color("success", is_dark),
-            ConnectionFixtureStatus::Offline => theme::semantic_color("muted-foreground", is_dark),
-            ConnectionFixtureStatus::NeedsAttention => theme::semantic_color("danger", is_dark),
+            ConnectionRowStatus::Connected => theme::semantic_color("success", is_dark),
+            ConnectionRowStatus::Offline => theme::semantic_color("muted-foreground", is_dark),
+            ConnectionRowStatus::NeedsAttention => theme::semantic_color("danger", is_dark),
+            ConnectionRowStatus::Connecting => theme::semantic_color("warning", is_dark),
         }
     }
 
-    fn connection_primary_label(status: ConnectionFixtureStatus) -> &'static str {
+    fn connection_primary_label(status: ConnectionRowStatus) -> &'static str {
         match status {
-            ConnectionFixtureStatus::Connected => locale::text("Manage", "管理", "管理"),
-            ConnectionFixtureStatus::Offline => locale::text("Connect", "连接", "連線"),
-            ConnectionFixtureStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
+            ConnectionRowStatus::Connected => locale::text("Manage", "管理", "管理"),
+            ConnectionRowStatus::Offline => locale::text("Connect", "连接", "連線"),
+            ConnectionRowStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
+            ConnectionRowStatus::Connecting => locale::text("Cancel", "取消", "取消"),
         }
     }
 
@@ -105497,7 +105668,7 @@ mod tests {
     }
 
     #[test]
-    fn connections_section_is_discoverable_and_covers_fixture_states() {
+    fn connections_section_is_discoverable_and_uses_the_profile_store() {
         assert_eq!(
             settings_section_for_query("ssh"),
             Some(SettingsSection::Connections)
@@ -105512,22 +105683,18 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.section == SettingsSection::Connections)
         );
-        assert_eq!(
-            CONNECTION_FIXTURES.len(),
-            3,
-            "the skeleton should show connected, offline, and attention states"
-        );
+        let source = include_str!("app.rs");
+        assert!(source.contains("connections_profiles: Vec<SshConnectionProfile>"));
+        assert!(source.contains("SshProfileStore::at_home"));
+        assert!(source.contains("fn connections_rows("));
+        assert!(source.contains("fn connections_progress_panel("));
         for status in [
-            ConnectionFixtureStatus::Connected,
-            ConnectionFixtureStatus::Offline,
-            ConnectionFixtureStatus::NeedsAttention,
+            "ConnectionRowStatus::Connected",
+            "ConnectionRowStatus::Offline",
+            "ConnectionRowStatus::NeedsAttention",
+            "ConnectionRowStatus::Connecting",
         ] {
-            assert!(CONNECTION_FIXTURES.iter().any(|row| row.status == status));
-        }
-        for row in &CONNECTION_FIXTURES {
-            assert!(!row.name.is_empty());
-            assert!(!row.host.is_empty());
-            assert!(row.port > 0);
+            assert!(source.contains(status), "{status} should be mapped");
         }
     }
 
