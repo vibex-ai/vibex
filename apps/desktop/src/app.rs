@@ -248,11 +248,12 @@ use crate::responsive::WorkbenchVisibility;
 use crate::skeleton;
 use crate::spinner::Spinner;
 use crate::ssh_connection::{
-    MIN_FREE_KB, ProvisioningRunOutcome, ProvisioningService, ProvisioningServiceEvent,
-    ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep, SshCommand, SshConnectionProfile,
-    SshDestination, SshHostEntry, SshProfileStore, SshProvisioningEffects, SshRuntimeChannel,
-    TunnelProcess, default_ssh_config_path, discover_default_hosts, probe,
-    resolve_effective_default, select_local_port,
+    LaunchConfig, MIN_FREE_KB, ProvisioningRunOutcome, ProvisioningService,
+    ProvisioningServiceEvent, ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep,
+    SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshProfileStore,
+    SshProvisioningEffects, SshRuntimeChannel, TunnelProcess, default_ssh_config_path,
+    discover_default_hosts, download_server_artifact, probe, resolve_effective_default,
+    select_local_port, select_server_artifact,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -9174,6 +9175,8 @@ pub struct VibexWorkbench {
     /// owns after Ready. The tunnel lives here so it survives the service.
     ssh_provisioning: Option<ProvisioningService<SshProvisioningEffects>>,
     #[allow(dead_code)]
+    ssh_provisioning_start_task: Option<Task<()>>,
+    #[allow(dead_code)]
     ssh_provisioning_task: Option<Task<()>>,
     #[allow(dead_code)]
     ssh_provisioning_snapshot: Option<ProvisioningSnapshot>,
@@ -10973,6 +10976,7 @@ impl VibexWorkbench {
             settings_view,
             remote_client: None,
             ssh_provisioning: None,
+            ssh_provisioning_start_task: None,
             ssh_provisioning_task: None,
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
@@ -13955,6 +13959,119 @@ impl VibexWorkbench {
     /// so it names the runtime and states what survives on the server.
     fn confirm_remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
         self.runtime_remove_pending = Some(id);
+        cx.notify();
+    }
+
+    /// Loads a saved profile, resolves the server artifact, downloads it, and
+    /// starts the provisioning worker. The add flow calls this after saving a
+    /// probed profile.
+    #[allow(dead_code)]
+    fn start_ssh_profile_provisioning(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if self.ssh_provisioning.is_some() {
+            return;
+        }
+        let Some(config) = self.config.clone() else {
+            self.ssh_provisioning_error =
+                Some("the runtime configuration is unavailable".to_string());
+            self.sync_ssh_provisioning_settings(cx);
+            cx.notify();
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            self.ssh_provisioning_error = Some("the local runtime is unavailable".to_string());
+            self.sync_ssh_provisioning_settings(cx);
+            cx.notify();
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.ssh_provisioning_error = Some("the SSH profile was not found".to_string());
+            self.sync_ssh_provisioning_settings(cx);
+            cx.notify();
+            return;
+        };
+        let home = config.home_dir.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let destination = SshDestination {
+                host: profile.host.clone(),
+                user: profile.user.clone(),
+                port: profile.port,
+            };
+            let command = SshCommand::for_destination(
+                "ssh",
+                &destination,
+                profile.ssh_config_path.as_deref(),
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let environment = probe(&command, profile.remote_port, MIN_FREE_KB)
+                .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+            let verified = runtime
+                .app_update()
+                .latest_verified_manifest()
+                .await
+                .map_err(|error| format!("{}: {}", error.code, error.message))?
+                .ok_or_else(|| "the release manifest is unavailable".to_string())?;
+            let version = verified.manifest.version.to_string();
+            let artifact = select_server_artifact(&verified, environment.arch)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let local = download_server_artifact(
+                artifact,
+                &version,
+                environment.arch,
+                &home.join("ssh-artifacts"),
+                |_, _| {},
+            )
+            .await
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let launch = LaunchConfig::new(
+                &profile.remote_home,
+                &profile.remote_install_root,
+                &profile.workspace_roots,
+                profile.remote_port,
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let effects = SshProvisioningEffects::new(
+                command,
+                destination,
+                profile.ssh_config_path.clone(),
+                launch,
+                local,
+                home,
+                profile.local_tunnel_port,
+                unix_timestamp_ms(),
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            Ok::<(SshProvisioningEffects, String), String>((effects, profile.id))
+        });
+        self.ssh_provisioning_start_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match result {
+                        Ok(Ok((effects, profile_id))) => {
+                            this.start_ssh_provisioning(effects, profile_id, cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.ssh_provisioning_error = Some(error);
+                            this.sync_ssh_provisioning_settings(cx);
+                        }
+                        Err(_) => {
+                            this.ssh_provisioning_error = Some(
+                                "the SSH provisioning download task stopped unexpectedly"
+                                    .to_string(),
+                            );
+                            this.sync_ssh_provisioning_settings(cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
         cx.notify();
     }
 
@@ -81873,22 +81990,29 @@ impl FoundationSettings {
             profiles.retain(|existing| {
                 existing.id != profile.id && existing.ssh_alias != profile.ssh_alias
             });
+            let profile_id = profile.id.clone();
             profiles.push(profile);
             store
                 .save(&profiles)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            Ok::<String, String>(alias)
+            Ok::<(String, String), String>((alias, profile_id))
         });
         self.connections_probe_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
                     match result {
-                        Ok(Ok(alias)) => {
+                        Ok(Ok((alias, profile_id))) => {
                             this.reload_connections_profiles();
                             this.connections_probe_state = ConnectionsProbeState::Added(alias);
                             this.connections_add_preview = false;
                             this.connections_selected_host = None;
+                            let workbench = this.workbench.clone();
+                            cx.defer(move |cx| {
+                                let _ = workbench.update(cx, |workbench, cx| {
+                                    workbench.start_ssh_profile_provisioning(profile_id, cx)
+                                });
+                            });
                         }
                         Ok(Err(error)) => {
                             this.connections_probe_state = ConnectionsProbeState::Failed(error);
@@ -105923,6 +106047,9 @@ mod tests {
         assert!(source.contains("fn load_connections_discovery("));
         assert!(source.contains("fn probe_connections_host("));
         assert!(source.contains("connections-host-"));
+        assert!(source.contains("start_ssh_profile_provisioning"));
+        assert!(source.contains("latest_verified_manifest"));
+        assert!(source.contains("download_server_artifact"));
         let id = connections_profile_id("dev@host.example", 42);
         assert!(id.len() <= 64);
         assert!(id.chars().all(|character| {
