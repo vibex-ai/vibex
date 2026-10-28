@@ -9293,6 +9293,8 @@ pub struct VibexWorkbench {
     /// displayed — that is what makes switching non-destructive.
     runtime_registry: DesktopRuntimeRegistry,
     runtime_registry_store: Option<Arc<DesktopRuntimeRegistryStore>>,
+    /// Last compatibility report per remote runtime id, captured on connect.
+    runtime_compatibility: BTreeMap<String, crate::ssh_connection::compat::CompatibilityReport>,
     runtime_manager_open: bool,
     runtime_manager_stage: RuntimeManagerStage,
     /// The runtime whose detail stage is showing, or whose rename is running.
@@ -11117,6 +11119,7 @@ impl VibexWorkbench {
             ssh_tunnel_task: None,
             runtime_registry,
             runtime_registry_store,
+            runtime_compatibility: BTreeMap::new(),
             runtime_manager_open: false,
             runtime_manager_stage: RuntimeManagerStage::List,
             runtime_manager_target: None,
@@ -14595,6 +14598,7 @@ impl VibexWorkbench {
         let backend = client.backend.clone();
         let sidebar_authority = remote_authority_key(&client.credential);
         self.remote_client = Some(client);
+        self.refresh_runtime_compatibility(&runtime_id);
         self.activate_sidebar_authority(&sidebar_authority, cx);
         let facade = backend.facade();
         self.shared_workflow = Some(AgentFileGitController::from_facade(&facade));
@@ -14651,6 +14655,29 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn refresh_runtime_compatibility(&mut self, runtime_id: &str) {
+        let Some(profile) = self.ssh_profile_for_runtime(runtime_id) else {
+            return;
+        };
+        let Some(info) = self
+            .remote_client
+            .as_ref()
+            .and_then(|client| client.backend.transport().server_info())
+        else {
+            return;
+        };
+        let report = crate::ssh_connection::compat::evaluate(
+            env!("CARGO_PKG_VERSION"),
+            &info.desktop_version,
+            &info.protocol_range,
+            &info.capabilities,
+            &[],
+            profile.channel,
+        );
+        self.runtime_compatibility
+            .insert(runtime_id.to_string(), report);
+    }
+
     /// Reconnects to the registry's active remote runtime at boot. A failed
     /// connect falls back to the embedded runtime instead of leaving the shell
     /// without an authority.
@@ -14674,6 +14701,9 @@ impl VibexWorkbench {
             .into_iter()
             .find(|profile| profile.id == profile_id)?;
         let runtime_id = profile.registered_runtime_id.as_deref()?;
+        if let Some(report) = self.runtime_compatibility.get(runtime_id) {
+            return Some(report.clone());
+        }
         if self.runtime_registry.active_runtime_id() != runtime_id {
             return None;
         }
@@ -15277,6 +15307,7 @@ impl VibexWorkbench {
         if !self.runtime_registry.remove(&id) {
             return;
         }
+        self.runtime_compatibility.remove(&id);
         self.runtime_remove_pending = None;
         if self
             .remote_client
@@ -15707,6 +15738,25 @@ impl VibexWorkbench {
             runtime_state_label(state).to_string(),
             cx,
         ));
+        let compatibility = self.runtime_compatibility.get(id.as_str()).cloned();
+        if let Some(report) = compatibility.as_ref() {
+            let mut detail = runtime_compatibility_label(report.state).to_string();
+            if !report.reasons.is_empty() {
+                detail.push_str(&format!(" ({})", report.reasons.join(", ")));
+            }
+            rows.push(runtime_detail_row(
+                locale::text("Compatibility", "兼容性", "相容性"),
+                detail,
+                cx,
+            ));
+            if !report.missing_capabilities.is_empty() {
+                rows.push(runtime_detail_row(
+                    locale::text("Missing capabilities", "缺少能力", "缺少能力"),
+                    report.missing_capabilities.join(", "),
+                    cx,
+                ));
+            }
+        }
         if let Some(runtime) = runtime.as_ref() {
             rows.push(runtime_detail_row(
                 locale::text("Address", "地址", "位址"),
@@ -15767,6 +15817,30 @@ impl VibexWorkbench {
                     move |this, _, _, cx| this.switch_to_runtime(id.clone(), cx)
                 })),
         );
+        let upgrade_profile = if is_local {
+            None
+        } else {
+            self.ssh_profile_for_runtime(&id)
+        };
+        if let (Some(profile), Some(report)) = (upgrade_profile.as_ref(), compatibility.as_ref())
+            && matches!(
+                report.state,
+                crate::ssh_connection::compat::RuntimeCompatibility::UpdateRecommended
+                    | crate::ssh_connection::compat::RuntimeCompatibility::UpdateRequired
+            )
+        {
+            let profile_id = profile.id.clone();
+            actions = actions.child(
+                Button::new("runtime-detail-update")
+                    .small()
+                    .outline()
+                    .label(locale::text("Update runtime", "更新运行时", "更新執行階段"))
+                    .disabled(switching || self.ssh_upgrade_running)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.start_ssh_runtime_upgrade(profile_id.clone(), cx)
+                    })),
+            );
+        }
         // Renaming is offered for the embedded runtime as well: it is the
         // runtime its paired clients see, and the name is published to all of
         // them.
@@ -16170,6 +16244,11 @@ impl VibexWorkbench {
                 "{address} · {}",
                 locale::text("last attempt failed", "上次连接失败", "上次連線失敗")
             );
+        }
+        if let Some(report) = self.runtime_compatibility.get(runtime.id.as_str())
+            && report.state != crate::ssh_connection::compat::RuntimeCompatibility::Compatible
+        {
+            return format!("{address} · {}", runtime_compatibility_label(report.state));
         }
         address
     }
@@ -88129,6 +88208,27 @@ enum RuntimeStatePresentation {
 }
 
 /// Status is never carried by color alone: every dot is paired with this.
+fn runtime_compatibility_label(
+    state: crate::ssh_connection::compat::RuntimeCompatibility,
+) -> &'static str {
+    use crate::ssh_connection::compat::RuntimeCompatibility;
+    match state {
+        RuntimeCompatibility::Compatible => locale::text("Compatible", "兼容", "相容"),
+        RuntimeCompatibility::UpdateRecommended => {
+            locale::text("Update available", "可更新", "可更新")
+        }
+        RuntimeCompatibility::UpdateRequired => locale::text(
+            "Runtime update required",
+            "需要更新运行时",
+            "需要更新執行階段",
+        ),
+        RuntimeCompatibility::DesktopUpdateRequired => {
+            locale::text("Update Vibex", "需要更新 Vibex", "需要更新 Vibex")
+        }
+        RuntimeCompatibility::Incompatible => locale::text("Incompatible", "不兼容", "不相容"),
+    }
+}
+
 fn runtime_state_label(state: RuntimeStatePresentation) -> &'static str {
     match state {
         RuntimeStatePresentation::Ready => locale::text("Ready", "已就绪", "已就緒"),
@@ -107028,6 +107128,9 @@ mod tests {
         assert!(source.contains("channel_for_version_str"));
         assert!(source.contains("fn ssh_runtime_compatibility("));
         assert!(source.contains("compat::evaluate"));
+        assert!(source.contains("runtime_compatibility"));
+        assert!(source.contains("runtime-detail-update"));
+        assert!(source.contains("start_ssh_runtime_upgrade(profile_id.clone()"));
     }
 
     #[test]
