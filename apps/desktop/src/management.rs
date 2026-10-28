@@ -1527,7 +1527,7 @@ pub struct ManagementCenter {
     automation_title: Entity<InputState>,
     automation_description: Entity<InputState>,
     prompt_name: Entity<InputState>,
-    prompt_body: Entity<InputState>,
+    prompt_body: Entity<TextareaState>,
     prompt_search: Entity<InputState>,
     /// The Prompt the editor holds, or `None` while it is creating one.
     ///
@@ -1963,7 +1963,7 @@ impl ManagementCenter {
             ))
         });
         let prompt_body = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
+            TextareaState::new(window, cx).placeholder(management_locale_text(
                 "e.g. Review this workspace",
                 "例如 检查此工作区",
                 "例如 檢查此工作區",
@@ -2815,14 +2815,6 @@ impl ManagementCenter {
                 &self.prompt_name,
                 ("e.g. Review command", "例如 检查命令", "例如 檢查命令"),
             ),
-            (
-                &self.prompt_body,
-                (
-                    "e.g. Review this workspace",
-                    "例如 检查此工作区",
-                    "例如 檢查此工作區",
-                ),
-            ),
             (&self.hook_name, ("Hook name", "Hook 名称", "Hook 名稱")),
             (
                 &self.hook_command,
@@ -2850,6 +2842,19 @@ impl ManagementCenter {
                 input.set_placeholder(locale::text(en, zh_cn, zh_tw), window, cx)
             });
         }
+        // The Prompt body is a multi-line textarea, so it cannot share the
+        // single-line placeholder array above.
+        self.prompt_body.update(cx, |input, cx| {
+            input.set_placeholder(
+                locale::text(
+                    "e.g. Review this workspace",
+                    "例如 检查此工作区",
+                    "例如 檢查此工作區",
+                ),
+                window,
+                cx,
+            )
+        });
         cx.notify();
     }
 
@@ -33417,10 +33422,9 @@ impl ManagementCenter {
                 false,
                 cx,
             ))
-            .child(management_input_field(
+            .child(management_textarea_field(
                 management_locale_text("Prompt body", "提示词内容", "提示詞內容"),
                 &self.prompt_body,
-                false,
                 cx,
             ));
 
@@ -44657,6 +44661,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the prompt editor should remain inspectable");
         assert!(editor.contains("this.save_prompt(cx)"));
+        // A Prompt body is prose, so it is written in the kit's multi-line
+        // textarea rather than the single-line input the name field uses.
+        assert!(editor.contains("management_textarea_field("));
         // The sidebar owns the list, so the body must not draw a second copy.
         assert!(!editor.contains("management_resource_row("));
     }
