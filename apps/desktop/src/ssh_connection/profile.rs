@@ -54,6 +54,10 @@ pub struct SshConnectionProfile {
     pub local_tunnel_port: u16,
     pub channel: SshRuntimeChannel,
     pub runtime_version: Option<String>,
+    /// The registry id this profile produced, when it has been provisioned.
+    /// Optional so stores written before runtime binding remain valid.
+    #[serde(default)]
+    pub registered_runtime_id: Option<String>,
     pub created_at_ms: i64,
     pub last_connected_at_ms: Option<i64>,
 }
@@ -111,6 +115,18 @@ impl SshConnectionProfile {
         validate_port("localTunnelPort", self.local_tunnel_port)?;
         if let Some(version) = &self.runtime_version {
             validate_version(version)?;
+        }
+        if let Some(runtime_id) = &self.registered_runtime_id
+            && (runtime_id.is_empty()
+                || runtime_id.len() > 64
+                || !runtime_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                }))
+        {
+            return Err(invalid(
+                "registeredRuntimeId",
+                "must be 1-64 characters of letters, digits, '_' or '-'",
+            ));
         }
         if self.created_at_ms < 0 {
             return Err(invalid("createdAtMs", "must not be negative"));
@@ -543,6 +559,7 @@ mod tests {
             local_tunnel_port: 18765,
             channel: SshRuntimeChannel::Rc,
             runtime_version: Some("0.1.0-rc.8".to_string()),
+            registered_runtime_id: None,
             created_at_ms: 1_700_000_000_000,
             last_connected_at_ms: Some(1_700_000_100_000),
         }
@@ -675,6 +692,15 @@ mod tests {
 
         let mut profile = sample();
         profile.id = String::new();
+        assert_eq!(profile.validate().unwrap_err().code, "ssh_profile_invalid");
+    }
+
+    #[test]
+    fn registered_runtime_id_must_be_registry_safe() {
+        let mut profile = sample();
+        profile.registered_runtime_id = Some("server-1".to_string());
+        profile.validate().unwrap();
+        profile.registered_runtime_id = Some("not a registry id".to_string());
         assert_eq!(profile.validate().unwrap_err().code, "ssh_profile_invalid");
     }
 

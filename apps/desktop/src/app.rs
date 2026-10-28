@@ -251,9 +251,9 @@ use crate::ssh_connection::{
     LaunchConfig, MIN_FREE_KB, ProvisioningRunOutcome, ProvisioningService,
     ProvisioningServiceEvent, ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep,
     SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshProfileStore,
-    SshProvisioningEffects, SshRuntimeChannel, TunnelProcess, default_ssh_config_path,
+    SshProvisioningEffects, SshRuntimeChannel, TunnelProcess, TunnelSpec, default_ssh_config_path,
     discover_default_hosts, download_server_artifact, probe, resolve_effective_default,
-    select_local_port, select_server_artifact,
+    select_local_port, select_server_artifact, supervisor,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -14155,6 +14155,30 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn bind_ssh_profile_runtime(
+        &self,
+        profile_id: &str,
+        runtime_id: &str,
+        version: Option<String>,
+    ) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
+            return;
+        };
+        profile.registered_runtime_id = Some(runtime_id.to_string());
+        profile.last_connected_at_ms = Some(unix_timestamp_ms());
+        if let Some(version) = version {
+            profile.runtime_version = Some(version);
+        }
+        let _ = store.save(&profiles);
+    }
+
     fn sync_ssh_provisioning_settings(&self, cx: &mut Context<Self>) {
         let snapshot = self.ssh_provisioning_snapshot.clone();
         let error = self.ssh_provisioning_error.clone();
@@ -14195,6 +14219,10 @@ impl VibexWorkbench {
                     cx.notify();
                     return;
                 };
+                let version = effects
+                    .runtime_status()
+                    .map(|status| status.version.clone());
+                let profile_id = snapshot.profile_id.clone();
                 self.ssh_tunnel = effects.take_tunnel_process();
                 self.ssh_provisioning_snapshot = Some(snapshot);
                 self.install_remote_client(
@@ -14206,6 +14234,7 @@ impl VibexWorkbench {
                     cx,
                 );
                 self.mark_runtime_active(&runtime_id, cx);
+                self.bind_ssh_profile_runtime(&profile_id, &runtime_id, version);
                 self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
@@ -14315,7 +14344,151 @@ impl VibexWorkbench {
     /// connect falls back to the embedded runtime instead of leaving the shell
     /// without an authority.
     fn begin_active_remote_start(&mut self, runtime: RegisteredRuntime, cx: &mut Context<Self>) {
-        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
+        if let Some(profile) = self.ssh_profile_for_runtime(&runtime.id) {
+            self.begin_ssh_remote_boot(runtime, profile, cx);
+        } else {
+            self.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
+        }
+    }
+
+    fn ssh_profile_for_runtime(&self, runtime_id: &str) -> Option<SshConnectionProfile> {
+        let config = self.config.as_ref()?;
+        SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .ok()?
+            .into_iter()
+            .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
+    }
+
+    /// Restores the SSH tunnel and remote runtime before booting the client.
+    /// The pairing credential points at the loopback tunnel, so a stale or
+    /// missing tunnel must be rebuilt first.
+    fn begin_ssh_remote_boot(
+        &mut self,
+        runtime: RegisteredRuntime,
+        profile: SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_switch_pending.is_some() {
+            return;
+        }
+        let program = profile
+            .ssh_client_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ssh"));
+        let destination = SshDestination {
+            host: profile.host.clone(),
+            user: profile.user.clone(),
+            port: profile.port,
+        };
+        let config_path = profile.ssh_config_path.clone();
+        let command =
+            match SshCommand::for_destination(program, &destination, config_path.as_deref()) {
+                Ok(command) => command,
+                Err(error) => {
+                    self.finish_runtime_connect_failure(
+                        BackendError::offline(
+                            "ssh_boot_command_invalid",
+                            format!("{}: {}", error.code, error.message),
+                        ),
+                        RuntimeConnectOrigin::Boot,
+                        cx,
+                    );
+                    return;
+                }
+            };
+        let launch = match LaunchConfig::new(
+            &profile.remote_home,
+            &profile.remote_install_root,
+            &profile.workspace_roots,
+            profile.remote_port,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.finish_runtime_connect_failure(
+                    BackendError::offline(
+                        "ssh_boot_launch_invalid",
+                        format!("{}: {}", error.code, error.message),
+                    ),
+                    RuntimeConnectOrigin::Boot,
+                    cx,
+                );
+                return;
+            }
+        };
+        let spec = match TunnelSpec::new(
+            command.program.clone(),
+            destination,
+            config_path,
+            profile.local_tunnel_port,
+            profile.remote_port,
+        ) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.finish_runtime_connect_failure(
+                    BackendError::offline(
+                        "ssh_boot_tunnel_invalid",
+                        format!("{}: {}", error.code, error.message),
+                    ),
+                    RuntimeConnectOrigin::Boot,
+                    cx,
+                );
+                return;
+            }
+        };
+        self.runtime_switch_pending = Some(runtime.id.clone());
+        self.runtime_status = RuntimeStatus::Starting;
+        self.runtime_note = Some(
+            locale::text(
+                "Restoring SSH runtime…",
+                "正在恢复 SSH 运行时…",
+                "正在恢復 SSH 執行階段…",
+            )
+            .to_string(),
+        );
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            supervisor::ensure_started(&command, &launch)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let tunnel = TunnelProcess::spawn(&spec)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok::<TunnelProcess, String>(tunnel)
+        });
+        self.boot_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match outcome {
+                        Ok(Ok(tunnel)) => {
+                            this.runtime_switch_pending = None;
+                            this.ssh_tunnel = Some(tunnel);
+                            this.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.finish_runtime_connect_failure(
+                                BackendError::offline("ssh_boot_failed", error),
+                                RuntimeConnectOrigin::Boot,
+                                cx,
+                            );
+                            this.runtime_switch_pending = None;
+                        }
+                        Err(_) => {
+                            this.finish_runtime_connect_failure(
+                                BackendError::offline(
+                                    "ssh_boot_task_failed",
+                                    "the SSH boot task stopped unexpectedly",
+                                ),
+                                RuntimeConnectOrigin::Boot,
+                                cx,
+                            );
+                            this.runtime_switch_pending = None;
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
     }
 
     /// Connects to a registered remote runtime and installs it once the
@@ -81994,6 +82167,7 @@ impl FoundationSettings {
                 local_tunnel_port,
                 channel: SshRuntimeChannel::Stable,
                 runtime_version: None,
+                registered_runtime_id: None,
                 created_at_ms: now,
                 last_connected_at_ms: None,
             };
@@ -106089,6 +106263,11 @@ mod tests {
         assert!(finish.contains("mark_runtime_active"));
         assert!(finish.contains("take_tunnel_process"));
         assert!(source.contains("ssh_tunnel: Option<TunnelProcess>"));
+        assert!(source.contains("registered_runtime_id"));
+        assert!(source.contains("fn begin_ssh_remote_boot("));
+        assert!(source.contains("fn ssh_profile_for_runtime("));
+        assert!(source.contains("supervisor::ensure_started"));
+        assert!(source.contains("TunnelProcess::spawn"));
     }
 
     #[test]
