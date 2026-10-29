@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use crate::typography::code_font_weight;
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
-    EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, Rems, Render, Role, ScrollHandle, SharedString, Size as GpuiSize,
-    StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window, div, prelude::*, px,
-    rems, size as gpui_size,
+    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
+    Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle, SharedString,
+    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window,
+    canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -30980,40 +30980,17 @@ impl ManagementCenter {
             rows = rows.child(row);
         }
         if !any {
+            let border_color = cx.theme().border.opacity(0.55);
             rows = rows.child(
-                div()
-                    .id("management-route-group-empty")
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(cx.theme().border.opacity(0.55))
-                    .bg(cx.theme().background.opacity(0.45))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(management_locale_text(
-                            "New route group",
-                            "新建路由组",
-                            "新增路由組",
-                        ))
-                        .build(window, cx)
-                    })
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::LIGHT)
-                            .text_color(cx.theme().muted_foreground.opacity(0.8))
-                            .child("+"),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_route_group_editor(true, window, cx);
-                    })),
+                management_empty_source_card(
+                    "management-route-group-empty",
+                    management_locale_text("New route group", "新建路由组", "新增路由組"),
+                    border_color,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_route_group_editor(true, window, cx);
+                })),
             );
         }
         v_flex()
@@ -32845,40 +32822,17 @@ impl ManagementCenter {
             // An empty list is a card-shaped invitation, not a paragraph: the
             // placeholder is the exact size of a Provider row and the whole
             // card opens the same dialog the + button does.
-            div()
-                .id("provider-empty-card")
-                .w_full()
-                .min_w_0()
-                .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(8.0))
-                .border_1()
-                .border_dashed()
-                .border_color(cx.theme().border.opacity(0.55))
-                .bg(cx.theme().background.opacity(0.45))
-                .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
-                .tooltip(move |window, cx| {
-                    Tooltip::new(management_locale_text(
-                        "Add model provider",
-                        "添加模型供应商",
-                        "新增模型供應商",
-                    ))
-                    .build(window, cx)
-                })
-                .child(
-                    div()
-                        .text_xl()
-                        .font_weight(FontWeight::LIGHT)
-                        .text_color(cx.theme().muted_foreground.opacity(0.8))
-                        .child("+"),
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_profile_creator(window, cx);
-                }))
-                .into_any_element()
+            let border_color = cx.theme().border.opacity(0.55);
+            management_empty_source_card(
+                "provider-empty-card",
+                management_locale_text("Add model provider", "添加模型供应商", "新增模型供應商"),
+                border_color,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_profile_creator(window, cx);
+            }))
+            .into_any_element()
         } else {
             profile_rows.into_any_element()
         };
@@ -43420,6 +43374,109 @@ fn management_detail_icon_action(button: Button, label: &'static str) -> impl In
     )
 }
 
+/// The long-dash frame around an empty source card.
+///
+/// The kit's dashed border is a two-pixel dash on a one-pixel stroke, which
+/// reads as a dotted line on a 72px row. The placeholders paint their own
+/// rounded frame so the dashes stay visibly separate from the gaps.
+fn paint_empty_source_border(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+    let inset = px(1.0);
+    let radius = px(8.0);
+    let left = bounds.left() + inset;
+    let top = bounds.top() + inset;
+    let right = bounds.right() - inset;
+    let bottom = bounds.bottom() - inset;
+    if right <= left || bottom <= top {
+        return;
+    }
+    let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(10.0), px(6.0)]);
+    path.move_to(point(left + radius, top));
+    path.line_to(point(right - radius, top));
+    path.arc_to(
+        point(radius, radius),
+        px(0.0),
+        false,
+        true,
+        point(right, top + radius),
+    );
+    path.line_to(point(right, bottom - radius));
+    path.arc_to(
+        point(radius, radius),
+        px(0.0),
+        false,
+        true,
+        point(right - radius, bottom),
+    );
+    path.line_to(point(left + radius, bottom));
+    path.arc_to(
+        point(radius, radius),
+        px(0.0),
+        false,
+        true,
+        point(left, bottom - radius),
+    );
+    path.line_to(point(left, top + radius));
+    path.arc_to(
+        point(radius, radius),
+        px(0.0),
+        false,
+        true,
+        point(left + radius, top),
+    );
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// A card-shaped invitation to add the first record of a kind.
+fn management_empty_source_card(
+    id: &'static str,
+    label: &'static str,
+    border_color: Hsla,
+    cx: &mut Context<ManagementCenter>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .relative()
+        .w_full()
+        .min_w_0()
+        .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .bg(cx.theme().background.opacity(0.45))
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::Plus)
+                        .size(px(16.0))
+                        .text_color(cx.theme().muted_foreground.opacity(0.8)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .text_color(cx.theme().muted_foreground.opacity(0.9))
+                        .child(label),
+                ),
+        )
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| paint_empty_source_border(bounds, border_color, window),
+            )
+            .absolute()
+            .size_full(),
+        )
+}
+
 fn management_card_inner(
     title: &'static str,
     description: &'static str,
@@ -46662,14 +46719,31 @@ mod tests {
         );
         assert!(!render.contains("provider-empty-import-existing"));
         assert!(!render.contains("compact_empty_state("));
-        // The placeholder is a full-size, dashed card the reader can click.
+        // The placeholder is a full-size card with an icon and a caption.
         assert!(render.contains("provider-empty-card"));
-        assert!(render.contains(".border_dashed()"));
-        assert!(render.contains("min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))"));
+        assert!(render.contains("management_empty_source_card("));
+        assert!(render.contains("Add model provider"));
         assert!(render.contains("this.open_profile_creator(window, cx)"));
         // The two headings show their own counts.
         assert!(render.contains("management_section_heading("));
         assert!(render.contains("profiles.len()"));
+
+        let empty_card = source
+            .split_once("fn management_empty_source_card(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_card_inner("))
+            .map(|(body, _)| body)
+            .expect("the empty source card should remain inspectable");
+        assert!(empty_card.contains("min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))"));
+        assert!(empty_card.contains("Icon::new(IconName::Plus)"));
+        assert!(empty_card.contains(".gap_2()"));
+
+        let border = source
+            .split_once("fn paint_empty_source_border(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_empty_source_card("))
+            .map(|(body, _)| body)
+            .expect("the long-dash border should remain inspectable");
+        assert!(border.contains("dash_array(&[px(10.0), px(6.0)])"));
+        assert!(border.contains("window.paint_path(path, color)"));
     }
 
     #[test]
@@ -49901,9 +49975,9 @@ mod gateway_surface_tests {
         assert!(card.contains("preview_route_group_reorder("));
         assert!(card.contains("finish_route_group_drag("));
         assert!(card.contains("ordered_agent_route_groups(&agent_id)"));
-        // An empty list is a same-size dashed card, not a paragraph.
+        // An empty list is a same-size card with an icon and a caption.
         assert!(card.contains("management-route-group-empty"));
-        assert!(card.contains(".border_dashed()"));
+        assert!(card.contains("management_empty_source_card("));
         assert!(card.contains("management_section_heading("));
         assert!(card.contains("group_count"));
 
