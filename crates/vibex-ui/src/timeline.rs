@@ -14,6 +14,44 @@ use vibex_desktop_model::{
 /// The common height of a live reasoning window, in text rows.
 pub const REASONING_WINDOW_LINES: usize = 6;
 
+/// How far the start of a live window's source moves at a time.
+///
+/// The window shows six rows, so the text view only needs the end of the
+/// thought; this bounds what it lays out to between one and two quanta.
+pub const REASONING_WINDOW_TAIL_QUANTUM: usize = 2 * 1024;
+
+/// The end of a live thought that is enough to fill its window.
+///
+/// The window clips the body to its newest rows, but a clip is not a budget:
+/// handed the whole thought, the text view lays out and paints every row of it
+/// on each delta, and a long thought costs frames in
+/// proportion to its length while showing six rows. The cut advances in fixed
+/// quanta, so between steps the source only grows at its end and the view
+/// appends instead of reparsing. It starts at a paragraph, or failing that a
+/// line, inside text that was already there, so the start stays put as deltas
+/// arrive.
+pub fn reasoning_window_tail(body: &str) -> &str {
+    let quantum = REASONING_WINDOW_TAIL_QUANTUM;
+    if body.len() <= quantum * 2 {
+        return body;
+    }
+    let mut cut = (body.len() - quantum) / quantum * quantum;
+    while !body.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let mut settled_end = (cut + quantum).min(body.len());
+    while !body.is_char_boundary(settled_end) {
+        settled_end -= 1;
+    }
+    let settled = &body[cut..settled_end];
+    let start = settled
+        .find("\n\n")
+        .map(|ix| ix + 2)
+        .or_else(|| settled.find('\n').map(|ix| ix + 1))
+        .unwrap_or(0);
+    &body[cut + start..]
+}
+
 pub fn turn_finished(turn: &TimelineConversationTurn) -> bool {
     turn.complete || turn.superseded
 }

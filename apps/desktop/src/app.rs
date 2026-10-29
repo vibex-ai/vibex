@@ -63952,18 +63952,26 @@ impl VibexWorkbench {
             // reasoning of the turn by construction — the caller only reaches it
             // while the turn is unfinished — so the window applies to it exactly
             // as it does to a streaming row.
+            let live_window = self.live_reasoning_uses_window(true);
+            let remaining_source = remaining_source.map(|source| {
+                if live_window {
+                    vibex_ui::timeline::reasoning_window_tail(source)
+                } else {
+                    source
+                }
+            });
             let window = self.reasoning_window(true, remaining_source);
+            let surface_id = if live_window {
+                format!("thought:{row_id}:window")
+            } else {
+                format!("thought:{row_id}:remaining")
+            };
             let remaining = remaining_source.map(|source| {
-                self.reasoning_markdown_view(
-                    format!("thought:{row_id}:remaining"),
-                    Arc::<str>::from(source),
-                    None,
-                    cx,
-                )
-                .w_full()
-                .min_w_0()
-                .text_color(cx.theme().muted_foreground)
-                .into_any_element()
+                self.reasoning_markdown_view(surface_id, Arc::<str>::from(source), None, cx)
+                    .w_full()
+                    .min_w_0()
+                    .text_color(cx.theme().muted_foreground)
+                    .into_any_element()
             });
             return self.render_expanded_reasoning_layout(
                 row_id,
@@ -64060,20 +64068,28 @@ impl VibexWorkbench {
             // stays plain text and only the body keeps the Markdown surface.
             let first_line = self.reasoning_first_line_text(Some(row), first_line_source, cx);
             let arriving = self.row_is_arriving(row);
+            let live_window = self.live_reasoning_uses_window(arriving);
+            let remaining_source = remaining_source.map(|source| {
+                if live_window {
+                    reasoning_window_source(&source)
+                } else {
+                    source
+                }
+            });
             let window = self.reasoning_window(arriving, remaining_source.as_deref());
+            let surface_id = if live_window {
+                format!("thought:{}:window", row.id)
+            } else {
+                format!("thought:{}:remaining", row.id)
+            };
             let remaining = match windowed_body {
                 Some(body) => Some(body),
                 None => remaining_source.map(|source| {
-                    self.reasoning_markdown_view(
-                        format!("thought:{}:remaining", row.id),
-                        source,
-                        search_highlight,
-                        cx,
-                    )
-                    .w_full()
-                    .min_w_0()
-                    .text_color(cx.theme().muted_foreground)
-                    .into_any_element()
+                    self.reasoning_markdown_view(surface_id, source, search_highlight, cx)
+                        .w_full()
+                        .min_w_0()
+                        .text_color(cx.theme().muted_foreground)
+                        .into_any_element()
                 }),
             };
             return self.render_expanded_reasoning_layout(
@@ -72755,6 +72771,16 @@ const REASONING_WINDOW_HEIGHT: f32 = REASONING_WINDOW_LINES * REASONING_WINDOW_L
 /// the row rather than reading a marker.
 fn reasoning_window_height(body: &str, chars_per_line: usize) -> f32 {
     estimated_markdown_body_height(body, chars_per_line).min(REASONING_WINDOW_HEIGHT)
+}
+
+/// [`vibex_ui::timeline::reasoning_window_tail`] for a shared source, reusing it when it is short.
+fn reasoning_window_source(source: &Arc<str>) -> Arc<str> {
+    let tail = vibex_ui::timeline::reasoning_window_tail(source);
+    if tail.len() == source.len() {
+        source.clone()
+    } else {
+        Arc::from(tail)
+    }
 }
 
 /// Hold a reasoning body to its window.
@@ -93696,6 +93722,33 @@ mod tests {
             truncate_agent_thinking_label("short status"),
             "short status"
         );
+    }
+
+    #[test]
+    fn a_live_window_lays_out_only_the_end_of_a_long_thought() {
+        let short = "a short thought\n\nstill short";
+        assert_eq!(vibex_ui::timeline::reasoning_window_tail(short), short);
+
+        let mut body = String::new();
+        for n in 0..400 {
+            body.push_str(&format!("paragraph {n} of a long thought\n\n"));
+        }
+        let tail = vibex_ui::timeline::reasoning_window_tail(&body);
+        assert!(body.ends_with(tail), "the window keeps the newest text");
+        assert!(tail.len() <= vibex_ui::timeline::REASONING_WINDOW_TAIL_QUANTUM * 2);
+        assert!(
+            tail.starts_with("paragraph "),
+            "the cut lands on a paragraph"
+        );
+
+        // A delta only appends to the window's source until the next quantum,
+        // so the text view extends its document rather than reparsing it.
+        let grown = format!("{body}and a few more words");
+        let grown_tail = vibex_ui::timeline::reasoning_window_tail(&grown);
+        assert!(grown_tail.starts_with(tail));
+
+        let wide = "思考".repeat(4000);
+        assert!(wide.ends_with(vibex_ui::timeline::reasoning_window_tail(&wide)));
     }
 
     #[test]

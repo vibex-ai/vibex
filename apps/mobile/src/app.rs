@@ -16,12 +16,12 @@ use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Bounds, ClipboardItem, Context,
-    DispatchPhase, Edges, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image,
-    ImageFormat, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState, LongPressEvent,
-    MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent, TouchPhase, Transformation,
-    UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list,
-    percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
+    DispatchPhase, Edges, ElementId, Entity, FocusHandle, Focusable, FollowMode, FontWeight, Hsla,
+    Image, ImageFormat, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState,
+    LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point,
+    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent,
+    TouchPhase, Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out,
+    ease_out_quint, img, list, percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
 };
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -103,7 +103,6 @@ use gpui_component::progress::ProgressCircle;
 use gpui_component::shimmer::ShimmerText;
 use gpui_component::{Disableable as _, Icon, Sizable as _, StyledExt as _};
 
-const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 /// How long a released press still counts as the hold that just fired.
 ///
 /// A hold opens a sheet over the pill, so the release usually lands on the
@@ -235,13 +234,24 @@ const RUNTIME_SHEET_AGENT_STRIP_HEIGHT: f32 = 52.0;
 const RUNTIME_SHEET_SEARCH_HEIGHT: f32 = 44.0;
 const RUNTIME_SHEET_MODEL_LIST_HEIGHT: f32 = 216.0;
 
+/// The list owns following the live end.
+///
+/// `FollowMode::Tail` is decided inside the list's own scroll handling: any
+/// gesture toward older content stops following on that very event, and
+/// following resumes only once layout finds the viewport at the true bottom.
+/// Deciding it in the view instead — from reported offsets a frame late, or
+/// from which turn the top landed on — cannot see a reader scrolling inside
+/// the one tall turn that is streaming, and handed them back to the end under
+/// their own finger.
 fn timeline_list_state(turn_count: usize) -> ListState {
-    ListState::new(
+    let state = ListState::new(
         turn_count,
         ListAlignment::Top,
         px(TIMELINE_LIST_OVERDRAW_PX),
     )
-    .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX))
+    .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+    state.set_follow_mode(FollowMode::Tail);
+    state
 }
 
 /// Points the timeline list's scroll reports at the view.
@@ -250,9 +260,6 @@ fn timeline_list_state(turn_count: usize) -> ListState {
 /// state is mutably borrowed, so it only hands the viewport to the view; every
 /// list call happens on the view's turn.
 fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileApp>) {
-    // A clone of the same state, for the directions the view asks for once the
-    // list has finished with the borrow it holds while it runs the handler.
-    let list = state.clone();
     state.set_scroll_handler(move |event, _window, cx| {
         let viewport = TimelineViewport {
             first_visible: event.visible_range.start,
@@ -264,19 +271,6 @@ fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileAp
         let _ = owner.update(cx, |app, cx| {
             app.timeline_viewport = Some(viewport);
             app.prefetch_older_history_if_near_top(cx);
-        });
-        // The list runs this handler while it already holds its own state
-        // mutably, so reading that state back here — the position and the
-        // scroll offsets the follow decision needs — panics with "RefCell
-        // already mutably borrowed" and takes the render thread down with it.
-        // Ask once the handler has returned and the borrow is released; the
-        // position read there is the one this report just moved the list to.
-        let owner = owner.clone();
-        let list = list.clone();
-        cx.defer(move |cx| {
-            let _ = owner.update(cx, |app, _cx| {
-                app.settle_timeline_follow_after_scroll(list.logical_scroll_top());
-            });
         });
     });
 }
@@ -299,52 +293,6 @@ fn hint_unmeasured_timeline_rows(list: &ListState) {
     let _ = list
         .clone()
         .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
-}
-
-/// Which way a scroll report moved the list's top.
-///
-/// A top that landed on an earlier turn is a finger pulling older content into
-/// view. The first report of a gesture has nothing to compare against, and one
-/// that stayed inside the same turn is a re-measure rather than a gesture, so
-/// both keep the direction already recorded.
-fn timeline_scrolled_toward_older(
-    previous: Option<ListOffset>,
-    current: ListOffset,
-    toward_older: bool,
-) -> bool {
-    match previous {
-        Some(previous) if previous.item_ix != current.item_ix => current.item_ix < previous.item_ix,
-        _ => toward_older,
-    }
-}
-
-/// Whether a settled scroll report leaves the transcript following new output.
-///
-/// Follow is the reader's decision, and this is where they make it. Three things
-/// decide it, in this order:
-///
-/// A gesture heading toward older turns has already answered "no". This is
-/// checked first because the arithmetic cannot be trusted to agree: a list whose
-/// unmeasured turns report no height has a scroll extent much shorter than what
-/// is painted, so a reader who is plainly halfway up the conversation can sit
-/// "within 96px of the bottom" and be pulled back to the live end under a finger
-/// that was scrolling away from it.
-///
-/// A reader who has arrived at the bottom follows again — that is what scrolling
-/// to the bottom means. A short conversation, whose whole content is within the
-/// threshold, counts as arrived.
-///
-/// Anything else leaves follow exactly as it was. The previous state was also
-/// the reader's decision, and a report that cannot name a direction — a
-/// re-measure, a resize, an older page landing — is not a new one.
-fn timeline_follow_after_scroll(following: bool, toward_older: bool, near_bottom: bool) -> bool {
-    if toward_older {
-        return false;
-    }
-    if near_bottom {
-        return true;
-    }
-    following
 }
 
 /// The reader's place in the timeline, as the list last reported it.
@@ -1788,24 +1736,6 @@ pub struct MobileApp {
     /// while its state is borrowed, so the prefetch path reads this instead of
     /// asking the list where it is.
     timeline_viewport: Option<TimelineViewport>,
-    /// Whether the transcript keeps following new output. Set by the reader's
-    /// own scrolling, so streaming cannot drag the list back to the end while
-    /// they are reading something above it.
-    timeline_follow: bool,
-    /// The direction the reader's current gesture is travelling in, in content
-    /// terms: `true` while the finger is pulling older turns into view.
-    ///
-    /// Follow is the reader's decision and a reader scrolling up has already
-    /// made it. Deciding from the reported offsets alone cannot see that: a
-    /// list whose unmeasured turns report no height has a scroll extent far
-    /// shorter than what is on screen, so a reader parked halfway up can be
-    /// "within 96px of the bottom" by arithmetic and be handed back to the live
-    /// end under their own finger. The direction of the gesture is the one
-    /// signal that does not depend on a measurement being right.
-    timeline_scroll_toward_older: bool,
-    /// Where the list last reported its top, so the next report can say which
-    /// way the gesture is going.
-    timeline_scroll_top: Option<ListOffset>,
     /// The rows that have already had their detail read back, and the ones
     /// being read now. Opening the same activity twice pays for one read.
     timeline_detail_ready: BTreeSet<i64>,
@@ -4021,9 +3951,6 @@ impl MobileApp {
             },
             timeline_cache_timeline: None,
             timeline_viewport: None,
-            timeline_follow: true,
-            timeline_scroll_toward_older: false,
-            timeline_scroll_top: None,
             timeline_detail_ready: BTreeSet::new(),
             timeline_detail_in_flight: BTreeSet::new(),
             drawer_scroll: UniformListScrollHandle::new(),
@@ -5460,7 +5387,6 @@ impl MobileApp {
         if self.overlay == Some(MobileOverlay::Team) && !self.team_busy {
             self.refresh_team(false, cx);
         }
-        let should_follow = self.timeline_follow;
         let mut timeline_changed = false;
         let mut sessions_need_refresh = false;
         let mut sidebar_needs_refresh = false;
@@ -5581,9 +5507,6 @@ impl MobileApp {
             // The counters move with the conversation; the composer's ring is
             // only ever one event behind.
             self.refresh_token_usage(cx);
-            if should_follow {
-                self.timeline_list.scroll_to_end();
-            }
         }
         if sessions_need_refresh || sidebar_needs_refresh {
             self.refresh_sessions(cx);
@@ -8311,9 +8234,8 @@ impl MobileApp {
         self.pending_user_message = message;
         self.timeline_cache_timeline = None;
         self.timeline_metadata_tip = None;
-        self.timeline_follow = true;
         self.rebuild_timeline_turns();
-        self.timeline_list.scroll_to_end();
+        self.timeline_list.set_follow_mode(FollowMode::Tail);
         cx.notify();
     }
 
@@ -8402,7 +8324,7 @@ impl MobileApp {
                         if selected {
                             this.pending_user_message = None;
                             this.rebuild_timeline_turns();
-                            this.timeline_list.remeasure();
+                            this.remeasure_timeline();
                         }
                         this.fail(error);
                     }
@@ -8592,7 +8514,7 @@ impl MobileApp {
             None
         };
         self.reset_drawers();
-        self.timeline_follow = true;
+        self.timeline_list.set_follow_mode(FollowMode::Tail);
         self.token_usage = None;
         // The command catalogue belongs to the Agent behind this session, so it
         // goes with the session. The armed command never survives a switch
@@ -12003,7 +11925,6 @@ impl MobileApp {
         let Some(session_id) = selected else {
             return;
         };
-        let should_follow = self.timeline_follow;
         // The history this view has already loaded past the cold window. A
         // refetch answers with the newest window only, so replacing the
         // projection with it would throw away every older page the reader
@@ -12050,10 +11971,7 @@ impl MobileApp {
                         );
                     this.timeline_cache_timeline = None;
                     this.rebuild_timeline_turns();
-                    this.timeline_list.remeasure();
-                    if should_follow {
-                        this.timeline_list.scroll_to_end();
-                    }
+                    this.remeasure_timeline();
                     this.persist_active_session_timeline();
                 }
                 cx.notify();
@@ -12578,7 +12496,7 @@ impl MobileApp {
         self.mark_composer_state_dirty(cx);
         self.operation_busy = true;
         self.rebuild_timeline_turns();
-        self.timeline_list.scroll_to_end();
+        self.timeline_list.set_follow_mode(FollowMode::Tail);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             (backend.replace_user_message(request).await, session_id)
         });
@@ -13036,7 +12954,7 @@ impl MobileApp {
         // authority would refuse.
         self.turn_submissions_in_flight += 1;
         self.rebuild_timeline_turns();
-        self.timeline_list.scroll_to_end();
+        self.timeline_list.set_follow_mode(FollowMode::Tail);
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
@@ -13662,7 +13580,7 @@ impl MobileApp {
         }
         self.persist_timeline_display_settings_overrides();
         self.rebuild_timeline_turns();
-        self.timeline_list.remeasure();
+        self.remeasure_timeline();
         cx.notify();
     }
 
@@ -13730,7 +13648,7 @@ impl MobileApp {
         self.timeline_display_settings_overrides.remove(&host_id);
         self.persist_timeline_display_settings_overrides();
         self.rebuild_timeline_turns();
-        self.timeline_list.remeasure();
+        self.remeasure_timeline();
         cx.notify();
     }
 
@@ -13769,7 +13687,7 @@ impl MobileApp {
                     Ok(settings) => {
                         this.desktop_timeline_display_settings = settings;
                         this.rebuild_timeline_turns();
-                        this.timeline_list.remeasure();
+                        this.remeasure_timeline();
                     }
                     Err(error) => {
                         this.fail(error);
@@ -13785,7 +13703,7 @@ impl MobileApp {
         self.expanded_process.insert(id, !expanded);
         // Expanded process rows change a turn's measured height. Re-measure the
         // virtual list immediately so the following turns keep their anchors.
-        self.timeline_list.remeasure();
+        self.remeasure_timeline();
         cx.notify();
     }
 
@@ -13807,7 +13725,7 @@ impl MobileApp {
         if expanded {
             self.ensure_timeline_row_detail(&id, cx);
         }
-        self.timeline_list.remeasure();
+        self.remeasure_timeline();
         cx.notify();
     }
 
@@ -13851,7 +13769,7 @@ impl MobileApp {
                     // item restores it from there.
                     this.timeline_detail_ready.insert(sequence);
                     this.rebuild_timeline_turns();
-                    this.timeline_list.remeasure();
+                    this.remeasure_timeline();
                 }
                 cx.notify();
             });
@@ -13921,38 +13839,17 @@ impl MobileApp {
         Some(index)
     }
 
-    fn timeline_is_near_bottom(&self) -> bool {
-        timeline_distance_to_bottom(
-            f32::from(self.timeline_list.scroll_px_offset_for_scrollbar().y),
-            f32::from(self.timeline_list.max_offset_for_scrollbar().y),
-        ) <= TIMELINE_NEAR_BOTTOM_PX
-    }
-
-    /// Records which way the reader's gesture is travelling.
+    /// Marks every turn for re-measurement while keeping the reader's place.
     ///
-    /// The list reports where its top landed, so a top that moved to an earlier
-    /// turn is a finger pulling older content into view. The first report of a
-    /// gesture has nothing to compare against and leaves the direction as it
-    /// was; the deferred question reads only a direction, and a stale one is
-    /// settled by the next report either way.
-    fn note_timeline_scroll_direction(&mut self, scroll_top: ListOffset) {
-        let previous = self.timeline_scroll_top.replace(scroll_top);
-        self.timeline_scroll_toward_older =
-            timeline_scrolled_toward_older(previous, scroll_top, self.timeline_scroll_toward_older);
-    }
-
-    /// Decides, once a scroll report has settled, whether the transcript should
-    /// keep following new output.
-    ///
-    /// The decision itself lives in [`timeline_follow_after_scroll`]; this hands
-    /// it the three things it reads.
-    fn settle_timeline_follow_after_scroll(&mut self, scroll_top: ListOffset) {
-        self.note_timeline_scroll_direction(scroll_top);
-        self.timeline_follow = timeline_follow_after_scroll(
-            self.timeline_follow,
-            self.timeline_scroll_toward_older,
-            self.timeline_is_near_bottom(),
-        );
+    /// `ListState::remeasure` anchors the top turn proportionally: a turn that
+    /// grows by 1000px under a reader halfway down it moves them 500px. A turn
+    /// is a whole exchange, so the top one is usually tall, and a row opening
+    /// inside it is exactly the change that should leave the pixels above the
+    /// row where they are. The absolute anchor keeps the offset into the top
+    /// turn instead.
+    fn remeasure_timeline(&self) {
+        let count = self.timeline_list.item_count();
+        self.timeline_list.remeasure_items(0..count);
     }
 
     /// Whether the reader is close enough to the top to want history above it.
@@ -13983,7 +13880,11 @@ impl MobileApp {
             // to the top of the conversation in the middle of a scroll.
             self.timeline_list
                 .reset_with_uniform_height(turn_count, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
-            self.restore_timeline_scroll_anchor(anchor);
+            // A reader following the live end has no place to keep, and
+            // `scroll_to` an earlier turn would stop the follow they chose.
+            if !self.timeline_list.is_following_tail() {
+                self.restore_timeline_scroll_anchor(anchor);
+            }
         } else {
             // An append keeps every row already in the table, measured or not,
             // so only the new tail is spliced in. `splice` gives those rows no
@@ -14069,7 +13970,11 @@ impl MobileApp {
             self.timeline_list
                 .reset_with_uniform_height(turn_count, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
         }
-        let first_visible = self.restore_timeline_scroll_anchor(anchor);
+        let first_visible = if self.timeline_list.is_following_tail() {
+            None
+        } else {
+            self.restore_timeline_scroll_anchor(anchor)
+        };
         let visible = self.timeline_viewport.map(|viewport| viewport.visible);
         self.timeline_viewport =
             first_visible
@@ -21309,15 +21214,26 @@ impl MobileApp {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> Entity<markdown::MarkdownView> {
+        self.render_markdown_source_view(key, row, &row.body, cx)
+    }
+
+    /// [`Self::render_markdown_view`] over `body` instead of the row's whole
+    /// text, for a surface that only shows part of it.
+    pub(super) fn render_markdown_source_view(
+        &self,
+        key: String,
+        row: &TimelineRow,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<markdown::MarkdownView> {
         let revision = row.last_sequence.max(0) as u64;
         let mut views = self.timeline_markdown_views.borrow_mut();
         if let Some((view, cached_revision, cached_source)) = views.get_mut(&key) {
-            let source =
-                if *cached_revision == revision && cached_source.as_ref() == row.body.as_str() {
-                    cached_source.clone()
-                } else {
-                    Arc::<str>::from(row.body.as_str())
-                };
+            let source = if *cached_revision == revision && cached_source.as_ref() == body {
+                cached_source.clone()
+            } else {
+                Arc::<str>::from(body)
+            };
             *cached_revision = revision;
             *cached_source = source.clone();
             let view = view.clone();
@@ -21329,7 +21245,7 @@ impl MobileApp {
             return view;
         }
 
-        let source = Arc::<str>::from(row.body.as_str());
+        let source = Arc::<str>::from(body);
         let view = cx.new(|cx| {
             markdown::render(
                 source.clone(),
@@ -27882,7 +27798,7 @@ impl Render for MobileApp {
         // moment it is not.
         self.runtime_agent_strip_frame.set(None);
         if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
-            self.timeline_list.remeasure();
+            self.remeasure_timeline();
             self.scroll_to_timeline_turn(&turn_id, cx);
         }
         for hint in std::mem::take(&mut self.pending_hints) {
@@ -35785,10 +35701,6 @@ fn session_sidebar_time_label_at(
     local_time.format("%m/%d").to_string()
 }
 
-fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
-    (max_offset_y + offset_y).max(0.0)
-}
-
 /// Merges an authoritative refetch into the history already on screen.
 ///
 /// A refetch answers with the newest window only, bounded by turns and by
@@ -41763,13 +41675,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_follow_only_stays_active_near_the_bottom() {
-        assert_eq!(timeline_distance_to_bottom(-500.0, 500.0), 0.0);
-        assert_eq!(timeline_distance_to_bottom(-450.0, 500.0), 50.0);
-        assert_eq!(timeline_distance_to_bottom(-100.0, 500.0), 400.0);
-    }
-
-    #[test]
     fn timeline_list_has_a_scroll_extent_before_offscreen_turns_are_measured() {
         let state = timeline_list_state(10);
 
@@ -41846,81 +41751,6 @@ mod tests {
         assert_eq!(
             state.max_offset_for_scrollbar().y,
             px(3.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
-        );
-    }
-
-    /// Follow is the reader's decision and a gesture toward older turns has
-    /// already made it.
-    ///
-    /// The arithmetic alone cannot be trusted here. A list whose unmeasured
-    /// turns report no height has an extent much shorter than what is painted,
-    /// so a reader plainly halfway up can sit "within 96px of the bottom" — and
-    /// the previous code handed them back to the live end under their own
-    /// finger, which is the jump this pins against.
-    #[test]
-    fn a_scroll_toward_older_turns_leaves_follow_behind() {
-        assert!(
-            !timeline_follow_after_scroll(true, true, true),
-            "scrolling up outranks an offset that says the reader is at the bottom"
-        );
-        assert!(!timeline_follow_after_scroll(true, true, false));
-        assert!(!timeline_follow_after_scroll(false, true, true));
-    }
-
-    /// The direction is read off where the list's top landed.
-    ///
-    /// This is the half of the decision that does not come from pixel offsets:
-    /// a report whose top moved to an earlier turn is a finger pulling older
-    /// content into view. Reading it from the list's own position is what keeps
-    /// it independent of a measurement that is wrong exactly when this matters.
-    #[test]
-    fn the_scroll_direction_follows_the_turn_the_top_landed_on() {
-        let at = |item_ix: usize| ListOffset {
-            item_ix,
-            offset_in_item: px(0.0),
-        };
-
-        // The first report has nothing to compare against.
-        assert!(!timeline_scrolled_toward_older(None, at(4), false));
-        assert!(
-            timeline_scrolled_toward_older(None, at(4), true),
-            "a first report cannot be a direction, so it keeps the one recorded"
-        );
-
-        // Moving to an earlier turn is a gesture toward older history, and
-        // moving back down is a reader who turned around and may follow again.
-        assert!(timeline_scrolled_toward_older(Some(at(4)), at(2), false));
-        assert!(!timeline_scrolled_toward_older(Some(at(2)), at(5), true));
-
-        // A report that stayed inside one turn is a re-measure, not a gesture.
-        assert!(
-            timeline_scrolled_toward_older(Some(at(2)), at(2), true),
-            "growing an offset inside the same turn is not a direction"
-        );
-    }
-
-    /// Arriving at the bottom is what resumes following.
-    #[test]
-    fn reaching_the_bottom_resumes_follow() {
-        assert!(timeline_follow_after_scroll(false, false, true));
-        assert!(timeline_follow_after_scroll(true, false, true));
-    }
-
-    /// A report that cannot name a direction is not a new decision.
-    ///
-    /// Re-measures, resizes and pages landing all produce reports. Treating one
-    /// as "the reader is not at the bottom" would quietly cancel a follow the
-    /// reader asked for by scrolling down; treating one as "at the bottom" is
-    /// the jump this change is about.
-    #[test]
-    fn a_directionless_report_leaves_follow_where_the_reader_left_it() {
-        assert!(
-            timeline_follow_after_scroll(true, false, false),
-            "a follow the reader asked for survives a report that says nothing"
-        );
-        assert!(
-            !timeline_follow_after_scroll(false, false, false),
-            "and a reader who scrolled away is not dragged back by one"
         );
     }
 

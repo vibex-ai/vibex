@@ -794,6 +794,8 @@ fn an_older_page_prepends_without_moving_the_reader(cx: &mut TestAppContext) {
     let data_dir = tempfile::tempdir().unwrap();
     let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
     app.update(cx, |app, cx| {
+        // The reader is parked up the conversation, not following the end.
+        app.timeline_list.pause_following_tail();
         let first_visible_before = 1;
         app.timeline_viewport = Some(TimelineViewport {
             first_visible: first_visible_before,
@@ -1082,64 +1084,62 @@ fn a_turn_appended_during_a_run_grows_the_reported_extent(cx: &mut TestAppContex
     draw(cx);
 }
 
-/// A reader dragging upward is not handed back to the live end.
-///
-/// The degenerate case this pins is the one the phone actually produces: a
-/// table whose rows carry no height reports an extent of zero, so every offset
-/// in it is "within 96px of the bottom" by arithmetic. The reader is at the top
-/// of a long conversation and the offsets say they are at the end of a short
-/// one; deciding follow from those offsets alone put them back at the live end
-/// under their own finger, which is the jump this change is about. The
-/// direction of the gesture is what tells the two apart.
-#[gpui::test]
-fn scrolling_up_does_not_resume_following_the_live_end(cx: &mut TestAppContext) {
-    let data_dir = tempfile::tempdir().unwrap();
-    let (app, _, cx) = open_timeline(
-        cx,
-        data_dir.path(),
-        (0..5)
-            .map(|n| {
-                TimelinePayload::UserMessage(UserMessagePayload {
-                    text: format!("question {n}"),
-                    ..Default::default()
-                })
+/// The timeline list as the app configures it, with one tall live turn.
+struct TallTurnList {
+    list: ListState,
+}
+
+impl Render for TallTurnList {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            gpui::list(self.list.clone(), |_, _, _| {
+                div().w_full().h(px(4000.0)).into_any_element()
             })
-            .collect(),
+            .size_full(),
+        )
+    }
+}
+
+/// A reader dragging upward inside the streaming turn is not handed back.
+///
+/// The live turn is one list item and usually taller than the screen, so a
+/// gesture inside it never moves the top to another turn. Following has to
+/// stop on the gesture itself, and a re-measure of the growing turn must leave
+/// the reader where they scrolled to.
+#[gpui::test]
+fn scrolling_up_inside_the_live_turn_stops_following(cx: &mut TestAppContext) {
+    let list = timeline_list_state(1);
+    let (_, cx) = cx.add_window_view(|_, _| TallTurnList { list: list.clone() });
+    draw(cx);
+    assert!(
+        list.is_following_tail(),
+        "a fresh timeline follows the live end"
     );
-    app.update(cx, |app, cx| {
-        // A table of rows with no height hint, which is what `splice` used to
-        // leave behind: the extent it reports is shorter than what is painted.
-        app.timeline_list.reset(6);
-        assert_eq!(
-            app.timeline_list.max_offset_for_scrollbar().y,
-            px(0.0),
-            "the fixture has to reproduce the extent the bug needs"
-        );
-        assert!(
-            app.timeline_is_near_bottom(),
-            "and with that extent every offset reads as the bottom"
-        );
 
-        // The reader drags upward: down the table, then back toward its head.
-        app.timeline_follow = true;
-        app.timeline_list.scroll_to(ListOffset {
-            item_ix: 4,
-            offset_in_item: px(0.0),
-        });
-        app.settle_timeline_follow_after_scroll(app.timeline_list.logical_scroll_top());
-        app.timeline_list.scroll_to(ListOffset {
-            item_ix: 1,
-            offset_in_item: px(0.0),
-        });
-        app.settle_timeline_follow_after_scroll(app.timeline_list.logical_scroll_top());
-
-        assert!(
-            !app.timeline_follow,
-            "a gesture toward older turns outranks an offset that says the bottom"
-        );
-        cx.notify();
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: list.viewport_bounds().center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(30.0))),
+        modifiers: Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
     });
     draw(cx);
+    assert!(
+        !list.is_following_tail(),
+        "a 30px pull toward older content is already the reader's decision"
+    );
+    let parked = list.logical_scroll_top();
+    assert_eq!(parked.item_ix, 0, "the reader is inside the one tall turn");
+
+    // The turn keeps streaming; the list re-measures it the way the event
+    // batch does.
+    list.remeasure_items(0..1);
+    draw(cx);
+    let after = list.logical_scroll_top();
+    assert_eq!(
+        (parked.item_ix, parked.offset_in_item),
+        (after.item_ix, after.offset_in_item),
+        "the growing turn does not pull the reader back"
+    );
 }
 
 /// A request the reader has answered collapses to a record they can open.
@@ -1469,7 +1469,7 @@ fn opening_a_row_stops_the_list_following_the_live_end(cx: &mut TestAppContext) 
         app.timeline_turns[0].process_rows[0].id.clone()
     });
     assert!(
-        app.read_with(cx, |app, _| app.timeline_follow),
+        app.read_with(cx, |app, _| app.timeline_list.is_following_tail()),
         "the fixture starts following the live end"
     );
     let header = format!("activity-header:{row_id}");
@@ -1479,7 +1479,7 @@ fn opening_a_row_stops_the_list_following_the_live_end(cx: &mut TestAppContext) 
         .top();
     app.update(cx, |app, cx| app.set_row_expanded(row_id.clone(), true, cx));
     draw(cx);
-    let follow = app.read_with(cx, |app, _| app.timeline_follow);
+    let follow = app.read_with(cx, |app, _| app.timeline_list.is_following_tail());
     assert!(!follow, "opening a row hands the screen to the reader");
     let after = cx
         .debug_bounds(header.clone().leak())

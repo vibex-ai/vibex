@@ -30,7 +30,7 @@ impl MobileApp {
         // way a scroll is. Leaving the list following the live end would drag it
         // back down as the row's height changes, lifting the row they just
         // opened out of view — the same rule the scroll handler applies.
-        self.timeline_follow = false;
+        self.timeline_list.pause_following_tail();
         if expanded {
             self.collapsed_timeline_rows.remove(&id);
             self.expanded_timeline_rows.insert(id.clone());
@@ -41,7 +41,7 @@ impl MobileApp {
             self.expanded_timeline_rows.remove(&id);
             self.collapsed_timeline_rows.insert(id);
         }
-        self.timeline_list.remeasure();
+        self.remeasure_timeline();
         cx.notify();
     }
 
@@ -246,14 +246,25 @@ impl MobileApp {
                                         this.full_reasoning_rows.remove(&full_id);
                                     }
                                     this.collapsed_timeline_rows.remove(&full_id);
-                                    this.timeline_list.remeasure();
+                                    this.remeasure_timeline();
                                     cx.notify();
                                 })),
                         )
                     }),
             );
         if expanded {
-            let body = self.render_markdown_view(format!("thought:{}", row.id), row, cx);
+            // The window shows the newest rows only; handing it the whole
+            // thought would lay every row out on each delta just to clip them.
+            let body = if windowed {
+                self.render_markdown_source_view(
+                    format!("thought-window:{}", row.id),
+                    row,
+                    vibex_ui::timeline::reasoning_window_tail(&row.body),
+                    cx,
+                )
+            } else {
+                self.render_markdown_view(format!("thought:{}", row.id), row, cx)
+            };
             content = content.child(activity_body(
                 div()
                     .w_full()

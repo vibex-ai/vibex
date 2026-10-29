@@ -529,7 +529,7 @@ impl MobileApp {
         if !self.expanded_settled_questions.insert(id.clone()) {
             self.expanded_settled_questions.remove(&id);
         }
-        self.timeline_list.remeasure();
+        self.remeasure_timeline();
         cx.notify();
     }
 
