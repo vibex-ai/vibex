@@ -21,6 +21,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Copilot => [0x11393e, 0x155958, 0x228e80, 0x5ac8a4, 0xa3e8bd],
         // Graphite, as the logo's dark cube: its lit faces stay cool and grey.
         Guardian::Cursor => [0x0e1013, 0x1b1e23, 0x2b2f36, 0x464b55, 0x737a86],
+        // The logo's white outline, as a light steel frame.
+        Guardian::Cline => [0x262b36, 0x4f5767, 0x8f98a8, 0xc9d0db, 0xf2f4f8],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -48,6 +50,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Cursor => [
             0x1a1e26, 0x9aa2ab, 0xb4bac1, 0xcdd1d6, 0x8a929c, 0x5d6672, 0xdfe2e6,
         ],
+        // A dark server room, so the white head stands out as the logo does.
+        Guardian::Cline => [
+            0x080c18, 0x1a2236, 0x222c45, 0x2d3955, 0x121a2c, 0x34405f, 0x52618a,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -72,6 +78,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Copilot => [0x9b2c2c, 0xff7a45, 0xffe0b0],
         // The pointer facet charges cyan-white.
         Guardian::Cursor => [0x236a94, 0x5cd2ff, 0xe4fbff],
+        // The vent on the back of the head runs hot.
+        Guardian::Cline => [0xa1461c, 0xff8a3d, 0xffe2c4],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -84,6 +92,12 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         colors[ink::DUST as usize] = rgb(0xa4b4bc).into();
         colors[ink::IVORY as usize] = rgb(0xe0eae5).into();
         colors[ink::WHITE as usize] = rgb(0xf3fff8).into();
+    }
+    if guardian == Guardian::Cline {
+        // Its eyes and bolts are a bright terminal cyan.
+        for (ix, value) in [0x0f4a7a, 0x2fa8f0, 0xa8ecff].into_iter().enumerate() {
+            colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
+        }
     }
     if guardian == Guardian::Cursor {
         // The logo is monochrome: its light facet is a neutral white.

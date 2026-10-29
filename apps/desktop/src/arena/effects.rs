@@ -309,6 +309,22 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
                 frame.ring(pixel(CENTER), (r, r), WATER_LIGHT, true);
             }
         }
+        (Guardian::Cline, Attack::Glide) => {
+            route(frame, boss.from, boss.target, boss.radius(), WARN_DARK);
+        }
+        (Guardian::Cline, Attack::Fan) if boss.state == BossState::Windup => {
+            // Where the fan will fly: short rays that grow as the eyes charge.
+            let origin = boss.attack_origin();
+            let aim = boss.target.minus(origin).angle();
+            for offset in boss.fan() {
+                let ray = Vec2::from_angle(aim + offset);
+                frame.line(
+                    pixel(origin.plus(ray.scale(8.0))),
+                    pixel(origin.plus(ray.scale(10.0 + progress * 14.0))),
+                    color,
+                );
+            }
+        }
         (Guardian::Cursor, Attack::Tumble) => {
             route(frame, boss.from, boss.target, boss.radius(), color);
         }
@@ -375,6 +391,20 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 frame.ellipse((c.0 - 1, c.1 - 1), (3, 3), WATER_LIGHT);
                 frame.rect(c.0 - 2, c.1 - 3, 2, 2, WHITE);
                 frame.ring(c, (9 + pulse, 9 + pulse), WATER_LIGHT, true);
+            }
+            ProjectileKind::Bolt => {
+                // A streak of eye-light, brightest at its head.
+                let tail = p.position.minus(direction.scale(3.4));
+                let side = direction.perpendicular().scale(0.3);
+                for (offset, color) in [(-1.0, WATER_DARK), (1.0, WATER_DARK), (0.0, WATER_LIGHT)] {
+                    frame.line(
+                        pixel(tail.plus(side.scale(offset))),
+                        pixel(p.position.plus(side.scale(offset))),
+                        color,
+                    );
+                }
+                frame.ellipse(c, (3, 3), WATER_LIGHT);
+                frame.rect(c.0 - 1, c.1 - 1, 2, 2, WHITE);
             }
             ProjectileKind::Block => {
                 let tail = pixel(p.position.minus(direction.scale(3.2)));

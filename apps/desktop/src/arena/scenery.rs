@@ -5,7 +5,10 @@ use super::{
     art::{HEIGHT, SCALE, TOP_PAD, WIDTH, pixel},
     geometry::Vec2,
     guardian::Guardian,
-    map::{BLOCK_RADIUS, BRAZIER, CENTER, ISLANDS, Map, PLATES, Pillar, REACH, ScarKind, THRONE},
+    map::{
+        BLOCK_RADIUS, BRAZIER, CENTER, ISLANDS, Map, PLATES, Pillar, REACH, STATIONS, ScarKind,
+        THRONE,
+    },
     raster::{Raster, hash, ink::*},
 };
 use std::{
@@ -91,6 +94,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::DeepSeek => lagoon(&mut frame),
         Guardian::Copilot => terrace(&mut frame),
         Guardian::Cursor => grid_hall(&mut frame),
+        Guardian::Cline => server_room(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -137,6 +141,52 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Cline's server room: a raised floor of square panels, some vented, with
+/// cable trays down both sides and a pad at each of the four stations it
+/// glides between.
+fn server_room(frame: &mut Raster) {
+    const PANEL: i32 = 36;
+    for row in -4..(HEIGHT as i32 / PANEL + 1) {
+        for col in 0..(WIDTH as i32 / PANEL + 1) {
+            let (x, y) = (col * PANEL, row * PANEL);
+            let seed = hash(col, row + 7);
+            frame.line((x, y), (x + PANEL - 1, y), SEAM);
+            frame.line((x, y), (x, y + PANEL - 1), SEAM);
+            frame.line((x + 1, y + 1), (x + PANEL - 2, y + 1), FLOOR_LIGHT);
+            for (dx, dy) in [
+                (3, 3),
+                (PANEL - 4, 3),
+                (3, PANEL - 4),
+                (PANEL - 4, PANEL - 4),
+            ] {
+                frame.put(x + dx, y + dy, FLOOR_LIGHT);
+            }
+            if seed.is_multiple_of(3) {
+                // A vented panel.
+                for vy in (8..PANEL - 6).step_by(4) {
+                    for vx in (8..PANEL - 6).step_by(4) {
+                        frame.rect(x + vx, y + vy, 2, 2, FLOOR_SHADE);
+                    }
+                }
+            }
+        }
+    }
+    let c = pixel(CENTER);
+    for side in [-1, 1] {
+        let x = c.0 + side * 262;
+        frame.rect(x - 9, -TOP_PAD, 18, HEIGHT as i32, DEPTH);
+        for (n, color) in [WATER, CORE_DARK, WATER_DARK].into_iter().enumerate() {
+            let cx = x - 5 + n as i32 * 5;
+            frame.line((cx, -TOP_PAD), (cx, HEIGHT as i32), color);
+        }
+    }
+    for station in STATIONS {
+        let p = pixel(station);
+        frame.ring(p, (30, 18), FLOOR_SHADE, false);
+        frame.ring(p, (26, 15), SEAM, true);
+        frame.rect(p.0 - 2, p.1 - 2, 5, 5, WALL);
+    }
+}
 /// Cursor's hall: a pale grid laid on the diagonals the cube rolls along,
 /// one cube side between lines, with major lines every fourth, pointer glyphs
 /// etched where major lines cross, and a dashed selection round the middle.
@@ -614,6 +664,18 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                     let x = 120 + (h % 460) as i32 / 32 * 32 + 12;
                     let y = 60 + ((h >> 9) % 320) as i32 / 32 * 32 + 8;
                     frame.rect(x, y, 2, 14, WALL);
+                }
+            }
+        }
+        Guardian::Cline => {
+            // Status lights wink on the vented panels.
+            for n in 0..10 {
+                let h = hash(n, 29);
+                if (time * 0.9 + (h % 13) as f32 * 0.17).fract() < 0.3 {
+                    let x = 40 + (h % 620) as i32 / 36 * 36 + 18;
+                    let y = 10 + ((h >> 9) % 400) as i32 / 36 * 36 + 18;
+                    let color = if n % 3 == 0 { CORE } else { WATER_LIGHT };
+                    frame.rect(x - 1, y - 1, 3, 2, color);
                 }
             }
         }

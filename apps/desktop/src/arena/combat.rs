@@ -107,6 +107,8 @@ pub(super) enum ProjectileKind {
     /// Pushes the archer away instead of killing outright.
     Orb,
     Block,
+    /// A fast, lethal bolt from Cline's eyes.
+    Bolt,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Projectile {
@@ -654,6 +656,8 @@ impl Arena {
             Guardian::Pi | Guardian::DeepSeek => true,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
+            // The whole back is open, but the head always turns to the archer.
+            Guardian::Cline => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
             // The pointer facet takes an arrow only from the side it faces.
             Guardian::Cursor => super::cube::ground_direction(self.boss.facet, self.boss.yaw)
                 .is_some_and(|facing| from.minus(self.boss.core).dot(facing) > 0.0),
@@ -728,6 +732,13 @@ impl Arena {
                 ),
                 Contact::Core,
             );
+            if returning && boss.guardian == Guardian::Cline {
+                // A recalled arrow meets the whole back on its way through.
+                consider(
+                    circle_hit(boss.body_center(), from, to, boss.radius() * 0.8),
+                    Contact::Core,
+                );
+            }
         }
         let visible = boss.state != BossState::Submerged && boss.fade > 0.5;
         if boss.guardian == Guardian::Claude {
@@ -904,6 +915,7 @@ impl Arena {
             let radius = match projectile.kind {
                 ProjectileKind::Orb => 1.7,
                 ProjectileKind::Block => 1.5,
+                ProjectileKind::Bolt => 1.2,
             };
             if segment_distance(
                 Vec2::default(),
@@ -913,7 +925,7 @@ impl Arena {
             {
                 projectile.remaining = 0.0;
                 match projectile.kind {
-                    ProjectileKind::Block => hit = true,
+                    ProjectileKind::Block | ProjectileKind::Bolt => hit = true,
                     ProjectileKind::Orb if !shielded => {
                         pushes.push(projectile.velocity.normalized());
                     }

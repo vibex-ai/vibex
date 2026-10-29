@@ -22,6 +22,7 @@ impl Arena {
             Guardian::DeepSeek => self.tick_deepseek(),
             Guardian::Copilot => self.tick_copilot(),
             Guardian::Cursor => self.tick_cursor(),
+            Guardian::Cline => self.tick_cline(),
         }
         self.boss.update_core();
     }
@@ -90,6 +91,8 @@ impl Arena {
 
 #[path = "encounter_claude.rs"]
 mod claude;
+#[path = "encounter_cline.rs"]
+mod cline;
 #[path = "encounter_codex.rs"]
 mod codex;
 #[path = "encounter_copilot.rs"]

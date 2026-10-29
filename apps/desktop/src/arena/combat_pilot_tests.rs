@@ -9,6 +9,8 @@ struct Plan {
     hold: bool,
     charge: f32,
     sprint: bool,
+    /// Whether to recall a loosed arrow now, when the encounter decides.
+    recall: Option<bool>,
 }
 
 #[derive(Default)]
@@ -60,7 +62,11 @@ impl Pilot {
                 self.flying += STEP;
                 controls.recall = self.flying > 0.8;
             }
-            _ => controls.recall = escape.is_none() || arena.player.swimming,
+            _ => {
+                controls.recall = plan
+                    .recall
+                    .unwrap_or(escape.is_none() || arena.player.swimming)
+            }
         }
         arena.tick(controls);
     }
@@ -90,6 +96,7 @@ fn plan(arena: &Arena) -> Plan {
         hold: false,
         charge,
         sprint: false,
+        recall: None,
     };
     match boss.guardian {
         Guardian::Claude => {
@@ -258,6 +265,34 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Cline => {
+            let body = boss.body_center();
+            match arena.arrow.state {
+                ArrowState::Ready => {
+                    // Loose past the head so the arrow lands behind it.
+                    let across = body.minus(player).normalized().perpendicular();
+                    plan.goal = around(boss.position, 30.0);
+                    plan.target = Some(body.plus(across.scale(10.0)));
+                }
+                ArrowState::Returning => plan.recall = Some(true),
+                _ => {
+                    // Put the head between the arrow and the archer, then
+                    // recall the arrow through its back.
+                    let arrow = arena.arrow.position;
+                    let through = body.minus(arrow).normalized();
+                    plan.goal = arena.map.move_body(
+                        boss.position,
+                        boss.position.plus(through.scale(26.0)),
+                        2.0,
+                    );
+                    plan.sprint = true;
+                    let between = body.minus(arrow).dot(player.minus(body)) > 0.0;
+                    plan.recall = Some(
+                        between && segment_distance(body, arrow, player) < boss.radius() * 0.45,
+                    );
+                }
+            }
+        }
         Guardian::Cursor => {
             let facing = crate::arena::cube::ground_direction(boss.facet, boss.yaw);
             if boss.exposed > arrival(boss.core) + 0.03
@@ -350,6 +385,9 @@ fn route(arena: &Arena) -> Option<(Vec2, Vec2, f32)> {
             boss.radius(),
         )),
         (Guardian::Copilot, Attack::Dash) if committed => {
+            Some((boss.position, boss.target, boss.radius()))
+        }
+        (Guardian::Cline, Attack::Glide) if boss.state == BossState::Rushing => {
             Some((boss.position, boss.target, boss.radius()))
         }
         (Guardian::Cursor, Attack::Tumble) if boss.state == BossState::Rushing => {
@@ -547,4 +585,8 @@ fn the_helmet_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_cube_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Cursor);
+}
+#[test]
+fn the_robot_head_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Cline);
 }

@@ -89,6 +89,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::DeepSeek => 50,
             Guardian::OpenCode | Guardian::Copilot => 30,
             Guardian::Cursor => 38,
+            Guardian::Cline => 32,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
         frame.ellipse(
@@ -187,7 +188,11 @@ fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
             frame.ring((x, y), (15 + beat, 15 + beat), CORE, true);
             gleam(frame, (x, y), 5, WHITE);
         }
-        Guardian::OpenCode | Guardian::DeepSeek | Guardian::Copilot | Guardian::Cursor => {
+        Guardian::OpenCode
+        | Guardian::DeepSeek
+        | Guardian::Copilot
+        | Guardian::Cursor
+        | Guardian::Cline => {
             frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
             frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
             gleam(frame, (x, y), 4, WHITE);
@@ -222,6 +227,7 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = 
     (-88, -206, 84, 22),
     (-55, -133, 56, 6),
     (-43, -85, 42, 21),
+    (-49, -122, 48, -5),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -230,7 +236,7 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// median over its loop. The window above also has to hold the loop's
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
-pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] = [65, 96, 110, 85, 106, 82, 92];
+pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] = [65, 96, 110, 85, 106, 82, 92, 95];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]
 }

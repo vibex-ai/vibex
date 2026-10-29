@@ -15,10 +15,11 @@ pub(super) enum Guardian {
     DeepSeek,
     Copilot,
     Cursor,
+    Cline,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -26,6 +27,7 @@ impl Guardian {
         Self::DeepSeek,
         Self::Copilot,
         Self::Cursor,
+        Self::Cline,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -36,6 +38,7 @@ impl Guardian {
             Self::DeepSeek => "DeepSeek",
             Self::Copilot => "Copilot",
             Self::Cursor => "Cursor",
+            Self::Cline => "Cline",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -47,6 +50,7 @@ impl Guardian {
             "deepseek" | "deepseek-harness" => Some(Self::DeepSeek),
             "copilot" | "github-copilot" => Some(Self::Copilot),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
+            "cline" => Some(Self::Cline),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl Guardian {
             Self::DeepSeek => "deepseek",
             Self::Copilot => "copilot",
             Self::Cursor => "cursor",
+            Self::Cline => "cline",
         }
     }
 }
@@ -101,11 +106,17 @@ pub(super) enum Attack {
     Tumble,
     /// The pointer facet charging, then firing along its face.
     Laser,
+    /// A glide to the next station round the room.
+    Glide,
+    /// A fan of bolts from the eyes.
+    Fan,
 }
 
 /// Visual and collision scale of the spark after each split.
 pub(super) const SPARK_SCALE: [f32; 5] = [1.0, 0.8, 0.64, 0.52, 0.42];
 pub(super) const IDLE_LOOP: f32 = 36.0;
+/// The middle of Cline's head above its ground anchor.
+pub(super) const CLINE_HEAD: f32 = 11.0;
 
 /// Elevation of a spark's center; a landing squash lowers it.
 pub(super) fn spark_height(size: f32, squash: f32) -> f32 {
@@ -272,6 +283,7 @@ impl Boss {
             Guardian::Pi | Guardian::DeepSeek => 9.0,
             Guardian::Copilot => 7.0,
             Guardian::Cursor => 8.5,
+            Guardian::Cline => 8.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -340,6 +352,7 @@ impl Boss {
             Guardian::DeepSeek => (0.0, 2.0, 8.0),
             Guardian::Copilot => (0.0, 0.0, 11.0),
             Guardian::Cursor => (0.0, 0.0, super::cube::HALF),
+            Guardian::Cline => (0.0, 0.0, CLINE_HEAD),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -382,6 +395,7 @@ impl Boss {
             Guardian::DeepSeek => self.articulated(0.0, 2.0, 8.0),
             Guardian::Copilot => self.articulated(0.0, 0.0, 11.0),
             Guardian::Cursor => self.local(0.0, 0.0, super::cube::HALF),
+            Guardian::Cline => self.articulated(0.0, 0.0, CLINE_HEAD),
         }
     }
     pub fn update_core(&mut self) {
@@ -401,6 +415,8 @@ impl Boss {
                     super::cube::facet_point(self.facet, across, up, super::cube::HALF + 0.2);
                 self.articulated(x, y, super::cube::HALF + z)
             }
+            // The vent on the back of the head.
+            Guardian::Cline => self.articulated(0.0, -8.6, CLINE_HEAD),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -408,6 +424,7 @@ impl Boss {
             Guardian::Pi => self.local(-2.6, 2.0, 20.0),
             Guardian::OpenCode => self.articulated(0.0, 5.0, 9.0 * self.squash_scale()),
             Guardian::Copilot => self.articulated(0.0, 6.0, 12.0),
+            Guardian::Cline => self.articulated(0.0, 4.0, CLINE_HEAD),
             _ => self.body_center(),
         }
     }
@@ -428,9 +445,22 @@ impl Boss {
             _ => 6.0,
         }
     }
+    /// Angles of the bolts in Cline's current fan, relative to its aim. The
+    /// fans run 3, 5, 6, 6: an odd fan is centred on the archer and an even
+    /// one straddles them, offset half a gap so standing still is still hit.
+    pub fn fan(&self) -> Vec<f32> {
+        const COUNTS: [u32; 4] = [3, 5, 6, 6];
+        const SPREAD: f32 = 0.2;
+        let count = COUNTS[(self.attacks.wrapping_sub(1) % 4) as usize];
+        let even = if count % 2 == 0 { SPREAD * 0.5 } else { 0.0 };
+        (0..count)
+            .map(|n| (n as f32 - (count as f32 - 1.0) * 0.5) * SPREAD + even)
+            .collect()
+    }
     pub fn hover_height(&self, time: f32) -> f32 {
         match self.guardian {
             Guardian::Copilot => 6.5 + (time * 3.0).sin() * 0.6,
+            Guardian::Cline => 3.0 + (time * 2.4).sin() * 0.5,
             _ => 0.0,
         }
     }
@@ -571,6 +601,28 @@ impl Boss {
                 let turn = (next - yaw + PI).rem_euclid(TAU) - PI;
                 boss.yaw = yaw + turn * smoothstep((u - 0.55) / 0.3);
             }
+            Guardian::Cline => {
+                // The head glides clockwise between eight stations round the
+                // home, always turned to the viewer, and rocks back at each
+                // stop as if it had fired.
+                let (station, u) = beat(time, IDLE_LOOP / 8.0);
+                let at = |n: f32| {
+                    let a = n * TAU / 8.0;
+                    CENTER.plus(Vec2::new(a.sin() * 60.0, -a.cos() * 30.0))
+                };
+                let glide = smoothstep(u / 0.45);
+                let (from, to) = (at(station), at(station + 1.0));
+                boss.position = from.lerp(to, glide);
+                boss.height = 3.0 + (time * TAU / 1.5).sin() * 0.6;
+                let moving = if u < 0.45 { (u / 0.45 * PI).sin() } else { 0.0 };
+                boss.yaw = -to.minus(from).normalized().x * 0.3 * moving;
+                let held = (u - 0.45) * IDLE_LOOP / 8.0;
+                boss.pitch = if (0.0..0.4).contains(&held) {
+                    (held / 0.4 * PI).sin() * 0.18
+                } else {
+                    0.0
+                };
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -669,7 +721,9 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
         ),
-        Guardian::Cursor => unreachable!("Cursor tumbles between grid waypoints instead"),
+        Guardian::Cursor | Guardian::Cline => {
+            unreachable!("{guardian:?} moves between its own stations instead")
+        }
     };
     (CENTER.plus(Vec2::new(x, y)), Vec2::new(dx, dy))
 }

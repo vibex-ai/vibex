@@ -328,12 +328,14 @@ rebirth, without a damage override.
 | OpenCode | Light-grey chest after the logo frame, its window a hinged mouth; spit, vanish-and-bite, two leaps, then a gaping block volley | A close archer is bitten on reflex. Spat code blocks fall, stay as obstacles for the archer, and are crushed by landings. The open mouth accepts a hit from the front during the 1.6-second gape. |
 | DeepSeek | Orca in the logo blue: deep navy back, white chin, belly sweep and eye patch, tall dorsal fin, paddle flippers; the tail curls over its back as in the logo when it falls; three breaches, then a dive and an electric discharge | Breaches dive onto the archer and shatter floes where they erupt and land. The raised tail opens as the whale falls and for 0.7 seconds after landing. Shooting needs a dry floe; the discharge kills anyone in the water and then restores every floe. |
 | Copilot | Teal helmet with goggles, a dark face plate with two slots, ear pods and a rear jet; energy orbs and one to three spin dashes | Orbs knock the archer back, fatally into a wall. A dash into the rim or a column stuns it facing the wall for 1.4 seconds with the rear jet bare, while a telegraphed row of ice falls across the archer's line. The jet accepts a hit only from behind. |
+| Cline | The logo's robot head in light steel: a rounded hollow frame with a point at the middle of each side, two upright cyan pill eyes in a dark face, the large antenna ball, and a rounded shell behind with a hot vent; it glides clockwise between four station pads, always turned to the archer | At each station a fan of lethal bolts flies at the archer, 3, 5, 6, 6 round and round; an even fan is offset half a gap so standing still is still hit. The whole back is always open but never shown: an arrow loosed past the head and recalled through it from behind wins anywhere on the back. |
 | Cursor | The logo's graphite cube standing corner-on (its hexagon), the pointer cut into one face as a light arrow with its notch; it tumbles four quarter-turns toward the archer along the diagonals, then the pointer charges and fires | A laser fires down the pointer's face normal, telegraphed by rails at its exact width and stopped by the hall's four columns. The pointer is bare while it charges, but only from the side it faces. Facing the sky it flares harmlessly; pressed to the floor it blasts the cube over, and it lands with the pointer toward the viewer, dazed for 1.9 seconds. |
 
 - Keep identity readable: models follow the Agent logos — the spark's uneven
   rays, the knot's six loops, Pi's aperture and separate stem, the chest's
   frame and window, the orca's markings, fin and curled tail, Copilot's
-  goggles and face slots, Cursor's corner-on cube and pointer cut. Every model
+  goggles and face slots, Cursor's corner-on cube and pointer cut, Cline's
+  pointed frame, pill eyes and antenna ball. Every model
   carries a dark one-pixel silhouette.
 - Cursor's cube (`arena/cube.rs`) names faces in model space with +y the way
   it rolls. A quarter-turn about the leading bottom edge is a pitch about the
@@ -397,6 +399,7 @@ rebirth, without a damage override.
 | Closed armor or wrong weak-point direction | No victory; arrow remains retrievable |
 | Spark hit before four splits / split spark hit | Split and recoil / shatter it; no victory |
 | Ordinary arrow on the knot / shielded cube | Glance off; only a burning arrow melts it, only a shield gap wins |
+| Arrow at Cline's face | Glances off; its back takes the arrow, recalled through it or loosed from behind |
 | Waiting without play | No encounter opens its weak point by itself |
 | Guarding stem in front of Pi's eye | The arrow stops; the eye opens only on a switch |
 | Floe destroyed under a charging archer | Cancel drawing, show swimming, and preserve recall |

@@ -247,7 +247,10 @@ fn every_weak_point_is_drawn_where_collision_places_it() {
         boss.lid = 1.0;
         boss.unravel = 1.0;
         boss.shield = 1.0;
-        boss.yaw = if matches!(guardian, Guardian::DeepSeek | Guardian::Copilot) {
+        boss.yaw = if matches!(
+            guardian,
+            Guardian::DeepSeek | Guardian::Copilot | Guardian::Cline
+        ) {
             PI
         } else {
             0.0
