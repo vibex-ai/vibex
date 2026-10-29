@@ -1327,6 +1327,9 @@ pub struct ManagementCenter {
     provider_source_categories: BTreeSet<ProviderPresetCategory>,
     provider_detail_tab: ProviderDetailTab,
     route_group_detail_tab: RouteGroupDetailTab,
+    /// The gateway detail's selected section, so its cards stay one page
+    /// rather than a single long column.
+    gateway_detail_tab: GatewayDetailTab,
     provider_models_search: Entity<InputState>,
     provider_models_filter: ProviderModelsFilter,
     traffic_range: TrafficRange,
@@ -2666,6 +2669,7 @@ impl ManagementCenter {
             provider_source_categories: ProviderPresetCategory::ALL.into_iter().collect(),
             provider_detail_tab: ProviderDetailTab::Overview,
             route_group_detail_tab: RouteGroupDetailTab::Overview,
+            gateway_detail_tab: GatewayDetailTab::Overview,
             provider_models_search,
             provider_models_filter: ProviderModelsFilter::All,
             traffic_range: TrafficRange::Day,
@@ -21622,6 +21626,29 @@ impl ManagementCenter {
                 ),
         );
 
+        let selected_tab = GatewayDetailTab::ALL
+            .iter()
+            .position(|tab| *tab == self.gateway_detail_tab)
+            .unwrap_or(0);
+        body = body.child(
+            TabBar::new("management-gateway-detail-tabs")
+                .w_full()
+                .segmented()
+                .selected_index(selected_tab)
+                .children(GatewayDetailTab::ALL.into_iter().map(|tab| {
+                    Tab::new()
+                        .flex_1()
+                        .aria_label(tab.label())
+                        .child(div().text_sm().child(tab.label()))
+                }))
+                .on_click(cx.listener(|this, index: &usize, _, cx| {
+                    if let Some(tab) = GatewayDetailTab::ALL.get(*index) {
+                        this.gateway_detail_tab = *tab;
+                        cx.notify();
+                    }
+                })),
+        );
+
         // What the service is listening on. The address is read-only on
         // purpose: an Agent binding points at it, so editing it by hand would
         // break every one of them.
@@ -21671,7 +21698,8 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        body = body.child(management_card_with_icon(
+        if self.gateway_detail_tab == GatewayDetailTab::Overview {
+            body = body.child(management_card_with_icon(
             management_locale_text("Connection", "连接", "連線"),
             management_locale_text(
                 "An Agent bound to a route group points here instead of at a vendor. Vibex manages this address.",
@@ -21682,23 +21710,13 @@ impl ManagementCenter {
             connection_rows.into_any_element(),
             cx,
         ));
+        }
 
         // Policy. Routing strategy and conversation pinning are not here: each
         // belongs to a route group, which decides how its own Providers are
         // tried. What remains is Key-level policy, which is the same for every
         // group because it describes the accounts, not the composition.
         let mut policy_rows = v_flex().w_full().gap_2();
-        policy_rows = policy_rows.child(
-            div()
-                .w_full()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text(
-                    "Which Provider answers, and whether a conversation stays on one key, is set on each route group.",
-                    "由哪个供应商回答、对话是否固定在同一 Key，都在各个路由组上设置。",
-                    "由哪個供應商回答、對話是否固定在同一 Key，都在各個路由組上設定。",
-                )),
-        );
         // Token ceiling. The window and the count are edited together because
         // neither means anything alone: "1,000,000" says nothing without "per
         // day", and the stored pair is replaced as a unit.
@@ -21824,17 +21842,19 @@ impl ManagementCenter {
                     "該上限由閘道按本機觀測到的 token 計數，不等於廠商側的額度或餘額。",
                 )),
         );
-        body = body.child(management_card_with_icon(
-            management_locale_text("Keys and protocol", "Key 与协议", "Key 與協定"),
+        if self.gateway_detail_tab == GatewayDetailTab::Overview {
+            body = body.child(management_card_with_icon(
+            management_locale_text("Token limit", "Token 上限", "Token 上限"),
             management_locale_text(
-                "How a Provider's keys are chosen for each request, and which protocol directions the gateway may translate.",
-                "每次请求如何在供应商的 Key 中选择一个，以及网关可以翻译哪些协议方向。",
-                "每次請求如何在供應商的 Key 中選擇一個，以及閘道可以翻譯哪些協定方向。",
+                "A local ceiling for the whole gateway, counted from the tokens it observed. A route group may set its own.",
+                "整个网关的本地 token 上限，按网关观测到的 token 计数；路由组可以设置自己的上限。",
+                "整個閘道的本機 token 上限，按閘道觀測到的 token 計數；路由組可以設定自己的上限。",
             ),
             "icons/vibex/file-cog.svg",
             policy_rows.into_any_element(),
             cx,
         ));
+        }
 
         let defaults = self
             .gateway_default_inputs
@@ -21954,40 +21974,42 @@ impl ManagementCenter {
             );
         }
         let defaults_error = self.gateway_default_error.clone();
-        body = body.child(management_card_with_icon(
-            management_locale_text("Alerts and defaults", "告警与默认值", "警示與預設值"),
-            management_locale_text(
-                "Observed thresholds and fallback timeouts. Empty leaves the value unset.",
-                "观测阈值与回退超时；留空表示不设置。",
-                "觀測閾值與回退逾時；留空表示不設定。",
-            ),
-            "icons/vibex/activity.svg",
-            v_flex()
-                .w_full()
-                .gap_2()
-                .child(default_rows)
-                .children(
-                    defaults_error.map(|message| {
+        if self.gateway_detail_tab == GatewayDetailTab::Advanced {
+            body = body.child(management_card_with_icon(
+                management_locale_text("Alerts and defaults", "告警与默认值", "警示與預設值"),
+                management_locale_text(
+                    "Observed thresholds and fallback timeouts. Empty leaves the value unset.",
+                    "观测阈值与回退超时；留空表示不设置。",
+                    "觀測閾值與回退逾時；留空表示不設定。",
+                ),
+                "icons/vibex/activity.svg",
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(default_rows)
+                    .children(defaults_error.map(|message| {
                         div().text_xs().text_color(cx.theme().danger).child(message)
-                    }),
-                )
-                .child(
-                    h_flex().w_full().justify_end().child(
-                        Button::new("management-gateway-defaults-save")
-                            .xsmall()
-                            .primary()
-                            .label(management_locale_text(
-                                "Save defaults",
-                                "保存默认值",
-                                "儲存預設值",
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_gateway_defaults(cx))),
-                    ),
-                )
-                .into_any_element(),
-            cx,
-        ));
+                    }))
+                    .child(
+                        h_flex().w_full().justify_end().child(
+                            Button::new("management-gateway-defaults-save")
+                                .xsmall()
+                                .primary()
+                                .label(management_locale_text(
+                                    "Save defaults",
+                                    "保存默认值",
+                                    "儲存預設值",
+                                ))
+                                .disabled(pending)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.save_gateway_defaults(cx)),
+                                ),
+                        ),
+                    )
+                    .into_any_element(),
+                cx,
+            ));
+        }
 
         // Translation is the one policy most users never touch, so it sits
         // after the Key policy and before the group members: visible when
@@ -22025,7 +22047,8 @@ impl ManagementCenter {
                     ),
             );
         }
-        body = body.child(management_card_with_icon(
+        if self.gateway_detail_tab == GatewayDetailTab::Protocol {
+            body = body.child(management_card_with_icon(
             management_locale_text(
                 "Protocol translation",
                 "协议翻译",
@@ -22040,6 +22063,7 @@ impl ManagementCenter {
             translate_rows.into_any_element(),
             cx,
         ));
+        }
 
         // The Providers the route groups name. This is a read: a Provider
         // joins the gateway by being a group's member, so there is nothing to
@@ -22262,20 +22286,24 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        body = body.child(management_card_with_icon(
+        if self.gateway_detail_tab == GatewayDetailTab::Keys {
+            body = body.child(management_card_with_icon(
             management_locale_text("Route group members", "路由组成员", "路由組成員"),
             management_locale_text(
-                "The Providers the enabled route groups name. Add or remove one on the group itself.",
-                "已启用的路由组所使用的供应商。增删请到路由组上操作。",
-                "已啟用的路由組所使用的供應商。增刪請到路由組上操作。",
+                "The Providers the enabled route groups name. Routing strategy and pinning are set on the group; members are added or removed there too.",
+                "已启用的路由组所使用的供应商。路由策略与会话固定在组上设置，成员的增删也在那里。",
+                "已啟用的路由組所使用的供應商。路由策略與會話固定在組上設定，成員的增刪也在那裡。",
             ),
             "icons/vibex/database.svg",
             member_rows.into_any_element(),
             cx,
         ));
+        }
 
-        body = body.child(self.render_gateway_dashboard(cx));
-        body = body.child(self.render_gateway_topology(cx));
+        if self.gateway_detail_tab == GatewayDetailTab::Traffic {
+            body = body.child(self.render_gateway_dashboard(cx));
+            body = body.child(self.render_gateway_topology(cx));
+        }
 
         // Recent requests: which upstream answered, which protocol changed,
         // and how many tokens it took. This is the only view that explains a
@@ -22431,7 +22459,8 @@ impl ManagementCenter {
             );
         }
         request_rows = request_rows.child(ledger_foot);
-        body = body.child(management_card_with_icon(
+        if self.gateway_detail_tab == GatewayDetailTab::Requests {
+            body = body.child(management_card_with_icon(
             management_locale_text("Recent requests", "最近请求", "最近請求"),
             management_locale_text(
                 "Metadata only: model, route, status and tokens. Never the prompt, the reply, or a key.",
@@ -22442,6 +22471,7 @@ impl ManagementCenter {
             request_rows.into_any_element(),
             cx,
         ));
+        }
 
         // There is no Agents card: an Agent reaches the gateway by binding a
         // route group, so that decision is made on the group rather than here.
@@ -38979,6 +39009,38 @@ impl GatewayRequestFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayDetailTab {
+    Overview,
+    Keys,
+    Protocol,
+    Traffic,
+    Requests,
+    Advanced,
+}
+
+impl GatewayDetailTab {
+    const ALL: [Self; 6] = [
+        Self::Overview,
+        Self::Keys,
+        Self::Protocol,
+        Self::Traffic,
+        Self::Requests,
+        Self::Advanced,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => management_locale_text("Overview", "概览", "概覽"),
+            Self::Keys => management_locale_text("Keys", "Key", "Key"),
+            Self::Protocol => management_locale_text("Protocol", "协议", "協定"),
+            Self::Traffic => management_locale_text("Traffic", "流量", "流量"),
+            Self::Requests => management_locale_text("Requests", "请求", "請求"),
+            Self::Advanced => management_locale_text("Advanced", "高级", "進階"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteGroupDetailTab {
     Overview,
     Members,
@@ -49322,6 +49384,26 @@ mod gateway_surface_tests {
             assert!(
                 source.contains(marker),
                 "the route workbench must keep {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gateway_workbench_has_six_tabs() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-gateway-detail-tabs",
+            "GatewayDetailTab::Overview",
+            "GatewayDetailTab::Keys",
+            "GatewayDetailTab::Protocol",
+            "GatewayDetailTab::Traffic",
+            "GatewayDetailTab::Requests",
+            "GatewayDetailTab::Advanced",
+            "self.gateway_detail_tab = *tab",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the gateway workbench must keep {marker}"
             );
         }
     }
