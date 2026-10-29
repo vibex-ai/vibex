@@ -293,6 +293,49 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  server-macos:
+    name: Server macOS ${{ matrix.arch }}
+    needs: release-meta
+    runs-on: macos-14
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build, sign, check, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-meta.outputs.version }}"
+          target="${{ matrix.target }}"
+          arch="${{ matrix.arch }}"
+          cargo build -p vibex-server --release --locked --target "${target}"
+          binary="target/${target}/release/vibex-server"
+          codesign --force --sign - "${binary}"
+          scripts/check-server-macos.sh "${binary}" "${arch}"
+          node scripts/package-server-release.mjs             --version "${version}" --arch "${arch}" --os macos             --binary "${binary}" --output target/server-artifacts
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: server-macos-${{ github.sha }}
+          path: |
+            target/server-artifacts/*.tar.gz
+            target/server-artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   mobile-android:
     name: Mobile Android release artifact
     needs: release-meta
@@ -421,8 +464,8 @@ jobs:
     name: Aggregate and publish release
     permissions:
       contents: write
-    needs: [release-meta, desktop, server-linux, mobile-android, mobile-ios]
-    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
+    needs: [release-meta, desktop, server-linux, server-macos, mobile-android, mobile-ios]
+    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -515,6 +558,14 @@ jobs:
           done
           require_artifact_class 'vibex-server-*-linux-x86_64.tar.gz' 'Linux x86_64 server'
           require_artifact_class 'vibex-server-*-linux-aarch64.tar.gz' 'Linux aarch64 server'
+          for arch in aarch64 x86_64; do
+            server_tarball="target/publish/vibex-server-${version}-macos-${arch}.tar.gz"
+            if [[ -f "${server_tarball}" ]]; then
+              manifest_args+=(--server-artifact "macos|$(manifest_arch "${arch}")|${server_tarball}|${repository_url}/$(basename "${server_tarball}")")
+            fi
+          done
+          require_artifact_class 'vibex-server-*-macos-x86_64.tar.gz' 'macOS x86_64 server'
+          require_artifact_class 'vibex-server-*-macos-aarch64.tar.gz' 'macOS aarch64 server'
           for arch in aarch64 x86_64; do
             dmg="target/publish/vibex-${version}-macos-${arch}-app.dmg"
             if [[ -f "${dmg}" ]]; then

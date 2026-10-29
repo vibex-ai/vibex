@@ -65,16 +65,34 @@ pub fn select_server_artifact(
     manifest: &VerifiedManifest,
     arch: RemoteArch,
 ) -> Result<&ServerArtifact, ArtifactError> {
+    select_server_artifact_for_os(manifest, "linux", arch)
+}
+
+/// Selects a server artifact for an explicit release OS (`linux` or `macos`).
+pub fn select_server_artifact_for_os<'a>(
+    manifest: &'a VerifiedManifest,
+    os: &str,
+    arch: RemoteArch,
+) -> Result<&'a ServerArtifact, ArtifactError> {
+    let os = normalized_server_os(os);
     let target = match arch {
         RemoteArch::X86_64 => "x86_64",
         RemoteArch::Aarch64 => "arm64",
     };
-    manifest.server_artifact("linux", target).ok_or_else(|| {
+    manifest.server_artifact(os, target).ok_or_else(|| {
         ArtifactError::new(
             "ssh_artifact_missing",
-            format!("the release does not ship a Linux {target} server artifact"),
+            format!("the release does not ship a {os} {target} server artifact"),
         )
     })
+}
+
+pub fn normalized_server_os(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("darwin") || value.eq_ignore_ascii_case("macos") {
+        "macos"
+    } else {
+        "linux"
+    }
 }
 
 /// Downloads `artifact` into `cache_dir`, or reuses a verified cached copy.
@@ -84,15 +102,27 @@ pub async fn download_server_artifact(
     version: &str,
     arch: RemoteArch,
     cache_dir: &Path,
+    progress: impl FnMut(u64, u64),
+) -> Result<LocalArtifact, ArtifactError> {
+    download_server_artifact_for_os(artifact, "linux", version, arch, cache_dir, progress).await
+}
+
+pub async fn download_server_artifact_for_os(
+    artifact: &ServerArtifact,
+    os: &str,
+    version: &str,
+    arch: RemoteArch,
+    cache_dir: &Path,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<LocalArtifact, ArtifactError> {
-    if artifact.os != "linux" {
+    let os = normalized_server_os(os);
+    if artifact.os != os {
         return Err(ArtifactError::new(
             "ssh_artifact_target_invalid",
-            "the selected server artifact is not for Linux",
+            format!("the selected server artifact is not for {os}"),
         ));
     }
-    let file_name = cache_file_name(version, arch)?;
+    let file_name = cache_file_name_for_os(version, os, arch)?;
     fs::create_dir_all(cache_dir).map_err(|_| {
         ArtifactError::new(
             "ssh_artifact_cache_failed",
@@ -277,7 +307,27 @@ pub fn verify_file(
     Ok(())
 }
 
+fn cache_file_name_for_os(
+    version: &str,
+    os: &str,
+    arch: RemoteArch,
+) -> Result<String, ArtifactError> {
+    if os == "linux" {
+        return cache_file_name(version, arch);
+    }
+    validate_version_for_cache(version)?;
+    Ok(format!(
+        "vibex-server-{version}-{os}-{}.tar.gz",
+        arch.as_str()
+    ))
+}
+
 fn cache_file_name(version: &str, arch: RemoteArch) -> Result<String, ArtifactError> {
+    validate_version_for_cache(version)?;
+    Ok(format!("vibex-server-{version}-{}.tar.gz", arch.as_str()))
+}
+
+fn validate_version_for_cache(version: &str) -> Result<(), ArtifactError> {
     if version.is_empty()
         || version.chars().count() > MAX_VERSION_CHARS
         || !version.chars().all(|character| {
@@ -289,7 +339,7 @@ fn cache_file_name(version: &str, arch: RemoteArch) -> Result<String, ArtifactEr
             "the server artifact version is not a safe file name",
         ));
     }
-    Ok(format!("vibex-server-{version}-{}.tar.gz", arch.as_str()))
+    Ok(())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -334,6 +384,20 @@ mod tests {
                     "url": "https://example.com/vibex-server-linux-arm64.tar.gz",
                     "size": size,
                     "sha256": sha256
+                },
+                {
+                    "os": "macos",
+                    "arch": "x86_64",
+                    "url": "https://example.com/vibex-server-macos-x86_64.tar.gz",
+                    "size": size,
+                    "sha256": sha256
+                },
+                {
+                    "os": "macos",
+                    "arch": "arm64",
+                    "url": "https://example.com/vibex-server-macos-arm64.tar.gz",
+                    "size": size,
+                    "sha256": sha256
                 }
             ]
         });
@@ -362,6 +426,25 @@ mod tests {
                 .arch,
             "arm64"
         );
+    }
+
+    #[test]
+    fn selects_macos_and_normalizes_darwin() {
+        let verified = manifest("a".repeat(64), 10);
+        assert_eq!(
+            select_server_artifact_for_os(&verified, "Darwin", RemoteArch::Aarch64)
+                .unwrap()
+                .os,
+            "macos"
+        );
+        assert_eq!(
+            select_server_artifact_for_os(&verified, "macOS", RemoteArch::X86_64)
+                .unwrap()
+                .arch,
+            "x86_64"
+        );
+        assert_eq!(normalized_server_os("Linux"), "linux");
+        assert_eq!(normalized_server_os("darwin"), "macos");
     }
 
     #[test]

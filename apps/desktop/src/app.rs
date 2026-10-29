@@ -254,8 +254,9 @@ use crate::ssh_connection::{
     ProvisioningServiceEvent, ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep,
     SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshMacOsLifecycle,
     SshProfileStore, SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess,
-    TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact, probe,
-    resolve_effective_default, select_local_port, select_server_artifact, supervisor,
+    TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact_for_os,
+    normalized_server_os, probe, resolve_effective_default, select_local_port,
+    select_server_artifact_for_os, supervisor,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -14489,10 +14490,12 @@ impl VibexWorkbench {
                 .map_err(|error| format!("{}: {}", error.code, error.message))?
                 .ok_or_else(|| "the release manifest is unavailable".to_string())?;
             let target = verified.manifest.version.clone();
-            let artifact = select_server_artifact(&verified, environment.arch)
+            let artifact_os = normalized_server_os(&environment.os);
+            let artifact = select_server_artifact_for_os(&verified, artifact_os, environment.arch)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let local = download_server_artifact(
+            let local = download_server_artifact_for_os(
                 artifact,
+                artifact_os,
                 &target.to_string(),
                 environment.arch,
                 &home.join("ssh-artifacts"),
@@ -14793,10 +14796,12 @@ impl VibexWorkbench {
                 .map_err(|error| format!("{}: {}", error.code, error.message))?
                 .ok_or_else(|| "the release manifest is unavailable".to_string())?;
             let version = verified.manifest.version.to_string();
-            let artifact = select_server_artifact(&verified, environment.arch)
+            let artifact_os = normalized_server_os(&environment.os);
+            let artifact = select_server_artifact_for_os(&verified, artifact_os, environment.arch)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let local = download_server_artifact(
+            let local = download_server_artifact_for_os(
                 artifact,
+                artifact_os,
                 &version,
                 environment.arch,
                 &home.join("ssh-artifacts"),

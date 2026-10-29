@@ -2,8 +2,8 @@
 // Package one checked headless server binary as a release asset.
 //
 // Output:
-//   vibex-server-<version>-linux-<arch>.tar.gz
-//   vibex-server-<version>-linux-<arch>.tar.gz.sha256
+//   vibex-server-<version>-<os>-<arch>.tar.gz
+//   vibex-server-<version>-<os>-<arch>.tar.gz.sha256
 //
 // The tarball contains exactly one top-level file named `vibex-server`, so the
 // installer never has to guess a path. The archive is written with normalised
@@ -11,7 +11,7 @@
 //
 // Usage:
 //   node scripts/package-server-release.mjs \
-//     --version 0.2.0 --arch x86_64 \
+//     --version 0.2.0 --arch x86_64 --os linux \
 //     --binary target/x86_64-unknown-linux-gnu/release/vibex-server \
 //     --output target/server-artifacts
 
@@ -29,6 +29,7 @@ import {
 import { basename, join, resolve } from "node:path";
 
 const ARCHES = new Set(["x86_64", "aarch64"]);
+const SYSTEMS = new Set(["linux", "macos"]);
 
 function fail(message) {
   console.error(`package-server-release: ${message}`);
@@ -36,7 +37,7 @@ function fail(message) {
 }
 
 function parseArguments(argv) {
-  const values = {};
+  const values = { os: "linux" };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
@@ -47,6 +48,7 @@ function parseArguments(argv) {
     const key = {
       "--version": "version",
       "--arch": "arch",
+      "--os": "os",
       "--binary": "binary",
       "--output": "output"
     }[flag];
@@ -62,10 +64,13 @@ function parseArguments(argv) {
   if (!ARCHES.has(values.arch)) {
     fail("--arch must be x86_64 or aarch64");
   }
+  if (!SYSTEMS.has(values.os)) {
+    fail("--os must be linux or macos");
+  }
   return values;
 }
 
-const { version, arch, binary, output } = parseArguments(process.argv.slice(2));
+const { version, arch, os, binary, output } = parseArguments(process.argv.slice(2));
 const binaryPath = resolve(binary);
 const outputDir = resolve(output);
 let binaryStat;
@@ -79,7 +84,7 @@ if (!binaryStat.isFile() || binaryStat.size === 0) {
 }
 
 mkdirSync(outputDir, { recursive: true });
-const name = `vibex-server-${version}-linux-${arch}.tar.gz`;
+const name = `vibex-server-${version}-${os}-${arch}.tar.gz`;
 const tarball = join(outputDir, name);
 const stage = join(outputDir, `.stage-server-${arch}-${process.pid}`);
 rmSync(stage, { recursive: true, force: true });
@@ -89,22 +94,22 @@ try {
   const stagedBinary = join(stage, "vibex-server");
   copyFileSync(binaryPath, stagedBinary);
   chmodSync(stagedBinary, 0o755);
-  execFileSync(
-    "tar",
-    [
-      "--sort=name",
-      "--mtime=@0",
-      "--owner=0",
-      "--group=0",
-      "--numeric-owner",
-      "-czf",
-      tarball,
-      "-C",
-      stage,
-      "vibex-server"
-    ],
-    { stdio: ["ignore", "ignore", "pipe"] }
-  );
+  const tarArgs =
+    os === "linux"
+      ? [
+          "--sort=name",
+          "--mtime=@0",
+          "--owner=0",
+          "--group=0",
+          "--numeric-owner",
+          "-czf",
+          tarball,
+          "-C",
+          stage,
+          "vibex-server"
+        ]
+      : ["-czf", tarball, "-C", stage, "vibex-server"];
+  execFileSync("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
 } finally {
   rmSync(stage, { recursive: true, force: true });
 }

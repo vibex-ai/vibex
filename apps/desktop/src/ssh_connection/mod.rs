@@ -30,7 +30,8 @@ pub mod uninstall;
 pub mod upgrade;
 
 pub use artifact::{
-    ArtifactError, LocalArtifact, download_server_artifact, select_server_artifact, verify_file,
+    ArtifactError, LocalArtifact, download_server_artifact, download_server_artifact_for_os,
+    normalized_server_os, select_server_artifact, select_server_artifact_for_os, verify_file,
 };
 pub use command::{SshCommand, SshDestination, SshOutput};
 pub use config::{
