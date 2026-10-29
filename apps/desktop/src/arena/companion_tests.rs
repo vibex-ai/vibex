@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::arena::combat::Phase;
-use crate::arena::gait::lane_lap;
+use crate::arena::gait::{self, lane_lap};
 use crate::arena::init as arena_init;
 use gpui::{
     Focusable as _, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseUpEvent,
@@ -213,7 +213,8 @@ fn every_guardian_fits_inside_the_lane_it_rides_at_a_legible_size() {
 /// Every guardian travels the lane on a rhythm of its own rather than one
 /// shared sway: its lap differs from every other guardian's, it reaches both
 /// ends of the lane, it pauses or turns at its own spots instead of swaying
-/// evenly, and on average it never outpaces a walk.
+/// evenly — all but the whale, which swims at one steady speed — and on average
+/// it never outpaces a walk.
 #[test]
 fn every_guardian_crosses_the_lane_on_a_rhythm_of_its_own() {
     const STEP: f32 = 1.0 / 60.0;
@@ -244,8 +245,10 @@ fn every_guardian_crosses_the_lane_on_a_rhythm_of_its_own() {
         // On a 720px column this is well under a hundred pixels a second.
         let pace = travelled / lap;
         assert!(pace < 0.12, "{guardian:?} crosses {pace} lanes a second");
+        // The whale is the one swimmer: it never stops and keeps one speed,
+        // and its rhythm is its own lap and breach.
         assert!(
-            still / lap > 0.15,
+            guardian == Guardian::DeepSeek || still / lap > 0.15,
             "{guardian:?} spends only {still}s of its {lap}s lap at rest or turning"
         );
     }
@@ -306,6 +309,148 @@ fn every_lane_itinerary_is_continuous_and_closes_its_lap() {
             time += STEP;
         }
     }
+}
+
+/// Each guardian enters and leaves its own way: an entrance starts wholly out
+/// of sight and lands exactly on the lane's first pose, an exit starts from
+/// exactly the pose the turn ended on and ends wholly out of sight, and neither
+/// jumps from one frame to the next.
+#[test]
+fn every_guardian_enters_and_leaves_its_own_way_without_a_cut() {
+    const STEP: f32 = 1.0 / 60.0;
+    let hidden = |shot: &Shot| {
+        shot.slide.abs() >= 0.999 || shot.lift.abs() >= 0.999 || shot.opacity <= 0.001
+    };
+    let jump = |a: &Shot, b: &Shot| {
+        (a.slide - b.slide).abs() < 0.1
+            && (a.lift - b.lift).abs() < 0.12
+            && (a.opacity - b.opacity).abs() < 0.1
+            && (across(&a.boss) - across(&b.boss)).abs() < 0.03
+            && (a.boss.height - b.boss.height).abs() < 2.0
+    };
+    let mut ways = Vec::new();
+    for guardian in Guardian::ALL {
+        let entrance = gait::entrance(guardian);
+        let first = gait::shot(guardian, -entrance);
+        assert!(
+            hidden(&first),
+            "{guardian:?} starts its entrance in sight: {first:?}"
+        );
+        let mut previous = first;
+        let mut time = -entrance;
+        while time < 0.5 {
+            let shot = gait::shot(guardian, time);
+            assert!(
+                jump(&previous, &shot),
+                "{guardian:?} jumps entering at {time}s"
+            );
+            previous = shot;
+            time += STEP;
+        }
+        let landed = gait::shot(guardian, -1e-4);
+        assert!(
+            landed.slide.abs() < 0.01 && landed.lift.abs() < 0.01 && landed.opacity > 0.99,
+            "{guardian:?} lands off its lane: {landed:?}"
+        );
+        for from in [-entrance * 0.5, 0.0, 3.3, lane_lap(guardian) * 0.7] {
+            let held = gait::shot(guardian, from);
+            let mut previous = gait::leaving(guardian, from, from);
+            assert!(
+                jump(&held, &previous)
+                    && (held.boss.squash - previous.boss.squash).abs() < 0.1
+                    && (held.boss.lid - previous.boss.lid).abs() < 0.1
+                    && (held.boss.pitch - previous.boss.pitch).abs() < 0.1,
+                "{guardian:?} cuts away from its pose leaving at {from}s"
+            );
+            let mut time = from;
+            while time <= from + gait::exit(guardian) {
+                let shot = gait::leaving(guardian, from, time);
+                assert!(
+                    jump(&previous, &shot),
+                    "{guardian:?} jumps leaving at {time}s"
+                );
+                previous = shot;
+                time += STEP;
+            }
+            let gone = gait::leaving(guardian, from, from + gait::exit(guardian));
+            assert!(
+                hidden(&gone),
+                "{guardian:?} is still in sight after leaving: {gone:?}"
+            );
+        }
+        ways.push((
+            (gait::entrance(guardian) * 100.0) as i32,
+            (gait::exit(guardian) * 100.0) as i32,
+        ));
+    }
+    ways.sort_unstable();
+    ways.dedup();
+    assert_eq!(
+        ways.len(),
+        Guardian::ALL.len(),
+        "two guardians share an entrance and exit"
+    );
+}
+
+/// The shot's offsets carry the model wholly out of the lane at either end,
+/// above it, or below it, on whole pixels.
+#[test]
+fn a_shot_leaves_the_lane_wholly_at_its_ends() {
+    let boss = Boss::lane(Guardian::Codex, 0.0);
+    let shot = |slide: f32, lift: f32| Shot {
+        boss,
+        slide,
+        lift,
+        opacity: 1.0,
+    };
+    let (lane, badge, height) = (720.0, 90.0, 60.0);
+    let (x, y) = placement(&shot(0.0, 0.0), lane, badge, height);
+    assert_eq!((x, y), (lane_x(lane, badge, across(&boss)), 0.0));
+    assert_eq!(placement(&shot(1.0, 0.0), lane, badge, height).0, lane);
+    assert_eq!(placement(&shot(-1.0, 0.0), lane, badge, height).0, -badge);
+    assert_eq!(placement(&shot(0.0, 1.0), lane, badge, height).1, height);
+    assert_eq!(placement(&shot(0.0, -1.0), lane, badge, height).1, -height);
+    assert_eq!(
+        placement(&shot(0.37, 0.41), lane, badge, height).0.fract(),
+        0.0
+    );
+}
+
+/// A turn that starts brings the guardian in from out of sight, and it lands
+/// on its lane once its entrance is over; a session switched to mid-turn hands
+/// the lane over at once instead.
+#[gpui::test]
+fn a_starting_turn_brings_the_companion_in_its_own_way(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    drive(&harness, Some("claude"), false, cx);
+    cx.background_executor.advance_clock(
+        Duration::from_secs_f32(gait::exit(Guardian::Claude)) + Duration::from_millis(60),
+    );
+    draw(cx);
+    draw(cx);
+    assert!(cx.debug_bounds("composer-companion-lane").is_none());
+
+    drive(&harness, Some("claude"), true, cx);
+    let lane = cx.debug_bounds("composer-companion-lane").unwrap();
+    let badge = cx.debug_bounds("composer-companion").unwrap();
+    assert!(
+        badge.bottom() <= lane.top(),
+        "the spark starts above the lane it falls into"
+    );
+    cx.background_executor
+        .advance_clock(Duration::from_secs_f32(gait::entrance(Guardian::Claude)));
+    draw(cx);
+    let lane = cx.debug_bounds("composer-companion-lane").unwrap();
+    let badge = cx.debug_bounds("composer-companion").unwrap();
+    assert!(badge.top() >= lane.top() && badge.bottom() <= lane.bottom());
+
+    drive(&harness, Some("codex"), true, cx);
+    let lane = cx.debug_bounds("composer-companion-lane").unwrap();
+    let badge = cx.debug_bounds("composer-companion").unwrap();
+    assert!(
+        badge.left() >= lane.left() && badge.right() <= lane.right(),
+        "a hand-over is not an entrance"
+    );
 }
 
 /// The travel never leaves the lane at any width the composer can take, and
@@ -383,8 +528,9 @@ fn reduced_motion_never_mounts_the_companion(cx: &mut TestAppContext) {
     });
     draw(cx);
     assert!(cx.debug_bounds("composer-companion").is_none());
-    cx.background_executor
-        .advance_clock(Duration::from_secs_f32(LEAP_DURATION) + Duration::from_millis(60));
+    cx.background_executor.advance_clock(
+        Duration::from_secs_f32(gait::exit(Guardian::Claude)) + Duration::from_millis(60),
+    );
     draw(cx);
     draw(cx);
     assert_eq!(
@@ -435,11 +581,12 @@ fn a_finished_turn_dives_the_companion_into_the_composer_and_retires_it(cx: &mut
     assert!(cx.debug_bounds("composer-companion-lane").is_some());
     let stage = harness.read_with(cx, |harness, cx| harness.stage(cx));
     assert!(
-        matches!(stage, Stage::Leaping { .. }),
+        matches!(stage, Stage::Leaving { .. }),
         "the companion is diving, not gone: {stage:?}"
     );
-    cx.background_executor
-        .advance_clock(Duration::from_secs_f32(LEAP_DURATION) + Duration::from_millis(60));
+    cx.background_executor.advance_clock(
+        Duration::from_secs_f32(gait::exit(Guardian::Claude)) + Duration::from_millis(60),
+    );
     draw(cx);
     draw(cx);
     assert!(cx.debug_bounds("composer-companion-lane").is_none());

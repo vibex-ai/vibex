@@ -1,16 +1,17 @@
 //! The reward a won encounter unlocks: that Agent's guardian rides a lane the
-//! session page floats over the bottom of its timeline while the turn runs, and
-//! dives into the composer when the session stops. Floating it — instead of
-//! giving it a row of the composer — keeps the timeline at its full height and
-//! lets the lane share the timeline's bottom with the follow-the-agent button,
-//! painted over it rather than beside it. Double-clicking it opens the same duel
-//! the home page offers, over the session page instead of the new-session page.
+//! session page floats over the bottom of its timeline while the turn runs. It
+//! enters its own way when a turn starts and leaves its own way when the turn
+//! ends (see `gait`). Floating it — instead of giving it a row of the composer
+//! — keeps the timeline at its full height and lets the lane share the
+//! timeline's bottom with the follow-the-agent button, painted over it rather
+//! than beside it. Double-clicking it opens the same duel the home page offers,
+//! over the session page instead of the new-session page.
 
 use super::{
     ArenaView, Awakened, art,
-    combat::{Boss, Guardian, smoothstep},
+    combat::{Boss, Guardian},
     copy,
-    gait::LANE_REACH,
+    gait::{self, LANE_REACH, Shot},
     map::CENTER,
     motion, palette,
     raster::{PixelRect, ink},
@@ -40,8 +41,6 @@ const MODEL_HEIGHT: f32 = 40.0;
 /// The tallest lane a companion may reserve. A guardian whose loop reaches far
 /// above its standing pose — the whale's breach — is drawn smaller instead.
 const MAX_LANE: f32 = 72.0;
-/// The dive into the composer.
-const LEAP_DURATION: f32 = 0.62;
 /// Idle poses are rebuilt at this rate. The pixel art does not read faster, and
 /// every rebuild rasterizes the whole sculpture.
 const FRAME_RATE: f32 = 12.0;
@@ -53,13 +52,38 @@ const INSET: f32 = 12.0;
 enum Stage {
     /// No companion is mounted: no reward, no running turn, or a duel is up.
     Idle,
-    /// The session is running; the companion travels its lane. `clock` is the
-    /// pose's own monotonic clock.
+    /// The session is running; the companion enters, then travels its lane.
+    /// `clock` is the pose's own monotonic clock: the instant its itinerary
+    /// starts, still ahead while the guardian makes its entrance.
     Roaming { clock: Instant },
-    /// The turn ended; the companion is diving into the composer from where it
-    /// stood, on the same pose clock, so the dive continues the pass instead
-    /// of restarting it.
-    Leaping { clock: Instant, from: f32 },
+    /// The turn ended; the companion leaves its own way from the pose it held
+    /// `from` seconds into its lane, on the same pose clock, so the exit
+    /// continues the pass instead of restarting it.
+    Leaving { clock: Instant, from: f32 },
+}
+/// Signed seconds from `clock` to `now`: negative while `clock` is ahead.
+fn seconds(now: Instant, clock: Instant) -> f32 {
+    match now.checked_duration_since(clock) {
+        Some(elapsed) => elapsed.as_secs_f32(),
+        None => -(clock - now).as_secs_f32(),
+    }
+}
+
+/// Which of the companion's motions a frame is sampled from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Motion {
+    /// The entrance and then the lane itinerary.
+    Lane,
+    /// The exit, from the lane time the turn ended at.
+    Leaving { from: f32 },
+}
+impl Motion {
+    fn shot(self, guardian: Guardian, time: f32) -> Shot {
+        match self {
+            Self::Lane => gait::shot(guardian, time),
+            Self::Leaving { from } => gait::leaving(guardian, from, time),
+        }
+    }
 }
 
 /// The unlocked guardian that rides above one Agent session's composer.
@@ -73,9 +97,6 @@ pub(crate) struct Companion {
     /// The lane's width, measured by its last prepaint. The travel is resolved
     /// while the tree is laid out, before this frame's bounds exist.
     lane_width: Rc<Cell<Pixels>>,
-    /// How far across the lane the companion stands, from 0 to 1, so a dive can
-    /// start from the place the reader last saw it.
-    roam: Rc<Cell<f32>>,
     /// The pose the companion last painted, handed to the duel it opens as the
     /// entry camera, so the model grows out of the lane it came from.
     sample: Rc<Cell<Option<PreviewSample>>>,
@@ -96,7 +117,6 @@ impl Companion {
             generation: 0,
             frames: Rc::new(RefCell::new(FrameCache::default())),
             lane_width: Rc::new(Cell::new(px(0.0))),
-            roam: Rc::new(Cell::new(0.0)),
             sample: Rc::new(Cell::new(None)),
             composer_focus: None,
             best_ms: None,
@@ -120,19 +140,20 @@ impl Companion {
         let guardian = reward.and_then(Guardian::from_agent);
         if guardian != self.guardian {
             // A different Agent owns the composer now. The previous companion
-            // leaves with the surface it belonged to: a dive would be a lie
-            // about a session that is still running. A duel it opened belongs
-            // to that session too, so it ends here rather than following the
-            // reader to a session it was never about.
+            // leaves with the surface it belonged to: an exit would be a lie
+            // about a session that is still running, and an entrance a lie
+            // about a turn that did not just start, so the lane hands over at
+            // once. A duel it opened belongs to that session too, so it ends
+            // here rather than following the reader to a session it was never
+            // about.
             self.guardian = guardian;
             self.generation += 1;
             self.frames.borrow_mut().clear();
             self.sample.set(None);
-            self.roam.set(0.0);
             self.dismiss(cx);
             self.stage = match guardian {
                 Some(_) if running => Stage::Roaming {
-                    clock: Instant::now(),
+                    clock: cx.background_executor().now(),
                 },
                 _ => Stage::Idle,
             };
@@ -140,13 +161,16 @@ impl Companion {
         }
         match (running, self.stage) {
             (true, Stage::Roaming { .. }) | (false, Stage::Idle) => {}
-            (false, Stage::Leaping { .. }) => {}
+            (false, Stage::Leaving { .. }) => {}
             (true, _) => {
+                // A turn started: the guardian makes its entrance first.
+                let entrance = self.guardian.map_or(0.0, gait::entrance);
+                self.generation += 1;
                 self.stage = Stage::Roaming {
-                    clock: Instant::now(),
+                    clock: cx.background_executor().now() + Duration::from_secs_f32(entrance),
                 };
             }
-            (false, Stage::Roaming { .. }) => self.leap(cx),
+            (false, Stage::Roaming { .. }) => self.leave(cx),
         }
     }
     /// Ends a duel without a result: the session it was opened over is gone.
@@ -158,22 +182,23 @@ impl Companion {
         battle.update(cx, |view, cx| view.close(cx));
         cx.notify();
     }
-    /// The session stopped: the companion dives into the composer and is gone
-    /// by the time the dive lands.
-    fn leap(&mut self, cx: &mut Context<Self>) {
-        let Stage::Roaming { clock } = self.stage else {
+    /// The session stopped: the companion leaves its lane its own way and is
+    /// gone by the time the exit ends.
+    fn leave(&mut self, cx: &mut Context<Self>) {
+        let (Stage::Roaming { clock }, Some(guardian)) = (self.stage, self.guardian) else {
+            self.stage = Stage::Idle;
             return;
         };
-        self.stage = Stage::Leaping {
+        let executor = cx.background_executor().clone();
+        self.stage = Stage::Leaving {
             clock,
-            from: self.roam.get(),
+            from: seconds(executor.now(), clock),
         };
         self.generation += 1;
         let generation = self.generation;
-        let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             executor
-                .timer(Duration::from_secs_f32(LEAP_DURATION) + Duration::from_millis(40))
+                .timer(Duration::from_secs_f32(gait::exit(guardian)) + Duration::from_millis(40))
                 .await;
             this.update(cx, |companion, cx| {
                 if companion.generation == generation {
@@ -279,6 +304,18 @@ fn lane_x(lane_width: f32, badge_width: f32, across: f32) -> f32 {
     let span = (lane_width - badge_width - INSET * 2.0).max(0.0);
     (INSET + across.clamp(0.0, 1.0) * span).round()
 }
+/// The model's top-left corner in the lane for a shot, in whole screen pixels:
+/// its lane place, carried toward or past either end by the shot's slide, and
+/// raised out of or sunk below the lane by its lift.
+fn placement(shot: &Shot, lane_width: f32, badge_width: f32, lane_height: f32) -> (f32, f32) {
+    let x = lane_x(lane_width, badge_width, across(&shot.boss));
+    let x = if shot.slide >= 0.0 {
+        x + (lane_width - x) * shot.slide
+    } else {
+        x + (x + badge_width) * shot.slide
+    };
+    (x.round(), (shot.lift * lane_height).round())
+}
 
 /// The lane the session page floats over the timeline's bottom, or nothing when
 /// this session has no reward to show, when its turn is not running, or when
@@ -302,12 +339,12 @@ pub(crate) fn lane_with_best(
 ) -> Option<AnyElement> {
     // Reduced motion drops the effect entirely — the setting asks for a still
     // workbench, and a roaming model is exactly the motion it turns off. The
-    // companion is still told the turn ended, so nothing is left half-dived.
+    // companion is still told the turn ended, so nothing is left half-gone.
     state.update(cx, |companion, cx| {
         companion.best_ms = best_ms;
         companion.track(reward, running && !reduced, focus, cx)
     });
-    let (guardian, stage, frames, sample, lane_width, roam) = {
+    let (guardian, stage, frames, sample, lane_width) = {
         let companion = state.read(cx);
         if reduced || companion.battle().is_some() {
             return None;
@@ -318,12 +355,16 @@ pub(crate) fn lane_with_best(
             companion.frames.clone(),
             companion.sample.clone(),
             companion.lane_width.clone(),
-            companion.roam.clone(),
         )
     };
-    if stage == Stage::Idle {
-        return None;
-    }
+    let (motion, clock, id) = match stage {
+        Stage::Idle => return None,
+        Stage::Roaming { clock } => (Motion::Lane, clock, "composer-companion-roam"),
+        Stage::Leaving { clock, from } => {
+            (Motion::Leaving { from }, clock, "composer-companion-leave")
+        }
+    };
+    let executor = cx.background_executor().clone();
     let measured = lane_width.clone();
     let state = state.clone();
     let geometry = fit(guardian);
@@ -345,6 +386,7 @@ pub(crate) fn lane_with_best(
             })
             .child(Badge {
                 guardian,
+                motion,
                 time,
                 opacity,
                 fit: geometry,
@@ -363,56 +405,30 @@ pub(crate) fn lane_with_best(
         .flex_none()
         .overflow_hidden()
         .on_prepaint(move |bounds, _, _| measured.set(bounds.size.width));
-    match stage {
-        Stage::Roaming { clock } => Some(
-            lane.with_animation(
-                "composer-companion-roam",
-                // The animation is only the frame ticker: the pose and the
-                // place both come from the pose's own monotonic clock, so the
-                // authored loop closes on itself and never cuts back to its
-                // first frame in the middle of the lane.
-                Animation::new(Duration::from_secs(60))
-                    .repeat()
-                    .with_max_fps(30.0),
-                move |this, _| {
-                    let time = clock.elapsed().as_secs_f32();
-                    let place = across(&Boss::lane(guardian, time));
-                    roam.set(place);
-                    this.child(badge(
-                        time,
-                        1.0,
-                        lane_x(f32::from(lane_width.get()), badge_width, place),
-                        0.0,
-                    ))
-                },
-            )
-            .into_any_element(),
-        ),
-        Stage::Leaping { clock, from } => {
-            let depth = geometry.lane();
-            Some(
-                lane.with_animation(
-                    "composer-companion-leap",
-                    Animation::new(Duration::from_secs_f32(LEAP_DURATION)).with_max_fps(30.0),
-                    move |this, delta| {
-                        // Up a little, then down past the lane's own edge, where
-                        // the composer below swallows it.
-                        let hop = -(delta * std::f32::consts::PI).sin() * 9.0;
-                        let dive = delta * delta * (depth + 18.0);
-                        let opacity = 1.0 - smoothstep((delta - 0.55) / 0.45);
-                        this.child(badge(
-                            clock.elapsed().as_secs_f32(),
-                            opacity,
-                            lane_x(f32::from(lane_width.get()), badge_width, from),
-                            (hop + dive).round(),
-                        ))
-                    },
-                )
-                .into_any_element(),
-            )
-        }
-        Stage::Idle => None,
-    }
+    Some(
+        lane.with_animation(
+            id,
+            // The animation is only the frame ticker: the pose and the place
+            // both come from the pose's own monotonic clock, so the authored
+            // loop closes on itself and never cuts back to its first frame in
+            // the middle of the lane.
+            Animation::new(Duration::from_secs(60))
+                .repeat()
+                .with_max_fps(30.0),
+            move |this, _| {
+                let time = seconds(executor.now(), clock);
+                let shot = motion.shot(guardian, time);
+                let (x, y) = placement(
+                    &shot,
+                    f32::from(lane_width.get()),
+                    badge_width,
+                    geometry.lane(),
+                );
+                this.child(badge(time, shot.opacity, x, y))
+            },
+        )
+        .into_any_element(),
+    )
 }
 
 /// Wraps a session page so an open duel covers it, exactly as it does on the
@@ -470,7 +486,7 @@ pub(crate) fn session_surface(
 /// same pose costs nothing beyond the quads it paints.
 #[derive(Default)]
 struct FrameCache {
-    key: Option<(Guardian, u64, usize, usize)>,
+    key: Option<(Guardian, Motion, i64, usize, usize)>,
     rectangles: Vec<PixelRect>,
 }
 impl FrameCache {
@@ -478,13 +494,19 @@ impl FrameCache {
         self.key = None;
         self.rectangles.clear();
     }
-    fn rectangles(&mut self, guardian: Guardian, time: f32, fit: Fit) -> Vec<PixelRect> {
-        let tick = (time * FRAME_RATE) as u64;
-        let key = (guardian, tick, fit.columns, fit.rows);
+    fn rectangles(
+        &mut self,
+        guardian: Guardian,
+        motion: Motion,
+        time: f32,
+        fit: Fit,
+    ) -> Vec<PixelRect> {
+        let tick = (time * FRAME_RATE).floor() as i64;
+        let key = (guardian, motion, tick, fit.columns, fit.rows);
         if self.key != Some(key) {
             self.key = Some(key);
             let time = tick as f32 / FRAME_RATE;
-            let boss = Boss::lane(guardian, time);
+            let boss = motion.shot(guardian, time).boss;
             self.rectangles = art::companion(&boss, time, false)
                 .resample(fit.columns, fit.rows)
                 .rectangles();
@@ -501,6 +523,7 @@ impl FrameCache {
 /// model turns to face where its itinerary heads; it is never mirrored.
 struct Badge {
     guardian: Guardian,
+    motion: Motion,
     time: f32,
     opacity: f32,
     fit: Fit,
@@ -545,13 +568,13 @@ impl Element for Badge {
         _: &mut Window,
         _: &mut App,
     ) -> Self::PrepaintState {
-        let rectangles = self
-            .frames
-            .borrow_mut()
-            .rectangles(self.guardian, self.time, self.fit);
+        let rectangles =
+            self.frames
+                .borrow_mut()
+                .rectangles(self.guardian, self.motion, self.time, self.fit);
         let (left, top, _, _) = self.window_box;
         let pixel = px(self.fit.pixel);
-        let boss = Boss::lane(self.guardian, self.time);
+        let boss = self.motion.shot(self.guardian, self.time).boss;
         let (x, y) = art::pixel(boss.position);
         // The duel starts from this frame: the same model, in the same pose, at
         // the same spot, so it grows out of the lane it was standing in.

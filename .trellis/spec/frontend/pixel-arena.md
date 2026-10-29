@@ -80,11 +80,11 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   draft initialization, runtime choice, and Agent choice call
   `sync_home_arena_agent` from update handlers, never from render.
 - `Companion` owns the unlocked reward on a session: the Agent whose guardian
-  rides that composer, its roaming/leaping stage, its frame cache, the lane
+  rides that composer, its roaming/leaving stage, its frame cache, the lane
   width measured by the last prepaint, the pose it last painted, and the duel it
   opened. The composer drives it from the render path through
   `arena::companion_lane`, which never notifies: every change it makes is read
-  back by the same frame that asked for it. The dive's retire task carries the
+  back by the same frame that asked for it. The exit's retire task carries the
   generation it was scheduled for, so a stage that replaced it is never retired
   by a stale timer.
 - `ArenaView` owns input, the last measured projection, pause/closed flags,
@@ -226,27 +226,44 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   way it hops, the knot cruises with momentum, rocks to a stop and pivots, Pi
   strides with stems that settle together whenever it stops and looks about,
   the chest lumbers and peeks out of its lid during its long sit, the whale
-  never stops — it surges, breaches on the outbound pass only, and swims a
-  U-turn at each end — and Copilot darts between uneven hovering spots with one
+  never stops — it swims at one steady speed, breaches on the outbound pass
+  only, and swims each end's U-turn as a half circle at that same speed, never
+  surging or gliding — and Copilot darts between uneven hovering spots with one
   barrel roll per lap. Every itinerary averages under 0.12 lanes a second, so
   no guardian sprints. The pose clock is monotonic and every itinerary closes
   on itself (spin, facing, and stems included), so the lap's seam never cuts
   back to a first frame mid-lane.
-- When the turn ends the companion dives on the same pose clock: a short hop, a
-  fall past the lane's own bottom edge where the composer swallows it, and a
-  fade. The lane is
-  removed once the dive lands, and the composer returns to its own height. A
-  stage replaced during a dive is never retired by the stale dive's timer.
+- Entrances and exits are each guardian's own too (`gait::shot` before lane
+  time 0, `gait::leaving`, durations `gait::entrance` / `gait::exit`). A turn
+  that starts sets the pose clock's origin one entrance ahead, so the entrance
+  plays on the same monotonic clock: the spark falls in from above and bounces,
+  the knot rolls in past the left end, Pi climbs out of the composer one stem at
+  a time, the chest pops out lid open, the whale surfaces nose first, and
+  Copilot swoops in from above the left end with a roll. Each starts wholly out
+  of sight and lands exactly on the itinerary's first pose. When the turn ends
+  the companion leaves from exactly the pose it held: the spark crouches and
+  flares up out of the lane, the knot pivots and rolls off the nearer end, Pi
+  gathers its stems and steps down into the composer, the chest gapes and jumps
+  in, the whale noses down and sounds tail-up, and Copilot banks and climbs away
+  past the nearer end. A `Shot` carries the pose plus `slide` (share of the way
+  past a lane end) and `lift` (lane heights above or below), so the lane's clip
+  hides what has gone; a turn that ends mid-entrance hands the entrance's offset
+  over to the exit. The lane is removed once the exit ends, and the composer
+  returns to its own height. A stage replaced during an exit is never retired by
+  the stale exit's timer. The companion's clocks read
+  `BackgroundExecutor::now()`, so tests drive entrances and exits on the fake
+  clock.
 - Double-clicking the companion opens the same duel as the home page, over the
   session page: the session's elements fade out, the arena fills the column
   page, and Escape returns. `Arena::from_preview` still starts from the pose
   actually painted, so the model grows out of the lane it stood in. A victory
   there re-emits `Awakened`; the unlock it was reached through stays unlocked.
 - The companion follows the composer it is rendered for. Switching to another
-  Agent hands the lane to that Agent's guardian without a dive, and ends a duel
+  Agent hands the lane to that Agent's guardian at once, with neither an exit
+  nor an entrance — the turn neither ended nor just started — and ends a duel
   that was opened over the previous session rather than letting it follow the
-  reader. Reduced motion removes the effect entirely: no lane, no badge, and no
-  dive, while the companion's stage is still retired.
+  reader. Reduced motion removes the effect entirely: no lane, no badge, no
+  entrance or exit, while the companion's stage is still retired.
 - Nothing here mutates a session, draft, attachment, queue, or runtime state.
   The companion is a render-time passenger of a composer.
 
@@ -383,7 +400,8 @@ rebirth, without a damage override.
 | State predates clear times | No best line, and a win still records one |
 | Duel started with a stored best | The clock shows it as the pace to beat on the home page and over a session |
 | Session Agent has no unlocked guardian | No lane, no badge, no reserved row |
-| Session turn not running | No lane; a turn that just ended dives once and then leaves |
+| Session turn starts | The guardian makes its own entrance, then rides its lane |
+| Session turn not running | No lane; a turn that just ended plays the guardian's own exit once |
 | Companion double-clicked | Duel over the session page, session elements gone, Escape returns |
 | Composer moves to another Agent | Lane hands over instantly; a duel opened over the previous session ends |
 | Reduced motion enabled | No companion lane at all, and nothing left roaming behind the setting |
@@ -430,13 +448,17 @@ rebirth, without a damage override.
   row, at narrow and wide composer widths; every guardian stands at a legible
   height inside its lane; every guardian covers the lane on a lap of a
   distinct length, pauses or turns for a share of it, and stays under the
-  pace limit; every itinerary moves without a jump and closes its lap; the
-  resampled frame keeps the figure's coverage; a finished turn
-  dives and retires it, returning the composer to its own height; double-click
+  pace limit (the whale exempt from pausing); every itinerary moves without a
+  jump and closes its lap; every entrance starts out of sight and lands on the
+  lane without a cut, every exit starts from the held pose and ends out of
+  sight, including from mid-entrance; a starting turn brings the badge in from
+  outside the lane while a hand-over does not; the resampled frame keeps the
+  figure's coverage; a finished turn plays its exit and retires it, returning
+  the composer to its own height; double-click
   opens a duel that covers the session page and Escape returns; a victory
   reports the unlock; a session switch ends the previous duel. Art tests pin
-  the crop to the same drawing, and that no idle or lane pose reaches its
-  window edge.
+  the crop to the same drawing, and that no idle, lane, entrance, or exit
+  pose reaches its window edge.
 - Preference tests retain legacy decoding and persisted opt-out coverage.
   Progress tests retain "absent state decodes to nothing defeated" and
   "a repeat win is not a change". Clear-time tests retain "only a faster win
@@ -473,10 +495,11 @@ let entry_camera = sample.viewport;
 let time = phase * ROAM_PERIOD;
 let place = across(&Boss::idle(guardian, time, false));
 
-// Correct: the pose clock is monotonic; pose and place both come from the
-// guardian's own lane itinerary.
-let time = clock.elapsed().as_secs_f32();
-let place = across(&Boss::lane(guardian, time));
+// Correct: the pose clock is monotonic and reads the executor's clock; pose
+// and place both come from the guardian's own entrance and lane itinerary.
+let time = seconds(executor.now(), clock); // negative while entering
+let shot = gait::shot(guardian, time);
+let (x, y) = placement(&shot, lane_width, badge_width, lane_height);
 
 // Wrong: painting raster pixels at a third of a screen pixel each.
 let pixel = unit / art::SCALE; // ~0.3px: quads collapse into noise

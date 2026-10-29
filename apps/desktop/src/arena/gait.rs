@@ -5,8 +5,13 @@
 //! form keeps an itinerary of its own: where it stops, how long it rests, how it
 //! covers the ground in between, and how long its lap takes. The spark hops in
 //! bursts, the knot rolls with momentum and rocks to a stop, Pi strides and
-//! looks around, the chest lumbers and peeks, the whale glides and breaches,
+//! looks around, the chest lumbers and peeks, the whale swims steadily and breaches,
 //! and Copilot darts between hovering spots.
+//!
+//! Every guardian also enters and leaves its own way: the spark falls in and
+//! flares out upward, the knot rolls in and off an end, Pi climbs out of the
+//! composer and steps back down into it, the chest pops out and jumps back in,
+//! the whale surfaces and sounds, and Copilot swoops in and climbs away.
 
 use super::{
     geometry::{Vec2, smoothstep},
@@ -66,8 +71,9 @@ const OPENCODE: [Leg; 3] = [
     leg(3.4, 3.0 * OPENCODE_HOP, 0.92),
     leg(1.6, 6.0 * OPENCODE_HOP, -0.92),
 ];
-/// The whale never stops: each rest is a U-turn swum at the lane's end.
-const DEEPSEEK: [Leg; 2] = [leg(2.0, 8.6, 0.88), leg(2.0, 8.6, -0.88)];
+/// The whale swims at one steady speed and never stops: each rest is a
+/// U-turn swum at the lane's end, at the same speed as the passes.
+const DEEPSEEK: [Leg; 2] = [leg(2.0, 8.6, 0.85), leg(2.0, 8.6, -0.85)];
 /// Where the outbound pass breaches, as a share of its swim. Only that pass
 /// breaches: the window is cut for the breach the home page swims, heading
 /// right, and the raised tail of a breach heading left would leave it.
@@ -161,14 +167,14 @@ fn heading_of(legs: &[Leg], index: usize) -> f32 {
 fn turns(legs: &[Leg], index: usize) -> bool {
     heading_of(legs, previous(legs, index)) != heading_of(legs, index)
 }
-/// Half-turns completed since the lap began, plus `progress` of the one under
-/// way. Every turn goes the same way round, and a closed itinerary turns an
+/// Half-turns completed since the lap began, plus `progress` — already eased
+/// as the gait turns — of the one under way. Every turn goes the same way round, and a closed itinerary turns an
 /// even number of times, so the facing closes over the lap.
 fn half_turns(legs: &[Leg], moment: Moment, progress: f32) -> f32 {
     let done = (0..moment.index).filter(|&ix| turns(legs, ix)).count() as f32;
     let current = if moment.resting().is_some() {
         if turns(legs, moment.index) {
-            smoothstep(progress)
+            progress.clamp(0.0, 1.0)
         } else {
             0.0
         }
@@ -314,7 +320,8 @@ impl Boss {
                 let roll = CODEX_TURNS * TAU / travelled(legs, legs.len());
                 boss.spin = (travelled(legs, moment.index) + rolled) * roll;
                 boss.height = ((boss.spin * 6.0).sin() * 0.35).max(0.0);
-                boss.yaw = wrap(heading_angle(legs) + PI * half_turns(legs, moment, turn));
+                boss.yaw =
+                    wrap(heading_angle(legs) + PI * half_turns(legs, moment, smoothstep(turn)));
                 place
             }
             Guardian::Pi => {
@@ -391,18 +398,18 @@ impl Boss {
                 boss.pitch = (phase * TAU * 5.0).sin() * 0.05;
                 let (place, turn) = match moment.resting() {
                     Some(elapsed) => {
-                        // A U-turn at the lane's end: out a little, round, and
-                        // back along the lane the other way.
+                        // A U-turn at the lane's end: half a circle seen side-on,
+                        // entered and left at the speed of the passes, so the
+                        // swim never slows or surges.
                         let turn = elapsed / moment.leg.hold;
                         let arrived = heading_of(legs, previous(legs, moment.index));
+                        let speed = span.abs() / moment.leg.travel;
+                        let radius = speed * moment.leg.hold / PI;
                         boss.bank = (turn * PI).sin() * 0.12;
-                        (from + arrived * 0.05 * (turn * PI).sin().powi(2), turn)
+                        (from + arrived * radius * (turn * PI).sin(), turn)
                     }
                     None => {
-                        // Tail kicks: the swim surges and glides three times a pass.
                         let t = moment.progress();
-                        let kicks = 3.0;
-                        let surge = t - 0.55 * (t * TAU * kicks).sin() / (TAU * kicks);
                         let breach = (t - BREACH) / 0.3;
                         if heading > 0.0 && (0.0..1.0).contains(&breach) {
                             let arc = (breach * PI).sin();
@@ -410,7 +417,7 @@ impl Boss {
                             boss.pitch += (0.5 - breach) * arc;
                             boss.unravel = arc;
                         }
-                        (from + span * smoothstep(surge), 0.0)
+                        (from + span * t, 0.0)
                     }
                 };
                 boss.yaw =
@@ -445,16 +452,239 @@ impl Boss {
             }
         };
         boss.position = lane_point(place);
-        boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
-        boss.previous_position = boss.position;
         if guardian != Guardian::Pi {
             boss.rest_hands();
         }
-        boss.update_core();
-        boss.previous_core = boss.core;
-        boss
+        settled(boss)
     }
 }
 fn lane_point(place: f32) -> Vec2 {
     CENTER.plus(Vec2::new(place * LANE_REACH, LANE_ROW))
+}
+/// Derives what follows from a pose once its fields are set.
+fn settled(mut boss: Boss) -> Boss {
+    boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
+    boss.previous_position = boss.position;
+    boss.update_core();
+    boss.previous_core = boss.core;
+    boss
+}
+
+/// A companion as drawn: its pose, and how far it stands off its lane place
+/// while it enters or leaves.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Shot {
+    pub boss: Boss,
+    /// Travel along the lane past the pose's own place, as a share of the way
+    /// to being wholly out of sight past the lane's end: 1 is gone past the
+    /// right end, -1 past the left one.
+    pub slide: f32,
+    /// Height off the lane, in lane heights: 1 is wholly sunk into the
+    /// composer below, -1 wholly risen out of the lane's top.
+    pub lift: f32,
+    pub opacity: f32,
+}
+impl Shot {
+    fn on_lane(boss: Boss) -> Self {
+        Self {
+            boss,
+            slide: 0.0,
+            lift: 0.0,
+            opacity: 1.0,
+        }
+    }
+}
+
+/// How long a guardian takes to enter its lane when a turn starts.
+pub(super) fn entrance(guardian: Guardian) -> f32 {
+    match guardian {
+        Guardian::Claude => 0.9,
+        Guardian::Codex => 1.2,
+        Guardian::Pi => 1.6,
+        Guardian::OpenCode => 1.1,
+        Guardian::DeepSeek => 1.5,
+        Guardian::Copilot => 1.3,
+    }
+}
+/// How long a guardian takes to leave its lane when the turn ends.
+pub(super) fn exit(guardian: Guardian) -> f32 {
+    match guardian {
+        Guardian::Claude => 0.85,
+        Guardian::Codex => 1.1,
+        Guardian::Pi => 1.3,
+        Guardian::OpenCode => 0.8,
+        Guardian::DeepSeek => 1.25,
+        Guardian::Copilot => 0.95,
+    }
+}
+
+/// The companion `time` seconds into its lane. Before 0 it is still entering:
+/// each guardian arrives its own way and lands exactly on the lane's first
+/// pose, so the entrance hands over to the itinerary without a cut.
+pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
+    let base = Boss::lane(guardian, time.max(0.0));
+    if time >= 0.0 {
+        return Shot::on_lane(base);
+    }
+    let a = ((time + entrance(guardian)) / entrance(guardian)).clamp(0.0, 1.0);
+    let mut shot = Shot::on_lane(base);
+    let boss = &mut shot.boss;
+    match guardian {
+        Guardian::Claude => {
+            // The spark falls in from above the lane, whirling, lands flat,
+            // and bounces once.
+            if a < 0.5 {
+                shot.lift = -1.15 * (1.0 - (a / 0.5).powi(2));
+                boss.squash = -0.3;
+            } else if a < 0.7 {
+                boss.squash = 0.8 * (1.0 - smoothstep((a - 0.5) / 0.2));
+            } else {
+                let bounce = ((a - 0.7) / 0.3 * PI).sin();
+                boss.height = bounce * 4.0;
+                boss.squash = -0.2 * bounce;
+            }
+            boss.spin -= TAU * 0.75 * (1.0 - smoothstep(a));
+        }
+        Guardian::Codex => {
+            // The knot rolls in from past the lane's left end and slows to a
+            // stop, turning with the ground it covers.
+            let left = (1.0 - a).powi(2);
+            shot.slide = -left;
+            boss.spin += left * TAU * 2.5;
+            boss.height = ((boss.spin * 6.0).sin() * 0.35).max(0.0);
+        }
+        Guardian::Pi => {
+            // The glyph climbs out of the composer one stem at a time.
+            let (ix, from, to, u) = if a < 0.5 {
+                (0, 1.05, 0.5, a / 0.5)
+            } else {
+                (1, 0.5, 0.0, (a - 0.5) / 0.5)
+            };
+            shot.lift = from + (to - from) * smoothstep(u);
+            boss.hand_heights[ix] = (u * PI).sin() * 4.5;
+            boss.bank = if ix == 0 { 1.0 } else { -1.0 } * (u * PI).sin() * 0.07;
+        }
+        Guardian::OpenCode => {
+            // The chest pops out of the composer with its lid flung open,
+            // lands hard, and chatters shut.
+            if a < 0.65 {
+                let p = a / 0.65;
+                shot.lift = 1.0 - p - 0.75 * (p * PI).sin();
+                boss.lid = 0.55;
+                boss.squash = -0.3 * (p * PI).sin();
+            } else {
+                let p = (a - 0.65) / 0.35;
+                boss.squash = 0.8 * (1.0 - smoothstep(p / 0.55));
+                boss.lid = (p * PI * 3.0).sin().abs() * 0.3 * (1.0 - p);
+            }
+        }
+        Guardian::DeepSeek => {
+            // The whale surfaces nose first and bobs as it levels out.
+            if a < 0.7 {
+                let p = a / 0.7;
+                shot.lift = 1.0 - smoothstep(p);
+                boss.pitch += 0.3 * (p * PI).sin();
+            } else {
+                shot.lift = -0.06 * ((a - 0.7) / 0.3 * PI).sin();
+            }
+        }
+        Guardian::Copilot => {
+            // Copilot swoops in from above the left end, rolling once as it
+            // brakes into a hover.
+            let left = (1.0 - a).powi(2);
+            shot.slide = -left;
+            shot.lift = -0.9 * left;
+            boss.bank += TAU * smoothstep(a);
+            boss.yaw = (boss.yaw + 0.45 * (1.0 - a)).clamp(-0.5, 0.5);
+            boss.pitch += 0.12 * (1.0 - a);
+        }
+    }
+    shot.boss = settled(shot.boss);
+    shot
+}
+
+/// The companion leaving: `from` is where on its lane the turn ended, and
+/// `time` runs on from there. Each guardian leaves its own way, starting from
+/// exactly the pose it held, and is wholly out of sight by [`exit`].
+pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
+    let mut shot = shot(guardian, from);
+    let a = ((time - from) / exit(guardian)).clamp(0.0, 1.0);
+    let place = (shot.boss.position.x - CENTER.x) / LANE_REACH;
+    // Whatever leaves along the lane takes the nearer end.
+    let side = if place >= 0.0 { 1.0 } else { -1.0 };
+    let boss = &mut shot.boss;
+    let (slide, lift, opacity) = match guardian {
+        Guardian::Claude => {
+            // A crouch, then the spark flares up out of the lane, whirling.
+            boss.squash = if a < 0.15 {
+                boss.squash + (0.5 - boss.squash) * smoothstep(a / 0.15)
+            } else {
+                -0.3
+            };
+            let p = ((a - 0.15) / 0.85).max(0.0);
+            boss.spin += TAU * 1.5 * p * p;
+            (0.0, -1.2 * p * p, 1.0 - smoothstep((a - 0.7) / 0.3))
+        }
+        Guardian::Codex => {
+            // The knot pivots toward the nearer end and rolls off it.
+            let heading = if side > 0.0 { 0.0 } else { PI };
+            boss.yaw = wrap(boss.yaw + wrap(heading - boss.yaw) * smoothstep(a / 0.3));
+            let p = ((a - 0.3) / 0.7).max(0.0);
+            boss.spin += TAU * 3.0 * p * p;
+            boss.height = ((boss.spin * 6.0).sin() * 0.35).max(0.0);
+            (side * p * p, 0.0, 1.0)
+        }
+        Guardian::Pi => {
+            // The glyph gathers its stems and steps down into the composer.
+            let gather = smoothstep(a / 0.2);
+            for ix in 0..2 {
+                let rest = boss.resting_hand(ix);
+                boss.hands[ix] = boss.hands[ix].lerp(rest, gather);
+                boss.hand_heights[ix] *= 1.0 - gather;
+            }
+            boss.bank *= 1.0 - gather;
+            let (ix, from, to, u) = if a < 0.6 {
+                (0, 0.0, 0.5, ((a - 0.2) / 0.4).max(0.0))
+            } else {
+                (1, 0.5, 1.1, (a - 0.6) / 0.4)
+            };
+            if u > 0.0 {
+                boss.hand_heights[ix] = (u * PI).sin() * 4.5;
+            }
+            (0.0, from + (to - from) * smoothstep(u), 1.0)
+        }
+        Guardian::OpenCode => {
+            // The chest gapes and jumps into the composer, lid first.
+            boss.lid += (0.55 - boss.lid) * smoothstep(a / 0.3);
+            boss.squash += (-0.3 - boss.squash) * smoothstep(a / 0.2);
+            let lift = if a < 0.35 {
+                -0.3 * (a / 0.7 * PI).sin()
+            } else {
+                -0.3 + 1.45 * ((a - 0.35) / 0.65).powi(2)
+            };
+            (0.0, lift, 1.0)
+        }
+        Guardian::DeepSeek => {
+            // The whale noses down, raises its tail, and sounds.
+            boss.pitch -= 0.45 * smoothstep(a / 0.4);
+            boss.unravel = boss.unravel.max(smoothstep(a / 0.5));
+            (0.0, 1.15 * smoothstep((a - 0.2) / 0.8), 1.0)
+        }
+        Guardian::Copilot => {
+            // Copilot banks toward the nearer end and climbs away past it.
+            let turn = smoothstep(a / 0.3);
+            boss.yaw = (boss.yaw + side * 0.45 * turn).clamp(-0.5, 0.5);
+            boss.bank -= side * 0.3 * turn;
+            boss.pitch += (0.12 - boss.pitch) * turn;
+            (side * a * a, -0.5 * a * a, 1.0)
+        }
+    };
+    // A turn that ends mid-entrance leaves from where the entrance had got to;
+    // that offset hands over to the exit's own as it goes.
+    let entering = 1.0 - a;
+    shot.slide = shot.slide * entering + slide;
+    shot.lift = shot.lift * entering + lift;
+    shot.opacity = (shot.opacity + (1.0 - shot.opacity) * a) * opacity;
+    shot.boss = settled(shot.boss);
+    shot
 }

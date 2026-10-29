@@ -226,10 +226,22 @@ fn the_companion_window_holds_every_idle_pose_without_touching_its_edge() {
                 time += 0.2;
             }
         }
-        // The companion draws its lane itinerary, not the home loop.
-        let mut time = 0.0;
+        // The companion draws its lane itinerary, not the home loop, with its
+        // entrance before it and an exit from a few places along it.
+        let mut poses = Vec::new();
+        let mut time = -crate::arena::gait::entrance(guardian);
         while time < crate::arena::gait::lane_lap(guardian) {
-            let boss = Boss::lane(guardian, time);
+            poses.push((time, crate::arena::gait::shot(guardian, time).boss));
+            time += 0.1;
+        }
+        for from in [0.0, 4.4, 9.7] {
+            let mut time = from;
+            while time <= from + crate::arena::gait::exit(guardian) {
+                poses.push((time, crate::arena::gait::leaving(guardian, from, time).boss));
+                time += 0.05;
+            }
+        }
+        for (time, boss) in poses {
             let frame = reference(&boss, time, false);
             let (x, y) = pixel(boss.position);
             for (ix, ink) in frame.pixels.iter().enumerate() {
@@ -244,7 +256,6 @@ fn the_companion_window_holds_every_idle_pose_without_touching_its_edge() {
                      outside its window {left},{top},{right},{bottom}"
                 );
             }
-            time += 0.1;
         }
     }
 }
