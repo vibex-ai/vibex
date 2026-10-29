@@ -2311,9 +2311,26 @@ pub fn load_fonts(cx: &mut App) -> Result<AssetLoadReport, String> {
         .map(Cow::Borrowed),
     );
     fonts.push(Cow::Borrowed(WQY_MICROHEI));
-    cx.text_system()
-        .add_fonts(fonts)
-        .map_err(|error| format!("failed to load bundled desktop fonts: {error}"))?;
+    // DirectWrite rejects some formats that CoreText/fontconfig accept
+    // (notably WOFF2 and TTC). Load each face independently so one
+    // unsupported face does not prevent the app from opening; the UI falls
+    // back to a system family.
+    let mut loaded = 0;
+    let mut last_error = None;
+    for font in fonts {
+        match cx.text_system().add_fonts(vec![font]) {
+            Ok(()) => loaded += 1,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if loaded == 0 {
+        return Err(format!(
+            "failed to load bundled desktop fonts: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no fonts were accepted".to_string())
+        ));
+    }
     Ok(asset_report())
 }
 
