@@ -245,14 +245,14 @@ fn map_ssh_failure(failure: SshFailure) -> InstallError {
 }
 
 /// Writes the install script to a file, for local script tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_script(dir: &Path) -> std::path::PathBuf {
     let path = crate::ssh_connection::test_support::unique_path(dir, "install.sh");
     crate::ssh_connection::test_support::write_executable(&path, INSTALL_SCRIPT);
     path
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::ssh_connection::command::SshDestination;

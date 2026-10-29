@@ -219,6 +219,81 @@ impl WslCommand {
     }
 }
 
+/// Holds a WSL2 distro open for the lifetime of a runtime. WSL terminates the
+/// distro when its last Windows client exits; a detached server alone is not
+/// enough on current WSL builds.
+#[derive(Debug)]
+pub struct WslKeepalive {
+    child: std::process::Child,
+}
+
+impl WslKeepalive {
+    /// Runs the server as the foreground process of a held `wsl.exe`. WSL
+    /// terminates detached children when the client exits, so keeping the
+    /// client alive is the reliable way to own the runtime.
+    pub fn spawn_runtime(
+        program: &Path,
+        distro: &str,
+        env_file: &str,
+        binary: &str,
+    ) -> Result<Self, WslError> {
+        let child = Command::new(program)
+            .args([
+                "-d",
+                distro,
+                "--exec",
+                "/bin/sh",
+                "-c",
+                "set -a; . \"$1\"; set +a; exec \"$2\" serve --no-pairing",
+                "sh",
+                env_file,
+                binary,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    WslError::new("wsl_missing", "wsl.exe is not available")
+                } else {
+                    WslError::new(
+                        "wsl_runtime_spawn_failed",
+                        format!("the WSL runtime could not start: {error}"),
+                    )
+                }
+            })?;
+        Ok(Self { child })
+    }
+
+    pub fn spawn(program: &Path, distro: &str) -> Result<Self, WslError> {
+        let child = Command::new(program)
+            .args(["-d", distro, "--exec", "sleep", "infinity"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    WslError::new("wsl_missing", "wsl.exe is not available")
+                } else {
+                    WslError::new(
+                        "wsl_keepalive_failed",
+                        format!("the WSL keepalive could not start: {error}"),
+                    )
+                }
+            })?;
+        Ok(Self { child })
+    }
+}
+
+impl Drop for WslKeepalive {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Debug)]
 pub struct WslOutput {
     pub status: std::process::ExitStatus,
@@ -386,6 +461,25 @@ mod tests {
             environment.arch,
             super::super::environment::RemoteArch::Aarch64
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_wsl_transport_when_a_distro_is_installed() {
+        let program = Path::new("wsl.exe");
+        let Ok(distros) = list_distros(program) else {
+            return;
+        };
+        let Some(distro) = distros.first() else {
+            return;
+        };
+        let mut command = WslCommand::new(program, distro);
+        let output = command.run_script("printf '%s' \"$HOME\"", &[]).unwrap();
+        let home = output.stdout_lossy();
+        assert!(home.starts_with('/'), "HOME={home:?}");
+        let environment = probe_environment(program, distro, 8765).unwrap();
+        assert_eq!(environment.os, "Linux");
+        assert!(environment.home.starts_with('/'));
     }
 
     #[test]

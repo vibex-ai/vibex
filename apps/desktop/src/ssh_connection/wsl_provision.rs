@@ -19,7 +19,7 @@ use super::pairing::{
     parse_pairing_payload,
 };
 use super::supervisor::{STATUS_SCRIPT, STOP_SCRIPT, ServerStatus, parse_status};
-use super::wsl::{WslCommand, WslError, localhost_forwarded, probe_environment};
+use super::wsl::{WslCommand, WslError, WslKeepalive, localhost_forwarded, probe_environment};
 use crate::remote_client::{DesktopRemoteCredential, DesktopRuntimeRegistryStore};
 use vibex_remote_client::WebRemoteBackend;
 
@@ -79,6 +79,8 @@ pub struct WslProvisionOutcome {
     pub pairing: PairingOutcome,
     pub backend: Arc<WebRemoteBackend>,
     pub environment: RemoteEnvironment,
+    /// Keeps the distro alive after the provisioning `wsl.exe` commands exit.
+    pub keepalive: WslKeepalive,
 }
 
 impl WslProvisioner {
@@ -258,7 +260,29 @@ impl WslProvisioner {
             ));
         }
         self.install(artifact)?;
-        self.ensure_started()?;
+        self.write_env()?;
+        let keepalive = WslKeepalive::spawn_runtime(
+            &self.program,
+            &self.distro,
+            &self.launch.env_file,
+            &self.launch.binary,
+        )
+        .map_err(WslProvisionError::from_wsl)?;
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            if let Ok(status) = self.status()
+                && status.is_healthy()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(WslProvisionError::retryable(
+                    "wsl_health_timeout",
+                    "the WSL runtime did not become healthy in time",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
         let deadline = Instant::now() + FORWARDING_DEADLINE;
         while !localhost_forwarded(self.launch.remote_port) {
             if Instant::now() >= deadline {
@@ -288,6 +312,7 @@ impl WslProvisioner {
             pairing,
             backend,
             environment,
+            keepalive,
         })
     }
 }
@@ -301,7 +326,91 @@ pub fn credential_backend(
         .map_err(|error| WslProvisionError::new("wsl_backend_failed", error.message))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::path::{Path, PathBuf};
+
+    use sha2::{Digest as _, Sha256};
+
+    use super::*;
+    use crate::ssh_connection::environment::RemoteArch;
+
+    #[test]
+    #[ignore = "requires Windows WSL and VIBEX_WSL_E2E_ARTIFACT"]
+    fn real_wsl_install_and_start() {
+        let Ok(artifact_path) = std::env::var("VIBEX_WSL_E2E_ARTIFACT") else {
+            return;
+        };
+        let distro =
+            std::env::var("VIBEX_WSL_E2E_DISTRO").unwrap_or_else(|_| "archlinux".to_string());
+        let home =
+            std::env::var("VIBEX_WSL_E2E_HOME").unwrap_or_else(|_| "/home/peatboy".to_string());
+        let root = format!("{home}/.local/share/vibex/wsl-e2e-server");
+        let bytes = std::fs::read(&artifact_path).unwrap();
+        let artifact = LocalArtifact {
+            path: PathBuf::from(artifact_path),
+            version: "0.1.0-rc.8".to_string(),
+            arch: RemoteArch::X86_64,
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        let provisioner = WslProvisioner::new(
+            "wsl.exe",
+            &distro,
+            &home,
+            &root,
+            &[home.clone()],
+            8770,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        provisioner.install(&artifact).unwrap();
+        let _keepalive = WslKeepalive::spawn(Path::new("wsl.exe"), &distro).unwrap();
+        let status = provisioner.ensure_started().unwrap();
+        assert!(status.is_healthy());
+        provisioner.stop().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires Windows WSL and VIBEX_WSL_E2E_ARTIFACT"]
+    async fn real_wsl_full_provisioning_reaches_pairing_and_connect() {
+        let Ok(artifact_path) = std::env::var("VIBEX_WSL_E2E_ARTIFACT") else {
+            return;
+        };
+        let distro =
+            std::env::var("VIBEX_WSL_E2E_DISTRO").unwrap_or_else(|_| "archlinux".to_string());
+        let home =
+            std::env::var("VIBEX_WSL_E2E_HOME").unwrap_or_else(|_| "/home/peatboy".to_string());
+        let desktop = tempfile::tempdir().unwrap();
+        let bytes = std::fs::read(&artifact_path).unwrap();
+        let artifact = LocalArtifact {
+            path: PathBuf::from(artifact_path),
+            version: "0.1.0-rc.8".to_string(),
+            arch: RemoteArch::X86_64,
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        let provisioner = WslProvisioner::new(
+            "wsl.exe",
+            &distro,
+            &home,
+            &format!("{home}/.local/share/vibex/wsl-e2e-full"),
+            &[home.clone()],
+            8771,
+            desktop.path(),
+        )
+        .unwrap();
+        let outcome = provisioner
+            .provision(&artifact, vibex_core::unix_timestamp_ms())
+            .await
+            .unwrap();
+        assert!(!outcome.pairing.runtime_id.is_empty());
+        provisioner.stop().unwrap();
+        drop(outcome.keepalive);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use std::process::Command;
 

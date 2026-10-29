@@ -301,7 +301,7 @@ fn validate_remote_path(label: &'static str, value: &str) -> Result<(), LaunchEr
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

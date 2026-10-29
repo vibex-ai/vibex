@@ -9402,6 +9402,7 @@ pub struct VibexWorkbench {
     #[allow(dead_code)]
     wsl_task: Option<Task<()>>,
     wsl_error: Option<String>,
+    wsl_keepalive: Option<crate::ssh_connection::wsl::WslKeepalive>,
     #[allow(dead_code)]
     ssh_provisioning_task: Option<Task<()>>,
     #[allow(dead_code)]
@@ -11288,6 +11289,7 @@ impl VibexWorkbench {
             ssh_uninstall_error: None,
             wsl_task: None,
             wsl_error: None,
+            wsl_keepalive: None,
             ssh_provisioning_task: None,
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
@@ -14514,6 +14516,7 @@ impl VibexWorkbench {
                     String,
                     DesktopRemoteCredential,
                     Arc<WebRemoteBackend>,
+                    crate::ssh_connection::wsl::WslKeepalive,
                 ),
                 String,
             >((
@@ -14521,6 +14524,7 @@ impl VibexWorkbench {
                 distro,
                 outcome.pairing.credential,
                 outcome.backend,
+                outcome.keepalive,
             ))
         });
         self.wsl_task = Some(cx.spawn(
@@ -14528,7 +14532,8 @@ impl VibexWorkbench {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
                     match result {
-                        Ok(Ok((runtime_id, distro, credential, backend))) => {
+                        Ok(Ok((runtime_id, distro, credential, backend, keepalive))) => {
+                            this.wsl_keepalive = Some(keepalive);
                             if let Some(store) = this.runtime_registry_store.as_ref() {
                                 this.runtime_registry = store.load_or_migrate();
                             }

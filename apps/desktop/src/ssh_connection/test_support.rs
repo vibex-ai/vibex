@@ -1,5 +1,6 @@
 //! Test-only filesystem helpers.
 
+#[cfg(unix)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
