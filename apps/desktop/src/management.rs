@@ -80,7 +80,7 @@ use vibex_desktop_runtime::{DesktopRuntime, validate_external_open_url};
 use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::app::TITLE_BAR_HEIGHT;
-use crate::assets::agent_brand_icon;
+use crate::assets::{agent_brand_icon, model_brand_icon};
 use crate::gpui_ext::{
     SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label, solid_empty_border,
 };
@@ -13335,11 +13335,12 @@ impl ManagementCenter {
             cx.theme().muted_foreground
         };
         gateway_section = gateway_section.child(
-            v_flex()
+            h_flex()
                 .id("management-global-provider-row-gateway")
                 .w_full()
                 .min_w_0()
-                .gap_1()
+                .items_center()
+                .gap_2p5()
                 // The same card the Agent sidebar draws: an 8px surface, a
                 // hairline border, and a filled background. Selection takes the
                 // solid accent plate and hover the light primary wash, so
@@ -13367,38 +13368,67 @@ impl ManagementCenter {
                     })
                 })
                 .child(
-                    h_flex()
-                        .w_full()
+                    div()
+                        .flex_none()
+                        .size(px(32.0))
+                        .flex()
                         .items_center()
-                        .justify_between()
-                        .gap_2()
+                        .justify_center()
+                        .rounded(cx.theme().radius_lg)
+                        .bg(cx.theme().primary.opacity(0.12))
+                        .child(
+                            Icon::default()
+                                .path("icons/vibex/server.svg")
+                                .size(px(18.0))
+                                .text_color(cx.theme().primary),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(gateway_display_name(&gateway.settings)),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .size(px(6.0))
+                                                .rounded_full()
+                                                .bg(gateway_state_color),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(gateway_state_color)
+                                                .child(gateway_state),
+                                        ),
+                                ),
+                        )
                         .child(
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_sm()
-                                .font_medium()
-                                .child(gateway_display_name(&gateway.settings)),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_none()
-                                .items_center()
-                                .gap_1p5()
-                                .child(div().size(px(6.0)).rounded_full().bg(gateway_state_color))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(gateway_state_color)
-                                        .child(gateway_state),
-                                ),
+                                .text_xs()
+                                .text_color(gateway_summary_color)
+                                .child(gateway_summary),
                         ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(gateway_summary_color)
-                        .child(gateway_summary),
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
@@ -13429,12 +13459,7 @@ impl ManagementCenter {
                 locale,
             );
             let (health_label, health_status) = self.shared_provider_health_label(&row.profile);
-            let health_color = match health_status {
-                vibex_core::ProviderHealthStatus::Fail => cx.theme().danger,
-                vibex_core::ProviderHealthStatus::Warn => cx.theme().warning,
-                vibex_core::ProviderHealthStatus::Pass => cx.theme().success,
-                _ => cx.theme().muted_foreground,
-            };
+            let health_color = management_provider_health_color(health_status, cx);
             let agent_count = row.agents.len();
             // The card's footer names the Agents by their logos only. The
             // shapes are recognizable at a glance and the names made every row
@@ -13456,82 +13481,80 @@ impl ManagementCenter {
                 })
                 .collect::<Vec<_>>();
             let select_id = id.clone();
-            list = list.child(
-                v_flex()
-                    .id(SharedString::from(format!(
-                        "management-global-provider-row-{id}"
-                    )))
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(if is_selected {
-                        cx.theme().primary.opacity(0.0)
-                    } else {
-                        cx.theme().border.opacity(0.65)
-                    })
-                    .bg(if is_selected {
-                        cx.theme().accent
-                    } else {
-                        cx.theme().background.opacity(0.70)
-                    })
-                    .p_2()
-                    .cursor_pointer()
-                    .hover(|style| {
-                        style.bg(if is_selected {
+            list =
+                list.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "management-global-provider-row-{id}"
+                        )))
+                        .w_full()
+                        .min_w_0()
+                        .items_start()
+                        .gap_2p5()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(if is_selected {
+                            cx.theme().primary.opacity(0.0)
+                        } else {
+                            cx.theme().border.opacity(0.65)
+                        })
+                        .bg(if is_selected {
                             cx.theme().accent
                         } else {
-                            cx.theme().primary.opacity(0.08)
+                            cx.theme().background.opacity(0.70)
                         })
-                    })
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("○"),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_medium()
-                                            .child(row.profile.display_name.clone()),
-                                    )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "management-provider-favorite-{id}"
-                                        )))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(if is_favorite {
-                                            IconName::StarFill
-                                        } else {
-                                            IconName::Star
-                                        })
-                                        .tooltip(if is_favorite {
-                                            management_locale_text(
-                                                "Remove favorite",
-                                                "取消收藏",
-                                                "取消收藏",
-                                            )
-                                        } else {
-                                            management_locale_text("Favorite", "收藏", "收藏")
-                                        })
-                                        .on_click(
-                                            cx.listener({
+                        .p_2()
+                        .cursor_pointer()
+                        .hover(|style| {
+                            style.bg(if is_selected {
+                                cx.theme().accent
+                            } else {
+                                cx.theme().primary.opacity(0.08)
+                            })
+                        })
+                        // The logo holds the leading slot every row shares, so the
+                        // names form one column whatever the Provider's mark is.
+                        .child(provider_logo_tile(&row.profile, px(32.0), cx))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(row.profile.display_name.clone()),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "management-provider-favorite-{id}"
+                                            )))
+                                            .xsmall()
+                                            .ghost()
+                                            .icon(if is_favorite {
+                                                IconName::StarFill
+                                            } else {
+                                                IconName::Star
+                                            })
+                                            .tooltip(if is_favorite {
+                                                management_locale_text(
+                                                    "Remove favorite",
+                                                    "取消收藏",
+                                                    "取消收藏",
+                                                )
+                                            } else {
+                                                management_locale_text("Favorite", "收藏", "收藏")
+                                            })
+                                            .on_click(cx.listener({
                                                 let favorite_id = id.clone();
                                                 move |this, _, _, cx| {
                                                     cx.stop_propagation();
@@ -13540,65 +13563,95 @@ impl ManagementCenter {
                                                         cx,
                                                     )
                                                 }
-                                            }),
+                                            })),
+                                        )
+                                        .child(div().flex_1())
+                                        .when(
+                                            row.profile.status
+                                                != vibex_core::ModelProviderProfileStatus::Enabled,
+                                            |line| {
+                                                line.child(gateway_provider_status_badge(
+                                                    &row.profile,
+                                                    cx,
+                                                ))
+                                            },
                                         ),
-                                    ),
-                            )
-                            .child(gateway_provider_status_badge(&row.profile, cx)),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(summary),
-                            )
-                            .child(div().text_xs().text_color(health_color).child(health_label)),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_1()
-                            .children(agent_stack.into_iter().map(|(agent_id, label)| {
-                                let tooltip = SharedString::from(label);
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "management-provider-agent-logo-{id}-{agent_id}"
-                                    )))
-                                    .role(Role::Image)
-                                    .aria_label(tooltip.clone())
-                                    .flex_none()
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
-                                            .build(window, cx)
-                                    })
-                                    .child(agent_brand_icon(&agent_id, px(14.0), None))
-                            }))
-                            .when(agent_count > MANAGEMENT_CARD_AGENT_LOGO_LIMIT, |stack| {
-                                stack.child(
-                                    div()
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_1p5()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(format!(
-                                            "+{}",
-                                            agent_count - MANAGEMENT_CARD_AGENT_LOGO_LIMIT
-                                        )),
+                                        .child(div().min_w_0().truncate().child(summary))
+                                        .child(
+                                            div()
+                                                .size(px(6.0))
+                                                .flex_none()
+                                                .rounded_full()
+                                                .bg(health_color),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_color(health_color)
+                                                .child(health_label),
+                                        ),
                                 )
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_global_provider_id = Some(select_id.clone());
-                        this.selected_global_route_id = None;
-                        this.provider_create_page_open = false;
-                        this.route_group_page_open = false;
-                        cx.notify();
-                    })),
-            );
+                                .when(!agent_stack.is_empty(), |text| {
+                                    text.child(
+                                        h_flex()
+                                            .w_full()
+                                            .items_center()
+                                            .gap_1()
+                                            .pt_0p5()
+                                            .children(agent_stack.into_iter().map(
+                                                |(agent_id, label)| {
+                                                    let tooltip = SharedString::from(label);
+                                                    div()
+                                                .id(SharedString::from(format!(
+                                                    "management-provider-agent-logo-{id}-{agent_id}"
+                                                )))
+                                                .role(Role::Image)
+                                                .aria_label(tooltip.clone())
+                                                .flex_none()
+                                                .tooltip(move |window, cx| {
+                                                    gpui_component::tooltip::Tooltip::new(
+                                                        tooltip.clone(),
+                                                    )
+                                                    .build(window, cx)
+                                                })
+                                                .child(agent_brand_icon(&agent_id, px(14.0), None))
+                                                },
+                                            ))
+                                            .when(
+                                                agent_count > MANAGEMENT_CARD_AGENT_LOGO_LIMIT,
+                                                |stack| {
+                                                    stack.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(format!(
+                                                            "+{}",
+                                                            agent_count
+                                                                - MANAGEMENT_CARD_AGENT_LOGO_LIMIT
+                                                        )),
+                                                    )
+                                                },
+                                            ),
+                                    )
+                                }),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected_global_provider_id = Some(select_id.clone());
+                            this.selected_global_route_id = None;
+                            this.provider_create_page_open = false;
+                            this.route_group_page_open = false;
+                            cx.notify();
+                        })),
+                );
         }
         // The gateway row is always there and is the page's first answer; a
         // selected Provider keeps the selection while it still exists.
@@ -15120,19 +15173,22 @@ impl ManagementCenter {
             return self.render_gateway(window, cx);
         };
         let profile = &row.profile;
-        let mut body = v_flex().w_full().min_w_0().gap_3();
+        let mut body = v_flex().w_full().min_w_0().gap_4();
         let selected_tab_index = ProviderDetailTab::ALL
             .iter()
             .position(|tab| *tab == self.provider_detail_tab)
             .unwrap_or(0);
+        // The identity band sits above the tabs, so every tab says which
+        // Provider it describes; the tabs underneath read as sections of one
+        // page rather than six equal buttons.
+        body = body.child(self.render_shared_provider_header(profile, window, cx));
         body = body.child(
             TabBar::new("management-provider-detail-tabs")
                 .w_full()
-                .segmented()
+                .underline()
                 .selected_index(selected_tab_index)
                 .children(ProviderDetailTab::ALL.into_iter().map(|tab| {
                     Tab::new()
-                        .flex_1()
                         .aria_label(tab.label())
                         .child(div().text_sm().child(tab.label()))
                 }))
@@ -15147,11 +15203,57 @@ impl ManagementCenter {
             body = body.child(self.render_shared_provider_keys(profile, window, cx));
         }
         if self.provider_detail_tab == ProviderDetailTab::Overview {
-            body = body.child(self.render_shared_provider_header(profile, window, cx));
+            body = body.child(self.render_shared_provider_overview_stats(profile, cx));
             if self.shared_provider_edit_target.as_ref() == Some(&profile.id) {
                 body = body.child(self.render_shared_provider_editor(profile, cx));
             }
-            let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
+            // One row per Agent, in two groups: the Agents that use this
+            // Provider, then the ones that could. A switch on each row says the
+            // state and changes it, so nothing on the list unbinds on a stray
+            // click the way the old pills did.
+            let mut agent_rows = v_flex().w_full().min_w_0();
+            let agent_row = |id: SharedString,
+                             agent_id: &str,
+                             label: String,
+                             trailing: AnyElement,
+                             default_badge: bool,
+                             cx: &mut Context<Self>| {
+                h_flex()
+                    .id(id)
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_3()
+                    .px_1()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted.opacity(0.5))
+                            .child(agent_brand_icon(agent_id, px(16.0), None)),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(div().min_w_0().truncate().text_sm().child(label))
+                            .when(default_badge, |name| {
+                                name.child(
+                                    Tag::color(ColorName::Neutral)
+                                        .xsmall()
+                                        .child(management_locale_text("Default", "默认", "預設")),
+                                )
+                            }),
+                    )
+                    .child(trailing)
+            };
             for agent_id in &row.agents {
                 let label = self
                     .snapshot
@@ -15169,9 +15271,9 @@ impl ManagementCenter {
                     })
                     .and_then(|binding| binding.legacy_provider_profile_id.clone())
                     .or_else(|| {
-                        // The click paints a bound pill before the binding row
+                        // The click paints a bound row before the binding row
                         // exists; the request already named the legacy Profile
-                        // the pill's controls address.
+                        // the row's controls address.
                         self.pending_provider_bindings
                             .get(&(profile.id.as_str().to_string(), agent_id.clone()))
                             .cloned()
@@ -15187,60 +15289,73 @@ impl ManagementCenter {
                 let unbind_agent = agent_id.clone();
                 let unbind_legacy = legacy_id.clone();
                 let unbind_label = label.clone();
-                agent_rows = agent_rows.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "management-provider-agent-pill-{agent_id}"
+                let trailing = h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .when(!is_default, |trailing| {
+                        trailing.child(
+                            Button::new(SharedString::from(format!(
+                                "management-provider-agent-default-{}",
+                                agent_id
+                            )))
+                            .small()
+                            .ghost()
+                            .label(management_set_default_label())
+                            .disabled(self.mutation.is_some())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.set_agent_default_model_source(
+                                        click_agent.clone(),
+                                        click_source.clone(),
+                                        cx,
+                                    )
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        Switch::new(SharedString::from(format!(
+                            "management-provider-agent-switch-{agent_id}"
                         )))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let Ok(agent_id) = AgentId::parse(unbind_agent.clone()) else {
-                                return;
-                            };
-                            this.try_unbind_model_source(
-                                agent_id,
-                                vibex_core::AgentModelSourceRef::Provider(unbind_legacy.clone()),
-                                UnbindModelSource::Provider(unbind_legacy.clone()),
-                                unbind_label.clone(),
-                                window,
-                                cx,
+                        .small()
+                        .checked(true)
+                        .disabled(self.mutation.is_some())
+                        .accessibility_label(SharedString::from(format!(
+                            "{} · {label}",
+                            management_locale_text(
+                                "Uses this Provider",
+                                "使用该供应商",
+                                "使用該供應商"
                             )
-                        }))
-                        .child(
-                            Tag::color(ColorName::Neutral).child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(agent_brand_icon(agent_id, px(14.0), None))
-                                    .child(label)
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "management-provider-agent-default-{}",
-                                            agent_id
-                                        )))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(if is_default {
-                                            IconName::StarFill
-                                        } else {
-                                            IconName::Star
-                                        })
-                                        .tooltip(management_set_default_label())
-                                        .disabled(self.mutation.is_some())
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.set_agent_default_model_source(
-                                                    click_agent.clone(),
-                                                    click_source.clone(),
-                                                    cx,
-                                                )
-                                            }),
-                                        ),
+                        )))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                let Ok(agent_id) = AgentId::parse(unbind_agent.clone()) else {
+                                    return;
+                                };
+                                this.try_unbind_model_source(
+                                    agent_id,
+                                    vibex_core::AgentModelSourceRef::Provider(
+                                        unbind_legacy.clone(),
                                     ),
-                            ),
-                        ),
-                );
+                                    UnbindModelSource::Provider(unbind_legacy.clone()),
+                                    unbind_label.clone(),
+                                    window,
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .into_any_element();
+                agent_rows = agent_rows.child(agent_row(
+                    SharedString::from(format!("management-provider-agent-pill-{agent_id}")),
+                    agent_id,
+                    label,
+                    trailing,
+                    is_default,
+                    cx,
+                ));
             }
             let configurable =
                 vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
@@ -15252,68 +15367,68 @@ impl ManagementCenter {
                 .filter(|agent| configurable.contains(&agent.id))
                 .filter(|agent| !row.agents.contains(agent.id.as_str()))
                 .collect::<Vec<_>>();
-            // One card answers both halves of "who uses this Provider": the
-            // Agents that already do, and the ones that could. Reporting the
-            // sharing in one card and offering it in a second made the reader
-            // match two lists against each other, while this list already has
-            // every Agent in it — bound ones as removable pills, the rest as
-            // pills that bind on click. The Agent page remains the other place
-            // to do the same thing, not a separate capability.
             let bind_profile = profile
                 .legacy_provider_profile_id
                 .clone()
                 .unwrap_or_else(vibex_core::ProviderProfileId::new);
             let bind_shared = Some(profile.id.clone());
             if !unbound.is_empty() {
-                // A rule, not another blank line: the pills above are the
-                // Agents that use this Provider and the ones below are the ones
-                // that could, and the two lists answer different questions.
+                // A rule and a caption, not another blank line: the rows above
+                // use this Provider and the rows below could.
                 agent_rows = agent_rows
-                    .child(Separator::horizontal().my_1().h(px(1.0)))
+                    .when(!row.agents.is_empty(), |rows| {
+                        rows.child(Separator::horizontal().my_1().h(px(1.0)))
+                    })
                     .child(
                         div()
                             .w_full()
-                            .pt_1()
+                            .px_1()
+                            .pt_2()
+                            .pb_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(management_locale_text(
-                                "Select an Agent to let it use this Provider",
-                                "点击 Agent 即可让它使用该供应商",
-                                "點擊 Agent 即可讓它使用該供應商",
+                                "Other Agents",
+                                "其他 Agent",
+                                "其他 Agent",
                             )),
                     );
                 for agent in &unbound {
                     let bind_agent = agent.id.clone();
                     let bind_profile = bind_profile.clone();
                     let bind_shared = bind_shared.clone();
-                    agent_rows = agent_rows.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "management-provider-unbound-agent-{}",
-                                agent.id.as_str()
-                            )))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.bind_provider_to_agent(
-                                    bind_agent.clone(),
-                                    bind_profile.clone(),
-                                    bind_shared.clone(),
-                                    cx,
-                                )
-                            }))
-                            .child(
-                                // An outline pill is the offer: the filled
-                                // pills above are the Agents that already use
-                                // this Provider.
-                                Tag::color(ColorName::Neutral).outline().child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
-                                        .child(agent.label.clone()),
-                                ),
-                            ),
-                    );
+                    let trailing = Switch::new(SharedString::from(format!(
+                        "management-provider-unbound-agent-switch-{}",
+                        agent.id.as_str()
+                    )))
+                    .small()
+                    .checked(false)
+                    .disabled(self.mutation.is_some())
+                    .accessibility_label(SharedString::from(format!(
+                        "{} · {}",
+                        management_locale_text("Use this Provider", "使用该供应商", "使用該供應商"),
+                        agent.label
+                    )))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.bind_provider_to_agent(
+                            bind_agent.clone(),
+                            bind_profile.clone(),
+                            bind_shared.clone(),
+                            cx,
+                        )
+                    }))
+                    .into_any_element();
+                    agent_rows = agent_rows.child(agent_row(
+                        SharedString::from(format!(
+                            "management-provider-unbound-agent-{}",
+                            agent.id.as_str()
+                        )),
+                        agent.id.as_str(),
+                        agent.label.clone(),
+                        trailing,
+                        false,
+                        cx,
+                    ));
                 }
             }
             if row.agents.is_empty() && unbound.is_empty() {
@@ -15329,9 +15444,9 @@ impl ManagementCenter {
             body = body.child(management_card_with_icon(
                 management_locale_text("Agent usage", "Agent 使用", "Agent 使用"),
                 management_locale_text(
-                    "Select an Agent in the first list to remove it, or one below to let it use this Provider. Deleting the Provider would remove the model source of every Agent listed here.",
-                    "点击第一组中的 Agent 可移除它，点击下方 Agent 可让它使用该供应商；删除该供应商会让这里列出的 Agent 失去模型来源。",
-                    "點擊第一組中的 Agent 可移除它，點擊下方 Agent 可讓它使用該供應商；刪除該供應商會讓這裡列出的 Agent 失去模型來源。",
+                    "Turn an Agent on to let it use this Provider. Deleting the Provider removes this model source from every Agent that is on.",
+                    "打开开关即可让 Agent 使用该供应商；删除该供应商会让已打开的 Agent 失去这个模型来源。",
+                    "打開開關即可讓 Agent 使用該供應商；刪除該供應商會讓已打開的 Agent 失去這個模型來源。",
                 ),
                 "icons/vibex/cpu.svg",
                 agent_rows.into_any_element(),
@@ -15434,19 +15549,26 @@ impl ManagementCenter {
                         "該供應商向所有綁定它的 Agent 提供的模型。",
                     ),
                     "icons/vibex/brain.svg",
-                    compact_empty_state(
-                        management_locale_text(
-                            "No matching models",
-                            "没有匹配的模型",
-                            "沒有符合的模型",
-                        ),
-                        management_locale_text(
-                            "Clear the filter, or edit this Provider to add models.",
-                            "清除筛选，或编辑该供应商添加模型。",
-                            "清除篩選，或編輯該供應商新增模型。",
-                        ),
-                        cx,
-                    ),
+                    // The band stays above the empty state, or the filter that
+                    // emptied the list could not be cleared from here.
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(controls)
+                        .child(compact_empty_state(
+                            management_locale_text(
+                                "No matching models",
+                                "没有匹配的模型",
+                                "沒有符合的模型",
+                            ),
+                            management_locale_text(
+                                "Clear the filter, or edit this Provider to add models.",
+                                "清除筛选，或编辑该供应商添加模型。",
+                                "清除篩選，或編輯該供應商新增模型。",
+                            ),
+                            cx,
+                        ))
+                        .into_any_element(),
                     cx,
                 ));
             } else {
@@ -15516,31 +15638,74 @@ impl ManagementCenter {
                         .map(|position| (route, position))
                 })
                 .collect::<Vec<_>>();
-            let mut route_rows = v_flex().w_full().gap_1();
-            for (route, position) in &member_routes {
+            let mut route_rows = v_flex().w_full().min_w_0();
+            for (index, (route, position)) in member_routes.iter().enumerate() {
+                let select_id = route.id.as_str().to_string();
                 route_rows = route_rows.child(
                     h_flex()
+                        .id(SharedString::from(format!(
+                            "management-provider-route-{}",
+                            route.id.as_str()
+                        )))
                         .w_full()
+                        .min_w_0()
                         .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .py_1()
+                        .gap_3()
+                        .px_1()
+                        .py_2()
+                        .when(index > 0, |row| {
+                            row.border_t_1()
+                                .border_color(cx.theme().border.opacity(0.6))
+                        })
                         .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .child(route.display_name.clone()),
+                            Icon::default()
+                                .path("icons/vibex/git-branch.svg")
+                                .size(px(16.0))
+                                .text_color(cx.theme().muted_foreground),
                         )
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "{} {}",
-                                    management_locale_text("member", "成员", "成員"),
-                                    position + 1
-                                )),
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(route.display_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{} {}",
+                                            route.members.len(),
+                                            management_locale_text("members", "个成员", "個成員")
+                                        )),
+                                ),
+                        )
+                        .child(Tag::color(ColorName::Neutral).xsmall().child(format!(
+                            "{} {}",
+                            management_locale_text("Priority", "优先级", "優先級"),
+                            position + 1
+                        )))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "management-provider-route-open-{}",
+                                route.id.as_str()
+                            )))
+                            .small()
+                            .ghost()
+                            .label(management_locale_text("Open", "打开", "開啟"))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
+                                    this.selected_global_route_id = Some(select_id.clone());
+                                    this.selected_global_provider_id = None;
+                                    cx.notify();
+                                },
+                            )),
                         ),
                 );
             }
@@ -15634,31 +15799,63 @@ impl ManagementCenter {
                         cx.notify();
                     }
                 }));
-            let mut traffic = v_flex().w_full().gap_2().child(range_row);
-            traffic = traffic.child(description_grid(vec![
-                (
-                    management_locale_text("Health", "健康", "健康"),
-                    health_label.to_string(),
-                ),
-                (
-                    management_locale_text("Requests", "请求", "請求"),
-                    total.to_string(),
-                ),
-                (
-                    management_locale_text("Succeeded", "成功", "成功"),
-                    succeeded.to_string(),
-                ),
-                (
-                    management_locale_text("Tokens", "Token", "Token"),
-                    tokens.to_string(),
-                ),
-                ("p50", p50),
-                ("p95", p95),
-                (
-                    management_locale_text("Top error", "错误 Top", "錯誤 Top"),
-                    top_error,
-                ),
-            ]));
+            let (_, health_status) = self.shared_provider_health_label(profile);
+            let success_caption = if total == 0 {
+                "—".to_string()
+            } else {
+                format!(
+                    "{} {:.0}%",
+                    management_locale_text("Success", "成功率", "成功率"),
+                    succeeded as f64 * 100.0 / total as f64
+                )
+            };
+            let mut traffic = v_flex()
+                .w_full()
+                .gap_3()
+                .child(h_flex().w_full().justify_end().child(range_row))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .flex_wrap()
+                        .gap_3()
+                        .child(management_stat_tile(
+                            management_locale_text("Requests", "请求", "請求"),
+                            total.to_string(),
+                            success_caption,
+                            None,
+                            cx,
+                        ))
+                        .child(management_stat_tile(
+                            management_locale_text("Latency p50", "延迟 p50", "延遲 p50"),
+                            p50,
+                            format!("p95 {p95}"),
+                            None,
+                            cx,
+                        ))
+                        .child(management_stat_tile(
+                            "Token",
+                            gateway_token_count(tokens),
+                            management_locale_text(
+                                "Counted by the gateway",
+                                "网关计数",
+                                "閘道計數",
+                            )
+                            .to_string(),
+                            None,
+                            cx,
+                        ))
+                        .child(management_stat_tile(
+                            management_locale_text("Health", "健康", "健康"),
+                            health_label.to_string(),
+                            format!(
+                                "{} {top_error}",
+                                management_locale_text("Top error", "最多错误", "最多錯誤")
+                            ),
+                            Some(management_provider_health_color(health_status, cx)),
+                            cx,
+                        )),
+                );
             if total == 0 {
                 traffic = traffic.child(compact_empty_state(
                     management_locale_text("No traffic yet", "还没有流量", "還沒有流量"),
@@ -15684,29 +15881,69 @@ impl ManagementCenter {
         }
 
         if self.provider_detail_tab == ProviderDetailTab::Advanced {
-            let mut advanced = v_flex().w_full().gap_1();
-            for endpoint in &profile.endpoints {
-                advanced = advanced.child(
+            let pending = self.mutation.is_some();
+            // Endpoints first: they are the addresses every other setting on
+            // this tab shapes. A protocol-specific address names its protocol.
+            let mut endpoints = v_flex().w_full().min_w_0();
+            for (index, endpoint) in profile.endpoints.iter().enumerate() {
+                endpoints = endpoints.child(
                     h_flex()
                         .w_full()
+                        .min_w_0()
                         .items_center()
-                        .gap_2()
+                        .gap_3()
+                        .py_2()
+                        .when(index > 0, |row| {
+                            row.border_t_1()
+                                .border_color(cx.theme().border.opacity(0.6))
+                        })
                         .child(
-                            Tag::color(ColorName::Neutral)
-                                .xsmall()
-                                .child(format!("{:?}", endpoint.kind)),
+                            div()
+                                .flex_none()
+                                .w(rems(7.5))
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_endpoint_kind_label(
+                                    endpoint.kind,
+                                    endpoint.wire_protocol_id.as_deref(),
+                                )),
                         )
                         .child(
                             div()
                                 .min_w_0()
                                 .flex_1()
                                 .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_sm()
+                                .font_family(cx.theme().mono_font_family.clone())
                                 .child(endpoint.url.clone()),
                         ),
                 );
             }
+            if profile.endpoints.is_empty() {
+                endpoints = endpoints.child(
+                    div()
+                        .py_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "No endpoint saved",
+                            "还没有保存端点",
+                            "還沒有儲存端點",
+                        )),
+                );
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Endpoints", "端点", "端點"),
+                management_locale_text(
+                    "The addresses requests are sent to. Edit the Provider to change them.",
+                    "请求发往的地址；如需修改请编辑供应商。",
+                    "請求發往的位址；如需修改請編輯供應商。",
+                ),
+                "icons/vibex/globe.svg",
+                endpoints.into_any_element(),
+                cx,
+            ));
+
             let proxy_label = match profile.proxy_policy {
                 vibex_core::ModelProviderProxyPolicy::InheritSystem => {
                     management_locale_text("Inherit system proxy", "跟随系统代理", "跟隨系統代理")
@@ -15718,301 +15955,293 @@ impl ManagementCenter {
                     management_locale_text("Custom proxy", "自定义代理", "自訂代理")
                 }
             };
-            advanced = advanced
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text("Proxy", "代理", "代理")),
-                        )
-                        .child(div().text_sm().child(proxy_label)),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text("Headers", "请求头", "請求標頭")),
-                        )
-                        .child(div().text_sm().child(profile.headers.len().to_string())),
-                )
-                .when(profile.metadata.only_through_route_groups, |card| {
-                    card.child(div().text_xs().text_color(cx.theme().warning).child(
+            let auth_modes: [(&'static str, &'static str); 4] = [
+                ("auto", management_locale_text("Auto", "自动", "自動")),
+                ("x-api-key", "x-api-key"),
+                ("bearer", "Authorization: Bearer"),
+                (
+                    "both",
+                    management_locale_text("Both", "两者都发", "兩者都發"),
+                ),
+            ];
+            let ua_modes: [(&'static str, &'static str); 2] = [
+                (
+                    "default",
+                    management_locale_text("Vibex default", "Vibex 默认", "Vibex 預設"),
+                ),
+                (
+                    "pass_through",
+                    management_locale_text(
+                        "Pass the Agent's through",
+                        "透传 Agent 的",
+                        "透傳 Agent 的",
+                    ),
+                ),
+            ];
+            let auth_select = management_option_menu(
+                "management-shared-provider-auth-mode",
+                &auth_modes,
+                profile
+                    .metadata
+                    .auth_header_mode
+                    .as_deref()
+                    .unwrap_or("auto"),
+                pending,
+                cx.weak_entity(),
+                {
+                    let profile_id = profile.id.clone();
+                    move |this, value, cx| {
+                        this.update_shared_provider_metadata(
+                            profile_id.clone(),
+                            move |metadata| {
+                                metadata.auth_header_mode =
+                                    (value != "auto").then(|| value.to_string());
+                            },
+                            cx,
+                        );
+                    }
+                },
+            );
+            let ua_select = management_option_menu(
+                "management-shared-provider-ua-mode",
+                &ua_modes,
+                profile
+                    .metadata
+                    .user_agent_mode
+                    .as_deref()
+                    .unwrap_or("default"),
+                pending,
+                cx.weak_entity(),
+                {
+                    let profile_id = profile.id.clone();
+                    move |this, value, cx| {
+                        this.update_shared_provider_metadata(
+                            profile_id.clone(),
+                            move |metadata| {
+                                metadata.user_agent_mode =
+                                    (value != "default").then(|| value.to_string());
+                            },
+                            cx,
+                        );
+                    }
+                },
+            );
+            let tls_locked = profile.metadata.catalog_id.is_some()
+                && profile.metadata.category.as_deref() != Some("local");
+            let settings = management_settings_list(
+                vec![
+                    management_setting_row(
+                        management_locale_text("Proxy", "代理", "代理"),
                         management_locale_text(
-                            "Only reachable through route groups",
-                            "仅通过路由组使用",
-                            "僅透過路由組使用",
+                            "How requests reach the endpoints.",
+                            "请求如何到达端点。",
+                            "請求如何到達端點。",
                         ),
-                    ))
-                })
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_start()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text("Auth header", "认证头", "認證標頭")),
-                        )
-                        .child({
-                            let modes = [
-                                ("auto", management_locale_text("Auto", "自动", "自動")),
-                                (
-                                    "x-api-key",
-                                    management_locale_text("x-api-key", "x-api-key", "x-api-key"),
-                                ),
-                                (
-                                    "bearer",
-                                    management_locale_text("Bearer", "Bearer", "Bearer"),
-                                ),
-                                ("both", management_locale_text("Both", "两者", "兩者")),
-                            ];
-                            let current = profile
-                                .metadata
-                                .auth_header_mode
-                                .as_deref()
-                                .unwrap_or("auto");
-                            ButtonGroup::new("management-shared-provider-auth-mode-group")
-                                .xsmall()
-                                .outline()
-                                .children(modes.into_iter().map(|(value, label)| {
-                                    Button::new(SharedString::from(format!(
-                                        "management-shared-provider-auth-mode-{value}"
-                                    )))
-                                    .xsmall()
-                                    .label(label)
-                                    .selected(current == value)
-                                }))
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    move |this, clicks: &Vec<usize>, _, cx| {
-                                        if let Some((value, _)) =
-                                            clicks.first().and_then(|index| modes.get(*index))
-                                        {
-                                            let value = (*value).to_string();
-                                            this.update_shared_provider_metadata(
-                                                profile_id.clone(),
-                                                move |metadata| {
-                                                    metadata.auth_header_mode =
-                                                        (value != "auto").then_some(value);
-                                                },
-                                                cx,
-                                            );
-                                        }
-                                    }
-                                }))
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "User-Agent",
-                                    "User-Agent",
-                                    "User-Agent",
-                                )),
-                        )
-                        .child({
-                            let modes = [
-                                ("default", management_locale_text("Default", "默认", "預設")),
-                                (
-                                    "pass_through",
-                                    management_locale_text("Pass through", "透传", "透傳"),
-                                ),
-                            ];
-                            let current = profile
-                                .metadata
-                                .user_agent_mode
-                                .as_deref()
-                                .unwrap_or("default");
-                            ButtonGroup::new("management-shared-provider-ua-mode-group")
-                                .xsmall()
-                                .outline()
-                                .children(modes.into_iter().map(|(value, label)| {
-                                    Button::new(SharedString::from(format!(
-                                        "management-shared-provider-ua-mode-{value}"
-                                    )))
-                                    .xsmall()
-                                    .label(label)
-                                    .selected(current == value)
-                                }))
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    move |this, clicks: &Vec<usize>, _, cx| {
-                                        if let Some((value, _)) =
-                                            clicks.first().and_then(|index| modes.get(*index))
-                                        {
-                                            let value = (*value).to_string();
-                                            this.update_shared_provider_metadata(
-                                                profile_id.clone(),
-                                                move |metadata| {
-                                                    metadata.user_agent_mode =
-                                                        (value != "default").then_some(value);
-                                                },
-                                                cx,
-                                            );
-                                        }
-                                    }
-                                }))
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Auto-refresh models",
-                                    "自动刷新模型",
-                                    "自動重新整理模型",
-                                )),
-                        )
-                        .child(
-                            Switch::new("management-shared-provider-auto-refresh")
-                                .small()
-                                .checked(profile.metadata.auto_refresh_models)
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    move |this, checked, _, cx| {
-                                        this.update_shared_provider_metadata(
-                                            profile_id.clone(),
-                                            move |metadata| metadata.auto_refresh_models = *checked,
-                                            cx,
-                                        )
-                                    }
-                                })),
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(proxy_label)
+                            .into_any_element(),
+                        cx,
+                    ),
+                    management_setting_row(
+                        management_locale_text("Auth header", "认证头", "認證標頭"),
+                        management_locale_text(
+                            "Which header carries the Key. Auto follows the protocol.",
+                            "用哪个请求头携带 Key；自动会按协议选择。",
+                            "用哪個請求標頭攜帶 Key；自動會依協定選擇。",
                         ),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Allow self-signed TLS",
-                                    "允许自签 TLS",
-                                    "允許自簽 TLS",
-                                )),
-                        )
-                        .child(
-                            Switch::new("management-shared-provider-tls-invalid")
-                                .small()
-                                .checked(profile.metadata.tls_accept_invalid)
-                                .disabled(
-                                    profile.metadata.catalog_id.is_some()
-                                        && profile.metadata.category.as_deref() != Some("local"),
-                                )
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    move |this, checked, _, cx| {
-                                        this.update_shared_provider_metadata(
-                                            profile_id.clone(),
-                                            move |metadata| metadata.tls_accept_invalid = *checked,
-                                            cx,
-                                        )
-                                    }
-                                })),
+                        auth_select,
+                        cx,
+                    ),
+                    management_setting_row(
+                        "User-Agent",
+                        management_locale_text(
+                            "The User-Agent sent upstream.",
+                            "发往上游的 User-Agent。",
+                            "發往上游的 User-Agent。",
                         ),
-                );
+                        ua_select,
+                        cx,
+                    ),
+                    management_setting_row(
+                        management_locale_text("Request headers", "请求头", "請求標頭"),
+                        management_locale_text(
+                            "Extra headers sent with every request.",
+                            "每个请求额外携带的请求头。",
+                            "每個請求額外攜帶的請求標頭。",
+                        ),
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if profile.headers.is_empty() {
+                                management_locale_text("None", "无", "無").to_string()
+                            } else {
+                                profile.headers.len().to_string()
+                            })
+                            .into_any_element(),
+                        cx,
+                    ),
+                    management_setting_row(
+                        management_locale_text(
+                            "Auto-refresh models",
+                            "自动刷新模型",
+                            "自動重新整理模型",
+                        ),
+                        management_locale_text(
+                            "Fetch the model list again when Vibex starts.",
+                            "Vibex 启动时重新获取模型列表。",
+                            "Vibex 啟動時重新取得模型清單。",
+                        ),
+                        Switch::new("management-shared-provider-auto-refresh")
+                            .small()
+                            .checked(profile.metadata.auto_refresh_models)
+                            .disabled(pending)
+                            .on_click(cx.listener({
+                                let profile_id = profile.id.clone();
+                                move |this, checked, _, cx| {
+                                    this.update_shared_provider_metadata(
+                                        profile_id.clone(),
+                                        move |metadata| metadata.auto_refresh_models = *checked,
+                                        cx,
+                                    )
+                                }
+                            }))
+                            .into_any_element(),
+                        cx,
+                    ),
+                    management_setting_row(
+                        management_locale_text(
+                            "Allow self-signed TLS",
+                            "允许自签 TLS",
+                            "允許自簽 TLS",
+                        ),
+                        if tls_locked {
+                            management_locale_text(
+                                "Only for custom and local Providers.",
+                                "仅适用于自定义和本地供应商。",
+                                "僅適用於自訂和本機供應商。",
+                            )
+                        } else {
+                            management_locale_text(
+                                "Accept certificates no authority signed. Use only on networks you trust.",
+                                "接受未经机构签发的证书，仅在可信网络中使用。",
+                                "接受未經機構簽發的憑證，僅在可信網路中使用。",
+                            )
+                        },
+                        Switch::new("management-shared-provider-tls-invalid")
+                            .small()
+                            .checked(profile.metadata.tls_accept_invalid)
+                            .disabled(pending || tls_locked)
+                            .on_click(cx.listener({
+                                let profile_id = profile.id.clone();
+                                move |this, checked, _, cx| {
+                                    this.update_shared_provider_metadata(
+                                        profile_id.clone(),
+                                        move |metadata| metadata.tls_accept_invalid = *checked,
+                                        cx,
+                                    )
+                                }
+                            }))
+                            .into_any_element(),
+                        cx,
+                    ),
+                ],
+                cx,
+            );
             body = body.child(management_card_with_icon(
-                management_locale_text("Advanced", "高级", "進階"),
+                management_locale_text("Connection", "连接", "連線"),
                 management_locale_text(
-                    "Endpoints and visibility settings that are not part of the model list.",
-                    "不属于模型列表的端点与可见性设置。",
-                    "不屬於模型清單的端點與可見性設定。",
+                    "How Vibex talks to this Provider. Changes apply right away.",
+                    "Vibex 与该供应商通信的方式，修改立即生效。",
+                    "Vibex 與該供應商通訊的方式，修改立即生效。",
                 ),
                 "icons/vibex/settings.svg",
-                advanced.into_any_element(),
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(settings)
+                    .when(profile.metadata.only_through_route_groups, |card| {
+                        card.child(div().text_xs().text_color(cx.theme().warning).child(
+                            management_locale_text(
+                                "Agents reach this Provider only through route groups.",
+                                "Agent 只能通过路由组使用该供应商。",
+                                "Agent 只能透過路由組使用該供應商。",
+                            ),
+                        ))
+                    })
+                    .into_any_element(),
                 cx,
             ));
             body = body.child(self.render_shared_provider_endpoint_probes(profile, cx));
             body = body.child(self.render_shared_provider_advanced_editor(profile, window, cx));
-        }
 
-        if self.provider_detail_tab == ProviderDetailTab::Advanced {
+            // The irreversible command closes the page, apart from everything
+            // that can be changed back.
             let delete_id = profile.id.clone();
             let delete_label = profile.display_name.clone();
             let used_by = row.agents.len();
-            let pending = self.mutation.is_some();
-            body = body.child(management_card_with_icon(
-            management_locale_text("Delete", "删除", "刪除"),
-            if used_by == 0 {
-                management_locale_text(
-                    "No Agent uses this Provider, so deleting it changes nothing else.",
-                    "没有 Agent 使用该供应商，删除不会影响其他配置。",
-                    "沒有 Agent 使用該供應商，刪除不會影響其他設定。",
-                )
-            } else {
-                management_locale_text(
-                    "Deleting removes this Provider and unbinds it from every Agent that uses it.",
-                    "删除会移除该供应商，并从所有使用它的 Agent 上解绑。",
-                    "刪除會移除該供應商，並從所有使用它的 Agent 上解綁。",
-                )
-            },
-            "icons/vibex/trash-2.svg",
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "The models it served stop being available to those Agents.",
-                            "它提供的模型将不再对那些 Agent 可用。",
-                            "它提供的模型將不再對那些 Agent 可用。",
+            body = body.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_4()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().danger.opacity(0.35))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(div().text_sm().font_medium().child(management_locale_text(
+                                "Delete this Provider",
+                                "删除该供应商",
+                                "刪除該供應商",
+                            )))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if used_by == 0 {
+                                        management_locale_text(
+                                            "No Agent uses it, so nothing else changes.",
+                                            "没有 Agent 使用它，删除不会影响其他配置。",
+                                            "沒有 Agent 使用它，刪除不會影響其他設定。",
+                                        )
+                                    } else {
+                                        management_locale_text(
+                                            "Every Agent that uses it loses this model source.",
+                                            "所有使用它的 Agent 都会失去这个模型来源。",
+                                            "所有使用它的 Agent 都會失去這個模型來源。",
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-delete-{}",
+                            delete_id.as_str()
+                        )))
+                        .small()
+                        .danger()
+                        .label(management_locale_text("Delete…", "删除…", "刪除…"))
+                        .disabled(pending)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.confirm_delete_shared_provider(
+                                    delete_id.clone(),
+                                    delete_label.clone(),
+                                    window,
+                                    cx,
+                                )
+                            },
                         )),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-delete-{}",
-                        delete_id.as_str()
-                    )))
-                    .xsmall()
-                    .danger()
-                    .label(management_delete_profile_label())
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.confirm_delete_shared_provider(
-                            delete_id.clone(),
-                            delete_label.clone(),
-                            window,
-                            cx,
-                        )
-                    })),
-                )
-                .into_any_element(),
-            cx,
-        ));
+                    ),
+            );
         }
 
         v_flex()
@@ -19311,8 +19540,13 @@ impl ManagementCenter {
         )
     }
 
-    /// One shared Provider's header: name, status, and the facts that decide
-    /// whether it can serve a request.
+    /// The Provider's identity band, drawn above every tab of its page.
+    ///
+    /// It answers what a reader looks for first — which Provider, whether it
+    /// is on, where it points and whether it works — and keeps the commands
+    /// that act on the whole Provider in one place. The previous header was a
+    /// card on the Overview tab only, written as a label/value table, so the
+    /// other five tabs showed no name at all and Delete lived on its own tab.
     fn render_shared_provider_header(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
@@ -19335,7 +19569,8 @@ impl ManagementCenter {
         } else {
             None
         };
-        let name_row = if let Some(input) = name_input {
+        let enabled = profile.status == vibex_core::ModelProviderProfileStatus::Enabled;
+        let title = if let Some(input) = name_input {
             h_flex()
                 .w_full()
                 .min_w_0()
@@ -19345,11 +19580,12 @@ impl ManagementCenter {
                     div()
                         .flex_1()
                         .min_w_0()
+                        .max_w(rems(20.0))
                         .child(Input::new(&input).small().w_full()),
                 )
                 .child(
                     Button::new("management-shared-provider-name-save")
-                        .xsmall()
+                        .small()
                         .primary()
                         .label(management_locale_text("Save", "保存", "儲存"))
                         .disabled(pending)
@@ -19362,7 +19598,7 @@ impl ManagementCenter {
                 )
                 .child(
                     Button::new("management-shared-provider-name-cancel")
-                        .xsmall()
+                        .small()
                         .ghost()
                         .label(management_locale_text("Cancel", "取消", "取消"))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -19378,77 +19614,19 @@ impl ManagementCenter {
                 .w_full()
                 .min_w_0()
                 .items_center()
-                .gap_1()
-                .child(div().text_sm().child(management_locale_text(
-                    "Display name",
-                    "显示名",
-                    "顯示名",
-                )))
+                .gap_2()
                 .child(
                     div()
                         .min_w_0()
-                        .flex_1()
                         .truncate()
-                        .text_sm()
-                        .font_medium()
+                        .text_lg()
+                        .font_semibold()
                         .child(profile.display_name.clone()),
                 )
                 .child(
-                    Button::new("management-shared-provider-name-edit")
-                        .xsmall()
-                        .ghost()
-                        .compact()
-                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
-                        .tooltip(management_locale_text("Rename", "重命名", "重新命名"))
-                        .accessibility_label(management_locale_text("Rename", "重命名", "重新命名"))
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let profile = profile.clone();
-                            move |this, _, window, cx| {
-                                this.open_shared_provider_name_editor(&profile, window, cx)
-                            }
-                        })),
-                )
-                .child(
-                    Button::new("management-shared-provider-test")
-                        .xsmall()
-                        .ghost()
-                        .label(management_locale_text("Test", "测试", "測試"))
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let profile_id = profile.id.clone();
-                            move |this, _, _, cx| this.test_shared_provider(profile_id.clone(), cx)
-                        })),
-                )
-                .child(
-                    Button::new("management-shared-provider-refresh-models")
-                        .xsmall()
-                        .ghost()
-                        .label(management_locale_text(
-                            "Refresh models",
-                            "刷新模型",
-                            "重新整理模型",
-                        ))
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let profile_id = profile.id.clone();
-                            move |this, _, _, cx| {
-                                this.refresh_shared_provider_models(profile_id.clone(), cx)
-                            }
-                        })),
-                )
-                .child(
-                    Button::new("management-shared-provider-edit")
-                        .xsmall()
-                        .outline()
-                        .label(management_locale_text("Edit", "编辑", "編輯"))
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let profile = profile.clone();
-                            move |this, _, window, cx| {
-                                this.open_shared_provider_editor(&profile, window, cx)
-                            }
-                        })),
+                    div()
+                        .flex_none()
+                        .child(gateway_provider_status_badge(profile, cx)),
                 )
                 .into_any_element()
         };
@@ -19456,72 +19634,356 @@ impl ManagementCenter {
             .then(|| self.shared_provider_name_error.clone())
             .flatten();
 
-        let enabled = profile.status == vibex_core::ModelProviderProfileStatus::Enabled;
-        let mut details = v_flex().w_full().gap_2();
-        details = details.child(v_flex().w_full().gap_1().child(name_row).children(
-            name_error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
-        ));
-        details = details.child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .child(management_locale_text("Status", "状态", "狀態")),
-                )
-                .child(
-                    Switch::new("management-shared-provider-enabled")
-                        .small()
-                        .checked(enabled)
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let profile_id = profile.id.clone();
-                            move |this, checked, _, cx| {
-                                this.set_shared_provider_enabled(profile_id.clone(), *checked, cx)
-                            }
-                        })),
-                ),
-        );
+        // One line of facts, in the order a reader checks them: where the
+        // Provider points, what it offers, what it signs with, whether it works.
         let ready_keys = profile
             .credentials
             .iter()
             .filter(|credential| credential.status == vibex_core::AgentCredentialStatus::Ready)
             .count();
-        let mut facts = vec![
-            (
+        let enabled_models = profile
+            .configured_models
+            .iter()
+            .filter(|model| model.enabled)
+            .count();
+        let (health_label, health_status) = self.shared_provider_health_label(profile);
+        let health_color = management_provider_health_color(health_status, cx);
+        let mut facts = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .flex_wrap()
+            .gap_x_2()
+            .gap_y_0p5()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground);
+        let separator = || div().flex_none().child("·");
+        if let Some(endpoint) = profile.primary_api_endpoint() {
+            facts = facts
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w(rems(24.0))
+                        .truncate()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(endpoint.url.clone()),
+                )
+                .child(separator());
+        }
+        facts = facts
+            .child(management_provider_card_summary(
+                enabled_models,
+                profile.credentials.len(),
+                locale::current_locale(),
+            ))
+            .when(ready_keys < profile.credentials.len(), |facts| {
+                facts
+                    .child(separator())
+                    .child(div().text_color(cx.theme().warning).child(format!(
+                        "{} {ready_keys}/{}",
+                        management_locale_text("Keys ready", "可用 Key", "可用 Key"),
+                        profile.credentials.len()
+                    )))
+            })
+            .child(separator())
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .child(div().size(px(6.0)).rounded_full().bg(health_color))
+                    .child(div().text_color(health_color).child(health_label)),
+            );
+
+        // Secondary commands share one menu. Test and Edit stay visible because
+        // they are what a reader does most here; Rename, the catalogue refresh
+        // and the irreversible Delete are one click further and Delete sits
+        // apart from the rest.
+        let menu_center = cx.weak_entity();
+        let menu_profile = profile.clone();
+        let more = Button::new("management-shared-provider-more")
+            .small()
+            .ghost()
+            .icon(IconName::Ellipsis)
+            .tooltip(management_locale_text(
+                "More actions",
+                "更多操作",
+                "更多操作",
+            ))
+            .accessibility_label(management_locale_text(
+                "More actions",
+                "更多操作",
+                "更多操作",
+            ))
+            .disabled(pending)
+            .dropdown_menu(move |menu, _, _| {
+                let rename = {
+                    let center = menu_center.clone();
+                    let profile = menu_profile.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        center
+                            .update(cx, |this, cx| {
+                                this.open_shared_provider_name_editor(&profile, window, cx)
+                            })
+                            .ok();
+                    }
+                };
+                let refresh = {
+                    let center = menu_center.clone();
+                    let profile_id = menu_profile.id.clone();
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        center
+                            .update(cx, |this, cx| {
+                                this.refresh_shared_provider_models(profile_id.clone(), cx)
+                            })
+                            .ok();
+                    }
+                };
+                let delete = {
+                    let center = menu_center.clone();
+                    let profile_id = menu_profile.id.clone();
+                    let label = menu_profile.display_name.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        center
+                            .update(cx, |this, cx| {
+                                this.confirm_delete_shared_provider(
+                                    profile_id.clone(),
+                                    label.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .ok();
+                    }
+                };
+                menu.item(
+                    PopupMenuItem::new(management_locale_text("Rename…", "重命名…", "重新命名…"))
+                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                        .on_click(rename),
+                )
+                .item(
+                    PopupMenuItem::new(management_locale_text(
+                        "Refresh models",
+                        "刷新模型",
+                        "重新整理模型",
+                    ))
+                    .icon(IconName::RefreshCw)
+                    .on_click(refresh),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(management_locale_text(
+                        "Delete Provider…",
+                        "删除供应商…",
+                        "刪除供應商…",
+                    ))
+                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                    .on_click(delete),
+                )
+            });
+        let actions = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .child(
+                Switch::new("management-shared-provider-enabled")
+                    .small()
+                    .checked(enabled)
+                    .disabled(pending)
+                    .label(if enabled {
+                        management_locale_text("On", "启用", "啟用")
+                    } else {
+                        management_locale_text("Off", "停用", "停用")
+                    })
+                    .tooltip(if enabled {
+                        management_locale_text(
+                            "Turn off: Agents stop using this Provider",
+                            "停用后 Agent 不再使用该供应商",
+                            "停用後 Agent 不再使用該供應商",
+                        )
+                    } else {
+                        management_locale_text(
+                            "Turn on: bound Agents can use this Provider",
+                            "启用后已绑定的 Agent 可以使用该供应商",
+                            "啟用後已綁定的 Agent 可以使用該供應商",
+                        )
+                    })
+                    .on_click(cx.listener({
+                        let profile_id = profile.id.clone();
+                        move |this, checked, _, cx| {
+                            this.set_shared_provider_enabled(profile_id.clone(), *checked, cx)
+                        }
+                    })),
+            )
+            .child(Separator::vertical().h(rems(1.25)))
+            .child(
+                Button::new("management-shared-provider-test")
+                    .small()
+                    .outline()
+                    .icon(Icon::default().path("icons/vibex/zap.svg"))
+                    .label(management_locale_text("Test", "测试", "測試"))
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let profile_id = profile.id.clone();
+                        move |this, _, _, cx| this.test_shared_provider(profile_id.clone(), cx)
+                    })),
+            )
+            .child(
+                Button::new("management-shared-provider-edit")
+                    .small()
+                    .outline()
+                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                    .label(management_locale_text("Edit…", "编辑…", "編輯…"))
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let profile = profile.clone();
+                        move |this, _, window, cx| {
+                            this.open_shared_provider_editor(&profile, window, cx)
+                        }
+                    })),
+            )
+            .child(more);
+
+        v_flex()
+            .id("management-shared-provider-header")
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_3()
+                    .child(provider_logo_tile(profile, px(40.0), cx))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(title)
+                            .child(facts),
+                    )
+                    .child(actions),
+            )
+            .children(
+                name_error
+                    .map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+            )
+            .into_any_element()
+    }
+
+    /// The Overview's first row: four tiles that say whether the Provider
+    /// can serve a request right now.
+    ///
+    /// Counts read better as large numbers than as a label/value table, and the
+    /// traffic tile uses the same window the Traffic tab is set to, so the two
+    /// never disagree.
+    fn render_shared_provider_overview_stats(
+        &self,
+        profile: &vibex_core::ModelProviderProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let enabled_models = profile
+            .configured_models
+            .iter()
+            .filter(|model| model.enabled)
+            .count();
+        let ready_keys = profile
+            .credentials
+            .iter()
+            .filter(|credential| credential.status == vibex_core::AgentCredentialStatus::Ready)
+            .count();
+        let (health_label, health_status) = self.shared_provider_health_label(profile);
+        let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
+        let requests = self
+            .gateway_requests
+            .iter()
+            .filter(|request| {
+                request.model_provider_profile_id == profile.id && request.created_at_ms >= cutoff
+            })
+            .collect::<Vec<_>>();
+        let succeeded = requests
+            .iter()
+            .filter(|request| request.status.is_some_and(|status| status < 400))
+            .count();
+        let traffic_caption = if requests.is_empty() {
+            management_locale_text("No traffic yet", "还没有流量", "還沒有流量").to_string()
+        } else {
+            format!(
+                "{} {:.0}% · {}",
+                management_locale_text("Success", "成功率", "成功率"),
+                succeeded as f64 * 100.0 / requests.len() as f64,
+                self.traffic_range.label()
+            )
+        };
+        let models_caption = if profile.configured_models.len() > enabled_models {
+            format!(
+                "{} {}",
+                profile.configured_models.len() - enabled_models,
+                management_locale_text("turned off", "个已停用", "個已停用")
+            )
+        } else {
+            management_locale_text("All turned on", "全部启用", "全部啟用").to_string()
+        };
+        let keys_caption = if profile.credentials.is_empty() {
+            management_locale_text(
+                "Add a Key to use it",
+                "添加 Key 后才能使用",
+                "新增 Key 後才能使用",
+            )
+            .to_string()
+        } else if ready_keys == profile.credentials.len() {
+            management_locale_text("All ready", "全部可用", "全部可用").to_string()
+        } else {
+            format!(
+                "{} {}",
+                profile.credentials.len() - ready_keys,
+                management_locale_text("unavailable", "个不可用", "個不可用")
+            )
+        };
+        let keys_tone = (profile.credentials.is_empty() || ready_keys < profile.credentials.len())
+            .then(|| cx.theme().warning);
+        h_flex()
+            .id("management-provider-overview-stats")
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .gap_3()
+            .child(management_stat_tile(
                 management_locale_text("Models", "模型", "模型"),
-                profile
-                    .configured_models
-                    .iter()
-                    .filter(|model| model.enabled)
-                    .count()
-                    .to_string(),
-            ),
-            (
+                format!("{enabled_models}"),
+                models_caption,
+                None,
+                cx,
+            ))
+            .child(management_stat_tile(
                 management_locale_text("Keys", "Key", "Key"),
                 format!("{ready_keys}/{}", profile.credentials.len()),
-            ),
-        ];
-        if let Some(endpoint) = profile.primary_api_endpoint() {
-            facts.push((
-                management_locale_text("Endpoint", "接口地址", "介面位址"),
-                endpoint.url.clone(),
-            ));
-        }
-        details = details.child(description_rows_plain(facts));
-        management_card_dynamic(
-            profile.display_name.clone(),
-            management_locale_text(
-                "A shared Provider. Every Agent below uses the same keys.",
-                "共享的供应商。下面每个 Agent 使用同一套 Key。",
-                "共享的供應商。下面每個 Agent 使用同一套 Key。",
-            ),
-            details.into_any_element(),
-            cx,
-        )
+                keys_caption,
+                keys_tone,
+                cx,
+            ))
+            .child(management_stat_tile(
+                management_locale_text("Health", "健康", "健康"),
+                health_label.to_string(),
+                management_locale_text(
+                    "From the latest probe",
+                    "来自最近一次探测",
+                    "來自最近一次探測",
+                )
+                .to_string(),
+                Some(management_provider_health_color(health_status, cx)),
+                cx,
+            ))
+            .child(management_stat_tile(
+                management_locale_text("Requests", "请求", "請求"),
+                requests.len().to_string(),
+                traffic_caption,
+                None,
+                cx,
+            ))
+            .into_any_element()
     }
 
     /// The identity a Key row shows: its masked fingerprint, an explicit
@@ -19760,20 +20222,201 @@ impl ManagementCenter {
                         credential.credential.secret_reference().is_some(),
                         cx,
                     ))
-                    .child(
+                    .child({
+                        // The row keeps what is checked often in sight — the
+                        // state, the on/off switch and Test — and folds the
+                        // rarer commands into one menu, Remove last and apart.
+                        let menu_center = cx.weak_entity();
+                        let menu_profile = profile.id.clone();
+                        let menu_credential = credential.id.clone();
+                        let more = Button::new(SharedString::from(format!(
+                            "management-shared-provider-key-more-{}",
+                            credential.id.as_str()
+                        )))
+                        .small()
+                        .ghost()
+                        .icon(IconName::Ellipsis)
+                        .tooltip(management_locale_text(
+                            "More actions",
+                            "更多操作",
+                            "更多操作",
+                        ))
+                        .accessibility_label(management_locale_text(
+                            "More actions",
+                            "更多操作",
+                            "更多操作",
+                        ))
+                        .disabled(pending)
+                        .dropdown_menu(move |menu, _, _| {
+                            let prefer = {
+                                let center = menu_center.clone();
+                                let profile_id = menu_profile.clone();
+                                let credential_id = menu_credential.clone();
+                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                    center
+                                        .update(cx, |this, cx| {
+                                            this.update_gateway_settings(
+                                                |request| {
+                                                    request.account_updates.push(
+                                                        vibex_core::GatewayAccountUpdate {
+                                                            model_provider_profile_id: profile_id
+                                                                .clone(),
+                                                            credential_id: credential_id.clone(),
+                                                            enabled: None,
+                                                            preferred: Some(true),
+                                                        },
+                                                    );
+                                                },
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                }
+                            };
+                            let replace = {
+                                let center = menu_center.clone();
+                                let profile_id = menu_profile.clone();
+                                let credential_id = menu_credential.clone();
+                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                    center
+                                        .update(cx, |this, cx| {
+                                            if replace_open {
+                                                this.gateway_key_replace_target = None;
+                                            } else {
+                                                this.gateway_key_replace_target = Some((
+                                                    profile_id.clone(),
+                                                    credential_id.clone(),
+                                                ));
+                                            }
+                                            this.gateway_key_replace_input = None;
+                                            this.gateway_key_replace_error = None;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
+                            };
+                            let remove = {
+                                let center = menu_center.clone();
+                                let profile_id = menu_profile.clone();
+                                let credential_id = menu_credential.clone();
+                                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                    center
+                                        .update(cx, |this, cx| {
+                                            this.confirm_remove_provider_key(
+                                                profile_id.clone(),
+                                                credential_id.clone(),
+                                                count,
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                }
+                            };
+                            let scope = {
+                                let center = menu_center.clone();
+                                let profile_id = menu_profile.clone();
+                                let credential_id = menu_credential.clone();
+                                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                    center
+                                        .update(cx, |this, cx| {
+                                            this.open_gateway_key_policy_editor(
+                                                &profile_id,
+                                                &credential_id,
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                }
+                            };
+                            menu.item(
+                                PopupMenuItem::new(management_locale_text(
+                                    "Prefer this Key",
+                                    "优先使用该 Key",
+                                    "優先使用該 Key",
+                                ))
+                                .on_click(prefer),
+                            )
+                            .item(
+                                PopupMenuItem::new(if replace_open {
+                                    management_locale_text(
+                                        "Cancel replacing",
+                                        "取消更换",
+                                        "取消更換",
+                                    )
+                                } else {
+                                    management_locale_text("Replace Key…", "更换 Key…", "更換 Key…")
+                                })
+                                .on_click(replace),
+                            )
+                            .item(
+                                PopupMenuItem::new(management_locale_text(
+                                    "Scope and proxy…",
+                                    "范围与代理…",
+                                    "範圍與代理…",
+                                ))
+                                .on_click(scope),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(management_locale_text(
+                                    "Remove Key…",
+                                    "移除 Key…",
+                                    "移除 Key…",
+                                ))
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .on_click(remove),
+                            )
+                        });
                         h_flex()
+                            .flex_none()
                             .items_center()
                             .gap_2()
                             .child(state)
+                            .child(
+                                Switch::new(SharedString::from(format!(
+                                    "management-shared-provider-toggle-key-{}",
+                                    credential.id.as_str()
+                                )))
+                                .small()
+                                .checked(key_enabled)
+                                .disabled(pending)
+                                .tooltip(if key_enabled {
+                                    management_locale_text(
+                                        "Turn off this Key",
+                                        "停用该 Key",
+                                        "停用該 Key",
+                                    )
+                                } else {
+                                    management_locale_text(
+                                        "Turn on this Key",
+                                        "启用该 Key",
+                                        "啟用該 Key",
+                                    )
+                                })
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    let credential_id = credential.id.clone();
+                                    move |this, checked, _, cx| {
+                                        this.set_gateway_key_enabled(
+                                            profile_id.clone(),
+                                            credential_id.clone(),
+                                            *checked,
+                                            cx,
+                                        )
+                                    }
+                                })),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!(
                                     "management-shared-provider-test-key-{}",
                                     credential.id.as_str()
                                 )))
-                                .xsmall()
-                                .ghost()
+                                .small()
+                                .outline()
                                 .label(if key_testing {
-                                    management_locale_text("Testing...", "测试中...", "測試中...")
+                                    management_locale_text("Testing…", "测试中…", "測試中…")
                                 } else {
                                     management_locale_text("Test", "测试", "測試")
                                 })
@@ -19791,117 +20434,8 @@ impl ManagementCenter {
                                     }
                                 })),
                             )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-shared-provider-toggle-key-{}",
-                                    credential.id.as_str()
-                                )))
-                                .xsmall()
-                                .ghost()
-                                .label(if key_enabled {
-                                    management_locale_text("Disable", "停用", "停用")
-                                } else {
-                                    management_locale_text("Enable", "启用", "啟用")
-                                })
-                                .disabled(pending)
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    let credential_id = credential.id.clone();
-                                    move |this, _, _, cx| {
-                                        this.set_gateway_key_enabled(
-                                            profile_id.clone(),
-                                            credential_id.clone(),
-                                            !key_enabled,
-                                            cx,
-                                        )
-                                    }
-                                })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-shared-provider-prefer-key-{}",
-                                    credential.id.as_str()
-                                )))
-                                .xsmall()
-                                .ghost()
-                                .label(management_locale_text("Prefer", "优先", "優先"))
-                                .disabled(pending)
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    let credential_id = credential.id.clone();
-                                    move |this, _, _, cx| {
-                                        this.update_gateway_settings(
-                                            |request| {
-                                                request.account_updates.push(
-                                                    vibex_core::GatewayAccountUpdate {
-                                                        model_provider_profile_id: profile_id
-                                                            .clone(),
-                                                        credential_id: credential_id.clone(),
-                                                        enabled: None,
-                                                        preferred: Some(true),
-                                                    },
-                                                );
-                                            },
-                                            cx,
-                                        )
-                                    }
-                                })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-shared-provider-replace-key-{}",
-                                    credential.id.as_str()
-                                )))
-                                .xsmall()
-                                .ghost()
-                                .label(if replace_open {
-                                    management_locale_text("Cancel", "取消", "取消")
-                                } else {
-                                    management_locale_text("Replace key", "更换 Key", "更換 Key")
-                                })
-                                .disabled(pending)
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    let credential_id = credential.id.clone();
-                                    move |this, _, _, cx| {
-                                        if replace_open {
-                                            this.gateway_key_replace_target = None;
-                                            this.gateway_key_replace_input = None;
-                                            this.gateway_key_replace_error = None;
-                                        } else {
-                                            this.gateway_key_replace_target =
-                                                Some((profile_id.clone(), credential_id.clone()));
-                                            this.gateway_key_replace_input = None;
-                                            this.gateway_key_replace_error = None;
-                                        }
-                                        cx.notify();
-                                    }
-                                })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-shared-provider-remove-key-{}",
-                                    credential.id.as_str()
-                                )))
-                                .xsmall()
-                                .ghost()
-                                .label(management_locale_text("Remove", "移除", "移除"))
-                                .disabled(pending)
-                                .on_click(cx.listener({
-                                    let profile_id = profile.id.clone();
-                                    let credential_id = credential.id.clone();
-                                    move |this, _, window, cx| {
-                                        this.confirm_remove_provider_key(
-                                            profile_id.clone(),
-                                            credential_id.clone(),
-                                            count,
-                                            window,
-                                            cx,
-                                        )
-                                    }
-                                })),
-                            ),
-                    ),
+                            .child(more)
+                    }),
             );
             key_rows = key_rows.child(self.render_gateway_key_replace(
                 &profile.id,
@@ -19926,9 +20460,30 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        key_rows = key_rows
-            .child(self.render_gateway_add_key(&profile.id, window, cx))
-            .child(self.render_gateway_batch_add_key(&profile.id, window, cx));
+        // Adding sits under the list it adds to. Closed, the two ways to add
+        // share one row at their own width; an open one takes the full width.
+        let adding = self.gateway_key_add_target.as_deref() == Some(profile.id.as_str())
+            || self.gateway_key_batch_target.as_deref() == Some(profile.id.as_str());
+        let add = self.render_gateway_add_key(&profile.id, window, cx);
+        let batch = self.render_gateway_batch_add_key(&profile.id, window, cx);
+        key_rows = key_rows.child(if adding {
+            v_flex()
+                .w_full()
+                .gap_2()
+                .pt_2()
+                .child(add)
+                .child(batch)
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .pt_2()
+                .child(add)
+                .child(batch)
+                .into_any_element()
+        });
         management_card_with_icon(
             management_locale_text("Keys", "Key", "Key"),
             management_locale_text(
@@ -20607,10 +21162,10 @@ impl ManagementCenter {
             return Button::new(SharedString::from(format!(
                 "management-gateway-add-key-{profile_key}"
             )))
-            .xsmall()
+            .small()
             .outline()
             .icon(IconName::Plus)
-            .label(management_locale_text("Add key", "添加 Key", "新增 Key"))
+            .label(management_locale_text("Add Key", "添加 Key", "新增 Key"))
             .on_click(cx.listener({
                 let profile = profile.clone();
                 move |this, _, _, cx| {
@@ -22221,22 +22776,8 @@ impl ManagementCenter {
             },
         );
         if !active {
-            return Button::new(SharedString::from(format!(
-                "management-shared-provider-key-policy-{}",
-                credential.id.as_str()
-            )))
-            .xsmall()
-            .ghost()
-            .label(management_locale_text("Scope", "范围", "範圍"))
-            .disabled(self.mutation.is_some())
-            .on_click(cx.listener({
-                let profile = profile.id.clone();
-                let credential = credential.id.clone();
-                move |this, _, window, cx| {
-                    this.open_gateway_key_policy_editor(&profile, &credential, window, cx)
-                }
-            }))
-            .into_any_element();
+            // Closed, the editor is a command in the Key row's menu.
+            return div().into_any_element();
         }
         let input = self
             .gateway_key_policy_input
@@ -22493,8 +23034,9 @@ impl ManagementCenter {
             return Button::new(SharedString::from(format!(
                 "management-shared-provider-batch-key-{profile_key}"
             )))
-            .xsmall()
+            .small()
             .ghost()
+            .icon(Icon::default().path("icons/vibex/clipboard-paste.svg"))
             .label(management_locale_text(
                 "Paste multiple",
                 "批量粘贴",
@@ -40887,6 +41429,229 @@ fn shared_route_group_rows(
 }
 
 /// A shared Provider's status as a badge.
+/// How one Provider endpoint is named on its row.
+fn management_endpoint_kind_label(
+    kind: vibex_core::ModelProviderEndpointKind,
+    protocol: Option<&str>,
+) -> String {
+    let kind = match kind {
+        vibex_core::ModelProviderEndpointKind::Api => management_locale_text("API", "API", "API"),
+        vibex_core::ModelProviderEndpointKind::Auth => {
+            management_locale_text("Sign-in", "登录", "登入")
+        }
+        vibex_core::ModelProviderEndpointKind::ModelCatalog => {
+            management_locale_text("Model list", "模型列表", "模型清單")
+        }
+        vibex_core::ModelProviderEndpointKind::Proxy => {
+            management_locale_text("Proxy", "代理", "代理")
+        }
+    };
+    match protocol {
+        Some(protocol) if !protocol.is_empty() => format!("{kind} · {protocol}"),
+        _ => kind.to_string(),
+    }
+}
+
+/// One settings row: what the setting is and does on the leading side, its
+/// control on the trailing edge.
+///
+/// Rows stack inside [`management_settings_list`], which draws the hairlines,
+/// so labels form one column and controls another however long the copy is.
+fn management_setting_row(
+    title: &'static str,
+    description: &'static str,
+    control: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_4()
+        .py_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().text_sm().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                ),
+        )
+        .child(div().flex_none().child(control))
+        .into_any_element()
+}
+
+/// Settings rows separated by hairlines, the first without one.
+fn management_settings_list(rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+    let border = cx.theme().border.opacity(0.6);
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .children(rows.into_iter().enumerate().map(move |(index, row)| {
+            div()
+                .w_full()
+                .when(index > 0, |row| row.border_t_1().border_color(border))
+                .child(row)
+        }))
+        .into_any_element()
+}
+
+/// A button that names the current choice and opens the other choices as a
+/// checked menu — the desktop select for a short, fixed set of values.
+fn management_option_menu(
+    id: &'static str,
+    options: &[(&'static str, &'static str)],
+    current: &str,
+    disabled: bool,
+    center: WeakEntity<ManagementCenter>,
+    on_select: impl Fn(&mut ManagementCenter, &'static str, &mut Context<ManagementCenter>) + 'static,
+) -> AnyElement {
+    let label = options
+        .iter()
+        .find(|(value, _)| *value == current)
+        .or_else(|| options.first())
+        .map(|(_, label)| *label)
+        .unwrap_or_default();
+    let options = options.to_vec();
+    let current = current.to_string();
+    let on_select = Rc::new(on_select);
+    Button::new(id)
+        .small()
+        .outline()
+        .label(label)
+        .dropdown_caret(true)
+        .disabled(disabled)
+        .dropdown_menu(move |mut menu, _, _| {
+            for (value, label) in options.iter().copied() {
+                let center = center.clone();
+                let on_select = on_select.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .checked(value == current)
+                        .on_click(move |_, _, cx| {
+                            center
+                                .update(cx, |this, cx| on_select(this, value, cx))
+                                .ok();
+                        }),
+                );
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// One figure on a summary row: a caption, the number, and a line of context.
+///
+/// Tiles share one width rule so a row of them forms columns, and the value
+/// takes the tone only when the tone is the news (a warning, a health verdict).
+fn management_stat_tile(
+    label: &'static str,
+    value: String,
+    caption: String,
+    tone: Option<Hsla>,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .flex_1()
+        .min_w(rems(9.0))
+        .gap_1()
+        .px_4()
+        .py_3()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_xl()
+                .font_semibold()
+                .text_color(tone.unwrap_or(cx.theme().foreground))
+                .child(value),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(caption),
+        )
+        .into_any_element()
+}
+
+/// The colour a Provider health verdict reads in, wherever it is drawn.
+fn management_provider_health_color(status: vibex_core::ProviderHealthStatus, cx: &App) -> Hsla {
+    match status {
+        vibex_core::ProviderHealthStatus::Fail => cx.theme().danger,
+        vibex_core::ProviderHealthStatus::Warn => cx.theme().warning,
+        vibex_core::ProviderHealthStatus::Pass => cx.theme().success,
+        _ => cx.theme().muted_foreground,
+    }
+}
+
+/// A Provider's mark: the vendor's logo when one is known, otherwise its
+/// initial on a quiet plate.
+///
+/// Every row reserves the same leading slot, so names line up whether or not
+/// a logo exists. The brand is looked up from what the record says about its
+/// vendor — the catalogue id, the bundled icon key, the vendor hint, then the
+/// name — and never from its models: a relay serving GPT is not OpenAI.
+fn provider_logo_tile(
+    profile: &vibex_core::ModelProviderProfile,
+    size: Pixels,
+    cx: &App,
+) -> AnyElement {
+    let icon_size = size * 0.6;
+    let logo = [
+        profile.metadata.catalog_id.as_deref(),
+        profile.metadata.icon.as_deref(),
+        profile.vendor_hint.as_deref(),
+        Some(profile.display_name.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|candidate| model_brand_icon(candidate, icon_size, None));
+    let plate = div()
+        .flex_none()
+        .size(size)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.7))
+        .bg(cx.theme().muted.opacity(0.5));
+    match logo {
+        Some(logo) => plate.child(logo).into_any_element(),
+        None => {
+            let initial = profile
+                .display_name
+                .trim()
+                .chars()
+                .next()
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            plate
+                .text_size(size * 0.42)
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(initial)
+                .into_any_element()
+        }
+    }
+}
+
 fn gateway_provider_status_badge(
     profile: &vibex_core::ModelProviderProfile,
     _cx: &App,
@@ -51041,7 +51806,7 @@ mod gateway_surface_tests {
             "management-shared-provider-batch-save-",
             "save_gateway_key_batch(",
             "management-shared-provider-toggle-key-",
-            "management-shared-provider-prefer-key-",
+            "Prefer this Key",
             "render_gateway_key_limits(key, window, cx)",
         ] {
             assert!(source.contains(marker), "shared Keys must keep {marker}");
@@ -51168,9 +51933,10 @@ mod gateway_surface_tests {
     fn the_models_tab_searches_filters_and_sets_defaults() {
         let source = include_str!("management.rs");
         for marker in [
-            "management-provider-models-filter-",
-            "management-provider-models-enable-all",
-            "management-provider-models-disable-all",
+            "management-provider-models-filter",
+            "management-provider-models-bulk",
+            "Turn on all models",
+            "Turn off all models",
             "management-provider-model-default-",
             "set_shared_provider_models_enabled(",
             "set_shared_provider_default_model(",
@@ -51343,7 +52109,7 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the gateway row should remain inspectable");
         assert!(
-            row.contains(".rounded_full().bg(gateway_state_color)"),
+            row.contains(".rounded_full()") && row.contains(".bg(gateway_state_color)"),
             "the state dot is drawn from the theme's state colour"
         );
         assert!(
