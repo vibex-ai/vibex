@@ -15404,12 +15404,15 @@ impl VibexWorkbench {
     /// Watches the held `wsl.exe` child. A `wsl --shutdown` (or server crash)
     /// exits it; restart the distro and reconnect once.
     fn arm_wsl_watchdog(&mut self, runtime_id: String, cx: &mut Context<Self>) {
+        eprintln!("vibex-wsl: watchdog armed for {runtime_id}");
         self.wsl_watch_generation = self.wsl_watch_generation.wrapping_add(1);
         let generation = self.wsl_watch_generation;
         self.wsl_watch_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
                     let action = entity.update(cx, |this, cx| {
                         if this.wsl_watch_generation != generation {
                             return None;
@@ -15421,6 +15424,7 @@ impl VibexWorkbench {
                         if !exited {
                             return None;
                         }
+                        eprintln!("vibex-wsl: keepalive exited");
                         this.wsl_keepalive = None;
                         let runtime = this
                             .runtime_registry
@@ -15428,7 +15432,11 @@ impl VibexWorkbench {
                             .iter()
                             .find(|runtime| runtime.id == runtime_id)
                             .cloned()?;
-                        let profile = this.wsl_profile_for_runtime(&runtime_id)?;
+                        let Some(profile) = this.wsl_profile_for_runtime(&runtime_id) else {
+                            eprintln!("vibex-wsl: profile missing for {runtime_id}");
+                            return None;
+                        };
+                        eprintln!("vibex-wsl: restarting {runtime_id}");
                         this.runtime_note = Some(
                             locale::text(
                                 "WSL runtime exited; restarting…",
@@ -15494,17 +15502,33 @@ impl VibexWorkbench {
         );
         let port = profile.remote_port;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (keepalive, _) = provisioner
-                .start_foreground()
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            while !crate::ssh_connection::wsl::localhost_forwarded(port) {
-                if std::time::Instant::now() >= deadline {
-                    return Err("WSL2 localhost forwarding is unavailable".to_string());
+            let mut last_error = String::new();
+            for attempt in 0..3 {
+                match provisioner.start_foreground() {
+                    Ok((keepalive, _)) => {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                        while !crate::ssh_connection::wsl::localhost_forwarded(port) {
+                            if std::time::Instant::now() >= deadline {
+                                last_error = "WSL2 localhost forwarding is unavailable".to_string();
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        if last_error.is_empty() {
+                            return Ok(keepalive);
+                        }
+                    }
+                    Err(error) => {
+                        last_error = format!("{}: {}", error.code, error.message);
+                        eprintln!(
+                            "vibex-wsl: restore attempt {} failed: {last_error}",
+                            attempt + 1
+                        );
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            Ok::<_, String>(keepalive)
+            Err(last_error)
         });
         self.boot_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -15518,6 +15542,7 @@ impl VibexWorkbench {
                             this.begin_remote_connect(runtime, origin, cx);
                         }
                         Ok(Err(error)) => {
+                            eprintln!("vibex-wsl: restore failed: {error}");
                             this.finish_runtime_connect_failure(
                                 BackendError::offline("wsl_boot_failed", error),
                                 origin,
