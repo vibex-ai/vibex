@@ -256,7 +256,7 @@ use crate::ssh_connection::{
     SshProfileStore, SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess,
     TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact_for_os,
     normalized_server_os, probe, resolve_effective_default, select_local_port,
-    select_server_artifact_for_os, supervisor,
+    select_server_artifact_for_os, supervisor, wsl::WslCommand, wsl_provision::WslProvisioner,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -9400,6 +9400,9 @@ pub struct VibexWorkbench {
     #[allow(dead_code)]
     ssh_uninstall_error: Option<String>,
     #[allow(dead_code)]
+    wsl_task: Option<Task<()>>,
+    wsl_error: Option<String>,
+    #[allow(dead_code)]
     ssh_provisioning_task: Option<Task<()>>,
     #[allow(dead_code)]
     ssh_provisioning_snapshot: Option<ProvisioningSnapshot>,
@@ -9418,6 +9421,8 @@ pub struct VibexWorkbench {
     runtime_registry_store: Option<Arc<DesktopRuntimeRegistryStore>>,
     /// Last compatibility report per remote runtime id, captured on connect.
     runtime_compatibility: BTreeMap<String, crate::ssh_connection::compat::CompatibilityReport>,
+    /// Runtime id -> WSL distro for the Runtime Manager label.
+    wsl_runtime_labels: BTreeMap<String, String>,
     runtime_manager_open: bool,
     runtime_manager_stage: RuntimeManagerStage,
     /// The runtime whose detail stage is showing, or whose rename is running.
@@ -11281,6 +11286,8 @@ impl VibexWorkbench {
             ssh_upgrade_error: None,
             ssh_uninstall_task: None,
             ssh_uninstall_error: None,
+            wsl_task: None,
+            wsl_error: None,
             ssh_provisioning_task: None,
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
@@ -11291,6 +11298,7 @@ impl VibexWorkbench {
             runtime_registry,
             runtime_registry_store,
             runtime_compatibility: BTreeMap::new(),
+            wsl_runtime_labels: BTreeMap::new(),
             runtime_manager_open: false,
             runtime_manager_stage: RuntimeManagerStage::List,
             runtime_manager_target: None,
@@ -14437,6 +14445,140 @@ impl VibexWorkbench {
     }
 
     #[allow(dead_code)]
+    fn provision_wsl_distro(&mut self, distro: String, cx: &mut Context<Self>) {
+        let Some(config) = self.config.clone() else {
+            self.wsl_error = Some("the runtime configuration is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            self.wsl_error = Some("the local runtime is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let desktop_home = config.home_dir.clone();
+        self.wsl_error = None;
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_wsl_error = None;
+            cx.notify();
+        });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let mut command = WslCommand::new("wsl.exe", &distro);
+            let output = command
+                .run_script("printf '%s' \"$HOME\"", &[])
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let remote_home = output.stdout_lossy().trim().to_string();
+            if !remote_home.starts_with('/') || remote_home.contains('\n') {
+                return Err("the WSL HOME is not an absolute Linux path".to_string());
+            }
+            let install_root = format!("{remote_home}/.local/share/vibex/server");
+            let provisioner = WslProvisioner::new(
+                "wsl.exe",
+                &distro,
+                &remote_home,
+                &install_root,
+                std::slice::from_ref(&remote_home),
+                8765,
+                &desktop_home,
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let environment = provisioner
+                .probe()
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let verified = runtime
+                .app_update()
+                .latest_verified_manifest()
+                .await
+                .map_err(|error| format!("{}: {}", error.code, error.message))?
+                .ok_or_else(|| "the release manifest is unavailable".to_string())?;
+            let version = verified.manifest.version.to_string();
+            let artifact = select_server_artifact_for_os(&verified, "linux", environment.arch)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let local = download_server_artifact_for_os(
+                artifact,
+                "linux",
+                &version,
+                environment.arch,
+                &desktop_home.join("ssh-artifacts"),
+                |_, _| {},
+            )
+            .await
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let outcome = provisioner
+                .provision(&local, unix_timestamp_ms())
+                .await
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            Ok::<
+                (
+                    String,
+                    String,
+                    DesktopRemoteCredential,
+                    Arc<WebRemoteBackend>,
+                ),
+                String,
+            >((
+                outcome.pairing.runtime_id,
+                distro,
+                outcome.pairing.credential,
+                outcome.backend,
+            ))
+        });
+        self.wsl_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match result {
+                        Ok(Ok((runtime_id, distro, credential, backend))) => {
+                            if let Some(store) = this.runtime_registry_store.as_ref() {
+                                this.runtime_registry = store.load_or_migrate();
+                            }
+                            this.install_remote_client(
+                                DesktopRemoteClient {
+                                    runtime_id: runtime_id.clone(),
+                                    credential,
+                                    backend,
+                                },
+                                cx,
+                            );
+                            this.mark_runtime_active(&runtime_id, cx);
+                            this.wsl_runtime_labels.insert(runtime_id, distro.clone());
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_error = None;
+                                cx.notify();
+                            });
+                            this.runtime_note = Some(format!(
+                                "{} {distro}",
+                                locale::text(
+                                    "WSL runtime connected",
+                                    "WSL 运行时已连接",
+                                    "WSL 執行階段已連線"
+                                )
+                            ));
+                        }
+                        Ok(Err(error)) => {
+                            this.wsl_error = Some(error.clone());
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_error = Some(error.clone());
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            let error = "the WSL task stopped unexpectedly".to_string();
+                            this.wsl_error = Some(error.clone());
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_error = Some(error);
+                                cx.notify();
+                            });
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
     fn start_ssh_runtime_upgrade(&mut self, profile_id: String, cx: &mut Context<Self>) {
         if self.ssh_upgrade_running || self.ssh_provisioning.is_some() {
             return;
@@ -17194,6 +17336,9 @@ impl VibexWorkbench {
     }
 
     fn remote_runtime_meta(&self, runtime: &RegisteredRuntime) -> String {
+        if let Some(distro) = self.wsl_runtime_labels.get(runtime.id.as_str()) {
+            return format!("WSL · {distro}");
+        }
         let address = runtime.credential.record.server_url.clone();
         // A failed pairing is the one runtime fact with no other home on the
         // row: the status lane says `Not connected` either way, so the reason
@@ -80547,6 +80692,10 @@ struct FoundationSettings {
     connections_probe_task: Option<Task<()>>,
     connections_log_view: Option<SshLogView>,
     connections_log_task: Option<Task<()>>,
+    connections_wsl_open: bool,
+    connections_wsl_distros: Vec<String>,
+    connections_wsl_selected: Option<String>,
+    connections_wsl_error: Option<String>,
     active_section: SettingsSection,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
@@ -81010,6 +81159,10 @@ impl FoundationSettings {
                 connections_probe_task: None,
                 connections_log_view: None,
                 connections_log_task: None,
+                connections_wsl_open: false,
+                connections_wsl_distros: Vec::new(),
+                connections_wsl_selected: None,
+                connections_wsl_error: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
@@ -84503,6 +84656,35 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn load_wsl_distros(&mut self, cx: &mut Context<Self>) {
+        self.connections_wsl_open = true;
+        self.connections_wsl_error = None;
+        match crate::ssh_connection::wsl::list_distros(Path::new("wsl.exe")) {
+            Ok(distros) => {
+                self.connections_wsl_selected = distros.first().cloned();
+                self.connections_wsl_distros = distros;
+            }
+            Err(error) => {
+                self.connections_wsl_distros.clear();
+                self.connections_wsl_selected = None;
+                self.connections_wsl_error = Some(format!("{}: {}", error.code, error.message));
+            }
+        }
+        cx.notify();
+    }
+
+    fn connect_wsl_distro(&self, cx: &mut Context<Self>) {
+        let Some(distro) = self.connections_wsl_selected.clone() else {
+            return;
+        };
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| {
+                workbench.provision_wsl_distro(distro.clone(), cx)
+            });
+        });
+    }
+
     fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let is_dark = cx.theme().is_dark();
         let muted = theme::semantic_color("muted-foreground", is_dark);
@@ -84519,6 +84701,18 @@ impl FoundationSettings {
                 this.load_connections_discovery(cx);
             }));
 
+        let wsl_button = Button::new("connections-add-wsl")
+            .small()
+            .outline()
+            .icon(IconName::Plus)
+            .label(locale::text(
+                "Add WSL runtime",
+                "添加 WSL 运行时",
+                "新增 WSL 執行階段",
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.load_wsl_distros(cx);
+            }));
         let mut groups = Vec::new();
         if self.connections_add_preview {
             let close = Button::new("connections-add-close")
@@ -84635,6 +84829,94 @@ impl FoundationSettings {
                 children,
             ));
         }
+        if self.connections_wsl_open {
+            let close = Button::new("connections-wsl-close")
+                .small()
+                .ghost()
+                .label(locale::text("Close", "关闭", "關閉"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.connections_wsl_open = false;
+                    cx.notify();
+                }));
+            let connect = Button::new("connections-wsl-connect")
+                .small()
+                .outline()
+                .label(locale::text("Connect WSL", "连接 WSL", "連線 WSL"))
+                .disabled(self.connections_wsl_selected.is_none())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.connect_wsl_distro(cx);
+                }));
+            let mut children = vec![
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(locale::text(
+                        "WSL2 runs Linux locally; no sshd or SSH key is required.",
+                        "WSL2 在本机运行 Linux，不需要 sshd 或 SSH 密钥。",
+                        "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
+                    ))
+                    .into_any_element(),
+            ];
+            if let Some(error) = &self.connections_wsl_error {
+                children.push(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(error.clone())
+                        .into_any_element(),
+                );
+            }
+            if self.connections_wsl_distros.is_empty() {
+                children.push(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(locale::text(
+                            "No WSL distros found. Install WSL2 and at least one distro first.",
+                            "未找到 WSL 发行版。请先安装 WSL2 和一个发行版。",
+                            "找不到 WSL 發行版。請先安裝 WSL2 和一個發行版。",
+                        ))
+                        .into_any_element(),
+                );
+            } else {
+                children.push(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .children(self.connections_wsl_distros.iter().map(|distro| {
+                            let selected =
+                                self.connections_wsl_selected.as_deref() == Some(distro.as_str());
+                            let value = distro.clone();
+                            Button::new(SharedString::from(format!("connections-wsl-{distro}")))
+                                .small()
+                                .when(selected, |button| button.primary())
+                                .when(!selected, |button| button.outline())
+                                .label(distro.clone())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.connections_wsl_selected = Some(value.clone());
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        }))
+                        .into_any_element(),
+                );
+            }
+            children.push(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(close)
+                    .child(connect)
+                    .into_any_element(),
+            );
+            groups.push(SettingsGroup::new(
+                locale::text("WSL", "WSL", "WSL"),
+                children,
+            ));
+        }
+
         if self.connections_snapshot.is_some() || self.connections_error.is_some() {
             groups.push(SettingsGroup::new(
                 locale::text("Provisioning", "配置进度", "設定進度"),
@@ -84658,6 +84940,8 @@ impl FoundationSettings {
             .w_full()
             .items_center()
             .justify_end()
+            .gap_2()
+            .child(wsl_button)
             .child(add_button)
             .into_any_element();
         groups.push(SettingsGroup::with_leading(
@@ -109309,6 +109593,8 @@ mod tests {
         assert!(source.contains("fn remove_ssh_profile_for_runtime("));
         assert!(source.contains("runtime-detail-uninstall"));
         assert!(source.contains("runtime-uninstall-confirm"));
+        assert!(source.contains("connections-add-wsl"));
+        assert!(source.contains("connections-wsl-connect"));
         assert!(source.contains("runtime-detail-edit"));
         assert!(source.contains("runtime-edit-save"));
     }
