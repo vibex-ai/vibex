@@ -9429,6 +9429,13 @@ pub struct VibexWorkbench {
     runtime_manager_add_scroll: ScrollHandle,
     runtime_rename_input: Entity<InputState>,
     runtime_rename_active: bool,
+    runtime_edit_pending: Option<String>,
+    runtime_edit_name_input: Entity<InputState>,
+    runtime_edit_client_input: Entity<InputState>,
+    runtime_edit_config_input: Entity<InputState>,
+    runtime_edit_workspaces_input: Entity<InputState>,
+    runtime_edit_local_port_input: Entity<InputState>,
+    runtime_edit_error: Option<String>,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
     runtime_add_tab: RuntimeAddTab,
@@ -10703,6 +10710,41 @@ impl VibexWorkbench {
                 .placeholder(locale::text("Runtime name", "运行时名称", "執行階段名稱"))
                 .submit_on_enter(true)
         });
+        let runtime_edit_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Display name",
+                "显示名称",
+                "顯示名稱",
+            ))
+        });
+        let runtime_edit_client_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "ssh client path (optional)",
+                "ssh 客户端路径（可选）",
+                "ssh 用戶端路徑（可選）",
+            ))
+        });
+        let runtime_edit_config_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "ssh config path (optional)",
+                "ssh 配置路径（可选）",
+                "ssh 設定路徑（可選）",
+            ))
+        });
+        let runtime_edit_workspaces_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Workspace roots, one per line",
+                "工作区根目录，每行一个",
+                "工作區根目錄，每行一個",
+            ))
+        });
+        let runtime_edit_local_port_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Local tunnel port",
+                "本地隧道端口",
+                "本機通道連接埠",
+            ))
+        });
         let runtime_add_server_url_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "https://host:8787",
@@ -11256,6 +11298,13 @@ impl VibexWorkbench {
             runtime_manager_add_scroll: ScrollHandle::new(),
             runtime_rename_input,
             runtime_rename_active: false,
+            runtime_edit_pending: None,
+            runtime_edit_name_input,
+            runtime_edit_client_input,
+            runtime_edit_config_input,
+            runtime_edit_workspaces_input,
+            runtime_edit_local_port_input,
+            runtime_edit_error: None,
             runtime_switch_pending: None,
             runtime_add_tab: RuntimeAddTab::default(),
             runtime_add_server_url_input,
@@ -14040,7 +14089,162 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Applies a rename to the runtime that owns the name.
+    fn open_ssh_profile_edit(
+        &mut self,
+        profile: &SshConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.runtime_edit_pending = Some(profile.id.clone());
+        self.runtime_edit_error = None;
+        self.runtime_rename_active = false;
+        self.runtime_remove_pending = None;
+        self.runtime_uninstall_pending = None;
+        let values = [
+            (&self.runtime_edit_name_input, profile.display_name.clone()),
+            (
+                &self.runtime_edit_client_input,
+                profile
+                    .ssh_client_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                &self.runtime_edit_config_input,
+                profile
+                    .ssh_config_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                &self.runtime_edit_workspaces_input,
+                profile.workspace_roots.join("\n"),
+            ),
+            (
+                &self.runtime_edit_local_port_input,
+                profile.local_tunnel_port.to_string(),
+            ),
+        ];
+        for (input, value) in values {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        self.runtime_edit_name_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn save_ssh_profile_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(profile_id) = self.runtime_edit_pending.clone() else {
+            return;
+        };
+        let Some(config) = self.config.as_ref() else {
+            self.runtime_edit_error = Some("the runtime configuration is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            self.runtime_edit_error = Some("the SSH profile store could not be read".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
+            self.runtime_edit_error = Some("the SSH profile was not found".to_string());
+            cx.notify();
+            return;
+        };
+        let display_name = self
+            .runtime_edit_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let client = self
+            .runtime_edit_client_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let config_path = self
+            .runtime_edit_config_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let workspaces = self
+            .runtime_edit_workspaces_input
+            .read(cx)
+            .value()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let port = self
+            .runtime_edit_local_port_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(0);
+        if display_name.is_empty() {
+            self.runtime_edit_error = Some("the display name must not be empty".to_string());
+            cx.notify();
+            return;
+        }
+        if workspaces.is_empty() {
+            self.runtime_edit_error = Some("at least one workspace root is required".to_string());
+            cx.notify();
+            return;
+        }
+        if port == 0 {
+            self.runtime_edit_error = Some("the local tunnel port is invalid".to_string());
+            cx.notify();
+            return;
+        }
+        if port != profile.local_tunnel_port && profile.registered_runtime_id.is_some() {
+            self.runtime_edit_error = Some(
+                "the local tunnel port cannot change while this connection is bound; remove and re-add it"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        profile.display_name = display_name;
+        profile.ssh_client_path = (!client.is_empty()).then(|| PathBuf::from(client));
+        profile.ssh_config_path = (!config_path.is_empty()).then(|| PathBuf::from(config_path));
+        profile.workspace_roots = workspaces;
+        profile.local_tunnel_port = port;
+        if let Err(error) = profile.validate() {
+            self.runtime_edit_error = Some(format!("{}: {}", error.code, error.message));
+            cx.notify();
+            return;
+        }
+        let active = profile.registered_runtime_id.as_deref()
+            == Some(self.runtime_registry.active_runtime_id());
+        if let Err(error) = store.save(&profiles) {
+            self.runtime_edit_error = Some(format!("{}: {}", error.code, error.message));
+            cx.notify();
+            return;
+        }
+        self.runtime_edit_pending = None;
+        self.runtime_edit_error = None;
+        self.runtime_note = Some(if active {
+            locale::text(
+                "Reconnect to apply connection changes",
+                "重新连接后生效",
+                "重新連線後生效",
+            )
+            .to_string()
+        } else {
+            locale::text("SSH connection updated", "SSH 连接已更新", "SSH 連線已更新").to_string()
+        });
+        cx.notify();
+    }
+
+    /// Applies a rename to the runtime that owns the name.    /// Applies a rename to the runtime that owns the name.
     ///
     /// A connected runtime is renamed through its authority, which publishes
     /// the new name to every client. A runtime this shell cannot reach keeps
@@ -16077,6 +16281,17 @@ impl VibexWorkbench {
                 cx,
             ));
         }
+        if self
+            .runtime_edit_pending
+            .as_deref()
+            .zip(upgrade_profile.as_ref())
+            .is_some_and(|(pending, profile)| pending == profile.id)
+        {
+            rows.push(self.render_ssh_profile_edit(
+                upgrade_profile.as_ref().expect("profile checked above"),
+                cx,
+            ));
+        }
         if let Some(runtime) = runtime.as_ref() {
             rows.push(runtime_detail_row(
                 locale::text("Address", "地址", "位址"),
@@ -16174,6 +16389,17 @@ impl VibexWorkbench {
         );
         actions = actions.child(div().flex_1());
         if let Some(profile) = upgrade_profile.as_ref() {
+            let edit_profile = profile.clone();
+            actions = actions.child(
+                Button::new("runtime-detail-edit")
+                    .small()
+                    .ghost()
+                    .label(locale::text("Edit", "编辑", "編輯"))
+                    .disabled(switching)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_ssh_profile_edit(&edit_profile, window, cx)
+                    })),
+            );
             let profile_id = profile.id.clone();
             actions = actions.child(
                 Button::new("runtime-detail-uninstall")
@@ -16524,6 +16750,95 @@ impl VibexWorkbench {
                             .label(locale::text("Cancel", "取消", "取消"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.runtime_upgrade_pending = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_ssh_profile_edit(
+        &self,
+        _profile: &SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let field = |label: &'static str, input: AnyElement| {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(input)
+                .into_any_element()
+        };
+        let mut fields = v_flex().w_full().gap_2();
+        fields = fields
+            .child(field(
+                locale::text("Display name", "显示名称", "顯示名稱"),
+                Input::new(&self.runtime_edit_name_input)
+                    .small()
+                    .into_any_element(),
+            ))
+            .child(field(
+                locale::text("SSH client path", "SSH 客户端路径", "SSH 用戶端路徑"),
+                Input::new(&self.runtime_edit_client_input)
+                    .small()
+                    .into_any_element(),
+            ))
+            .child(field(
+                locale::text("SSH config path", "SSH 配置路径", "SSH 設定路徑"),
+                Input::new(&self.runtime_edit_config_input)
+                    .small()
+                    .into_any_element(),
+            ))
+            .child(field(
+                locale::text("Workspace roots", "工作区根目录", "工作區根目錄"),
+                Input::new(&self.runtime_edit_workspaces_input)
+                    .small()
+                    .into_any_element(),
+            ))
+            .child(field(
+                locale::text("Local tunnel port", "本地隧道端口", "本機通道連接埠"),
+                Input::new(&self.runtime_edit_local_port_input)
+                    .small()
+                    .into_any_element(),
+            ));
+        v_flex()
+            .w_full()
+            .gap_2()
+            .px_2()
+            .py_2()
+            .child(div().text_sm().font_medium().child(locale::text(
+                "Edit SSH connection",
+                "编辑 SSH 连接",
+                "編輯 SSH 連線",
+            )))
+            .when_some(self.runtime_edit_error.clone(), |this, error| {
+                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+            })
+            .child(fields)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("runtime-edit-save")
+                            .small()
+                            .outline()
+                            .label(locale::text("Save", "保存", "儲存"))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_ssh_profile_edit(cx))),
+                    )
+                    .child(
+                        Button::new("runtime-edit-cancel")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.runtime_edit_pending = None;
+                                this.runtime_edit_error = None;
                                 cx.notify();
                             })),
                     ),
@@ -108989,6 +109304,8 @@ mod tests {
         assert!(source.contains("fn remove_ssh_profile_for_runtime("));
         assert!(source.contains("runtime-detail-uninstall"));
         assert!(source.contains("runtime-uninstall-confirm"));
+        assert!(source.contains("runtime-detail-edit"));
+        assert!(source.contains("runtime-edit-save"));
     }
 
     #[test]
