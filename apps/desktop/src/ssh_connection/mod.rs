@@ -26,6 +26,7 @@ pub mod supervisor;
 #[cfg(test)]
 mod test_support;
 pub mod tunnel;
+pub mod uninstall;
 pub mod upgrade;
 
 pub use artifact::{

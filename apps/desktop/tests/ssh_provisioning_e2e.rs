@@ -26,7 +26,7 @@ use vibex_desktop::ssh_connection::{
     LaunchConfig, LocalArtifact, MIN_FREE_KB, ProvisioningCoordinator, ProvisioningRunOutcome,
     RemoteArch, RunCancellation, SshCommand, SshDestination, SshProvisioningEffects,
     SshRuntimeChannel, install::install_artifact, launchd, probe, run_provisioning,
-    select_local_port, supervisor, upgrade::upgrade_runtime,
+    select_local_port, supervisor, uninstall::uninstall_runtime, upgrade::upgrade_runtime,
 };
 
 fn now_ms() -> i64 {
@@ -163,6 +163,71 @@ async fn probe_classifies_a_changed_host_key() {
     let config = write_config(dir.path(), &identity, &known_hosts, "yes");
     let error = probe(&command_for(&config), 8765, MIN_FREE_KB).expect_err("host key must fail");
     assert_eq!(error.code(), "ssh_host_key_changed", "{}", error.message());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an SSH fixture and a server tarball"]
+async fn uninstall_preserves_or_removes_the_runtime_home() {
+    let Some(fixture) = fixture_config() else {
+        return;
+    };
+    let artifact_path =
+        PathBuf::from(std::env::var("VIBEX_SSH_E2E_ARTIFACT").expect("VIBEX_SSH_E2E_ARTIFACT"));
+    let bytes = std::fs::read(&artifact_path).expect("read artifact");
+    let arch = std::env::var("VIBEX_SSH_E2E_ARCH")
+        .ok()
+        .and_then(|value| match value.as_str() {
+            "aarch64" | "arm64" => Some(RemoteArch::Aarch64),
+            "x86_64" => Some(RemoteArch::X86_64),
+            _ => None,
+        })
+        .unwrap_or(RemoteArch::X86_64);
+    let base = std::env::var("VIBEX_SSH_E2E_UNINSTALL_HOME")
+        .unwrap_or_else(|_| "/home/dev/uninstall-home".to_string());
+    let root =
+        std::env::var("VIBEX_SSH_E2E_UNINSTALL_ROOT").unwrap_or_else(|_| format!("{base}/server"));
+    let port = std::env::var("VIBEX_SSH_E2E_UNINSTALL_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8769);
+    let command = command_for(&fixture);
+    let launch =
+        LaunchConfig::new(&base, &root, std::slice::from_ref(&base), port).expect("launch config");
+    let mut prepare = command.clone();
+    prepare.remote_script("mkdir -p \"$1\" \"$2\"").unwrap();
+    prepare
+        .args
+        .extend([base.clone().into(), root.clone().into()]);
+    prepare.run().expect("prepare uninstall dirs");
+    let artifact = LocalArtifact {
+        path: artifact_path,
+        version: "0.1.0-rc.8".to_string(),
+        arch,
+        size: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    install_artifact(&command, &artifact, &root, |_, _| {}).expect("install runtime");
+    supervisor::ensure_started(&command, &launch).expect("start runtime");
+    let marker = format!("{root}/home/uninstall-marker");
+    let mut touch = command.clone();
+    touch.remote_script("printf marker > \"$1\"").unwrap();
+    touch.args.push(marker.clone().into());
+    touch.run().expect("write marker");
+
+    let outcome = uninstall_runtime(&command, &launch, false).expect("uninstall preserving home");
+    assert!(outcome.home_preserved);
+    let mut check = command.clone();
+    check
+        .remote_script("test -f \"$1\" && test -d \"$2\"")
+        .unwrap();
+    check.args.extend([marker.into(), root.clone().into()]);
+    check.run().expect("home should remain");
+
+    uninstall_runtime(&command, &launch, true).expect("uninstall removing home");
+    let mut gone = command.clone();
+    gone.remote_script("test ! -e \"$1\"").unwrap();
+    gone.args.push(root.into());
+    gone.run().expect("install root should be removed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

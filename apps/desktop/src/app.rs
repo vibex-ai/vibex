@@ -9395,6 +9395,10 @@ pub struct VibexWorkbench {
     #[allow(dead_code)]
     ssh_upgrade_error: Option<String>,
     #[allow(dead_code)]
+    ssh_uninstall_task: Option<Task<()>>,
+    #[allow(dead_code)]
+    ssh_uninstall_error: Option<String>,
+    #[allow(dead_code)]
     ssh_provisioning_task: Option<Task<()>>,
     #[allow(dead_code)]
     ssh_provisioning_snapshot: Option<ProvisioningSnapshot>,
@@ -9436,6 +9440,8 @@ pub struct VibexWorkbench {
     runtime_remove_pending: Option<String>,
     /// The SSH profile whose upgrade is waiting for confirmation.
     runtime_upgrade_pending: Option<String>,
+    runtime_uninstall_pending: Option<String>,
+    runtime_uninstall_remove_home: bool,
     /// Why a runtime last refused to connect, keyed by runtime id. A failed
     /// boot falls back to the embedded runtime, so the panel is the only place
     /// that can still explain what happened.
@@ -11230,6 +11236,8 @@ impl VibexWorkbench {
             ssh_upgrade_task: None,
             ssh_upgrade_running: false,
             ssh_upgrade_error: None,
+            ssh_uninstall_task: None,
+            ssh_uninstall_error: None,
             ssh_provisioning_task: None,
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
@@ -11256,6 +11264,8 @@ impl VibexWorkbench {
             runtime_add_busy: false,
             runtime_remove_pending: None,
             runtime_upgrade_pending: None,
+            runtime_uninstall_pending: None,
+            runtime_uninstall_remove_home: false,
             runtime_connect_errors: BTreeMap::new(),
             local_runtime_name: None,
             local_runtime_name_task: None,
@@ -14388,6 +14398,125 @@ impl VibexWorkbench {
         self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
     }
 
+    #[allow(dead_code)]
+    fn uninstall_ssh_runtime(
+        &mut self,
+        profile_id: String,
+        remove_home: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let program = profile
+            .ssh_client_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ssh"));
+        let destination = SshDestination {
+            host: profile.host.clone(),
+            user: profile.user.clone(),
+            port: profile.port,
+        };
+        let command = match SshCommand::for_destination(
+            program,
+            &destination,
+            profile.ssh_config_path.as_deref(),
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                self.ssh_uninstall_error = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
+                return;
+            }
+        };
+        let launch = match LaunchConfig::new(
+            &profile.remote_home,
+            &profile.remote_install_root,
+            &profile.workspace_roots,
+            profile.remote_port,
+        ) {
+            Ok(launch) if profile.macos_lifecycle == SshMacOsLifecycle::LaunchAgent => launch
+                .with_launch_agent(crate::ssh_connection::launchd::label_for_profile(
+                    &profile.id,
+                )),
+            Ok(launch) => launch,
+            Err(error) => {
+                self.ssh_uninstall_error = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
+                return;
+            }
+        };
+        let runtime_id = profile.registered_runtime_id.clone();
+        let profile_id = profile.id;
+        self.ssh_uninstall_error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            crate::ssh_connection::uninstall::uninstall_runtime(&command, &launch, remove_home)
+                .map_err(|error| format!("{}: {}", error.code, error.message))
+        });
+        self.ssh_uninstall_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match result {
+                        Ok(Ok(_)) => {
+                            this.runtime_note = Some(
+                                locale::text(
+                                    "SSH runtime uninstalled",
+                                    "SSH 运行时已卸载",
+                                    "SSH 執行階段已解除安裝",
+                                )
+                                .to_string(),
+                            );
+                            this.clear_ssh_profile_binding(&profile_id);
+                            if let Some(runtime_id) = runtime_id.as_deref()
+                                && this.runtime_registry.active_runtime_id() == runtime_id
+                            {
+                                this.remote_client = None;
+                                this.runtime_registry.remove(runtime_id);
+                                this.persist_runtime_registry(cx);
+                                this.activate_local_runtime(cx);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            this.ssh_uninstall_error = Some(error);
+                        }
+                        Err(_) => {
+                            this.ssh_uninstall_error =
+                                Some("the SSH uninstall task stopped unexpectedly".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
+    fn clear_ssh_profile_binding(&self, profile_id: &str) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
+            return;
+        };
+        profile.registered_runtime_id = None;
+        profile.runtime_version = None;
+        let _ = store.save(&profiles);
+    }
+
     fn cancel_ssh_provisioning(&mut self, cx: &mut Context<Self>) {
         let Some(service) = self.ssh_provisioning.as_ref() else {
             return;
@@ -15440,11 +15569,27 @@ impl VibexWorkbench {
 
     /// Removes a runtime and its stored grant. Removing the active runtime
     /// returns the workbench to the embedded authority.
+    fn remove_ssh_profile_for_runtime(&self, runtime_id: &str) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let before = profiles.len();
+        profiles.retain(|profile| profile.registered_runtime_id.as_deref() != Some(runtime_id));
+        if profiles.len() != before {
+            let _ = store.save(&profiles);
+        }
+    }
+
     fn remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
         if !self.runtime_registry.remove(&id) {
             return;
         }
         self.runtime_compatibility.remove(&id);
+        self.remove_ssh_profile_for_runtime(&id);
         self.runtime_remove_pending = None;
         if self
             .remote_client
@@ -15921,6 +16066,17 @@ impl VibexWorkbench {
                 cx,
             ));
         }
+        if self
+            .runtime_uninstall_pending
+            .as_deref()
+            .zip(upgrade_profile.as_ref())
+            .is_some_and(|(pending, profile)| pending == profile.id)
+        {
+            rows.push(self.render_runtime_uninstall_confirmation(
+                upgrade_profile.as_ref().expect("profile checked above"),
+                cx,
+            ));
+        }
         if let Some(runtime) = runtime.as_ref() {
             rows.push(runtime_detail_row(
                 locale::text("Address", "地址", "位址"),
@@ -16017,6 +16173,25 @@ impl VibexWorkbench {
                 })),
         );
         actions = actions.child(div().flex_1());
+        if let Some(profile) = upgrade_profile.as_ref() {
+            let profile_id = profile.id.clone();
+            actions = actions.child(
+                Button::new("runtime-detail-uninstall")
+                    .small()
+                    .ghost()
+                    .label(locale::text(
+                        "Uninstall runtime",
+                        "卸载运行时",
+                        "解除安裝執行階段",
+                    ))
+                    .disabled(switching || self.ssh_upgrade_running)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.runtime_uninstall_pending = Some(profile_id.clone());
+                        this.runtime_uninstall_remove_home = false;
+                        cx.notify();
+                    })),
+            );
+        }
         if runtime.is_some() {
             actions = actions.child(
                 Button::new("runtime-detail-remove")
@@ -16104,6 +16279,7 @@ impl VibexWorkbench {
                                 this.runtime_rename_active = false;
                                 this.runtime_remove_pending = None;
                                 this.runtime_upgrade_pending = None;
+                                this.runtime_uninstall_pending = None;
                                 cx.notify();
                             })),
                     )
@@ -16348,6 +16524,86 @@ impl VibexWorkbench {
                             .label(locale::text("Cancel", "取消", "取消"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.runtime_upgrade_pending = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_runtime_uninstall_confirmation(
+        &self,
+        profile: &SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let profile_id = profile.id.clone();
+        let remove_home = self.runtime_uninstall_remove_home;
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .child(locale::text(
+                        "Uninstall this runtime?",
+                        "卸载此运行时？",
+                        "解除安裝此執行階段？",
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "The remote process stops and version directories are removed. Workspace files are never touched.",
+                        "远端进程会停止，版本目录会删除；工作区文件不会受影响。",
+                        "遠端程序會停止，版本目錄會刪除；工作區檔案不會受影響。",
+                    )),
+            )
+            .child(
+                Button::new("runtime-uninstall-data-toggle")
+                    .small()
+                    .when(remove_home, |button| button.primary())
+                    .when(!remove_home, |button| button.ghost())
+                    .label(if remove_home {
+                        locale::text("Also delete runtime data", "同时删除运行时数据", "同時刪除執行階段資料")
+                    } else {
+                        locale::text("Keep runtime data", "保留运行时数据", "保留執行階段資料")
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.runtime_uninstall_remove_home = !this.runtime_uninstall_remove_home;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .pt_1()
+                    .child(
+                        Button::new("runtime-uninstall-confirm")
+                            .small()
+                            .danger()
+                            .label(locale::text("Uninstall", "卸载", "解除安裝"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.runtime_uninstall_pending = None;
+                                this.uninstall_ssh_runtime(
+                                    profile_id.clone(),
+                                    this.runtime_uninstall_remove_home,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new("runtime-uninstall-cancel")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.runtime_uninstall_pending = None;
                                 cx.notify();
                             })),
                     ),
@@ -108729,6 +108985,10 @@ mod tests {
         assert!(source.contains("connection_diagnostic_title"));
         assert!(source.contains("remote_os"));
         assert!(source.contains("diagnose_with_platform"));
+        assert!(source.contains("fn uninstall_ssh_runtime("));
+        assert!(source.contains("fn remove_ssh_profile_for_runtime("));
+        assert!(source.contains("runtime-detail-uninstall"));
+        assert!(source.contains("runtime-uninstall-confirm"));
     }
 
     #[test]
