@@ -118,6 +118,18 @@ install_sshd() {
 
 install_sshd
 
+SSHD_USE_PAM="$("$SSHD_BIN" -T 2>/dev/null | awk '$1 == "usepam" {print $2; exit}' || true)"
+if [ "$SSHD_USE_PAM" != "yes" ] && command -v getent >/dev/null 2>&1; then
+    SHADOW_ENTRY="$(getent shadow "$USER_NAME" 2>/dev/null || true)"
+    SHADOW_HASH="${SHADOW_ENTRY#*:}"
+    SHADOW_HASH="${SHADOW_HASH%%:*}"
+    case "$SHADOW_HASH" in
+        '!'*|'*'*)
+            fail "account '$USER_NAME' is locked and this sshd does not use PAM; set a password or unlock the account"
+            ;;
+    esac
+fi
+
 if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -A >/dev/null
 fi
