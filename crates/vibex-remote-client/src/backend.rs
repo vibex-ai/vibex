@@ -4749,6 +4749,31 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn get_model_provider_credential_secret(
+        &self,
+        request: vibex_core::ModelProviderCredentialSecretRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderCredentialSecretResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::GetProviderCredentialSecret(
+                vibex_core::RemoteProviderCredentialSecretGetRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderCredentialSecretGetResponse>(value)?.response)
+        })
+    }
+
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>> {
         let this = self.clone();
         Box::pin(async move {

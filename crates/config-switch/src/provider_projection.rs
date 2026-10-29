@@ -686,7 +686,12 @@ impl ProviderConfigService {
 
     pub fn list_model_provider_profiles(&self) -> VibexResult<Vec<ModelProviderProfile>> {
         let conn = self.open_connection()?;
-        ModelProviderProfileRepository::list(&conn)
+        let mut profiles = ModelProviderProfileRepository::list(&conn)?;
+        // A Key written before the mask existed still has to identify itself
+        // without showing its credential id. Reading its Secret once fills the
+        // mask in memory; the next replacement persists a fresh one.
+        hydrate_provider_credential_masks(&mut profiles);
+        Ok(profiles)
     }
 
     pub fn create_model_provider_profile(
@@ -1134,7 +1139,8 @@ impl ProviderConfigService {
             .display_name
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| format!("Key {}", RequestId::new().as_str()));
+            .unwrap_or_default();
+        let masked_hint = vibex_core::masked_secret_hint(value);
         let conn = self.open_connection()?;
         let mut profile = require_model_provider(&conn, &request.model_provider_profile_id)?;
         let credential_id = RequestId::new();
@@ -1144,6 +1150,7 @@ impl ProviderConfigService {
         profile.credentials.push(ModelProviderCredentialReference {
             id: credential_id,
             display_name,
+            masked_hint,
             status: AgentCredentialStatus::Ready,
             credential: AgentCredential::ApiKey {
                 secret: vibex_core::ProjectionSecretReference {
@@ -1279,6 +1286,13 @@ impl ProviderConfigService {
         } else {
             AgentCredentialStatus::Ready
         };
+        credential.masked_hint = if request.clear {
+            String::new()
+        } else {
+            next_value
+                .map(vibex_core::masked_secret_hint)
+                .unwrap_or_default()
+        };
         credential.revision = credential.revision.saturating_add(1).max(1);
         let expected_revision = profile.revision;
         profile.revision = profile.revision.saturating_add(1);
@@ -1296,6 +1310,52 @@ impl ProviderConfigService {
         }
         self.refresh_bindings_for_model_provider(&conn, &updated.id)?;
         Ok(updated)
+    }
+
+    /// Reads one shared Provider credential's stored Secret on request.
+    ///
+    /// This is the single explicit reveal path. Ordinary profile reads carry
+    /// only `masked_hint`, so a Key value never enters a list, a fingerprint,
+    /// or a gateway request unless the user asked to see it.
+    pub fn get_model_provider_credential_secret(
+        &self,
+        request: vibex_core::ModelProviderCredentialSecretRequest,
+    ) -> VibexResult<vibex_core::ModelProviderCredentialSecretResponse> {
+        let conn = self.open_connection()?;
+        let profile = require_model_provider(&conn, &request.model_provider_profile_id)?;
+        let credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.id == request.credential_id)
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "model_provider_credential_not_found",
+                    "model provider credential was not found",
+                )
+            })?;
+        let value = match credential.credential.secret_reference() {
+            Some(reference) => secrets::resolve_provider_secret_reference(
+                reference.backend,
+                reference.setup_state,
+                &reference.lookup_key,
+            )?,
+            None => None,
+        };
+        let masked_hint = if credential.masked_hint.is_empty() {
+            value
+                .as_deref()
+                .map(vibex_core::masked_secret_hint)
+                .unwrap_or_default()
+        } else {
+            credential.masked_hint.clone()
+        };
+        Ok(vibex_core::ModelProviderCredentialSecretResponse {
+            model_provider_profile_id: profile.id,
+            credential_id: credential.id.clone(),
+            display_name: credential.display_label(),
+            masked_hint,
+            value,
+        })
     }
 
     pub(crate) fn sync_legacy_projection(
@@ -5109,6 +5169,32 @@ fn replace_credential_secret(
     Ok(())
 }
 
+/// Fills the display mask for Keys written before the field existed.
+///
+/// A failure to read one Secret leaves its mask empty rather than failing the
+/// whole list; the row then falls back to a fixed mask and the eye reports the
+/// read error on its own.
+fn hydrate_provider_credential_masks(profiles: &mut [ModelProviderProfile]) {
+    for profile in profiles {
+        for credential in &mut profile.credentials {
+            if !credential.masked_hint.trim().is_empty() {
+                continue;
+            }
+            let Some(reference) = credential.credential.secret_reference() else {
+                continue;
+            };
+            let Ok(Some(value)) = secrets::resolve_provider_secret_reference(
+                reference.backend,
+                reference.setup_state,
+                &reference.lookup_key,
+            ) else {
+                continue;
+            };
+            credential.masked_hint = vibex_core::masked_secret_hint(&value);
+        }
+    }
+}
+
 fn validate_workspace_key(value: &str) -> VibexResult<()> {
     let value = value.trim();
     if value.is_empty()
@@ -6912,6 +6998,7 @@ mod tests {
             credentials: vec![ModelProviderCredentialReference {
                 id: credential_id.clone(),
                 display_name: "Matrix API key".to_string(),
+                masked_hint: String::new(),
                 status: AgentCredentialStatus::Referenced,
                 credential: AgentCredential::ApiKey {
                     secret: vibex_core::ProjectionSecretReference {
@@ -8085,6 +8172,7 @@ mod tests {
         provider.credentials = vec![ModelProviderCredentialReference {
             id: credential_id.clone(),
             display_name: "OpenCode API key".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Referenced,
             credential: AgentCredential::ApiKey {
                 secret: vibex_core::ProjectionSecretReference {
@@ -8666,6 +8754,7 @@ mod tests {
         provider.credentials = vec![ModelProviderCredentialReference {
             id: credential_id.clone(),
             display_name: "Test API key".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Ready,
             credential: AgentCredential::ApiKey {
                 secret: vibex_core::ProjectionSecretReference {

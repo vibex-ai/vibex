@@ -4932,6 +4932,7 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
                     display_name: "Primary".to_string(),
+                    masked_hint: "sk-********abcd".to_string(),
                     state: vibex_core::GatewayKeyState::Ready,
                     used_tokens: 0,
                     limits: None,
@@ -4941,6 +4942,7 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
                     display_name: "Backup".to_string(),
+                    masked_hint: "sk-********efgh".to_string(),
                     state: vibex_core::GatewayKeyState::Cooling {
                         kind: vibex_core::GatewayFailureKind::Rate,
                         until_ms: Some(1),
@@ -5088,6 +5090,7 @@ fn a_gateway_key_row_switches_and_prefers() {
             keys: vec![vibex_core::GatewayKeySummary {
                 credential_id: credential,
                 display_name: "Primary".to_string(),
+                masked_hint: "sk-********abcd".to_string(),
                 state: vibex_core::GatewayKeyState::Ready,
                 used_tokens: 0,
                 limits: None,

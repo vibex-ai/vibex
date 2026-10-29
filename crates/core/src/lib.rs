@@ -487,6 +487,7 @@ pub use remote::{
     RemoteProviderApplyNativeExportRequest, RemoteProviderApplyNativeExportResponse,
     RemoteProviderCapabilitySummaryListRequest, RemoteProviderCapabilitySummaryListResponse,
     RemoteProviderCreateProfileFromImportRequest, RemoteProviderCreateProfileFromImportResponse,
+    RemoteProviderCredentialSecretGetRequest, RemoteProviderCredentialSecretGetResponse,
     RemoteProviderCredentialSecretMutationRequest, RemoteProviderFailoverRecommendationListRequest,
     RemoteProviderFailoverRecommendationListResponse, RemoteProviderGetAcpProfileConfigRequest,
     RemoteProviderGetAcpProfileConfigResponse, RemoteProviderHealthSummaryListRequest,

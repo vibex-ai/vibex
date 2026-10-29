@@ -1322,6 +1322,9 @@ pub struct GatewayUpstreamSummary {
 pub struct GatewayKeySummary {
     pub credential_id: RequestId,
     pub display_name: String,
+    /// The masked fingerprint the row shows instead of the credential id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub masked_hint: String,
     pub state: GatewayKeyState,
     #[serde(default)]
     pub used_tokens: u64,
@@ -1408,7 +1411,7 @@ impl GatewayRequestSummary {
                     .credentials
                     .iter()
                     .find(|candidate| &candidate.id == credential)
-                    .map(|candidate| candidate.display_name.clone())
+                    .map(|candidate| candidate.display_label())
             })
         };
         let route = log
@@ -2071,6 +2074,7 @@ mod tests {
         let credential = |id: RequestId, name: &str| crate::ModelProviderCredentialReference {
             id,
             display_name: name.to_string(),
+            masked_hint: String::new(),
             status: crate::AgentCredentialStatus::Ready,
             credential: crate::AgentCredential::Local { runtime: None },
             revision: 1,

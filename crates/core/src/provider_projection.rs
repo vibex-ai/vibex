@@ -343,6 +343,13 @@ impl AgentCredential {
 pub struct ModelProviderCredentialReference {
     pub id: RequestId,
     pub display_name: String,
+    /// A masked fingerprint of the stored Secret.
+    ///
+    /// Surfaces identify a Key by this value instead of its credential id, so
+    /// a row is recognizable without resolving the Secret. Empty until the
+    /// Secret has been written or read once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub masked_hint: String,
     pub status: AgentCredentialStatus,
     pub credential: AgentCredential,
     pub revision: i64,
@@ -359,6 +366,7 @@ impl Default for ModelProviderCredentialReference {
         Self {
             id: RequestId::new(),
             display_name: String::new(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Missing,
             credential: AgentCredential::Local { runtime: None },
             revision: 1,
@@ -366,6 +374,49 @@ impl Default for ModelProviderCredentialReference {
             proxy_url: None,
         }
     }
+}
+
+impl ModelProviderCredentialReference {
+    /// The label a surface should use when it names this Key.
+    ///
+    /// A user-given name wins. The generated `Key <credential id>` placeholder
+    /// is not a name — it identifies the record, not the Key — so it falls
+    /// through to the masked fingerprint.
+    pub fn display_label(&self) -> String {
+        let name = self.display_name.trim();
+        if !name.is_empty() && !self.has_generated_name() {
+            return name.to_string();
+        }
+        if !self.masked_hint.is_empty() {
+            return self.masked_hint.clone();
+        }
+        "********".to_string()
+    }
+
+    /// Whether the stored name is the retired generated placeholder.
+    pub fn has_generated_name(&self) -> bool {
+        self.display_name.trim() == format!("Key {}", self.id.as_str())
+    }
+}
+
+/// Masks a stored Secret for display.
+///
+/// Keeps one to four leading and trailing characters and replaces the middle
+/// with a fixed eight asterisks, so the mask identifies a Key without
+/// disclosing its full value or its exact length. A Secret too short to split
+/// is masked entirely.
+pub fn masked_secret_hint(secret: &str) -> String {
+    if secret.is_empty() {
+        return String::new();
+    }
+    let characters: Vec<char> = secret.chars().collect();
+    if characters.len() <= 2 {
+        return "********".to_string();
+    }
+    let visible = (characters.len() / 4).clamp(1, 4);
+    let front: String = characters[..visible].iter().collect();
+    let back: String = characters[characters.len() - visible..].iter().collect();
+    format!("{front}********{back}")
 }
 
 /// Provider metadata that is not part of the launch contract.
@@ -1900,6 +1951,40 @@ pub struct RemoveModelProviderCredentialRequest {
     pub credential_id: RequestId,
 }
 
+/// Reads one shared Provider credential's stored Secret.
+///
+/// The response is only produced for an explicit reveal; ordinary reads carry
+/// the masked hint instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderCredentialSecretRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub credential_id: RequestId,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderCredentialSecretResponse {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub credential_id: RequestId,
+    pub display_name: String,
+    pub masked_hint: String,
+    pub value: Option<String>,
+}
+
+impl fmt::Debug for ModelProviderCredentialSecretResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelProviderCredentialSecretResponse")
+            .field("model_provider_profile_id", &self.model_provider_profile_id)
+            .field("credential_id", &self.credential_id)
+            .field("display_name", &self.display_name)
+            .field("masked_hint", &self.masked_hint)
+            .field("value", &self.value.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderCredentialSecretMutationRequest {
     pub model_provider_profile_id: ModelProviderProfileId,
@@ -3041,5 +3126,57 @@ mod key_policy_tests {
         let encoded = serde_json::to_string(&credential).unwrap();
         let decoded: ModelProviderCredentialReference = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, credential);
+    }
+
+    #[test]
+    fn a_secret_mask_keeps_the_prefix_and_suffix_but_not_the_length() {
+        assert_eq!(
+            masked_secret_hint("sk-1234567890abcdef"),
+            "sk-1********cdef"
+        );
+        assert_eq!(masked_secret_hint("abc"), "a********c");
+        assert_eq!(masked_secret_hint("ab"), "********");
+        assert!(masked_secret_hint("").is_empty());
+        assert!(!masked_secret_hint("sk-1234567890abcdef").contains("1234567890"));
+    }
+
+    #[test]
+    fn a_generated_key_name_falls_back_to_the_mask() {
+        let credential = ModelProviderCredentialReference {
+            id: RequestId::new(),
+            display_name: String::new(),
+            masked_hint: "sk-1********cdef".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(credential.display_label(), "sk-1********cdef");
+
+        let generated = ModelProviderCredentialReference {
+            id: credential.id.clone(),
+            display_name: format!("Key {}", credential.id.as_str()),
+            masked_hint: "sk-1********cdef".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(generated.display_label(), "sk-1********cdef");
+
+        let named = ModelProviderCredentialReference {
+            display_name: "Work account".to_string(),
+            masked_hint: "sk-1********cdef".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(named.display_label(), "Work account");
+    }
+
+    #[test]
+    fn an_older_key_record_reads_with_an_empty_mask() {
+        let encoded = r#"{
+            "id": "request_00000000000000000000000000000001",
+            "displayName": "Key request_00000000000000000000000000000001",
+            "status": "ready",
+            "credential": {"kind": "local"},
+            "revision": 1
+        }"#;
+        let decoded: ModelProviderCredentialReference = serde_json::from_str(encoded).unwrap();
+        assert!(decoded.masked_hint.is_empty());
+        assert_eq!(decoded.display_label(), "********");
     }
 }

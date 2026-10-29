@@ -1914,6 +1914,18 @@ fn gateway_child_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow>
                     (strings.config_state_off().to_string(), ConfigTone::Muted)
                 }
             };
+            // The row identifies the Key by its masked fingerprint, never by
+            // the credential id. A record written before the mask existed falls
+            // back to a fixed mask rather than exposing the id it replaced.
+            let key_label = if !key.masked_hint.trim().is_empty() {
+                key.masked_hint.clone()
+            } else if key.display_name.trim().is_empty()
+                || key.display_name.trim() == format!("Key {}", key.credential_id.as_str())
+            {
+                "********".to_string()
+            } else {
+                key.display_name.clone()
+            };
             rows.push(
                 ConfigRow::new(
                     format!(
@@ -1921,7 +1933,7 @@ fn gateway_child_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow>
                         upstream.model_provider_profile_id.as_str(),
                         key.credential_id.as_str()
                     ),
-                    format!("  │  ├ {}", key.display_name),
+                    format!("  │  ├ {key_label}"),
                 )
                 .cell(String::new())
                 .cell("1")
@@ -1929,7 +1941,6 @@ fn gateway_child_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow>
                 .cell(String::new())
                 .chip(&state, tone)
                 .enabled(key.state != vibex_core::GatewayKeyState::Disabled)
-                .detail(strings.config_field_id(), key.credential_id.as_str())
                 .detail(strings.config_field_kind(), "Key")
                 .detail(strings.config_col_state(), state.clone())
                 .detail(strings.config_field_models(), key.used_tokens.to_string())

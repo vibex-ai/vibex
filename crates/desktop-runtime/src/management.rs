@@ -353,6 +353,14 @@ impl ProviderManagementFacade {
         self.service.mutate_provider_credential_secret(request)
     }
 
+    /// Reads one shared Provider Key's stored value for an explicit reveal.
+    pub fn get_model_provider_credential_secret(
+        &self,
+        request: vibex_core::ModelProviderCredentialSecretRequest,
+    ) -> VibexResult<vibex_core::ModelProviderCredentialSecretResponse> {
+        self.service.get_model_provider_credential_secret(request)
+    }
+
     pub fn get_profile(
         &self,
         provider_profile_id: &vibex_core::ProviderProfileId,

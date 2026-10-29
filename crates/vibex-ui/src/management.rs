@@ -1547,6 +1547,13 @@ mod tests {
             error_future()
         }
 
+        fn get_model_provider_credential_secret(
+            &self,
+            _request: vibex_core::ModelProviderCredentialSecretRequest,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderCredentialSecretResponse> {
+            error_future()
+        }
+
         fn health_summaries(&self) -> BackendFuture<'_, Vec<vibex_core::ProviderHealthSummary>> {
             error_future()
         }

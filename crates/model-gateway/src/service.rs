@@ -63,6 +63,7 @@ pub struct GatewayUpstream {
 pub struct GatewayKeySummary {
     pub credential_id: RequestId,
     pub display_name: String,
+    pub masked_hint: String,
     pub state: vibex_core::GatewayKeyState,
     pub used_tokens: u64,
     pub models: Vec<String>,
@@ -633,7 +634,8 @@ impl ModelGatewayService {
                         });
                     GatewayKeySummary {
                         credential_id: credential.id.clone(),
-                        display_name: credential.display_name.clone(),
+                        display_name: credential.display_label(),
+                        masked_hint: credential.masked_hint.clone(),
                         state: state.visibility_at(now),
                         used_tokens: used,
                         models: credential.models.clone(),

@@ -396,6 +396,7 @@ fn seed_upstream(
     let credential = ModelProviderCredentialReference {
         id: RequestId::new(),
         display_name: "Primary".to_string(),
+        masked_hint: String::new(),
         status: AgentCredentialStatus::Ready,
         credential: AgentCredential::ApiKey {
             secret: ProjectionSecretReference {
@@ -512,6 +513,7 @@ fn seed_untyped_upstream(
     let credential = ModelProviderCredentialReference {
         id: RequestId::new(),
         display_name: "Primary".to_string(),
+        masked_hint: String::new(),
         status: AgentCredentialStatus::Ready,
         credential: AgentCredential::ApiKey {
             secret: ProjectionSecretReference {
@@ -1009,6 +1011,7 @@ async fn an_invalid_key_is_marked_and_the_next_key_answers() {
         profile.credentials.push(ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Broken".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Missing,
             credential: AgentCredential::Local { runtime: None },
             revision: 1,
@@ -1073,6 +1076,7 @@ async fn a_preferred_key_is_tried_before_the_provider_order() {
         let credential = ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Backup".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Ready,
             credential: AgentCredential::ApiKey {
                 secret: ProjectionSecretReference {
@@ -1261,6 +1265,7 @@ async fn a_cooling_key_is_skipped_and_the_second_key_answers() {
         let credential = ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Cooling".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Ready,
             credential: AgentCredential::ApiKey {
                 secret: ProjectionSecretReference {
@@ -1353,6 +1358,7 @@ async fn a_failover_records_the_refused_key_and_why_it_moved_on() {
         let credential = ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Backup".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Ready,
             credential: AgentCredential::ApiKey {
                 secret: ProjectionSecretReference {
@@ -1448,6 +1454,7 @@ async fn a_first_try_success_on_a_multi_key_provider_is_not_a_failover() {
         profile.credentials.push(ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Secondary".to_string(),
+            masked_hint: String::new(),
             status: AgentCredentialStatus::Ready,
             credential: AgentCredential::ApiKey {
                 secret: ProjectionSecretReference {

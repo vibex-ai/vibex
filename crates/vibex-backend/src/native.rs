@@ -1136,7 +1136,8 @@ fn read_gateway_snapshot(
             .iter()
             .map(|credential| vibex_core::GatewayKeySummary {
                 credential_id: credential.id.clone(),
-                display_name: credential.display_name.clone(),
+                display_name: credential.display_label(),
+                masked_hint: credential.masked_hint.clone(),
                 state: vibex_core::GatewayKeyState::Ready,
                 used_tokens: 0,
                 limits: settings.policy.account_limits.get(&credential.id).copied(),
@@ -3610,6 +3611,22 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .mutate_provider_credential_secret(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn get_model_provider_credential_secret(
+        &self,
+        request: vibex_core::ModelProviderCredentialSecretRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderCredentialSecretResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_model_provider_credential_secret(request)
                 .map_err(Into::into)
         })
     }

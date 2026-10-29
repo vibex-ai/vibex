@@ -2308,6 +2308,7 @@ pub enum RemoteProviderOperationKind {
     CreateAgentModelProviderBinding,
     UpdateAgentModelProviderBinding,
     MutateProviderCredentialSecret,
+    GetProviderCredentialSecret,
     SetAgentModelProviderDefault,
     GetAgentModelSourceDefault,
     SetAgentModelSourceDefault,
@@ -3041,6 +3042,40 @@ impl fmt::Debug for RemoteProviderCredentialSecretMutationRequest {
             .field("touched", &self.touched)
             .field("clear", &self.clear)
             .field("value", &self.value.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+/// Reads one shared Provider credential's stored Secret back for an explicit
+/// reveal. `Debug` never prints the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCredentialSecretGetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelProviderCredentialSecretRequest,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCredentialSecretGetResponse {
+    pub response: crate::ModelProviderCredentialSecretResponse,
+}
+
+impl fmt::Debug for RemoteProviderCredentialSecretGetRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteProviderCredentialSecretGetRequest")
+            .field("auth", &self.auth)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RemoteProviderCredentialSecretGetResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteProviderCredentialSecretGetResponse")
+            .field("response", &self.response)
             .finish()
     }
 }
@@ -3903,6 +3938,7 @@ pub enum RemoteProviderRequest {
     CreateAgentModelProviderBinding(RemoteAgentModelProviderBindingCreateRequest),
     UpdateAgentModelProviderBinding(RemoteAgentModelProviderBindingUpdateRequest),
     MutateProviderCredentialSecret(RemoteProviderCredentialSecretMutationRequest),
+    GetProviderCredentialSecret(RemoteProviderCredentialSecretGetRequest),
     SetAgentModelProviderDefault(RemoteAgentModelProviderDefaultRequest),
     GetAgentModelSourceDefault(RemoteAgentModelSourceDefaultRequest),
     SetAgentModelSourceDefault(RemoteSetAgentModelSourceDefaultRequest),
@@ -4088,6 +4124,9 @@ impl RemoteProviderRequest {
             }
             Self::MutateProviderCredentialSecret(_) => {
                 RemoteProviderOperationKind::MutateProviderCredentialSecret
+            }
+            Self::GetProviderCredentialSecret(_) => {
+                RemoteProviderOperationKind::GetProviderCredentialSecret
             }
             Self::SetAgentModelProviderDefault(_) => {
                 RemoteProviderOperationKind::SetAgentModelProviderDefault

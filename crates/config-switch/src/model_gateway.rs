@@ -931,6 +931,10 @@ mod tests {
                 value: "sk-original".to_string(),
             })
             .unwrap();
+        assert_eq!(
+            added.credentials[0].masked_hint,
+            vibex_core::masked_secret_hint("sk-original")
+        );
         let credential = added.credentials[0].id.clone();
         let conn = test_connection(&path).unwrap();
         let mut state =
@@ -939,7 +943,7 @@ mod tests {
         state.consecutive_failures = 1;
         vibex_db::ModelProviderAccountStateRepository::upsert(&conn, &state).unwrap();
 
-        service
+        let replaced = service
             .mutate_provider_credential_secret(
                 vibex_core::ProviderCredentialSecretMutationRequest {
                     model_provider_profile_id: profile.id.clone(),
@@ -950,6 +954,10 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(
+            replaced.credentials[0].masked_hint,
+            vibex_core::masked_secret_hint("sk-replacement")
+        );
         let states =
             vibex_db::ModelProviderAccountStateRepository::list(&conn, &profile.id).unwrap();
         assert!(
@@ -964,7 +972,7 @@ mod tests {
             vibex_core::ModelProviderAccountState::ready(profile.id.clone(), credential.clone());
         state.cooldown_reason = Some(vibex_core::GatewayFailureKind::Auth);
         vibex_db::ModelProviderAccountStateRepository::upsert(&conn, &state).unwrap();
-        service
+        let cleared = service
             .mutate_provider_credential_secret(
                 vibex_core::ProviderCredentialSecretMutationRequest {
                     model_provider_profile_id: profile.id.clone(),
@@ -975,9 +983,61 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(cleared.credentials[0].masked_hint.is_empty());
         let states =
             vibex_db::ModelProviderAccountStateRepository::list(&conn, &profile.id).unwrap();
         assert!(!states[0].is_ready_at(vibex_core::unix_timestamp_ms()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A Key's value leaves the runtime only through the explicit reveal.
+    #[test]
+    fn a_key_value_is_only_read_through_the_explicit_reveal() {
+        let (path, service) = service();
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "DeepSeek".to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        {
+            let conn = test_connection(&path).unwrap();
+            vibex_db::ModelProviderProfileRepository::insert(&conn, &profile).unwrap();
+        }
+        let secret = "sk-reveal-sentinel-1234";
+        let added = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: profile.id.clone(),
+                display_name: None,
+                value: secret.to_string(),
+            })
+            .unwrap();
+        let credential = added.credentials[0].id.clone();
+
+        let listed = service.list_model_provider_profiles().unwrap();
+        let listed_key = &listed[0].credentials[0];
+        assert_eq!(
+            listed_key.masked_hint,
+            vibex_core::masked_secret_hint(secret)
+        );
+        assert!(
+            !serde_json::to_string(&listed).unwrap().contains(secret),
+            "an ordinary profile read must not carry the value"
+        );
+
+        let revealed = service
+            .get_model_provider_credential_secret(
+                vibex_core::ModelProviderCredentialSecretRequest {
+                    model_provider_profile_id: profile.id.clone(),
+                    credential_id: credential,
+                },
+            )
+            .unwrap();
+        assert_eq!(revealed.value.as_deref(), Some(secret));
+        assert_eq!(revealed.masked_hint, listed_key.masked_hint);
+        assert!(
+            !format!("{revealed:?}").contains(secret),
+            "the reveal response must not print its value in Debug"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1591,6 +1651,7 @@ mod fingerprint_tests {
                 credentials: vec![vibex_core::ModelProviderCredentialReference {
                     id: RequestId::new(),
                     display_name: "Primary".to_string(),
+                    masked_hint: String::new(),
                     status: AgentCredentialStatus::Ready,
                     credential: AgentCredential::ApiKey {
                         secret: ProjectionSecretReference {

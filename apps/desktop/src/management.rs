@@ -1272,6 +1272,16 @@ pub struct ManagementCenter {
     gateway_key_replace_target: Option<(vibex_core::ModelProviderProfileId, vibex_core::RequestId)>,
     gateway_key_replace_input: Option<Entity<InputState>>,
     gateway_key_replace_error: Option<String>,
+    /// Key values the user explicitly revealed, keyed by
+    /// `model_provider_profile_id:credential_id`.
+    ///
+    /// Only an eye click fills this map; ordinary snapshots carry the masked
+    /// hint. It is cleared whenever a fresh snapshot replaces the profile rows,
+    /// so a replaced Secret cannot stay on screen.
+    revealed_provider_keys: BTreeMap<String, String>,
+    /// The Key whose reveal read is in flight, so its eye can show progress.
+    revealing_provider_key: Option<String>,
+    provider_key_reveal_task: Option<Task<()>>,
     /// The Key being added to one Provider, keyed by profile id.
     gateway_key_drafts: BTreeMap<String, Entity<InputState>>,
     gateway_key_batch_target: Option<String>,
@@ -2761,6 +2771,9 @@ impl ManagementCenter {
             gateway_key_replace_target: None,
             gateway_key_replace_input: None,
             gateway_key_replace_error: None,
+            revealed_provider_keys: BTreeMap::new(),
+            revealing_provider_key: None,
+            provider_key_reveal_task: None,
             gateway_key_drafts: BTreeMap::new(),
             gateway_key_batch_target: None,
             gateway_key_batch_drafts: BTreeMap::new(),
@@ -5435,6 +5448,11 @@ impl ManagementCenter {
         self.snapshot = snapshot.center;
         self.gateway = snapshot.gateway;
         self.providers = snapshot.providers;
+        // A reveal belongs to the exact Secret that was read. A fresh snapshot
+        // may carry a replaced value, so every revealed row folds back to its
+        // mask instead of showing a stale Secret.
+        self.revealed_provider_keys.clear();
+        self.revealing_provider_key = None;
         self.provider_bindings = snapshot.provider_bindings;
         // A stale snapshot must not put a Provider back after its delete was
         // requested. Keep the row hidden until a snapshot actually omits it.
@@ -19506,6 +19524,171 @@ impl ManagementCenter {
         )
     }
 
+    /// The identity a Key row shows: its masked fingerprint, an explicit
+    /// reveal toggle, and the user-given name when there is one.
+    ///
+    /// The credential id is never drawn. A Key is identified by the value it
+    /// contains, and the full value exists on screen only after the eye is
+    /// clicked.
+    fn render_provider_key_value(
+        &self,
+        profile_id: &vibex_core::ModelProviderProfileId,
+        credential_id: &vibex_core::RequestId,
+        masked_hint: &str,
+        display_name: &str,
+        can_reveal: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row_key = provider_key_row_key(profile_id, credential_id);
+        let revealed = self.revealed_provider_keys.get(&row_key);
+        let revealing = self.revealing_provider_key.as_deref() == Some(row_key.as_str());
+        let fallback = if masked_hint.trim().is_empty() {
+            "********"
+        } else {
+            masked_hint
+        };
+        let shown = revealed.map(String::as_str).unwrap_or(fallback);
+        let generated_name = format!("Key {}", credential_id.as_str());
+        let custom_name = display_name.trim();
+        let custom_name =
+            (!custom_name.is_empty() && custom_name != generated_name && custom_name != shown)
+                .then_some(custom_name);
+        let label = if revealed.is_some() {
+            management_locale_text("Hide key", "隐藏 Key", "隱藏 Key")
+        } else {
+            management_locale_text("Show key", "显示 Key", "顯示 Key")
+        };
+        v_flex()
+            .min_w_0()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .child(shown.to_string()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-key-reveal-{}-{}",
+                            profile_id.as_str(),
+                            credential_id.as_str()
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(if revealed.is_some() {
+                            IconName::EyeOff
+                        } else {
+                            IconName::Eye
+                        })
+                        .tooltip(label)
+                        .accessibility_label(label)
+                        .disabled(!can_reveal || revealing)
+                        .loading(revealing)
+                        .on_click(cx.listener({
+                            let profile_id = profile_id.clone();
+                            let credential_id = credential_id.clone();
+                            move |this, _, _, cx| {
+                                this.toggle_provider_key_reveal(
+                                    profile_id.clone(),
+                                    credential_id.clone(),
+                                    cx,
+                                )
+                            }
+                        })),
+                    ),
+            )
+            .children(custom_name.map(|name| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(name.to_string())
+            }))
+            .into_any_element()
+    }
+
+    /// Reveals one Key on request, or folds it back to its mask.
+    fn toggle_provider_key_reveal(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        credential_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let row_key = provider_key_row_key(&profile_id, &credential_id);
+        if self.revealed_provider_keys.remove(&row_key).is_some() {
+            cx.notify();
+            return;
+        }
+        if self.revealing_provider_key.as_deref() == Some(row_key.as_str()) {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            self.error = Some(
+                management_locale_text(
+                    "This runtime cannot read a stored Provider key.",
+                    "当前运行时无法读取已保存的供应商 Key。",
+                    "目前執行階段無法讀取已儲存的供應商 Key。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        self.revealing_provider_key = Some(row_key.clone());
+        self.error = None;
+        let entity = cx.weak_entity();
+        self.provider_key_reveal_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .get_model_provider_credential_secret(
+                    vibex_core::ModelProviderCredentialSecretRequest {
+                        model_provider_profile_id: profile_id,
+                        credential_id,
+                    },
+                )
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                // A snapshot or a second eye click may have moved on while the
+                // read was in flight; a late value must not appear under a Key
+                // whose state has since changed.
+                if this.revealing_provider_key.as_deref() != Some(row_key.as_str()) {
+                    return;
+                }
+                this.revealing_provider_key = None;
+                match outcome {
+                    Ok(response) => {
+                        if let Some(value) = response.value.filter(|value| !value.trim().is_empty())
+                        {
+                            this.revealed_provider_keys.insert(row_key, value);
+                        } else {
+                            this.error = Some(
+                                management_locale_text(
+                                    "The stored key could not be read. Add it again to replace it.",
+                                    "无法读取已保存的 Key，请重新添加以替换。",
+                                    "無法讀取已儲存的 Key，請重新新增以取代。",
+                                )
+                                .to_string(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     /// One shared Provider's keys, editable through the v2 credential API.
     fn render_shared_provider_keys(
         &mut self,
@@ -19569,13 +19752,14 @@ impl ManagementCenter {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .py_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .child(credential.display_name.clone()),
-                    )
+                    .child(self.render_provider_key_value(
+                        &profile.id,
+                        &credential.id,
+                        &credential.masked_hint,
+                        &credential.display_name,
+                        credential.credential.secret_reference().is_some(),
+                        cx,
+                    ))
                     .child(
                         h_flex()
                             .items_center()
@@ -23403,13 +23587,14 @@ impl ManagementCenter {
                                         }
                                     })),
                                 )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(key.display_name.clone()),
-                                )
+                                .child(self.render_provider_key_value(
+                                    &upstream.model_provider_profile_id,
+                                    &key.credential_id,
+                                    &key.masked_hint,
+                                    &key.display_name,
+                                    true,
+                                    cx,
+                                ))
                                 .children(preferred_key.then(|| {
                                     Tag::color(ColorName::Blue)
                                         .xsmall()
@@ -41057,6 +41242,14 @@ fn management_provider_card_summary(
     }
 }
 
+/// The key a revealed Key value is stored under.
+fn provider_key_row_key(
+    profile_id: &vibex_core::ModelProviderProfileId,
+    credential_id: &vibex_core::RequestId,
+) -> String {
+    format!("{}:{}", profile_id.as_str(), credential_id.as_str())
+}
+
 /// One Key's state, labelled so colour is never the only signal.
 fn gateway_key_state_badge(key: &vibex_core::GatewayKeySummary, _cx: &App) -> AnyElement {
     match key.state {
@@ -50337,6 +50530,7 @@ mod gateway_surface_tests {
         let key = |state| vibex_core::GatewayKeySummary {
             credential_id: vibex_core::RequestId::new(),
             display_name: "Key".to_string(),
+            masked_hint: "sk-********abcd".to_string(),
             state,
             used_tokens: 0,
             limits: None,
@@ -51541,6 +51735,7 @@ mod gateway_surface_tests {
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
                     display_name: "Primary".to_string(),
+                    masked_hint: "sk-********abcd".to_string(),
                     state: vibex_core::GatewayKeyState::Ready,
                     used_tokens: 0,
                     limits: None,
@@ -51551,6 +51746,7 @@ mod gateway_surface_tests {
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
                     display_name: "Backup".to_string(),
+                    masked_hint: "sk-********efgh".to_string(),
                     state: vibex_core::GatewayKeyState::Cooling {
                         kind: vibex_core::GatewayFailureKind::Rate,
                         until_ms: Some(1),
@@ -51564,6 +51760,7 @@ mod gateway_surface_tests {
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
                     display_name: "Revoked".to_string(),
+                    masked_hint: "sk-********ijkl".to_string(),
                     state: vibex_core::GatewayKeyState::Invalid,
                     used_tokens: 0,
                     limits: None,
@@ -51675,6 +51872,7 @@ mod gateway_surface_tests {
             keys: vec![vibex_core::GatewayKeySummary {
                 credential_id: vibex_core::RequestId::new(),
                 display_name: "Primary".to_string(),
+                masked_hint: "sk-********abcd".to_string(),
                 state: vibex_core::GatewayKeyState::Cooling {
                     kind: vibex_core::GatewayFailureKind::Credit,
                     until_ms: Some(1),
@@ -51867,6 +52065,48 @@ mod gateway_surface_tests {
             .expect("the v2 write should remain inspectable");
         assert!(update.contains("update_model_provider_profile"));
         assert!(update.contains("ModelProviderProfileUpdateRequest"));
+    }
+
+    /// A Key is identified by its masked value, never by its credential id.
+    ///
+    /// The old row drew `display_name`, which the authority generated as
+    /// `Key <credential id>`; two keys then looked like interchangeable ids.
+    #[test]
+    fn key_rows_show_a_mask_with_a_reveal_toggle_instead_of_the_credential_id() {
+        let source = include_str!("management.rs");
+        let provider_keys = source
+            .split_once("    fn render_shared_provider_keys(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The gateway's sidebar"))
+            .map(|(body, _)| body)
+            .expect("the shared Provider key editor should remain inspectable");
+        assert!(provider_keys.contains("render_provider_key_value"));
+        assert!(provider_keys.contains("credential.masked_hint"));
+        assert!(
+            !provider_keys.contains("child(credential.display_name.clone())"),
+            "the row must not draw the generated name"
+        );
+
+        let gateway_keys = source
+            .split_once("            for key in &upstream.keys {")
+            .and_then(|(_, tail)| tail.split_once("\n            if upstream.keys.is_empty()"))
+            .map(|(body, _)| body)
+            .expect("the gateway Key row should remain inspectable");
+        assert!(gateway_keys.contains("render_provider_key_value"));
+        assert!(gateway_keys.contains("key.masked_hint"));
+        assert!(
+            !gateway_keys.contains("child(key.display_name.clone())"),
+            "the gateway row must not draw the generated name"
+        );
+
+        let reveal = source
+            .split_once("    fn render_provider_key_value(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Reveals one Key on request"))
+            .map(|(body, _)| body)
+            .expect("the shared Key identity renderer should remain inspectable");
+        assert!(reveal.contains("IconName::Eye"));
+        assert!(reveal.contains("IconName::EyeOff"));
+        assert!(reveal.contains("revealed_provider_keys"));
+        assert!(reveal.contains("toggle_provider_key_reveal"));
     }
 
     /// Creating from the global page must borrow a real projection descriptor,

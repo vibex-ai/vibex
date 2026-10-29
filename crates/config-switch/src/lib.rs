@@ -2438,7 +2438,7 @@ impl ProviderConfigService {
                     backend: reference.backend,
                     setup_state: reference.setup_state,
                     lookup_key: reference.lookup_key.clone(),
-                    display_label: credential.display_name.clone(),
+                    display_label: credential.display_label(),
                     redacted_hint: reference.redacted_hint.clone(),
                     created_at_ms: now,
                     updated_at_ms: now,

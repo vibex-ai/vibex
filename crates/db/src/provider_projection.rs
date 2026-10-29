@@ -1147,7 +1147,7 @@ fn legacy_secrets_from_model_provider(
                 backend: reference.backend,
                 setup_state: reference.setup_state,
                 lookup_key: reference.lookup_key.clone(),
-                display_label: credential.display_name.clone(),
+                display_label: credential.display_label(),
                 redacted_hint: reference.redacted_hint.clone(),
                 created_at_ms: existing
                     .map(|secret| secret.created_at_ms.max(1))
@@ -2107,6 +2107,7 @@ fn legacy_credentials(profile: &ProviderProfile) -> Vec<ModelProviderCredentialR
             ModelProviderCredentialReference {
                 id: secret.id.clone(),
                 display_name: secret.display_label.clone(),
+                masked_hint: String::new(),
                 status,
                 credential,
                 revision: secret.updated_at_ms.max(1),

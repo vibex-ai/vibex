@@ -1391,7 +1391,8 @@ fn assemble_gateway_snapshot(
                     .unwrap_or(vibex_core::GatewayKeyState::Ready);
                 vibex_core::GatewayKeySummary {
                     credential_id: credential.id.clone(),
-                    display_name: credential.display_name.clone(),
+                    display_name: credential.display_label(),
+                    masked_hint: credential.masked_hint.clone(),
                     state,
                     used_tokens: 0,
                     limits: settings.policy.account_limits.get(&credential.id).copied(),

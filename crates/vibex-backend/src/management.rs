@@ -34,6 +34,7 @@ use vibex_core::{
     McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
     McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
     McpServerValidateRequest, McpServerValidationResult, ModelCapabilitySuggestionRequest,
+    ModelProviderCredentialSecretRequest, ModelProviderCredentialSecretResponse,
     ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
     Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
     PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
@@ -384,6 +385,13 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<ProviderCredentialSecretMutationRequest>,
     ) -> BackendFuture<'_, ModelProviderProfile>;
+
+    /// Reads one shared Provider credential's stored Secret for an explicit
+    /// reveal. Ordinary reads carry only the masked hint.
+    fn get_model_provider_credential_secret(
+        &self,
+        request: ModelProviderCredentialSecretRequest,
+    ) -> BackendFuture<'_, ModelProviderCredentialSecretResponse>;
 
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>>;
 

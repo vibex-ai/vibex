@@ -4683,6 +4683,21 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteModelProviderProfileResponse { profile })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::GetProviderCredentialSecret(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            // A reveal is a read, not a mutation: the user asked for the value
+            // and nothing about the Provider changes, so no audit line is
+            // written. The Agent-profile Secret read follows the same policy.
+            let response = service.get_model_provider_credential_secret(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderCredentialSecretGetResponse { response })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::SetAgentModelProviderDefault(request) => {
             let auth = authorize_provider_action(
                 runtime,

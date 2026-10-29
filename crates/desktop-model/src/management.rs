@@ -1069,6 +1069,7 @@ mod shared_projection_tests {
                 .map(|_| vibex_core::ModelProviderCredentialReference {
                     id: vibex_core::RequestId::new(),
                     display_name: "Key".to_string(),
+                    masked_hint: "sk-********abcd".to_string(),
                     status: vibex_core::AgentCredentialStatus::Ready,
                     credential: vibex_core::AgentCredential::ApiKey {
                         secret: vibex_core::ProjectionSecretReference {
