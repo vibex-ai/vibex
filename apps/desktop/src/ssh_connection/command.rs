@@ -56,6 +56,10 @@ pub struct SshCommand {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub stdin: Option<Vec<u8>>,
+    /// Index of the first remote-script positional argument. Arguments from
+    /// here on are shell-quoted before OpenSSH joins them into its remote
+    /// command string.
+    pub(crate) remote_arg_start: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -85,6 +89,7 @@ impl SshCommand {
             program: program.into(),
             args: Vec::new(),
             stdin: None,
+            remote_arg_start: None,
         }
     }
 
@@ -122,6 +127,7 @@ impl SshCommand {
             program: program.into(),
             args,
             stdin: None,
+            remote_arg_start: None,
         })
     }
 
@@ -142,6 +148,7 @@ impl SshCommand {
         }
         self.args.push(OsString::from("sh"));
         self.args.push(OsString::from("-s"));
+        self.remote_arg_start = Some(self.args.len());
         self.stdin = Some(script.as_bytes().to_vec());
         Ok(self)
     }
@@ -149,6 +156,16 @@ impl SshCommand {
     pub fn with_remote_script(mut self, script: &str) -> VibexResult<Self> {
         self.remote_script(script)?;
         Ok(self)
+    }
+
+    fn append_args(&self, command: &mut Command) {
+        for (index, arg) in self.args.iter().enumerate() {
+            if self.remote_arg_start.is_some_and(|start| index >= start) {
+                command.arg(shell_quote(&arg.to_string_lossy()));
+            } else {
+                command.arg(arg);
+            }
+        }
     }
 
     pub fn run(&self) -> Result<SshOutput, SshFailure> {
@@ -159,7 +176,7 @@ impl SshCommand {
         #[cfg(test)]
         let _process_guard = crate::ssh_connection::test_support::process_guard();
         let mut command = Command::new(&self.program);
-        command.args(&self.args);
+        self.append_args(&mut command);
         command.env("LC_ALL", "C");
         command.stdin(if self.stdin.is_some() {
             Stdio::piped()
@@ -263,7 +280,7 @@ impl SshCommand {
         #[cfg(test)]
         let _process_guard = crate::ssh_connection::test_support::process_guard();
         let mut command = Command::new(&self.program);
-        command.args(&self.args);
+        self.append_args(&mut command);
         command.env("LC_ALL", "C");
         command.stdin(if self.stdin.is_some() {
             Stdio::piped()
@@ -394,6 +411,10 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
     buffer
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +507,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "ssh_destination_invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quotes_every_positional_argument_after_a_remote_script() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("fake-ssh");
+        let capture = dir.path().join("args");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat >/dev/null\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = SshCommand::new(&ssh);
+        command.remote_script("set -eu").unwrap();
+        let value = "/tmp/a b;$(touch /tmp/pwned)'quoted";
+        command.args.push(value.into());
+        command.run().unwrap();
+        let args = std::fs::read_to_string(&capture).unwrap();
+        assert!(args.contains(shell_quote(value).as_str()), "{args}");
+        assert!(args.lines().any(|line| line == "sh"), "{args}");
+        assert!(args.lines().any(|line| line == "-s"), "{args}");
     }
 
     #[test]

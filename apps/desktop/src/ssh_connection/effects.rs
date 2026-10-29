@@ -300,6 +300,7 @@ mod tests {
             program: path,
             args: Vec::new(),
             stdin: None,
+            remote_arg_start: None,
         }
     }
 

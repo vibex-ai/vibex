@@ -455,7 +455,7 @@ mod tests {
         assert!(
             lines
                 .windows(2)
-                .any(|pair| pair == ["-s", config.env_file.as_str()]),
+                .any(|pair| { pair[0] == "-s" && pair[1].trim_matches('\'') == config.env_file }),
             "env file must follow sh -s: {args}"
         );
         assert!(args.contains("VIBEX_HOME='"));

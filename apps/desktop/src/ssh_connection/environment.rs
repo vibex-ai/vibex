@@ -715,6 +715,7 @@ runtime=present\n";
             program: ssh,
             args: Vec::new(),
             stdin: None,
+            remote_arg_start: None,
         };
         let environment = probe(&command, 8765, MIN_FREE_KB).unwrap();
         assert_eq!(environment.arch, RemoteArch::X86_64);

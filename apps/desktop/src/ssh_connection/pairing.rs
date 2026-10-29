@@ -397,6 +397,7 @@ mod tests {
             program: ssh,
             args: Vec::new(),
             stdin: None,
+            remote_arg_start: None,
         };
         let payload = fetch_pairing_code(&command, &config(), 1000).unwrap();
         assert_eq!(payload.endpoint, "https://127.0.0.1:8765");
