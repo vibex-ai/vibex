@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use super::environment::{EnvironmentError, RemoteEnvironment, parse_probe_output, probe_script};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_SCRIPT: &str = r#"set -eu; umask 077; mkdir -p "$(dirname "$1")"; cat > "$1""#;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +98,33 @@ impl WslCommand {
     pub fn arg(&mut self, value: impl Into<std::ffi::OsString>) -> &mut Self {
         self.args.push(value.into());
         self
+    }
+
+    /// Runs a fixed script with exact positional arguments.
+    pub fn run_script(&mut self, script: &str, args: &[String]) -> Result<WslOutput, WslError> {
+        self.remote_script(script)?;
+        for arg in args {
+            self.arg(arg.clone());
+        }
+        self.run()
+    }
+
+    /// Uploads bytes to a destination inside the distro without a shell
+    /// reparse of the path.
+    pub fn upload(&mut self, destination: &str, contents: &[u8]) -> Result<WslOutput, WslError> {
+        self.args.clear();
+        self.args.extend([
+            "-d".into(),
+            self.distro.clone().into(),
+            "--exec".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            UPLOAD_SCRIPT.into(),
+            "sh".into(),
+            destination.into(),
+        ]);
+        self.stdin = Some(contents.to_vec());
+        self.run()
     }
 
     pub fn run(&self) -> Result<WslOutput, WslError> {

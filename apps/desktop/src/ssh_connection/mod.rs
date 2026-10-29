@@ -29,6 +29,7 @@ pub mod tunnel;
 pub mod uninstall;
 pub mod upgrade;
 pub mod wsl;
+pub mod wsl_provision;
 
 pub use artifact::{
     ArtifactError, LocalArtifact, download_server_artifact, download_server_artifact_for_os,

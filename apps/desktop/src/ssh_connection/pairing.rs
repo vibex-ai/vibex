@@ -211,6 +211,37 @@ pub fn parse_pairing_payload(json: &str, now_ms: i64) -> Result<PairingPayload, 
     Ok(payload)
 }
 
+/// Claims an already-fetched payload and registers the credential. WSL has no
+/// SSH command for a refresh retry, so it fetches a fresh payload before
+/// calling this.
+pub async fn claim_payload_and_register(
+    payload: PairingPayload,
+    home_dir: &Path,
+    local_port: u16,
+    allow_insecure_local_dev: bool,
+    now_ms: i64,
+) -> Result<PairingOutcome, PairingError> {
+    let local_endpoint = payload.local_endpoint(local_port)?;
+    let mut credential = claim_once(&payload, &local_endpoint, allow_insecure_local_dev).await?;
+    if credential.expected_server_id != payload.server_id {
+        return Err(PairingError::new(
+            "ssh_pairing_identity_mismatch",
+            "the pairing response does not match the advertised server identity",
+        ));
+    }
+    credential.pinned_tls_certificate_der = payload.tls_certificate_der.clone();
+    credential.validate().map_err(PairingError::from_register)?;
+
+    let store = DesktopRuntimeRegistryStore::new(home_dir);
+    let mut registry = store.load_or_migrate();
+    let runtime_id = registry.upsert(credential.clone(), now_ms);
+    store.save(&registry).map_err(PairingError::from_register)?;
+    Ok(PairingOutcome {
+        runtime_id,
+        credential,
+    })
+}
+
 /// Claims a code, registers the credential in the desktop runtime registry, and
 /// returns the runtime id. The active runtime is intentionally not changed;
 /// activation belongs to the Ready step.
