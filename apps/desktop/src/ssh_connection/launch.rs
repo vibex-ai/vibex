@@ -404,6 +404,23 @@ mod tests {
         assert!(START_SCRIPT.contains("umask 077"));
     }
 
+    /// `serve` prints a pairing code unless told not to, and the log it writes
+    /// to is what View log shows. Every serve line must carry the flag.
+    #[test]
+    fn start_script_never_prints_a_pairing_code_into_the_log() {
+        let serves = START_SCRIPT
+            .lines()
+            .filter(|line| line.contains(" serve"))
+            .collect::<Vec<_>>();
+        assert_eq!(serves.len(), 2, "{serves:?}");
+        assert!(
+            serves
+                .iter()
+                .all(|line| line.contains("serve --no-pairing")),
+            "{serves:?}"
+        );
+    }
+
     #[test]
     fn parses_start_outcomes() {
         assert_eq!(

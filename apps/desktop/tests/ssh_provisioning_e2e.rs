@@ -457,6 +457,15 @@ async fn provisioning_reaches_ready_over_sshd() {
         effects.runtime_id(),
         effects.runtime_status()
     );
+    // The pairing code is fetched over SSH and claimed directly; it must never
+    // land in the server log, which the desktop shows through View log.
+    let mut read_log = command.clone();
+    read_log.remote_script("cat \"$1\"").unwrap();
+    read_log.args.push(launch.log_file.clone().into());
+    let log = read_log.run().expect("read server log").stdout_lossy();
+    assert!(log.contains("runtime=ready"), "server log: {log}");
+    assert!(!log.contains("pairing_code="), "server log: {log}");
+    assert!(!log.contains("vibex://pair"), "server log: {log}");
     let stop = supervisor::ensure_stopped(&command, &launch);
     let _ = effects.take_tunnel_process();
     stop.expect("runtime should stop");
