@@ -20639,6 +20639,17 @@ impl MobileApp {
         }
     }
 
+    /// How long a settled command or agent call ran, as its header reads it.
+    pub(super) fn timeline_row_duration(
+        &self,
+        row: &TimelineRow,
+        activity: &vibex_ui::timeline::Activity,
+    ) -> Option<String> {
+        let items = &self.controller.as_ref()?.state.timeline.items;
+        vibex_ui::timeline::row_duration_ms(row, activity, items)
+            .map(vibex_ui::timeline::format_duration)
+    }
+
     /// [`crate::file_diff::line_counts`] for a row, counted once per sequence.
     pub(super) fn timeline_row_line_counts(&self, row: &TimelineRow) -> Option<(usize, usize)> {
         if let Some((sequence, counts)) = self.timeline_file_line_counts.borrow().get(&row.id)

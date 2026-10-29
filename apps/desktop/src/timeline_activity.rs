@@ -13,8 +13,26 @@ const RAIL_ICON_GAP_REM: f32 = 0.125;
 const HOVER_GROUP: &str = "timeline-activity";
 
 pub(super) use vibex_ui::timeline::{
-    Activity, ActivitySummary, activity_target, group_open, is_running,
+    Activity, ActivitySummary, activity_target, display_command, group_open, is_running,
 };
+
+/// How long a settled command or agent call ran, as a muted header label.
+pub(super) fn row_duration(
+    row: &TimelineRow,
+    activity: &Activity,
+    items: &[vibex_core::TimelineItem],
+    cx: &App,
+) -> Option<AnyElement> {
+    let elapsed = vibex_ui::timeline::row_duration_ms(row, activity, items)?;
+    Some(
+        div()
+            .flex_none()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground.opacity(0.72))
+            .child(vibex_ui::timeline::format_duration(elapsed))
+            .into_any_element(),
+    )
+}
 
 pub(super) fn current_locale() -> vibex_ui::locale::Locale {
     match locale::current_locale() {
@@ -246,6 +264,24 @@ pub(super) fn header(
                         .child(activity_text("action-shimmer", activity.action(), running)),
                 )
                 .child(target)
+                // A failed call says why while it is closed; open, its body
+                // shows the whole output and the line would only repeat it.
+                .when_some(
+                    activity
+                        .error_line()
+                        .filter(|_| !disclosure.is_some_and(|(open, _)| open)),
+                    |this, line| {
+                        this.child(
+                            div()
+                                .id("error-line")
+                                .min_w_0()
+                                .flex_shrink(1.0)
+                                .truncate()
+                                .text_color(cx.theme().danger.opacity(0.78))
+                                .child(line.to_string()),
+                        )
+                    },
+                )
                 .children(statistics)
                 .when_some(disclosure, |this, (open, progress)| {
                     this.child(

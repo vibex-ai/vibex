@@ -6,7 +6,9 @@
 
 use crate::locale::Locale;
 use std::collections::BTreeSet;
-use vibex_core::{FileOperationKind, PlanStepStatus, TimelinePayload, ToolCallPayload};
+use vibex_core::{
+    FileOperationKind, PlanStepStatus, TimelineItem, TimelinePayload, ToolCallPayload,
+};
 use vibex_desktop_model::{
     TimelineConversationTurn, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
 };
@@ -69,6 +71,7 @@ pub enum ActivityKind {
     Collaboration,
     Image,
     Integration,
+    Web,
     Retry,
     Generic,
 }
@@ -81,6 +84,8 @@ pub struct Activity {
     path: Option<String>,
     icon: ActivityKind,
     failed: bool,
+    /// The first line of what a failed call printed, for its collapsed row.
+    error: Option<String>,
 }
 
 impl Activity {
@@ -94,9 +99,16 @@ impl Activity {
                 } else {
                     &tool.summary
                 };
-                let input_target = summary_is_uninformative(&tool.summary, &tool.tool_name)
-                    .then(|| tool_input_target(tool, icon))
+                // A command's own description says what it is for; the command
+                // itself stays one disclosure away.
+                let described = (icon == Icon::Command)
+                    .then(|| tool_input_string(tool, &["description"]))
                     .flatten();
+                let input_target = described.or_else(|| {
+                    summary_is_uninformative(&tool.summary, &tool.tool_name)
+                        .then(|| tool_input_target(tool, icon))
+                        .flatten()
+                });
                 let summary = if summary_is_uninformative(summary, &tool.tool_name)
                     && input_target.is_none()
                 {
@@ -104,8 +116,9 @@ impl Activity {
                     // tool's own name is the most a reader can be told.
                     readable_tool_name(&tool.tool_name, summary)
                 } else {
-                    summary
+                    summary.to_string()
                 };
+                let summary = summary.as_str();
                 let path = matches!(
                     icon,
                     Icon::FileRead | Icon::FileEdit | Icon::FileCreate | Icon::FileDelete
@@ -245,6 +258,11 @@ impl Activity {
                 )
             }
         };
+        let error = failed.then(|| failure_line(payload, locale)).flatten();
+        let target = match icon {
+            Icon::Command => display_command(&target).to_string(),
+            _ => target,
+        };
         Self {
             locale,
             action,
@@ -252,7 +270,13 @@ impl Activity {
             path,
             icon,
             failed,
+            error,
         }
+    }
+
+    /// The first line a failed call printed, if it printed anything.
+    pub fn error_line(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     pub fn action(&self) -> &'static str {
@@ -295,6 +319,7 @@ pub(crate) fn input_keys(kind: ActivityKind) -> &'static [&'static str] {
         ActivityKind::Search => &["pattern", "query", "regex", "q"],
         ActivityKind::Collaboration => &["description", "subagent_type", "agent", "prompt"],
         ActivityKind::Integration => &["name", "skill", "server", "tool"],
+        ActivityKind::Web => &["url", "query", "queries"],
         ActivityKind::Directory => &["pattern", "glob", "path"],
         _ => &[],
     }
@@ -314,6 +339,24 @@ fn tool_input_target(tool: &ToolCallPayload, kind: ActivityKind) -> Option<Strin
         .trim();
     match serde_json::from_str::<serde_json::Value>(source) {
         Ok(serde_json::Value::String(text)) => Some(text),
+        Ok(serde_json::Value::Object(object)) if kind == ActivityKind::Search => {
+            let pattern = keys.iter().find_map(|key| {
+                object
+                    .get(*key)?
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+            })?;
+            Some(
+                match object
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|path| !path.trim().is_empty() && *path != ".")
+                {
+                    Some(path) => format!("{pattern} in {path}"),
+                    None => pattern.to_string(),
+                },
+            )
+        }
         Ok(serde_json::Value::Object(object)) => keys.iter().find_map(|key| {
             match object.get(*key)? {
                 serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
@@ -356,14 +399,165 @@ fn summary_is_uninformative(summary: &str, tool_name: &str) -> bool {
 }
 
 /// A tool's name as the header shows it when nothing better is known.
-fn readable_tool_name<'a>(tool_name: &'a str, summary: &'a str) -> &'a str {
+///
+/// An MCP tool reads as its server and tool (`github · create_issue`), and a
+/// snake- or kebab-case name as words (`ask_user_question` → `Ask user
+/// question`).
+fn readable_tool_name(tool_name: &str, summary: &str) -> String {
     let summary = summary.trim();
-    if !summary.starts_with("ACP tool call") && !summary.is_empty() {
-        return summary.strip_suffix(": {}").unwrap_or(summary);
+    let name = if !summary.starts_with("ACP tool call") && !summary.is_empty() {
+        summary.strip_suffix(": {}").unwrap_or(summary)
+    } else {
+        match tool_name.trim() {
+            "" | "tool" | "other" => summary,
+            name => name,
+        }
+    };
+    if let Some((server, tool)) = mcp_tool_name(name) {
+        return format!("{server} · {tool}");
     }
-    match tool_name.trim() {
-        "" | "tool" | "other" => summary,
-        name => name,
+    humanize_tool_name(name)
+}
+
+/// `mcp__server__tool` (Claude) or `mcp_server_tool` style names, split.
+pub fn mcp_tool_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
+}
+
+fn humanize_tool_name(name: &str) -> String {
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || name.contains([':', '/', '.'])
+        || !name.contains(['_', '-'])
+    {
+        return name.to_string();
+    }
+    let words = name
+        .split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut characters = words.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + characters.as_str()
+    })
+}
+
+/// One string argument of a tool call, by the first of `keys` it carries.
+fn tool_input_string(tool: &ToolCallPayload, keys: &[&str]) -> Option<String> {
+    let source = tool
+        .raw_extension
+        .as_ref()
+        .and_then(|extension| extension.raw_input.as_deref())
+        .filter(|source| !source.trim().is_empty())
+        .or(tool.input_summary.as_deref())?;
+    let value = serde_json::from_str::<serde_json::Value>(source).ok()?;
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)?
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// A command as its header shows it.
+///
+/// Agents routinely open every command with `cd <absolute path> &&` to pin the
+/// directory it runs in. That prefix is the same on every row and pushes what
+/// the command does past the truncation point, so the header leaves it out;
+/// the full command stays in the detail.
+pub fn display_command(command: &str) -> &str {
+    let trimmed = command.trim_start();
+    let Some(rest) = trimmed.strip_prefix("cd ") else {
+        return command;
+    };
+    let Some(end) = rest.find(" && ").or_else(|| rest.find("; ")) else {
+        return command;
+    };
+    let directory = rest[..end].trim().trim_matches(['"', '\'']);
+    if directory.contains(char::is_whitespace) && !rest[..end].trim().starts_with(['"', '\'']) {
+        return command;
+    }
+    let separator = if rest[end..].starts_with(" && ") {
+        4
+    } else {
+        2
+    };
+    let remainder = rest[end + separator..].trim_start();
+    if remainder.is_empty() {
+        command
+    } else {
+        remainder
+    }
+}
+
+/// The first readable line a failed call left behind.
+fn failure_line(payload: Option<&TimelinePayload>, locale: Locale) -> Option<String> {
+    let text = match payload? {
+        TimelinePayload::ToolCall(tool) => crate::tool_detail::output(
+            tool.raw_extension.as_ref(),
+            tool.output_summary.as_deref(),
+            None,
+            locale,
+        )?,
+        TimelinePayload::Command(command) => crate::tool_detail::output(
+            command.raw_extension.as_ref(),
+            command.output_summary.as_deref(),
+            command.exit_code,
+            locale,
+        )?,
+        _ => return None,
+    };
+    let heading = locale.text("Error", "错误", "錯誤");
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != heading)
+        .map(|line| line.chars().take(240).collect())
+}
+
+/// How long a settled row ran, from its first event to its last.
+///
+/// Only commands and delegated agents carry a duration: those are the calls a
+/// reader waits on, and a read or a search finishing in milliseconds would
+/// only add noise. `items` is the sequence-sorted timeline the row came from.
+pub fn row_duration_ms(
+    row: &TimelineRow,
+    activity: &Activity,
+    items: &[TimelineItem],
+) -> Option<i64> {
+    if row.streaming
+        || !matches!(
+            activity.icon,
+            ActivityKind::Command | ActivityKind::Collaboration
+        )
+    {
+        return None;
+    }
+    let index = items
+        .binary_search_by_key(&row.first_sequence, |item| item.sequence)
+        .ok()?;
+    let elapsed = row.timestamp_ms - items[index].timestamp_ms;
+    (elapsed >= 1_000).then_some(elapsed)
+}
+
+/// A duration as a header reads it: `4.2s`, `38s`, `2m 05s`, `1h 03m`.
+pub fn format_duration(ms: i64) -> String {
+    let ms = ms.max(0);
+    if ms < 10_000 {
+        return format!("{:.1}s", ms as f64 / 1_000.0);
+    }
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3_600, seconds % 3_600 / 60)
     }
 }
 
@@ -380,6 +574,7 @@ fn action_label(icon: ActivityKind, locale: Locale) -> &'static str {
         ActivityKind::Collaboration => "Agent",
         ActivityKind::Image => locale.text("Image", "图像", "圖像"),
         ActivityKind::Integration => "MCP",
+        ActivityKind::Web => locale.text("Web", "网页", "網頁"),
         ActivityKind::Retry => locale.text("Retry", "重试", "重試"),
         ActivityKind::Generic => locale.text("Tool", "工具", "工具"),
     }
@@ -474,6 +669,13 @@ impl ActivitySummary {
     pub fn label(&self, locale: Locale) -> String {
         let entries = [
             (
+                self.edits.len(),
+                "Changed {n} file",
+                "Changed {n} files",
+                "修改 {n} 个文件",
+                "修改 {n} 個檔案",
+            ),
+            (
                 self.commands,
                 "Ran {n} command",
                 "Ran {n} commands",
@@ -486,13 +688,6 @@ impl ActivitySummary {
                 "Read {n} files",
                 "读取 {n} 个文件",
                 "讀取 {n} 個檔案",
-            ),
-            (
-                self.edits.len(),
-                "Changed {n} file",
-                "Changed {n} files",
-                "修改 {n} 个文件",
-                "修改 {n} 個檔案",
             ),
             (
                 self.searches,
@@ -557,7 +752,9 @@ fn semantic_tool_activity_icon(value: &str) -> Option<ActivityKind> {
             .any(|term| candidates.contains(&term))
     };
 
-    if has_any(&["todo", "todos", "plan", "checklist"]) {
+    if value.trim_start().starts_with("mcp__") {
+        Some(ActivityKind::Integration)
+    } else if has_any(&["todo", "todos", "plan", "checklist"]) {
         Some(ActivityKind::Todo)
     } else if has_any(&[
         "command",
@@ -571,6 +768,8 @@ fn semantic_tool_activity_icon(value: &str) -> Option<ActivityKind> {
         "ran",
     ]) {
         Some(ActivityKind::Command)
+    } else if has_any(&["web", "fetch", "url", "browse", "http", "https"]) {
+        Some(ActivityKind::Web)
     } else if has_any(&["search", "searched", "grep", "find", "query", "rg"]) {
         Some(ActivityKind::Search)
     } else if has_any(&[

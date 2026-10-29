@@ -286,7 +286,7 @@ fn activity_summary_uses_tool_semantics_and_counts_each_changed_file_once() {
     }
     assert_eq!(
         summary.label(vibex_ui::locale::Locale::En),
-        "Ran 1 command · Read 1 file · Changed 1 file · 1 failed",
+        "Changed 1 file · Ran 1 command · Read 1 file · 1 failed",
         "semantic counts and typed failures survive a successful turn"
     );
     assert!(

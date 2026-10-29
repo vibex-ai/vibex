@@ -430,6 +430,28 @@ impl MobileApp {
                                     )),
                             ),
                     )
+                    // A failed call says why while it is closed.
+                    .when_some(
+                        activity.error_line().filter(|_| !expanded),
+                        |header, line| {
+                            header.child(
+                                div()
+                                    .min_w_0()
+                                    .flex_shrink(1.0)
+                                    .truncate()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::accent_red())
+                                    .child(line.to_string()),
+                            )
+                        },
+                    )
+                    .children(self.timeline_row_duration(row, &activity).map(|label| {
+                        div()
+                            .flex_none()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(label)
+                    }))
                     .children(self.timeline_row_line_counts(row).map(|(added, removed)| {
                         div()
                             .flex_none()
@@ -707,6 +729,7 @@ pub(super) fn icon_path(kind: ActivityKind) -> &'static str {
         ActivityKind::Collaboration => "icons/user.svg",
         ActivityKind::Image => "icons/image.svg",
         ActivityKind::Integration => "icons/plug-zap.svg",
+        ActivityKind::Web => "icons/globe.svg",
         ActivityKind::Retry => "icons/wifi-outlined.svg",
         ActivityKind::Generic => "icons/zap.svg",
     }

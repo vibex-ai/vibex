@@ -64647,13 +64647,19 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
             });
+        let duration = timeline_activity::row_duration(
+            row,
+            &projection.activity,
+            &self.active_timeline().items,
+            cx,
+        );
         let header = timeline_activity::header(
             format!("activity:{}", row.id),
             &projection.activity,
             timeline_activity::is_running(row, turn_live),
             has_details.then_some((expanded, progress)),
             target,
-            None,
+            duration,
             cx,
         )
         .tab_stop(has_details)
@@ -64749,8 +64755,19 @@ impl VibexWorkbench {
         let title = if command.command.trim().is_empty() {
             locale::text("Command", "命令", "命令").to_string()
         } else {
-            command.command.clone()
+            timeline_activity::display_command(&command.command).to_string()
         };
+        let duration = (!in_progress)
+            .then(|| {
+                let projection = self.tool_card_projection_cached(row);
+                timeline_activity::row_duration(
+                    row,
+                    &projection.activity,
+                    &self.active_timeline().items,
+                    cx,
+                )
+            })
+            .flatten();
         let header = h_flex()
             .w_full()
             .min_w_0()
@@ -64765,6 +64782,7 @@ impl VibexWorkbench {
                     .text_size(cx.theme().mono_font_size)
                     .child(title.clone()),
             )
+            .children(duration)
             .when(in_progress && !waiting_for_confirmation, |this| {
                 this.child(Spinner::new().xsmall())
             })
@@ -72091,6 +72109,7 @@ fn process_activity_icon(kind: ProcessActivityIcon) -> Icon {
         ProcessActivityIcon::Collaboration => Icon::new(IconName::User),
         ProcessActivityIcon::Image => Icon::default().path("icons/vibex/image.svg"),
         ProcessActivityIcon::Integration => Icon::default().path("icons/vibex/plug-zap.svg"),
+        ProcessActivityIcon::Web => Icon::new(IconName::Globe),
         ProcessActivityIcon::Retry => Icon::default().path("icons/vibex/wifi-outlined.svg"),
         ProcessActivityIcon::Generic => Icon::default().path("icons/vibex/zap.svg"),
     }

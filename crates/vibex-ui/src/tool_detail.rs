@@ -1120,6 +1120,73 @@ mod tests {
     }
 
     #[test]
+    fn headers_lead_with_what_the_call_is_for() {
+        let project = |tool: ToolCallPayload| {
+            let payload = TimelinePayload::ToolCall(tool);
+            timeline_activity::Activity::project(&row_for(&payload), Some(&payload), Locale::En)
+        };
+        // A described command reads as its description.
+        let described = project(tool(
+            "Bash",
+            "",
+            serde_json::json!({"command": "ls -la", "description": "List the repository"}),
+        ));
+        assert_eq!(described.target(), "List the repository");
+        // The pinned working directory is left out of the header.
+        let pinned = project(tool(
+            "execute",
+            "cd /home/me/repo && cargo test -p vibex-ui",
+            serde_json::json!({}),
+        ));
+        assert_eq!(pinned.target(), "cargo test -p vibex-ui");
+        // MCP tools read as server and tool; other names as words.
+        let mcp = project(tool("mcp__github__create_issue", "", serde_json::json!({})));
+        assert_eq!(mcp.icon(), ProcessActivityIcon::Integration);
+        assert_eq!(mcp.target(), "github · create_issue");
+        let mut asked = tool("other", "ask_user_question", serde_json::json!({}));
+        asked.input_summary = None;
+        assert_eq!(project(asked).target(), "Ask user question");
+        // Fetches are web calls and name their URL; searches name their scope.
+        let fetch = project(tool(
+            "WebFetch",
+            "",
+            serde_json::json!({"url": "https://example.com/a", "prompt": "summarize"}),
+        ));
+        assert_eq!(fetch.icon(), ProcessActivityIcon::Web);
+        assert_eq!(fetch.target(), "https://example.com/a");
+        let grep = project(tool(
+            "Grep",
+            "",
+            serde_json::json!({"pattern": "fn main", "path": "src"}),
+        ));
+        assert_eq!(grep.target(), "fn main in src");
+    }
+
+    #[test]
+    fn failed_calls_carry_their_first_line_and_durations_read_short() {
+        let mut failed = tool("Bash", "", serde_json::json!({"command": "cargo build"}));
+        failed.status = vibex_core::ToolCallStatus::Failed;
+        failed.output_summary = Some(
+            r#"{"output":"\nerror[E0425]: cannot find value\n  --> src/main.rs","isError":true}"#
+                .into(),
+        );
+        let payload = TimelinePayload::ToolCall(failed);
+        let activity =
+            timeline_activity::Activity::project(&row_for(&payload), Some(&payload), Locale::En);
+        assert_eq!(
+            activity.error_line(),
+            Some("error[E0425]: cannot find value")
+        );
+
+        assert_eq!(timeline_activity::format_duration(4_230), "4.2s");
+        assert_eq!(timeline_activity::format_duration(38_900), "38s");
+        assert_eq!(timeline_activity::format_duration(125_000), "2m 05s");
+        assert_eq!(timeline_activity::format_duration(3_780_000), "1h 03m");
+        assert_eq!(timeline_activity::display_command("cd 'a b' && ls"), "ls");
+        assert_eq!(timeline_activity::display_command("cd src"), "cd src");
+    }
+
+    #[test]
     fn harness_envelopes_unwrap_to_their_text() {
         assert_eq!(
             output_text(
