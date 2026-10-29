@@ -1099,7 +1099,7 @@ pub async fn assemble_management_snapshot(
     }
 
     let agents = provider
-        .list_agents(vibex_core::AgentListRequest {
+        .list_agents_cached(vibex_core::AgentListRequest {
             include_disabled: true,
         })?
         .agents

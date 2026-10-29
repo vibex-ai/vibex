@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use semver::Version;
@@ -175,6 +175,24 @@ impl ProviderConfigService {
     }
 
     pub fn list_agents(&self, request: AgentListRequest) -> VibexResult<AgentListResponse> {
+        self.list_agents_with_discovery(request, true)
+    }
+
+    /// Lists Agents from the discoveries already stored on disk.
+    ///
+    /// The Config Center bundle is assembled on every mutation. Discovery is
+    /// refreshed when the page opens and when an Agent mutation asks for it;
+    /// a read-only snapshot can use the rows that wrote instead of re-probing
+    /// every CLI and rewriting discovery on each read.
+    pub fn list_agents_cached(&self, request: AgentListRequest) -> VibexResult<AgentListResponse> {
+        self.list_agents_with_discovery(request, false)
+    }
+
+    fn list_agents_with_discovery(
+        &self,
+        request: AgentListRequest,
+        refresh_discovery: bool,
+    ) -> VibexResult<AgentListResponse> {
         let conn = self.open_connection()?;
         let definitions = agent_definitions(&conn)?;
         let configs = AgentConfigRepository::list(&conn)?;
@@ -184,13 +202,15 @@ impl ProviderConfigService {
             .collect::<HashMap<_, _>>();
         let mut discoveries =
             AgentDiscoveryRepository::latest_by_agent(&conn, DEFAULT_AGENT_CWD_SCOPE)?;
-        let snapshots = build_agent_snapshots(
-            definitions.clone(),
-            configs.clone(),
-            discoveries.clone(),
-            &managed_installations,
-        );
-        refresh_changed_agent_discoveries(&conn, &snapshots, &mut discoveries)?;
+        if refresh_discovery {
+            let snapshots = build_agent_snapshots(
+                definitions.clone(),
+                configs.clone(),
+                discoveries.clone(),
+                &managed_installations,
+            );
+            refresh_changed_agent_discoveries(&conn, &snapshots, &mut discoveries)?;
+        }
         let snapshots =
             build_agent_snapshots(definitions, configs, discoveries, &managed_installations);
         let agents = if request.include_disabled {
@@ -3554,9 +3574,44 @@ impl ProviderConfigService {
 
     fn open_connection(&self) -> VibexResult<vibex_db::DbConnection> {
         let mut conn = open_database(&self.db_path)?;
-        apply_migrations(&mut conn)?;
+        // Every repository method opens its own connection, and the Config
+        // Center snapshot calls dozens of them. Migrations are process-wide
+        // and already applied at startup, so repeating the whole migration
+        // chain for each read was turning a snapshot into seconds of work.
+        // The fingerprint keeps a restored or replaced database migrating.
+        let fingerprint = database_fingerprint(&self.db_path);
+        let migrated = MIGRATED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut migrated = migrated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !migrated.contains(&fingerprint) {
+            apply_migrations(&mut conn)?;
+            migrated.insert(fingerprint);
+        }
+        drop(migrated);
         Ok(conn)
     }
+}
+
+/// Databases this process has already migrated.
+///
+/// Keyed by path, size and modification time so a restored or replaced file
+/// runs the chain again instead of trusting a stale entry.
+static MIGRATED_DATABASES: OnceLock<Mutex<HashSet<(PathBuf, u64, u128)>>> = OnceLock::new();
+
+fn database_fingerprint(path: &Path) -> (PathBuf, u64, u128) {
+    let (size, modified) = fs::metadata(path)
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            (metadata.len(), modified)
+        })
+        .unwrap_or((0, 0));
+    (path.to_path_buf(), size, modified)
 }
 
 const ACP_CONFIG_OPTION_KEY: &str = "acp.config.v1";

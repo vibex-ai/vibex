@@ -4160,6 +4160,18 @@ impl AgentDiscoveryRepository {
                 diagnostics_json, discovered_at_ms
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(agent_id, cwd_scope) DO UPDATE SET
+                discovery_record_id = excluded.discovery_record_id,
+                install_status = excluded.install_status,
+                config_status = excluded.config_status,
+                runtime_status = excluded.runtime_status,
+                binary_path = excluded.binary_path,
+                version = excluded.version,
+                native_config_paths_json = excluded.native_config_paths_json,
+                models_json = excluded.models_json,
+                modes_json = excluded.modes_json,
+                diagnostics_json = excluded.diagnostics_json,
+                discovered_at_ms = excluded.discovered_at_ms
             ",
             params![
                 record.discovery_record_id.as_str(),
@@ -4217,13 +4229,22 @@ impl AgentDiscoveryRepository {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT discovery_record_id, agent_id, cwd_scope, install_status,
-                    config_status, runtime_status, binary_path, version,
-                    native_config_paths_json, models_json, modes_json,
-                    diagnostics_json, discovered_at_ms
-                FROM agent_discovery_records
-                WHERE cwd_scope = ?1
-                ORDER BY agent_id ASC, discovered_at_ms DESC
+                SELECT record.discovery_record_id, record.agent_id, record.cwd_scope,
+                    record.install_status, record.config_status, record.runtime_status,
+                    record.binary_path, record.version, record.native_config_paths_json,
+                    record.models_json, record.modes_json, record.diagnostics_json,
+                    record.discovered_at_ms
+                FROM agent_discovery_records AS record
+                JOIN (
+                    SELECT agent_id, MAX(discovered_at_ms) AS latest_ms
+                    FROM agent_discovery_records
+                    WHERE cwd_scope = ?1
+                    GROUP BY agent_id
+                ) AS latest
+                    ON latest.agent_id = record.agent_id
+                    AND latest.latest_ms = record.discovered_at_ms
+                WHERE record.cwd_scope = ?1
+                ORDER BY record.agent_id ASC, record.discovered_at_ms DESC
                 ",
             )
             .map_err(storage_err(
@@ -12484,6 +12505,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_gateway_profile_kind_repair(conn, &mut applied)?;
     model_gateway::migrate_endpoint_protocol(conn, &mut applied)?;
     apply_route_failover(conn, &mut applied)?;
+    apply_agent_discovery_latest_only(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
@@ -12994,6 +13016,57 @@ fn apply_runtime_auth_source_route_shape(
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record the runtime auth source route migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Keeps only the latest Agent discovery row per Agent and cwd scope.
+///
+/// Discovery used to append a row on every refresh, so a long-lived home grew
+/// six figures of rows and `latest_by_agent` decoded all of them on every
+/// Config Center refresh. The unique index makes the repository's insert
+/// replace the one row, and this migration collapses the existing history.
+fn apply_agent_discovery_latest_only(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 85;
+    const NAME: &str = "agent_discovery_latest_only";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        DELETE FROM agent_discovery_records
+        WHERE discovery_record_id NOT IN (
+            SELECT discovery_record_id
+            FROM (
+                SELECT discovery_record_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY agent_id, cwd_scope
+                        ORDER BY discovered_at_ms DESC, discovery_record_id DESC
+                    ) AS discovery_rank
+                FROM agent_discovery_records
+            )
+            WHERE discovery_rank = 1
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_discovery_records_agent_scope
+            ON agent_discovery_records(agent_id, cwd_scope);
+        ",
+    )
+    .map_err(storage_err(
+        "agent_discovery_retention_failed",
+        "failed to collapse Agent discovery history",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Agent discovery retention",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -21801,6 +21874,18 @@ mod tests {
         assert_eq!(
             by_agent.get(&agent_id).unwrap().discovery_record_id,
             "agent_discovery_new"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_discovery_records
+                 WHERE agent_id = ?1 AND cwd_scope = 'home'",
+                params![agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "a repeated discovery replaces the Agent's row instead of appending history"
         );
 
         cleanup_db(temp);

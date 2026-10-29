@@ -6,10 +6,10 @@
 //! scheduler, automation runner, Relay, diagnostics, and backup semantics stay
 //! authoritative.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -59,6 +59,17 @@ impl ProviderManagementFacade {
         request: vibex_core::AgentListRequest,
     ) -> VibexResult<vibex_core::AgentListResponse> {
         self.service.list_agents(request)
+    }
+
+    /// Lists Agents without re-probing every installed CLI.
+    ///
+    /// The Config Center bundle is read on every mutation; discovery is
+    /// refreshed by the page's first load and by Agent mutations instead.
+    pub fn list_agents_cached(
+        &self,
+        request: vibex_core::AgentListRequest,
+    ) -> VibexResult<vibex_core::AgentListResponse> {
+        self.service.list_agents_cached(request)
     }
 
     pub fn create_custom_agent(
@@ -1039,9 +1050,41 @@ impl Drop for ManagementMutationClaim {
     }
 }
 
+/// Databases this process has already migrated.
+///
+/// The Config Center reads several repositories per snapshot and each one
+/// opened a fresh connection. Running the whole migration chain for every read
+/// made the bundle take seconds; the fingerprint still reruns it when a file is
+/// restored or replaced.
+static MIGRATED_DATABASES: OnceLock<Mutex<HashSet<(PathBuf, u64, u128)>>> = OnceLock::new();
+
+fn database_fingerprint(path: &Path) -> (PathBuf, u64, u128) {
+    let (size, modified) = fs::metadata(path)
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            (metadata.len(), modified)
+        })
+        .unwrap_or((0, 0));
+    (path.to_path_buf(), size, modified)
+}
+
 fn migrated(path: &Path) -> VibexResult<rusqlite::Connection> {
     let mut connection = open_database(path)?;
-    apply_migrations(&mut connection)?;
+    let fingerprint = database_fingerprint(path);
+    let migrated = MIGRATED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut migrated = migrated
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !migrated.contains(&fingerprint) {
+        apply_migrations(&mut connection)?;
+        migrated.insert(fingerprint);
+    }
+    drop(migrated);
     Ok(connection)
 }
 
