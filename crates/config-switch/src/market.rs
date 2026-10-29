@@ -1613,7 +1613,13 @@ fn read_skill_bundle(archive_bytes: &[u8]) -> VibexResult<ClawHubBundle> {
                 continue;
             }
         };
-        let raw_name = entry.name().to_string();
+        let raw_name = match entry.name() {
+            Ok(name) => name.to_string(),
+            Err(error) => {
+                bundle.skipped.push(format!("entry {index}: {error}"));
+                continue;
+            }
+        };
         if entry.is_dir() {
             continue;
         }
@@ -3163,7 +3169,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             for (path, content) in entries {
                 writer.start_file(*path, options).unwrap();
                 writer.write_all(content.as_bytes()).unwrap();
@@ -3245,7 +3251,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             writer.start_file("SKILL.md", options).unwrap();
             writer.write_all(b"manifest").unwrap();
             writer.start_file("logo.png", options).unwrap();

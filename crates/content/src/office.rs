@@ -403,7 +403,13 @@ fn validate_archive<R: Read + std::io::Seek>(
                 "Office archive entry is invalid",
             )
         })?;
-        if file.enclosed_name().is_none() || file.name().contains('\0') {
+        let name = file.name().map_err(|_| {
+            VibexError::validation(
+                "office_archive_entry_invalid",
+                "Office archive entry name is invalid",
+            )
+        })?;
+        if file.enclosed_name().is_none() || name.contains('\0') {
             return Err(VibexError::validation(
                 "office_archive_path_invalid",
                 "Office archive entry path is unsafe",
@@ -480,7 +486,10 @@ fn read_optional_archive_text<R: Read + std::io::Seek>(
     guard: &OfficeParseGuard<'_>,
 ) -> VibexResult<Option<String>> {
     guard.check()?;
-    if !archive.file_names().any(|candidate| candidate == name) {
+    if !archive
+        .file_names()
+        .any(|candidate| candidate.is_ok_and(|candidate| candidate.as_ref() == name))
+    {
         return Ok(None);
     }
     read_archive_text(archive, name, stats, guard).map(Some)
@@ -861,7 +870,15 @@ fn parse_pptx<R: Read + std::io::Seek>(
                 "Office archive entry is invalid",
             )
         })?;
-        let name = file.name().to_string();
+        let name = file
+            .name()
+            .map_err(|_| {
+                VibexError::validation(
+                    "office_archive_entry_invalid",
+                    "Office archive entry name is invalid",
+                )
+            })?
+            .to_string();
         if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
             slide_names.push(name);
         }
