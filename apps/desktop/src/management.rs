@@ -30309,6 +30309,12 @@ impl ManagementCenter {
             .min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))
             .flex_none()
             .overflow_hidden()
+            // The seam owns the top edge; the other three make the drawer read
+            // as a docked bar instead of a wash that happens to end the column.
+            .border_l_1()
+            .border_r_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
             // A hair above the sidebar's own fill: enough to read as a docked
             // surface, not enough to become a floating card.
             .bg(management_surface_wash(
@@ -50719,6 +50725,9 @@ mod gateway_surface_tests {
             .expect("the suggestion drawer should remain inspectable");
         assert!(drawer.contains(".h(px(self.route_group_recommendations_height))"));
         assert!(drawer.contains(".min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))"));
+        assert!(drawer.contains(".border_l_1()"));
+        assert!(drawer.contains(".border_r_1()"));
+        assert!(drawer.contains(".border_b_1()"));
         assert!(drawer.contains("render_route_group_recommendations_resize_handle(cx)"));
         assert!(drawer.contains("management-route-group-suggestions-close"));
         assert!(drawer.contains("overflow_y_scrollbar()"));
