@@ -13276,19 +13276,23 @@ impl ManagementCenter {
                             ),
                     )
                     .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{summary} · {used}")),
+                    )
+                    // The logos get their own line, left-aligned with the two
+                    // above them, the way a Provider card draws them. Sharing
+                    // the summary line put them at its right edge, where they
+                    // read as that sentence's trailing punctuation and moved
+                    // every time the summary changed width.
+                    .child(
                         h_flex()
                             .w_full()
                             .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{summary} · {used}")),
-                            )
+                            .gap_1()
                             .children(agent_stack.into_iter().map(|(agent_id, label)| {
                                 let tooltip = SharedString::from(label);
                                 div()
@@ -48135,6 +48139,35 @@ mod gateway_surface_tests {
         assert!(
             card.contains("agent_count > 5"),
             "the overflow count matches the Provider card's"
+        );
+        // The logos own a row of their own, after the summary line. Sharing
+        // that line put them at its trailing edge, where they moved with the
+        // text instead of starting where the name starts.
+        let summary_at = card
+            .find(".child(format!(\"{summary} · {used}\")),")
+            .expect("the summary line should remain inspectable");
+        let logos_at = card
+            .find("management-route-agent-logo-")
+            .expect("the logos should remain inspectable");
+        assert!(
+            summary_at < logos_at,
+            "the logos follow the summary, on their own row"
+        );
+        let between = &card[summary_at..logos_at];
+        // The summary is a self-closing `div`; the logos open the next `h_flex`
+        // rather than riding inside it, which is what put them at the right
+        // edge of the sentence.
+        assert!(
+            between.contains("h_flex()") && between.contains(".gap_1()"),
+            "the logos open a row of their own, tight enough for a logo strip"
+        );
+        assert!(
+            !between.contains("justify_between") && !between.contains("justify_end"),
+            "nothing pushes the logos to the card's trailing edge"
+        );
+        assert!(
+            !between.contains(".flex_1()"),
+            "the logos do not share the summary's flexible column"
         );
     }
 
