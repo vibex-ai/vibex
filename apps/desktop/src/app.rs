@@ -81652,9 +81652,6 @@ impl FoundationSettings {
     }
 
     fn activate_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        if !self.settings_section_visible(section, cx) {
-            return;
-        }
         self.active_section = section;
         self.settings_render_context
             .target_title
@@ -82475,7 +82472,13 @@ impl FoundationSettings {
         else {
             self.search_selected_index = 0;
             self.search_scroll.scroll_to_item(0);
-            if let Some(section) = settings_section_for_query(&query) {
+            // The keyword fallback can name a section the candidate list
+            // filtered out (Connections behind its flag), so it is checked
+            // here rather than in activation, which also runs while the
+            // workbench is leased and cannot read its state.
+            if let Some(section) = settings_section_for_query(&query)
+                .filter(|section| self.settings_section_visible(*section, cx))
+            {
                 self.activate_settings_section(section, cx);
             } else {
                 self.settings_render_context
@@ -110381,13 +110384,14 @@ mod tests {
                 .map(|(body, _)| body.to_string())
                 .unwrap_or_else(|| panic!("{start} should remain inspectable"))
         };
-        // Settings: navigation, search, and activation all consult the flag,
-        // so Connections cannot be reached by any route while it is off.
-        let activate = section(
-            "    fn activate_settings_section(",
-            "\n    fn request_storage_usage_probe(",
+        // Settings: navigation, search, and the keyword fallback all consult
+        // the flag, so Connections cannot be reached by any route while it is
+        // off.
+        let preview = section(
+            "    fn preview_settings_search_selection(",
+            "\n    fn select_settings_search_candidate(",
         );
-        assert!(activate.contains("if !self.settings_section_visible(section, cx)"));
+        assert!(preview.contains(".filter(|section| self.settings_section_visible(*section, cx))"));
         let navigation = section("    fn render_navigation(", "\n    }\n");
         assert!(
             navigation.contains("connections_visible || *section != SettingsSection::Connections")
