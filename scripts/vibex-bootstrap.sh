@@ -133,6 +133,7 @@ if [ -z "$KEY_BLOB" ] || ! grep -qF "$KEY_BLOB" "$AUTHORIZED_KEYS"; then
     printf '%s vibex:desktop\n' "$PUBLIC_KEY" >> "$AUTHORIZED_KEYS"
 fi
 
+mkdir -p /run/sshd
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl enable ssh >/dev/null 2>&1 || systemctl enable sshd >/dev/null 2>&1 || true
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || "$SSHD_BIN"
@@ -140,7 +141,6 @@ elif command -v rc-service >/dev/null 2>&1; then
     rc-update add sshd default >/dev/null 2>&1 || true
     rc-service sshd restart 2>/dev/null || rc-service sshd start
 else
-    mkdir -p /run/sshd
     if [ -f /run/sshd.pid ] && kill -0 "$(cat /run/sshd.pid)" 2>/dev/null; then
         :
     else
