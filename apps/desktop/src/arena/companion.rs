@@ -10,6 +10,7 @@ use super::{
     ArenaView, Awakened, art,
     combat::{Boss, Guardian, smoothstep},
     copy,
+    gait::LANE_REACH,
     map::CENTER,
     motion, palette,
     raster::{PixelRect, ink},
@@ -39,10 +40,6 @@ const MODEL_HEIGHT: f32 = 40.0;
 /// The tallest lane a companion may reserve. A guardian whose loop reaches far
 /// above its standing pose — the whale's breach — is drawn smaller instead.
 const MAX_LANE: f32 = 72.0;
-/// How far the home page's route reaches either side of the arena's centre, in
-/// world units. The lane maps that reach onto its own width, so the companion
-/// keeps each guardian's own gait — hops, rolls, strides — at its own pace.
-const ROUTE_REACH: f32 = 72.0;
 /// The dive into the composer.
 const LEAP_DURATION: f32 = 0.62;
 /// Idle poses are rebuilt at this rate. The pixel art does not read faster, and
@@ -268,12 +265,13 @@ fn fit(guardian: Guardian) -> Fit {
         pixel: rows / box_height,
     }
 }
-/// How far across the lane a guardian stands at `time`, from 0 to 1.
+/// How far across the lane a lane pose stands, from 0 to 1.
 ///
-/// This is the home page's own route seen side-on: the guardian walks, hops,
-/// rolls, or swims exactly as it does there, and turns where its route turns.
+/// The pose comes from the guardian's own itinerary ([`Boss::lane`]): where it
+/// stops, how long it rests, and how it hops, rolls, strides, swims, or darts
+/// between, each on a lap of its own length.
 fn across(boss: &Boss) -> f32 {
-    ((boss.position.x - CENTER.x) / ROUTE_REACH * 0.5 + 0.5).clamp(0.0, 1.0)
+    ((boss.position.x - CENTER.x) / LANE_REACH * 0.5 + 0.5).clamp(0.0, 1.0)
 }
 /// The model's left edge for a place `across` the lane, in whole screen pixels
 /// from the lane's left edge, so every cell lands on a pixel of its own.
@@ -378,7 +376,7 @@ pub(crate) fn lane_with_best(
                     .with_max_fps(30.0),
                 move |this, _| {
                     let time = clock.elapsed().as_secs_f32();
-                    let place = across(&Boss::idle(guardian, time, false));
+                    let place = across(&Boss::lane(guardian, time));
                     roam.set(place);
                     this.child(badge(
                         time,
@@ -486,7 +484,7 @@ impl FrameCache {
         if self.key != Some(key) {
             self.key = Some(key);
             let time = tick as f32 / FRAME_RATE;
-            let boss = Boss::idle(guardian, time, false);
+            let boss = Boss::lane(guardian, time);
             self.rectangles = art::companion(&boss, time, false)
                 .resample(fit.columns, fit.rows)
                 .rectangles();
@@ -500,7 +498,7 @@ impl FrameCache {
 ///
 /// The element only carries the model's own rectangles; the box it was cropped
 /// from is fixed for the whole loop, so the model never shifts inside it. The
-/// model faces where its route heads, exactly as it does on the home page.
+/// model turns to face where its itinerary heads; it is never mirrored.
 struct Badge {
     guardian: Guardian,
     time: f32,
@@ -553,7 +551,7 @@ impl Element for Badge {
             .rectangles(self.guardian, self.time, self.fit);
         let (left, top, _, _) = self.window_box;
         let pixel = px(self.fit.pixel);
-        let boss = Boss::idle(self.guardian, self.time, false);
+        let boss = Boss::lane(self.guardian, self.time);
         let (x, y) = art::pixel(boss.position);
         // The duel starts from this frame: the same model, in the same pose, at
         // the same spot, so it grows out of the lane it was standing in.

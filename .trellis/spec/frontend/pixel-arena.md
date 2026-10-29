@@ -26,7 +26,7 @@ Companion::new() -> Companion
 arena::companion_lane(&Entity<Companion>, Option<&str>, Option<u64>, bool, Option<FocusHandle>, bool, &mut App) -> Option<AnyElement>
 arena::session_surface(&Entity<Companion>, impl IntoElement, &mut App) -> AnyElement
 art::companion_box(Guardian) -> (i32, i32, i32, i32) // crop window around the ground anchor
-art::companion_height(Guardian) -> i32 // median idle pose height, in raster pixels
+art::companion_height(Guardian) -> i32 // median lane pose height, in raster pixels
 art::companion(&Boss, f32, bool) -> Raster // one idle frame cropped to that window
 Raster::resample(usize, usize) -> Raster // coarser grid, one ink per cell
 HomeArena::new(FocusHandle) -> HomeArena
@@ -41,7 +41,9 @@ Arena::respawn()
 Arena::outcome_ready() -> bool
 Arena::clear_millis() -> Option<u64> // the winning run's time; None until victory
 Arena::brazier_lit() -> bool
-Boss::idle(Guardian, f32, bool) -> Boss // each form's own gait
+Boss::idle(Guardian, f32, bool) -> Boss // each form's own gait on the shared home loop
+Boss::lane(Guardian, f32) -> Boss // the companion's pose on that guardian's own lane itinerary
+gait::lane_lap(Guardian) -> f32 // seconds one lane itinerary takes; distinct per guardian
 Boss::articulated(f32, f32, f32) -> Vec2 // model point after pivoted tilt
 Boss::body_center() -> Vec2
 Boss::target_locked() -> bool
@@ -205,20 +207,31 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 - The companion is drawn from `art::companion`: one idle frame cropped to
   `art::companion_box` around the model's ground anchor, without the arena's
   ground shadow. The window holds every pose of the idle loop, reduced pose
-  included, so no frame is ever sliced. The model is sized so its median pose
+  included, and every pose of the guardian's lane itinerary, so no frame is
+  ever sliced. The model is sized so its median lane pose
   (`art::companion_height`) stands `MODEL_HEIGHT` screen pixels tall, unless
   the window would then exceed `MAX_LANE`. The crop is resampled to one ink per
   screen pixel before it is painted: quads at a fraction of a screen pixel snap
   onto each other or vanish and the model dissolves into noise. Cells are
   painted as merged rectangles on whole pixels and rebuilt only when the
-  quantized pose changes. There is no mirroring: the sculpture faces its
-  route's heading exactly as on the home page.
+  quantized pose changes. There is no mirroring: the sculpture turns to face
+  its itinerary's heading.
 - Mounting follows the turn. A composer whose Agent has an unlocked guardian and
-  whose turn is running shows the lane. The companion walks the home page's own
-  route seen side-on — the route's x, `ROUTE_REACH` either side of the centre,
-  mapped onto the lane — so each guardian keeps its gait and pace instead of a
-  pass of its own. Its pose clock is monotonic, so the authored loop closes on
-  itself instead of cutting back to a first frame mid-lane.
+  whose turn is running shows the lane. The companion does not reuse the home
+  route: side-on, that route is the same even sway on the same 36 s loop for
+  every guardian. `Boss::lane` (`arena/gait.rs`) gives each guardian an
+  itinerary of its own — stops along the lane (-1..1, `LANE_REACH` either side
+  of the centre), rests, and the stretches between them — on a lap of its own
+  length, travelled in that form's gait: the spark hops in bursts and rolls the
+  way it hops, the knot cruises with momentum, rocks to a stop and pivots, Pi
+  strides with stems that settle together whenever it stops and looks about,
+  the chest lumbers and peeks out of its lid during its long sit, the whale
+  never stops — it surges, breaches on the outbound pass only, and swims a
+  U-turn at each end — and Copilot darts between uneven hovering spots with one
+  barrel roll per lap. Every itinerary averages under 0.12 lanes a second, so
+  no guardian sprints. The pose clock is monotonic and every itinerary closes
+  on itself (spin, facing, and stems included), so the lap's seam never cuts
+  back to a first frame mid-lane.
 - When the turn ends the companion dives on the same pose clock: a short hop, a
   fall past the lane's own bottom edge where the composer swallows it, and a
   fade. The lane is
@@ -415,12 +428,15 @@ rebirth, without a damage override.
   session and disappears for a locked one, a non-running turn, and reduced
   motion; the badge stays inside the lane, and the lane above every composer
   row, at narrow and wide composer widths; every guardian stands at a legible
-  height inside its lane; the companion covers the lane over a loop at the
-  home route's pace; the resampled frame keeps the figure's coverage; a finished turn
+  height inside its lane; every guardian covers the lane on a lap of a
+  distinct length, pauses or turns for a share of it, and stays under the
+  pace limit; every itinerary moves without a jump and closes its lap; the
+  resampled frame keeps the figure's coverage; a finished turn
   dives and retires it, returning the composer to its own height; double-click
   opens a duel that covers the session page and Escape returns; a victory
   reports the unlock; a session switch ends the previous duel. Art tests pin
-  the crop to the same drawing, and that no idle pose reaches its window edge.
+  the crop to the same drawing, and that no idle or lane pose reaches its
+  window edge.
 - Preference tests retain legacy decoding and persisted opt-out coverage.
   Progress tests retain "absent state decodes to nothing defeated" and
   "a repeat win is not a change". Clear-time tests retain "only a faster win
@@ -451,13 +467,16 @@ let sample = self.preview.get();
 let arena = Arena::from_preview(sample.boss, sample.time, seed);
 let entry_camera = sample.viewport;
 
-// Wrong: a per-pass clock cuts the idle loop every time the companion turns,
-// and a pass of its own outruns the guardian's gait.
+// Wrong: a per-pass clock cuts the loop every time the companion turns, and
+// one shared pass (or the home route side-on) gives every guardian the same
+// rhythm whatever its gait.
 let time = phase * ROAM_PERIOD;
-
-// Correct: the pose clock is monotonic; the place is the home route side-on.
-let time = clock.elapsed().as_secs_f32();
 let place = across(&Boss::idle(guardian, time, false));
+
+// Correct: the pose clock is monotonic; pose and place both come from the
+// guardian's own lane itinerary.
+let time = clock.elapsed().as_secs_f32();
+let place = across(&Boss::lane(guardian, time));
 
 // Wrong: painting raster pixels at a third of a screen pixel each.
 let pixel = unit / art::SCALE; // ~0.3px: quads collapse into noise

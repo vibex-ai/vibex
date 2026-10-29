@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::arena::combat::Phase;
-use crate::arena::guardian::IDLE_LOOP;
+use crate::arena::gait::lane_lap;
 use crate::arena::init as arena_init;
 use gpui::{
     Focusable as _, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseUpEvent,
@@ -14,6 +14,7 @@ use gpui_component::{
     Root,
     input::{Input, InputState},
 };
+use std::f32::consts::{PI, TAU};
 use std::time::Duration;
 
 fn draw(cx: &mut VisualTestContext) {
@@ -209,31 +210,108 @@ fn every_guardian_fits_inside_the_lane_it_rides_at_a_legible_size() {
     }
 }
 
-/// The companion keeps the home page's own gait and pace: it follows its route
-/// side-on rather than sprinting a pass of its own, reaches both ends of the
-/// lane over a loop, and never leaves it at any width the composer can take.
+/// Every guardian travels the lane on a rhythm of its own rather than one
+/// shared sway: its lap differs from every other guardian's, it reaches both
+/// ends of the lane, it pauses or turns at its own spots instead of swaying
+/// evenly, and on average it never outpaces a walk.
 #[test]
-fn the_companion_walks_its_home_route_across_the_lane() {
+fn every_guardian_crosses_the_lane_on_a_rhythm_of_its_own() {
+    const STEP: f32 = 1.0 / 60.0;
+    let mut laps = Vec::new();
     for guardian in Guardian::ALL {
+        let lap = lane_lap(guardian);
+        laps.push((lap, guardian));
         let (mut lowest, mut highest, mut travelled) = (1.0f32, 0.0f32, 0.0f32);
-        let mut previous = across(&Boss::idle(guardian, 0.0, false));
-        let mut time = 0.0;
-        while time < IDLE_LOOP {
-            let place = across(&Boss::idle(guardian, time, false));
+        let mut still = 0.0f32;
+        let mut previous = across(&Boss::lane(guardian, 0.0));
+        let mut time = STEP;
+        while time <= lap {
+            let place = across(&Boss::lane(guardian, time));
+            let speed = (place - previous).abs() / STEP;
             lowest = lowest.min(place);
             highest = highest.max(place);
             travelled += (place - previous).abs();
+            if speed < 0.05 {
+                still += STEP;
+            }
             previous = place;
-            time += 0.05;
+            time += STEP;
         }
         assert!(
             lowest < 0.12 && highest > 0.88,
             "{guardian:?} covers {lowest}..{highest} of the lane"
         );
         // On a 720px column this is well under a hundred pixels a second.
-        let pace = travelled / IDLE_LOOP;
+        let pace = travelled / lap;
         assert!(pace < 0.12, "{guardian:?} crosses {pace} lanes a second");
+        assert!(
+            still / lap > 0.15,
+            "{guardian:?} spends only {still}s of its {lap}s lap at rest or turning"
+        );
     }
+    laps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for pair in laps.windows(2) {
+        assert!(
+            pair[1].0 - pair[0].0 > 0.5,
+            "{:?} and {:?} share a lap of about {}s",
+            pair[0].1,
+            pair[1].1,
+            pair[0].0
+        );
+    }
+}
+
+/// The pose clock is monotonic, so every itinerary has to close on itself and
+/// move without a jump anywhere, the lap's seam included: the lane never cuts
+/// back to a first frame, and nothing leaps from one frame to the next.
+#[test]
+fn every_lane_itinerary_is_continuous_and_closes_its_lap() {
+    const STEP: f32 = 1.0 / 60.0;
+    let turn = |a: f32, b: f32| ((a - b + PI).rem_euclid(TAU) - PI).abs();
+    for guardian in Guardian::ALL {
+        let lap = lane_lap(guardian);
+        let mut previous = Boss::lane(guardian, -STEP);
+        let mut time = 0.0;
+        while time <= lap + STEP {
+            let boss = Boss::lane(guardian, time);
+            let at = format!("{guardian:?} at {time}s");
+            assert!(
+                (across(&boss) - across(&previous)).abs() < 0.03,
+                "{at} jumps along the lane"
+            );
+            assert!((boss.height - previous.height).abs() < 2.0, "{at} jumps up");
+            // A crouch springs into the air at take-off and a landing lands
+            // flat at once, exactly as the home page's hops do.
+            assert!((boss.squash - previous.squash).abs() < 0.9, "{at} squashes");
+            assert!((boss.lid - previous.lid).abs() < 0.2, "{at} slams its lid");
+            assert!(
+                (boss.unravel - previous.unravel).abs() < 0.2,
+                "{at} unravels"
+            );
+            for (angle, now, then) in [
+                ("yaw", boss.yaw, previous.yaw),
+                ("spin", boss.spin, previous.spin),
+                ("pitch", boss.pitch, previous.pitch),
+                ("bank", boss.bank, previous.bank),
+            ] {
+                assert!(turn(now, then) < 0.3, "{at} snaps its {angle}");
+            }
+            for ix in 0..2 {
+                assert!(
+                    boss.hands[ix].minus(previous.hands[ix]).length() < 2.0,
+                    "{at} snaps stem {ix}"
+                );
+            }
+            previous = boss;
+            time += STEP;
+        }
+    }
+}
+
+/// The travel never leaves the lane at any width the composer can take, and
+/// every place lands on a whole screen pixel.
+#[test]
+fn the_companion_stays_inside_the_lane_on_whole_pixels() {
     for lane_width in [280.0f32, 720.0, 1600.0] {
         let badge_width = fit(Guardian::Pi).width();
         let span = lane_width - badge_width - INSET * 2.0;
@@ -252,7 +330,7 @@ fn the_companion_walks_its_home_route_across_the_lane() {
 fn the_resampled_frame_keeps_the_figure() {
     for guardian in Guardian::ALL {
         let fitted = fit(guardian);
-        let boss = Boss::idle(guardian, 3.5, false);
+        let boss = Boss::lane(guardian, 3.5);
         let fine = art::companion(&boss, 3.5, false);
         let coarse = fine.resample(fitted.columns, fitted.rows);
         assert_eq!((coarse.width, coarse.height), (fitted.columns, fitted.rows));

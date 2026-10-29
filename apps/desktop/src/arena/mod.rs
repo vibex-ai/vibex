@@ -6,6 +6,7 @@ mod clock;
 mod combat;
 mod companion;
 mod copy;
+mod gait;
 mod geometry;
 mod guardian;
 mod map;

@@ -536,13 +536,13 @@ impl Boss {
 }
 
 /// Count and fraction of a repeating gait period.
-fn beat(time: f32, period: f32) -> (f32, f32) {
+pub(super) fn beat(time: f32, period: f32) -> (f32, f32) {
     let beat = time / period;
     (beat.floor(), beat.fract())
 }
 
 /// Stretch while airborne, flatten on landing, crouch before take-off.
-fn landing_squash(u: f32, air: f32) -> f32 {
+pub(super) fn landing_squash(u: f32, air: f32) -> f32 {
     if u < air {
         -0.3 * (u / air * PI).sin()
     } else if u < air + 0.25 {

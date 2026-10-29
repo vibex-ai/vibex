@@ -226,18 +226,38 @@ fn the_companion_window_holds_every_idle_pose_without_touching_its_edge() {
                 time += 0.2;
             }
         }
+        // The companion draws its lane itinerary, not the home loop.
+        let mut time = 0.0;
+        while time < crate::arena::gait::lane_lap(guardian) {
+            let boss = Boss::lane(guardian, time);
+            let frame = reference(&boss, time, false);
+            let (x, y) = pixel(boss.position);
+            for (ix, ink) in frame.pixels.iter().enumerate() {
+                if *ink == CLEAR {
+                    continue;
+                }
+                let dx = (ix % frame.width) as i32 - x;
+                let dy = (ix / frame.width) as i32 - (y + TOP_PAD);
+                assert!(
+                    dx > left && dx < right && dy > top && dy < bottom,
+                    "{guardian:?} {time}s into its lane reaches {dx},{dy}, \
+                     outside its window {left},{top},{right},{bottom}"
+                );
+            }
+            time += 0.1;
+        }
     }
 }
 
 /// A companion sizes its model by the ordinary standing pose, so the recorded
-/// height has to stay the median of the loop the companion actually draws.
+/// height has to stay the median of the lane itinerary the companion draws.
 #[test]
 fn the_companion_height_is_the_median_idle_pose() {
     for guardian in Guardian::ALL {
         let mut heights = Vec::new();
         let mut time = 0.0;
-        while time < crate::arena::guardian::IDLE_LOOP {
-            let boss = Boss::idle(guardian, time, false);
+        while time < crate::arena::gait::lane_lap(guardian) {
+            let boss = Boss::lane(guardian, time);
             let frame = companion(&boss, time, false);
             let rows = (0..frame.height)
                 .filter(|row| {
