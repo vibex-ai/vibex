@@ -88,6 +88,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::Pi => 40,
             Guardian::DeepSeek => 50,
             Guardian::OpenCode | Guardian::Copilot => 30,
+            Guardian::Cursor => 38,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
         frame.ellipse(
@@ -186,7 +187,7 @@ fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
             frame.ring((x, y), (15 + beat, 15 + beat), CORE, true);
             gleam(frame, (x, y), 5, WHITE);
         }
-        Guardian::OpenCode | Guardian::DeepSeek | Guardian::Copilot => {
+        Guardian::OpenCode | Guardian::DeepSeek | Guardian::Copilot | Guardian::Cursor => {
             frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
             frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
             gleam(frame, (x, y), 4, WHITE);
@@ -213,13 +214,14 @@ pub(super) fn preview(guardian: Guardian, time: f32, reduced: bool) -> Raster {
 /// every pose the idle loop reaches — the whale's breach, the knot's roll,
 /// Pi's detached stems — because the companion fits the window, not the pose,
 /// into its lane; a window too small would slice the model at the extremes.
-pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); 6] = [
+pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = [
     (-43, -124, 43, -2),
     (-48, -102, 48, 13),
     (-67, -111, 67, 33),
     (-36, -122, 36, 19),
     (-88, -206, 84, 22),
     (-55, -133, 56, 6),
+    (-43, -85, 42, 21),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -228,7 +230,7 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// median over its loop. The window above also has to hold the loop's
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
-pub(super) const COMPANION_HEIGHTS: [i32; 6] = [65, 96, 110, 85, 106, 82];
+pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] = [65, 96, 110, 85, 106, 82, 92];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]
 }
@@ -556,6 +558,9 @@ fn hero(frame: &mut Raster, arena: &Arena, reduced: bool) {
     }
 }
 
+#[cfg(test)]
+#[path = "sheet_tests.rs"]
+mod sheets;
 #[cfg(test)]
 #[path = "art_tests.rs"]
 mod tests;

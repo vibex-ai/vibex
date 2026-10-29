@@ -19,6 +19,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::OpenCode => [0x37474f, 0x607d8b, 0x90a4ae, 0xcfd8dc, 0xeef3f5],
         Guardian::DeepSeek => [0x1b2370, 0x2f3fb8, 0x4d6bfe, 0x7d94ff, 0xb9c6ff],
         Guardian::Copilot => [0x11393e, 0x155958, 0x228e80, 0x5ac8a4, 0xa3e8bd],
+        // Graphite, as the logo's dark cube: its lit faces stay cool and grey.
+        Guardian::Cursor => [0x0e1013, 0x1b1e23, 0x2b2f36, 0x464b55, 0x737a86],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -42,6 +44,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Copilot => [
             0x2d3a4f, 0x687b89, 0x8a9ba1, 0xb0bbb4, 0x4b606f, 0x425768, 0xb6c4bc,
         ],
+        // A pale editor grid, so the dark cube reads as the logo does on white.
+        Guardian::Cursor => [
+            0x1a1e26, 0x9aa2ab, 0xb4bac1, 0xcdd1d6, 0x8a929c, 0x5d6672, 0xdfe2e6,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -64,6 +70,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::OpenCode => [0xa0522d, 0xffb347, 0xfff1c9],
         Guardian::DeepSeek => [0xb07a1a, 0xffd04a, 0xfff4c2],
         Guardian::Copilot => [0x9b2c2c, 0xff7a45, 0xffe0b0],
+        // The pointer facet charges cyan-white.
+        Guardian::Cursor => [0x236a94, 0x5cd2ff, 0xe4fbff],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -76,6 +84,12 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         colors[ink::DUST as usize] = rgb(0xa4b4bc).into();
         colors[ink::IVORY as usize] = rgb(0xe0eae5).into();
         colors[ink::WHITE as usize] = rgb(0xf3fff8).into();
+    }
+    if guardian == Guardian::Cursor {
+        // The logo is monochrome: its light facet is a neutral white.
+        colors[ink::WHITE as usize] = rgb(0xf5f7fa).into();
+        colors[ink::IVORY as usize] = rgb(0xd9dde3).into();
+        colors[ink::DUST as usize] = rgb(0xa6adb7).into();
     }
     if guardian == Guardian::OpenCode {
         colors[ink::WHITE as usize] = rgb(0xfffef5).into();

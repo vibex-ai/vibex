@@ -445,6 +445,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::OpenCode => chest(&mut mesh, boss, fall),
         Guardian::DeepSeek => whale(&mut mesh, boss, time, fall),
         Guardian::Copilot => copilot(&mut mesh, boss, time, fall),
+        Guardian::Cursor => cursor::cursor(&mut mesh, boss, time, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -469,6 +470,13 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
             boss.yaw,
         ),
         Guardian::OpenCode => (pitch, bank + fall * 0.18, boss.height, boss.yaw),
+        // A beaten cube settles askew on one edge.
+        Guardian::Cursor => (
+            pitch,
+            bank + fall * 0.35,
+            boss.height - fall * 2.0,
+            boss.yaw,
+        ),
         _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
@@ -1031,6 +1039,9 @@ fn copilot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
         );
     }
 }
+
+#[path = "sculpture_cursor.rs"]
+mod cursor;
 
 #[cfg(test)]
 #[path = "sculpture_tests.rs"]

@@ -98,6 +98,7 @@ fn itinerary(guardian: Guardian) -> &'static [Leg] {
         Guardian::OpenCode => &OPENCODE,
         Guardian::DeepSeek => &DEEPSEEK,
         Guardian::Copilot => &COPILOT,
+        Guardian::Cursor => &cursor::LEGS,
     }
 }
 /// How long one guardian takes to walk its whole itinerary once.
@@ -450,6 +451,7 @@ impl Boss {
                 boss.pitch = lean.abs() * 0.12;
                 place
             }
+            Guardian::Cursor => cursor::lane(&mut boss, legs, moment),
         };
         boss.position = lane_point(place);
         if guardian != Guardian::Pi {
@@ -504,6 +506,7 @@ pub(super) fn entrance(guardian: Guardian) -> f32 {
         Guardian::OpenCode => 1.1,
         Guardian::DeepSeek => 1.5,
         Guardian::Copilot => 1.3,
+        Guardian::Cursor => cursor::ENTRANCE,
     }
 }
 /// How long a guardian takes to leave its lane when the turn ends.
@@ -515,6 +518,7 @@ pub(super) fn exit(guardian: Guardian) -> f32 {
         Guardian::OpenCode => 0.8,
         Guardian::DeepSeek => 1.25,
         Guardian::Copilot => 0.95,
+        Guardian::Cursor => cursor::EXIT,
     }
 }
 
@@ -598,6 +602,7 @@ pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
             boss.yaw = (boss.yaw + 0.45 * (1.0 - a)).clamp(-0.5, 0.5);
             boss.pitch += 0.12 * (1.0 - a);
         }
+        Guardian::Cursor => cursor::entering(&mut shot, a),
     }
     shot.boss = settled(shot.boss);
     shot
@@ -678,6 +683,7 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
             boss.pitch += (0.12 - boss.pitch) * turn;
             (side * a * a, -0.5 * a * a, 1.0)
         }
+        Guardian::Cursor => cursor::leaving(boss, a),
     };
     // A turn that ends mid-entrance leaves from where the entrance had got to;
     // that offset hands over to the exit's own as it goes.
@@ -688,3 +694,6 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
     shot.boss = settled(shot.boss);
     shot
 }
+
+#[path = "gait_cursor.rs"]
+mod cursor;

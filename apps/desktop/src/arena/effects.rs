@@ -109,6 +109,39 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
             _ => {}
         }
     }
+    for beam in &arena.beams {
+        if beam.time >= beam.delay {
+            continue;
+        }
+        // The line it will fire down: rails at its exact width, closing in
+        // and turning solid as the shot nears.
+        let progress = (beam.time / beam.delay.max(0.001)).clamp(0.0, 1.0);
+        let urgent = progress > 0.6;
+        let color = if urgent { WARN } else { WARN_DARK };
+        let side = beam
+            .to
+            .minus(beam.from)
+            .normalized()
+            .perpendicular()
+            .scale(beam.width + (1.0 - progress) * 3.0);
+        for offset in [-1.0, 1.0] {
+            let a = beam.from.plus(side.scale(offset));
+            let b = beam.to.plus(side.scale(offset));
+            if urgent {
+                frame.line(pixel(a), pixel(b), color);
+            } else {
+                let length = b.minus(a).length();
+                let dashes = (length / 3.0).ceil().max(1.0) as usize;
+                for n in (0..dashes).step_by(2) {
+                    frame.line(
+                        pixel(a.lerp(b, n as f32 / dashes as f32)),
+                        pixel(a.lerp(b, (n as f32 + 1.0) / dashes as f32)),
+                        color,
+                    );
+                }
+            }
+        }
+    }
     if arena.phase == Phase::Battle {
         telegraph(frame, arena);
     }
@@ -276,6 +309,21 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
                 frame.ring(pixel(CENTER), (r, r), WATER_LIGHT, true);
             }
         }
+        (Guardian::Cursor, Attack::Tumble) => {
+            route(frame, boss.from, boss.target, boss.radius(), color);
+        }
+        (Guardian::Cursor, Attack::Laser)
+            if boss.state == BossState::Windup && boss.facet == crate::arena::cube::DOWN =>
+        {
+            // Light leaks out under the cube before the floor blast.
+            landing(
+                frame,
+                pixel(boss.position),
+                (7.0 * SCALE) as i32,
+                WARN,
+                progress,
+            );
+        }
         (Guardian::Copilot, Attack::Volley) if boss.state == BossState::Windup => {
             let p = pixel(boss.attack_origin());
             let r = 3 + (progress * 6.0) as i32;
@@ -335,6 +383,39 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 code_block(frame, c);
             }
         }
+    }
+    for beam in arena.beams.iter().filter(|b| b.active()) {
+        let fade = 1.0 - (beam.time - beam.delay) / beam.duration.max(0.001);
+        let side = beam.to.minus(beam.from).normalized().perpendicular();
+        let rays = (beam.width * SCALE * fade.max(0.35)) as i32;
+        for n in -rays..=rays {
+            let offset = side.scale(n as f32 / SCALE);
+            let edge = n.abs() as f32 / rays.max(1) as f32;
+            let color = if edge < 0.35 {
+                WHITE
+            } else if edge < 0.75 {
+                CORE_LIGHT
+            } else {
+                CORE
+            };
+            frame.line(
+                pixel(beam.from.plus(offset)),
+                pixel(beam.to.plus(offset)),
+                color,
+            );
+        }
+        if !reduced {
+            let tick = (arena.visual_time * 30.0) as i32;
+            for n in 0..6 {
+                let seed = hash(n, tick);
+                let t = (seed % 97) as f32 / 97.0;
+                let p = pixel(beam.from.lerp(beam.to, t));
+                frame.rect(p.0 - 1, p.1 - 6 - (seed % 5) as i32, 3, 2, CORE_LIGHT);
+            }
+        }
+        let end = pixel(beam.to);
+        frame.ellipse(end, (6, 4), CORE_LIGHT);
+        frame.ellipse(end, (3, 2), WHITE);
     }
     if arena.boss.guardian == Guardian::DeepSeek
         && arena.boss.attack == Attack::Discharge

@@ -59,6 +59,12 @@ const FOUNDRY: [Pillar; 4] = pillars(
     9.0,
 );
 const TERRACE: [Pillar; 2] = pillars([(47.0, 58.0), (129.0, 58.0)], 3.0, 7.0);
+/// Cursor's grid hall: four square columns that stop its laser.
+const GRID: [Pillar; 4] = pillars(
+    [(56.0, 38.0), (120.0, 38.0), (56.0, 80.0), (120.0, 80.0)],
+    3.4,
+    11.0,
+);
 pub(super) const ISLANDS: [(Vec2, f32); 4] = [
     (Vec2::new(48.0, 48.0), 9.0),
     (Vec2::new(122.0, 35.0), 8.0),
@@ -118,6 +124,7 @@ impl Map {
             Guardian::OpenCode => &FOUNDRY,
             Guardian::DeepSeek => &[],
             Guardian::Copilot => &TERRACE,
+            Guardian::Cursor => &GRID,
         }
     }
 
@@ -143,6 +150,10 @@ impl Map {
             }
             Guardian::Copilot => {
                 x < 67.0 - margin && y < 49.0 - margin && !(x > 44.0 - margin && y > 35.0 - margin)
+            }
+            // A square-cornered hall with its corners cut back on the grid.
+            Guardian::Cursor => {
+                x < 72.0 - margin && y < 47.0 - margin && !(x > 58.0 - margin && y > 33.0 - margin)
             }
         }
     }

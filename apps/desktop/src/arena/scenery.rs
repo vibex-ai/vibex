@@ -14,7 +14,7 @@ use std::{
 };
 
 pub(super) fn floor(guardian: Guardian) -> &'static Raster {
-    static FLOORS: OnceLock<[Raster; 6]> = OnceLock::new();
+    static FLOORS: OnceLock<[Raster; Guardian::ALL.len()]> = OnceLock::new();
     &FLOORS.get_or_init(|| Guardian::ALL.map(build))[guardian as usize]
 }
 
@@ -90,6 +90,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::OpenCode => foundry(&mut frame),
         Guardian::DeepSeek => lagoon(&mut frame),
         Guardian::Copilot => terrace(&mut frame),
+        Guardian::Cursor => grid_hall(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -136,6 +137,78 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Cursor's hall: a pale grid laid on the diagonals the cube rolls along,
+/// one cube side between lines, with major lines every fourth, pointer glyphs
+/// etched where major lines cross, and a dashed selection round the middle.
+fn grid_hall(frame: &mut Raster) {
+    // One cube side between parallel lines, measured across them.
+    let spacing = crate::arena::cube::SIDE * std::f32::consts::SQRT_2 * SCALE;
+    let c = pixel(CENTER);
+    for y in -TOP_PAD..HEIGHT as i32 - TOP_PAD {
+        for x in 0..WIDTH as i32 {
+            let u = ((x - c.0) + (y - c.1)) as f32 / spacing;
+            let v = ((x - c.0) - (y - c.1)) as f32 / spacing;
+            let (cu, cv) = (u.floor() as i32, v.floor() as i32);
+            let on = |t: f32| t - t.floor() < 1.4 / spacing;
+            let major = |n: i32| n.rem_euclid(4) == 0;
+            if on(u) {
+                frame.put(x, y, if major(cu) { FLOOR_SHADE } else { SEAM });
+            } else if on(v) {
+                frame.put(x, y, if major(cv) { FLOOR_SHADE } else { SEAM });
+            } else if hash(cu, cv + 40).is_multiple_of(9) {
+                frame.put(x, y, FLOOR_LIGHT);
+            }
+        }
+    }
+    for a in -6..=6 {
+        for b in -6..=6 {
+            if a % 4 != 0 || b % 4 != 0 {
+                continue;
+            }
+            // Where two major lines cross, a small pointer.
+            let (u, v) = (a as f32 * spacing, b as f32 * spacing);
+            let tip = (
+                c.0 + ((u + v) * 0.5) as i32 + 4,
+                c.1 + ((u - v) * 0.5) as i32 + 4,
+            );
+            frame.polygon(
+                &[tip, (tip.0, tip.1 + 11), (tip.0 + 8, tip.1 + 8)],
+                FLOOR_SHADE,
+            );
+            frame.polygon(
+                &[
+                    (tip.0 + 1, tip.1 + 2),
+                    (tip.0 + 1, tip.1 + 8),
+                    (tip.0 + 5, tip.1 + 7),
+                ],
+                FLOOR_LIGHT,
+            );
+        }
+    }
+    let (w, h) = (150, 90);
+    for (from, to) in [
+        ((c.0 - w, c.1 - h), (c.0 + w, c.1 - h)),
+        ((c.0 - w, c.1 + h), (c.0 + w, c.1 + h)),
+        ((c.0 - w, c.1 - h), (c.0 - w, c.1 + h)),
+        ((c.0 + w, c.1 - h), (c.0 + w, c.1 + h)),
+    ] {
+        let length = (to.0 - from.0).abs().max((to.1 - from.1).abs());
+        for n in (0..length).step_by(12) {
+            let at = |n: i32| {
+                let t = n.min(length) as f32 / length as f32;
+                (
+                    from.0 + ((to.0 - from.0) as f32 * t) as i32,
+                    from.1 + ((to.1 - from.1) as f32 * t) as i32,
+                )
+            };
+            frame.line(at(n), at(n + 6), WALL);
+        }
+    }
+    for (x, y) in [(-w, -h), (w, -h), (-w, h), (w, h)] {
+        frame.rect(c.0 + x - 3, c.1 + y - 3, 7, 7, WALL);
+        frame.rect(c.0 + x - 2, c.1 + y - 2, 5, 5, WALL_LIGHT);
+    }
+}
 fn tiles(frame: &mut Raster, width: i32, height: i32, offset: bool) {
     for row in 0..(HEIGHT as i32 / height + 1) {
         for col in 0..(WIDTH as i32 / width + 2) {
@@ -531,6 +604,17 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                 let x = (t * WIDTH as f32) as i32;
                 let y = (h % 400 + 30) as i32;
                 frame.line((x, y), (x + 12, y - 3), FLOOR_LIGHT);
+            }
+        }
+        Guardian::Cursor => {
+            // Carets blink on the grid, each on its own beat.
+            for n in 0..6 {
+                let h = hash(n, 47);
+                if (time * 1.6 + n as f32 * 0.37).fract() < 0.5 {
+                    let x = 120 + (h % 460) as i32 / 32 * 32 + 12;
+                    let y = 60 + ((h >> 9) % 320) as i32 / 32 * 32 + 8;
+                    frame.rect(x, y, 2, 14, WALL);
+                }
             }
         }
         Guardian::OpenCode => {}

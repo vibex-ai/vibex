@@ -21,6 +21,7 @@ impl Arena {
             Guardian::OpenCode => self.tick_opencode(),
             Guardian::DeepSeek => self.tick_deepseek(),
             Guardian::Copilot => self.tick_copilot(),
+            Guardian::Cursor => self.tick_cursor(),
         }
         self.boss.update_core();
     }
@@ -93,6 +94,8 @@ mod claude;
 mod codex;
 #[path = "encounter_copilot.rs"]
 mod copilot;
+#[path = "encounter_cursor.rs"]
+mod cursor;
 #[path = "encounter_deepseek.rs"]
 mod deepseek;
 #[path = "encounter_opencode.rs"]

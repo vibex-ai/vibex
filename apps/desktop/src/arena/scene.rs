@@ -157,7 +157,7 @@ fn paint_actors(_: Bounds<Pixels>, layout: ActorsLayout, window: &mut Window, _:
 /// for the life of the process. Every floor is fully opaque, so it needs no
 /// blending beyond the quad's own element opacity.
 fn ground_image(guardian: Guardian) -> Arc<RenderImage> {
-    static IMAGES: OnceLock<[OnceLock<Arc<RenderImage>>; 6]> = OnceLock::new();
+    static IMAGES: OnceLock<[OnceLock<Arc<RenderImage>>; Guardian::ALL.len()]> = OnceLock::new();
     let images = IMAGES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     images[guardian as usize]
         .get_or_init(|| Arc::new(bake_ground(guardian)))
@@ -206,7 +206,7 @@ fn bake_ground(guardian: Guardian) -> RenderImage {
 }
 #[cfg(test)]
 fn ground_rectangles(guardian: Guardian) -> &'static [PixelRect] {
-    static GROUND: OnceLock<[Vec<PixelRect>; 6]> = OnceLock::new();
+    static GROUND: OnceLock<[Vec<PixelRect>; Guardian::ALL.len()]> = OnceLock::new();
     &GROUND.get_or_init(|| Guardian::ALL.map(|g| art::floor(g).rectangles()))[guardian as usize]
 }
 fn paint_rectangles(

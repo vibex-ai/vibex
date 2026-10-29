@@ -76,7 +76,7 @@ fn entry_spawn_avoids_where_the_guardian_will_settle() {
 }
 
 #[test]
-fn agent_identity_selects_only_the_six_supported_guardians() {
+fn agent_identity_selects_only_the_supported_guardians() {
     for (id, g) in [
         ("claude", Guardian::Claude),
         ("codex", Guardian::Codex),
@@ -84,6 +84,8 @@ fn agent_identity_selects_only_the_six_supported_guardians() {
         ("opencode", Guardian::OpenCode),
         ("deepseek-harness", Guardian::DeepSeek),
         ("copilot", Guardian::Copilot),
+        ("cursor", Guardian::Cursor),
+        ("cursor-agent", Guardian::Cursor),
     ] {
         assert_eq!(Guardian::from_agent(id), Some(g));
     }

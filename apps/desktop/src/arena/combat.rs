@@ -15,6 +15,7 @@ pub(super) const MAX_PROJECTILES: usize = 48;
 pub(super) const MAX_EFFECTS: usize = 64;
 pub(super) const MAX_WAVES: usize = 8;
 pub(super) const MAX_HAZARDS: usize = 16;
+pub(super) const MAX_BEAMS: usize = 8;
 pub(super) const PLAYER_RADIUS: f32 = 0.9;
 pub(super) const CORE_RADIUS: f32 = 1.8;
 pub(super) const ROLL_DURATION: f32 = 0.24;
@@ -151,6 +152,22 @@ impl Hazard {
         self.time >= self.delay && self.time < self.delay + self.duration
     }
 }
+/// A straight, lethal line. It shows where it will fire for `delay`, then
+/// burns for `duration`; a column in its way ends it where the column stands.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Beam {
+    pub from: Vec2,
+    pub to: Vec2,
+    pub width: f32,
+    pub time: f32,
+    pub delay: f32,
+    pub duration: f32,
+}
+impl Beam {
+    pub fn active(&self) -> bool {
+        self.time >= self.delay && self.time < self.delay + self.duration
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EffectKind {
     Impact,
@@ -189,6 +206,7 @@ pub(super) struct Arena {
     pub waves: Vec<Wave>,
     pub effects: Vec<Effect>,
     pub hazards: Vec<Hazard>,
+    pub beams: Vec<Beam>,
     pub elapsed: f32,
     /// The duel's own wall clock: it starts when the intro ends, keeps counting
     /// through deaths and rebirths, and freezes on victory so the recorded
@@ -235,6 +253,7 @@ impl Arena {
             waves: Vec::with_capacity(MAX_WAVES),
             effects: Vec::with_capacity(MAX_EFFECTS),
             hazards: Vec::with_capacity(MAX_HAZARDS),
+            beams: Vec::with_capacity(MAX_BEAMS),
             elapsed: 0.0,
             run_time: 0.0,
             visual_time: idle_time,
@@ -635,6 +654,9 @@ impl Arena {
             Guardian::Pi | Guardian::DeepSeek => true,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
+            // The pointer facet takes an arrow only from the side it faces.
+            Guardian::Cursor => super::cube::ground_direction(self.boss.facet, self.boss.yaw)
+                .is_some_and(|facing| from.minus(self.boss.core).dot(facing) > 0.0),
         }
     }
     fn tick_arrow(&mut self, recalling: bool) {
@@ -824,6 +846,7 @@ impl Arena {
         self.projectiles.clear();
         self.waves.clear();
         self.hazards.clear();
+        self.beams.clear();
     }
     fn win(&mut self) {
         self.phase = Phase::Victory;
@@ -941,6 +964,19 @@ impl Arena {
             }
         }
         self.hazards.retain(|h| h.time < h.delay + h.duration);
+        for beam in &mut self.beams {
+            beam.time += STEP;
+            if beam.active()
+                && segment_distance(player, beam.from, beam.to).min(segment_distance(
+                    player_from,
+                    beam.from,
+                    beam.to,
+                )) < beam.width + PLAYER_RADIUS
+            {
+                hit = true;
+            }
+        }
+        self.beams.retain(|b| b.time < b.delay + b.duration);
         for (kind, position, radius) in landings {
             match kind {
                 HazardKind::Drop => {
@@ -977,6 +1013,27 @@ impl Arena {
                 remaining: 4.0,
                 kind,
                 age: 0.0,
+            });
+        }
+    }
+    /// Fires a beam from `from` along `direction`, ended by the rim or the
+    /// first column in its way.
+    pub(super) fn beam(
+        &mut self,
+        from: Vec2,
+        direction: Vec2,
+        width: f32,
+        delay: f32,
+        duration: f32,
+    ) {
+        if self.phase == Phase::Battle && self.beams.len() < MAX_BEAMS {
+            self.beams.push(Beam {
+                from,
+                to: self.map.beam_end(from, direction),
+                width,
+                time: 0.0,
+                delay,
+                duration,
             });
         }
     }

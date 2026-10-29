@@ -14,16 +14,18 @@ pub(super) enum Guardian {
     OpenCode,
     DeepSeek,
     Copilot,
+    Cursor,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
         Self::OpenCode,
         Self::DeepSeek,
         Self::Copilot,
+        Self::Cursor,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -33,6 +35,7 @@ impl Guardian {
             Self::OpenCode => "OpenCode",
             Self::DeepSeek => "DeepSeek",
             Self::Copilot => "Copilot",
+            Self::Cursor => "Cursor",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -43,6 +46,7 @@ impl Guardian {
             "opencode" => Some(Self::OpenCode),
             "deepseek" | "deepseek-harness" => Some(Self::DeepSeek),
             "copilot" | "github-copilot" => Some(Self::Copilot),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -59,6 +63,7 @@ impl Guardian {
             Self::OpenCode => "opencode",
             Self::DeepSeek => "deepseek",
             Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -92,6 +97,10 @@ pub(super) enum Attack {
     Discharge,
     Volley,
     Dash,
+    /// A cube's quarter-turn onto its next face.
+    Tumble,
+    /// The pointer facet charging, then firing along its face.
+    Laser,
 }
 
 /// Visual and collision scale of the spark after each split.
@@ -189,6 +198,9 @@ pub(super) struct Boss {
     /// Brief white flash after a hit that did not finish the guardian.
     pub flash: f32,
     pub fired: u32,
+    /// The face of the cube that carries Cursor's pointer facet, in model
+    /// space (see [`cube`](super::cube)).
+    pub facet: u8,
 }
 
 impl Boss {
@@ -234,7 +246,13 @@ impl Boss {
             dashes: 0,
             flash: 0.0,
             fired: 0,
+            facet: super::cube::FRONT,
         };
+        if guardian == Guardian::Cursor {
+            // The cube stands corner-on, as the logo's hexagon.
+            boss.yaw = -PI * 0.25;
+            boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
+        }
         boss.rest_hands();
         boss.update_core();
         boss.previous_core = boss.core;
@@ -253,6 +271,7 @@ impl Boss {
             Guardian::Codex | Guardian::OpenCode => 8.0,
             Guardian::Pi | Guardian::DeepSeek => 9.0,
             Guardian::Copilot => 7.0,
+            Guardian::Cursor => 8.5,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -320,6 +339,7 @@ impl Boss {
             Guardian::OpenCode => (0.0, 0.0, 6.5 * squash),
             Guardian::DeepSeek => (0.0, 2.0, 8.0),
             Guardian::Copilot => (0.0, 0.0, 11.0),
+            Guardian::Cursor => (0.0, 0.0, super::cube::HALF),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -361,6 +381,7 @@ impl Boss {
             Guardian::OpenCode => self.articulated(0.0, 0.0, 7.0 * squash),
             Guardian::DeepSeek => self.articulated(0.0, 2.0, 8.0),
             Guardian::Copilot => self.articulated(0.0, 0.0, 11.0),
+            Guardian::Cursor => self.local(0.0, 0.0, super::cube::HALF),
         }
     }
     pub fn update_core(&mut self) {
@@ -374,6 +395,12 @@ impl Boss {
                 self.articulated(0.0, -15.2, 11.4 + tail_lift(self.unravel, -15.2))
             }
             Guardian::Copilot => self.articulated(0.0, -8.6, 10.0),
+            Guardian::Cursor => {
+                let (across, up) = super::cube::POINTER;
+                let (x, y, z) =
+                    super::cube::facet_point(self.facet, across, up, super::cube::HALF + 0.2);
+                self.articulated(x, y, super::cube::HALF + z)
+            }
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -395,7 +422,7 @@ impl Boss {
     pub fn impact_radius(&self) -> f32 {
         match (self.guardian, self.attack) {
             (Guardian::Claude, _) => 3.0 + 5.0 * self.scale(),
-            (Guardian::Codex | Guardian::OpenCode, Attack::Leap) => 7.0,
+            (Guardian::Codex | Guardian::OpenCode | Guardian::Cursor, Attack::Leap) => 7.0,
             (Guardian::Pi, _) => 5.5,
             (Guardian::DeepSeek, _) => 6.5,
             _ => 6.0,
@@ -523,6 +550,27 @@ impl Boss {
                 boss.bank = -heading.x * 0.3 + TAU * smoothstep(u / 0.1);
                 boss.pitch = heading.y * 0.12;
             }
+            Guardian::Cursor => {
+                // The cube stands corner-on, the logo's hexagon, and tumbles one
+                // face at a time along the diagonals: a zigzag east along the
+                // top of the home and back west along the bottom.
+                let (step, u) = beat(time, IDLE_LOOP / CURSOR_STEPS as f32);
+                let step = step as usize;
+                let roll = (u / 0.4).min(1.0);
+                let theta = smoothstep(roll) * PI * 0.5;
+                let (lift, advance) = super::cube::tumble(theta);
+                let heading = cursor_heading(step);
+                let (from, to) = (cursor_waypoint(step), cursor_waypoint(step + 1));
+                boss.position = from.lerp(to, advance / super::cube::SIDE);
+                boss.height = lift;
+                // The quarter-turns accumulate as one rolling pitch, with the
+                // facet carried round by it rather than snapping between faces.
+                boss.pitch = (-(step as f32 * PI * 0.5 + theta) + PI).rem_euclid(TAU) - PI;
+                let yaw = super::cube::yaw_toward(heading);
+                let next = super::cube::yaw_toward(cursor_heading(step + 1));
+                let turn = (next - yaw + PI).rem_euclid(TAU) - PI;
+                boss.yaw = yaw + turn * smoothstep((u - 0.55) / 0.3);
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -533,6 +581,29 @@ impl Boss {
         boss.previous_core = boss.core;
         boss
     }
+}
+
+/// Quarter-turns Cursor tumbles round its zigzag each home loop: a whole
+/// number of four, so the pointer facet comes home with the loop.
+const CURSOR_STEPS: usize = 24;
+/// The diagonal Cursor's step `step` rolls along: runs of three quarter-turns,
+/// north-east and south-east by turns going east, then south-west and
+/// north-west coming back.
+fn cursor_heading(step: usize) -> Vec2 {
+    let (x, y) = match (step % CURSOR_STEPS) / 3 {
+        0 | 2 => (1.0, -1.0),
+        1 | 3 => (1.0, 1.0),
+        4 | 6 => (-1.0, 1.0),
+        _ => (-1.0, -1.0),
+    };
+    Vec2::new(x, y).normalized()
+}
+/// Where Cursor's step `step` leaves from.
+fn cursor_waypoint(step: usize) -> Vec2 {
+    let start = CENTER.plus(Vec2::new(-55.0, -6.0));
+    (0..step % CURSOR_STEPS).fold(start, |p, ix| {
+        p.plus(cursor_heading(ix).scale(super::cube::SIDE))
+    })
 }
 
 /// Count and fraction of a repeating gait period.
@@ -598,6 +669,7 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
         ),
+        Guardian::Cursor => unreachable!("Cursor tumbles between grid waypoints instead"),
     };
     (CENTER.plus(Vec2::new(x, y)), Vec2::new(dx, dy))
 }

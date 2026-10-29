@@ -314,7 +314,7 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   shatter a split one. Closed armor never grants a win. An arrow that passes
   through the lit brazier burns for four seconds.
 
-### Six encounters
+### Encounters
 
 `Guardian::ALL` is the bounded identity/art-cache order. Each encounter must be
 winnable using normal movement, charging, release, recall, roll, and automatic
@@ -328,11 +328,23 @@ rebirth, without a damage override.
 | OpenCode | Light-grey chest after the logo frame, its window a hinged mouth; spit, vanish-and-bite, two leaps, then a gaping block volley | A close archer is bitten on reflex. Spat code blocks fall, stay as obstacles for the archer, and are crushed by landings. The open mouth accepts a hit from the front during the 1.6-second gape. |
 | DeepSeek | Orca in the logo blue: deep navy back, white chin, belly sweep and eye patch, tall dorsal fin, paddle flippers; the tail curls over its back as in the logo when it falls; three breaches, then a dive and an electric discharge | Breaches dive onto the archer and shatter floes where they erupt and land. The raised tail opens as the whale falls and for 0.7 seconds after landing. Shooting needs a dry floe; the discharge kills anyone in the water and then restores every floe. |
 | Copilot | Teal helmet with goggles, a dark face plate with two slots, ear pods and a rear jet; energy orbs and one to three spin dashes | Orbs knock the archer back, fatally into a wall. A dash into the rim or a column stuns it facing the wall for 1.4 seconds with the rear jet bare, while a telegraphed row of ice falls across the archer's line. The jet accepts a hit only from behind. |
+| Cursor | The logo's graphite cube standing corner-on (its hexagon), the pointer cut into one face as a light arrow with its notch; it tumbles four quarter-turns toward the archer along the diagonals, then the pointer charges and fires | A laser fires down the pointer's face normal, telegraphed by rails at its exact width and stopped by the hall's four columns. The pointer is bare while it charges, but only from the side it faces. Facing the sky it flares harmlessly; pressed to the floor it blasts the cube over, and it lands with the pointer toward the viewer, dazed for 1.9 seconds. |
 
 - Keep identity readable: models follow the Agent logos — the spark's uneven
   rays, the knot's six loops, Pi's aperture and separate stem, the chest's
   frame and window, the orca's markings, fin and curled tail, Copilot's
-  goggles and face slots. Every model carries a dark one-pixel silhouette.
+  goggles and face slots, Cursor's corner-on cube and pointer cut. Every model
+  carries a dark one-pixel silhouette.
+- Cursor's cube (`arena/cube.rs`) names faces in model space with +y the way
+  it rolls. A quarter-turn about the leading bottom edge is a pitch about the
+  center plus `cube::tumble`'s lift and travel. In combat the facet is
+  discrete (`Boss::facet`, re-expressed by `cube::turned` whenever the
+  symmetric cube snaps its yaw) because exposure and the laser read it; on the
+  home route and the lane the turns accumulate as one rolling pitch with the
+  facet held, so the pose never snaps, and each loop's quarter-turn count is a
+  multiple of four.
+- `Beam` is the shared straight-line threat: rails at its exact width while
+  it charges (`delay`), lethal for `duration`, ended by `Map::beam_end`.
 - Weak points use `Boss::articulated`, the same pivoted pitch and bank as the
   sculpture, so the drawn and the collided point agree in every pose.
 - Terrain damage is combat state (`Map::broken`, `sunken`, `scars`, `blocks`).
@@ -471,6 +483,11 @@ rebirth, without a damage override.
   to beat, a slower replay keeping a faster record, and the face staying large
   enough to read: pin the cell size and assert the plate is wider and taller
   than the face it frames.
+- `arena::art::sheets` (ignored) writes contact sheets — home roaming, lane
+  entrance and pass, and battle frames — to `$VIBEX_ARENA_SHEETS`, optionally
+  for one `$VIBEX_ARENA_GUARDIAN` key; `arena::art::sheets::windows` prints
+  each guardian's companion window and median lane height for authoring
+  `COMPANION_BOXES` / `COMPANION_HEIGHTS`. Review new artwork with them.
 - Run `cargo test -p vibex-desktop --lib arena:: --locked`,
   `cargo test -p vibex-desktop-model --locked`, formatting, and scoped Clippy.
   Measure dynamic rasterization and rectangle counts after artwork changes;

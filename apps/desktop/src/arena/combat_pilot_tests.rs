@@ -258,6 +258,34 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Cursor => {
+            let facing = crate::arena::cube::ground_direction(boss.facet, boss.yaw);
+            if boss.exposed > arrival(boss.core) + 0.03
+                && facing.is_none_or(|f| player.minus(boss.core).dot(f) > 2.0)
+            {
+                plan.target = Some(boss.core);
+            }
+            // Beside the line the facet faces, on its side: the laser misses
+            // and the facet is in sight.
+            plan.goal = match facing {
+                Some(f) => {
+                    let across = f.perpendicular();
+                    let sign = if player.minus(boss.position).dot(across) >= 0.0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    arena.map.move_body(
+                        boss.position,
+                        boss.position
+                            .plus(f.scale(18.0))
+                            .plus(across.scale(sign * 15.0)),
+                        2.0,
+                    )
+                }
+                None => around(boss.position, 26.0),
+            };
+        }
     }
     plan
 }
@@ -300,6 +328,12 @@ fn strike(arena: &Arena) -> Option<(Vec2, f32)> {
         {
             Some((boss.target, radius))
         }
+        (Guardian::Cursor, Attack::Leap) if aerial => Some((boss.target, radius)),
+        (Guardian::Cursor, Attack::Laser)
+            if boss.state == BossState::Windup && boss.facet == crate::arena::cube::DOWN =>
+        {
+            Some((boss.position, 7.0))
+        }
         _ => None,
     }
 }
@@ -316,6 +350,9 @@ fn route(arena: &Arena) -> Option<(Vec2, Vec2, f32)> {
             boss.radius(),
         )),
         (Guardian::Copilot, Attack::Dash) if committed => {
+            Some((boss.position, boss.target, boss.radius()))
+        }
+        (Guardian::Cursor, Attack::Tumble) if boss.state == BossState::Rushing => {
             Some((boss.position, boss.target, boss.radius()))
         }
         _ => None,
@@ -378,6 +415,11 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
         let gap = distance - wave.radius;
         if distance < wave.maximum + PLAYER_RADIUS + 0.6 && gap > -1.6 && gap < 4.0 {
             score += 6.0;
+        }
+    }
+    for beam in &arena.beams {
+        if segment_distance(q, beam.from, beam.to) < beam.width + PLAYER_RADIUS + 1.5 {
+            score += 10.0;
         }
     }
     for p in &arena.projectiles {
@@ -460,6 +502,12 @@ fn winnable(guardian: Guardian) {
             }
             pilot.tick(&mut arena);
         }
+        if std::env::var_os("VIBEX_PILOT_LOG").is_some() {
+            eprintln!(
+                "{guardian:?} seed {seed}: {:?} after {:.1}s, {} deaths",
+                arena.phase, arena.run_time, arena.deaths
+            );
+        }
         assert_eq!(
             arena.phase,
             Phase::Victory,
@@ -495,4 +543,8 @@ fn the_whale_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_helmet_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Copilot);
+}
+#[test]
+fn the_cube_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Cursor);
 }

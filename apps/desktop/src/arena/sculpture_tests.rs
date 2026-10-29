@@ -307,3 +307,37 @@ fn every_model_carries_a_dark_silhouette() {
         assert!(outline > 60, "{guardian:?}: {outline}");
     }
 }
+
+#[test]
+fn the_cube_carries_its_pointer_on_whichever_face_it_has_turned_to() {
+    use crate::arena::cube::{FRONT, UP, WEST};
+    for facet in [FRONT, WEST, UP] {
+        let mut boss = front(Guardian::Cursor);
+        boss.yaw = -PI * 0.25;
+        boss.facet = facet;
+        boss.exposed = 1.0;
+        boss.update_core();
+        let frame = render(&boss);
+        let color = at(&frame, boss.core);
+        assert!(
+            matches!(color, CORE | CORE_LIGHT | WHITE),
+            "{facet}: {color}"
+        );
+        // Closed, the pointer is the logo's light cut, never the dark body.
+        boss.exposed = 0.0;
+        let frame = render(&boss);
+        let color = at(&frame, boss.core);
+        assert!(matches!(color, DUST | IVORY | WHITE), "{facet}: {color}");
+    }
+    // Corner-on, the cube shows the logo's hexagon: two side faces and the top.
+    let mut boss = front(Guardian::Cursor);
+    boss.yaw = -PI * 0.25;
+    boss.facet = crate::arena::cube::DOWN;
+    let frame = render(&boss);
+    let center = boss.body_center();
+    let left = at(&frame, center.plus(Vec2::new(-5.0, 2.0)));
+    let right = at(&frame, center.plus(Vec2::new(5.0, 2.0)));
+    let top = at(&frame, center.plus(Vec2::new(0.0, -6.0)));
+    assert!(body(left) && body(right) && body(top));
+    assert!(left != right || right != top, "faces share one shade");
+}
