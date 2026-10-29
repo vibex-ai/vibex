@@ -9280,6 +9280,35 @@ enum LocalClientsSettingsState {
     Unavailable,
 }
 
+/// Debug-only local artifact path for WSL UI verification on machines without
+/// an update signing key. Release builds always go through the signed manifest.
+#[cfg(debug_assertions)]
+fn debug_wsl_artifact(
+    arch: crate::ssh_connection::environment::RemoteArch,
+) -> Result<Option<crate::ssh_connection::LocalArtifact>, String> {
+    let Ok(path) = std::env::var("VIBEX_WSL_E2E_ARTIFACT") else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("VIBEX_WSL_E2E_ARTIFACT could not be read: {error}"))?;
+    let version =
+        std::env::var("VIBEX_WSL_E2E_VERSION").unwrap_or_else(|_| "0.1.0-rc.8".to_string());
+    Ok(Some(crate::ssh_connection::LocalArtifact {
+        path: PathBuf::from(path),
+        version,
+        arch,
+        size: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    }))
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_wsl_artifact(
+    _arch: crate::ssh_connection::environment::RemoteArch,
+) -> Result<Option<crate::ssh_connection::LocalArtifact>, String> {
+    Ok(None)
+}
+
 pub struct VibexWorkbench {
     focus_handle: FocusHandle,
     config: Option<DesktopRuntimeConfig>,
@@ -14510,25 +14539,31 @@ impl VibexWorkbench {
             let environment = provisioner
                 .probe()
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let verified = runtime
-                .app_update()
-                .latest_verified_manifest()
-                .await
-                .map_err(|error| format!("{}: {}", error.code, error.message))?
-                .ok_or_else(|| "the release manifest is unavailable".to_string())?;
-            let version = verified.manifest.version.to_string();
-            let artifact = select_server_artifact_for_os(&verified, "linux", environment.arch)
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let local = download_server_artifact_for_os(
-                artifact,
-                "linux",
-                &version,
-                environment.arch,
-                &desktop_home.join("ssh-artifacts"),
-                |_, _| {},
-            )
-            .await
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let local = match debug_wsl_artifact(environment.arch)? {
+                Some(local) => local,
+                None => {
+                    let verified = runtime
+                        .app_update()
+                        .latest_verified_manifest()
+                        .await
+                        .map_err(|error| format!("{}: {}", error.code, error.message))?
+                        .ok_or_else(|| "the release manifest is unavailable".to_string())?;
+                    let version = verified.manifest.version.to_string();
+                    let artifact =
+                        select_server_artifact_for_os(&verified, "linux", environment.arch)
+                            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+                    download_server_artifact_for_os(
+                        artifact,
+                        "linux",
+                        &version,
+                        environment.arch,
+                        &desktop_home.join("ssh-artifacts"),
+                        |_, _| {},
+                    )
+                    .await
+                    .map_err(|error| format!("{}: {}", error.code, error.message))?
+                }
+            };
             let now_ms = unix_timestamp_ms();
             let outcome = provisioner
                 .provision(&local, now_ms)
