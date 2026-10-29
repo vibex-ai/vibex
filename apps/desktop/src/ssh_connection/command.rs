@@ -536,6 +536,36 @@ mod tests {
         assert!(args.lines().any(|line| line == "-s"), "{args}");
     }
 
+    /// sshd joins the remote arguments with spaces and hands the result to the
+    /// login shell. The fake client does the same, so this proves hostile
+    /// values reach the script as one literal argument and never run.
+    #[cfg(unix)]
+    #[test]
+    fn hostile_arguments_survive_the_remote_shell_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = fake_ssh(dir.path(), "exec /bin/sh -c \"$*\"");
+        let capture = dir.path().join("argument");
+        let pwned = dir.path().join("pwned");
+        let values = [
+            format!("a b;touch {}", pwned.display()),
+            format!("$(touch {})", pwned.display()),
+            format!("`touch {}`", pwned.display()),
+            format!("it's \"quoted\"\ntouch {}", pwned.display()),
+            "&& || | > < * ? ~ # ! \\".to_string(),
+        ];
+        for value in values {
+            let mut command = SshCommand::new(&ssh);
+            command
+                .remote_script("printf '%s' \"$1\" > \"$2\"")
+                .unwrap();
+            command.args.push(value.clone().into());
+            command.args.push(capture.clone().into());
+            command.run().unwrap();
+            assert_eq!(std::fs::read_to_string(&capture).unwrap(), value);
+            assert!(!pwned.exists(), "{value:?} was executed");
+        }
+    }
+
     #[test]
     fn rejects_a_script_with_a_nul_byte() {
         let mut command = SshCommand::new("ssh");
