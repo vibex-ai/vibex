@@ -463,6 +463,9 @@ impl ProfileCandidateRow {
 /// Disclosures the Provider editor owns, named so the toggle can find them.
 const PROFILE_PROTOCOL_DISCLOSURE_ID: &str = "provider-protocol-overrides";
 const PROFILE_HEADERS_DISCLOSURE_ID: &str = "provider-request-headers";
+/// The page-level creator's own header disclosure, distinct from the Agent
+/// editor's so the two drafts never toggle each other.
+const PROVIDER_CREATE_HEADERS_DISCLOSURE_ID: &str = "provider-create-headers";
 
 struct ManagementCenterFeedbackNotification;
 
@@ -1297,6 +1300,36 @@ pub struct ManagementCenter {
     shared_provider_edit_name_error: Option<String>,
     shared_provider_edit_base_url_error: Option<String>,
     shared_provider_edit_models_error: Option<String>,
+    /// Whether the Providers page is showing its own "new Provider" view.
+    ///
+    /// It replaces the detail pane rather than opening an overlay: the record
+    /// is created here, beside the list it lands in, and the Agent dialog that
+    /// used to own this form is a different question — which model source one
+    /// Agent should use — that the global page must not ask.
+    provider_create_page_open: bool,
+    provider_create_name: Entity<InputState>,
+    provider_create_base_url: Entity<InputState>,
+    provider_create_models: Entity<InputState>,
+    provider_create_default_model: Entity<InputState>,
+    provider_create_models_url: Entity<InputState>,
+    provider_create_auth_url: Entity<InputState>,
+    provider_create_api_key: Entity<InputState>,
+    provider_create_headers: Entity<TextareaState>,
+    provider_create_headers_open: bool,
+    provider_create_proxy_url: Entity<InputState>,
+    provider_create_proxy_disabled: bool,
+    provider_create_only_through_groups: bool,
+    provider_create_category: Option<String>,
+    provider_create_catalog_id: Entity<InputState>,
+    /// The preset the page draft started from, so its region override and
+    /// catalogue id survive until the record is created.
+    provider_create_preset: Option<vibex_core::ProviderPreset>,
+    provider_create_preset_region: Option<String>,
+    provider_create_error: Option<String>,
+    provider_create_name_error: Option<String>,
+    provider_create_base_url_error: Option<String>,
+    provider_create_models_error: Option<String>,
+    provider_create_endpoint_error: Option<String>,
     /// The preset the editor's draft started from, until it is saved.
     ///
     /// It is kept beside the draft rather than inside it because a preset is a
@@ -1361,6 +1394,12 @@ pub struct ManagementCenter {
     /// Agent it was opened from differs: on the global page it creates a record
     /// nobody references yet, while on an Agent it also binds that Agent.
     route_group_editor_from_agent: bool,
+    /// Whether the Providers page is showing its own route-group editor.
+    ///
+    /// The page version is the same draft the Agent dialog authors, but it is
+    /// drawn in the detail pane and saves a global record without binding any
+    /// Agent — the reason the Providers page has a New button at all.
+    route_group_page_open: bool,
     /// The group draft's name.
     route_group_name: Entity<InputState>,
     /// A rejected group name, shown beside its field.
@@ -1967,6 +2006,77 @@ impl ManagementCenter {
             ))
         });
         let shared_provider_edit_proxy_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "http://127.0.0.1:7890",
+                "http://127.0.0.1:7890",
+                "http://127.0.0.1:7890",
+            ))
+        });
+        // The Providers page creates its own record, so it owns its own draft
+        // rather than borrowing the Agent editor's. Sharing the inputs would
+        // make a page draft and a dialog draft overwrite each other.
+        let provider_create_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Provider name",
+                "供应商名称",
+                "供應商名稱",
+            ))
+        });
+        let provider_create_base_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "https://api.example.com/v1",
+                "https://api.example.com/v1",
+                "https://api.example.com/v1",
+            ))
+        });
+        let provider_create_models = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "model-a, model-b",
+                "模型 A, 模型 B",
+                "模型 A, 模型 B",
+            ))
+        });
+        let provider_create_default_model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "default model",
+                "默认模型",
+                "預設模型",
+            ))
+        });
+        let provider_create_models_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "models endpoint",
+                "模型列表地址",
+                "模型清單位址",
+            ))
+        });
+        let provider_create_catalog_id = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "models.dev id",
+                "models.dev ID",
+                "models.dev ID",
+            ))
+        });
+        let provider_create_auth_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "auth endpoint",
+                "认证地址",
+                "認證位址",
+            ))
+        });
+        let provider_create_api_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(PROVIDER_API_KEY_PLACEHOLDER)
+                .masked(true)
+        });
+        let provider_create_headers = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(management_locale_text(
+                "{\n  \"X-Header\": \"value\"\n}",
+                "{\n  \"X-Header\": \"值\"\n}",
+                "{\n  \"X-Header\": \"值\"\n}",
+            ))
+        });
+        let provider_create_proxy_url = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "http://127.0.0.1:7890",
                 "http://127.0.0.1:7890",
@@ -2675,6 +2785,28 @@ impl ManagementCenter {
             shared_provider_edit_name_error: None,
             shared_provider_edit_base_url_error: None,
             shared_provider_edit_models_error: None,
+            provider_create_page_open: false,
+            provider_create_name,
+            provider_create_base_url,
+            provider_create_models,
+            provider_create_default_model,
+            provider_create_models_url,
+            provider_create_auth_url,
+            provider_create_api_key,
+            provider_create_headers,
+            provider_create_headers_open: false,
+            provider_create_proxy_url,
+            provider_create_proxy_disabled: false,
+            provider_create_only_through_groups: false,
+            provider_create_category: None,
+            provider_create_catalog_id,
+            provider_create_preset: None,
+            provider_create_preset_region: None,
+            provider_create_error: None,
+            provider_create_name_error: None,
+            provider_create_base_url_error: None,
+            provider_create_models_error: None,
+            provider_create_endpoint_error: None,
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
@@ -2699,6 +2831,7 @@ impl ManagementCenter {
             route_group_editor_open: false,
             route_group_editing_id: None,
             route_group_editor_from_agent: false,
+            route_group_page_open: false,
             route_group_name,
             route_group_name_error: None,
             route_group_model_members: Vec::new(),
@@ -4953,6 +5086,12 @@ impl ManagementCenter {
             return false;
         }
         self.error = None;
+        // A create view belongs to the Providers page. Leaving the section ends
+        // it, so returning later shows the list rather than a stale draft.
+        if section != ManagementSection::Providers {
+            self.provider_create_page_open = false;
+            self.route_group_page_open = false;
+        }
         cx.notify();
         true
     }
@@ -6686,6 +6825,9 @@ impl ManagementCenter {
             }
             PROFILE_HEADERS_DISCLOSURE_ID => {
                 self.profile_headers_open = !self.profile_headers_open;
+            }
+            PROVIDER_CREATE_HEADERS_DISCLOSURE_ID => {
+                self.provider_create_headers_open = !self.provider_create_headers_open;
             }
             _ => return,
         }
@@ -13235,6 +13377,8 @@ impl ManagementCenter {
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
                     this.selected_global_route_id = None;
+                    this.provider_create_page_open = false;
+                    this.route_group_page_open = false;
                     cx.notify();
                 })),
         );
@@ -13424,6 +13568,8 @@ impl ManagementCenter {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_provider_id = Some(select_id.clone());
                         this.selected_global_route_id = None;
+                        this.provider_create_page_open = false;
+                        this.route_group_page_open = false;
                         cx.notify();
                     })),
             );
@@ -13617,6 +13763,8 @@ impl ManagementCenter {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_route_id = Some(select_id.clone());
                         this.selected_global_provider_id = None;
+                        this.provider_create_page_open = false;
+                        this.route_group_page_open = false;
                         cx.notify();
                     })),
             );
@@ -13663,6 +13811,11 @@ impl ManagementCenter {
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 if let Some(tab) = ProviderSidebarTab::ALL.get(*index) {
                     this.providers_sidebar_tab = *tab;
+                    // Switching tabs changes which list is being authored, so a
+                    // draft opened on the other one is no longer the view's
+                    // subject.
+                    this.provider_create_page_open = false;
+                    this.route_group_page_open = false;
                     match tab {
                         ProviderSidebarTab::Providers => {
                             if this.selected_global_provider_id.is_none() {
@@ -13724,7 +13877,7 @@ impl ManagementCenter {
                         management_locale_text("Add a Provider", "添加供应商", "新增供應商"),
                         false,
                         cx.listener(|this, _, window, cx| {
-                            this.open_shared_provider_creator(window, cx)
+                            this.open_provider_create_page(None, window, cx)
                         }),
                     ),
                     management_provider_header_action(
@@ -13752,7 +13905,7 @@ impl ManagementCenter {
                     management_locale_text("New route group", "新建路由组", "新增路由組"),
                     false,
                     cx.listener(|this, _, window, cx| {
-                        this.open_route_group_editor(false, window, cx)
+                        this.open_route_group_page_editor(window, cx)
                     }),
                 )];
                 // Closing the drawer leaves the suggestions reachable from the
@@ -13893,25 +14046,1014 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    /// Opens the Provider editor to create a shared record.
+    /// Opens the Providers page's own "new Provider" view.
     ///
-    /// A Provider created here belongs to no Agent: it is one record that
-    /// several Agents bind afterwards. That is why nothing in this path asks an
-    /// Agent which protocol it speaks — the answer depends on who binds it, and
-    /// the binding is where the answer is checked.
-    fn open_shared_provider_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_profile_creator(window, cx);
-        // The global page has no Agent card behind the dialog, so the shared
-        // record is not bound to anyone here.
-        self.provider_editor_bind_agent = false;
-        // The preset step still applies: it fills the address, the protocol and
-        // the starting model list, none of which needs an Agent.
+    /// This is not the Agent dialog. A Provider created here belongs to no
+    /// Agent: it is one record that Agents bind afterwards, so nothing on this
+    /// page borrows an Agent's projection, protocol, or model catalogue. The
+    /// form fills the detail pane beside the list it lands in, which keeps the
+    /// global page answering a global question.
+    fn open_provider_create_page(
+        &mut self,
+        preset_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.provider_create_page_open = true;
+        self.provider_create_error = None;
+        self.provider_create_name_error = None;
+        self.provider_create_base_url_error = None;
+        self.provider_create_models_error = None;
+        self.provider_create_endpoint_error = None;
+        self.provider_create_headers_open = false;
+        self.provider_create_proxy_disabled = false;
+        self.provider_create_only_through_groups = false;
+        self.provider_create_category = None;
+        self.provider_create_preset = None;
+        self.provider_create_preset_region = None;
+        for input in [
+            &self.provider_create_name,
+            &self.provider_create_base_url,
+            &self.provider_create_models,
+            &self.provider_create_default_model,
+            &self.provider_create_models_url,
+            &self.provider_create_auth_url,
+            &self.provider_create_proxy_url,
+            &self.provider_create_catalog_id,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.provider_create_api_key.update(cx, |state, cx| {
+            state.set_masked(true, window, cx);
+            state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
+            state.set_value("", window, cx);
+        });
+        self.provider_create_headers
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        if let Some(preset_id) = preset_id {
+            self.apply_provider_create_preset(preset_id, window, cx);
+        }
+        self.navigation
+            .mark_dirty(ManagementSection::Providers, false);
         cx.notify();
+    }
+
+    fn close_provider_create_page(&mut self, cx: &mut Context<Self>) {
+        self.provider_create_page_open = false;
+        self.provider_create_error = None;
+        self.provider_create_name_error = None;
+        self.provider_create_base_url_error = None;
+        self.provider_create_models_error = None;
+        self.provider_create_endpoint_error = None;
+        cx.notify();
+    }
+
+    /// Fills the page draft from one built-in preset.
+    ///
+    /// Only the starting values move: the name, the default protocol's
+    /// address, its model ids, and the catalogue id the record keeps as
+    /// advisory metadata. A preset declares no default model and no key, so
+    /// those are cleared rather than inherited from the previous choice.
+    fn apply_provider_create_preset(
+        &mut self,
+        preset_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preset) = vibex_core::provider_preset(preset_id) else {
+            return;
+        };
+        self.provider_create_preset = Some(preset.clone());
+        self.provider_create_preset_region = None;
+        let catalog_id = preset.catalog_id.clone().unwrap_or_default();
+        self.provider_create_catalog_id
+            .update(cx, |state, cx| state.set_value(catalog_id, window, cx));
+        self.provider_create_category = Some(
+            provider_preset_category(&preset)
+                .metadata_value()
+                .to_string(),
+        );
+        let models = preset.models.join(", ");
+        self.provider_create_name.update(cx, |state, cx| {
+            state.set_value(preset.display_name.clone(), window, cx)
+        });
+        self.provider_create_models
+            .update(cx, |state, cx| state.set_value(models, window, cx));
+        for input in [
+            &self.provider_create_default_model,
+            &self.provider_create_models_url,
+            &self.provider_create_auth_url,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.apply_provider_create_preset_region(None, window, cx);
+        cx.notify();
+    }
+
+    /// Drops the applied preset and starts the same form from empty again.
+    ///
+    /// The fields a preset filled are cleared with it, because the menu says
+    /// "empty form"; the Key, headers and proxy stay, since a preset never
+    /// writes them.
+    fn clear_provider_create_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.provider_create_preset = None;
+        self.provider_create_preset_region = None;
+        self.provider_create_category = None;
+        for input in [
+            &self.provider_create_name,
+            &self.provider_create_base_url,
+            &self.provider_create_models,
+            &self.provider_create_default_model,
+            &self.provider_create_models_url,
+            &self.provider_create_auth_url,
+            &self.provider_create_catalog_id,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Writes the selected preset's addresses, with one region applied.
+    fn apply_provider_create_preset_region(
+        &mut self,
+        region_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preset) = self.provider_create_preset.clone() else {
+            return;
+        };
+        let regional = preset.with_region(region_id.as_deref());
+        let base_url = regional
+            .default_wire_api()
+            .and_then(|wire_api| regional.endpoint_for(wire_api))
+            .unwrap_or_default()
+            .to_string();
+        self.provider_create_base_url
+            .update(cx, |state, cx| state.set_value(base_url, window, cx));
+        self.provider_create_preset_region = region_id;
+        cx.notify();
+    }
+
+    /// Creates the shared Provider the page draft describes.
+    fn save_provider_create_page(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            self.provider_create_error = Some(
+                management_error_text(
+                    "Management runtime is not connected",
+                    "配置中心运行时未连接",
+                    "配置中心執行階段未連線",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let name = self
+            .provider_create_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.provider_create_name_error = name.is_empty().then(|| {
+            management_error_text(
+                "Provider name is required",
+                "请填写供应商名称",
+                "請填寫供應商名稱",
+            )
+            .to_string()
+        });
+        if self.provider_create_name_error.is_some() {
+            cx.notify();
+            return;
+        }
+        let base_url = self
+            .provider_create_base_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if base_url.is_empty() {
+            self.provider_create_base_url_error = Some(
+                management_error_text(
+                    "Enter at least one address for this Provider",
+                    "请至少填写一个接口地址",
+                    "請至少填寫一個介面位址",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let model_ids = self
+            .provider_create_models
+            .read(cx)
+            .value()
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .fold(Vec::<String>::new(), |mut ids, id| {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
+                ids
+            });
+        let default_model = self
+            .provider_create_default_model
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !default_model.is_empty() && !model_ids.iter().any(|id| id == &default_model) {
+            self.provider_create_models_error = Some(
+                management_locale_text(
+                    "The default model must be one of this Provider's models",
+                    "默认模型必须是该供应商的模型之一",
+                    "預設模型必須是該供應商的模型之一",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        // Header rows are the one free-form field, so a malformed object is
+        // reported under the disclosure instead of being silently dropped.
+        let headers_text = self.provider_create_headers.read(cx).value().to_string();
+        let parsed_headers = match serde_json::from_str::<serde_json::Value>(&headers_text) {
+            Ok(serde_json::Value::Object(headers)) if !headers_text.trim().is_empty() => {
+                let mut parsed = Vec::new();
+                for (header, value) in headers {
+                    let header = header.trim().to_string();
+                    if header.is_empty() {
+                        continue;
+                    }
+                    let value = match value {
+                        serde_json::Value::String(value) => {
+                            vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value)
+                        }
+                        serde_json::Value::Object(object) => {
+                            let Some(variable) = object
+                                .get("variable")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(vibex_core::ModelProviderHeaderVariable::from_id)
+                            else {
+                                self.provider_create_endpoint_error = Some(format!(
+                                    "{}: {header}",
+                                    management_locale_text(
+                                        "A header must be a string or a known variable",
+                                        "请求头必须是字符串或已知变量",
+                                        "請求標頭必須是字串或已知變數",
+                                    )
+                                ));
+                                cx.notify();
+                                return;
+                            };
+                            vibex_core::ModelProviderHeaderValue::DynamicVariable(variable)
+                        }
+                        _ => {
+                            self.provider_create_endpoint_error = Some(format!(
+                                "{}: {header}",
+                                management_locale_text(
+                                    "A header must be a string or a known variable",
+                                    "请求头必须是字符串或已知变量",
+                                    "請求標頭必須是字串或已知變數",
+                                )
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                    };
+                    parsed.push(vibex_core::ModelProviderHeaderReference {
+                        name: header,
+                        value,
+                        redacted_hint: "created".to_string(),
+                    });
+                }
+                parsed
+            }
+            Ok(_) if headers_text.trim().is_empty() => Vec::new(),
+            Ok(_) => {
+                self.provider_create_endpoint_error = Some(
+                    management_locale_text(
+                        "Headers must be a JSON object",
+                        "请求头必须是 JSON 对象",
+                        "請求標頭必須是 JSON 物件",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.provider_create_endpoint_error = Some(format!(
+                    "{}: {error}",
+                    management_locale_text(
+                        "Headers JSON is invalid",
+                        "请求头 JSON 无效",
+                        "請求標頭 JSON 無效",
+                    )
+                ));
+                cx.notify();
+                return;
+            }
+        };
+        let models = model_ids
+            .iter()
+            .map(|id| vibex_core::ModelProviderCatalogEntry {
+                id: id.clone(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let mut endpoints = vec![vibex_core::ModelProviderEndpoint {
+            id: "api".to_string(),
+            kind: vibex_core::ModelProviderEndpointKind::Api,
+            url: base_url,
+            wire_protocol_id: None,
+        }];
+        for (id, kind, url) in [
+            (
+                "models",
+                vibex_core::ModelProviderEndpointKind::ModelCatalog,
+                self.provider_create_models_url.read(cx).value().trim(),
+            ),
+            (
+                "auth",
+                vibex_core::ModelProviderEndpointKind::Auth,
+                self.provider_create_auth_url.read(cx).value().trim(),
+            ),
+        ] {
+            if !url.is_empty() {
+                endpoints.push(vibex_core::ModelProviderEndpoint {
+                    id: id.to_string(),
+                    kind,
+                    url: url.to_string(),
+                    wire_protocol_id: None,
+                });
+            }
+        }
+        let proxy_url = self
+            .provider_create_proxy_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let proxy_policy = if self.provider_create_proxy_disabled {
+            vibex_core::ModelProviderProxyPolicy::Disabled
+        } else if proxy_url.is_empty() {
+            vibex_core::ModelProviderProxyPolicy::InheritSystem
+        } else {
+            vibex_core::ModelProviderProxyPolicy::Endpoint(proxy_url)
+        };
+        let api_key = self
+            .provider_create_api_key
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let catalog_id = self
+            .provider_create_catalog_id
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let category = self.provider_create_category.clone();
+        let only_through_groups = self.provider_create_only_through_groups;
+        let request = vibex_core::ModelProviderProfileCreateRequest {
+            display_name: name,
+            vendor_hint: self
+                .provider_create_preset
+                .as_ref()
+                .map(|preset| preset.id.clone()),
+            endpoints,
+            proxy_policy,
+            credentials: Vec::new(),
+            configured_models: models,
+            default_model_id: (!default_model.is_empty()).then_some(default_model),
+            headers: parsed_headers,
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+        };
+        let active_locale = locale::current_locale();
+        self.provider_create_error = None;
+        self.provider_create_name_error = None;
+        self.provider_create_base_url_error = None;
+        self.provider_create_models_error = None;
+        self.provider_create_endpoint_error = None;
+        self.mutation = Some(ManagementMutation::ProfileCreate);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let created = backend
+                .management()
+                .create_model_provider_profile(vibex_backend::MutationRequest::new(request))
+                .await;
+            let outcome = match created {
+                Ok(profile) => {
+                    // Metadata and the Key are written after the record exists:
+                    // a failure there leaves an editable Provider rather than a
+                    // half-created one the user has to clean up.
+                    let needs_metadata =
+                        !catalog_id.is_empty() || category.is_some() || only_through_groups;
+                    let profile = if needs_metadata {
+                        let mut profile = profile;
+                        profile.metadata.catalog_id =
+                            (!catalog_id.is_empty()).then(|| catalog_id.clone());
+                        profile.metadata.category = category.clone();
+                        profile.metadata.only_through_route_groups = only_through_groups;
+                        let expected_revision = profile.revision;
+                        backend
+                            .management()
+                            .update_model_provider_profile(vibex_backend::MutationRequest::new(
+                                vibex_core::ModelProviderProfileUpdateRequest {
+                                    profile,
+                                    expected_revision,
+                                },
+                            ))
+                            .await
+                    } else {
+                        Ok(profile)
+                    };
+                    match profile {
+                        Ok(profile) if !api_key.is_empty() => backend
+                            .management()
+                            .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                                vibex_core::AddModelProviderCredentialRequest {
+                                    model_provider_profile_id: profile.id.clone(),
+                                    display_name: None,
+                                    value: api_key,
+                                },
+                            ))
+                            .await
+                            .map(|_| profile),
+                        other => other,
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(profile) => {
+                        let display_name = profile.display_name.clone();
+                        let profile_id = profile.id.as_str().to_string();
+                        this.apply_shared_provider_success(profile);
+                        this.selected_global_provider_id = Some(profile_id);
+                        this.selected_global_route_id = None;
+                        this.providers_sidebar_tab = ProviderSidebarTab::Providers;
+                        this.close_provider_create_page(cx);
+                        this.notice = Some(format!(
+                            "{} · {}",
+                            management_locale_text_for(
+                                active_locale,
+                                "Provider created",
+                                "供应商已创建",
+                                "供應商已建立",
+                            ),
+                            display_name
+                        ));
+                        this.navigation
+                            .mark_dirty(ManagementSection::Providers, false);
+                        cx.notify();
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.provider_create_error =
+                            Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// The Providers page's own "new Provider" view.
+    fn render_provider_create_page(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let category = self.provider_create_category.clone();
+        let preset = self.provider_create_preset.clone();
+        let preset_label = preset
+            .as_ref()
+            .map(|preset| preset.display_name.clone())
+            .unwrap_or_else(|| management_locale_text("Custom", "自定义", "自訂").to_string());
+        let preset_menu_center = cx.weak_entity();
+        let preset_choices = vibex_core::provider_presets();
+        let region_choices = preset
+            .as_ref()
+            .map(|preset| {
+                preset
+                    .regions
+                    .iter()
+                    .map(|region| (region.id.clone(), region.display_name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current_region_label = self
+            .provider_create_preset_region
+            .as_ref()
+            .and_then(|region_id| {
+                region_choices
+                    .iter()
+                    .find(|(id, _)| id == region_id)
+                    .map(|(_, label)| label.clone())
+            })
+            .unwrap_or_else(|| management_locale_text("Default", "默认", "預設").to_string());
+        let region_menu_center = cx.weak_entity();
+        let category_values = [
+            (
+                "vendor",
+                management_locale_text("Vendor", "供应商", "供應商"),
+            ),
+            ("relay", management_locale_text("Relay", "中转", "中轉")),
+            ("local", management_locale_text("Local", "本机", "本機")),
+        ];
+
+        let body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("management-provider-create-close")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .label(management_locale_text("Back", "返回", "返回"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_provider_create_page(cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "A shared record: any Agent can bind it afterwards.",
+                                "共享记录：任何 Agent 之后都可以绑定它。",
+                                "共用記錄：任何 Agent 之後都可以綁定它。",
+                            )),
+                    ),
+            )
+            .child(management_input_field_with_error(
+                management_locale_text("Provider name", "供应商名称", "供應商名稱"),
+                &self.provider_create_name,
+                false,
+                self.provider_create_name_error.as_deref(),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(management_field_label(management_locale_text(
+                                "Start from a preset",
+                                "从预设开始",
+                                "從預設開始",
+                            )))
+                            .child(
+                                Button::new("management-provider-create-preset")
+                                    .small()
+                                    .outline()
+                                    .w_full()
+                                    .label(preset_label)
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let mut menu = menu;
+                                        let center = preset_menu_center.clone();
+                                        let custom_center = center.clone();
+                                        menu = menu.item(PopupMenuItem::new(
+                                            management_locale_text(
+                                                "Custom (empty form)",
+                                                "自定义（空表单）",
+                                                "自訂（空表單）",
+                                            ),
+                                        )
+                                        .on_click(move |_, window, cx| {
+                                            let _ = custom_center.update(cx, |this, cx| {
+                                                this.clear_provider_create_preset(window, cx)
+                                            });
+                                        }));
+                                        for preset in &preset_choices {
+                                            let center = center.clone();
+                                            let preset_id = preset.id.clone();
+                                            let label = preset.display_name.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(label).on_click(
+                                                    move |_, window, cx| {
+                                                        let _ = center.update(cx, |this, cx| {
+                                                            this.apply_provider_create_preset(
+                                                                &preset_id,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        });
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        menu
+                                    }),
+                            ),
+                    )
+                    .when(!region_choices.is_empty(), |row| {
+                        row.child(
+                            v_flex()
+                                .w(px(200.0))
+                                .flex_none()
+                                .gap_1()
+                                .child(management_field_label(management_locale_text(
+                                    "Region", "区域", "區域",
+                                )))
+                                .child(
+                                    Button::new("management-provider-create-region")
+                                        .small()
+                                        .outline()
+                                        .w_full()
+                                        .label(current_region_label)
+                                        .dropdown_menu(move |menu, _, _| {
+                                            let mut menu = menu;
+                                            let center = region_menu_center.clone();
+                                            let choices = region_choices.clone();
+                                            for (region_id, label) in
+                                                std::iter::once((None, management_locale_text(
+                                                    "Default",
+                                                    "默认",
+                                                    "預設",
+                                                )
+                                                .to_string()))
+                                                .chain(choices.into_iter().map(
+                                                    |(id, label)| (Some(id), label),
+                                                ))
+                                            {
+                                                let center = center.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(label).on_click(
+                                                        move |_, window, cx| {
+                                                            let _ = center.update(
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.apply_provider_create_preset_region(
+                                                                        region_id.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            );
+                                                        },
+                                                    ),
+                                                );
+                                            }
+                                            menu
+                                        }),
+                                ),
+                        )
+                    }),
+            )
+            .child(management_input_field_with_error(
+                management_locale_text(
+                    "Default API request URL",
+                    "默认 API 请求地址",
+                    "預設 API 請求位址",
+                ),
+                &self.provider_create_base_url,
+                false,
+                self.provider_create_base_url_error.as_deref(),
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(management_input_field(
+                        management_locale_text("API key", "API Key", "API Key"),
+                        &self.provider_create_api_key,
+                        true,
+                        cx,
+                    ))
+                    .child(management_field_hint(
+                        management_locale_text(
+                            "Stored once and shared by the Agents that bind this Provider. You can add more keys later.",
+                            "只保存一次，绑定该供应商的 Agent 共用。之后还可以添加更多 Key。",
+                            "只儲存一次，綁定該供應商的 Agent 共用。之後還可以新增更多 Key。",
+                        ),
+                        cx,
+                    )),
+            )
+            .child(management_input_field_with_error(
+                management_locale_text(
+                    "Enabled models (comma separated)",
+                    "启用的模型（逗号分隔）",
+                    "啟用的模型（逗號分隔）",
+                ),
+                &self.provider_create_models,
+                false,
+                self.provider_create_models_error.as_deref(),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .child(div().min_w_0().flex_1().child(management_input_field(
+                        management_locale_text("Default model", "默认模型", "預設模型"),
+                        &self.provider_create_default_model,
+                        false,
+                        cx,
+                    )))
+                    .child(div().min_w_0().flex_1().child(management_input_field(
+                        management_locale_text("Models URL", "模型列表地址", "模型清單位址"),
+                        &self.provider_create_models_url,
+                        false,
+                        cx,
+                    )))
+                    .child(div().min_w_0().flex_1().child(management_input_field(
+                        management_locale_text("Auth URL", "认证地址", "認證位址"),
+                        &self.provider_create_auth_url,
+                        false,
+                        cx,
+                    ))),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(management_field_label(management_locale_text(
+                        "Category", "类别", "類別",
+                    )))
+                    .children(category_values.into_iter().map(|(value, label)| {
+                        let selected = category.as_deref() == Some(value);
+                        Button::new(SharedString::from(format!(
+                            "management-provider-create-category-{value}"
+                        )))
+                        .xsmall()
+                        .when(selected, |button| button.primary())
+                        .when(!selected, |button| button.outline())
+                        .label(label)
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.provider_create_category = Some(value.to_string());
+                            cx.notify();
+                        }))
+                    })),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(div().text_xs().child(management_locale_text(
+                                "Only through route groups",
+                                "仅通过路由组使用",
+                                "僅透過路由組使用",
+                            )))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Keeps these models out of Agent pickers; a route group can still reach them.",
+                                        "让这些模型不出现在 Agent 选择器中，路由组仍可调用。",
+                                        "讓這些模型不出現在 Agent 選擇器中，路由組仍可呼叫。",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Switch::new("management-provider-create-only-groups")
+                            .small()
+                            .checked(self.provider_create_only_through_groups)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.provider_create_only_through_groups = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(div().min_w_0().flex_1().child(management_input_field(
+                        management_locale_text("Proxy URL", "代理地址", "代理位址"),
+                        &self.provider_create_proxy_url,
+                        false,
+                        cx,
+                    )))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_xs().child(management_locale_text(
+                                "No proxy",
+                                "不使用代理",
+                                "不使用代理",
+                            )))
+                            .child(
+                                Switch::new("management-provider-create-proxy-disabled")
+                                    .small()
+                                    .checked(self.provider_create_proxy_disabled)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, checked, _, cx| {
+                                        this.provider_create_proxy_disabled = *checked;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child({
+                let open = self.provider_create_headers_open;
+                let error = self.provider_create_endpoint_error.clone();
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(profile_editor_disclosure(
+                        PROVIDER_CREATE_HEADERS_DISCLOSURE_ID,
+                        management_locale_text(
+                            "Request headers",
+                            "请求头",
+                            "請求標頭",
+                        )
+                        .into(),
+                        open,
+                        None,
+                        cx,
+                    ))
+                    .when(open, |section| {
+                        section
+                            .child(
+                                Textarea::new(&self.provider_create_headers)
+                                    .small()
+                                    .w_full()
+                                    .h(px(92.0)),
+                            )
+                            .child(management_field_hint(
+                                management_locale_text(
+                                    "A JSON object of header names to values. Use {\"variable\": \"session_id\"} for the built-in session header.",
+                                    "JSON 对象，键为请求头名称。使用 {\"variable\": \"session_id\"} 表示内置会话请求头。",
+                                    "JSON 物件，鍵為請求標頭名稱。使用 {\"variable\": \"session_id\"} 表示內建工作階段請求標頭。",
+                                ),
+                                cx,
+                            ))
+                    })
+                    .children(
+                        error.map(|message| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(message)
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(management_field_label(management_locale_text(
+                        "Advanced",
+                        "高级",
+                        "進階",
+                    )))
+                    .child(management_input_field(
+                        management_locale_text("Catalog ID", "目录 ID", "目錄 ID"),
+                        &self.provider_create_catalog_id,
+                        false,
+                        cx,
+                    ))
+                    .child(management_field_hint(
+                        management_locale_text(
+                            "The models.dev id is advisory: it powers suggestions only and never changes a request.",
+                            "models.dev ID 仅用于提供建议，不会改变请求。",
+                            "models.dev ID 僅用於提供建議，不會改變請求。",
+                        ),
+                        cx,
+                    )),
+            )
+            .children(self.provider_create_error.clone().map(|message| {
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(message)
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("management-provider-create-cancel")
+                            .small()
+                            .ghost()
+                            .label(management_locale_text("Cancel", "取消", "取消"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_provider_create_page(cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("management-provider-create-save")
+                            .small()
+                            .primary()
+                            .label(management_locale_text(
+                                "Create Provider",
+                                "创建供应商",
+                                "建立供應商",
+                            ))
+                            .loading(pending)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_provider_create_page(cx)
+                            })),
+                    ),
+            );
+
+        v_flex()
+            .id("management-provider-create-page")
+            .w_full()
+            .min_w_0()
+            .max_w(px(760.0))
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div().text_xl().font_semibold().child(management_locale_text(
+                            "New Provider",
+                            "新建供应商",
+                            "新增供應商",
+                        )),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Add a model source once, then share it with the Agents that need it.",
+                                "添加一个模型来源，再共享给需要它的 Agent。",
+                                "新增一個模型來源，再共用給需要它的 Agent。",
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_3()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background.opacity(0.70))
+                    .p_4()
+                    .child(body),
+            )
+            .into_any_element()
     }
 
     /// The global Providers panel: the pinned gateway row's detail, or one
     /// Provider's keys and bindings.
     fn render_provider_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // Creating is a view of this page, not an overlay over it: the form
+        // replaces the detail pane so the list it will land in stays visible
+        // and the page keeps owning a page-level record.
+        if self.provider_create_page_open {
+            return self.render_provider_create_page(window, cx);
+        }
+        if self.route_group_page_open {
+            return self.render_route_group_page_editor(window, cx);
+        }
         // The gateway is a row on this page, not a tab, so its selection wins
         // over the tab's list: clicking the row while Route groups is showing
         // must still describe the gateway.
@@ -29590,6 +30732,139 @@ impl ManagementCenter {
         cx.notify();
     }
 
+    /// Opens the Providers page's own route-group editor.
+    ///
+    /// It is the same draft the Agent dialog authors, so the two cannot drift,
+    /// but it is drawn in the detail pane and saves a global record: no Agent
+    /// is bound, which is exactly what the Providers page's New button means.
+    fn open_route_group_page_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.route_group_editor_open = false;
+        self.route_group_page_open = true;
+        self.route_group_editing_id = None;
+        self.route_group_editor_from_agent = false;
+        self.route_group_name_error = None;
+        self.route_group_member_efforts.clear();
+        self.route_group_model_members.clear();
+        self.route_group_unlists = false;
+        self.route_group_sink = false;
+        self.route_group_sim_images = false;
+        self.route_group_sim_effort = String::new();
+        self.route_group_sim_failure = None;
+        self.route_group_strategy = vibex_core::RouteStrategy::Ordered;
+        self.route_group_pin = true;
+        self.route_group_auto_failover = true;
+        self.route_group_token_limit_window = vibex_core::GatewayTokenWindow::Day;
+        for input in [
+            &self.route_group_first_token_timeout,
+            &self.route_group_context_tokens,
+            &self.route_group_token_limit,
+            &self.route_group_model_query,
+            &self.route_group_patience,
+            &self.route_group_sim_agent,
+            &self.route_group_sim_context,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.route_group_name.update(cx, |state, cx| {
+            state.set_value(
+                management_locale_text("Route group", "路由组", "路由組"),
+                window,
+                cx,
+            )
+        });
+        self.request_model_canonical_ids(cx);
+        self.navigation
+            .mark_dirty(ManagementSection::Providers, false);
+        cx.notify();
+    }
+
+    /// The Providers page's own route-group editor.
+    fn render_route_group_page_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let editing = self.route_group_editing_id.is_some();
+        v_flex()
+            .id("management-route-group-page-editor")
+            .w_full()
+            .min_w_0()
+            .max_w(px(760.0))
+            .gap_4()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("management-route-group-page-back")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .label(management_locale_text("Back", "返回", "返回"))
+                            .disabled(self.mutation.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_route_group_editor(cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "A global record: Agents reference it, they do not own it.",
+                                "全局记录：Agent 引用它，但并不拥有它。",
+                                "全域記錄：Agent 引用它，但並不擁有它。",
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div().text_xl().font_semibold().child(if editing {
+                            management_locale_text(
+                                "Edit route group",
+                                "编辑路由组",
+                                "編輯路由組",
+                            )
+                        } else {
+                            management_locale_text(
+                                "New route group",
+                                "新建路由组",
+                                "新增路由組",
+                            )
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Compose Providers and models into one model name Agents can ask for.",
+                                "把供应商和模型组合成一个 Agent 可请求的模型名。",
+                                "把供應商和模型組合成一個 Agent 可請求的模型名。",
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_3()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background.opacity(0.70))
+                    .p_4()
+                    .child(self.render_model_group_editor(window, cx)),
+            )
+            .into_any_element()
+    }
+
     /// Opens the editor on an existing group, with its Providers in order.
     ///
     /// `from_agent` says whether the save should also bind the Agent the
@@ -29695,6 +30970,7 @@ impl ManagementCenter {
 
     fn close_route_group_editor(&mut self, cx: &mut Context<Self>) {
         self.route_group_editor_open = false;
+        self.route_group_page_open = false;
         self.route_group_editing_id = None;
         self.route_group_editor_from_agent = false;
         self.route_group_name_error = None;
@@ -30186,6 +31462,7 @@ impl ManagementCenter {
                 match outcome {
                     Ok(()) => {
                         this.route_group_editor_open = false;
+                        this.route_group_page_open = false;
                         this.route_group_editing_id = None;
                         this.route_group_editor_from_agent = false;
                         // A group created on the Providers page becomes the
@@ -32799,6 +34076,9 @@ impl ManagementCenter {
                         .label(management_locale_text("Cancel", "取消", "取消"))
                         .disabled(pending)
                         .on_click(cx.listener(|this, _, window, cx| {
+                            // The same draft is drawn in the dialog and in the
+                            // Providers page, so abandoning it has to end both:
+                            // whichever surface is live returns to its list.
                             this.close_route_group_editor(cx);
                             if window.has_active_dialog(cx) {
                                 window.close_dialog(cx);
@@ -39085,6 +40365,15 @@ enum ProviderPresetCategory {
 
 impl ProviderPresetCategory {
     const ALL: [Self; 3] = [Self::Vendor, Self::Relay, Self::Local];
+
+    /// The value this category stores in a Provider's metadata.
+    fn metadata_value(self) -> &'static str {
+        match self {
+            Self::Vendor => "vendor",
+            Self::Relay => "relay",
+            Self::Local => "local",
+        }
+    }
 
     fn label(self) -> &'static str {
         match self {
@@ -47681,12 +48970,17 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the Agent create entry should remain inspectable");
         assert!(creator.contains("self.provider_editor_bind_agent = true;"));
-        let shared_creator = source
-            .split_once("    fn open_shared_provider_creator(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The global Providers panel"))
+        // The global Providers page owns a separate create view, so this dialog
+        // is always the Agent-card entry and always ends with a bind.
+        assert!(source.contains("fn open_provider_create_page("));
+        // The page creator is not the dialog: it never borrows an Agent.
+        let page_creator = source
+            .split_once("    fn open_provider_create_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn close_provider_create_page("))
             .map(|(body, _)| body)
-            .expect("the global create entry should remain inspectable");
-        assert!(shared_creator.contains("self.provider_editor_bind_agent = false;"));
+            .expect("the page create entry should remain inspectable");
+        assert!(!page_creator.contains("open_profile_creator("));
+        assert!(!page_creator.contains("provider_editor_bind_agent"));
         let save = source
             .split_once("    fn save_profile(")
             .and_then(|(_, tail)| {
@@ -50921,7 +52215,7 @@ mod gateway_surface_tests {
         let sidebar = source
             .split_once("    fn render_provider_page_sidebar(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Opens the Provider editor to create a shared record.")
+                tail.split_once("\n    /// Opens the Providers page's own \"new Provider\" view.")
             })
             .map(|(body, _)| body)
             .expect("the Providers sidebar should remain inspectable");
@@ -50929,7 +52223,7 @@ mod gateway_surface_tests {
         assert!(sidebar.contains("management-provider-sidebar-tabs"));
         assert!(sidebar.contains("shared_route_group_rows"));
         assert!(sidebar.contains("management-route-group-page-add"));
-        assert!(sidebar.contains("open_route_group_editor(false, window, cx)"));
+        assert!(sidebar.contains("open_route_group_page_editor(window, cx)"));
 
         // The tab is what decides the detail pane, so the page cannot show a
         // Provider while the left column lists groups.
@@ -50940,6 +52234,98 @@ mod gateway_surface_tests {
             .expect("the Providers panel should remain inspectable");
         assert!(page.contains("ProviderSidebarTab::RouteGroups"));
         assert!(page.contains("render_route_group_page"));
+    }
+
+    /// The Providers page authors its own records instead of borrowing the
+    /// Agent dialog.
+    ///
+    /// The page's New buttons used to open the Agent-scoped dialogs, which asked
+    /// an Agent question the global page cannot answer. Both now replace the
+    /// detail pane with a page view, and the dialogs keep serving the Agent
+    /// page unchanged.
+    #[test]
+    fn the_providers_page_creates_in_its_own_right_pane() {
+        let source = include_str!("management.rs");
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the Providers page's own \"new Provider\" view.")
+            })
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        assert!(
+            sidebar.contains("this.open_provider_create_page(None, window, cx)"),
+            "New Provider opens the page view"
+        );
+        assert!(
+            !sidebar.contains("open_shared_provider_creator"),
+            "the Provider page must not reopen the Agent dialog"
+        );
+        assert!(
+            sidebar.contains("this.open_route_group_page_editor(window, cx)"),
+            "New route group opens the page view"
+        );
+        assert!(
+            !sidebar.contains("open_route_group_editor(false, window, cx)"),
+            "the route-group page must not reopen the Agent dialog"
+        );
+
+        let page = source
+            .split_once("    fn render_provider_page(&mut self, window")
+            .and_then(|(_, tail)| tail.split_once("\n        let rows = self.shared_providers();"))
+            .map(|(body, _)| body)
+            .expect("the Providers panel should remain inspectable");
+        assert!(page.contains("self.provider_create_page_open"));
+        assert!(page.contains("render_provider_create_page(window, cx)"));
+        assert!(page.contains("self.route_group_page_open"));
+        assert!(page.contains("render_route_group_page_editor(window, cx)"));
+
+        // The create views are page-level state, not the dialog flags.
+        let create = source
+            .split_once("    fn open_provider_create_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn close_provider_create_page("))
+            .map(|(body, _)| body)
+            .expect("the page creator should remain inspectable");
+        assert!(create.contains("self.provider_create_page_open = true;"));
+        assert!(!create.contains("profile_editor_open"));
+        assert!(!create.contains("present_profile_editor_dialog"));
+
+        let group = source
+            .split_once("    fn open_route_group_page_editor(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The Providers page's own route-group editor.")
+            })
+            .map(|(body, _)| body)
+            .expect("the page route-group opener should remain inspectable");
+        assert!(group.contains("self.route_group_page_open = true;"));
+        assert!(group.contains("self.route_group_editor_from_agent = false;"));
+        assert!(!group.contains("present_route_group_dialog"));
+
+        // Saving from the page writes the shared record and refreshes the list.
+        let save = source
+            .split_once("    fn save_provider_create_page(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The Providers page's own \"new Provider\" view.")
+            })
+            .map(|(body, _)| body)
+            .expect("the page save path should remain inspectable");
+        for marker in [
+            "create_model_provider_profile",
+            "add_model_provider_credential",
+            "apply_shared_provider_success",
+            "ManagementMutation::ProfileCreate",
+        ] {
+            assert!(save.contains(marker), "the page save must keep {marker}");
+        }
+        assert!(
+            !save.contains("agent_id"),
+            "a shared Provider is created without an Agent"
+        );
+
+        // The Agent dialog is deliberately untouched.
+        assert!(source.contains("fn present_profile_editor_dialog("));
+        assert!(source.contains("fn present_route_group_dialog("));
+        assert!(source.contains("open_profile_creator(window, cx)"));
     }
 
     /// Suggested groups are a docked drawer, not a card at the end of a list.
@@ -50953,7 +52339,7 @@ mod gateway_surface_tests {
         let sidebar = source
             .split_once("    fn render_provider_page_sidebar(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Opens the Provider editor to create a shared record.")
+                tail.split_once("\n    /// Opens the Providers page's own \"new Provider\" view.")
             })
             .map(|(body, _)| body)
             .expect("the Providers sidebar should remain inspectable");
