@@ -16832,6 +16832,24 @@ impl VibexWorkbench {
                     })),
             );
         }
+        // A runtime newer than this desktop cannot be fixed on the remote side;
+        // the next step is the desktop's own signed update on the About page.
+        if compatibility.as_ref().is_some_and(|report| {
+            report.state
+                == crate::ssh_connection::compat::RuntimeCompatibility::DesktopUpdateRequired
+        }) {
+            actions = actions.child(
+                Button::new("runtime-detail-update-vibex")
+                    .small()
+                    .outline()
+                    .label(locale::text("Update Vibex", "更新 Vibex", "更新 Vibex"))
+                    .disabled(switching)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_runtime_manager(cx);
+                        this.open_settings_section(SettingsSection::About, window, cx);
+                    })),
+            );
+        }
         // Renaming is offered for the embedded runtime as well: it is the
         // runtime its paired clients see, and the name is published to all of
         // them.
@@ -17093,6 +17111,20 @@ impl VibexWorkbench {
                         .into_any_element()
                 },
             )))
+            // Neither lifecycle survives the Mac going to sleep: the runtime
+            // pauses and the tunnel drops until it wakes. Say so where the
+            // user picks how the runtime runs.
+            .child(
+                div()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "While the Mac sleeps the runtime pauses and the tunnel drops; Vibex reconnects after it wakes. To keep it awake while you work, run `caffeinate -i` on the Mac or turn on “Prevent automatic sleeping” in System Settings.",
+                        "Mac 睡眠时运行时会暂停、隧道会断开，唤醒后 Vibex 会自动重连。若要在工作期间保持唤醒，可在 Mac 上运行 `caffeinate -i`，或在系统设置中开启“防止自动进入睡眠”。",
+                        "Mac 睡眠時執行階段會暫停、通道會中斷，喚醒後 Vibex 會自動重新連線。若要在工作期間保持喚醒，可在 Mac 上執行 `caffeinate -i`，或在系統設定中開啟「防止自動進入睡眠」。",
+                    )),
+            )
             .into_any_element()
     }
 
@@ -45436,6 +45468,23 @@ impl VibexWorkbench {
             cx.notify();
         } else {
             self.open_settings(window, cx);
+        }
+    }
+
+    /// Opens settings on one section rather than General, for actions that
+    /// point at a specific page (a desktop update lives on About).
+    fn open_settings_section(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(window, cx);
+        if self.settings_open {
+            self.settings_view.update(cx, |settings, cx| {
+                settings.activate_settings_section(section, cx);
+                cx.notify();
+            });
         }
     }
 
@@ -110380,6 +110429,27 @@ mod tests {
         assert!(developer.contains("feature::env_override()"));
         assert!(developer.contains(".disabled(ssh_override.is_some())"));
         assert!(developer.contains("set_ssh_remote_runtime"));
+    }
+
+    #[test]
+    fn runtime_detail_routes_desktop_updates_and_explains_mac_sleep() {
+        let source = include_str!("app.rs");
+        let detail = source
+            .split_once("    fn render_runtime_manager_detail(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_macos_lifecycle("))
+            .map(|(body, _)| body)
+            .expect("the runtime detail should remain inspectable");
+        let (before, after) = detail
+            .split_once("Button::new(\"runtime-detail-update-vibex\")")
+            .expect("a desktop-update-required runtime offers Update Vibex");
+        assert!(before.contains("RuntimeCompatibility::DesktopUpdateRequired"));
+        assert!(after.contains("open_settings_section(SettingsSection::About"));
+        let lifecycle = source
+            .split_once("    fn render_macos_lifecycle(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_upgrade_policy("))
+            .map(|(body, _)| body)
+            .expect("the macOS lifecycle row should remain inspectable");
+        assert!(lifecycle.contains("caffeinate -i"));
     }
 
     #[test]
