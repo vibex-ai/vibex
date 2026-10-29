@@ -1,0 +1,138 @@
+#!/bin/sh
+# Vibex SSH bootstrap for a Linux host that has no sshd yet.
+#
+# Run as root from a provider console, serial console, or cloud-init runcmd:
+#
+#   sudo sh vibex-bootstrap.sh --user ubuntu --key "ssh-ed25519 AAAA... vibex"
+#
+# It installs OpenSSH server, authorizes one desktop public key for an existing
+# user, starts sshd, and prints the host-key fingerprint. It never changes
+# PasswordAuthentication, never enables root login, and never touches the
+# firewall.
+#
+# The one-time token/signature envelope is a product-layer concern; this script
+# is the auditable payload it wraps. Do not claim a token was verified here.
+set -eu
+
+usage() {
+    cat <<'USAGE'
+usage: sh vibex-bootstrap.sh --user <name> --key "<ssh public key>" [--port <port>]
+
+  --user  existing Linux account that Vibex will connect as
+  --key   desktop public key to append to that account's authorized_keys
+  --port  expected sshd port (default 22; sshd config is not rewritten)
+USAGE
+}
+
+fail() {
+    echo "vibex-bootstrap: $*" >&2
+    exit 1
+}
+
+USER_NAME=""
+PUBLIC_KEY=""
+PORT="22"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --user) [ "$#" -ge 2 ] || fail "--user needs a value"; USER_NAME="$2"; shift 2 ;;
+        --key) [ "$#" -ge 2 ] || fail "--key needs a value"; PUBLIC_KEY="$2"; shift 2 ;;
+        --port) [ "$#" -ge 2 ] || fail "--port needs a value"; PORT="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || fail "run as root (for example: sudo sh vibex-bootstrap.sh ...)"
+[ -n "$PUBLIC_KEY" ] || fail "--key is required"
+[ -n "$USER_NAME" ] || fail "--user is required"
+case "$PORT" in
+    ''|*[!0-9]*) fail "--port must be numeric" ;;
+esac
+
+case "$PUBLIC_KEY" in
+    ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *)
+        ;;
+    *) fail "the value passed to --key does not look like an SSH public key" ;;
+esac
+
+id "$USER_NAME" >/dev/null 2>&1 || fail "user '$USER_NAME' does not exist"
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || fail "cannot resolve the home directory of '$USER_NAME'"
+GROUP_NAME="$(id -gn "$USER_NAME")"
+
+SSHD_BIN=""
+for candidate in /usr/sbin/sshd /usr/local/sbin/sshd; do
+    if [ -x "$candidate" ]; then SSHD_BIN="$candidate"; break; fi
+done
+
+install_sshd() {
+    if [ -n "$SSHD_BIN" ]; then
+        return
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq openssh-server >/dev/null
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q openssh-server >/dev/null
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q openssh-server >/dev/null
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache openssh >/dev/null
+    else
+        fail "no supported package manager; install openssh-server manually"
+    fi
+    for candidate in /usr/sbin/sshd /usr/local/sbin/sshd; do
+        if [ -x "$candidate" ]; then SSHD_BIN="$candidate"; return; fi
+    done
+    fail "openssh-server was installed but sshd was not found"
+}
+
+install_sshd
+
+if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+    ssh-keygen -A >/dev/null
+fi
+
+install -d -m 700 -o "$USER_NAME" -g "$GROUP_NAME" "$HOME_DIR/.ssh"
+AUTHORIZED_KEYS="$HOME_DIR/.ssh/authorized_keys"
+[ -e "$AUTHORIZED_KEYS" ] || : > "$AUTHORIZED_KEYS"
+chown "$USER_NAME:$GROUP_NAME" "$AUTHORIZED_KEYS"
+chmod 600 "$AUTHORIZED_KEYS"
+
+KEY_BLOB="$(printf '%s\n' "$PUBLIC_KEY" | cut -d' ' -f2)"
+if [ -z "$KEY_BLOB" ] || ! grep -qF "$KEY_BLOB" "$AUTHORIZED_KEYS"; then
+    printf '%s vibex:desktop\n' "$PUBLIC_KEY" >> "$AUTHORIZED_KEYS"
+fi
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl enable ssh >/dev/null 2>&1 || systemctl enable sshd >/dev/null 2>&1 || true
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || "$SSHD_BIN"
+elif command -v rc-service >/dev/null 2>&1; then
+    rc-update add sshd default >/dev/null 2>&1 || true
+    rc-service sshd restart 2>/dev/null || rc-service sshd start
+else
+    mkdir -p /run/sshd
+    if [ -f /run/sshd.pid ] && kill -0 "$(cat /run/sshd.pid)" 2>/dev/null; then
+        :
+    else
+        "$SSHD_BIN"
+    fi
+fi
+
+ACTUAL_PORT="$PORT"
+if command -v "$SSHD_BIN" >/dev/null 2>&1; then
+    ACTUAL_PORT="$("$SSHD_BIN" -T 2>/dev/null | awk '$1 == "port" {print $2; exit}' || true)"
+    [ -n "$ACTUAL_PORT" ] || ACTUAL_PORT="$PORT"
+fi
+
+echo "vibex-bootstrap=ready"
+echo "user=$USER_NAME"
+echo "port=$ACTUAL_PORT"
+if [ -f /run/sshd.pid ]; then
+    echo "sshd_pid=$(cat /run/sshd.pid)"
+fi
+if [ -f /etc/ssh/ssh_host_ed25519_key.pub ]; then
+    echo "host_key_fingerprint=$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}')"
+fi

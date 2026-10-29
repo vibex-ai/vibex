@@ -1,0 +1,15 @@
+#cloud-config
+# Vibex does not call cloud APIs. Create the VM with this template and replace
+# the user/key placeholders; the desktop then re-runs discovery and continues
+# provisioning over SSH.
+users:
+  - name: vibex
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "ssh-ed25519 REPLACE_WITH_DESKTOP_PUBLIC_KEY vibex:desktop"
+package_update: true
+packages:
+  - openssh-server
+runcmd:
+  - [systemctl, enable, --now, ssh]
