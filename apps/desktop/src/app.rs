@@ -16872,6 +16872,18 @@ impl VibexWorkbench {
                             // racing landed, and rebuilding the row from it is
                             // how a just-deleted session reappears.
                             let mut sessions = this.filter_hidden_sessions(sessions);
+                            // This list is read on every sidebar invalidation,
+                            // not only at startup, and it carries whole rows.
+                            // A new session's still-default `<agent> session`
+                            // title would otherwise replace the prompt-derived
+                            // name the reader is already looking at, and the
+                            // row would flip between the two with every
+                            // snapshot in between. Every row goes through the
+                            // same reconciliation a live snapshot gets.
+                            let mut sessions = std::mem::take(&mut sessions)
+                                .into_iter()
+                                .map(|session| this.reconcile_pending_new_session_title(session))
+                                .collect::<Vec<_>>();
                             // A project deleted optimistically (and its
                             // sessions) stays hidden while the authoritative
                             // deletion is still in flight. Once the deletion
@@ -17634,15 +17646,51 @@ impl VibexWorkbench {
             }
             return session;
         }
-        let Some(optimistic_title) = self
+        if let Some(optimistic_title) = self
             .pending_new_session_titles
             .get(session.id.as_str())
             .cloned()
-        else {
+        {
+            session.title = optimistic_title;
             return session;
-        };
-        session.title = optimistic_title;
+        }
+        // Nothing optimistic was recorded — the row predates this window, or
+        // it was created without a first message. The reader's own draft is the
+        // last name available, and `<agent> session` is never one worth
+        // showing. The borrowed name is remembered so a later list read, which
+        // answers with the placeholder again, keeps wearing it instead of
+        // flipping the row back.
+        if let Some(typed) = self.typed_session_title(&session) {
+            self.pending_new_session_titles
+                .insert(session.id.as_str().to_string(), typed.clone());
+            session.title = typed;
+        }
         session
+    }
+
+    /// The name the reader's own writing gives `session`, when it has one.
+    ///
+    /// Neither an unsent draft nor a queued send is authoritative, but both are
+    /// what the reader wrote, so either names the row better than the manager's
+    /// `<agent> session` placeholder. It is only ever consulted for a row that
+    /// still carries that placeholder: a name an Agent supplied is a real title
+    /// and wins over anything left in a textarea.
+    fn typed_session_title(&self, session: &AgentSession) -> Option<String> {
+        if session.title != agent_session_fallback_title(&session.agent_id) {
+            return None;
+        }
+        let session_id = session.id.as_str();
+        if let Some(draft) = self.composer_drafts.get(session_id)
+            && let Some(title) = normalize_agent_session_title(draft.content.text())
+        {
+            return Some(title);
+        }
+        self.composer_queue
+            .iter()
+            .filter(|message| message.session_id.as_str() == session_id)
+            .find_map(|message| {
+                session_title_from_first_message(&message.text, &message.attachments)
+            })
     }
 
     fn upsert_session_snapshot(&mut self, session: AgentSession) {
@@ -19625,10 +19673,33 @@ impl VibexWorkbench {
                 )
             })
             .collect();
+        // This pass runs on a timer, and every pass used to invalidate the
+        // sidebar projection and repaint whether or not its page had anything
+        // new to say. With the poll's cadence that is a periodic rebuild of
+        // every painted row — the conversation, the scroll position and the
+        // selection all get re-derived from a list that did not change. The
+        // pass therefore records what it actually changed and only invalidates
+        // when that is non-empty; `upsert_session_snapshot` reports its own
+        // row changes, so a page that describes the same sessions twice costs
+        // nothing after the first.
+        let mut sidebar_changed = false;
         for node in result.nodes.into_iter().chain(result.ancestors) {
-            if node.parent_session_ref.is_some() {
+            if node.parent_session_ref.is_some()
+                && self
+                    .sessions
+                    .iter()
+                    .any(|root| root.id.as_str() == node.session_ref.id)
+            {
                 self.sessions
                     .retain(|root| root.id.as_str() != node.session_ref.id);
+                sidebar_changed = true;
+            }
+            if self
+                .delegated_tree
+                .get(&node.session_ref.id)
+                .is_none_or(|existing| *existing != node)
+            {
+                sidebar_changed = true;
             }
             self.delegated_tree
                 .insert(node.session_ref.id.clone(), node);
@@ -19644,6 +19715,7 @@ impl VibexWorkbench {
                     if self.registered_session(session.id.as_str()).is_none()
                         && !self.session_hidden_from_sidebar(session.id.as_str())
                     {
+                        sidebar_changed = true;
                         self.delegated_sessions
                             .insert(session.id.as_str().to_string(), session.clone());
                     }
@@ -19678,8 +19750,11 @@ impl VibexWorkbench {
         }
         if !evicted.is_empty() {
             self.prune_delegated_cache(&parent);
+            sidebar_changed = true;
         }
-        self.invalidate_sidebar_projection_cache();
+        if sidebar_changed {
+            self.invalidate_sidebar_projection_cache();
+        }
         if self
             .delegated_reveal_target
             .as_ref()
@@ -25142,7 +25217,19 @@ impl VibexWorkbench {
         // too, which is harmless: the store then holds exactly what the
         // textarea does.
         self.remember_composer_draft(cx);
-        self.clear_sidebar_move_selection();
+        // Only a real navigation ends the sidebar's multi-selection. The
+        // authoritative list is re-read on every sidebar invalidation and
+        // answers with the session that is already open, so clearing here
+        // unconditionally tore the selection apart once every refresh — the
+        // rows the reader had just picked survived only until the next
+        // snapshot arrived. A plain click still collapses the selection to its
+        // own row in `update_sidebar_move_selection`, which is the affordance
+        // that owns that gesture, and a navigation to another session drops it
+        // as before.
+        let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);
+        if navigation_changed {
+            self.clear_sidebar_move_selection();
+        }
         self.home_arena.update(cx, |arena, cx| arena.close(cx));
         self.new_session_open = false;
         self.new_session_error = None;
@@ -25154,7 +25241,6 @@ impl VibexWorkbench {
         if runtime.is_none() && self.backend.is_none() {
             return;
         }
-        let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);
         if navigation_changed {
             // The inline goal editor belongs to the session it was opened on.
             self.composer_goal_editing = false;
@@ -50952,9 +51038,13 @@ impl VibexWorkbench {
         // The name of a session that exists only to wait for its scheduled
         // message comes from that message until the send actually leaves the
         // queue, so the manager's default `<agent> session` title never labels
-        // the wait.
+        // the wait. A row that still carries that placeholder wears what the
+        // reader typed instead: the placeholder is the manager's bookkeeping,
+        // not a name, and drawing it made the title alternate with the typed
+        // one as snapshots arrived.
         let row_title = self
             .pending_scheduled_session_title(session)
+            .or_else(|| self.typed_session_title(session))
             .unwrap_or_else(|| session.title.clone());
         let active_session_drag = self
             .sidebar_session_drag_state
@@ -103833,6 +103923,17 @@ mod tests {
             .map(|(body, _)| body)
             .expect("pending-session selection should remain inspectable");
         assert!(selection.contains("self.clear_sidebar_move_selection();"));
+        // The clear is fenced on a real navigation. The authoritative list is
+        // re-read on every sidebar invalidation and answers with the session
+        // that is already open, so an unconditional clear tore a multi-selection
+        // apart once per refresh.
+        let clear = selection
+            .find("if navigation_changed {\n            self.clear_sidebar_move_selection();")
+            .expect("the multi-selection clear must be fenced on real navigation");
+        let navigation = selection
+            .find("let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);")
+            .expect("the navigation change should be resolved before it is used");
+        assert!(navigation < clear);
         let snapshot = pending_open
             .find("self.upsert_session_snapshot(session);")
             .expect("the pending Session should enter the sidebar source immediately");
@@ -107109,6 +107210,54 @@ mod tests {
             .map(|(body, _)| body)
             .expect("new-session submission should remain inspectable");
         assert!(submit.contains("pending_new_session_titles"));
+
+        // The authoritative list is re-read on every sidebar invalidation and
+        // answers with whole rows, so it has to pass through the same
+        // reconciliation as a live snapshot. Without it the manager's
+        // `<agent> session` placeholder replaced the prompt-derived name on
+        // every refresh, which is what made the title alternate.
+        let overview = source
+            .split_once("    fn load_agent_overview(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    pub(crate) fn refresh_workspace_contexts(")
+            })
+            .map(|(body, _)| body)
+            .expect("agent overview should remain inspectable");
+        assert!(
+            overview.contains(".map(|session| this.reconcile_pending_new_session_title(session))"),
+            "a list read must not put the placeholder back on a named row"
+        );
+    }
+
+    /// A row that still carries the manager's `<agent> session` placeholder is
+    /// named by what the reader typed, and never by the placeholder itself.
+    #[test]
+    fn a_placeholder_title_falls_back_to_the_readers_own_text() {
+        let source = include_str!("app.rs");
+        let typed = source
+            .split_once("    fn typed_session_title(&self, session: &AgentSession)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn upsert_session_snapshot("))
+            .map(|(body, _)| body)
+            .expect("the typed-title fallback should remain inspectable");
+        // A name an Agent supplied is a real title: it must win over a draft
+        // that happens to still be sitting in the composer.
+        assert!(
+            typed.contains("if session.title != agent_session_fallback_title(&session.agent_id) {")
+        );
+        assert!(typed.contains("normalize_agent_session_title(draft.content.text())"));
+        assert!(
+            typed.contains("session_title_from_first_message(&message.text, &message.attachments)")
+        );
+
+        let row = source
+            .split_once("        let row_title = self")
+            .map(|(_, tail)| tail)
+            .expect("the sidebar row title should remain inspectable");
+        let row = &row[..row.find(';').expect("the row title ends its statement")];
+        assert!(
+            row.contains(".or_else(|| self.typed_session_title(session))"),
+            "the row itself must never fall back to the placeholder"
+        );
     }
 
     #[test]
@@ -110727,6 +110876,44 @@ mod tests {
         assert!(
             snapshot.contains("self.delegated_refresh_wake.notify_one();"),
             "an unplaceable session has to wake the pass that can place it"
+        );
+    }
+
+    /// A timed ownership pass that has nothing new to say costs nothing.
+    ///
+    /// The pass runs on an interval, and it used to invalidate the sidebar
+    /// projection and repaint on every tick whether or not its page described
+    /// anything new. At the poll's cadence that rebuilt every painted row — the
+    /// conversation included — a few seconds apart, which is what made the
+    /// sidebar and the timeline appear to flicker while the reader did nothing.
+    #[test]
+    fn an_idle_ownership_pass_does_not_rebuild_the_sidebar() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn apply_delegated_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Whether a session is known to own delegated children."))
+            .map(|(body, _)| body)
+            .expect("the delegated page applier should remain inspectable");
+
+        assert!(
+            page.contains("let mut sidebar_changed = false;"),
+            "the pass has to track what it actually changed"
+        );
+        assert!(
+            page.contains("if sidebar_changed {\n            self.invalidate_sidebar_projection_cache();\n        }"),
+            "an unchanged page must not invalidate the projection"
+        );
+        assert!(
+            !page.contains(
+                "        }\n        self.invalidate_sidebar_projection_cache();\n        if self\n            .delegated_reveal_target"
+            ),
+            "the invalidation has to stay behind the change flag"
+        );
+        // A row the tree describes differently is a change; the same row twice
+        // is not.
+        assert!(
+            page.contains(".is_none_or(|existing| *existing != node)"),
+            "a node only counts as a change when it differs from the one on hand"
         );
     }
 

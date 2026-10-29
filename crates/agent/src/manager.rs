@@ -5738,6 +5738,17 @@ impl AgentManager {
         title: &str,
     ) -> VibexResult<bool> {
         let conn = self.open_migrated()?;
+        // A provider reports its own session name, and several report the
+        // generic `<agent> session` they were handed at `session/new` back
+        // unchanged. Accepting that as an automatic title replaced the name the
+        // reader's first message had just seeded, and the row then alternated
+        // between the two for as long as snapshots carried the provider's copy.
+        // That placeholder is never a name worth showing, so it is not applied.
+        let known_placeholder = SessionRepository::get(&conn, session_id)?
+            .is_some_and(|session| *title.trim() == format!("{} session", session.agent_id));
+        if known_placeholder {
+            return Ok(false);
+        }
         let Some(session) = SessionRepository::refresh_auto_title(&conn, session_id, title)? else {
             return Ok(false);
         };
@@ -9175,6 +9186,20 @@ mod tests {
         assert_eq!(
             updates.try_recv().unwrap().title,
             "Plan release work".to_string()
+        );
+        // Several providers echo the generic `<agent> session` they were handed
+        // at `session/new` back as their session name. Applying it would replace
+        // the title the reader's first message seeded, and the row would then
+        // alternate between the two as snapshots arrived.
+        assert!(
+            !manager
+                .apply_auto_session_title(&session.id, "opencode session")
+                .unwrap()
+        );
+        assert!(updates.try_recv().is_err());
+        assert_eq!(
+            manager.get_session(&session.id).await.unwrap().title,
+            "Plan release work"
         );
         assert!(
             !manager
