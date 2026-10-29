@@ -38743,9 +38743,12 @@ fn upsert_shared_provider(
 /// Groups shared Provider Profiles by identity and resolves the Agents that
 /// bind each one.
 ///
-/// A Profile appears once regardless of how many bindings reference it, which
-/// is the property the Agent-scoped list lacked: it filtered by `agent_id`, so
-/// one upstream showed up once per Agent.
+/// Applies the bind/unbind rows that are still waiting for a snapshot.
+///
+/// The page paints the pill the click targets before the write returns. A real
+/// binding always wins on the next snapshot, and the pending sets are pruned
+/// there; until then this is the only thing that makes the two outside layers
+/// agree.
 fn apply_pending_provider_bindings(
     rows: &mut [SharedProviderRow],
     pending_binds: &BTreeMap<(String, String), vibex_core::ProviderProfileId>,
@@ -38769,6 +38772,9 @@ fn apply_pending_provider_bindings(
     }
 }
 
+/// A Profile appears once regardless of how many bindings reference it, which
+/// is the property the Agent-scoped list lacked: it filtered by `agent_id`, so
+/// one upstream showed up once per Agent.
 fn shared_provider_rows(
     profiles: &[vibex_core::ModelProviderProfile],
     bindings: &[vibex_core::AgentModelProviderBinding],
