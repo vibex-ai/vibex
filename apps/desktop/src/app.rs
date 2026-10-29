@@ -77598,6 +77598,14 @@ enum ConnectionsProbeState {
 }
 
 #[derive(Debug, Clone)]
+struct SshLogView {
+    profile_id: String,
+    text: String,
+    error: Option<String>,
+    loading: bool,
+}
+
+#[derive(Debug, Clone)]
 struct ConnectionDisplayRow {
     id: String,
     name: String,
@@ -79961,6 +79969,8 @@ struct FoundationSettings {
     connections_selected_host: Option<String>,
     connections_probe_state: ConnectionsProbeState,
     connections_probe_task: Option<Task<()>>,
+    connections_log_view: Option<SshLogView>,
+    connections_log_task: Option<Task<()>>,
     active_section: SettingsSection,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
@@ -80422,6 +80432,8 @@ impl FoundationSettings {
                 connections_selected_host: None,
                 connections_probe_state: ConnectionsProbeState::Idle,
                 connections_probe_task: None,
+                connections_log_view: None,
+                connections_log_task: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
@@ -84174,6 +84186,103 @@ impl FoundationSettings {
             .collect()
     }
 
+    fn request_ssh_log(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if self
+            .connections_log_view
+            .as_ref()
+            .is_some_and(|view| view.profile_id == profile_id && view.loading)
+        {
+            return;
+        }
+        let Some(home_dir) = self.home_dir.clone() else {
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let program = profile
+            .ssh_client_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ssh"));
+        let destination = SshDestination {
+            host: profile.host.clone(),
+            user: profile.user.clone(),
+            port: profile.port,
+        };
+        let command = match SshCommand::for_destination(
+            program,
+            &destination,
+            profile.ssh_config_path.as_deref(),
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                self.connections_log_view = Some(SshLogView {
+                    profile_id,
+                    text: String::new(),
+                    error: Some(format!("{}: {}", error.code, error.message)),
+                    loading: false,
+                });
+                cx.notify();
+                return;
+            }
+        };
+        let log_path = format!(
+            "{}/.local/state/vibex/server/server.log",
+            profile.remote_home
+        );
+        self.connections_log_view = Some(SshLogView {
+            profile_id: profile.id.clone(),
+            text: String::new(),
+            error: None,
+            loading: true,
+        });
+        let profile_id = profile.id;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let mut read = command;
+            read.remote_script("tail -n 200 \"$1\" 2>&1")
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            read.args.push(log_path.into());
+            let output = read
+                .run_with_timeout(Duration::from_secs(20))
+                .map_err(|error| format!("{}: {}", error.code(), error.message))?;
+            Ok::<String, String>(output.stdout_lossy())
+        });
+        self.connections_log_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    let Some(view) = this.connections_log_view.as_mut() else {
+                        return;
+                    };
+                    if view.profile_id != profile_id {
+                        return;
+                    }
+                    view.loading = false;
+                    match result {
+                        Ok(Ok(text)) => {
+                            view.text = text;
+                            view.error = None;
+                        }
+                        Ok(Err(error)) => {
+                            view.error = Some(error);
+                        }
+                        Err(_) => {
+                            view.error = Some("the log request stopped unexpectedly".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
     fn connections_progress_panel(
         &self,
         snapshot: Option<&ProvisioningSnapshot>,
@@ -84209,6 +84318,9 @@ impl FoundationSettings {
                 .iter()
                 .find(|profile| profile.id == snapshot.profile_id)
         });
+        let log_profile_id = profile
+            .map(|profile| profile.id.clone())
+            .or_else(|| snapshot.map(|snapshot| snapshot.profile_id.clone()));
         let host_alias = profile
             .map(|profile| {
                 if profile.ssh_alias.is_empty() {
@@ -84442,6 +84554,21 @@ impl FoundationSettings {
                                             ));
                                         })),
                                 )
+                                .when_some(log_profile_id.clone(), |this, profile_id| {
+                                    this.child(
+                                        Button::new("connections-diagnostic-view-log")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text(
+                                                "View log",
+                                                "查看日志",
+                                                "檢視日誌",
+                                            ))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.request_ssh_log(profile_id.clone(), cx)
+                                            })),
+                                    )
+                                })
                                 .when_some(log_command, |this, command| {
                                     this.child(
                                         Button::new("connections-diagnostic-log-command")
@@ -84462,6 +84589,91 @@ impl FoundationSettings {
                         ),
                 )
             })
+            .when_some(
+                self.connections_log_view
+                    .clone()
+                    .filter(|view| log_profile_id.as_deref() == Some(view.profile_id.as_str())),
+                |this, view| {
+                    let text = if let Some(error) = &view.error {
+                        format!("{}
+{error}", locale::text("Log unavailable", "无法读取日志", "無法讀取日誌"))
+                    } else if view.loading {
+                        locale::text("Loading log…", "正在读取日志…", "正在讀取日誌…").to_string()
+                    } else {
+                        view.text.clone()
+                    };
+                    let copy_text = text.clone();
+                    this.child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .p_2()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_medium()
+                                            .child(locale::text(
+                                                "Server log",
+                                                "服务器日志",
+                                                "伺服器日誌",
+                                            )),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("connections-log-copy")
+                                                    .small()
+                                                    .ghost()
+                                                    .label(locale::text(
+                                                        "Copy log",
+                                                        "复制日志",
+                                                        "複製日誌",
+                                                    ))
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                copy_text.clone(),
+                                                            ),
+                                                        );
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("connections-log-close")
+                                                    .small()
+                                                    .ghost()
+                                                    .label(locale::text(
+                                                        "Close",
+                                                        "关闭",
+                                                        "關閉",
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.connections_log_view = None;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_h(px(220.0))
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(muted)
+                                    .child(text),
+                            ),
+                    )
+                },
+            )
             .when(!actions.is_empty(), |this| {
                 this.child(h_flex().w_full().justify_end().gap_2().children(actions))
             })
@@ -108512,6 +108724,8 @@ mod tests {
         assert!(source.contains("runtime-macos-lifecycle-agent"));
         assert!(source.contains("connections-diagnostic-copy"));
         assert!(source.contains("connections-diagnostic-log-command"));
+        assert!(source.contains("connections-diagnostic-view-log"));
+        assert!(source.contains("fn request_ssh_log("));
         assert!(source.contains("connection_diagnostic_title"));
         assert!(source.contains("remote_os"));
         assert!(source.contains("diagnose_with_platform"));
