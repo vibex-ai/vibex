@@ -59,6 +59,14 @@ const FOUNDRY: [Pillar; 4] = pillars(
     9.0,
 );
 const TERRACE: [Pillar; 2] = pillars([(47.0, 58.0), (129.0, 58.0)], 3.0, 7.0);
+/// Where ZCode's slab stands, on a dais at the north of its hall.
+pub(super) const GATE: Vec2 = Vec2::new(88.0, 29.0);
+pub(super) const GATE_RADIUS: f32 = 10.0;
+/// The two floor switches ZCode's fists must both hold down.
+pub(super) const SWITCHES: [Vec2; 2] = [Vec2::new(36.0, 76.0), Vec2::new(140.0, 76.0)];
+pub(super) const SWITCH_RADIUS: f32 = 7.0;
+/// ZCode's hall: two columns that stop the sweep.
+const GATE_HALL: [Pillar; 2] = pillars([(62.0, 60.0), (114.0, 60.0)], 3.2, 12.0);
 /// The four pads Cline glides between, clockwise from the north.
 pub(super) const STATIONS: [Vec2; 4] = [
     Vec2::new(88.0, 28.0),
@@ -142,6 +150,7 @@ impl Map {
             Guardian::Cursor => &GRID,
             Guardian::Cline => &RACKS,
             Guardian::Grok => &OBSERVATORY_RIM,
+            Guardian::ZCode => &GATE_HALL,
         }
     }
 
@@ -169,6 +178,7 @@ impl Map {
                 x < 67.0 - margin && y < 49.0 - margin && !(x > 44.0 - margin && y > 35.0 - margin)
             }
             Guardian::Cline => x < 71.0 - margin && y < 46.0 - margin,
+            Guardian::ZCode => x < 72.0 - margin && y < 47.0 - margin,
             // A round floor, wider than it is deep.
             Guardian::Grok => (x / (74.0 - margin)).powi(2) + (y / (48.0 - margin)).powi(2) < 1.0,
             // A square-cornered hall with its corners cut back on the grid.
@@ -212,6 +222,7 @@ impl Map {
             && match self.guardian {
                 Guardian::Pi => p.minus(THRONE).length() > radius + DAIS_RADIUS,
                 Guardian::Codex => p.minus(BRAZIER).length() > radius + BOWL_RADIUS,
+                Guardian::ZCode => p.minus(GATE).length() > radius + GATE_RADIUS,
                 _ => true,
             }
     }

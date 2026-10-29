@@ -24,6 +24,7 @@ impl Arena {
             Guardian::Cursor => self.tick_cursor(),
             Guardian::Cline => self.tick_cline(),
             Guardian::Grok => self.tick_grok(),
+            Guardian::ZCode => self.tick_zcode(),
         }
         self.boss.update_core();
     }
@@ -108,3 +109,5 @@ pub(super) mod grok;
 mod opencode;
 #[path = "encounter_pi.rs"]
 mod pi;
+#[path = "encounter_zcode.rs"]
+pub(super) mod zcode;

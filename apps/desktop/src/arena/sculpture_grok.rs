@@ -110,14 +110,6 @@ fn slash(mesh: &mut Mesh, center: Point3, angle: f32) {
         );
     }
 }
-/// `quad` wound so the drawing faces it along `normal`.
-fn facing(mut quad: [Point3; 4], normal: Point3) -> [Point3; 4] {
-    let n = quad[2].sub(quad[0]).cross(quad[3].sub(quad[1]));
-    if n.dot(normal) < 0.0 {
-        quad.reverse();
-    }
-    quad
-}
 
 /// The hurled blade, drawn where it flies or lies, turning as it goes.
 pub(in crate::arena) fn blade(frame: &mut Raster, boss: &Boss) {

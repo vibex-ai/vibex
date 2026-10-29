@@ -82,6 +82,15 @@ struct Face {
     ramp: [u8; 5],
 }
 
+/// `quad` wound so the drawing faces it along `normal`.
+fn facing(mut quad: [Point3; 4], normal: Point3) -> [Point3; 4] {
+    let n = quad[2].sub(quad[0]).cross(quad[3].sub(quad[1]));
+    if n.dot(normal) < 0.0 {
+        quad.reverse();
+    }
+    quad
+}
+
 struct Mesh {
     faces: Vec<Face>,
 }
@@ -318,6 +327,32 @@ impl Mesh {
             );
         }
     }
+    /// A flat outline in the (x, z) plane about `center`, extruded `depth`
+    /// along y: the logo's parallelograms, given body.
+    fn prism(&mut self, outline: [(f32, f32); 4], center: Point3, depth: f32, ramp: [u8; 5]) {
+        let at = |(x, z): (f32, f32), y: f32| center.add(p3(x, y, z));
+        let half = depth * 0.5;
+        let front = outline.map(|p| at(p, half));
+        let back = outline.map(|p| at(p, -half));
+        self.quad(facing(front, p3(0.0, 1.0, 0.0)), ramp);
+        self.quad(facing(back, p3(0.0, -1.0, 0.0)), ramp);
+        let middle = outline
+            .iter()
+            .fold((0.0, 0.0), |(x, z), p| (x + p.0 * 0.25, z + p.1 * 0.25));
+        for ix in 0..4 {
+            let next = (ix + 1) % 4;
+            let (a, b) = (outline[ix], outline[next]);
+            let out = p3(
+                (a.0 + b.0) * 0.5 - middle.0,
+                0.0,
+                (a.1 + b.1) * 0.5 - middle.1,
+            );
+            self.quad(
+                facing([front[ix], front[next], back[next], back[ix]], out),
+                ramp,
+            );
+        }
+    }
     fn beam(&mut self, a: Point3, b: Point3, radius: f32, ramp: [u8; 5]) {
         self.tube(&[a, b], &[radius, radius], 1.0, ramp);
     }
@@ -448,6 +483,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Cursor => cursor::cursor(&mut mesh, boss, time, fall),
         Guardian::Cline => cline::cline(&mut mesh, boss, time, fall),
         Guardian::Grok => grok::grok(&mut mesh, boss, fall),
+        Guardian::ZCode => zcode::zcode(&mut mesh, boss, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -1058,6 +1094,9 @@ mod cursor;
 #[path = "sculpture_grok.rs"]
 mod grok;
 pub(super) use grok::blade;
+#[path = "sculpture_zcode.rs"]
+mod zcode;
+pub(super) use zcode::zbar;
 
 #[cfg(test)]
 #[path = "sculpture_tests.rs"]

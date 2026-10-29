@@ -40,6 +40,7 @@ enum Actor {
     Body,
     Stem(usize),
     Blade,
+    Bar(usize),
     Shard(usize),
     Block(usize),
     Brazier,
@@ -54,6 +55,11 @@ fn guardian_parts(boss: &Boss) -> Vec<(f32, Actor)> {
         Guardian::Pi => {
             for (ix, position) in boss.hands.iter().enumerate() {
                 parts.push((position.y, Actor::Stem(ix)));
+            }
+        }
+        Guardian::ZCode => {
+            for (ix, position) in boss.hands.iter().enumerate() {
+                parts.push((position.y, Actor::Bar(ix)));
             }
         }
         Guardian::Grok if boss.detached => {
@@ -76,6 +82,7 @@ fn draw_part(frame: &mut Raster, boss: &Boss, part: Actor, time: f32, fallen: f3
         Actor::Body => guardian(frame, boss, time, fallen, reduced),
         Actor::Stem(ix) if fallen < 2.1 => sculpture::stem(frame, boss, ix, fallen),
         Actor::Blade => sculpture::blade(frame, boss),
+        Actor::Bar(ix) => sculpture::zbar(frame, boss, ix, fallen),
         Actor::Shard(ix) => sculpture::shard(frame, &boss.shards[ix], time),
         _ => {}
     }
@@ -96,6 +103,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::Cursor => 38,
             Guardian::Cline => 32,
             Guardian::Grok => 30,
+            Guardian::ZCode => 44,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
         frame.ellipse(
@@ -103,6 +111,13 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             ((width - shrink).max(5), (10 - shrink / 4).max(2)),
             SHADOW,
         );
+    }
+    if boss.guardian == Guardian::ZCode {
+        for ix in 0..2 {
+            let p = pixel(boss.hands[ix]);
+            let r = (16.0 - boss.hand_heights[ix] * 0.3).max(6.0) as i32;
+            frame.ellipse((p.0 + 2, p.1 + 2), (r, (r / 3).max(2)), SHADOW);
+        }
     }
     if boss.guardian == Guardian::Grok && boss.detached {
         let p = pixel(boss.hands[0]);
@@ -203,7 +218,8 @@ fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
         | Guardian::Copilot
         | Guardian::Cursor
         | Guardian::Cline
-        | Guardian::Grok => {
+        | Guardian::Grok
+        | Guardian::ZCode => {
             frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
             frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
             gleam(frame, (x, y), 4, WHITE);
@@ -240,6 +256,7 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = 
     (-43, -85, 42, 21),
     (-49, -122, 48, -5),
     (-54, -100, 53, 15),
+    (-92, -161, 91, 7),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -249,7 +266,7 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
 pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] =
-    [65, 96, 110, 85, 106, 82, 92, 95, 79];
+    [65, 96, 110, 85, 106, 82, 92, 95, 79, 117];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]
 }

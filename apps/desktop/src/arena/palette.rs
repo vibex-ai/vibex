@@ -25,6 +25,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Cline => [0x262b36, 0x4f5767, 0x8f98a8, 0xc9d0db, 0xf2f4f8],
         // The white ring and slash of the logo on dark.
         Guardian::Grok => [0x34363d, 0x6a6e78, 0xa9adb6, 0xdcdee3, 0xffffff],
+        // Dark slate stone with the logo's crisp edges catching the light.
+        Guardian::ZCode => [0x10141c, 0x1f2633, 0x343d4f, 0x55627a, 0x8d9ab3],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -60,6 +62,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Grok => [
             0x020306, 0x0d0f18, 0x121522, 0x1a1e30, 0x08090f, 0x232840, 0x3a4163,
         ],
+        // A sandstone gate hall, warm against the cold slab.
+        Guardian::ZCode => [
+            0x2a1f17, 0x8a7356, 0xa68c69, 0xbfa57f, 0x6e5a42, 0x5c4a36, 0xd4bd96,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -88,6 +94,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Cline => [0xa1461c, 0xff8a3d, 0xffe2c4],
         // The core in the back of the ring burns red.
         Guardian::Grok => [0x8a1022, 0xff3a52, 0xffc6cd],
+        // The core behind the shutter, and the sweep, burn electric violet.
+        Guardian::ZCode => [0x4b1fa0, 0x9d6bff, 0xe6dcff],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();

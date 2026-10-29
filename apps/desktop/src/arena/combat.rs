@@ -238,6 +238,8 @@ impl Arena {
         let mut seed = seed.max(1);
         let intro_target = if boss.guardian == Guardian::Pi {
             super::map::THRONE
+        } else if boss.guardian == Guardian::ZCode {
+            super::map::GATE
         } else if map.is_clear(boss.position, boss.radius() + 1.0) {
             boss.position
         } else {
@@ -413,9 +415,15 @@ impl Arena {
             self.boss.unravel = self.intro.unravel * (1.0 - transition);
         }
         self.boss.stride += STEP * 2.0;
+        let hover = if self.boss.guardian == Guardian::ZCode {
+            super::guardian::ZCODE_HOVER
+        } else {
+            0.0
+        };
         for ix in 0..2 {
             self.boss.hands[ix] = self.intro.hands[ix].lerp(self.boss.resting_hand(ix), transition);
-            self.boss.hand_heights[ix] = self.intro.hand_heights[ix] * (1.0 - transition);
+            self.boss.hand_heights[ix] =
+                self.intro.hand_heights[ix] + (hover - self.intro.hand_heights[ix]) * transition;
         }
         self.boss.update_core();
         self.boss.previous_core = self.boss.core;
@@ -557,6 +565,7 @@ impl Arena {
         boss.shield = 0.0;
         boss.dashes = 0;
         boss.detached = false;
+        boss.pinned = [false; 2];
         boss.flash = 0.0;
         boss.generation = 0;
         boss.shards = [Shard::default(); 4];
@@ -660,6 +669,8 @@ impl Arena {
             Guardian::Pi | Guardian::DeepSeek => true,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
+            // The bared core looks down the hall.
+            Guardian::ZCode => from.y > self.boss.core.y - 1.0,
             // The core in the back of the ring, open while it spins and reels.
             Guardian::Grok => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
             // The whole back is open, but the head always turns to the archer.
@@ -795,6 +806,15 @@ impl Arena {
                     let rise = boss.hand_heights[ix] + length * (part as f32 + 0.5) / 3.0;
                     let point = boss.hands[ix].plus(Vec2::new(0.0, -rise));
                     consider(circle_hit(point, from, to, width * 0.5), Contact::Armor);
+                }
+            }
+        }
+        if !returning && boss.guardian == Guardian::ZCode {
+            // A fist near the floor is stone in the arrow's path.
+            for ix in 0..2 {
+                if boss.hand_heights[ix] < 8.0 {
+                    let point = boss.hands[ix].plus(Vec2::new(0.0, -boss.hand_heights[ix]));
+                    consider(circle_hit(point, from, to, 3.5), Contact::Armor);
                 }
             }
         }

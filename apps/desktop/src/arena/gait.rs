@@ -101,6 +101,7 @@ fn itinerary(guardian: Guardian) -> &'static [Leg] {
         Guardian::Cursor => &cursor::LEGS,
         Guardian::Cline => &cline::LEGS,
         Guardian::Grok => &grok::LEGS,
+        Guardian::ZCode => &zcode::LEGS,
     }
 }
 /// How long one guardian takes to walk its whole itinerary once.
@@ -456,9 +457,10 @@ impl Boss {
             Guardian::Cursor => cursor::lane(&mut boss, legs, moment),
             Guardian::Cline => cline::lane(&mut boss, moment, phase),
             Guardian::Grok => grok::lane(&mut boss, legs, moment, phase),
+            Guardian::ZCode => zcode::lane(&mut boss, moment),
         };
         boss.position = lane_point(place);
-        if guardian != Guardian::Pi {
+        if !matches!(guardian, Guardian::Pi | Guardian::ZCode) {
             boss.rest_hands();
         }
         settled(boss)
@@ -513,6 +515,7 @@ pub(super) fn entrance(guardian: Guardian) -> f32 {
         Guardian::Cursor => cursor::ENTRANCE,
         Guardian::Cline => cline::ENTRANCE,
         Guardian::Grok => grok::ENTRANCE,
+        Guardian::ZCode => zcode::ENTRANCE,
     }
 }
 /// How long a guardian takes to leave its lane when the turn ends.
@@ -527,6 +530,7 @@ pub(super) fn exit(guardian: Guardian) -> f32 {
         Guardian::Cursor => cursor::EXIT,
         Guardian::Cline => cline::EXIT,
         Guardian::Grok => grok::EXIT,
+        Guardian::ZCode => zcode::EXIT,
     }
 }
 
@@ -613,6 +617,7 @@ pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
         Guardian::Cursor => cursor::entering(&mut shot, a),
         Guardian::Cline => cline::entering(&mut shot, a),
         Guardian::Grok => grok::entering(&mut shot, a),
+        Guardian::ZCode => zcode::entering(&mut shot, a),
     }
     shot.boss = settled(shot.boss);
     shot
@@ -696,6 +701,7 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
         Guardian::Cursor => cursor::leaving(boss, a),
         Guardian::Cline => cline::leaving(boss, a),
         Guardian::Grok => grok::leaving(boss, a, side),
+        Guardian::ZCode => zcode::leaving(boss, a),
     };
     // A turn that ends mid-entrance leaves from where the entrance had got to;
     // that offset hands over to the exit's own as it goes.
@@ -713,3 +719,5 @@ mod cline;
 mod cursor;
 #[path = "gait_grok.rs"]
 mod grok;
+#[path = "gait_zcode.rs"]
+mod zcode;

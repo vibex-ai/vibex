@@ -7,7 +7,7 @@ use crate::arena::{
         Arena, Attack, BossState, EffectKind, Guardian, HazardKind, Phase, ProjectileKind, Vec2,
         WaveKind, smoothstep,
     },
-    map::{CENTER, ISLANDS, PLATE_RADIUS, PLATES},
+    map::{CENTER, ISLANDS, PLATE_RADIUS, PLATES, SWITCH_RADIUS, SWITCHES},
     raster::{Raster, hash, ink::*},
 };
 use std::f32::consts::{PI, TAU};
@@ -67,6 +67,9 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
     }
     if arena.boss.guardian == Guardian::Codex {
         plates(frame, arena, reduced);
+    }
+    if arena.boss.guardian == Guardian::ZCode {
+        switches(frame, arena);
     }
     for h in &arena.hazards {
         let c = pixel(h.position);
@@ -214,6 +217,23 @@ fn plates(frame: &mut Raster, arena: &Arena, reduced: bool) {
     }
 }
 
+/// ZCode's two floor switches, lit while a fist holds each down.
+fn switches(frame: &mut Raster, arena: &Arena) {
+    let boss = &arena.boss;
+    for switch in SWITCHES {
+        let held = (0..2).any(|ix| boss.pinned[ix] && boss.hands[ix].minus(switch).length() < 1.0);
+        let c = pixel(switch);
+        let r = (SWITCH_RADIUS * SCALE) as i32;
+        frame.ring(c, (r, r), if held { CORE_LIGHT } else { WALL }, false);
+        frame.ring(c, (r - 4, r - 4), if held { CORE } else { SEAM }, false);
+        // A Z on every switch.
+        let color = if held { CORE_LIGHT } else { WALL };
+        frame.line((c.0 - 8, c.1 - 7), (c.0 + 8, c.1 - 7), color);
+        frame.line((c.0 + 8, c.1 - 7), (c.0 - 8, c.1 + 7), color);
+        frame.line((c.0 - 8, c.1 + 7), (c.0 + 8, c.1 + 7), color);
+    }
+}
+
 fn telegraph(frame: &mut Raster, arena: &Arena) {
     let boss = &arena.boss;
     for shard in boss.shards.iter().filter(|s| s.alive && s.airborne) {
@@ -242,7 +262,7 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             };
             landing(frame, c, r, color, closing);
         }
-        (Guardian::Pi, Attack::LeftFist | Attack::RightFist) if aerial => {
+        (Guardian::Pi | Guardian::ZCode, Attack::LeftFist | Attack::RightFist) if aerial => {
             landing(frame, c, r, color, progress);
             frame.line((c.0 - 4, c.1), (c.0 + 4, c.1), color);
             frame.line((c.0, c.1 - 4), (c.0, c.1 + 4), color);
@@ -319,6 +339,20 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             }
             let r = (crate::arena::combat::GROK_BLADE_RADIUS * SCALE) as i32 + 4;
             landing(frame, c, r, color, progress);
+        }
+        (Guardian::ZCode, Attack::Sweep) if boss.state == BossState::Windup => {
+            // The half circle the eye will sweep, west to east through the
+            // south, drawn ahead of it as rays that grow as it charges.
+            let eye = arena.zcode_eye();
+            for n in 0..=8 {
+                let a = PI - PI * n as f32 / 8.0;
+                let ray = Vec2::from_angle(a);
+                frame.line(
+                    pixel(eye.plus(ray.scale(10.0))),
+                    pixel(eye.plus(ray.scale(12.0 + progress * 14.0))),
+                    if n == 0 { WARN } else { color },
+                );
+            }
         }
         (Guardian::Grok, Attack::Pull) => {
             route(frame, boss.position, boss.target, boss.radius(), WARN);

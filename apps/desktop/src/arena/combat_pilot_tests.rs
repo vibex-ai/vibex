@@ -1,5 +1,5 @@
 use super::*;
-use crate::arena::map::{ISLANDS, PLATES, THRONE};
+use crate::arena::map::{GATE, ISLANDS, PLATES, SWITCHES, THRONE};
 
 /// What the pilot wants this frame, read from visible state only.
 struct Plan {
@@ -265,6 +265,52 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::ZCode => {
+            let sweeping = boss.attack == Attack::Sweep
+                && matches!(boss.state, BossState::Windup | BossState::Striking);
+            if boss.exposed > 0.0 {
+                // Just off the line it fires down when it closes again.
+                plan.goal = Vec2::new(GATE.x + 14.0, 70.0);
+                if boss.exposed > arrival(boss.core) + 0.03 && player.y > boss.core.y + 2.0 {
+                    plan.target = Some(boss.core);
+                }
+            } else if sweeping {
+                // In a column's shadow from the eye.
+                let eye = arena.zcode_eye();
+                plan.goal = arena
+                    .map
+                    .pillars()
+                    .iter()
+                    .enumerate()
+                    .filter(|(ix, _)| arena.map.intact(*ix))
+                    .map(|(_, p)| {
+                        p.position
+                            .plus(p.position.minus(eye).normalized().scale(5.5))
+                    })
+                    .min_by(|a, b| {
+                        a.minus(player)
+                            .length()
+                            .total_cmp(&b.minus(player).length())
+                    })
+                    .unwrap_or(player);
+                plan.sprint = true;
+            } else {
+                // Stand on a switch nobody holds, so the next fist lands there.
+                let held = |switch: Vec2| {
+                    (0..2).any(|ix| boss.pinned[ix] && boss.hands[ix].minus(switch).length() < 1.0)
+                };
+                plan.goal = SWITCHES
+                    .into_iter()
+                    .filter(|s| !held(*s))
+                    .min_by(|a, b| {
+                        a.minus(player)
+                            .length()
+                            .total_cmp(&b.minus(player).length())
+                    })
+                    .unwrap_or(player);
+                plan.sprint = true;
+            }
+        }
         Guardian::Grok => {
             let frenzy = boss.attack == Attack::Frenzy && boss.state == BossState::Striking;
             if frenzy || boss.state == BossState::Recovery {
@@ -380,7 +426,7 @@ fn strike(arena: &Arena) -> Option<(Vec2, f32)> {
         (Guardian::Codex | Guardian::OpenCode, Attack::Leap) if aerial => {
             Some((boss.target, radius))
         }
-        (Guardian::Pi, Attack::LeftFist | Attack::RightFist) if aerial => {
+        (Guardian::Pi | Guardian::ZCode, Attack::LeftFist | Attack::RightFist) if aerial => {
             Some((boss.target, radius))
         }
         (Guardian::OpenCode, Attack::Bite) if aerial => {
@@ -496,6 +542,18 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
         let gap = distance - wave.radius;
         if distance < wave.maximum + PLAYER_RADIUS + 0.6 && gap > -1.6 && gap < 4.0 {
             score += 6.0;
+        }
+    }
+    if boss.guardian == Guardian::ZCode
+        && boss.attack == Attack::Sweep
+        && boss.state == BossState::Striking
+    {
+        // Ground the sweep is about to cross, unless a column shades it.
+        let eye = arena.zcode_eye();
+        let now = PI - PI * boss.progress();
+        let at = q.minus(eye).angle();
+        if (now - 0.4..=now).contains(&at) && !arena.map.cover_hit(eye, q) {
+            score += 8.0;
         }
     }
     if boss.guardian == Guardian::Grok && boss.detached && boss.state == BossState::Striking {
@@ -644,4 +702,8 @@ fn the_robot_head_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_slashed_ring_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Grok);
+}
+#[test]
+fn the_gate_slab_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::ZCode);
 }

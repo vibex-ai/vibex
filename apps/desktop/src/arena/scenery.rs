@@ -6,8 +6,8 @@ use super::{
     geometry::Vec2,
     guardian::Guardian,
     map::{
-        BLOCK_RADIUS, BRAZIER, CENTER, ISLANDS, Map, PLATES, Pillar, REACH, STATIONS, ScarKind,
-        THRONE,
+        BLOCK_RADIUS, BRAZIER, CENTER, GATE, GATE_RADIUS, ISLANDS, Map, PLATES, Pillar, REACH,
+        STATIONS, ScarKind, THRONE,
     },
     raster::{Raster, hash, ink::*},
 };
@@ -96,6 +96,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::Cursor => grid_hall(&mut frame),
         Guardian::Cline => server_room(&mut frame),
         Guardian::Grok => observatory_floor(&mut frame),
+        Guardian::ZCode => gate_hall(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -142,6 +143,47 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// ZCode's gate hall: broad sandstone flags, a stepped dais at the north
+/// where the slab stands, and a Z cut into the floor down the middle.
+fn gate_hall(frame: &mut Raster) {
+    tiles(frame, 48, 30, true);
+    let gate = pixel(GATE);
+    for (grow, color) in [(14, WALL), (8, WALL_LIGHT), (0, FLOOR_LIGHT)] {
+        frame.ellipse(
+            gate,
+            (
+                GATE_RADIUS as i32 * 4 + grow,
+                (GATE_RADIUS * 2.6) as i32 + grow / 2,
+            ),
+            color,
+        );
+    }
+    frame.ring(
+        gate,
+        (GATE_RADIUS as i32 * 4 - 4, (GATE_RADIUS * 2.6) as i32 - 3),
+        SEAM,
+        false,
+    );
+    let c = pixel(CENTER.plus(Vec2::new(0.0, 14.0)));
+    let (w, h) = (70, 40);
+    for offset in -1..=1 {
+        frame.line(
+            (c.0 - w, c.1 - h + offset),
+            (c.0 + w, c.1 - h + offset),
+            SEAM,
+        );
+        frame.line(
+            (c.0 + w + offset, c.1 - h),
+            (c.0 - w + offset, c.1 + h),
+            SEAM,
+        );
+        frame.line(
+            (c.0 - w, c.1 + h + offset),
+            (c.0 + w, c.1 + h + offset),
+            SEAM,
+        );
+    }
+}
 /// Grok's observatory: polished black stone strewn with stars, orbits
 /// engraved round the middle, and one long slash cut across it from lower
 /// left to upper right.
@@ -158,7 +200,7 @@ fn observatory_floor(frame: &mut Raster) {
             _ => FLOOR_LIGHT,
         };
         frame.put(x, y, color);
-        if h % 23 == 0 {
+        if h.is_multiple_of(23) {
             frame.put(x + 1, y, color);
             frame.put(x, y + 1, color);
         }
@@ -737,6 +779,16 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                     frame.line((x, y - 2), (x, y + 2), WALL_LIGHT);
                     frame.put(x, y, WHITE);
                 }
+            }
+        }
+        Guardian::ZCode => {
+            // Sand drifts down the hall in the light from the gate.
+            for n in 0..10 {
+                let h = hash(n, 61);
+                let t = (time * 0.07 + n as f32 * 0.1).fract();
+                let x = (h % 600) as i32 + 50 + (t * 20.0) as i32;
+                let y = (t * 420.0) as i32 + 10;
+                frame.rect(x, y, 2, 1, WALL_LIGHT);
             }
         }
         Guardian::OpenCode => {}

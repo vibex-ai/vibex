@@ -16,6 +16,7 @@ mod raster;
 mod scene;
 mod scenery;
 mod sculpture;
+mod zed;
 
 pub(crate) use companion::{Companion, lane_with_best as companion_lane, session_surface};
 

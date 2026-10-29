@@ -17,10 +17,11 @@ pub(super) enum Guardian {
     Cursor,
     Cline,
     Grok,
+    ZCode,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -30,6 +31,7 @@ impl Guardian {
         Self::Cursor,
         Self::Cline,
         Self::Grok,
+        Self::ZCode,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -42,6 +44,7 @@ impl Guardian {
             Self::Cursor => "Cursor",
             Self::Cline => "Cline",
             Self::Grok => "Grok",
+            Self::ZCode => "ZCode",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -55,6 +58,7 @@ impl Guardian {
             "cursor" | "cursor-agent" => Some(Self::Cursor),
             "cline" => Some(Self::Cline),
             "grok" | "grok-cli" => Some(Self::Grok),
+            "zcode" => Some(Self::ZCode),
             _ => None,
         }
     }
@@ -74,6 +78,7 @@ impl Guardian {
             Self::Cursor => "cursor",
             Self::Cline => "cline",
             Self::Grok => "grok",
+            Self::ZCode => "zcode",
         }
     }
 }
@@ -123,6 +128,10 @@ pub(super) enum Attack {
     Turn,
     /// Spinning with the blade whirled out round it.
     Frenzy,
+    /// A laser swept through a half circle from the slab's eye.
+    Sweep,
+    /// The shutter sliding open over the core.
+    Open,
 }
 
 /// Visual and collision scale of the spark after each split.
@@ -132,6 +141,12 @@ pub(super) const IDLE_LOOP: f32 = 36.0;
 pub(super) const CLINE_HEAD: f32 = 11.0;
 /// The middle of Grok's ring above its ground anchor.
 pub(super) const GROK_RING: f32 = 10.0;
+/// The middle of ZCode's slab, where the core sits behind its shutter.
+pub(super) const ZCODE_CORE: f32 = 14.0;
+/// How high ZCode's fists hover when they are not striking.
+pub(super) const ZCODE_HOVER: f32 = 9.0;
+/// Stamping steps ZCode marches round the home each loop.
+const ZCODE_STEPS: f32 = 30.0;
 
 /// Elevation of a spark's center; a landing squash lowers it.
 pub(super) fn spark_height(size: f32, squash: f32) -> f32 {
@@ -229,12 +244,16 @@ pub(super) struct Boss {
     pub facet: u8,
     /// Grok's blade is out of its ring, at `hands[0]`, `hand_heights[0]` up.
     pub detached: bool,
+    /// ZCode's fists that hold a floor switch down.
+    pub pinned: [bool; 2],
 }
 
 impl Boss {
     pub fn new(guardian: Guardian) -> Self {
         let position = if guardian == Guardian::Pi {
             THRONE
+        } else if guardian == Guardian::ZCode {
+            super::map::GATE
         } else {
             CENTER.plus(Vec2::new(0.0, -12.0))
         };
@@ -276,6 +295,7 @@ impl Boss {
             fired: 0,
             facet: super::cube::FRONT,
             detached: false,
+            pinned: [false; 2],
         };
         if guardian == Guardian::Cursor {
             // The cube stands corner-on, as the logo's hexagon.
@@ -303,6 +323,7 @@ impl Boss {
             Guardian::Cursor => 8.5,
             Guardian::Cline => 8.0,
             Guardian::Grok => 8.5,
+            Guardian::ZCode => 9.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -373,6 +394,7 @@ impl Boss {
             Guardian::Cursor => (0.0, 0.0, super::cube::HALF),
             Guardian::Cline => (0.0, 0.0, CLINE_HEAD),
             Guardian::Grok => (0.0, 0.0, GROK_RING),
+            Guardian::ZCode => (0.0, 0.0, ZCODE_CORE),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -395,6 +417,10 @@ impl Boss {
         self.local(dx + px, dy + py, dz + pz)
     }
     pub fn resting_hand(&self, ix: usize) -> Vec2 {
+        if self.guardian == Guardian::ZCode {
+            // The fists hover out to either side of the slab, a little ahead.
+            return self.ground(if ix == 0 { -17.0 } else { 17.0 }, 9.0);
+        }
         self.ground(if ix == 0 { -8.3 } else { 8.6 }, 0.0)
     }
     /// In front of the aperture, high enough for that stem to cover it.
@@ -403,7 +429,11 @@ impl Boss {
     }
     pub fn rest_hands(&mut self) {
         self.hands = [self.resting_hand(0), self.resting_hand(1)];
-        self.hand_heights = [0.0; 2];
+        self.hand_heights = if self.guardian == Guardian::ZCode {
+            [ZCODE_HOVER; 2]
+        } else {
+            [0.0; 2]
+        };
     }
     pub fn body_center(&self) -> Vec2 {
         let squash = self.squash_scale();
@@ -417,6 +447,7 @@ impl Boss {
             Guardian::Cursor => self.local(0.0, 0.0, super::cube::HALF),
             Guardian::Cline => self.articulated(0.0, 0.0, CLINE_HEAD),
             Guardian::Grok => self.articulated(0.0, 0.0, GROK_RING),
+            Guardian::ZCode => self.local(0.0, 0.0, ZCODE_CORE),
         }
     }
     pub fn update_core(&mut self) {
@@ -440,6 +471,8 @@ impl Boss {
             Guardian::Cline => self.articulated(0.0, -8.6, CLINE_HEAD),
             // The red core set in the back of the ring.
             Guardian::Grok => self.articulated(0.0, -2.4, GROK_RING),
+            // Behind the shutter in the middle of the slab's face.
+            Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -449,6 +482,7 @@ impl Boss {
             Guardian::Copilot => self.articulated(0.0, 6.0, 12.0),
             Guardian::Cline => self.articulated(0.0, 4.0, CLINE_HEAD),
             Guardian::Grok => self.articulated(4.0, 0.0, GROK_RING + 4.0),
+            Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
             _ => self.body_center(),
         }
     }
@@ -667,15 +701,41 @@ impl Boss {
                 boss.yaw = -heading.x * (0.25 + 0.3 * rush);
                 boss.bank = heading.x * 0.15 * rush;
             }
+            Guardian::ZCode => {
+                // The whole Z marches: each step rises, leans and stamps
+                // down, rocking side to side, the bars riding on its ends.
+                let (step, u) = beat(time, IDLE_LOOP / ZCODE_STEPS);
+                let s = (step + smoothstep(u)) * TAU / ZCODE_STEPS;
+                let (position, tangent) = route(guardian, s);
+                boss.position = position;
+                let rise = (u * PI).sin();
+                boss.height = rise * 3.0;
+                let side = if (step as usize).is_multiple_of(2) { 1.0 } else { -1.0 };
+                boss.bank = side * 0.1 * rise;
+                boss.pitch = -0.08 * rise;
+                boss.yaw = -tangent.normalized().x * 0.2;
+                boss.seat_bars(rise * 0.6);
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
-        if guardian != Guardian::Pi {
+        if !matches!(guardian, Guardian::Pi | Guardian::ZCode) {
             boss.rest_hands();
         }
         boss.update_core();
         boss.previous_core = boss.core;
         boss
+    }
+    /// Seats ZCode's bars on the ends of its slab, `spread` units out along
+    /// their own length, as the assembled Z of the logo.
+    pub fn seat_bars(&mut self, spread: f32) {
+        for ix in 0..2 {
+            let (ground, height) = super::zed::seated(self.position, self.yaw, self.height, ix);
+            let out = if ix == 0 { -spread } else { spread };
+            let (s, c) = self.yaw.sin_cos();
+            self.hands[ix] = ground.plus(Vec2::new(out * c, out * s * 0.62));
+            self.hand_heights[ix] = height;
+        }
     }
 }
 
@@ -764,6 +824,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::ZCode => (
+            s.sin() * 58.0,
+            -s.cos() * 30.0,
+            s.cos() * 58.0,
+            s.sin() * 30.0,
         ),
         Guardian::Grok => (
             s.sin() * 64.0,
