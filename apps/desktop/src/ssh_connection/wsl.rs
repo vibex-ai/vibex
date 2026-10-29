@@ -493,7 +493,14 @@ mod tests {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(localhost_forwarded(port));
-        drop(listener);
-        assert!(!localhost_forwarded(port));
+        // A socket that is bound but never listens keeps the port reserved,
+        // so a parallel test cannot start listening on it and the connect is
+        // refused deterministically.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved
+            .bind(std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let reserved_port = reserved.local_addr().unwrap().port();
+        assert!(!localhost_forwarded(reserved_port));
     }
 }
