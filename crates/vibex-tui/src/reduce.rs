@@ -5783,15 +5783,17 @@ impl App {
         Outcome::effects(vec![])
     }
 
-    /// Whether the page in front of the reader has a turn `Ctrl+C` can stop.
+    /// Whether the page in front of the reader is a session's own page with a
+    /// turn `Ctrl+C` can stop.
     ///
-    /// The composing page has no session of its own, so it never does: a turn
-    /// the session behind it is running belongs to that session's own page, and
-    /// a reader who is writing a new one is not asking to stop something the
-    /// page is not showing. Reading the session behind the page here is what
-    /// left the composing page unable to leave while that session was running.
+    /// Only the page that draws the transcript can stop the turn it shows. The
+    /// composing page has no session of its own, and the session list, settings
+    /// and every other page keep the session behind them selected only for
+    /// navigation: a reader pressing `Ctrl+C` there is not asking to stop
+    /// something the page is not showing. Reading the session behind those
+    /// pages is what left them unable to leave while a session was running.
     fn is_turn_running(&self) -> bool {
-        self.page_owns_session()
+        self.page_shows_transcript()
             && self.active_session().is_some_and(|session| {
                 matches!(
                     session.state,
@@ -10420,6 +10422,45 @@ mod tests {
         assert!(app.quit_armed(), "the page did not ask anything");
         app.perform(Intent::ContextualCancel);
         assert!(app.should_quit, "the second press did not leave");
+    }
+
+    #[test]
+    fn ctrl_c_off_the_session_page_asks_to_leave_rather_than_interrupting() {
+        // The session behind every other page keeps running: the list, the
+        // configuration centre and the panels are places to read or choose, not
+        // a view of the turn, so a press there is not an instruction to stop
+        // one. The composing page has its own test above; these are the pages
+        // that still own the selected session for navigation only.
+        for page in [
+            Page::Sessions,
+            Page::Management,
+            Page::Providers,
+            Page::Agents,
+            Page::Mcp,
+            Page::Skills,
+            Page::Prompts,
+            Page::Devices,
+            Page::Settings,
+            Page::Help,
+        ] {
+            let mut app = app_over_session(
+                page,
+                AgentSessionState::Running,
+                crate::app::LiveState::Ready,
+            );
+            let first = app.perform(Intent::ContextualCancel);
+            assert!(
+                first.effects.is_empty(),
+                "{page:?} interrupted a turn it does not show: {first:?}"
+            );
+            assert!(
+                !app.should_quit,
+                "{page:?}: one press was taken for an instruction"
+            );
+            assert!(app.quit_armed(), "{page:?}: the page did not ask to leave");
+            app.perform(Intent::ContextualCancel);
+            assert!(app.should_quit, "{page:?}: the second press did not leave");
+        }
     }
 
     #[test]

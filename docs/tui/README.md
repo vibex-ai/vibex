@@ -709,9 +709,10 @@ and `Ctrl+Y` its metadata. `Enter` opens a block's details. The composer takes
 line — `Ctrl+J` does the same on a terminal that cannot report `Shift+Enter`,
 see [Terminal ownership](#terminal-ownership) — `Ctrl+O` hands the draft to
 `$EDITOR`, and `Ctrl+S` steers a running turn. `Ctrl+C` clears the draft, then
-interrupts, then offers to quit. The status band's corner keeps the prompt's
-**Session list** entry, so another session is one gesture away without leaving the
-draft behind.
+interrupts, then offers to quit. The interrupt belongs to this page: from the
+session list, settings, or any other page, the running session behind it is
+left alone. The status band's corner keeps the prompt's **Session list** entry,
+so another session is one gesture away without leaving the draft behind.
 
 `/` on the transcript opens a search: a regular expression, case-insensitive
 until it contains an uppercase letter, highlighted in place. `Enter` keeps the

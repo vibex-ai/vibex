@@ -564,8 +564,11 @@ is never a column count.
   where the protocol answers, and `Ctrl+J` — a line feed, a byte of its own in
   every terminal — everywhere else. Help lists both; the send key stays `Enter`.
 * `Esc` only walks back one level; it never cancels a running turn. `Ctrl+C`
-  owns clear-draft / interrupt / quit-confirm. **The pages a reader opened are a
-  history, not a hierarchy.** `navigate_to` remembers the page it leaves — and
+  owns clear-draft / interrupt / quit-confirm. Only the page that draws the
+  transcript may interrupt its turn; on the session list, in settings, and on
+  every other page the selected session is behind the page, so the press never
+  stops it. **The pages a reader opened are a history, not a hierarchy.**
+  `navigate_to` remembers the page it leaves — and
   the pane that owned the keyboard on it — in `App::page_history`, and `go_back`
   returns there, so a reader who opens Usage (`3`) from the composing page comes
   back to that draft rather than to a session list they never opened. Walking
