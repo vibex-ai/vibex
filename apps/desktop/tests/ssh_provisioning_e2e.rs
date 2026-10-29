@@ -176,40 +176,57 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
     let old_bytes = std::fs::read(&artifact_path).expect("read old artifact");
     let old_sha = format!("{:x}", Sha256::digest(&old_bytes));
     let command = command_for(&fixture);
+    let upgrade_home = std::env::var("VIBEX_SSH_E2E_UPGRADE_HOME")
+        .unwrap_or_else(|_| "/home/dev/upgrade-home".to_string());
+    let upgrade_root = std::env::var("VIBEX_SSH_E2E_UPGRADE_ROOT")
+        .unwrap_or_else(|_| format!("{upgrade_home}/upgrade-server"));
+    let upgrade_port = std::env::var("VIBEX_SSH_E2E_UPGRADE_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8767);
+    let arch = std::env::var("VIBEX_SSH_E2E_ARCH")
+        .ok()
+        .and_then(|value| match value.as_str() {
+            "aarch64" | "arm64" => Some(RemoteArch::Aarch64),
+            "x86_64" => Some(RemoteArch::X86_64),
+            _ => None,
+        })
+        .unwrap_or(RemoteArch::X86_64);
+    let old_version =
+        std::env::var("VIBEX_SSH_E2E_OLD_VERSION").unwrap_or_else(|_| "0.1.0-rc.8".to_string());
     let launch = LaunchConfig::new(
-        "/home/dev/upgrade-home",
-        "/home/dev/upgrade-server",
-        &["/home/dev/upgrade-home".to_string()],
-        8767,
+        &upgrade_home,
+        &upgrade_root,
+        std::slice::from_ref(&upgrade_home),
+        upgrade_port,
     )
     .expect("launch config");
     let mut prepare = command.clone();
+    prepare.remote_script("mkdir -p \"$1\" \"$2\"").unwrap();
     prepare
-        .remote_script("mkdir -p /home/dev/upgrade-home /home/dev/upgrade-server")
-        .unwrap();
+        .args
+        .extend([upgrade_home.clone().into(), upgrade_root.clone().into()]);
     prepare.run().expect("prepare upgrade dirs");
 
     let old7 = LocalArtifact {
         path: artifact_path.clone(),
         version: "0.1.0-rc.7".to_string(),
-        arch: RemoteArch::X86_64,
+        arch,
         size: old_bytes.len() as u64,
         sha256: old_sha.clone(),
     };
-    install_artifact(&command, &old7, "/home/dev/upgrade-server", |_, _| {})
-        .expect("install rc.7 runtime");
+    install_artifact(&command, &old7, &upgrade_root, |_, _| {}).expect("install rc.7 runtime");
     let old = LocalArtifact {
         path: artifact_path.clone(),
-        version: "0.1.0-rc.8".to_string(),
-        arch: RemoteArch::X86_64,
+        version: old_version,
+        arch,
         size: old_bytes.len() as u64,
         sha256: old_sha,
     };
-    install_artifact(&command, &old, "/home/dev/upgrade-server", |_, _| {})
-        .expect("install old runtime");
+    install_artifact(&command, &old, &upgrade_root, |_, _| {}).expect("install old runtime");
     supervisor::ensure_started(&command, &launch).expect("start old runtime");
-    let identity_path = "/home/dev/upgrade-server/home/relay/desktop-identity.json";
-    let identity_before = remote_file_sha(&command, identity_path);
+    let identity_path = format!("{upgrade_root}/home/relay/desktop-identity.json");
+    let identity_before = remote_file_sha(&command, &identity_path);
 
     let dir = tempfile::tempdir().expect("upgrade artifacts");
     let (new_path, real_new_binary) = match std::env::var_os("VIBEX_SSH_E2E_NEW_ARTIFACT") {
@@ -224,7 +241,7 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
     let new = LocalArtifact {
         path: new_path,
         version: "0.1.0-rc.9".to_string(),
-        arch: RemoteArch::X86_64,
+        arch,
         size: new_bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(&new_bytes)),
     };
@@ -232,7 +249,7 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
         .expect("upgrade to rc.9");
     assert!(outcome.cleaned_versions >= 1, "rc.7 should be cleaned");
     assert_eq!(
-        remote_file_sha(&command, identity_path),
+        remote_file_sha(&command, &identity_path),
         identity_before,
         "upgrade must preserve the runtime identity"
     );
@@ -240,9 +257,7 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
     check
         .remote_script("test ! -d \"$1\"")
         .expect("cleanup check script");
-    check
-        .args
-        .push("/home/dev/upgrade-server/0.1.0-rc.7".into());
+    check.args.push(format!("{upgrade_root}/0.1.0-rc.7").into());
     check.run().expect("rc.7 directory should be removed");
     if real_new_binary {
         let status = supervisor::status(&command, &launch).expect("new binary status");
