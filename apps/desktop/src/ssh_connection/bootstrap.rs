@@ -66,7 +66,7 @@ pub fn generate(
     let script_sha256 = format!("{:x}", Sha256::digest(SCRIPT.as_bytes()));
     let payload = BASE64_STANDARD.encode(SCRIPT.as_bytes());
     let inner = format!(
-        "set -eu\numask 077\nd=$(mktemp -d)\ntrap 'rm -rf \"$d\"' EXIT\nprintf %s {} | base64 -d > \"$d/vibex-bootstrap.sh\"\necho '{}  $d/vibex-bootstrap.sh' | sha256sum -c - >/dev/null\nsh \"$d/vibex-bootstrap.sh\" --user {} --key {} --port {} --token {}",
+        "set -eu\numask 077\nd=$(mktemp -d)\ntrap 'rm -rf \"$d\"' EXIT\nprintf %s {} | base64 -d > \"$d/vibex-bootstrap.sh\"\ncd \"$d\"\necho '{}  vibex-bootstrap.sh' | sha256sum -c - >/dev/null\nsh \"$d/vibex-bootstrap.sh\" --user {} --key {} --port {} --token {}",
         shell_quote(&payload),
         script_sha256,
         shell_quote(user),
@@ -135,6 +135,8 @@ mod tests {
         assert!(command.command.contains("sha256sum -c"));
         assert!(command.command.contains("--port 2222"));
         assert!(command.command.contains(&command.token));
+        assert!(command.command.contains("cd \"$d\""));
+        assert!(command.command.contains("vibex-bootstrap.sh"));
         assert_eq!(command.expires_at_ms, 1_000 + TTL_MS);
         assert_eq!(command.token.split('.').count(), 3);
     }
