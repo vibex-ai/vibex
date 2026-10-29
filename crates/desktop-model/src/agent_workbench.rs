@@ -5,7 +5,7 @@ use vibex_core::{
     AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
     ElicitationRequestStatus, GoalAction, GoalChangeKind, GoalSnapshot, PermissionRequestStatus,
     PlanStepPayload, PlanStepStatus, RetryPhase, TimelineItem, TimelineItemKind, TimelinePayload,
-    TimelineTurnStart, ToolCallStatus, VibexSessionId, unix_timestamp_ms,
+    TimelineTurnStart, ToolCallPayload, ToolCallStatus, VibexSessionId, unix_timestamp_ms,
 };
 
 use crate::{ReasoningDisplayMode, SidebarState};
@@ -1162,6 +1162,19 @@ fn agent_message_row_id(correlation: &str, item: &TimelineItem) -> String {
 /// report is a row of its own, so the call's own id cannot name a row. The
 /// sequence of the item that opened the row completes it, for the same reason
 /// [`agent_message_row_id`] carries one.
+/// A transcript copy of a Claude step the ACP wire already delivered.
+///
+/// The Claude transcript tail used to re-emit every JSONL record as a tool
+/// call: prompts, replies and thinking under synthetic `claude_*` names, and
+/// each `tool_use` under its real name with the fixed title
+/// "Claude tool call". Only background work is new information.
+pub fn is_claude_transcript_echo(tool: &ToolCallPayload) -> bool {
+    matches!(
+        tool.tool_name.as_str(),
+        "claude_prompt" | "claude_message" | "claude_thinking" | "claude_tool"
+    ) || tool.summary == "Claude tool call"
+}
+
 fn tool_call_row_id(tool_call_id: &str, item: &TimelineItem) -> String {
     format!("tool:{tool_call_id}:{}", item.sequence)
 }
@@ -1309,6 +1322,9 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
             )),
             // Goal state feeds the composer goal bar, not the transcript.
             TimelinePayload::Goal(_) => {}
+            // Sessions recorded before the transcript tail stopped echoing
+            // the wire keep those copies on disk; they are not drawn.
+            TimelinePayload::ToolCall(tool) if is_claude_transcript_echo(tool) => {}
             TimelinePayload::ToolCall(tool) => rows.push(simple_row(
                 item,
                 tool_call_row_id(&tool.tool_call_id, item),

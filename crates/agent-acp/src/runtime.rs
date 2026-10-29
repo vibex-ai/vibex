@@ -3159,6 +3159,18 @@ impl AcpSessionAttachment {
                         .finish(&work_key, &event.native_event_id),
                 }
             }
+            // Prompts, replies, thinking and tool calls already arrive over
+            // ACP. Re-emitting their transcript copies drew every Claude step
+            // twice, the second time as a "tool call" whose detail was the
+            // raw JSONL envelope. Only work the wire never reports is drawn.
+            if !matches!(
+                event.kind,
+                ClaudeTranscriptEventKind::BackgroundTask
+                    | ClaudeTranscriptEventKind::BackgroundShell
+                    | ClaudeTranscriptEventKind::TaskNotification
+            ) {
+                continue;
+            }
             let input = claude_transcript_event_input(&event, &process.compatibility_identity);
             for normalized in normalize_agent_event(AgentEventEnricherKind::Claude, &input) {
                 self.emit_turn_event(AcpEvent::Canonical(normalized));
