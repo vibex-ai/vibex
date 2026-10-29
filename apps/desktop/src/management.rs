@@ -1456,6 +1456,14 @@ pub struct ManagementCenter {
     /// Whether the content stage that is running or starts next belongs to the
     /// first-load chain and should continue into the authoritative probe.
     refresh_full_after_content: bool,
+    /// Provider/Agent pairs the page already paints as bound while the next
+    /// snapshot is still in flight, with the legacy Profile the pill addresses.
+    pending_provider_bindings: BTreeMap<(String, String), vibex_core::ProviderProfileId>,
+    /// Provider/Agent pairs the page already paints as unbound while the next
+    /// snapshot is still in flight.
+    pending_provider_unbinds: BTreeSet<(String, String)>,
+    /// Shared Providers the page already hides while the delete is in flight.
+    pending_provider_deletes: BTreeSet<String>,
     agent_install_refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     agent_mutation_tasks: BTreeMap<String, Task<()>>,
@@ -2507,6 +2515,9 @@ impl ManagementCenter {
             refresh_pending: false,
             refresh_stage: ManagementRefreshStage::Idle,
             refresh_full_after_content: false,
+            pending_provider_bindings: BTreeMap::new(),
+            pending_provider_unbinds: BTreeSet::new(),
+            pending_provider_deletes: BTreeSet::new(),
             agent_install_refresh_task: None,
             mutation_task: None,
             agent_mutation_tasks: BTreeMap::new(),
@@ -2874,6 +2885,9 @@ impl ManagementCenter {
             self.refresh_pending = false;
             self.refresh_stage = ManagementRefreshStage::Idle;
             self.refresh_full_after_content = false;
+            self.pending_provider_bindings.clear();
+            self.pending_provider_unbinds.clear();
+            self.pending_provider_deletes.clear();
             self.loading = false;
             self.details_ready = false;
             self.refresh_task = None;
@@ -3040,6 +3054,9 @@ impl ManagementCenter {
         self.refresh_pending = false;
         self.refresh_stage = ManagementRefreshStage::Idle;
         self.refresh_full_after_content = false;
+        self.pending_provider_bindings.clear();
+        self.pending_provider_unbinds.clear();
+        self.pending_provider_deletes.clear();
         self.agent_install_refresh_task = None;
         self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
         self.agent_auth_loading = false;
@@ -5271,6 +5288,30 @@ impl ManagementCenter {
         self.gateway = snapshot.gateway;
         self.providers = snapshot.providers;
         self.provider_bindings = snapshot.provider_bindings;
+        // A stale snapshot must not put a Provider back after its delete was
+        // requested. Keep the row hidden until a snapshot actually omits it.
+        self.pending_provider_deletes
+            .retain(|provider_id| self.providers.iter().any(|p| p.id.as_str() == provider_id));
+        self.providers
+            .retain(|provider| !self.pending_provider_deletes.contains(provider.id.as_str()));
+        // A snapshot reconciles the optimistic bind/unbind rows it has caught
+        // up with. Entries it does not describe stay until a later read does,
+        // so a stale snapshot cannot make a just-bound Agent flicker back out.
+        let bindings = &self.provider_bindings;
+        let binding_exists = |provider_id: &str, agent_id: &str| {
+            bindings.iter().any(|binding| {
+                binding.deleted_at_ms.is_none()
+                    && binding
+                        .model_provider_profile_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == provider_id)
+                    && binding.agent_id.as_str() == agent_id
+            })
+        };
+        self.pending_provider_bindings
+            .retain(|(provider_id, agent_id), _| !binding_exists(provider_id, agent_id));
+        self.pending_provider_unbinds
+            .retain(|(provider_id, agent_id)| binding_exists(provider_id, agent_id));
         self.model_routes = snapshot.model_routes;
         self.agent_model_route_bindings = snapshot.agent_model_route_bindings;
         self.agent_model_source_defaults = snapshot.agent_model_source_defaults;
@@ -12903,7 +12944,13 @@ impl ManagementCenter {
     /// Provider once per Agent, which made a shared Provider look like three
     /// separate ones.
     fn shared_providers(&self) -> Vec<SharedProviderRow> {
-        shared_provider_rows(&self.providers, &self.provider_bindings)
+        let mut rows = shared_provider_rows(&self.providers, &self.provider_bindings);
+        apply_pending_provider_bindings(
+            &mut rows,
+            &self.pending_provider_bindings,
+            &self.pending_provider_unbinds,
+        );
+        rows
     }
 
     /// The global Providers sidebar: the gateway section, then one row per
@@ -13877,7 +13924,7 @@ impl ManagementCenter {
                     .find(|agent| agent.id.as_str() == agent_id)
                     .map(|agent| agent.label.clone())
                     .unwrap_or_else(|| agent_id.clone());
-                let Some(legacy_id) = self
+                let legacy_id = self
                     .provider_bindings
                     .iter()
                     .find(|binding| {
@@ -13885,7 +13932,15 @@ impl ManagementCenter {
                             && binding.model_provider_profile_id.as_ref() == Some(&profile.id)
                     })
                     .and_then(|binding| binding.legacy_provider_profile_id.clone())
-                else {
+                    .or_else(|| {
+                        // The click paints a bound pill before the binding row
+                        // exists; the request already named the legacy Profile
+                        // the pill's controls address.
+                        self.pending_provider_bindings
+                            .get(&(profile.id.as_str().to_string(), agent_id.clone()))
+                            .cloned()
+                    });
+                let Some(legacy_id) = legacy_id else {
                     continue;
                 };
                 let default_source = vibex_core::AgentModelSourceRef::Provider(legacy_id.clone());
@@ -15504,10 +15559,38 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
+        // The row and its bindings leave the page on the click, not after the
+        // write and the snapshot that follows it. Capture them so a rejected
+        // delete can put the same records back.
+        let previous_selection = self.selected_global_provider_id.clone();
+        let removed_provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned();
+        let removed_bindings = self
+            .provider_bindings
+            .iter()
+            .filter(|binding| binding.model_provider_profile_id.as_ref() == Some(&provider_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.providers.retain(|provider| provider.id != provider_id);
+        self.provider_bindings
+            .retain(|binding| binding.model_provider_profile_id.as_ref() != Some(&provider_id));
+        self.pending_provider_bindings
+            .retain(|(pending_provider, _), _| pending_provider != provider_id.as_str());
+        self.pending_provider_unbinds
+            .retain(|(pending_provider, _)| pending_provider != provider_id.as_str());
+        self.pending_provider_deletes
+            .insert(provider_id.as_str().to_string());
+        self.selected_global_provider_id = None;
+
         self.mutation = Some(ManagementMutation::ProviderDelete(
             provider_id.as_str().to_string(),
         ));
         self.error = None;
+        cx.notify();
+
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = backend
@@ -15520,19 +15603,17 @@ impl ManagementCenter {
                 this.mutation = None;
                 match outcome {
                     Ok(()) => {
-                        // The page's subject is gone, so fall back to the pinned
-                        // gateway row rather than leaving a detail pane that
-                        // describes nothing. Drop the row and its bindings now;
-                        // the refresh reconciles everything derived from them.
-                        this.providers.retain(|provider| provider.id != provider_id);
-                        this.provider_bindings.retain(|binding| {
-                            binding.model_provider_profile_id.as_ref() != Some(&provider_id)
-                        });
                         this.selected_global_provider_id = None;
                         cx.notify();
                         this.refresh(cx);
                     }
                     Err(error) => {
+                        this.pending_provider_deletes.remove(provider_id.as_str());
+                        if let Some(provider) = removed_provider {
+                            this.providers.push(provider);
+                        }
+                        this.provider_bindings.extend(removed_bindings);
+                        this.selected_global_provider_id = previous_selection;
                         this.error = Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                     }
@@ -15643,6 +15724,26 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
+        // Removing the pill is the visible result of the click; the write and
+        // the snapshot only confirm it. A rejected write restores the pill.
+        let optimistic_pair = match &source {
+            UnbindModelSource::Provider(legacy_id) => self
+                .providers
+                .iter()
+                .find(|provider| provider.legacy_provider_profile_id.as_ref() == Some(legacy_id))
+                .map(|provider| {
+                    (
+                        provider.id.as_str().to_string(),
+                        agent_id.as_str().to_string(),
+                    )
+                }),
+            UnbindModelSource::Route(_) => None,
+        };
+        if let Some(pair) = optimistic_pair.as_ref() {
+            self.pending_provider_bindings.remove(pair);
+            self.pending_provider_unbinds.insert(pair.clone());
+            cx.notify();
+        }
         self.mutation = Some(ManagementMutation::Gateway);
         self.error = None;
         let this = cx.entity();
@@ -15673,8 +15774,14 @@ impl ManagementCenter {
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
-                    Ok(_) => this.refresh(cx),
+                    Ok(_) => {
+                        cx.notify();
+                        this.refresh(cx);
+                    }
                     Err(error) => {
+                        if let Some(pair) = optimistic_pair.as_ref() {
+                            this.pending_provider_unbinds.remove(pair);
+                        }
                         this.error = Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                     }
@@ -15813,6 +15920,28 @@ impl ManagementCenter {
         let has_default_before_bind = self
             .resolved_agent_default_source(agent_id.as_str())
             .is_some();
+        // The Agent pill fills on the click. The snapshot that follows the
+        // write confirms the binding, and a rejected write removes the overlay
+        // again; waiting for either left the card looking inert.
+        let optimistic_pair = shared_id
+            .as_ref()
+            .map(|shared_id| shared_id.as_str().to_string())
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find(|provider| {
+                        provider.legacy_provider_profile_id.as_ref() == Some(&profile_id)
+                    })
+                    .map(|provider| provider.id.as_str().to_string())
+            })
+            .map(|provider_id| (provider_id, agent_id.as_str().to_string()));
+        if let Some(pair) = optimistic_pair.as_ref() {
+            self.pending_provider_unbinds.remove(pair);
+            self.pending_provider_bindings
+                .insert(pair.clone(), profile_id.clone());
+            cx.notify();
+        }
+
         self.mutation = Some(ManagementMutation::ProviderBind(
             agent_id.as_str().to_string(),
         ));
@@ -15844,9 +15973,13 @@ impl ManagementCenter {
                             ),
                             profile.agent_id.as_str()
                         ));
+                        cx.notify();
                         this.refresh(cx);
                     }
                     Err(error) => {
+                        if let Some(pair) = optimistic_pair.as_ref() {
+                            this.pending_provider_bindings.remove(pair);
+                        }
                         this.error = Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                     }
@@ -38613,6 +38746,29 @@ fn upsert_shared_provider(
 /// A Profile appears once regardless of how many bindings reference it, which
 /// is the property the Agent-scoped list lacked: it filtered by `agent_id`, so
 /// one upstream showed up once per Agent.
+fn apply_pending_provider_bindings(
+    rows: &mut [SharedProviderRow],
+    pending_binds: &BTreeMap<(String, String), vibex_core::ProviderProfileId>,
+    pending_unbinds: &BTreeSet<(String, String)>,
+) {
+    for (provider_id, agent_id) in pending_unbinds {
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.profile.id.as_str() == provider_id)
+        {
+            row.agents.remove(agent_id);
+        }
+    }
+    for (provider_id, agent_id) in pending_binds.keys() {
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.profile.id.as_str() == provider_id)
+        {
+            row.agents.insert(agent_id.clone());
+        }
+    }
+}
+
 fn shared_provider_rows(
     profiles: &[vibex_core::ModelProviderProfile],
     bindings: &[vibex_core::AgentModelProviderBinding],
@@ -49238,6 +49394,29 @@ mod gateway_surface_tests {
         ] {
             assert!(source.contains(marker), "binding pills must keep {marker}");
         }
+    }
+
+    /// The click paints the Agent pill before the write or its snapshot lands.
+    #[test]
+    fn pending_bindings_paint_before_the_snapshot_arrives() {
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "Pending Provider".to_string(),
+            ..Default::default()
+        };
+        let provider_id = provider.id.as_str().to_string();
+        let mut rows = shared_provider_rows(&[provider], &[]);
+        assert!(rows[0].agents.is_empty());
+
+        let binds = BTreeMap::from([(
+            (provider_id.clone(), "codex".to_string()),
+            vibex_core::ProviderProfileId::new(),
+        )]);
+        apply_pending_provider_bindings(&mut rows, &binds, &BTreeSet::new());
+        assert!(rows[0].agents.contains("codex"));
+
+        let unbinds = BTreeSet::from([(provider_id, "codex".to_string())]);
+        apply_pending_provider_bindings(&mut rows, &BTreeMap::new(), &unbinds);
+        assert!(!rows[0].agents.contains("codex"));
     }
 
     #[test]
