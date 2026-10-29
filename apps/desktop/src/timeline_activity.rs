@@ -153,11 +153,23 @@ pub(super) fn live_labels_animate() -> bool {
 }
 
 /// The same button geometry is used by tool, file and plan disclosures.
+/// The disclosure chevron, turned by the spring its body travels on.
+///
+/// Swapping a right chevron for a down one jumps a quarter turn in one frame
+/// while the body below it is still easing open; turning one glyph with the
+/// body's own progress keeps the two moving together.
+fn disclosure_chevron(progress: f32) -> Icon {
+    Icon::new(IconName::ChevronRight).rotate(gpui::radians(
+        progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2,
+    ))
+}
+
+/// `disclosure` is whether the row is open and how far its body has travelled.
 pub(super) fn header(
     id: String,
     activity: &Activity,
     running: bool,
-    open: Option<bool>,
+    disclosure: Option<(bool, f32)>,
     highlighted_target: Option<AnyElement>,
     statistics: Option<AnyElement>,
     cx: &App,
@@ -217,7 +229,7 @@ pub(super) fn header(
             running,
             activity.is_failed(),
         ))
-        .when_some(open, |this, open| this.toggled(open))
+        .when_some(disclosure, |this, (open, _)| this.toggled(open))
         .child(
             h_flex()
                 .w_full()
@@ -235,7 +247,7 @@ pub(super) fn header(
                 )
                 .child(target)
                 .children(statistics)
-                .when_some(open, |this, open| {
+                .when_some(disclosure, |this, (open, progress)| {
                     this.child(
                         div()
                             .id("disclosure")
@@ -246,14 +258,7 @@ pub(super) fn header(
                             .group_hover(HOVER_GROUP, |style| {
                                 style.text_color(hover_color).opacity(1.0)
                             })
-                            .child(
-                                Icon::new(if open {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size_3(),
-                            ),
+                            .child(disclosure_chevron(progress).size_3()),
                     )
                 }),
         )
@@ -267,6 +272,7 @@ pub(super) fn summary_header(
     id: String,
     label: String,
     open: bool,
+    progress: f32,
     running: bool,
     cx: &App,
 ) -> Button {
@@ -295,14 +301,12 @@ pub(super) fn summary_header(
                 .text_color(color)
                 .group_hover(HOVER_GROUP, |style| style.text_color(cx.theme().foreground))
                 .child(
-                    div().w_7().flex_none().flex().justify_center().child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size_3p5(),
-                    ),
+                    div()
+                        .w_7()
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(disclosure_chevron(progress).size_3p5()),
                 )
                 .child(div().min_w_0().flex_1().truncate().child(activity_text(
                     "summary-shimmer",

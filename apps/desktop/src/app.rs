@@ -64259,6 +64259,7 @@ impl VibexWorkbench {
             format!("activity-summary:{}", group.id),
             summary.label(timeline_activity::current_locale()),
             expanded,
+            progress,
             rows.iter()
                 .any(|row| timeline_activity::is_running(row, turn_live)),
             cx,
@@ -64583,6 +64584,9 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let projection = self.tool_card_projection_cached(row);
+        if projection.file_operation.is_some() {
+            return self.render_file_operation_entry(row, continues, turn_live, window, cx);
+        }
         let has_details = !projection.details.is_empty() || projection.details_pending;
         let expanded = has_details
             && self
@@ -64607,7 +64611,7 @@ impl VibexWorkbench {
             format!("activity:{}", row.id),
             &projection.activity,
             timeline_activity::is_running(row, turn_live),
-            has_details.then_some(expanded),
+            has_details.then_some((expanded, progress)),
             target,
             None,
             cx,
@@ -64830,16 +64834,17 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(operation) =
-            self.timeline_row_latest_item(row)
-                .and_then(|item| match &item.payload {
-                    TimelinePayload::FileOperation(operation) => Some(operation.clone()),
-                    _ => None,
-                })
+        let projection = self.tool_card_projection_cached(row);
+        let Some(operation) = self
+            .timeline_row_latest_item(row)
+            .and_then(|item| match &item.payload {
+                TimelinePayload::FileOperation(operation) => Some(operation.clone()),
+                _ => None,
+            })
+            .or_else(|| projection.file_operation.as_deref().cloned())
         else {
             return self.render_process_activity_entry(row, continues, turn_live, window, cx);
         };
-        let projection = self.tool_card_projection_cached(row);
         let expanded = self
             .timeline_command_expansion
             .get(&row.id)
@@ -64890,7 +64895,7 @@ impl VibexWorkbench {
             format!("file-card-header:{}", row.id),
             &projection.activity,
             timeline_activity::is_running(row, turn_live),
-            Some(expanded),
+            Some((expanded, progress)),
             target,
             statistics,
             cx,
@@ -71786,7 +71791,9 @@ fn timeline_disclosure_body(id: String, progress: f32, body: AnyElement) -> AnyE
             .w_full()
             .min_w_0()
             .flex_none()
-            .opacity(progress)
+            // The content settles ahead of the height, so the last stretch of
+            // the travel reveals finished rows instead of a half-faded block.
+            .opacity((progress * 1.4).min(1.0))
             .child(body)
             .into_any_element(),
     )
@@ -71804,6 +71811,9 @@ struct ToolCardProjection {
     /// output to show. Without this the row would look like it has nothing to
     /// open, and the reader could never reach the detail.
     details_pending: bool,
+    /// The file change a generic tool call's arguments describe, so an edit
+    /// reported as a plain tool call is drawn as a diff like any other.
+    file_operation: Option<Rc<vibex_core::FileOperationPayload>>,
 }
 
 /// One row's [`timeline_activity::Activity`], memoized on its own.
@@ -72012,6 +72022,11 @@ impl ToolCardProjection {
                 .iter()
                 .map(ToolCardDetailBlock::approximate_bytes)
                 .sum::<usize>()
+            + self.file_operation.as_ref().map_or(0, |operation| {
+                operation.path.len()
+                    + operation.old_text.as_ref().map_or(0, String::len)
+                    + operation.new_text.as_ref().map_or(0, String::len)
+            })
     }
 }
 
@@ -73023,10 +73038,24 @@ fn tool_card_projection(
 ) -> ToolCardProjection {
     use vibex_core::TimelinePayload as Payload;
     let activity = timeline_activity::project(row, payload);
+    let file_operation = match payload {
+        Some(Payload::ToolCall(tool)) => vibex_ui::tool_detail::file_operation(tool).map(Rc::new),
+        _ => None,
+    };
     let details = match payload {
         Some(Payload::ToolCall(tool)) => {
             let mut details = Vec::new();
-            if let Some((value, raw)) = timeline_tool_detail::invocation(tool, activity.icon()) {
+            // A todo list reads as the checklist it is, not as its arguments.
+            if let Some(todos) = vibex_ui::tool_detail::todo_items(tool) {
+                details.push(ToolCardDetailBlock::Rows {
+                    rows: todos
+                        .into_iter()
+                        .map(|(status, text)| (status.key().to_string(), text))
+                        .collect(),
+                });
+            } else if let Some((value, raw)) =
+                timeline_tool_detail::invocation(tool, activity.icon())
+            {
                 details.push(ToolCardDetailBlock::Invocation { value, raw });
             }
             if let Some(output) = timeline_tool_detail::output(
@@ -73182,6 +73211,7 @@ fn tool_card_projection(
         // Only a caller that can see the item behind the row knows whether
         // detail was withheld; the projection itself cannot.
         details_pending: false,
+        file_operation,
     }
 }
 /// Characters per line a content box `width` pixels wide fits.
@@ -82286,7 +82316,7 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) {
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let candidates = settings_search_candidates_for_query(&query, strings);
+        let candidates = self.visible_settings_search_candidates(&query, strings, cx);
         let Some(candidate) = candidates
             .get(index.min(candidates.len().saturating_sub(1)))
             .copied()
@@ -82341,10 +82371,9 @@ impl FoundationSettings {
             .highlighted_title
             .borrow_mut()
             .replace(candidate.title.to_string());
-        let candidates = settings_search_candidates_for_query(
-            self.search.read(cx).value().as_ref(),
-            locale::current_strings(),
-        );
+        let query = self.search.read(cx).value().to_string();
+        let candidates =
+            self.visible_settings_search_candidates(&query, locale::current_strings(), cx);
         self.search_scroll
             .scroll_to_item(settings_search_result_scroll_index(&candidates, index));
         self.search.update(cx, |input, cx| input.focus(window, cx));
@@ -82357,10 +82386,9 @@ impl FoundationSettings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let candidates = settings_search_candidates_for_query(
-            self.search.read(cx).value().as_ref(),
-            locale::current_strings(),
-        );
+        let query = self.search.read(cx).value().to_string();
+        let candidates =
+            self.visible_settings_search_candidates(&query, locale::current_strings(), cx);
         if candidates.is_empty() {
             return;
         }
@@ -82394,7 +82422,7 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let query = self.search.read(cx).value().trim().to_string();
-        let candidates = settings_search_candidates_for_query(&query, strings);
+        let candidates = self.visible_settings_search_candidates(&query, strings, cx);
         if candidates.is_empty() {
             return None;
         }
@@ -93908,6 +93936,49 @@ mod tests {
             runtime_attribution: None,
             file_path: None,
         }
+    }
+
+    #[test]
+    fn generic_edit_and_todo_calls_project_a_diff_and_a_checklist() {
+        let row = projection_test_row(TimelineRowKind::ToolCall);
+        let tool = |name: &str, summary: &str, input: serde_json::Value| {
+            vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: "call".to_string(),
+                tool_name: name.to_string(),
+                status: vibex_core::ToolCallStatus::Completed,
+                summary: summary.to_string(),
+                input_summary: Some(input.to_string()),
+                output_summary: None,
+                raw_extension: None,
+            })
+        };
+        let edit = tool(
+            "edit",
+            "Edit src/lib.rs",
+            serde_json::json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+        );
+        let projection = tool_card_projection(&row, Some(&edit));
+        let operation = projection
+            .file_operation
+            .as_deref()
+            .expect("an edit is a file change");
+        assert!(file_operation_has_diff(operation));
+        let preview = agent_file_operation_diff_preview(operation);
+        assert_eq!((preview.added_lines, preview.removed_lines), (1, 1));
+
+        let todos = tool(
+            "think",
+            "Update plan",
+            serde_json::json!({"todos": [{"content": "Ship", "status": "in_progress"}]}),
+        );
+        let projection = tool_card_projection(&row, Some(&todos));
+        assert!(projection.file_operation.is_none());
+        assert_eq!(
+            projection.details.first(),
+            Some(&ToolCardDetailBlock::Rows {
+                rows: vec![("running".to_string(), "Ship".to_string())]
+            })
+        );
     }
 
     #[test]

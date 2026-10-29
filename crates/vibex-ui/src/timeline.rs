@@ -94,10 +94,18 @@ impl Activity {
                 } else {
                     &tool.summary
                 };
-                let input_target = (tool.summary.trim().is_empty()
-                    || tool.summary.trim().eq_ignore_ascii_case(&tool.tool_name))
-                .then(|| tool_input_target(tool, icon))
-                .flatten();
+                let input_target = summary_is_uninformative(&tool.summary, &tool.tool_name)
+                    .then(|| tool_input_target(tool, icon))
+                    .flatten();
+                let summary = if summary_is_uninformative(summary, &tool.tool_name)
+                    && input_target.is_none()
+                {
+                    // An ACP call id or a bare `Bash: {}` says nothing; the
+                    // tool's own name is the most a reader can be told.
+                    readable_tool_name(&tool.tool_name, summary)
+                } else {
+                    summary
+                };
                 let path = matches!(
                     icon,
                     Icon::FileRead | Icon::FileEdit | Icon::FileCreate | Icon::FileDelete
@@ -279,12 +287,14 @@ impl Activity {
 
 pub(crate) fn input_keys(kind: ActivityKind) -> &'static [&'static str] {
     match kind {
-        ActivityKind::Command => &["command", "cmd"],
+        ActivityKind::Command => &["command", "cmd", "commands", "script"],
         ActivityKind::FileRead
         | ActivityKind::FileEdit
         | ActivityKind::FileCreate
         | ActivityKind::FileDelete => &["file_path", "path", "filePath"],
-        ActivityKind::Search => &["pattern", "query"],
+        ActivityKind::Search => &["pattern", "query", "regex", "q"],
+        ActivityKind::Collaboration => &["description", "subagent_type", "agent", "prompt"],
+        ActivityKind::Integration => &["name", "skill", "server", "tool"],
         ActivityKind::Directory => &["pattern", "glob", "path"],
         _ => &[],
     }
@@ -305,14 +315,55 @@ fn tool_input_target(tool: &ToolCallPayload, kind: ActivityKind) -> Option<Strin
     match serde_json::from_str::<serde_json::Value>(source) {
         Ok(serde_json::Value::String(text)) => Some(text),
         Ok(serde_json::Value::Object(object)) => keys.iter().find_map(|key| {
-            object
-                .get(*key)
-                .and_then(serde_json::Value::as_str)
-                .filter(|text| !text.trim().is_empty())
-                .map(str::to_string)
+            match object.get(*key)? {
+                serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+                // A batch runner's `commands`: the first stands for the batch.
+                serde_json::Value::Array(items) => {
+                    let mut texts = items.iter().filter_map(serde_json::Value::as_str);
+                    let first = texts.next()?;
+                    let more = texts.count();
+                    Some(if more == 0 {
+                        first.to_string()
+                    } else {
+                        format!("{first} (+{more})")
+                    })
+                }
+                _ => None,
+            }
         }),
         Err(_) if !source.is_empty() && !source.starts_with(['{', '[']) => Some(source.to_string()),
         _ => None,
+    }
+}
+
+/// Whether a tool call's title names the tool rather than what it did.
+///
+/// Agents title calls very differently: some send the command or path, others
+/// only the tool's name (`Bash`, `Read`), a generated id (`ACP tool call
+/// call_5d27…`) or the name over empty arguments (`Bash: {}`). Those titles
+/// leave the header to the call's own arguments.
+fn summary_is_uninformative(summary: &str, tool_name: &str) -> bool {
+    let summary = summary.trim();
+    summary.is_empty()
+        || summary.eq_ignore_ascii_case(tool_name.trim())
+        || summary.starts_with("ACP tool call")
+        || summary.ends_with(": {}")
+        || (!summary.contains(char::is_whitespace)
+            && summary.len() <= 40
+            && summary
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character)))
+}
+
+/// A tool's name as the header shows it when nothing better is known.
+fn readable_tool_name<'a>(tool_name: &'a str, summary: &'a str) -> &'a str {
+    let summary = summary.trim();
+    if !summary.starts_with("ACP tool call") && !summary.is_empty() {
+        return summary.strip_suffix(": {}").unwrap_or(summary);
+    }
+    match tool_name.trim() {
+        "" | "tool" | "other" => summary,
+        name => name,
     }
 }
 

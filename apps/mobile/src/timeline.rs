@@ -430,6 +430,27 @@ impl MobileApp {
                                     )),
                             ),
                     )
+                    .children(self.timeline_row_line_counts(row).map(|(added, removed)| {
+                        div()
+                            .flex_none()
+                            .flex()
+                            .gap_1()
+                            .text_size(theme::font_micro())
+                            .when(added > 0, |counts| {
+                                counts.child(
+                                    div()
+                                        .text_color(theme::accent_green())
+                                        .child(format!("+{added}")),
+                                )
+                            })
+                            .when(removed > 0, |counts| {
+                                counts.child(
+                                    div()
+                                        .text_color(theme::accent_red())
+                                        .child(format!("−{removed}")),
+                                )
+                            })
+                    }))
                     .when(row.pending_permission, |header| {
                         header.child(
                             div()
@@ -511,7 +532,11 @@ impl MobileApp {
                         .line_height(theme::line_height_for(theme::FONT_DETAIL))
                         .text_color(theme::text_secondary())
                         .whitespace_normal()
-                        .child(value),
+                        .child(if detail.is_file_content() && is_unified_diff(&value) {
+                            diff_lines(&value).into_any_element()
+                        } else {
+                            div().child(value).into_any_element()
+                        }),
                 )
                 .child(
                     Button::new(format!("activity-copy:{row_id}:{ix}"))
@@ -581,6 +606,43 @@ fn disclosure_icon(expanded: bool) -> gpui::Div {
         },
         theme::text_muted(),
     )
+}
+
+/// How many lines of a change a detail box colours before it stops.
+const DIFF_DETAIL_MAX_LINES: usize = 400;
+
+fn is_unified_diff(text: &str) -> bool {
+    text.starts_with("--- ") || text.starts_with("@@")
+}
+
+/// A unified diff with its added and removed lines coloured.
+fn diff_lines(text: &str) -> gpui::Div {
+    let lines = text
+        .lines()
+        .filter(|line| !line.starts_with("--- ") && !line.starts_with("+++ "));
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .children(lines.take(DIFF_DETAIL_MAX_LINES).map(|line| {
+            let (color, background) = if line.starts_with('+') {
+                (theme::accent_green(), theme::accent_green().opacity(0.10))
+            } else if line.starts_with('-') {
+                (theme::accent_red(), theme::accent_red().opacity(0.10))
+            } else if line.starts_with("@@") {
+                (theme::text_muted(), gpui::transparent_black())
+            } else {
+                (theme::text_secondary(), gpui::transparent_black())
+            };
+            div()
+                .w_full()
+                .min_w_0()
+                .px_1()
+                .text_color(color)
+                .bg(background)
+                .child(line.to_string())
+        }))
 }
 
 fn activity_body(body: impl IntoElement) -> gpui::Div {

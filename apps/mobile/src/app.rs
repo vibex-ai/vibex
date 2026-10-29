@@ -295,6 +295,9 @@ fn hint_unmeasured_timeline_rows(list: &ListState) {
         .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
 }
 
+/// Lines a file change removes and adds.
+type LineCounts = (usize, usize);
+
 /// The reader's place in the timeline, as the list last reported it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct TimelineViewport {
@@ -1788,6 +1791,10 @@ pub struct MobileApp {
     /// event does.
     overlay_swipe: Option<OverlaySwipe>,
     expanded_process: BTreeMap<String, bool>,
+    /// Lines each file-changing row removes and adds, keyed by row and the
+    /// sequence it was counted at. Counting diffs the change, which a header
+    /// redrawn every frame cannot afford to repeat.
+    timeline_file_line_counts: RefCell<BTreeMap<String, (i64, Option<LineCounts>)>>,
     expanded_timeline_rows: BTreeSet<String>,
     collapsed_timeline_rows: BTreeSet<String>,
     /// Live reasoning rows whose reader asked for the whole thought instead of
@@ -3974,6 +3981,7 @@ impl MobileApp {
             back_gesture_page: None,
             overlay_swipe: None,
             expanded_process: BTreeMap::new(),
+            timeline_file_line_counts: RefCell::new(BTreeMap::new()),
             expanded_timeline_rows: BTreeSet::new(),
             collapsed_timeline_rows: BTreeSet::new(),
             full_reasoning_rows: BTreeSet::new(),
@@ -8530,6 +8538,7 @@ impl MobileApp {
         self.composer_goal_expanded = false;
         self.refresh_token_usage(cx);
         self.expanded_process.clear();
+        self.timeline_file_line_counts.borrow_mut().clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
         self.full_reasoning_rows.clear();
@@ -11613,6 +11622,7 @@ impl MobileApp {
         self.timeline_display_settings_sync_busy = false;
         self.fork_session_busy = false;
         self.expanded_process.clear();
+        self.timeline_file_line_counts.borrow_mut().clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
         self.full_reasoning_rows.clear();
@@ -20616,6 +20626,35 @@ impl MobileApp {
         self.timeline_row_item(row).map(|item| &item.payload)
     }
 
+    /// The file change behind a row: a file operation, or a generic tool call
+    /// whose arguments carry an edit or a write.
+    pub(super) fn timeline_row_file_operation(
+        &self,
+        row: &TimelineRow,
+    ) -> Option<vibex_core::FileOperationPayload> {
+        match self.timeline_row_latest_payload(row)? {
+            TimelinePayload::FileOperation(operation) => Some(operation.clone()),
+            TimelinePayload::ToolCall(tool) => vibex_ui::tool_detail::file_operation(tool),
+            _ => None,
+        }
+    }
+
+    /// [`crate::file_diff::line_counts`] for a row, counted once per sequence.
+    pub(super) fn timeline_row_line_counts(&self, row: &TimelineRow) -> Option<(usize, usize)> {
+        if let Some((sequence, counts)) = self.timeline_file_line_counts.borrow().get(&row.id)
+            && *sequence == row.last_sequence
+        {
+            return *counts;
+        }
+        let counts = self
+            .timeline_row_file_operation(row)
+            .and_then(|operation| crate::file_diff::line_counts(&operation));
+        self.timeline_file_line_counts
+            .borrow_mut()
+            .insert(row.id.clone(), (row.last_sequence, counts));
+        counts
+    }
+
     fn timeline_row_user_attachments(&self, row: &TimelineRow) -> Vec<MessageAttachment> {
         if let Some(TimelinePayload::UserMessage(message)) = self.timeline_row_latest_payload(row) {
             return message.attachments.clone();
@@ -22228,14 +22267,9 @@ impl MobileApp {
         let mut seen_paths = BTreeSet::new();
         let mut changed_rows = Vec::new();
         for row in turn.process_rows.iter().rev() {
-            if row.kind != TimelineRowKind::FileOperation {
-                continue;
-            }
-            let changed = match self.timeline_row_latest_payload(row) {
-                Some(TimelinePayload::FileOperation(operation)) => {
-                    operation.operation != vibex_core::FileOperationKind::Read
-                }
-                _ => true,
+            let changed = match self.timeline_row_file_operation(row) {
+                Some(operation) => operation.operation != vibex_core::FileOperationKind::Read,
+                None => continue,
             };
             if !changed {
                 continue;
@@ -22360,37 +22394,19 @@ impl MobileApp {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let operation_path =
-            self.timeline_row_latest_payload(row)
-                .and_then(|payload| match payload {
-                    TimelinePayload::FileOperation(operation) => Some(operation.path.clone()),
-                    _ => None,
-                });
-        let title = match &operation_path {
-            Some(path) => format!(
+        let operation = self.timeline_row_file_operation(row);
+        let operation_path = operation.as_ref().map(|operation| operation.path.clone());
+        let title = match &operation {
+            Some(operation) => format!(
                 "{} {}",
-                self.timeline_row_latest_payload(row)
-                    .and_then(|payload| match payload {
-                        TimelinePayload::FileOperation(operation) => {
-                            Some(file_operation_verb(operation.operation))
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-                path
+                file_operation_verb(operation.operation),
+                operation.path
             ),
             None => process_title(row),
         };
         // The change's size is what tells one row from another at a glance; a
         // row whose operation carries no readable patch simply has none.
-        let counts = self
-            .timeline_row_latest_payload(row)
-            .and_then(|payload| match payload {
-                TimelinePayload::FileOperation(operation) => {
-                    crate::file_diff::line_counts(operation)
-                }
-                _ => None,
-            });
+        let counts = self.timeline_row_line_counts(row);
         let diff_row = row.clone();
         let diff_path = operation_path.clone();
         let mut element = div()
@@ -22486,11 +22502,8 @@ impl MobileApp {
     /// Opens one file change as a full screen.
     fn open_timeline_file_diff(&mut self, row: &TimelineRow, path: String, cx: &mut Context<Self>) {
         let preview = self
-            .timeline_row_latest_payload(row)
-            .and_then(|payload| match payload {
-                TimelinePayload::FileOperation(operation) => crate::file_diff::project(operation),
-                _ => None,
-            });
+            .timeline_row_file_operation(row)
+            .and_then(|operation| crate::file_diff::project(&operation));
         let Some(preview) = preview else {
             self.hint(
                 Tone::Info,
