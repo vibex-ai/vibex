@@ -47,6 +47,7 @@ Read these files before backend work:
 | [Desktop Application Updates](./app-update.md) | Touching signed release discovery, artifact verification, update scheduling, installation recovery, or updater UI state. |
 | [Provider Configuration](./provider-config.md) | Touching Provider profiles, MCP, Skills, runtime injection, health checks, or config import/export. |
 | [Remote and Relay Protocol](./remote-relay-protocol.md) | Touching LAN access, WebSocket APIs, pairing, device permissions, Relay rooms, or E2EE transport. |
+| [SSH and WSL Remote Runtime](./ssh-remote-runtime.md) | Touching SSH/WSL provisioning, its release flag, remote scripts, the tunnel, bootstrap, or upgrade/uninstall on a remote host. |
 | [Embedded Browser](./embedded-browser.md) | Touching the embedded browser panel, CDP integration, screencast frames, browser MCP tools, or browser navigation policy. |
 | [Database Guidelines](./database-guidelines.md) | Adding SQLite tables, migrations, persistence, or local file storage. |
 | [Error Handling](./error-handling.md) | Adding service errors, adapter failures, API errors, or user-visible diagnostics. |
