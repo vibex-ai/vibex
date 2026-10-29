@@ -463,11 +463,6 @@ pub struct Transcript {
     last_selected: Option<usize>,
     /// Display line the viewport started at in the last frame.
     scroll_offset: usize,
-    /// Whether the last window the reader was shown followed the live tail.
-    ///
-    /// The scroll state arrives per frame, but one decision outlives the frame:
-    /// a body that lands while the reader is at the tail stays open.
-    follow_tail: bool,
     /// Rows the viewport held in the last frame.
     ///
     /// Kept beside [`Transcript::scroll_offset`], and for the same reason: the
@@ -533,7 +528,6 @@ impl Transcript {
             phase: 0,
             last_selected: None,
             scroll_offset: 0,
-            follow_tail: true,
             viewport_rows: 0,
             stats: TranscriptStats::default(),
             pictures: false,
@@ -705,20 +699,6 @@ impl Transcript {
             block.group_summary = None;
         }
 
-        // A body that lands while the reader is watching it arrive stays open.
-        //
-        // While a block streams it is drawn whole and the fold does not apply;
-        // the fold lands the moment it settles, which is exactly when the answer
-        // the reader has been waiting for would shrink to a four-line preview in
-        // front of them. A block that stops streaming while the reader is at the
-        // tail is left expanded — they fold it themselves when they are done —
-        // and a body that lands while they are scrolled away folds as before.
-        let landing_in_view = self.follow_tail
-            && self.blocks.iter().any(|block| block.streaming)
-            && !blocks.iter().any(|block| block.streaming);
-        if landing_in_view && let Some(index) = blocks.iter().rposition(|block| block.collapsible) {
-            blocks[index].expanded = true;
-        }
         // A reader's explicit choice about a turn's process section outlives a
         // rebuild exactly as a reasoning expansion does; the projection supplies
         // the default the choice overrides. Choices leave with the turn that
@@ -1860,7 +1840,6 @@ impl Transcript {
         };
         let end = (offset + height).min(total);
         self.scroll_offset = offset;
-        self.follow_tail = scroll.follow;
 
         let mut lines = Vec::with_capacity(height);
         // The pictures of the rows this window draws, in its own coordinates:
@@ -4486,53 +4465,33 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_that_lands_in_front_of_the_reader_stays_open() {
+    fn a_tool_call_that_lands_in_front_of_the_reader_stays_folded() {
+        // Tool output is payload, not prose: a settled call must not unfold
+        // just because the reader was watching it stream. The compact row is
+        // what keeps a long session readable, and the call stays the reader's
+        // to open deliberately.
         let long = "word ".repeat(2000);
         let strings = strings();
         let palette = theme();
         let mut transcript = Transcript::new();
         transcript.configure(80, &theme());
-        let mut streaming = block("answer", TimelineRowKind::AgentMessage, &long);
+        let mut streaming = block("tool", TimelineRowKind::ToolCall, &long);
         streaming.streaming = true;
         transcript.set_blocks(vec![streaming]);
         transcript.visible_lines(ScrollState::default(), 100, &palette, strings);
 
-        // The turn settles: the same block comes back with its flag cleared.
-        transcript.set_blocks(vec![block("answer", TimelineRowKind::AgentMessage, &long)]);
+        // The call settles: the same block comes back with its flag cleared.
+        transcript.set_blocks(vec![block("tool", TimelineRowKind::ToolCall, &long)]);
         let index = transcript
-            .index_of_block("answer")
+            .index_of_block("tool")
             .expect("the block stays in the transcript");
-        assert!(
-            transcript.block(index).expect("the block").is_open(),
-            "the answer that landed in front of the reader is still shown whole"
-        );
-        // And it is still the reader's to fold.
-        assert!(transcript.toggle_block(index));
-        assert!(!transcript.block(index).expect("the block").is_open());
+        let block = transcript.block(index).expect("the block");
+        assert!(!block.expanded, "a settled tool call stays folded");
+        assert!(!block.is_open(), "its payload must not unfold with it");
 
-        // The same landing, with the reader scrolled away from the tail.
-        let mut away = Transcript::new();
-        away.configure(80, &theme());
-        let mut streaming = block("answer", TimelineRowKind::AgentMessage, &long);
-        streaming.streaming = true;
-        away.set_blocks(vec![streaming]);
-        away.visible_lines(
-            ScrollState {
-                follow: false,
-                ..ScrollState::default()
-            },
-            100,
-            &palette,
-            strings,
-        );
-        away.set_blocks(vec![block("answer", TimelineRowKind::AgentMessage, &long)]);
-        let index = away
-            .index_of_block("answer")
-            .expect("the block stays in the transcript");
-        assert!(
-            !away.block(index).expect("the block").is_open(),
-            "a body that lands out of sight folds"
-        );
+        // And the reader can still choose to read the whole call.
+        assert!(transcript.toggle_block(index));
+        assert!(transcript.block(index).expect("the block").is_open());
     }
 
     #[test]

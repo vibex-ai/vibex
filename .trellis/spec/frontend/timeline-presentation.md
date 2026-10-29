@@ -62,7 +62,9 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   the activity group.
 - Explicit expansion/collapse wins over live defaults and survives refresh.
   Mobile opens active groups by the shared desktop rule. Individual tool
-  details stay collapsed until requested.
+  details stay collapsed until requested: a TUI tool call that settles while
+  the reader is following the tail keeps its compact row instead of unfolding
+  its payload.
 - TUI groups three or more settled typed activities by turn and runtime,
   summarizes all action categories, and deduplicates changed files by full
   path. Running, failing, or approval-pending activities stay visible.

@@ -108,12 +108,14 @@ Agent replies render Markdown as text arrives, including wrapped code and tables
 
 Tool calls and reasoning use compact disclosure rows (`▸` / `▾`). Their layout
 stays the same while running and after completion. Click a header or press `e`
-to open it. Three or more settled activities in the same turn and runtime share
-a summary with action counts. Opening that summary reveals the individual
-headers; opening a child reveals its details. Thin vertical lines connect both
-levels. The summary remains available, and closing it also closes every child.
-Running, failed and approval-pending activities stay separately visible.
-Updates preserve your expansion choices.
+to open it. A tool call never opens its payload by itself: one that settles
+while you are following the tail keeps its compact row. Three or more settled
+activities in the same turn and runtime share a summary with action counts.
+Opening that summary reveals the individual headers; opening a child reveals
+its details. Thin vertical lines connect both levels. The summary remains
+available, and closing it also closes every child. Running, failed and
+approval-pending activities stay separately visible. Updates preserve your
+expansion choices.
 
 Reasoning can follow the latest live content at the bottom or remain in the
 timeline. Settings also control whether reasoning starts expanded and whether
