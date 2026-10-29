@@ -21,6 +21,7 @@ use super::artifact::LocalArtifact;
 use super::command::SshCommand;
 use super::install::{InstallError, InstallOutcome, install_artifact};
 use super::launch::LaunchConfig;
+use super::launchd;
 use super::profile::SshRuntimeChannel;
 use super::supervisor::{self, SupervisorError};
 
@@ -157,16 +158,12 @@ pub fn upgrade_runtime(
         Err(error) => return Err(rollback(command, launch, None, error)),
     };
 
-    if let Err(error) = supervisor::ensure_started(command, launch) {
+    if let Err(error) = ensure_started(command, launch) {
         return Err(rollback(
             command,
             launch,
             Some(&snapshot),
-            UpgradeError::new(
-                "ssh_upgrade_start_failed",
-                UpgradePhase::Starting,
-                supervisor_message(error),
-            ),
+            UpgradeError::new("ssh_upgrade_start_failed", UpgradePhase::Starting, error),
         ));
     }
 
@@ -204,13 +201,25 @@ fn rollback(
         Ok(()) => steps.push("current_previous"),
         Err(_) => steps.push("switch_failed"),
     }
-    match supervisor::ensure_started(command, launch) {
+    match ensure_started(command, launch) {
         Ok(_) => steps.push("old_started"),
         Err(_) => steps.push("old_start_failed"),
     }
     error.phase = UpgradePhase::RollingBack;
     error.rollback = Some(steps.join(","));
     error
+}
+
+fn ensure_started(command: &SshCommand, launch: &LaunchConfig) -> Result<(), String> {
+    if let Some(label) = launch.launch_agent_label.as_deref() {
+        launchd::ensure_started(command, launch, label)
+            .map(|_| ())
+            .map_err(|error| format!("{}: {}", error.code, error.message))
+    } else {
+        supervisor::ensure_started(command, launch)
+            .map(|_| ())
+            .map_err(|error| format!("{}: {}", error.code, error.message))
+    }
 }
 
 fn snapshot_database(command: &SshCommand, launch: &LaunchConfig) -> Result<String, UpgradeError> {
