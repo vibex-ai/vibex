@@ -129,6 +129,28 @@ fn run_computer_helper() -> Result<(), String> {
 }
 
 fn main() {
+    // GPUI's Windows startup path needs more than the default 1 MiB main
+    // stack. Run the real entry point on a named thread with a bounded but
+    // generous stack so a debug build does not overflow before the first
+    // window opens.
+    #[cfg(target_os = "windows")]
+    {
+        let handle = std::thread::Builder::new()
+            .name("vibex-main".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(run)
+            .expect("the Vibex main thread could not start");
+        if handle.join().is_err() {
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        run();
+    }
+}
+
+fn run() {
     configure_allocator();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     // Both self-exec sidecar modes are dispatched here. They run before any
