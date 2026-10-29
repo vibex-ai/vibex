@@ -387,15 +387,23 @@ pub fn localhost_forwarded(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh_connection::test_support;
+
+    /// A fake `wsl.exe` written and executed the way the rest of the SSH tests
+    /// do it, so a parallel test binary cannot hit `ETXTBSY` on it.
+    #[cfg(unix)]
+    fn fake_wsl(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = test_support::unique_path(dir, "wsl");
+        test_support::write_executable(&path, body);
+        path
+    }
 
     #[cfg(unix)]
     #[test]
     fn lists_distros_through_wsl_exe() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let wsl = dir.path().join("wsl");
-        std::fs::write(&wsl, "#!/bin/sh\nprintf 'Ubuntu-24.04\\nDebian\\n'\n").unwrap();
-        std::fs::set_permissions(&wsl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wsl = fake_wsl(dir.path(), "#!/bin/sh\nprintf 'Ubuntu-24.04\\nDebian\\n'\n");
+        let _guard = test_support::process_guard();
         assert_eq!(list_distros(&wsl).unwrap(), ["Ubuntu-24.04", "Debian"]);
     }
 
@@ -415,19 +423,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn builds_exec_shell_arguments_and_sends_the_script_on_stdin() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let wsl = dir.path().join("wsl");
         let capture = dir.path().join("args");
-        std::fs::write(
-            &wsl,
-            format!(
+        let wsl = fake_wsl(
+            dir.path(),
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat >/dev/null\n",
                 capture.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wsl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
+        let _guard = test_support::process_guard();
         let mut command = WslCommand::new(&wsl, "Ubuntu-24.04");
         command.remote_script("set -eu\necho ok\n").unwrap();
         command.arg("one two").arg("three");
@@ -450,15 +455,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probes_with_a_fake_wsl_and_parses_the_environment() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let wsl = dir.path().join("wsl");
-        std::fs::write(
-            &wsl,
+        let wsl = fake_wsl(
+            dir.path(),
             "#!/bin/sh\ncat >/dev/null\nprintf 'probe=ok\\nos=Linux\\narch=aarch64\\nhome=/home/dev\\nshell=/bin/bash\\ngit=yes\\nsha256sum=yes\\nfree_kb=1048576\\nglibc=2.36\\nhome_writable=yes\\nport=free\\nruntime=absent\\n'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&wsl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
+        let _guard = test_support::process_guard();
         let environment = probe_environment(&wsl, "Ubuntu", 8765).unwrap();
         assert_eq!(environment.os, "Linux");
         assert_eq!(
