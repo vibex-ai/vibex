@@ -252,9 +252,9 @@ use crate::spinner::Spinner;
 use crate::ssh_connection::{
     LaunchConfig, MIN_FREE_KB, ProvisioningRunOutcome, ProvisioningService,
     ProvisioningServiceEvent, ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep,
-    SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshProfileStore,
-    SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess, TunnelSpec,
-    default_ssh_config_path, discover_default_hosts, download_server_artifact, probe,
+    SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshMacOsLifecycle,
+    SshProfileStore, SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess,
+    TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact, probe,
     resolve_effective_default, select_local_port, select_server_artifact, supervisor,
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
@@ -14478,6 +14478,13 @@ impl VibexWorkbench {
                 profile.remote_port,
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let launch = if profile.macos_lifecycle == SshMacOsLifecycle::LaunchAgent {
+                launch.with_launch_agent(crate::ssh_connection::launchd::label_for_profile(
+                    &profile.id,
+                ))
+            } else {
+                launch
+            };
             let effects = SshProvisioningEffects::new(
                 command,
                 destination,
@@ -15006,6 +15013,10 @@ impl VibexWorkbench {
             &profile.workspace_roots,
             profile.remote_port,
         ) {
+            Ok(launch) if profile.macos_lifecycle == SshMacOsLifecycle::LaunchAgent => launch
+                .with_launch_agent(crate::ssh_connection::launchd::label_for_profile(
+                    &profile.id,
+                )),
             Ok(launch) => launch,
             Err(error) => {
                 self.finish_runtime_connect_failure(
@@ -15052,8 +15063,13 @@ impl VibexWorkbench {
         let spawn_spec = spec.clone();
         let monitor_spec = spec;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            supervisor::ensure_started(&command, &launch)
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            if let Some(label) = launch.launch_agent_label.as_deref() {
+                crate::ssh_connection::launchd::ensure_started(&command, &launch, label)
+                    .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            } else {
+                supervisor::ensure_started(&command, &launch)
+                    .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            }
             let tunnel = TunnelProcess::spawn(&spawn_spec)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -15885,6 +15901,14 @@ impl VibexWorkbench {
         }
         if let Some(profile) = upgrade_profile.as_ref() {
             rows.push(self.render_runtime_upgrade_policy(profile, cx));
+            if profile.remote_os.as_deref().is_some_and(|os| {
+                matches!(
+                    os.trim().to_ascii_lowercase().as_str(),
+                    "macos" | "mac" | "osx" | "darwin"
+                )
+            }) {
+                rows.push(self.render_macos_lifecycle(profile, cx));
+            }
         }
         if self
             .runtime_upgrade_pending
@@ -16130,6 +16154,85 @@ impl VibexWorkbench {
         if store.save(&profiles).is_ok() {
             cx.notify();
         }
+    }
+
+    fn set_macos_lifecycle(
+        &mut self,
+        profile_id: &str,
+        lifecycle: SshMacOsLifecycle,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = SshProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
+            return;
+        };
+        if profile.macos_lifecycle == lifecycle {
+            return;
+        }
+        profile.macos_lifecycle = lifecycle;
+        if store.save(&profiles).is_ok() {
+            cx.notify();
+        }
+    }
+
+    fn render_macos_lifecycle(
+        &self,
+        profile: &SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let profile_id = profile.id.clone();
+        let options = [
+            (
+                "runtime-macos-lifecycle-nohup",
+                SshMacOsLifecycle::Nohup,
+                locale::text("nohup", "nohup", "nohup"),
+            ),
+            (
+                "runtime-macos-lifecycle-agent",
+                SshMacOsLifecycle::LaunchAgent,
+                locale::text("At login", "登录时", "登入時"),
+            ),
+        ];
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "macOS lifecycle",
+                        "macOS 启动方式",
+                        "macOS 啟動方式",
+                    )),
+            )
+            .child(h_flex().w_full().gap_1().children(options.into_iter().map(
+                |(id, lifecycle, label)| {
+                    let profile_id = profile_id.clone();
+                    Button::new(id)
+                        .small()
+                        .when(profile.macos_lifecycle == lifecycle, |button| {
+                            button.primary()
+                        })
+                        .when(profile.macos_lifecycle != lifecycle, |button| {
+                            button.ghost()
+                        })
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_macos_lifecycle(&profile_id, lifecycle, cx)
+                        }))
+                        .into_any_element()
+                },
+            )))
+            .into_any_element()
     }
 
     fn render_runtime_upgrade_policy(
@@ -83757,6 +83860,7 @@ impl FoundationSettings {
                 channel: SshRuntimeChannel::Stable,
                 runtime_version: None,
                 upgrade_policy: crate::ssh_connection::profile::SshUpgradePolicy::Notify,
+                macos_lifecycle: crate::ssh_connection::profile::SshMacOsLifecycle::Nohup,
                 registered_runtime_id: None,
                 created_at_ms: now,
                 last_connected_at_ms: None,
@@ -108405,6 +108509,7 @@ mod tests {
         assert!(source.contains("runtime-upgrade-policy-notify"));
         assert!(source.contains("runtime-upgrade-confirm"));
         assert!(source.contains("SshUpgradePolicy"));
+        assert!(source.contains("runtime-macos-lifecycle-agent"));
         assert!(source.contains("connections-diagnostic-copy"));
         assert!(source.contains("connections-diagnostic-log-command"));
         assert!(source.contains("connection_diagnostic_title"));

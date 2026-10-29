@@ -40,6 +40,14 @@ pub enum SshUpgradePolicy {
     Pinned,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SshMacOsLifecycle {
+    #[default]
+    Nohup,
+    LaunchAgent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshConnectionProfile {
@@ -68,6 +76,8 @@ pub struct SshConnectionProfile {
     pub runtime_version: Option<String>,
     #[serde(default)]
     pub upgrade_policy: SshUpgradePolicy,
+    #[serde(default)]
+    pub macos_lifecycle: SshMacOsLifecycle,
     /// The registry id this profile produced, when it has been provisioned.
     /// Optional so stores written before runtime binding remain valid.
     #[serde(default)]
@@ -578,6 +588,7 @@ mod tests {
             channel: SshRuntimeChannel::Rc,
             runtime_version: Some("0.1.0-rc.8".to_string()),
             upgrade_policy: SshUpgradePolicy::Notify,
+            macos_lifecycle: SshMacOsLifecycle::Nohup,
             registered_runtime_id: None,
             created_at_ms: 1_700_000_000_000,
             last_connected_at_ms: Some(1_700_000_100_000),

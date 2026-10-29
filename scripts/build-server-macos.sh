@@ -15,15 +15,27 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 VERSION=${1:-$(node -p "require('./package.json').version")}
-ARCH=aarch64
+ARCH=${VIBEX_MACOS_ARCH:-aarch64}
+case "$ARCH" in
+  aarch64) TARGET="" ;;
+  x86_64) TARGET="x86_64-apple-darwin" ;;
+  *) echo "build-server-macos: unsupported arch $ARCH" >&2; exit 1 ;;
+esac
 OUT=target/server-artifacts-macos
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/vibex-server-macos.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT INT TERM
 
 PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
-cargo build -p vibex-server --release --locked
-BINARY=target/release/vibex-server
+if [ -n "$TARGET" ]; then
+  rustup target add "$TARGET" >/dev/null 2>&1 || true
+  cargo build -p vibex-server --release --locked --target "$TARGET"
+  BINARY="target/$TARGET/release/vibex-server"
+else
+  cargo build -p vibex-server --release --locked
+  BINARY=target/release/vibex-server
+fi
 test -x "$BINARY"
+codesign --force --sign - "$BINARY"
 codesign --verify "$BINARY"
 
 cp "$BINARY" "$STAGE/vibex-server"

@@ -25,8 +25,8 @@ use sha2::{Digest as _, Sha256};
 use vibex_desktop::ssh_connection::{
     LaunchConfig, LocalArtifact, MIN_FREE_KB, ProvisioningCoordinator, ProvisioningRunOutcome,
     RemoteArch, RunCancellation, SshCommand, SshDestination, SshProvisioningEffects,
-    SshRuntimeChannel, install::install_artifact, probe, run_provisioning, select_local_port,
-    supervisor, upgrade::upgrade_runtime,
+    SshRuntimeChannel, install::install_artifact, launchd, probe, run_provisioning,
+    select_local_port, supervisor, upgrade::upgrade_runtime,
 };
 
 fn now_ms() -> i64 {
@@ -318,13 +318,17 @@ async fn provisioning_reaches_ready_over_sshd() {
         .unwrap_or(RemoteArch::X86_64);
     let version = std::env::var("VIBEX_SSH_E2E_ARTIFACT_VERSION")
         .unwrap_or_else(|_| "0.1.0-rc.8".to_string());
-    let launch = LaunchConfig::new(
+    let mut launch = LaunchConfig::new(
         &remote_home,
         &remote_root,
         std::slice::from_ref(&remote_home),
         8765,
     )
     .expect("launch config");
+    let launchd_lifecycle = std::env::var("VIBEX_SSH_E2E_LIFECYCLE").as_deref() == Ok("launchd");
+    if launchd_lifecycle {
+        launch = launch.with_launch_agent(launchd::label_for_profile("e2e-profile"));
+    }
     let local_port = select_local_port(0, 1).expect("local tunnel port");
     let desktop_home = tempfile::tempdir().expect("desktop home");
     let artifact = LocalArtifact {
@@ -376,4 +380,8 @@ async fn provisioning_reaches_ready_over_sshd() {
     let stop = supervisor::ensure_stopped(&command, &launch);
     let _ = effects.take_tunnel_process();
     stop.expect("runtime should stop");
+    if launchd_lifecycle {
+        launchd::remove(&command, &launch, "dev.vibex.server.e2e-profile")
+            .expect("unload and remove LaunchAgent");
+    }
 }

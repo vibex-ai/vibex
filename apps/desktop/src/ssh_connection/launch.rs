@@ -26,6 +26,8 @@ pub struct LaunchConfig {
     pub binary: String,
     pub workspace_roots: Vec<String>,
     pub remote_port: u16,
+    /// macOS-only: use a user LaunchAgent instead of `nohup`.
+    pub launch_agent_label: Option<String>,
 }
 
 impl LaunchConfig {
@@ -70,7 +72,13 @@ impl LaunchConfig {
             binary: format!("{remote_install_root}/current/vibex-server"),
             workspace_roots: workspace_roots.to_vec(),
             remote_port,
+            launch_agent_label: None,
         })
+    }
+
+    pub fn with_launch_agent(mut self, label: impl Into<String>) -> Self {
+        self.launch_agent_label = Some(label.into());
+        self
     }
 
     pub fn env_pairs(&self) -> Vec<(&'static str, String)> {

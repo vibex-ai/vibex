@@ -15,6 +15,7 @@ use super::command::{SshCommand, SshDestination};
 use super::environment::{self, MIN_FREE_KB, RemoteEnvironment};
 use super::install::{self, InstallError, InstallOutcome};
 use super::launch::LaunchConfig;
+use super::launchd::{self, LaunchdError};
 use super::pairing::{self, PairingError, PairingOutcome};
 use super::provisioning_run::{ProvisioningEffectError, ProvisioningEffects};
 use super::supervisor::{self, ServerStatus, SupervisorError};
@@ -150,8 +151,11 @@ impl ProvisioningEffects for SshProvisioningEffects {
     }
 
     async fn start(&mut self) -> Result<(), ProvisioningEffectError> {
-        let status =
-            supervisor::ensure_started(&self.command, &self.launch).map_err(map_supervisor)?;
+        let status = if let Some(label) = self.launch.launch_agent_label.as_deref() {
+            launchd::ensure_started(&self.command, &self.launch, label).map_err(map_launchd)?
+        } else {
+            supervisor::ensure_started(&self.command, &self.launch).map_err(map_supervisor)?
+        };
         self.runtime_status = Some(status);
         Ok(())
     }
@@ -226,6 +230,10 @@ fn map_install(error: InstallError) -> ProvisioningEffectError {
 }
 
 fn map_supervisor(error: SupervisorError) -> ProvisioningEffectError {
+    ProvisioningEffectError::new(error.code, error.message).retryable(error.retryable)
+}
+
+fn map_launchd(error: LaunchdError) -> ProvisioningEffectError {
     ProvisioningEffectError::new(error.code, error.message).retryable(error.retryable)
 }
 

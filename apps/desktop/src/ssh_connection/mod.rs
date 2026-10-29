@@ -15,6 +15,7 @@ pub mod error;
 pub mod host_key;
 pub mod install;
 pub mod launch;
+pub mod launchd;
 pub mod pairing;
 pub mod profile;
 pub mod provisioning;
@@ -49,8 +50,8 @@ pub use pairing::{
     claim_and_register, fetch_pairing_code, parse_pairing_payload,
 };
 pub use profile::{
-    SCHEMA_VERSION, STORE_FILE_NAME, SshConnectionProfile, SshProfileStore, SshRuntimeChannel,
-    SshUpgradePolicy,
+    SCHEMA_VERSION, STORE_FILE_NAME, SshConnectionProfile, SshMacOsLifecycle, SshProfileStore,
+    SshRuntimeChannel, SshUpgradePolicy,
 };
 pub use provisioning::{
     ProvisioningBegin, ProvisioningControlError, ProvisioningCoordinator, ProvisioningEvent,
