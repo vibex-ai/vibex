@@ -13,6 +13,8 @@
 # The one-time token/signature envelope is a product-layer concern; this script
 # is the auditable payload it wraps. Do not claim a token was verified here.
 set -eu
+NL='
+'
 
 usage() {
     cat <<'USAGE'
@@ -50,6 +52,9 @@ case "$PORT" in
     ''|*[!0-9]*) fail "--port must be numeric" ;;
 esac
 
+case "$PUBLIC_KEY" in
+    *"$NL"*) fail "the public key must be a single line" ;;
+esac
 case "$PUBLIC_KEY" in
     ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *)
         ;;

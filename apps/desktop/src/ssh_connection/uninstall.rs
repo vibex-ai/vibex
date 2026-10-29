@@ -49,7 +49,7 @@ pub fn uninstall_runtime(
     config: &LaunchConfig,
     remove_home: bool,
 ) -> Result<UninstallOutcome, UninstallError> {
-    validate_root(&config.remote_install_root)?;
+    validate_root(&config.remote_install_root, &config.remote_home)?;
     if let Some(label) = config.launch_agent_label.as_deref() {
         let _ = launchd::remove(command, config, label);
     }
@@ -92,10 +92,13 @@ pub fn uninstall_runtime(
     })
 }
 
-fn validate_root(root: &str) -> Result<(), UninstallError> {
+fn validate_root(root: &str, remote_home: &str) -> Result<(), UninstallError> {
+    let home = remote_home.trim_end_matches('/');
     if root.is_empty()
         || root == "/"
+        || root == home
         || !root.starts_with('/')
+        || !root.starts_with(&format!("{home}/"))
         || root.contains('\0')
         || root.contains('\n')
         || root.split('/').any(|part| part == "..")
@@ -144,10 +147,12 @@ mod tests {
 
     #[test]
     fn rejects_root_and_parent_targets() {
-        assert!(validate_root("/").is_err());
-        assert!(validate_root("/home/dev/../etc").is_err());
-        assert!(validate_root("relative").is_err());
-        assert!(validate_root("/home/dev/.local/share/vibex/server").is_ok());
+        assert!(validate_root("/", "/home/dev").is_err());
+        assert!(validate_root("/home/dev/../etc", "/home/dev").is_err());
+        assert!(validate_root("relative", "/home/dev").is_err());
+        assert!(validate_root("/home/dev", "/home/dev").is_err());
+        assert!(validate_root("/etc", "/home/dev").is_err());
+        assert!(validate_root("/home/dev/.local/share/vibex/server", "/home/dev").is_ok());
     }
 
     #[test]
@@ -157,6 +162,6 @@ mod tests {
         assert!(UNINSTALL_SCRIPT.contains("home_preserved=yes"));
         assert!(!UNINSTALL_SCRIPT.contains("/home/dev/src"));
         let config = config();
-        assert!(validate_root(&config.remote_install_root).is_ok());
+        assert!(validate_root(&config.remote_install_root, &config.remote_home).is_ok());
     }
 }
