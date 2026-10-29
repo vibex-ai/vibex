@@ -16,6 +16,9 @@ on:
       - "scripts/e2e-ssh-docker.sh"
       - ".github/workflows/ssh-e2e.yml"
 
+permissions:
+  contents: read
+
 jobs:
   docker-sshd:
     name: Docker sshd provisioning
