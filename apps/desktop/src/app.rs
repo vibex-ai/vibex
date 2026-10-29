@@ -80968,6 +80968,8 @@ struct FoundationSettings {
     connections_wsl_distros: Vec<String>,
     connections_wsl_selected: Option<String>,
     connections_wsl_error: Option<String>,
+    bootstrap_command: Option<crate::ssh_connection::bootstrap::BootstrapCommand>,
+    bootstrap_error: Option<String>,
     active_section: SettingsSection,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
@@ -81435,6 +81437,8 @@ impl FoundationSettings {
                 connections_wsl_distros: Vec::new(),
                 connections_wsl_selected: None,
                 connections_wsl_error: None,
+                bootstrap_command: None,
+                bootstrap_error: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
@@ -84928,6 +84932,34 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn generate_bootstrap_command(&mut self, cx: &mut Context<Self>) {
+        self.bootstrap_error = None;
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from);
+        let Some(home) = home else {
+            self.bootstrap_error = Some("the local home directory is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let key = ["id_ed25519.pub", "id_rsa.pub", "id_ecdsa.pub"]
+            .iter()
+            .find_map(|name| std::fs::read_to_string(home.join(".ssh").join(name)).ok())
+            .map(|value| value.trim().to_string());
+        let Some(key) = key.filter(|value| !value.is_empty()) else {
+            self.bootstrap_error = Some(
+                "no ~/.ssh/id_ed25519.pub (or RSA/ECDSA) was found; create a key first".to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        match crate::ssh_connection::bootstrap::generate("ubuntu", &key, 22, unix_timestamp_ms()) {
+            Ok(command) => self.bootstrap_command = Some(command),
+            Err(error) => self.bootstrap_error = Some(format!("{}: {}", error.code, error.message)),
+        }
+        cx.notify();
+    }
+
     fn load_wsl_distros(&mut self, cx: &mut Context<Self>) {
         self.connections_wsl_open = true;
         self.connections_wsl_error = None;
@@ -84973,6 +85005,13 @@ impl FoundationSettings {
                 this.load_connections_discovery(cx);
             }));
 
+        let bootstrap_button = Button::new("connections-bootstrap")
+            .small()
+            .outline()
+            .label(locale::text("Bootstrap SSH", "初始化 SSH", "初始化 SSH"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.generate_bootstrap_command(cx);
+            }));
         let wsl_button = Button::new("connections-add-wsl")
             .small()
             .outline()
@@ -85101,6 +85140,95 @@ impl FoundationSettings {
                 children,
             ));
         }
+        if self.bootstrap_command.is_some() || self.bootstrap_error.is_some() {
+            let close = Button::new("connections-bootstrap-close")
+                .small()
+                .ghost()
+                .label(locale::text("Close", "关闭", "關閉"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.bootstrap_command = None;
+                    this.bootstrap_error = None;
+                    cx.notify();
+                }));
+            let copy = Button::new("connections-bootstrap-copy")
+                .small()
+                .outline()
+                .label(locale::text("Copy command", "复制命令", "複製命令"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(command) = this.bootstrap_command.as_ref() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(command.command.clone()));
+                    }
+                }));
+            let recheck = Button::new("connections-bootstrap-recheck")
+                .small()
+                .outline()
+                .label(locale::text("Recheck SSH", "重新检测 SSH", "重新偵測 SSH"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.bootstrap_command = None;
+                    this.bootstrap_error = None;
+                    this.load_connections_discovery(cx);
+                }));
+            let mut children = vec![div()
+                .text_xs()
+                .text_color(muted)
+                .child(locale::text(
+                    "Run this in the provider console or serial console. It installs sshd, authorizes the displayed desktop key, and expires after 15 minutes.",
+                    "在云控制台或串口控制台执行。它会安装 sshd、注入显示的桌面公钥，并在 15 分钟后过期。",
+                    "在雲端主控台或序列埠主控台執行。它會安裝 sshd、注入顯示的桌面公鑰，並在 15 分鐘後過期。",
+                ))
+                .into_any_element()];
+            if let Some(error) = &self.bootstrap_error {
+                children.push(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(error.clone())
+                        .into_any_element(),
+                );
+            }
+            if let Some(command) = &self.bootstrap_command {
+                children.push(
+                    div()
+                        .w_full()
+                        .rounded_md()
+                        .bg(cx.theme().muted)
+                        .p_2()
+                        .child(
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .font_family("monospace")
+                                .whitespace_normal()
+                                .child(command.command.clone()),
+                        )
+                        .into_any_element(),
+                );
+                children.push(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .gap_2()
+                        .child(close)
+                        .child(recheck)
+                        .child(copy)
+                        .into_any_element(),
+                );
+            } else {
+                children.push(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(close)
+                        .into_any_element(),
+                );
+            }
+            groups.push(SettingsGroup::new(
+                locale::text("Bootstrap without SSH", "无 SSH 初始化", "無 SSH 初始化"),
+                children,
+            ));
+        }
+
         if self.connections_wsl_open {
             let close = Button::new("connections-wsl-close")
                 .small()
@@ -85213,6 +85341,7 @@ impl FoundationSettings {
             .items_center()
             .justify_end()
             .gap_2()
+            .child(bootstrap_button)
             .child(wsl_button)
             .child(add_button)
             .into_any_element();
@@ -109866,6 +109995,7 @@ mod tests {
         assert!(source.contains("runtime-detail-uninstall"));
         assert!(source.contains("runtime-uninstall-confirm"));
         assert!(source.contains("connections-add-wsl"));
+        assert!(source.contains("connections-bootstrap"));
         assert!(source.contains("connections-wsl-connect"));
         assert!(source.contains("runtime-detail-edit"));
         assert!(source.contains("runtime-edit-save"));

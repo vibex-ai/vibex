@@ -62,6 +62,7 @@ sha2.workspace = true
 similar = "3.1.1"
 tray-icon.workspace = true
 base64.workspace = true
+uuid.workspace = true
 chrono = "0.4.45"
 futures-channel.workspace = true
 smallvec.workspace = true

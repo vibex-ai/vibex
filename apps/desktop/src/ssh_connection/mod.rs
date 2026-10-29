@@ -5,6 +5,7 @@
 //! code, or auth token.
 
 pub mod artifact;
+pub mod bootstrap;
 pub mod command;
 pub mod compat;
 pub mod config;

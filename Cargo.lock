@@ -10110,6 +10110,7 @@ dependencies = [
  "tracing",
  "tray-icon",
  "url",
+ "uuid",
  "vibex-agent",
  "vibex-agent-acp",
  "vibex-app-update",
