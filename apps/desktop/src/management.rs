@@ -21,8 +21,8 @@ use gpui::{
     canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
 use gpui_component::{
-    ActiveTheme as _, ColorName, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    Size, StyledExt as _, Theme, WindowExt as _,
+    ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
+    Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _, Toggle},
@@ -138,6 +138,25 @@ const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
 /// every sidebar button, and it stayed at 32 px while the rest of the interface
 /// followed the text-scale setting.
 const MANAGEMENT_SIDEBAR_CONTROL_HEIGHT: Rems = rems(2.0);
+/// How many Agent logos a Provider or route-group card draws before folding the
+/// rest into a `+N` count.
+///
+/// Twelve fills the card's footer at the sidebar's width while still leaving
+/// room for the count; five made the strip read as a sample rather than as the
+/// Agents that actually use the record.
+const MANAGEMENT_CARD_AGENT_LOGO_LIMIT: usize = 12;
+/// The bottom drawer that offers route groups no one has created yet.
+///
+/// The suggestions are a transient proposal, so they are docked below the
+/// saved list rather than being another card in it: the records the reader
+/// already made keep their place, and the proposal can be resized or dismissed.
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT: f32 = 260.0;
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT: f32 = 148.0;
+/// Releasing the drag below this closes the drawer, the way the changed-files
+/// drawer does, so a suggestion panel can be thrown away with the seam alone.
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_CLOSE_THRESHOLD: f32 = 172.0;
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP: f32 = 24.0;
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_RESIZE_HANDLE_HEIGHT: f32 = 12.0;
 /// The height the Skill preview keeps before it starts scrolling.
 ///
 /// The body is shown in full rather than summarised, but it must not push the
@@ -459,6 +478,21 @@ struct ManagementSidebarResizeDragState {
 struct ManagementSidebarResizeDrag;
 
 impl Render for ManagementSidebarResizeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ManagementRouteGroupSuggestionsResizeState {
+    start_window_y: f32,
+    start_height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagementRouteGroupSuggestionsResizeDrag;
+
+impl Render for ManagementRouteGroupSuggestionsResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
@@ -1334,6 +1368,13 @@ pub struct ManagementCenter {
     /// It is a suggestion, not a record: closing it hides the panel for this
     /// run without touching any group the reader saved.
     route_group_recommendations_open: bool,
+    /// The docked suggestion drawer's height, in logical pixels.
+    route_group_recommendations_height: f32,
+    /// The height of the sidebar region the drawer can occupy. Measured at
+    /// prepaint so a restored height is clamped against the current window.
+    route_group_recommendations_body_height: f32,
+    /// The live seam drag, while the pointer holds the drawer's top edge.
+    route_group_recommendations_resize: Option<ManagementRouteGroupSuggestionsResizeState>,
     /// The draft's search term for the model palette.
     route_group_model_query: Entity<InputState>,
     /// The draft's patience budget, in seconds. Empty disables retries.
@@ -2646,6 +2687,10 @@ impl ManagementCenter {
             route_group_name_error: None,
             route_group_model_members: Vec::new(),
             route_group_recommendations_open: true,
+            route_group_recommendations_height: MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT,
+            route_group_recommendations_body_height:
+                MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT,
+            route_group_recommendations_resize: None,
             route_group_model_query,
             route_group_patience,
             route_group_unlists: false,
@@ -12187,6 +12232,149 @@ impl ManagementCenter {
         });
     }
 
+    /// Imports every native Provider configuration this machine already has.
+    ///
+    /// This is the list-level Import: it is not scoped to the Agent whose page
+    /// the reader came from, because a Provider record is shared and the dialog
+    /// that used to own the action already read every Agent's file. It walks the
+    /// Agents the authority reports as import-capable, imports what their files
+    /// describe, and skips records that already exist so pressing it twice
+    /// cannot duplicate the list.
+    fn import_shared_providers(&mut self, agent_ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let targets = agent_ids
+            .into_iter()
+            .filter_map(|agent_id| AgentId::parse(agent_id).ok())
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.notice = Some(
+                management_locale_text(
+                    "No Agent on this machine keeps a native Provider configuration to import",
+                    "这台机器上没有可导入的原生供应商配置",
+                    "這台機器上沒有可匯入的原生供應商設定",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let active_locale = locale::current_locale();
+        let existing_profiles = self.provider_profiles.clone();
+        self.mutation = Some(ManagementMutation::ProviderPreview(
+            "native-import".to_string(),
+        ));
+        self.error = None;
+        self.notice = None;
+        // The preview reads config files and the CC Switch database — blocking
+        // I/O — so it stays on the Tokio bridge rather than the UI executor.
+        let preview_request = vibex_core::ProviderNativeImportPreviewRequest {
+            sources: vec![
+                vibex_core::ProviderNativeImportSource::Codex,
+                vibex_core::ProviderNativeImportSource::Claude,
+                vibex_core::ProviderNativeImportSource::CcSwitch,
+            ],
+        };
+        let runner = {
+            let backend = backend.clone();
+            gpui_tokio::Tokio::spawn(cx, async move {
+                let preview = backend
+                    .management()
+                    .preview_native_import(preview_request.clone())
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                let mut imported_profiles = Vec::new();
+                let mut imported_count = 0usize;
+                let mut missing_secret_count = 0usize;
+                for agent_id in &targets {
+                    for import_item_id in
+                        pending_native_import_item_ids(&preview, &existing_profiles, agent_id)
+                    {
+                        let result = backend
+                            .management()
+                            .create_profile_from_import(MutationRequest::new(
+                                vibex_core::ProviderNativeImportCreateRequest {
+                                    preview_request: preview_request.clone(),
+                                    import_item_id,
+                                },
+                            ))
+                            .await
+                            .map_err(crate::app::remote_error_into_vibex)?;
+                        imported_count += 1;
+                        if result.diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code
+                                == "provider_native_import_cc_switch_secret_keychain_unavailable"
+                        }) {
+                            missing_secret_count += 1;
+                        }
+                        imported_profiles.push(result.profile);
+                    }
+                }
+                Ok::<_, VibexError>((imported_count, missing_secret_count, imported_profiles))
+            })
+        };
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Err(error) => {
+                        this.error = Some(format!(
+                            "{}: {error}",
+                            management_locale_text("Import failed", "导入失败", "匯入失敗")
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Ok(Ok((0, _, _))) => {
+                        this.notice = Some(
+                            management_locale_text(
+                                "Every native Provider configuration is already imported",
+                                "原生供应商配置都已导入过了",
+                                "原生供應商設定都已匯入過了",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Ok(Ok((imported, missing_secrets, profiles))) => {
+                        this.notice = Some(match (active_locale, missing_secrets) {
+                            (ResolvedLocale::En, 0) => {
+                                format!("Imported {imported} configuration(s)")
+                            }
+                            (ResolvedLocale::En, missing) => format!(
+                                "Imported {imported} configuration(s); {missing} need API Keys"
+                            ),
+                            (ResolvedLocale::ZhCn, 0) => {
+                                format!("已导入 {imported} 个供应商配置")
+                            }
+                            (ResolvedLocale::ZhCn, missing) => format!(
+                                "已导入 {imported} 个供应商配置，其中 {missing} 个需要补充 API Key"
+                            ),
+                            (ResolvedLocale::ZhTw, 0) => {
+                                format!("已匯入 {imported} 個供應商設定")
+                            }
+                            (ResolvedLocale::ZhTw, missing) => format!(
+                                "已匯入 {imported} 個供應商設定，其中 {missing} 個需要補充 API Key"
+                            ),
+                        });
+                        this.native_import_report = Some(NativeImportReport {
+                            imported,
+                            missing_secrets,
+                        });
+                        this.apply_provider_profile_success(&profiles);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn preview_native_import(
         &mut self,
         import: bool,
@@ -12983,7 +13171,7 @@ impl ManagementCenter {
             let agent_stack = row
                 .agents
                 .iter()
-                .take(5)
+                .take(MANAGEMENT_CARD_AGENT_LOGO_LIMIT)
                 .map(|agent_id| {
                     let label = self
                         .snapshot
@@ -13119,12 +13307,15 @@ impl ManagementCenter {
                                     })
                                     .child(agent_brand_icon(&agent_id, px(14.0), None))
                             }))
-                            .when(agent_count > 5, |stack| {
+                            .when(agent_count > MANAGEMENT_CARD_AGENT_LOGO_LIMIT, |stack| {
                                 stack.child(
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(format!("+{}", agent_count - 5)),
+                                        .child(format!(
+                                            "+{}",
+                                            agent_count - MANAGEMENT_CARD_AGENT_LOGO_LIMIT
+                                        )),
                                 )
                             }),
                     )
@@ -13199,7 +13390,7 @@ impl ManagementCenter {
             let agent_stack = row
                 .agents
                 .iter()
-                .take(5)
+                .take(MANAGEMENT_CARD_AGENT_LOGO_LIMIT)
                 .map(|agent_id| {
                     let label = self
                         .snapshot
@@ -13308,13 +13499,16 @@ impl ManagementCenter {
                                     })
                                     .child(agent_brand_icon(&agent_id, px(14.0), None))
                             }))
-                            .when(agent_count > 5, |stack| {
+                            .when(agent_count > MANAGEMENT_CARD_AGENT_LOGO_LIMIT, |stack| {
                                 stack.child(
                                     div()
                                         .flex_none()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(format!("+{}", agent_count - 5)),
+                                        .child(format!(
+                                            "+{}",
+                                            agent_count - MANAGEMENT_CARD_AGENT_LOGO_LIMIT
+                                        )),
                                 )
                             }),
                     )
@@ -13335,9 +13529,6 @@ impl ManagementCenter {
                 ),
                 cx,
             ));
-        }
-        if self.providers_sidebar_tab == ProviderSidebarTab::RouteGroups {
-            route_group_list = route_group_list.child(self.render_route_group_recommendations(cx));
         }
         // A selection that points at a row which no longer exists falls back to
         // the first row, so the detail pane never describes a deleted group.
@@ -13392,67 +13583,118 @@ impl ManagementCenter {
             .then(|| self.render_catalog_status_row(cx));
         let import_report_row = (active_tab == ProviderSidebarTab::Providers)
             .then(|| self.render_native_import_report(cx));
+        // Both ways a Provider record enters this list sit in its heading. The
+        // import used to live one step deeper, inside the new-Provider dialog,
+        // so a reader looking at the list could not tell that importing an
+        // existing configuration was possible at all.
+        let importable_agents = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.added && vibex_core::is_user_visible_agent(&agent.id))
+            .map(|agent| agent.id.as_str().to_string())
+            .filter(|agent_id| {
+                AgentId::parse(agent_id.clone())
+                    .map(|agent_id| vibex_core::supports_native_provider_import(&agent_id))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let import_agents_for_click = importable_agents.clone();
+        let importing_native_data = matches!(
+            &self.mutation,
+            Some(ManagementMutation::ProviderPreview(action))
+                if action == "native-import" || action == "native-scan"
+        );
+        let route_group_suggestion_count = if active_tab == ProviderSidebarTab::RouteGroups {
+            self.recommended_route_groups().len()
+        } else {
+            0
+        };
         let (section_title, actions, section_body) = match active_tab {
             ProviderSidebarTab::Providers => (
                 // The list heading, not the tab: it names the records below it.
                 management_locale_text("Providers", "供应商", "供應商"),
                 vec![
-                    Button::new("management-provider-page-add")
-                        .xsmall()
-                        .outline()
-                        .icon(IconName::Plus)
-                        .tooltip(management_locale_text(
-                            "Add a Provider",
-                            "添加供应商",
-                            "新增供應商",
-                        ))
-                        .accessibility_label(management_locale_text(
-                            "Add a Provider",
-                            "添加供应商",
-                            "新增供應商",
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
+                    management_provider_header_action(
+                        "management-provider-page-add",
+                        Icon::new(IconName::Plus),
+                        management_locale_text("New", "新建", "新建"),
+                        management_locale_text("Add a Provider", "添加供应商", "新增供應商"),
+                        false,
+                        cx.listener(|this, _, window, cx| {
                             this.open_shared_provider_creator(window, cx)
-                        }))
-                        .into_any_element(),
+                        }),
+                    ),
+                    management_provider_header_action(
+                        "management-provider-page-import",
+                        Icon::default().path("icons/vibex/import.svg"),
+                        management_locale_text("Import", "导入", "匯入"),
+                        management_locale_text(
+                            "Import an existing configuration",
+                            "导入已有配置",
+                            "匯入既有配置",
+                        ),
+                        importing_native_data,
+                        cx.listener(move |this, _, _, cx| {
+                            this.import_shared_providers(import_agents_for_click.clone(), cx)
+                        }),
+                    ),
                 ],
                 list,
             ),
-            ProviderSidebarTab::RouteGroups => (
-                management_locale_text("Route groups", "路由组", "路由組"),
-                vec![
-                    Button::new("management-route-group-page-add")
-                        .xsmall()
-                        .outline()
-                        .icon(IconName::Plus)
-                        .tooltip(management_locale_text(
-                            "New route group",
-                            "新建路由组",
-                            "新增路由組",
-                        ))
-                        .accessibility_label(management_locale_text(
-                            "New route group",
-                            "新建路由组",
-                            "新增路由組",
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_route_group_editor(false, window, cx)
-                        }))
-                        .into_any_element(),
-                ],
-                route_group_list,
-            ),
+            ProviderSidebarTab::RouteGroups => {
+                let mut actions = vec![management_provider_header_action(
+                    "management-route-group-page-add",
+                    Icon::new(IconName::Plus),
+                    management_locale_text("New", "新建", "新建"),
+                    management_locale_text("New route group", "新建路由组", "新增路由組"),
+                    false,
+                    cx.listener(|this, _, window, cx| {
+                        this.open_route_group_editor(false, window, cx)
+                    }),
+                )];
+                // Closing the drawer leaves the suggestions reachable from the
+                // heading rather than only from a row at the bottom of a list
+                // the reader may have scrolled away from.
+                if route_group_suggestion_count > 0 && !self.route_group_recommendations_open {
+                    actions.push(
+                        Button::new("management-route-group-suggestions-show")
+                            .h(rems(2.25))
+                            .w(rems(2.25))
+                            .p_0()
+                            .outline()
+                            .icon(Icon::default().path("icons/vibex/sparkles.svg"))
+                            .tooltip(management_locale_text(
+                                "Show suggested groups",
+                                "显示推荐路由组",
+                                "顯示推薦路由組",
+                            ))
+                            .accessibility_label(management_locale_text(
+                                "Show suggested groups",
+                                "显示推荐路由组",
+                                "顯示推薦路由組",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.route_group_recommendations_open = true;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                (
+                    management_locale_text("Route groups", "路由组", "路由組"),
+                    actions,
+                    route_group_list,
+                )
+            }
         };
 
-        // The two groups are separated by the tab bar and their own headings:
-        // the gateway and the Provider records are both cards now, so the
-        // boundary between "the machine Vibex runs" and "the records I keep" is
-        // structural rather than a change in surface.
-        v_flex()
-            .id("management-provider-page-sidebar")
+        // The saved list keeps the sidebar's padding; the suggestion drawer is
+        // flush with the dock's edges so its seam reads as the column's bottom.
+        let sidebar_body = v_flex()
             .w_full()
-            .h_full()
-            .min_w_0()
+            .min_h_0()
+            .flex_1()
             .gap_3()
             .p_3()
             .child(gateway_section)
@@ -13463,8 +13705,12 @@ impl ManagementCenter {
                     .min_h_0()
                     .flex_1()
                     .gap_2()
-                    .child(management_resource_sidebar_actions(
+                    .child(management_resource_sidebar_actions_sized(
                         section_title,
+                        // Both commands are taller than a line of text, so the
+                        // band grows and the name centres in it instead of
+                        // riding the top edge.
+                        Some(rems(2.75)),
                         actions,
                         cx,
                     ))
@@ -13518,7 +13764,30 @@ impl ManagementCenter {
                             .scroll_gutter()
                             .child(section_body),
                     ),
-            )
+            );
+        let recommendations_drawer = (self.providers_sidebar_tab
+            == ProviderSidebarTab::RouteGroups
+            && self.route_group_recommendations_open
+            && route_group_suggestion_count > 0)
+            .then(|| self.render_route_group_recommendations_drawer(cx));
+        let sidebar_size_target = cx.entity().downgrade();
+        v_flex()
+            .id("management-provider-page-sidebar")
+            .w_full()
+            .h_full()
+            .min_w_0()
+            .on_prepaint(move |bounds, _, cx| {
+                let _ = sidebar_size_target.update(cx, |this, cx| {
+                    this.record_route_group_recommendations_body_height(
+                        f32::from(bounds.size.height),
+                        cx,
+                    )
+                });
+            })
+            .child(sidebar_body)
+            .when_some(recommendations_drawer, |sidebar, drawer| {
+                sidebar.child(drawer)
+            })
             .into_any_element()
     }
 
@@ -26880,62 +27149,10 @@ impl ManagementCenter {
                             }),
                     ),
             )
-            .children(self.selected_agent_id.clone().and_then(|agent_id| {
-                vibex_core::AgentId::parse(agent_id.clone())
-                    .ok()
-                    .filter(vibex_core::supports_native_provider_import)
-                    .map(|_| {
-                        Button::new("management-provider-source-import")
-                            .xsmall()
-                            .ghost()
-                            .icon(Icon::default().path("icons/vibex/import.svg"))
-                            .label(management_locale_text(
-                                "Import configuration",
-                                "导入配置",
-                                "匯入設定",
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.preview_native_import(false, Some(agent_id.clone()), cx);
-                                let _ = window;
-                            }))
-                    })
-            }))
-            .children(self.native_import_preview.as_ref().map(|preview| {
-                let importable = preview
-                    .items
-                    .iter()
-                    .filter(|item| native_import_status_is_eligible(item.status))
-                    .count();
-                let agent_id = self.selected_agent_id.clone().unwrap_or_default();
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .px_2()
-                    .py_1p5()
-                    .child(div().min_w_0().text_xs().child(format!(
-                        "{} · {} {}",
-                        management_locale_text("Import preview", "导入预览", "匯入預覽",),
-                        importable,
-                        management_locale_text("importable", "可导入", "可匯入")
-                    )))
-                    .child(
-                        Button::new("management-provider-import-apply")
-                            .xsmall()
-                            .primary()
-                            .label(management_locale_text("Import all", "全部导入", "全部匯入"))
-                            .disabled(pending || importable == 0)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_profile_editor(window, cx);
-                                this.preview_native_import(true, Some(agent_id.clone()), cx);
-                            })),
-                    )
-                    .into_any_element()
-            }))
+            // Importing no longer lives in this step. It reads every Agent's
+            // native configuration and writes shared records, so it belongs to
+            // the Providers list's own header, where it is visible before the
+            // reader has chosen between "new" and "existing".
             .child(
                 // The manual path never disappears: a preset library that
                 // covered every Provider would still be a wall, not a shortcut.
@@ -29872,97 +30089,91 @@ impl ManagementCenter {
         }));
     }
 
-    /// The sidebar's suggested groups: models more than one Provider serves.
+    /// The model suggestions worth offering.
     ///
-    /// The panel is deliberately below the saved list, not above it: a
-    /// suggestion must not push the records the reader already made down the
-    /// page. Closing it leaves a single row that can open it again.
-    fn render_route_group_recommendations(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let suggestions = vibex_core::suggested_model_groups(&self.providers, &self.model_routes)
+    /// The drawer shows at most four: they are a prompt to act, not a
+    /// catalogue, and the saved list above is what the reader came to manage.
+    fn recommended_route_groups(&self) -> Vec<vibex_core::SuggestedModelGroup> {
+        vibex_core::suggested_model_groups(&self.providers, &self.model_routes)
             .into_iter()
             .take(4)
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn close_route_group_recommendations(&mut self, cx: &mut Context<Self>) {
+        self.route_group_recommendations_open = false;
+        self.route_group_recommendations_resize = None;
+        self.route_group_recommendations_height = MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT;
+        cx.notify();
+    }
+
+    fn set_route_group_recommendations_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        let max_height = self
+            .route_group_recommendations_body_height
+            .max(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT);
+        let height = height
+            .round()
+            .clamp(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT, max_height);
+        if (height - self.route_group_recommendations_height).abs() < f32::EPSILON {
+            return;
+        }
+        self.route_group_recommendations_height = height;
+        cx.notify();
+    }
+
+    fn update_route_group_recommendations_resize(&mut self, window_y: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.route_group_recommendations_resize else {
+            return;
+        };
+        self.set_route_group_recommendations_height(
+            drag.start_height + drag.start_window_y - window_y,
+            cx,
+        );
+    }
+
+    fn finish_route_group_recommendations_resize(&mut self, cx: &mut Context<Self>) {
+        if self.route_group_recommendations_resize.take().is_none() {
+            return;
+        }
+        if management_route_group_suggestions_should_close(self.route_group_recommendations_height)
+        {
+            self.route_group_recommendations_open = false;
+            self.route_group_recommendations_height =
+                MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT;
+        }
+        cx.notify();
+    }
+
+    fn record_route_group_recommendations_body_height(
+        &mut self,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if !height.is_finite() || height <= 0.0 {
+            return;
+        }
+        self.route_group_recommendations_body_height = height;
+        let height = self.route_group_recommendations_height.min(height);
+        if (height - self.route_group_recommendations_height).abs() >= f32::EPSILON {
+            self.route_group_recommendations_height = height;
+            cx.notify();
+        }
+    }
+
+    /// The docked suggestions drawer.
+    ///
+    /// It is a sibling of the scrollable list, not part of it, so opening it
+    /// shrinks the list instead of appending a panel after an arbitrarily long
+    /// scroll. Its top edge is the resize seam, matching the changed-files
+    /// drawer, and dismissal sits where a reader looks for it: the header's
+    /// trailing corner.
+    fn render_route_group_recommendations_drawer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let suggestions = self.recommended_route_groups();
         if suggestions.is_empty() {
             return div().into_any_element();
         }
         let count = suggestions.len();
-        if !self.route_group_recommendations_open {
-            return h_flex()
-                .w_full()
-                .pt_1()
-                .child(
-                    Button::new("management-route-group-suggestions-show")
-                        .xsmall()
-                        .ghost()
-                        .icon(Icon::default().path("icons/vibex/sparkles.svg"))
-                        .label(format!(
-                            "{} ({count})",
-                            management_locale_text("Suggested groups", "推荐路由组", "推薦路由組",)
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.route_group_recommendations_open = true;
-                            cx.notify();
-                        })),
-                )
-                .into_any_element();
-        }
-        let mut panel = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .pt_2()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                Icon::default()
-                                    .path("icons/vibex/sparkles.svg")
-                                    .size(px(14.0))
-                                    .text_color(cx.theme().muted_foreground),
-                            )
-                            .child(div().min_w_0().truncate().text_xs().font_semibold().child(
-                                management_locale_text(
-                                    "Suggested groups",
-                                    "推荐路由组",
-                                    "推薦路由組",
-                                ),
-                            )),
-                    )
-                    .child(
-                        Button::new("management-route-group-suggestions-close")
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .icon(IconName::Close)
-                            .tooltip(management_locale_text("Hide", "收起", "收合"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route_group_recommendations_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Models several Providers serve. One click creates a group.",
-                        "多个供应商都提供的模型，点击即可创建路由组。",
-                        "多個供應商都提供的模型，點擊即可建立路由組。",
-                    )),
-            );
+        let mut rows = v_flex().w_full().min_w_0().gap_0p5();
         for suggestion in suggestions {
             let name = suggestion.model_id.clone();
             let member_count = suggestion.members.len();
@@ -29981,32 +30192,53 @@ impl ManagementCenter {
             } else {
                 provider_names.join(" · ")
             };
+            let aria_label = format!(
+                "{}: {name}",
+                management_locale_text("Create route group", "创建路由组", "建立路由組")
+            );
             let click = suggestion.clone();
-            panel = panel.child(
-                v_flex()
+            let keyboard_click = suggestion;
+            rows = rows.child(
+                h_flex()
                     .id(SharedString::from(format!(
                         "management-route-group-suggestion-{name}"
                     )))
                     .w_full()
                     .min_w_0()
-                    .gap_0p5()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.65))
-                    .bg(cx.theme().background.opacity(0.70))
-                    .p_2()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .px_2()
+                    .py_1p5()
                     .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().primary.opacity(0.08)))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(aria_label)
+                    .hover(|style| style.bg(cx.theme().primary.opacity(0.06)))
+                    .focus_visible(|style| style.bg(cx.theme().primary.opacity(0.08)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.create_recommended_route_group(click.clone(), cx)
                     }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.create_recommended_route_group(keyboard_click.clone(), cx);
+                        }
+                    }))
                     .child(
-                        h_flex()
-                            .w_full()
+                        div().flex_none().child(
+                            Icon::default()
+                                .path("icons/vibex/git-branch.svg")
+                                .size(px(15.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                    )
+                    .child(
+                        v_flex()
                             .min_w_0()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
+                            .flex_1()
+                            .gap_0p5()
                             .child(
                                 div()
                                     .min_w_0()
@@ -30016,23 +30248,252 @@ impl ManagementCenter {
                                     .child(name),
                             )
                             .child(
-                                Tag::color(ColorName::Neutral)
-                                    .xsmall()
-                                    .child(management_route_group_member_count(member_count)),
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(providers),
                             ),
                     )
                     .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(providers),
+                        Tag::color(ColorName::Neutral)
+                            .xsmall()
+                            .child(management_route_group_member_count(member_count)),
+                    )
+                    .child(
+                        div().flex_none().child(
+                            Icon::new(IconName::Plus)
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
                     ),
             );
         }
-        panel.into_any_element()
+
+        v_flex()
+            .id("management-route-group-suggestions-drawer")
+            .w_full()
+            .h(px(self.route_group_recommendations_height))
+            .min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))
+            .flex_none()
+            .overflow_hidden()
+            // A hair above the sidebar's own fill: enough to read as a docked
+            // surface, not enough to become a floating card.
+            .bg(management_surface_wash(
+                cx,
+                MANAGEMENT_PANEL_STRIP_WASH * 0.4,
+            ))
+            .child(self.render_route_group_recommendations_resize_handle(cx))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border.opacity(0.72))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/vibex/sparkles.svg")
+                                            .size(px(14.0))
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(management_locale_text(
+                                                "Suggested groups",
+                                                "推荐路由组",
+                                                "推薦路由組",
+                                            )),
+                                    )
+                                    .child(
+                                        Tag::color(ColorName::Neutral)
+                                            .xsmall()
+                                            .child(count.to_string()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Models several Providers serve. One click creates a group.",
+                                        "多个供应商都提供的模型，点击即可创建路由组。",
+                                        "多個供應商都提供的模型，點擊即可建立路由組。",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new("management-route-group-suggestions-close")
+                            .ml_1()
+                            .small()
+                            .ghost()
+                            .compact()
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .p_0()
+                            .icon(IconName::Close)
+                            .tooltip(management_locale_text(
+                                "Close suggested groups",
+                                "关闭推荐路由组",
+                                "關閉推薦路由組",
+                            ))
+                            .accessibility_label(management_locale_text(
+                                "Close suggested groups",
+                                "关闭推荐路由组",
+                                "關閉推薦路由組",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_route_group_recommendations(cx)
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("management-route-group-suggestions-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .px_2()
+                    .py_2()
+                    // The rows run to the scroller's edge, so the bar itself
+                    // needs the gutter instead of sitting over the plus.
+                    .scroll_gutter()
+                    .child(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_route_group_recommendations_resize_handle(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.route_group_recommendations_resize.is_some();
+        let increment_target = cx.weak_entity();
+        let decrement_target = cx.weak_entity();
+        let seam_key = resize_seam::seam_hover_key("management-route-group-suggestions");
+        h_flex()
+            .id("management-route-group-suggestions-resize")
+            .role(Role::Splitter)
+            .aria_label(management_locale_text(
+                "Resize suggested groups drawer",
+                "调整推荐路由组抽屉",
+                "調整推薦路由組抽屜",
+            ))
+            .aria_orientation(Orientation::Horizontal)
+            .aria_numeric_value(self.route_group_recommendations_height as f64)
+            .aria_numeric_value_step(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP as f64)
+            .aria_min_numeric_value(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT as f64)
+            .aria_max_numeric_value(
+                self.route_group_recommendations_body_height
+                    .max(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT) as f64,
+            )
+            .focusable()
+            .tab_index(0)
+            .relative()
+            .h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_RESIZE_HANDLE_HEIGHT))
+            .w_full()
+            .flex_none()
+            .cursor_ns_resize()
+            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let next = match event.keystroke.key.as_str() {
+                    "up" => {
+                        this.route_group_recommendations_height
+                            + MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP
+                    }
+                    "down" => {
+                        this.route_group_recommendations_height
+                            - MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP
+                    }
+                    "home" => MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT,
+                    "end" => this.route_group_recommendations_body_height,
+                    _ => return,
+                };
+                this.set_route_group_recommendations_height(next, cx);
+                cx.stop_propagation();
+            }))
+            .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
+                let _ = increment_target.update(cx, |this, cx| {
+                    this.set_route_group_recommendations_height(
+                        this.route_group_recommendations_height
+                            + MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP,
+                        cx,
+                    )
+                });
+            })
+            .on_a11y_action(AccessibleAction::Decrement, move |_, _, cx| {
+                let _ = decrement_target.update(cx, |this, cx| {
+                    this.set_route_group_recommendations_height(
+                        this.route_group_recommendations_height
+                            - MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP,
+                        cx,
+                    )
+                });
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    this.route_group_recommendations_resize =
+                        Some(ManagementRouteGroupSuggestionsResizeState {
+                            start_window_y: f32::from(event.position.y),
+                            start_height: this.route_group_recommendations_height,
+                        });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_drag(ManagementRouteGroupSuggestionsResizeDrag, |_, _, _, cx| {
+                cx.new(|_| ManagementRouteGroupSuggestionsResizeDrag)
+            })
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<ManagementRouteGroupSuggestionsResizeDrag>, _, cx| {
+                    cx.stop_propagation();
+                    this.update_route_group_recommendations_resize(
+                        f32::from(event.event.position.y),
+                        cx,
+                    );
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_route_group_recommendations_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_route_group_recommendations_resize(cx)),
+            )
+            .child(
+                resize_seam::seam_line(&seam_key, cx.theme().border, true, active, true)
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.0)),
+            )
+            .into_any_element()
     }
 
     /// Copies a group into an application-local draft record.
@@ -37736,6 +38197,42 @@ fn cc_switch_import_identity(options: &vibex_core::ProviderOptions) -> Option<St
     Some(format!("{db_path}\0{provider_id}\0{app_type}"))
 }
 
+/// The preview items worth importing for one Agent, whatever their source.
+///
+/// Two filters, both about not lying to the reader: an item that is already
+/// present is dropped, and an item whose status says it cannot be imported is
+/// dropped. The identity check is the CC Switch one, because that is the only
+/// source that reports a stable upstream identity across previews; a Codex or
+/// Claude file that is imported twice produces two records the reader can
+/// delete, which is better than silently skipping a file they just edited.
+///
+/// `existing_profiles` is the whole list, not one Agent's: a record imported
+/// from another Agent's page already exists, and the list is where the duplicate
+/// would show up.
+fn pending_native_import_item_ids(
+    preview: &vibex_core::ProviderNativeImportPreview,
+    existing_profiles: &[vibex_core::ProviderProfile],
+    target_agent_id: &AgentId,
+) -> Vec<vibex_core::RequestId> {
+    let imported_identities = existing_profiles
+        .iter()
+        .filter_map(|profile| cc_switch_import_identity(&profile.provider_options))
+        .collect::<HashSet<_>>();
+    let mut seen_item_ids = HashSet::new();
+    preview
+        .items
+        .iter()
+        .filter(|item| item.agent_id.as_ref() == Some(target_agent_id))
+        .filter(|item| native_import_status_is_eligible(item.status))
+        .filter(|item| {
+            cc_switch_import_identity(&item.provider_options)
+                .is_none_or(|identity| !imported_identities.contains(&identity))
+        })
+        .filter(|item| seen_item_ids.insert(item.import_item_id.as_str().to_string()))
+        .map(|item| item.import_item_id.clone())
+        .collect()
+}
+
 fn pending_cc_switch_import_item_ids(
     preview: &vibex_core::ProviderNativeImportPreview,
     existing_profiles: &[vibex_core::ProviderProfile],
@@ -39141,6 +39638,15 @@ fn management_field_hint(message: impl Into<SharedString>, cx: &App) -> AnyEleme
 /// user picked.
 fn management_surface_wash(cx: &App, strength: f32) -> Hsla {
     cx.theme().foreground.opacity(strength)
+}
+
+/// Whether releasing the suggestion drawer's seam should dismiss it.
+///
+/// The threshold sits above the minimum height so a deliberate drag to the
+/// bottom reads as "close", while the smallest usable panel still opens with
+/// its header and one row visible.
+fn management_route_group_suggestions_should_close(height: f32) -> bool {
+    height <= MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_CLOSE_THRESHOLD
 }
 
 /// The caption strip that names a pane and holds the one command local to it.
@@ -41089,11 +41595,27 @@ fn management_resource_sidebar_actions(
     actions: Vec<AnyElement>,
     cx: &App,
 ) -> AnyElement {
+    management_resource_sidebar_actions_sized(title, None, actions, cx)
+}
+
+/// The same header with an explicit minimum height.
+///
+/// The Providers column stacks more above its list than the MCP column does —
+/// a gateway row and a record switch — so its heading gets a taller band. The
+/// name stays centred in it, which is what keeps it aligned with the commands
+/// beside it once those grow past the line height.
+fn management_resource_sidebar_actions_sized(
+    title: &'static str,
+    min_height: Option<Rems>,
+    actions: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
     h_flex()
         .w_full()
         .min_w_0()
         .items_center()
         .gap_2()
+        .when_some(min_height, |row, height| row.min_h(height))
         .child(
             div()
                 .min_w_0()
@@ -41134,6 +41656,44 @@ fn management_sidebar_action(
             // The glyph is drawn as content rather than through `icon()`: the
             // kit derives that slot from the button size, which would pin it to
             // the small 14px while the label already owns that scale.
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(icon.size(px(16.0)))
+                    .child(div().text_sm().child(label)),
+            )
+            .tooltip(accessible_label.clone())
+            .on_click(on_click),
+        accessible_label,
+    )
+    .into_any_element()
+}
+
+/// A Providers-column header command: an icon and the verb, one step larger
+/// than the MCP column's commands.
+///
+/// Creating and importing are the two ways a record enters this list, and a
+/// glyph alone cannot say which is which, so both carry their word. They are
+/// sized for a heading band that also has to hold the column's only two verbs.
+fn management_provider_header_action(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    accessible_label: &'static str,
+    loading: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let accessible_label = SharedString::from(accessible_label);
+    button_with_aria_label(
+        Button::new(id)
+            .h(rems(2.25))
+            .px_3()
+            .outline()
+            .loading(loading)
+            // Drawn as content rather than through `icon()` for the same reason
+            // as `management_sidebar_action`: the kit derives that slot from
+            // the button size, and that size is the height here.
             .child(
                 h_flex()
                     .items_center()
@@ -44571,6 +45131,113 @@ mod tests {
             .expect("management renderer should remain inspectable");
         assert!(renderer.contains("self.present_feedback(window, cx);"));
         assert!(!renderer.contains(".bottom_4()"));
+    }
+
+    /// The Providers list heading carries both ways a record gets there.
+    ///
+    /// Import used to live inside the new-Provider dialog, one step past the
+    /// point where a reader decides between a preset and a blank form, so the
+    /// list itself never said an existing configuration could be imported. The
+    /// two commands now share the heading, which is also why that band is
+    /// taller than the MCP column's.
+    #[test]
+    fn the_providers_heading_owns_new_and_import() {
+        let source = include_str!("management.rs");
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        for marker in [
+            "management-provider-page-add",
+            "management-provider-page-import",
+            "management_provider_header_action(",
+            "Some(rems(2.75))",
+        ] {
+            assert!(
+                sidebar.contains(marker),
+                "the Providers heading must keep {marker}"
+            );
+        }
+        // Both commands are labelled: a glyph alone cannot say which of the two
+        // ways into the list it is.
+        let add = sidebar
+            .split_once("management-provider-page-add")
+            .map(|(_, tail)| tail)
+            .expect("the new command should remain inspectable");
+        let add = add
+            .split_once("importing_native_data")
+            .map_or(add, |(body, _)| body);
+        assert!(add.contains("management_locale_text(\"New\""));
+        assert!(add.contains("management_locale_text(\"Import\""));
+        // Import runs against every import-capable Agent, not the one whose page
+        // the reader happened to come from.
+        assert!(
+            sidebar.contains("this.import_shared_providers(import_agents_for_click.clone(), cx)"),
+            "the import action is list-level"
+        );
+        assert!(
+            source.contains("fn import_shared_providers("),
+            "the handler exists on the center"
+        );
+    }
+
+    /// The route-group tab takes the same header command, without an Import.
+    #[test]
+    fn the_route_groups_heading_uses_one_labelled_command() {
+        let source = include_str!("management.rs");
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("    /// The global Providers panel"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        assert!(
+            sidebar.contains("\"management-route-group-page-add\""),
+            "the route-group tab keeps its own add command"
+        );
+        // Exactly one record-creating command on that tab: a group has no
+        // import path. The suggestion toggle is a view command, not a second
+        // way to create the record.
+        let route_tab = sidebar
+            .split_once("let mut actions")
+            .map(|(_, tail)| tail)
+            .expect("the route-group arm should remain inspectable");
+        let route_tab = route_tab
+            .split_once("route_group_list,")
+            .map(|(body, _)| body)
+            .expect("the route-group header should remain inspectable");
+        assert_eq!(
+            route_tab
+                .matches("management_provider_header_action(")
+                .count(),
+            1,
+            "only the New command sits in the route-group heading"
+        );
+        assert!(!route_tab.contains("import"));
+    }
+
+    /// A card draws up to twelve Agent logos before folding the rest into `+N`.
+    #[test]
+    fn cards_draw_twelve_agent_logos_before_counting_the_rest() {
+        assert_eq!(MANAGEMENT_CARD_AGENT_LOGO_LIMIT, 12);
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(source, |(body, _)| body);
+        assert_eq!(
+            production
+                .matches("take(MANAGEMENT_CARD_AGENT_LOGO_LIMIT)")
+                .count(),
+            2,
+            "both card kinds clamp their logo strip to the same limit"
+        );
+        assert_eq!(
+            production
+                .matches("agent_count > MANAGEMENT_CARD_AGENT_LOGO_LIMIT")
+                .count(),
+            2,
+            "both card kinds count the overflow the same way"
+        );
     }
 
     /// The gateway is the first row of the Providers page, not a separate page.
@@ -48211,7 +48878,7 @@ mod gateway_surface_tests {
             "the card must not draw the Agent name"
         );
         assert!(
-            card.contains("agent_count > 5"),
+            card.contains("agent_count > MANAGEMENT_CARD_AGENT_LOGO_LIMIT"),
             "the overflow count matches the Provider card's"
         );
         // The logos own a row of their own, after the summary line. Sharing
@@ -48435,7 +49102,7 @@ mod gateway_surface_tests {
     fn native_import_exposes_preview_and_report() {
         let source = include_str!("management.rs");
         for marker in [
-            "management-provider-import-apply",
+            "management-provider-page-import",
             "management-provider-import-report-dismiss",
             "native_import_preview",
             "native_import_report",
@@ -48812,6 +49479,14 @@ mod gateway_surface_tests {
         assert!(
             stack.contains("management-provider-agent-logo-"),
             "the footer draws one logo per Agent"
+        );
+        assert!(
+            stack.contains("take(MANAGEMENT_CARD_AGENT_LOGO_LIMIT)"),
+            "the footer draws as many logos as the card allows"
+        );
+        assert_eq!(
+            MANAGEMENT_CARD_AGENT_LOGO_LIMIT, 12,
+            "twelve logos fit the card's footer next to the overflow count"
         );
         assert!(
             !stack.contains(".child(label)"),
@@ -49637,7 +50312,20 @@ mod gateway_surface_tests {
                 .any(|preset| preset.id == "ollama")
         );
         assert!(source.contains("provider_preset_logo("));
-        assert!(source.contains("management-provider-source-import"));
+        // The import moved to the Providers list header; the picker step must
+        // not offer a second path to it.
+        assert!(source.contains("management-provider-page-import"));
+        let picker = source
+            .split_once("    fn render_provider_picker_step(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives this Agent an existing shared Provider.")
+            })
+            .map(|(body, _)| body)
+            .expect("the picker step should remain inspectable");
+        assert!(
+            !picker.contains("preview_native_import("),
+            "the picker offers presets and existing records, not a second import"
+        );
         assert!(source.contains("management-provider-recent-"));
         assert!(source.contains("management-provider-recents.json"));
     }
@@ -49911,6 +50599,72 @@ mod gateway_surface_tests {
             .expect("the Providers panel should remain inspectable");
         assert!(page.contains("ProviderSidebarTab::RouteGroups"));
         assert!(page.contains("render_route_group_page"));
+    }
+
+    /// Suggested groups are a docked drawer, not a card at the end of a list.
+    ///
+    /// The proposal is transient and can grow; pinning it to the bottom keeps
+    /// the saved rows scannable and puts resizing and dismissal where the
+    /// changed-files drawer already puts them.
+    #[test]
+    fn suggested_groups_are_a_resizable_bottom_drawer() {
+        let source = include_str!("management.rs");
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the Provider editor to create a shared record.")
+            })
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        assert!(sidebar.contains("render_route_group_recommendations_drawer(cx)"));
+        assert!(sidebar.contains(".child(sidebar_body)"));
+        assert!(
+            !sidebar.contains(
+                "route_group_list = route_group_list.child(self.render_route_group_recommendations"
+            ),
+            "the suggestions must not be appended to the scrolling list"
+        );
+        assert!(sidebar.contains("management-route-group-suggestions-show"));
+        assert!(sidebar.contains("record_route_group_recommendations_body_height"));
+
+        let drawer = source
+            .split_once("    fn render_route_group_recommendations_drawer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_route_group_recommendations_resize_handle(")
+            })
+            .map(|(body, _)| body)
+            .expect("the suggestion drawer should remain inspectable");
+        assert!(drawer.contains(".h(px(self.route_group_recommendations_height))"));
+        assert!(drawer.contains(".min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))"));
+        assert!(drawer.contains("render_route_group_recommendations_resize_handle(cx)"));
+        assert!(drawer.contains("management-route-group-suggestions-close"));
+        assert!(drawer.contains("overflow_y_scrollbar()"));
+        assert!(drawer.contains("scroll_gutter()"));
+        assert!(drawer.contains("Role::Button"));
+        assert!(drawer.contains("event.keystroke.key.as_str()"));
+
+        let handle = source
+            .split_once("    fn render_route_group_recommendations_resize_handle(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Copies a group into an application-local draft record.")
+            })
+            .map(|(body, _)| body)
+            .expect("the suggestion drawer's seam should remain inspectable");
+        assert!(handle.contains("Role::Splitter"));
+        assert!(handle.contains("cursor_ns_resize()"));
+        assert!(handle.contains("on_drag_move"));
+        assert!(handle.contains("AccessibleAction::Increment"));
+        assert!(handle.contains("resize_seam::seam_line"));
+    }
+
+    #[test]
+    fn a_short_suggestions_drawer_is_treated_as_closed() {
+        assert!(management_route_group_suggestions_should_close(
+            MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_CLOSE_THRESHOLD
+        ));
+        assert!(!management_route_group_suggestions_should_close(
+            MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_CLOSE_THRESHOLD + 1.0
+        ));
     }
 
     /// A route-group row is a Provider row with different contents.
