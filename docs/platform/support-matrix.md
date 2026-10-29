@@ -15,6 +15,7 @@ platform-specific checks.
 | Android | Native GPUI client using `gpui-pre-mobile` and NativeActivity | `pnpm build:mobile:android` | Each rebuilt APK needs source-bound device or emulator validation before a release claim. |
 | iOS | Native GPUI client using `gpui-pre-mobile` and UIKit | `pnpm build:mobile:ios` on macOS | Simulator/device, signing, and distribution validation remain separate release evidence. |
 | Relay server | Optional user-self-hosted encrypted transport | `pnpm smoke:relay:local` | Relay is transport only; deployment, TLS, NAT, and device proof are operator-owned. |
+| SSH / WSL runtime (beta) | Desktop-provisioned `vibex-server` on a Linux or macOS host over SSH, or in a local WSL2 distro | `scripts/e2e-ssh-docker.sh <server-tarball>` | Off by default behind `VIBEX_SSH_REMOTE_RUNTIME` / Settings → Developer; per-platform status in [SSH Remote Runtime](../remote/ssh-runtime.md#support-matrix). |
 | Terminal (TUI) | Character-grid client for an authority or remote runtime | `cargo test -p vibex-tui`, `vibex status` | Requires an interactive terminal; CJK and RTL rendering depend on the user's terminal font and width tables, which are not queryable. |
 
 Desktop is the only authoritative runtime. Mobile is a remote client through the

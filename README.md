@@ -379,7 +379,9 @@ The main ownership boundaries are:
 
 Read the [UI architecture boundary](docs/architecture/ui-boundary.md),
 [platform support matrix](docs/platform/support-matrix.md), and
-[Remote Protocol v2](docs/remote/protocol-v2.md) for the detailed contracts.
+[Remote Protocol v2](docs/remote/protocol-v2.md) for the detailed contracts, and
+[SSH Remote Runtime](docs/remote/ssh-runtime.md) to run the runtime on another
+machine over SSH or in WSL2 (beta).
 
 ## Tech Stack
 

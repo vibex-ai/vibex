@@ -317,7 +317,7 @@ DesktopRuntime
 - `crates/vibex-remote-client` 负责配对、重连、同步以及 Direct、Tailnet 和 Relay 路由选择。
 - `apps/desktop` 负责原生工作台和 `DesktopRuntime`; `apps/mobile` 只将共享的远程投影组合成紧凑的原生界面。
 
-详细契约请阅读 [UI 架构边界](docs/architecture/ui-boundary.md)、[平台支持矩阵](docs/platform/support-matrix.md) 和 [Remote Protocol v2](docs/remote/protocol-v2.md)。
+详细契约请阅读 [UI 架构边界](docs/architecture/ui-boundary.md)、[平台支持矩阵](docs/platform/support-matrix.md) 和 [Remote Protocol v2](docs/remote/protocol-v2.md)；通过 SSH 或 WSL2 在另一台机器上运行 runtime（测试版）请阅读 [SSH Remote Runtime](docs/remote/ssh-runtime.md)。
 
 ## 技术栈
 
