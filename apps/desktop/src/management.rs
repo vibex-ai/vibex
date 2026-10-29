@@ -25,7 +25,7 @@ use gpui_component::{
     Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
-    button::{Button, ButtonVariants as _, Toggle},
+    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle},
     checkbox::Checkbox,
     clipboard::Clipboard,
     collapsible::Collapsible,
@@ -44,6 +44,7 @@ use gpui_component::{
     separator::Separator,
     switch::Switch,
     tab::{Tab, TabBar},
+    table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow},
     tag::Tag,
     toolbar::Toolbar,
     tooltip::Tooltip,
@@ -14812,21 +14813,29 @@ impl ManagementCenter {
                     .child(management_field_label(management_locale_text(
                         "Category", "类别", "類別",
                     )))
-                    .children(category_values.into_iter().map(|(value, label)| {
-                        let selected = category.as_deref() == Some(value);
-                        Button::new(SharedString::from(format!(
-                            "management-provider-create-category-{value}"
-                        )))
-                        .xsmall()
-                        .when(selected, |button| button.primary())
-                        .when(!selected, |button| button.outline())
-                        .label(label)
-                        .disabled(pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.provider_create_category = Some(value.to_string());
-                            cx.notify();
-                        }))
-                    })),
+                    .child(
+                        ButtonGroup::new("management-provider-create-category-group")
+                            .xsmall()
+                            .outline()
+                            .disabled(pending)
+                            .children(category_values.into_iter().map(|(value, label)| {
+                                Button::new(SharedString::from(format!(
+                                    "management-provider-create-category-{value}"
+                                )))
+                                .xsmall()
+                                .label(label)
+                                .selected(category.as_deref() == Some(value))
+                            }))
+                            .on_click(cx.listener(move |this, clicks: &Vec<usize>, _, cx| {
+                                if let Some((value, _)) = clicks
+                                    .first()
+                                    .and_then(|index| category_values.get(*index))
+                                {
+                                    this.provider_create_category = Some((*value).to_string());
+                                    cx.notify();
+                                }
+                            })),
+                    ),
             )
             .child(
                 h_flex()
@@ -14917,23 +14926,30 @@ impl ManagementCenter {
                         None,
                         cx,
                     ))
-                    .when(open, |section| {
-                        section
-                            .child(
-                                Textarea::new(&self.provider_create_headers)
-                                    .small()
+                    .child(
+                        Collapsible::new()
+                            .open(open)
+                            .motion_id(PROVIDER_CREATE_HEADERS_DISCLOSURE_ID)
+                            .content(
+                                v_flex()
                                     .w_full()
-                                    .h(px(92.0)),
-                            )
-                            .child(management_field_hint(
-                                management_locale_text(
-                                    "A JSON object of header names to values. Use {\"variable\": \"session_id\"} for the built-in session header.",
-                                    "JSON 对象，键为请求头名称。使用 {\"variable\": \"session_id\"} 表示内置会话请求头。",
-                                    "JSON 物件，鍵為請求標頭名稱。使用 {\"variable\": \"session_id\"} 表示內建工作階段請求標頭。",
-                                ),
-                                cx,
-                            ))
-                    })
+                                    .gap_1()
+                                    .child(
+                                        Textarea::new(&self.provider_create_headers)
+                                            .small()
+                                            .w_full()
+                                            .h(px(92.0)),
+                                    )
+                                    .child(management_field_hint(
+                                        management_locale_text(
+                                            "A JSON object of header names to values. Use {\"variable\": \"session_id\"} for the built-in session header.",
+                                            "JSON 对象，键为请求头名称。使用 {\"variable\": \"session_id\"} 表示内置会话请求头。",
+                                            "JSON 物件，鍵為請求標頭名稱。使用 {\"variable\": \"session_id\"} 表示內建工作階段請求標頭。",
+                                        ),
+                                        cx,
+                                    )),
+                            ),
+                    )
                     .children(
                         error.map(|message| {
                             div()
@@ -15314,24 +15330,29 @@ impl ManagementCenter {
                 .value()
                 .trim()
                 .to_lowercase();
-            let mut controls = h_flex().w_full().items_center().flex_wrap().gap_1();
-            for filter in ProviderModelsFilter::ALL {
-                let selected = filter == self.provider_models_filter;
-                controls = controls.child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-models-filter-{:?}",
-                        filter
-                    )))
+            let mut controls = h_flex().w_full().items_center().flex_wrap().gap_1().child(
+                ButtonGroup::new("management-provider-models-filter-group")
                     .xsmall()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.ghost())
-                    .label(filter.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.provider_models_filter = filter;
-                        cx.notify();
+                    .outline()
+                    .children(ProviderModelsFilter::ALL.into_iter().map(|filter| {
+                        Button::new(SharedString::from(format!(
+                            "management-provider-models-filter-{:?}",
+                            filter
+                        )))
+                        .xsmall()
+                        .label(filter.label())
+                        .selected(filter == self.provider_models_filter)
+                    }))
+                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                        if let Some(filter) = clicks
+                            .first()
+                            .and_then(|index| ProviderModelsFilter::ALL.get(*index))
+                        {
+                            this.provider_models_filter = *filter;
+                            cx.notify();
+                        }
                     })),
-                );
-            }
+            );
             let profile_id = profile.id.clone();
             controls = controls
                 .child(
@@ -15574,58 +15595,52 @@ impl ManagementCenter {
                 .max_by_key(|(_, count)| *count)
                 .map(|(status, count)| format!("{status} · {count}"))
                 .unwrap_or_else(|| "—".to_string());
-            let mut range_row = h_flex().w_full().gap_1();
-            for range in TrafficRange::ALL {
-                let selected = range == self.traffic_range;
-                range_row = range_row.child(
+            let range_row = ButtonGroup::new("management-provider-traffic-range-group")
+                .xsmall()
+                .outline()
+                .children(TrafficRange::ALL.into_iter().map(|range| {
                     Button::new(SharedString::from(format!(
                         "management-provider-traffic-range-{:?}",
                         range
                     )))
                     .xsmall()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.ghost())
                     .label(range.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.traffic_range = range;
+                    .selected(range == self.traffic_range)
+                }))
+                .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                    if let Some(range) = clicks
+                        .first()
+                        .and_then(|index| TrafficRange::ALL.get(*index))
+                    {
+                        this.traffic_range = *range;
                         cx.notify();
-                    })),
-                );
-            }
+                    }
+                }));
             let mut traffic = v_flex().w_full().gap_2().child(range_row);
-            traffic = traffic.child(
-                h_flex()
-                    .w_full()
-                    .flex_wrap()
-                    .gap_4()
-                    .child(stat_line(
-                        management_locale_text("Health", "健康", "健康"),
-                        health_label.to_string(),
-                        cx,
-                    ))
-                    .child(stat_line(
-                        management_locale_text("Requests", "请求", "請求"),
-                        total.to_string(),
-                        cx,
-                    ))
-                    .child(stat_line(
-                        management_locale_text("Succeeded", "成功", "成功"),
-                        succeeded.to_string(),
-                        cx,
-                    ))
-                    .child(stat_line(
-                        management_locale_text("Tokens", "Token", "Token"),
-                        tokens.to_string(),
-                        cx,
-                    ))
-                    .child(stat_line("p50", p50, cx))
-                    .child(stat_line("p95", p95, cx))
-                    .child(stat_line(
-                        management_locale_text("Top error", "错误 Top", "錯誤 Top"),
-                        top_error,
-                        cx,
-                    )),
-            );
+            traffic = traffic.child(description_grid(vec![
+                (
+                    management_locale_text("Health", "健康", "健康"),
+                    health_label.to_string(),
+                ),
+                (
+                    management_locale_text("Requests", "请求", "請求"),
+                    total.to_string(),
+                ),
+                (
+                    management_locale_text("Succeeded", "成功", "成功"),
+                    succeeded.to_string(),
+                ),
+                (
+                    management_locale_text("Tokens", "Token", "Token"),
+                    tokens.to_string(),
+                ),
+                ("p50", p50),
+                ("p95", p95),
+                (
+                    management_locale_text("Top error", "错误 Top", "錯誤 Top"),
+                    top_error,
+                ),
+            ]));
             if total == 0 {
                 traffic = traffic.child(compact_empty_state(
                     management_locale_text("No traffic yet", "还没有流量", "還沒有流量"),
@@ -15732,8 +15747,8 @@ impl ManagementCenter {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(management_locale_text("Auth header", "认证头", "認證標頭")),
                         )
-                        .children(
-                            [
+                        .child({
+                            let modes = [
                                 ("auto", management_locale_text("Auto", "自动", "自動")),
                                 (
                                     "x-api-key",
@@ -15744,37 +15759,42 @@ impl ManagementCenter {
                                     management_locale_text("Bearer", "Bearer", "Bearer"),
                                 ),
                                 ("both", management_locale_text("Both", "两者", "兩者")),
-                            ]
-                            .into_iter()
-                            .map(|(value, label)| {
-                                let selected = profile
-                                    .metadata
-                                    .auth_header_mode
-                                    .as_deref()
-                                    .unwrap_or("auto")
-                                    == value;
-                                let profile_id = profile.id.clone();
-                                Button::new(SharedString::from(format!(
-                                    "management-shared-provider-auth-mode-{value}"
-                                )))
+                            ];
+                            let current = profile
+                                .metadata
+                                .auth_header_mode
+                                .as_deref()
+                                .unwrap_or("auto");
+                            ButtonGroup::new("management-shared-provider-auth-mode-group")
                                 .xsmall()
-                                .when(selected, |button| button.primary())
-                                .when(!selected, |button| button.ghost())
-                                .label(label)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.update_shared_provider_metadata(
-                                            profile_id.clone(),
-                                            move |metadata| {
-                                                metadata.auth_header_mode =
-                                                    (value != "auto").then(|| value.to_string());
-                                            },
-                                            cx,
-                                        )
-                                    },
-                                ))
-                            }),
-                        ),
+                                .outline()
+                                .children(modes.into_iter().map(|(value, label)| {
+                                    Button::new(SharedString::from(format!(
+                                        "management-shared-provider-auth-mode-{value}"
+                                    )))
+                                    .xsmall()
+                                    .label(label)
+                                    .selected(current == value)
+                                }))
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    move |this, clicks: &Vec<usize>, _, cx| {
+                                        if let Some((value, _)) =
+                                            clicks.first().and_then(|index| modes.get(*index))
+                                        {
+                                            let value = (*value).to_string();
+                                            this.update_shared_provider_metadata(
+                                                profile_id.clone(),
+                                                move |metadata| {
+                                                    metadata.auth_header_mode =
+                                                        (value != "auto").then_some(value);
+                                                },
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                }))
+                        }),
                 )
                 .child(
                     h_flex()
@@ -15791,44 +15811,49 @@ impl ManagementCenter {
                                     "User-Agent",
                                 )),
                         )
-                        .children(
-                            [
+                        .child({
+                            let modes = [
                                 ("default", management_locale_text("Default", "默认", "預設")),
                                 (
                                     "pass_through",
                                     management_locale_text("Pass through", "透传", "透傳"),
                                 ),
-                            ]
-                            .into_iter()
-                            .map(|(value, label)| {
-                                let selected = profile
-                                    .metadata
-                                    .user_agent_mode
-                                    .as_deref()
-                                    .unwrap_or("default")
-                                    == value;
-                                let profile_id = profile.id.clone();
-                                Button::new(SharedString::from(format!(
-                                    "management-shared-provider-ua-mode-{value}"
-                                )))
+                            ];
+                            let current = profile
+                                .metadata
+                                .user_agent_mode
+                                .as_deref()
+                                .unwrap_or("default");
+                            ButtonGroup::new("management-shared-provider-ua-mode-group")
                                 .xsmall()
-                                .when(selected, |button| button.primary())
-                                .when(!selected, |button| button.ghost())
-                                .label(label)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.update_shared_provider_metadata(
-                                            profile_id.clone(),
-                                            move |metadata| {
-                                                metadata.user_agent_mode =
-                                                    (value != "default").then(|| value.to_string());
-                                            },
-                                            cx,
-                                        )
-                                    },
-                                ))
-                            }),
-                        ),
+                                .outline()
+                                .children(modes.into_iter().map(|(value, label)| {
+                                    Button::new(SharedString::from(format!(
+                                        "management-shared-provider-ua-mode-{value}"
+                                    )))
+                                    .xsmall()
+                                    .label(label)
+                                    .selected(current == value)
+                                }))
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    move |this, clicks: &Vec<usize>, _, cx| {
+                                        if let Some((value, _)) =
+                                            clicks.first().and_then(|index| modes.get(*index))
+                                        {
+                                            let value = (*value).to_string();
+                                            this.update_shared_provider_metadata(
+                                                profile_id.clone(),
+                                                move |metadata| {
+                                                    metadata.user_agent_mode =
+                                                        (value != "default").then_some(value);
+                                                },
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                }))
+                        }),
                 )
                 .child(
                     h_flex()
@@ -16342,56 +16367,91 @@ impl ManagementCenter {
         }
 
         if self.route_group_detail_tab == RouteGroupDetailTab::Members {
-            let mut member_rows = v_flex().w_full().gap_1();
-            for member in &route.members {
-                let provider_name = self
-                    .providers
-                    .iter()
-                    .find(|profile| profile.id == member.model_provider_profile_id)
-                    .map(|profile| profile.display_name.clone())
-                    .unwrap_or_else(|| member.model_provider_profile_id.as_str().to_string());
-                member_rows = member_rows.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .child(
-                            div()
-                                .w(px(22.0))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child((member.order_index + 1).to_string()),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_sm()
-                                .child(provider_name),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(member.model_id.clone()),
-                        )
-                        .when(!member.enabled, |row| {
-                            row.child(
+            let members_table = Table::new()
+                .small()
+                .w_full()
+                .accessibility_label(management_locale_text(
+                    "Route group members",
+                    "路由组成员",
+                    "路由組成員",
+                ))
+                .child(
+                    TableHeader::new().child(
+                        TableRow::new()
+                            .child(TableHead::new().child(management_locale_text(
+                                "Provider",
+                                "供应商",
+                                "供應商",
+                            )))
+                            .child(
+                                TableHead::new()
+                                    .child(management_locale_text("Model", "模型", "模型")),
+                            )
+                            .child(
+                                TableHead::new()
+                                    .text_right()
+                                    .child(management_locale_text("Details", "详情", "詳情")),
+                            ),
+                    ),
+                )
+                .child(
+                    TableBody::new().children(route.members.iter().map(|member| {
+                        let provider_name = self
+                            .providers
+                            .iter()
+                            .find(|profile| profile.id == member.model_provider_profile_id)
+                            .map(|profile| profile.display_name.clone())
+                            .unwrap_or_else(|| {
+                                member.model_provider_profile_id.as_str().to_string()
+                            });
+                        let mut details = h_flex().w_full().items_center().justify_end().gap_1();
+                        if !member.enabled {
+                            details = details.child(
                                 Tag::color(ColorName::Neutral)
                                     .xsmall()
                                     .child(management_locale_text("Disabled", "已停用", "已停用")),
+                            );
+                        }
+                        if let Some(effort) = member.reasoning_effort.clone() {
+                            details = details
+                                .child(Tag::color(ColorName::Neutral).xsmall().child(effort));
+                        }
+                        TableRow::new()
+                            .child(
+                                TableCell::new().child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(22.0))
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child((member.order_index + 1).to_string()),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .child(provider_name),
+                                        ),
+                                ),
                             )
-                        })
-                        .when_some(member.reasoning_effort.clone(), |row, effort| {
-                            row.child(Tag::color(ColorName::Neutral).xsmall().child(effort))
-                        }),
+                            .child(
+                                TableCell::new().child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(member.model_id.clone()),
+                                ),
+                            )
+                            .child(TableCell::new().child(details))
+                    })),
                 );
-            }
             body = body.child(management_card_with_icon(
                 management_locale_text("Members", "成员", "成員"),
                 management_locale_text(
@@ -16400,7 +16460,7 @@ impl ManagementCenter {
                     "嘗試順序、每個成員的模型和固定推理檔位。",
                 ),
                 "icons/vibex/list-checks.svg",
-                member_rows.into_any_element(),
+                members_table.into_any_element(),
                 cx,
             ));
         }
@@ -16436,40 +16496,32 @@ impl ManagementCenter {
                     management_locale_text("No local ceiling", "无本地上限", "無本地上限")
                         .to_string()
                 });
-            let policy = h_flex()
-                .w_full()
-                .flex_wrap()
-                .gap_4()
-                .child(stat_line(
+            let policy = description_rows_plain(vec![
+                (
                     management_locale_text("Strategy", "策略", "策略"),
-                    management_route_strategy_label(route.strategy),
-                    cx,
-                ))
-                .child(stat_line(
+                    management_route_strategy_label(route.strategy).to_string(),
+                ),
+                (
                     management_locale_text("Pin", "会话固定", "會話固定"),
                     pin_label.to_string(),
-                    cx,
-                ))
-                .child(stat_line(
+                ),
+                (
                     management_locale_text("Failover", "故障转移", "容錯移轉"),
                     failover_label.to_string(),
-                    cx,
-                ))
-                .child(stat_line(
+                ),
+                (
                     management_locale_text("First token", "首 Token", "首 Token"),
                     first_token,
-                    cx,
-                ))
-                .child(stat_line(
+                ),
+                (
                     management_locale_text("Context", "上下文", "上下文"),
                     context,
-                    cx,
-                ))
-                .child(stat_line(
+                ),
+                (
                     management_locale_text("Local ceiling", "本地上限", "本地上限"),
                     token_limit,
-                    cx,
-                ));
+                ),
+            ]);
             body = body.child(management_card_with_icon(
                 management_locale_text("Policy", "策略", "策略"),
                 management_locale_text(
@@ -16528,50 +16580,47 @@ impl ManagementCenter {
                 .max_by_key(|(_, count)| *count)
                 .map(|(status, count)| format!("{status} · {count}"))
                 .unwrap_or_else(|| "—".to_string());
-            let mut range_row = h_flex().w_full().gap_1();
-            for range in TrafficRange::ALL {
-                let selected = range == self.traffic_range;
-                range_row = range_row.child(
+            let range_row = ButtonGroup::new("management-route-traffic-range-group")
+                .xsmall()
+                .outline()
+                .children(TrafficRange::ALL.into_iter().map(|range| {
                     Button::new(SharedString::from(format!(
                         "management-route-traffic-range-{:?}",
                         range
                     )))
                     .xsmall()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.ghost())
                     .label(range.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.traffic_range = range;
+                    .selected(range == self.traffic_range)
+                }))
+                .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                    if let Some(range) = clicks
+                        .first()
+                        .and_then(|index| TrafficRange::ALL.get(*index))
+                    {
+                        this.traffic_range = *range;
                         cx.notify();
-                    })),
-                );
-            }
-            let traffic = h_flex()
-                .w_full()
-                .flex_wrap()
-                .gap_4()
-                .child(stat_line(
+                    }
+                }));
+            let traffic = description_grid(vec![
+                (
                     management_locale_text("Requests", "请求", "請求"),
                     total.to_string(),
-                    cx,
-                ))
-                .child(stat_line(
+                ),
+                (
                     management_locale_text("Succeeded", "成功", "成功"),
                     succeeded.to_string(),
-                    cx,
-                ))
-                .child(stat_line(
+                ),
+                (
                     management_locale_text("Tokens", "Token", "Token"),
                     tokens.to_string(),
-                    cx,
-                ))
-                .child(stat_line("p50", p50, cx))
-                .child(stat_line("p95", p95, cx))
-                .child(stat_line(
+                ),
+                ("p50", p50),
+                ("p95", p95),
+                (
                     management_locale_text("Top error", "错误 Top", "錯誤 Top"),
                     top_error,
-                    cx,
-                ));
+                ),
+            ]);
             body = body.child(management_card_with_icon(
                 management_locale_text("Traffic & Health", "流量与健康", "流量與健康"),
                 management_locale_text(
@@ -16711,35 +16760,26 @@ impl ManagementCenter {
             ResolvedLocale::ZhCn => format!("删除“{label}”？"),
             ResolvedLocale::ZhTw => format!("刪除「{label}」？"),
         };
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
             let provider_id = provider_id.clone();
-            dialog
+            alert
                 .title(title.clone())
-                .child(management_locale_text_for(
+                .description(management_locale_text_for(
                     active_locale,
                     "Every Agent that uses this Provider will lose it, and its models stop being selectable for them.",
                     "使用该供应商的 Agent 都会失去它，那些模型也不再能被它们选择。",
                     "使用該供應商的 Agent 都會失去它，那些模型也不再能被它們選擇。",
                 ))
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-shared-provider-delete")
-                                .outline()
-                                .label(management_locale_text_for(
-                                    active_locale,
-                                    "Cancel",
-                                    "取消",
-                                    "取消",
-                                )),
-                        ))
-                        .child(gpui_component::dialog::DialogAction::new().child(
-                            Button::new("confirm-shared-provider-delete")
-                                .danger()
-                                .label(management_delete_profile_label()),
-                        )),
-                )
+                .confirm()
+                .ok_text(management_delete_profile_label())
+                .cancel_text(management_locale_text_for(
+                    active_locale,
+                    "Cancel",
+                    "取消",
+                    "取消",
+                ))
+                .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         this.delete_shared_provider(provider_id.clone(), cx)
@@ -17395,51 +17435,32 @@ impl ManagementCenter {
         let Some(report) = self.native_import_report else {
             return div().into_any_element();
         };
-        h_flex()
-            .w_full()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(if report.missing_secrets > 0 {
-                cx.theme().warning.opacity(0.5)
-            } else {
-                cx.theme().border
-            })
-            .px_2()
-            .py_1p5()
-            .child(
-                div()
-                    .min_w_0()
-                    .text_xs()
-                    .child(if report.missing_secrets > 0 {
-                        format!(
-                            "{} {} · {} {}",
-                            management_locale_text("Imported", "已导入", "已匯入"),
-                            report.imported,
-                            management_locale_text("need keys", "需要 Key", "需要 Key"),
-                            report.missing_secrets
-                        )
-                    } else {
-                        format!(
-                            "{} {}",
-                            management_locale_text("Imported", "已导入", "已匯入"),
-                            report.imported
-                        )
-                    }),
+        let message = if report.missing_secrets > 0 {
+            format!(
+                "{} {} · {} {}",
+                management_locale_text("Imported", "已导入", "已匯入"),
+                report.imported,
+                management_locale_text("need keys", "需要 Key", "需要 Key"),
+                report.missing_secrets
             )
-            .child(
-                Button::new("management-provider-import-report-dismiss")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Close)
-                    .tooltip(management_locale_text("Dismiss", "关闭", "關閉"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.native_import_report = None;
-                        cx.notify();
-                    })),
+        } else {
+            format!(
+                "{} {}",
+                management_locale_text("Imported", "已导入", "已匯入"),
+                report.imported
             )
+        };
+        let alert = if report.missing_secrets > 0 {
+            Alert::warning("management-provider-import-report", message)
+        } else {
+            Alert::success("management-provider-import-report", message)
+        };
+        alert
+            .small()
+            .on_close(cx.listener(|this, _, _, cx| {
+                this.native_import_report = None;
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -19446,33 +19467,33 @@ impl ManagementCenter {
                         })),
                 ),
         );
-        details = details.child(stat_line(
-            management_locale_text("Models", "模型", "模型"),
-            profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .count()
-                .to_string(),
-            cx,
-        ));
         let ready_keys = profile
             .credentials
             .iter()
             .filter(|credential| credential.status == vibex_core::AgentCredentialStatus::Ready)
             .count();
-        details = details.child(stat_line(
-            management_locale_text("Keys", "Key", "Key"),
-            format!("{ready_keys}/{}", profile.credentials.len()),
-            cx,
-        ));
+        let mut facts = vec![
+            (
+                management_locale_text("Models", "模型", "模型"),
+                profile
+                    .configured_models
+                    .iter()
+                    .filter(|model| model.enabled)
+                    .count()
+                    .to_string(),
+            ),
+            (
+                management_locale_text("Keys", "Key", "Key"),
+                format!("{ready_keys}/{}", profile.credentials.len()),
+            ),
+        ];
         if let Some(endpoint) = profile.primary_api_endpoint() {
-            details = details.child(stat_line(
+            facts.push((
                 management_locale_text("Endpoint", "接口地址", "介面位址"),
                 endpoint.url.clone(),
-                cx,
             ));
         }
+        details = details.child(description_rows_plain(facts));
         management_card_dynamic(
             profile.display_name.clone(),
             management_locale_text(
@@ -19808,34 +19829,23 @@ impl ManagementCenter {
     /// sentence first.
     fn confirm_disable_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
-            dialog
+            alert
                 .title(management_locale_text(
                     "Turn off the gateway?",
                     "关闭网关？",
                     "關閉閘道？",
                 ))
-                .child(management_locale_text(
+                .description(management_locale_text(
                     "Every Agent bound to a route group will lose it. Agents that are not bound to one are not affected. The bindings are kept, so turning the gateway back on restores them.",
                     "所有绑定了路由组的 Agent 都会失去该路由组。未绑定路由组的 Agent 不受影响。绑定关系会保留，重新打开网关即可恢复。",
                     "所有綁定了路由組的 Agent 都會失去該路由組。未綁定路由組的 Agent 不受影響。綁定關係會保留，重新打開閘道即可恢復。",
                 ))
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-gateway-disable")
-                                .outline()
-                                .label(management_locale_text("Cancel", "取消", "取消")),
-                        ))
-                        .child(
-                            gpui_component::dialog::DialogAction::new().child(
-                                Button::new("confirm-gateway-disable").danger().label(
-                                    management_locale_text("Turn off", "关闭", "關閉"),
-                                ),
-                            ),
-                        ),
-                )
+                .confirm()
+                .ok_text(management_locale_text("Turn off", "关闭", "關閉"))
+                .cancel_text(management_locale_text("Cancel", "取消", "取消"))
+                .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         this.set_gateway_enabled(false, cx);
@@ -20301,38 +20311,23 @@ impl ManagementCenter {
     /// Asks before removing the token ceiling.
     fn confirm_clear_gateway_token_limit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
-            dialog
+            alert
                 .title(management_locale_text(
                     "Remove the token limit?",
                     "取消 token 上限？",
                     "取消 token 上限？",
                 ))
-                .child(management_locale_text(
+                .description(management_locale_text(
                     "The gateway will keep using a Provider past the locally observed ceiling. This is the limit Vibex counts, not the vendor's own quota.",
                     "网关将不再按本地观测到的 token 上限停用供应商。这是 Vibex 本地计数，不是厂商侧的额度。",
                     "閘道將不再按本機觀測到的 token 上限停用供應商。這是 Vibex 本機計數，不是廠商側的額度。",
                 ))
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-gateway-token-limit")
-                                .outline()
-                                .label(management_locale_text("Cancel", "取消", "取消")),
-                        ))
-                        .child(
-                            gpui_component::dialog::DialogAction::new().child(
-                                Button::new("confirm-gateway-token-limit")
-                                    .danger()
-                                    .label(management_locale_text(
-                                        "Remove limit",
-                                        "移除上限",
-                                        "移除上限",
-                                    )),
-                            ),
-                        ),
-                )
+                .confirm()
+                .ok_text(management_locale_text("Remove limit", "移除上限", "移除上限"))
+                .cancel_text(management_locale_text("Cancel", "取消", "取消"))
+                .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         this.clear_gateway_token_limit(cx);
@@ -20598,24 +20593,27 @@ impl ManagementCenter {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let mut ranges = h_flex().items_center().gap_1();
-        for range in TrafficRange::ALL {
-            let selected = range == self.traffic_range;
-            ranges = ranges.child(
+        let ranges = ButtonGroup::new("management-gateway-dashboard-range-group")
+            .xsmall()
+            .outline()
+            .children(TrafficRange::ALL.into_iter().map(|range| {
                 Button::new(SharedString::from(format!(
                     "management-gateway-dashboard-range-{:?}",
                     range
                 )))
                 .xsmall()
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.outline())
                 .label(range.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.traffic_range = range;
+                .selected(range == self.traffic_range)
+            }))
+            .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                if let Some(range) = clicks
+                    .first()
+                    .and_then(|index| TrafficRange::ALL.get(*index))
+                {
+                    this.traffic_range = *range;
                     cx.notify();
-                })),
-            );
-        }
+                }
+            }));
         let metric = |label: &str, value: String| {
             v_flex()
                 .min_w(px(112.0))
@@ -20683,27 +20681,20 @@ impl ManagementCenter {
                         .child(metric("Failovers", failover_count.to_string()))
                         .child(metric("Inflight", self.gateway_inflight.len().to_string())),
                 )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .flex_wrap()
-                        .gap_4()
-                        .child(stat_line(
-                            management_locale_text("Top Provider", "最多供应商", "最多供應商"),
-                            top(&top_providers),
-                            cx,
-                        ))
-                        .child(stat_line(
-                            management_locale_text("Top model", "最多模型", "最多模型"),
-                            top(&top_models),
-                            cx,
-                        ))
-                        .child(stat_line(
-                            management_locale_text("Top error", "最多错误", "最多錯誤"),
-                            top(&top_errors),
-                            cx,
-                        )),
-                )
+                .child(description_grid(vec![
+                    (
+                        management_locale_text("Top Provider", "最多供应商", "最多供應商"),
+                        top(&top_providers),
+                    ),
+                    (
+                        management_locale_text("Top model", "最多模型", "最多模型"),
+                        top(&top_models),
+                    ),
+                    (
+                        management_locale_text("Top error", "最多错误", "最多錯誤"),
+                        top(&top_errors),
+                    ),
+                ]))
                 .into_any_element(),
             cx,
         )
@@ -21168,37 +21159,23 @@ impl ManagementCenter {
 
     fn confirm_clear_gateway_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
-            dialog
+            alert
                 .title(management_locale_text(
                     "Clear gateway request records?",
                     "清除网关请求记录？",
                     "清除閘道請求記錄？",
                 ))
-                .child(management_locale_text(
+                .description(management_locale_text(
                     "The metadata of the last seven days is deleted. Usage statistics will no longer include the gateway's own records.",
                     "将删除最近七天的请求元数据，用量统计将不再包含网关自身的记录。",
                     "將刪除最近七天的請求中繼資料，用量統計將不再包含閘道自身的記錄。",
                 ))
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-gateway-clear").outline().label(
-                                management_locale_text("Cancel", "取消", "取消"),
-                            ),
-                        ))
-                        // The destructive action is the dialog's confirm, so
-                        // Enter and the button do the same thing rather than
-                        // letting a stray Return read as "cancel".
-                        .child(
-                            gpui_component::dialog::DialogAction::new().child(
-                                Button::new("confirm-gateway-clear")
-                                    .danger()
-                                    .label(management_locale_text("Clear", "清除", "清除")),
-                            ),
-                        ),
-                )
+                .confirm()
+                .ok_text(management_locale_text("Clear", "清除", "清除"))
+                .cancel_text(management_locale_text("Cancel", "取消", "取消"))
+                .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         this.clear_gateway_requests(window, cx);
@@ -21328,72 +21305,47 @@ impl ManagementCenter {
         request: &vibex_core::GatewayRequestSummary,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let label = |text: &'static str| {
-            div()
-                .w(px(56.0))
-                .flex_none()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(text)
-        };
-        let mut model_rows = v_flex()
-            .w_full()
-            .gap_0p5()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(label(management_locale_text("Asked", "请求", "請求")))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .child(request.model_requested.clone()),
-                    ),
-            )
-            .when_some(request.model_served.clone(), |this, served| {
-                this.child(
-                    h_flex()
-                        .gap_2()
-                        .child(label(management_locale_text("Served", "实际", "實際")))
-                        .child(div().min_w_0().truncate().text_xs().child(served)),
-                )
-            });
-        if request.model_served.as_deref() != Some(request.model_requested.as_str()) {
-            model_rows = model_rows.child(
-                div()
-                    .pl(px(64.0))
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "The Agent asked for one model and the upstream answered with another.",
-                        "Agent 请求的模型与上游实际返回的不是同一个。",
-                        "Agent 請求的模型與上游實際回傳的不是同一個。",
-                    )),
-            );
+        let _ = cx;
+        let mut model_rows = vec![(
+            management_locale_text("Asked", "请求", "請求"),
+            request.model_requested.clone(),
+        )];
+        if let Some(served) = request.model_served.clone() {
+            model_rows.push((management_locale_text("Served", "实际", "實際"), served));
         }
-
-        let mut route_rows = v_flex().w_full().gap_0p5();
-        for (index, line) in gateway_route_lines(request, locale::current_locale())
+        let model_mismatch =
+            request.model_served.as_deref() != Some(request.model_requested.as_str());
+        let route_rows = gateway_route_lines(request, locale::current_locale())
             .into_iter()
             .enumerate()
-        {
-            route_rows = route_rows.child(
-                h_flex()
-                    .gap_2()
-                    .child(if index == 0 {
-                        label(management_locale_text("Route", "经过", "經過"))
+            .map(|(index, line)| {
+                (
+                    if index == 0 {
+                        management_locale_text("Route", "经过", "經過")
                     } else {
-                        div().w(px(56.0)).flex_none()
-                    })
-                    .child(div().min_w_0().text_xs().child(line)),
-            );
+                        ""
+                    },
+                    line,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut meta_rows = vec![(
+            management_locale_text("Status", "状态", "狀態"),
+            format!(
+                "{} · {} ms",
+                request
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                request.latency_ms.unwrap_or_default()
+            ),
+        )];
+        if let Some(code) = gateway_request_error_code(request) {
+            meta_rows.push((management_locale_text("Failure", "失败", "失敗"), code));
         }
-
-        let usage = h_flex()
-            .gap_2()
-            .child(label(management_locale_text("Usage", "用量", "用量")))
-            .child(div().text_xs().child(format!(
+        meta_rows.push((
+            management_locale_text("Usage", "用量", "用量"),
+            format!(
                 "{} {} · {} {} · {} {} · {} {}",
                 management_locale_text("in", "输入", "輸入"),
                 request.input_tokens,
@@ -21403,7 +21355,8 @@ impl ManagementCenter {
                 request.cached_read_tokens,
                 management_locale_text("total", "合计", "合計"),
                 request.total_tokens
-            )));
+            ),
+        ));
 
         v_flex()
             .id(SharedString::from(format!(
@@ -21417,30 +21370,22 @@ impl ManagementCenter {
             .mb_1()
             .rounded(px(6.0))
             .bg(cx.theme().muted.opacity(0.35))
-            .child(model_rows)
-            .child(route_rows)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(label(management_locale_text("Status", "状态", "狀態")))
-                    .child(div().text_xs().child(format!(
-                                "{} · {} ms",
-                                request
-                                    .status
-                                    .map(|status| status.to_string())
-                                    .unwrap_or_else(|| "—".to_string()),
-                                request.latency_ms.unwrap_or_default()
-                            ))),
-            )
-            .when_some(gateway_request_error_code(request), |this, code| {
+            .child(description_rows_plain(model_rows))
+            .when(model_mismatch, |this| {
                 this.child(
-                    h_flex()
-                        .gap_2()
-                        .child(label(management_locale_text("Failure", "失败", "失敗")))
-                        .child(div().min_w_0().text_xs().child(code)),
+                    div()
+                        .pl(px(12.0))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "The Agent asked for one model and the upstream answered with another.",
+                            "Agent 请求的模型与上游实际返回的不是同一个。",
+                            "Agent 請求的模型與上游實際回傳的不是同一個。",
+                        )),
                 )
             })
-            .child(usage)
+            .child(description_rows_plain(route_rows))
+            .child(description_rows_plain(meta_rows))
             .into_any_element()
     }
 
@@ -21920,45 +21865,59 @@ impl ManagementCenter {
                 model.capabilities.reasoning,
             ),
         ] {
-            let mut chips = h_flex().items_center().gap_1().child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label),
-            );
-            for (choice, choice_label) in [
+            let choices = [
                 (None, management_locale_text("Inherit", "继承", "繼承")),
                 (Some(true), management_locale_text("Yes", "是", "是")),
                 (Some(false), management_locale_text("No", "否", "否")),
-            ] {
-                let selected = value == choice;
-                let profile_id = profile_id.clone();
-                let model_id = model_id.clone();
-                chips = chips.child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-model-{field}-{}-{}",
-                        model.id,
-                        match choice {
-                            None => "inherit",
-                            Some(true) => "yes",
-                            Some(false) => "no",
-                        }
+            ];
+            let chips = h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    ButtonGroup::new(SharedString::from(format!(
+                        "management-provider-model-{field}-{}-group",
+                        model.id
                     )))
                     .xsmall()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.ghost())
-                    .label(choice_label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_shared_provider_model_capability(
-                            profile_id.clone(),
-                            model_id.clone(),
-                            field,
-                            choice,
-                            cx,
-                        )
+                    .outline()
+                    .children(choices.into_iter().map(|(choice, choice_label)| {
+                        Button::new(SharedString::from(format!(
+                            "management-provider-model-{field}-{}-{}",
+                            model.id,
+                            match choice {
+                                None => "inherit",
+                                Some(true) => "yes",
+                                Some(false) => "no",
+                            }
+                        )))
+                        .xsmall()
+                        .label(choice_label)
+                        .selected(value == choice)
+                    }))
+                    .on_click(cx.listener({
+                        let profile_id = profile_id.clone();
+                        let model_id = model_id.clone();
+                        move |this, clicks: &Vec<usize>, _, cx| {
+                            if let Some((choice, _)) =
+                                clicks.first().and_then(|index| choices.get(*index))
+                            {
+                                this.set_shared_provider_model_capability(
+                                    profile_id.clone(),
+                                    model_id.clone(),
+                                    field,
+                                    *choice,
+                                    cx,
+                                );
+                            }
+                        }
                     })),
                 );
-            }
             capabilities = capabilities.child(chips);
         }
         v_flex()
@@ -22467,36 +22426,25 @@ impl ManagementCenter {
             return;
         }
         let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
             let profile = profile.clone();
             let credential = credential.clone();
-            dialog
+            alert
                 .title(management_locale_text(
                     "Remove the last key?",
                     "移除最后一个 Key？",
                     "移除最後一個 Key？",
                 ))
-                .child(management_locale_text(
+                .description(management_locale_text(
                     "This Provider has no other key. It cannot answer a request until a new key is added.",
                     "该供应商没有其他 Key，添加新 Key 之前无法发起请求。",
                     "該供應商沒有其他 Key，新增 Key 之前無法發起請求。",
                 ))
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-gateway-remove-last-key")
-                                .outline()
-                                .label(management_locale_text("Cancel", "取消", "取消")),
-                        ))
-                        .child(
-                            gpui_component::dialog::DialogAction::new().child(
-                                Button::new("confirm-gateway-remove-last-key")
-                                    .danger()
-                                    .label(management_locale_text("Remove", "移除", "移除")),
-                            ),
-                        ),
-                )
+                .confirm()
+                .ok_text(management_locale_text("Remove", "移除", "移除"))
+                .cancel_text(management_locale_text("Cancel", "取消", "取消"))
+                .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         this.remove_gateway_key(
@@ -22988,52 +22936,49 @@ impl ManagementCenter {
         // What the service is listening on. The address is read-only on
         // purpose: an Agent binding points at it, so editing it by hand would
         // break every one of them.
-        let mut connection_rows = v_flex().w_full().gap_2();
-        connection_rows = connection_rows.child(stat_line(
-            management_locale_text("Address", "地址", "位址"),
-            status.base_url().unwrap_or_else(|| {
-                management_locale_text("not running", "未运行", "未執行").to_string()
-            }),
-            cx,
-        ));
         let gateway_route_count = snapshot
             .models
             .iter()
             .filter_map(|model| model.route_id.as_deref())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        connection_rows = connection_rows.child(stat_line(
-            management_locale_text("Route groups", "路由组", "路由組"),
-            gateway_route_count.to_string(),
-            cx,
-        ));
-        connection_rows = connection_rows.child(stat_line(
-            management_locale_text("Keys ready", "可用 Key", "可用 Key"),
-            format!(
-                "{} / {}",
-                snapshot.ready_key_count(),
-                snapshot
-                    .upstreams
-                    .iter()
-                    .map(|upstream| upstream.keys.len())
-                    .sum::<usize>()
+        let mut connection_rows = vec![
+            (
+                management_locale_text("Address", "地址", "位址"),
+                status.base_url().unwrap_or_else(|| {
+                    management_locale_text("not running", "未运行", "未執行").to_string()
+                }),
             ),
-            cx,
-        ));
+            (
+                management_locale_text("Route groups", "路由组", "路由組"),
+                gateway_route_count.to_string(),
+            ),
+            (
+                management_locale_text("Keys ready", "可用 Key", "可用 Key"),
+                format!(
+                    "{} / {}",
+                    snapshot.ready_key_count(),
+                    snapshot
+                        .upstreams
+                        .iter()
+                        .map(|upstream| upstream.keys.len())
+                        .sum::<usize>()
+                ),
+            ),
+        ];
         if snapshot.cooling_key_count() > 0 {
-            connection_rows = connection_rows.child(stat_line(
+            connection_rows.push((
                 management_locale_text("Cooling down", "冷却中", "冷卻中"),
                 snapshot.cooling_key_count().to_string(),
-                cx,
             ));
         }
         if snapshot.invalid_key_count() > 0 {
-            connection_rows = connection_rows.child(stat_line(
+            connection_rows.push((
                 management_locale_text("Invalid", "已失效", "已失效"),
                 snapshot.invalid_key_count().to_string(),
-                cx,
             ));
         }
+        let connection_rows = description_rows_plain(connection_rows);
         if self.gateway_detail_tab == GatewayDetailTab::Overview {
             body = body.child(management_card_with_icon(
             management_locale_text("Connection", "连接", "連線"),
@@ -23073,25 +23018,33 @@ impl ManagementCenter {
                 })
             })
             .clone();
-        let mut limit_window_row = h_flex().w_full().items_center().gap_1();
-        for window_choice in vibex_core::GatewayTokenWindow::ALL {
-            let selected = window_choice == limit_window;
-            limit_window_row = limit_window_row.child(
-                Button::new(SharedString::from(format!(
-                    "management-gateway-token-window-{}",
-                    window_choice.id()
-                )))
-                .xsmall()
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.outline())
-                .label(gateway_token_window_label(window_choice))
-                .disabled(pending)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.gateway_token_limit_window = Some(window_choice);
-                    cx.notify();
-                })),
+        let limit_window_row =
+            h_flex().w_full().items_center().gap_1().child(
+                ButtonGroup::new("management-gateway-token-window-group")
+                    .xsmall()
+                    .outline()
+                    .disabled(pending)
+                    .children(vibex_core::GatewayTokenWindow::ALL.into_iter().map(
+                        |window_choice| {
+                            Button::new(SharedString::from(format!(
+                                "management-gateway-token-window-{}",
+                                window_choice.id()
+                            )))
+                            .xsmall()
+                            .label(gateway_token_window_label(window_choice))
+                            .selected(window_choice == limit_window)
+                        },
+                    ))
+                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                        if let Some(window_choice) = clicks
+                            .first()
+                            .and_then(|index| vibex_core::GatewayTokenWindow::ALL.get(*index))
+                        {
+                            this.gateway_token_limit_window = Some(*window_choice);
+                            cx.notify();
+                        }
+                    })),
             );
-        }
         let limit_error = self.gateway_token_limit_error.clone();
         policy_rows = policy_rows.child(
             v_flex()
@@ -23650,24 +23603,29 @@ impl ManagementCenter {
             .value()
             .trim()
             .to_lowercase();
-        let mut request_controls = h_flex().w_full().items_center().flex_wrap().gap_1();
-        for filter in GatewayRequestFilter::ALL {
-            let selected = filter == self.gateway_request_filter;
-            request_controls = request_controls.child(
-                Button::new(SharedString::from(format!(
-                    "management-gateway-request-filter-{:?}",
-                    filter
-                )))
+        let request_controls = h_flex().w_full().items_center().flex_wrap().gap_1().child(
+            ButtonGroup::new("management-gateway-request-filter-group")
                 .xsmall()
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.ghost())
-                .label(filter.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.gateway_request_filter = filter;
-                    cx.notify();
+                .outline()
+                .children(GatewayRequestFilter::ALL.into_iter().map(|filter| {
+                    Button::new(SharedString::from(format!(
+                        "management-gateway-request-filter-{:?}",
+                        filter
+                    )))
+                    .xsmall()
+                    .label(filter.label())
+                    .selected(filter == self.gateway_request_filter)
+                }))
+                .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                    if let Some(filter) = clicks
+                        .first()
+                        .and_then(|index| GatewayRequestFilter::ALL.get(*index))
+                    {
+                        this.gateway_request_filter = *filter;
+                        cx.notify();
+                    }
                 })),
-            );
-        }
+        );
         let mut request_rows = v_flex()
             .w_full()
             .gap_1()
@@ -32092,18 +32050,18 @@ impl ManagementCenter {
             .map(|route| route.display_name.clone())
             .unwrap_or_else(|| route_id.as_str().to_string());
         let active_locale = locale::current_locale();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
             let route_id = route_id.clone();
             let label = label.clone();
-            dialog
+            alert
                 .title(management_locale_text_for(
                     active_locale,
                     "Delete this route group?",
                     "删除这个路由组？",
                     "刪除這個路由組？",
                 ))
-                .child(match active_locale {
+                .description(match active_locale {
                     ResolvedLocale::En => format!(
                         "\u{201c}{label}\u{201d} will be removed, and every Agent using it loses these models."
                     ),
@@ -32114,29 +32072,20 @@ impl ManagementCenter {
                         "將移除「{label}」，所有使用它的 Agent 都會失去這些模型。"
                     ),
                 })
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-route-group-delete")
-                                .outline()
-                                .label(management_locale_text_for(
-                                    active_locale,
-                                    "Cancel",
-                                    "取消",
-                                    "取消",
-                                )),
-                        ))
-                        .child(gpui_component::dialog::DialogAction::new().child(
-                            Button::new("confirm-route-group-delete").danger().label(
-                                management_locale_text_for(
-                                    active_locale,
-                                    "Delete",
-                                    "删除",
-                                    "刪除",
-                                ),
-                            ),
-                        )),
-                )
+                .confirm()
+                .ok_text(management_locale_text_for(
+                    active_locale,
+                    "Delete",
+                    "删除",
+                    "刪除",
+                ))
+                .cancel_text(management_locale_text_for(
+                    active_locale,
+                    "Cancel",
+                    "取消",
+                    "取消",
+                ))
+                .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let entity = entity.clone();
                     let route_id = route_id.clone();
@@ -33824,24 +33773,30 @@ impl ManagementCenter {
                 .child(management_locale_text("Policy", "路由策略", "路由策略")),
         );
         let current = self.route_group_strategy;
-        let mut policies = h_flex().w_full().flex_wrap().items_center().gap_1();
-        for strategy in vibex_core::RouteStrategy::ALL {
-            policies = policies.child(
-                Button::new(SharedString::from(format!(
-                    "management-model-group-strategy-{}",
-                    strategy.id()
-                )))
+        let policies = h_flex().w_full().flex_wrap().items_center().gap_1().child(
+            ButtonGroup::new("management-model-group-strategy-group")
                 .xsmall()
-                .ghost()
-                .label(management_route_strategy_label(strategy))
-                .selected(strategy == current)
+                .outline()
                 .disabled(pending)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.route_group_strategy = strategy;
-                    cx.notify();
+                .children(vibex_core::RouteStrategy::ALL.into_iter().map(|strategy| {
+                    Button::new(SharedString::from(format!(
+                        "management-model-group-strategy-{}",
+                        strategy.id()
+                    )))
+                    .xsmall()
+                    .label(management_route_strategy_label(strategy))
+                    .selected(strategy == current)
+                }))
+                .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                    if let Some(strategy) = clicks
+                        .first()
+                        .and_then(|index| vibex_core::RouteStrategy::ALL.get(*index))
+                    {
+                        this.route_group_strategy = *strategy;
+                        cx.notify();
+                    }
                 })),
-            );
-        }
+        );
         rows = rows.child(
             v_flex()
                 .w_full()
@@ -45724,6 +45679,40 @@ fn description_rows(
         )
 }
 
+/// A borderless description list for facts that already live inside a card.
+///
+/// `stat_line` rows used to draw their own separator under every pair. The kit
+/// list owns the label column and the value alignment, so a detail card keeps
+/// the same density without another box inside it.
+fn description_rows_plain(
+    rows: impl IntoIterator<Item = (impl Into<DescriptionText>, impl Into<DescriptionText>)>,
+) -> DescriptionList {
+    DescriptionList::new()
+        .columns(1)
+        .label_width(px(140.0))
+        .bordered(false)
+        .with_size(Size::Small)
+        .children(
+            rows.into_iter()
+                .map(|(label, value)| DescriptionItem::new(label).value(value)),
+        )
+}
+
+/// A compact two-column description grid for metric summaries.
+fn description_grid(
+    rows: impl IntoIterator<Item = (impl Into<DescriptionText>, impl Into<DescriptionText>)>,
+) -> DescriptionList {
+    DescriptionList::new()
+        .columns(2)
+        .label_width(px(110.0))
+        .bordered(false)
+        .with_size(Size::Small)
+        .children(
+            rows.into_iter()
+                .map(|(label, value)| DescriptionItem::new(label).value(value)),
+        )
+}
+
 fn status_line(message: String, error: bool, cx: &mut Context<ManagementCenter>) -> AnyElement {
     div()
         .w_full()
@@ -50812,8 +50801,8 @@ mod gateway_surface_tests {
         assert!(source.contains("fn management_percentile("));
         assert!(source.contains("management_percentile(latencies.clone(), 0.5)"));
         assert!(source.contains("management_percentile(latencies, 0.95)"));
-        assert!(source.contains("stat_line(\"p50\""));
-        assert!(source.contains("stat_line(\"p95\""));
+        assert!(source.contains("(\"p50\", p50)"));
+        assert!(source.contains("(\"p95\", p95)"));
     }
 
     #[test]
@@ -51912,8 +51901,8 @@ mod gateway_surface_tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn clear_gateway_requests("))
             .map(|(body, _)| body)
             .expect("the ledger confirmation should remain inspectable");
-        assert!(clear.contains("window.open_dialog"));
-        assert!(clear.contains("DialogAction::new()"));
+        assert!(clear.contains("window.open_alert_dialog"));
+        assert!(clear.contains(".confirm()"));
         assert!(clear.contains(".on_ok("));
         assert!(clear.contains("clear_gateway_requests(window, cx)"));
 
