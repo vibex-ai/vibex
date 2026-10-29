@@ -26,6 +26,7 @@ impl Arena {
             Guardian::Grok => self.tick_grok(),
             Guardian::ZCode => self.tick_zcode(),
             Guardian::Kimi => self.tick_kimi(),
+            Guardian::CodeBuddy => self.tick_codebuddy(),
         }
         self.boss.update_core();
     }
@@ -96,6 +97,8 @@ impl Arena {
 mod claude;
 #[path = "encounter_cline.rs"]
 mod cline;
+#[path = "encounter_codebuddy.rs"]
+pub(super) mod codebuddy;
 #[path = "encounter_codex.rs"]
 mod codex;
 #[path = "encounter_copilot.rs"]

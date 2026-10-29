@@ -98,6 +98,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::Grok => observatory_floor(&mut frame),
         Guardian::ZCode => gate_hall(&mut frame),
         Guardian::Kimi => page(&mut frame),
+        Guardian::CodeBuddy => playroom(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -144,6 +145,38 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// CodeBuddy's playroom: a round violet rug in rings, paw prints wandering
+/// across it, and a ball of yarn's trail looping round the middle.
+fn playroom(frame: &mut Raster) {
+    let c = pixel(CENTER);
+    for (n, r) in [250, 205, 160, 115, 70].into_iter().enumerate() {
+        let color = if n % 2 == 0 { FLOOR_LIGHT } else { FLOOR };
+        frame.ellipse(c, (r, r * 2 / 3), color);
+        frame.ring(c, (r, r * 2 / 3), SEAM, true);
+    }
+    for n in 0..26 {
+        let h = hash(n, 101);
+        let a = n as f32 * 0.55 + (h % 7) as f32 * 0.05;
+        let r = 60.0 + (n % 9) as f32 * 18.0;
+        let (x, y) = (
+            c.0 + (a.cos() * r) as i32,
+            c.1 + (a.sin() * r * 0.66) as i32,
+        );
+        frame.ellipse((x, y), (3, 2), FLOOR_SHADE);
+        for (dx, dy) in [(-3, -4), (0, -5), (3, -4)] {
+            frame.rect(x + dx, y + dy, 2, 2, FLOOR_SHADE);
+        }
+    }
+    for n in 0..60 {
+        let a = n as f32 * TAU / 60.0;
+        let wobble = (a * 5.0).sin() * 14.0;
+        let p = (
+            c.0 + (a.cos() * (92.0 + wobble)) as i32,
+            c.1 + (a.sin() * (58.0 + wobble * 0.6)) as i32,
+        );
+        frame.rect(p.0, p.1, 2, 1, WALL_LIGHT);
+    }
+}
 /// Kimi's page: ruled lines down a pale floor, a margin rule, and faint
 /// token squares scattered along the lines like words.
 fn page(frame: &mut Raster) {
@@ -823,6 +856,18 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                 let on_page = map.inside(Vec2::new(x as f32 / SCALE, y as f32 / SCALE), 2.0);
                 if beat < 0.35 && on_page {
                     frame.rect(x, y, 8, 6, CORE);
+                }
+            }
+        }
+        Guardian::CodeBuddy => {
+            // Teal motes drift up from the rug.
+            for n in 0..9 {
+                let h = hash(n, 97);
+                let t = (time * 0.12 + n as f32 * 0.11).fract();
+                let p = Vec2::new(30.0 + (h % 116) as f32, 100.0 - t * 80.0);
+                if map.inside(p, 3.0) {
+                    let (x, y) = pixel(p);
+                    frame.rect(x, y, 2, 2, if n % 3 == 0 { CORE_LIGHT } else { CORE });
                 }
             }
         }

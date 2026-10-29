@@ -4,6 +4,7 @@ use super::geometry::circle_hit;
 pub(super) use super::geometry::{HEIGHT, Vec2, WIDTH, segment_distance, smoothstep};
 pub(super) use super::guardian::{Attack, Boss, BossState, Guardian, STEMS, Shard};
 use super::map::{BRAZIER, CENTER, FLAME_RADIUS, Map, ScarKind};
+pub(super) use encounters::codebuddy::BUG_RADIUS as CODEBUDDY_BUG_RADIUS;
 pub(super) use encounters::grok::{
     BLADE_RADIUS as GROK_BLADE_RADIUS, FRENZY_RADIUS as GROK_FRENZY_RADIUS,
 };
@@ -112,6 +113,8 @@ pub(super) enum ProjectileKind {
     Block,
     /// A fast, lethal bolt from Cline's eyes.
     Bolt,
+    /// A hairball rolling back to CodeBuddy, lethal on the way.
+    Yarn,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Projectile {
@@ -145,6 +148,12 @@ pub(super) enum HazardKind {
     /// A block of Kimi's long context, laid down behind it as it slides. It
     /// kills on touch until it fades, and an arrow through it clears it.
     Trail,
+    /// A hairball coughed up by CodeBuddy, lethal where it lands.
+    Hairball,
+    /// A landed hairball lying still until it rolls back to the cat.
+    Yarn,
+    /// CodeBuddy's bug bomb: it ticks for `delay`, then bursts.
+    Bug,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Hazard {
@@ -669,7 +678,7 @@ impl Arena {
         match self.boss.guardian {
             Guardian::Claude => self.boss.generation >= 4,
             Guardian::Codex => !self.boss.cube_shielded(),
-            Guardian::Pi | Guardian::DeepSeek => true,
+            Guardian::Pi | Guardian::DeepSeek | Guardian::CodeBuddy => true,
             // The blue square is on the tile's face.
             Guardian::Kimi => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
@@ -955,6 +964,7 @@ impl Arena {
                 ProjectileKind::Orb => 1.7,
                 ProjectileKind::Block => 1.5,
                 ProjectileKind::Bolt => 1.2,
+                ProjectileKind::Yarn => 1.8,
             };
             if segment_distance(
                 Vec2::default(),
@@ -964,7 +974,9 @@ impl Arena {
             {
                 projectile.remaining = 0.0;
                 match projectile.kind {
-                    ProjectileKind::Block | ProjectileKind::Bolt => hit = true,
+                    ProjectileKind::Block | ProjectileKind::Bolt | ProjectileKind::Yarn => {
+                        hit = true
+                    }
                     ProjectileKind::Orb if !shielded => {
                         pushes.push(projectile.velocity.normalized());
                     }
@@ -1007,14 +1019,24 @@ impl Arena {
             if !was_active {
                 landings.push((hazard.kind, hazard.position, hazard.radius));
             }
-            if hazard.kind != HazardKind::Goo
+            if !matches!(hazard.kind, HazardKind::Goo | HazardKind::Yarn)
                 && segment_distance(hazard.position, player_from, player)
                     < hazard.radius + PLAYER_RADIUS
             {
                 hit = true;
             }
         }
+        // A hairball that has lain long enough rolls back to the cat.
+        let returning: Vec<Vec2> = self
+            .hazards
+            .iter()
+            .filter(|h| h.kind == HazardKind::Yarn && h.time >= h.delay + h.duration)
+            .map(|h| h.position)
+            .collect();
         self.hazards.retain(|h| h.time < h.delay + h.duration);
+        for from in returning {
+            self.yarn_home(from);
+        }
         for beam in &mut self.beams {
             beam.time += STEP;
             if beam.active()
@@ -1038,7 +1060,12 @@ impl Arena {
                     self.effect(EffectKind::Rubble, position, 0.7, radius + 2.0);
                     self.map.scar(position, radius, ScarKind::Crack);
                 }
-                HazardKind::Goo | HazardKind::Trail => {}
+                HazardKind::Hairball => {
+                    self.effect(EffectKind::Dust, position, 0.5, radius + 1.0);
+                    self.hazard(HazardKind::Yarn, position, 0.0, 2.5, 2.0);
+                }
+                HazardKind::Bug => self.bug_burst(position, radius),
+                HazardKind::Goo | HazardKind::Trail | HazardKind::Yarn => {}
             }
         }
         if hit {

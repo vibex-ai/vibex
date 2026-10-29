@@ -485,6 +485,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Grok => grok::grok(&mut mesh, boss, fall),
         Guardian::ZCode => zcode::zcode(&mut mesh, boss, fall),
         Guardian::Kimi => kimi::kimi(&mut mesh, boss),
+        Guardian::CodeBuddy => codebuddy::codebuddy(&mut mesh, boss, time, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -527,6 +528,8 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Grok => (pitch + fall * 0.5, bank, boss.height - fall * 3.0, boss.yaw),
         // A beaten tile falls flat on its back.
         Guardian::Kimi => (pitch + fall * 1.3, bank, boss.height, boss.yaw),
+        // A beaten cat flops over onto its side.
+        Guardian::CodeBuddy => (pitch, bank + fall * 1.2, boss.height, boss.yaw),
         _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
@@ -1092,6 +1095,8 @@ fn copilot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
 
 #[path = "sculpture_cline.rs"]
 mod cline;
+#[path = "sculpture_codebuddy.rs"]
+mod codebuddy;
 #[path = "sculpture_cursor.rs"]
 mod cursor;
 #[path = "sculpture_grok.rs"]

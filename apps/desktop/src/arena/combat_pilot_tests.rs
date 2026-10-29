@@ -265,6 +265,26 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::CodeBuddy => {
+            let bug = arena
+                .hazards
+                .iter()
+                .find(|h| h.kind == HazardKind::Bug)
+                .map(|h| h.position);
+            plan.goal = match bug {
+                // Past its own bug, on the far side from the cat, so it
+                // waddles over the bug to reach us.
+                Some(bug) => arena.map.move_body(
+                    bug,
+                    bug.plus(bug.minus(boss.position).normalized().scale(15.0)),
+                    2.0,
+                ),
+                None => around(boss.position, 22.0),
+            };
+            if boss.exposed > arrival(boss.core) + 0.03 {
+                plan.target = Some(boss.core);
+            }
+        }
         Guardian::Kimi => {
             plan.goal = around(boss.position, 28.0);
             let front = player.minus(boss.core).dot(boss.direction) > 3.0;
@@ -542,6 +562,16 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
                 score += 10.0
             }
             HazardKind::Trail if distance < h.radius + PLAYER_RADIUS + 1.2 => score += 10.0,
+            HazardKind::Hairball
+                if h.time < h.delay + 0.02 && distance < h.radius + PLAYER_RADIUS + 1.2 =>
+            {
+                score += 10.0
+            }
+            HazardKind::Bug
+                if h.time > h.delay - 1.0 && distance < h.radius + PLAYER_RADIUS + 2.0 =>
+            {
+                score += 10.0
+            }
             _ => {}
         }
     }
@@ -721,4 +751,8 @@ fn the_gate_slab_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_tile_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Kimi);
+}
+#[test]
+fn the_cat_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::CodeBuddy);
 }

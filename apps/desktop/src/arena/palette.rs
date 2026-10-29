@@ -29,6 +29,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::ZCode => [0x10141c, 0x1f2633, 0x343d4f, 0x55627a, 0x8d9ab3],
         // The logo's black tile.
         Guardian::Kimi => [0x020203, 0x0c0c0f, 0x19191e, 0x2c2c33, 0x4a4a54],
+        // The mascot's white, cooled toward the logo's lilac in shadow.
+        Guardian::CodeBuddy => [0x3a3260, 0x6e66a8, 0xb2acdc, 0xe2def5, 0xffffff],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -72,6 +74,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Kimi => [
             0x1e1d1b, 0xc4c0b5, 0xdcd8ce, 0xece9e1, 0xb1ada2, 0x86827a, 0xf6f4ee,
         ],
+        // A deep violet playroom, the logo's gradient underfoot.
+        Guardian::CodeBuddy => [
+            0x120e26, 0x2d2559, 0x3a3170, 0x4a3f8a, 0x231d48, 0x2b2453, 0x6c5fc0,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -104,6 +110,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::ZCode => [0x4b1fa0, 0x9d6bff, 0xe6dcff],
         // The logo's blue square, and the context it lays down.
         Guardian::Kimi => [0x0b4fb3, 0x1683ff, 0xb3d6ff],
+        // The teal glow at the foot of the logo.
+        Guardian::CodeBuddy => [0x0f7a62, 0x32e6b9, 0xc5fff0],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -122,6 +130,16 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         for (ix, value) in [0x0f4a7a, 0x2fa8f0, 0xa8ecff].into_iter().enumerate() {
             colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
         }
+    }
+    if guardian == Guardian::CodeBuddy {
+        // The visor is the logo's violet-to-blue gradient, the eyes its
+        // cool white.
+        for (ix, value) in [0x3b2a9e, 0x5b4fe0, 0x8f9bff].into_iter().enumerate() {
+            colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
+        }
+        colors[ink::WHITE as usize] = rgb(0xffffff).into();
+        colors[ink::IVORY as usize] = rgb(0xeae8fb).into();
+        colors[ink::DUST as usize] = rgb(0xb9b4e2).into();
     }
     if guardian == Guardian::Kimi {
         // The K is the logo's pure white.

@@ -112,7 +112,32 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 frame.rect(c.0 - s, c.1 - s, s * 2 + 1, s * 2 + 1, CORE);
                 frame.rect(c.0 - s + 2, c.1 - s + 2, s, 2, CORE_LIGHT);
             }
-            HazardKind::Drop | HazardKind::Icicle if h.time < h.delay => {
+            HazardKind::Yarn => {
+                // A landed hairball; it twitches before it rolls home.
+                let left = h.delay + h.duration - h.time;
+                let shake = if left < 0.5 && !reduced {
+                    ((h.time * 40.0).sin() * 1.5) as i32
+                } else {
+                    0
+                };
+                yarn(frame, (c.0 + shake, c.1 - 4), 0.0);
+            }
+            HazardKind::Bug => {
+                if h.time < h.delay {
+                    // The bug, and the ring of its burst closing as it ticks.
+                    let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
+                    let urgent = progress > 0.65;
+                    frame.ring(c, (r, r), if urgent { WARN } else { WARN_DARK }, !urgent);
+                    let closing = r + ((1.0 - progress) * 16.0) as i32;
+                    frame.ring(c, (closing, closing), IVORY, true);
+                    bug(
+                        frame,
+                        c,
+                        !reduced && (h.time * (4.0 + progress * 10.0)).fract() < 0.5,
+                    );
+                }
+            }
+            HazardKind::Drop | HazardKind::Icicle | HazardKind::Hairball if h.time < h.delay => {
                 // The shadow grows under the falling body.
                 let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
                 let shade = (r as f32 * (0.35 + 0.65 * progress)) as i32;
@@ -351,6 +376,10 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             let r = (crate::arena::combat::GROK_BLADE_RADIUS * SCALE) as i32 + 4;
             landing(frame, c, r, color, progress);
         }
+        (Guardian::CodeBuddy, Attack::Bomb) if boss.state == BossState::Windup => {
+            let r = (crate::arena::combat::CODEBUDDY_BUG_RADIUS * SCALE) as i32;
+            landing(frame, c, r, color, progress);
+        }
         (Guardian::Kimi, Attack::Charge) if boss.state == BossState::Windup => {
             route(frame, boss.position, boss.target, boss.radius(), color);
         }
@@ -418,7 +447,12 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
 
 pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
     for h in &arena.hazards {
-        if h.time >= h.delay || !matches!(h.kind, HazardKind::Drop | HazardKind::Icicle) {
+        if h.time >= h.delay
+            || !matches!(
+                h.kind,
+                HazardKind::Drop | HazardKind::Icicle | HazardKind::Hairball
+            )
+        {
             continue;
         }
         let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
@@ -427,6 +461,8 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
         let (x, y) = (c.0, c.1 - fall);
         if h.kind == HazardKind::Drop {
             code_block(frame, (x, y - 4));
+        } else if h.kind == HazardKind::Hairball {
+            yarn(frame, (x, y - 4), h.time * 8.0);
         } else {
             frame.polygon(&[(x - 4, y - 12), (x + 4, y - 12), (x, y + 2)], WATER_LIGHT);
             frame.polygon(&[(x - 4, y - 12), (x, y - 12), (x, y + 2)], WHITE);
@@ -472,6 +508,10 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 }
                 frame.ellipse(c, (3, 3), WATER_LIGHT);
                 frame.rect(c.0 - 1, c.1 - 1, 2, 2, WHITE);
+            }
+            ProjectileKind::Yarn => {
+                frame.ellipse((c.0 + 2, c.1 + 5), (6, 2), SHADOW);
+                yarn(frame, (c.0, c.1 - 2), p.age * 14.0);
             }
             ProjectileKind::Block => {
                 let tail = pixel(p.position.minus(direction.scale(3.2)));
@@ -538,6 +578,42 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
             frame.line(mid, end, WATER_LIGHT);
         }
     }
+}
+
+/// A hairball: a fuzzy round wad with a strand wound round it.
+fn yarn(frame: &mut Raster, c: (i32, i32), turn: f32) {
+    frame.ellipse(c, (7, 6), OUTLINE);
+    frame.ellipse(c, (6, 5), BODY_LIGHT);
+    frame.ellipse((c.0 - 1, c.1 - 1), (3, 2), BODY_GLEAM);
+    for n in 0..3 {
+        let a = turn + n as f32 * TAU / 3.0;
+        let (s, k) = a.sin_cos();
+        frame.line(
+            (c.0 + (k * 5.0) as i32, c.1 + (s * 4.0) as i32),
+            (c.0 - (s * 4.0) as i32, c.1 + (k * 3.0) as i32),
+            BODY_DARK,
+        );
+    }
+}
+
+/// CodeBuddy's bug bomb: a round shell with spots, its fuse light blinking
+/// faster as it ticks down.
+fn bug(frame: &mut Raster, c: (i32, i32), lit: bool) {
+    frame.ellipse((c.0 + 2, c.1 + 3), (8, 3), SHADOW);
+    frame.ellipse((c.0, c.1 - 4), (8, 6), OUTLINE);
+    frame.ellipse((c.0, c.1 - 4), (7, 5), WARN);
+    frame.line((c.0, c.1 - 9), (c.0, c.1 + 1), OUTLINE);
+    for (dx, dy) in [(-4, -6), (3, -3), (-3, -1), (4, -7)] {
+        frame.rect(c.0 + dx, c.1 + dy, 2, 2, OUTLINE);
+    }
+    frame.ellipse((c.0, c.1 - 10), (3, 2), OUTLINE);
+    frame.rect(
+        c.0 - 1,
+        c.1 - 13,
+        2,
+        2,
+        if lit { CORE_LIGHT } else { CORE_DARK },
+    );
 }
 
 /// A small code block: a lit cube face marked with angle brackets.

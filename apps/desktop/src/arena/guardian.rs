@@ -19,10 +19,11 @@ pub(super) enum Guardian {
     Grok,
     ZCode,
     Kimi,
+    CodeBuddy,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -34,6 +35,7 @@ impl Guardian {
         Self::Grok,
         Self::ZCode,
         Self::Kimi,
+        Self::CodeBuddy,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -48,6 +50,7 @@ impl Guardian {
             Self::Grok => "Grok",
             Self::ZCode => "ZCode",
             Self::Kimi => "Kimi",
+            Self::CodeBuddy => "CodeBuddy",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -63,6 +66,7 @@ impl Guardian {
             "grok" | "grok-cli" => Some(Self::Grok),
             "zcode" => Some(Self::ZCode),
             "kimi" | "kimi-cli" => Some(Self::Kimi),
+            "codebuddy-code" | "codebuddy" => Some(Self::CodeBuddy),
             _ => None,
         }
     }
@@ -84,6 +88,7 @@ impl Guardian {
             Self::Grok => "grok",
             Self::ZCode => "zcode",
             Self::Kimi => "kimi",
+            Self::CodeBuddy => "codebuddy-code",
         }
     }
 }
@@ -139,6 +144,10 @@ pub(super) enum Attack {
     Open,
     /// A straight charge across the floor that ends in a skid.
     Charge,
+    /// Hairballs coughed up to rain round the archer.
+    Rain,
+    /// A bug bomb spat at the archer's feet.
+    Bomb,
 }
 
 /// Visual and collision scale of the spark after each split.
@@ -334,6 +343,7 @@ impl Boss {
             Guardian::Grok => 8.5,
             Guardian::ZCode => 9.0,
             Guardian::Kimi => 8.0,
+            Guardian::CodeBuddy => 8.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -388,6 +398,7 @@ impl Boss {
                 Guardian::Claude => 0.25,
                 Guardian::Codex => 0.2,
                 Guardian::OpenCode => 0.3,
+                Guardian::CodeBuddy => 0.22,
                 _ => 0.0,
             }
     }
@@ -407,6 +418,7 @@ impl Boss {
             Guardian::ZCode => (0.0, 0.0, ZCODE_CORE),
             // A tile tips about the bottom of its face.
             Guardian::Kimi => (0.0, 0.0, 0.0),
+            Guardian::CodeBuddy => (0.0, 0.0, 8.0 * squash),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -461,6 +473,7 @@ impl Boss {
             Guardian::Grok => self.articulated(0.0, 0.0, GROK_RING),
             Guardian::ZCode => self.local(0.0, 0.0, ZCODE_CORE),
             Guardian::Kimi => self.articulated(0.0, 0.0, KIMI_TILE * 0.5),
+            Guardian::CodeBuddy => self.articulated(0.0, 0.0, 10.0 * squash),
         }
     }
     pub fn update_core(&mut self) {
@@ -488,6 +501,8 @@ impl Boss {
             Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
             // The blue square at the tile's upper right corner.
             Guardian::Kimi => self.articulated(4.35, 3.4, 11.4),
+            // The gem on its chest.
+            Guardian::CodeBuddy => self.articulated(0.0, 6.0, 7.2 * squash),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -498,6 +513,7 @@ impl Boss {
             Guardian::Cline => self.articulated(0.0, 4.0, CLINE_HEAD),
             Guardian::Grok => self.articulated(4.0, 0.0, GROK_RING + 4.0),
             Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
+            Guardian::CodeBuddy => self.articulated(0.0, 5.0, 14.0 * self.squash_scale()),
             _ => self.body_center(),
         }
     }
@@ -749,6 +765,39 @@ impl Boss {
                 boss.bank = heading.x * 0.18 * (skid * TAU * 1.5).sin() * (1.0 - skid);
                 boss.pitch = -0.12 * (charge * PI).sin();
             }
+            Guardian::CodeBuddy => {
+                // Scurries round the home in quick little steps, and twice a
+                // loop crouches, wiggles and pounces.
+                let (beat_ix, u) = beat(time, IDLE_LOOP / 2.0);
+                let pounce = ((u - 0.78) / 0.12).clamp(0.0, 1.0);
+                let scurry = (u / 0.6).min(1.0);
+                let s = (beat_ix + scurry * 0.7 + smoothstep(pounce) * 0.3) * PI;
+                let (position, tangent) = route(guardian, s);
+                boss.position = position;
+                let heading = tangent.normalized();
+                boss.yaw = -heading.x * 0.45;
+                if u < 0.6 {
+                    let (step, w) = beat(time, 0.25);
+                    let side = if (step as usize).is_multiple_of(2) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    boss.height = (w * PI).sin() * 1.2;
+                    boss.bank = side * 0.06 * (w * PI).sin();
+                } else if u < 0.78 {
+                    // The wiggle before a pounce.
+                    let wiggle = smoothstep((u - 0.6) / 0.06);
+                    boss.bank = (time * 30.0).sin() * 0.08 * wiggle;
+                    boss.squash = 0.4 * wiggle;
+                } else if pounce < 1.0 {
+                    boss.height = (pounce * PI).sin() * 7.0;
+                    boss.squash = -0.3 * (pounce * PI).sin();
+                } else {
+                    let land = ((u - 0.9) / 0.1).min(1.0);
+                    boss.squash = 0.6 * (1.0 - smoothstep(land));
+                }
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -857,6 +906,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::CodeBuddy => (
+            s.sin() * 62.0,
+            -s.cos() * 33.0,
+            s.cos() * 62.0,
+            s.sin() * 33.0,
         ),
         Guardian::Kimi => (
             s.sin() * 66.0,
