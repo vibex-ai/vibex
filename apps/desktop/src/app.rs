@@ -81155,6 +81155,10 @@ struct FoundationSettings {
     connections_wsl_distros: Vec<String>,
     connections_wsl_selected: Option<String>,
     connections_wsl_error: Option<String>,
+    /// Whether the Bootstrap SSH panel is showing. The command is generated
+    /// only after the user names the Linux account it authorizes.
+    bootstrap_open: bool,
+    bootstrap_user_input: Entity<InputState>,
     bootstrap_command: Option<crate::ssh_connection::bootstrap::BootstrapCommand>,
     bootstrap_error: Option<String>,
     active_section: SettingsSection,
@@ -81330,6 +81334,7 @@ impl FoundationSettings {
                 .default_value(ui_state.network_proxy.bypass.clone())
                 .placeholder(DEFAULT_NETWORK_PROXY_BYPASS)
         });
+        let bootstrap_user_input = cx.new(|cx| InputState::new(window, cx).placeholder("ubuntu"));
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search settings",
@@ -81624,6 +81629,8 @@ impl FoundationSettings {
                 connections_wsl_distros: Vec::new(),
                 connections_wsl_selected: None,
                 connections_wsl_error: None,
+                bootstrap_open: false,
+                bootstrap_user_input,
                 bootstrap_command: None,
                 bootstrap_error: None,
                 active_section: SettingsSection::General,
@@ -85154,6 +85161,27 @@ impl FoundationSettings {
 
     fn generate_bootstrap_command(&mut self, cx: &mut Context<Self>) {
         self.bootstrap_error = None;
+        self.bootstrap_command = None;
+        // The account differs per image (ubuntu, debian, ec2-user, alpine...),
+        // so it is asked for rather than assumed.
+        let user = self
+            .bootstrap_user_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if user.is_empty() {
+            self.bootstrap_error = Some(
+                locale::text(
+                    "Enter the existing Linux account Vibex will connect as.",
+                    "请输入 Vibex 将以其身份连接的现有 Linux 账户。",
+                    "請輸入 Vibex 將以其身分連線的現有 Linux 帳戶。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(std::path::PathBuf::from);
@@ -85173,7 +85201,7 @@ impl FoundationSettings {
             cx.notify();
             return;
         };
-        match crate::ssh_connection::bootstrap::generate("ubuntu", &key, 22, unix_timestamp_ms()) {
+        match crate::ssh_connection::bootstrap::generate(&user, &key, 22, unix_timestamp_ms()) {
             Ok(command) => self.bootstrap_command = Some(command),
             Err(error) => self.bootstrap_error = Some(format!("{}: {}", error.code, error.message)),
         }
@@ -85230,7 +85258,10 @@ impl FoundationSettings {
             .outline()
             .label(locale::text("Bootstrap SSH", "初始化 SSH", "初始化 SSH"))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.generate_bootstrap_command(cx);
+                this.bootstrap_open = true;
+                this.bootstrap_command = None;
+                this.bootstrap_error = None;
+                cx.notify();
             }));
         let wsl_button = Button::new("connections-add-wsl")
             .small()
@@ -85360,12 +85391,13 @@ impl FoundationSettings {
                 children,
             ));
         }
-        if self.bootstrap_command.is_some() || self.bootstrap_error.is_some() {
+        if self.bootstrap_open {
             let close = Button::new("connections-bootstrap-close")
                 .small()
                 .ghost()
                 .label(locale::text("Close", "关闭", "關閉"))
                 .on_click(cx.listener(|this, _, _, cx| {
+                    this.bootstrap_open = false;
                     this.bootstrap_command = None;
                     this.bootstrap_error = None;
                     cx.notify();
@@ -85384,9 +85416,17 @@ impl FoundationSettings {
                 .outline()
                 .label(locale::text("Recheck SSH", "重新检测 SSH", "重新偵測 SSH"))
                 .on_click(cx.listener(|this, _, _, cx| {
+                    this.bootstrap_open = false;
                     this.bootstrap_command = None;
                     this.bootstrap_error = None;
                     this.load_connections_discovery(cx);
+                }));
+            let generate = Button::new("connections-bootstrap-generate")
+                .small()
+                .primary()
+                .label(locale::text("Generate command", "生成命令", "產生命令"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.generate_bootstrap_command(cx);
                 }));
             let mut children = vec![div()
                 .text_xs()
@@ -85397,6 +85437,24 @@ impl FoundationSettings {
                     "在雲端主控台或序列埠主控台執行。它會安裝 sshd、注入顯示的桌面公鑰，並在 15 分鐘後過期。",
                 ))
                 .into_any_element()];
+            children.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().text_color(muted).child(locale::text(
+                        "Linux account",
+                        "Linux 账户",
+                        "Linux 帳戶",
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.bootstrap_user_input).small().h(px(28.0))),
+                    )
+                    .child(generate)
+                    .into_any_element(),
+            );
             if let Some(error) = &self.bootstrap_error {
                 children.push(
                     div()
@@ -110433,6 +110491,20 @@ mod tests {
         assert!(developer.contains("feature::env_override()"));
         assert!(developer.contains(".disabled(ssh_override.is_some())"));
         assert!(developer.contains("set_ssh_remote_runtime"));
+    }
+
+    #[test]
+    fn bootstrap_command_authorizes_the_account_the_user_names() {
+        let source = include_str!("app.rs");
+        let generate = source
+            .split_once("    fn generate_bootstrap_command(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("bootstrap generation should remain inspectable");
+        assert!(generate.contains(".bootstrap_user_input"));
+        assert!(generate.contains("bootstrap::generate(&user,"));
+        assert!(!generate.contains("generate(\"ubuntu\""));
+        assert!(source.contains("Button::new(\"connections-bootstrap-generate\")"));
     }
 
     #[test]
