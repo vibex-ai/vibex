@@ -13838,10 +13838,6 @@ impl ManagementCenter {
         };
         let profile = &row.profile;
         let mut body = v_flex().w_full().min_w_0().gap_3();
-        body = body.child(self.render_shared_provider_header(profile, window, cx));
-        if self.shared_provider_edit_target.as_ref() == Some(&profile.id) {
-            body = body.child(self.render_shared_provider_editor(profile, cx));
-        }
         let selected_tab_index = ProviderDetailTab::ALL
             .iter()
             .position(|tab| *tab == self.provider_detail_tab)
@@ -13868,6 +13864,10 @@ impl ManagementCenter {
             body = body.child(self.render_shared_provider_keys(profile, window, cx));
         }
         if self.provider_detail_tab == ProviderDetailTab::Overview {
+            body = body.child(self.render_shared_provider_header(profile, window, cx));
+            if self.shared_provider_edit_target.as_ref() == Some(&profile.id) {
+                body = body.child(self.render_shared_provider_editor(profile, cx));
+            }
             let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
             for agent_id in &row.agents {
                 let label = self
@@ -14771,7 +14771,7 @@ impl ManagementCenter {
         );
 
         let mut body = v_flex().w_full().min_w_0().gap_3();
-        body = body.child(management_card_with_icon(
+        let header = management_card_with_icon(
             title,
             description,
             "icons/vibex/git-branch.svg",
@@ -14902,7 +14902,7 @@ impl ManagementCenter {
                 )
                 .into_any_element(),
             cx,
-        ));
+        );
 
         let selected_tab_index = RouteGroupDetailTab::ALL
             .iter()
@@ -14927,6 +14927,7 @@ impl ManagementCenter {
                 })),
         );
         if self.route_group_detail_tab == RouteGroupDetailTab::Overview {
+            body = body.child(header);
             // The Agents that reference it. Naming them is what makes the delete at
             // the bottom of this page a consequence rather than a surprise.
             let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
