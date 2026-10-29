@@ -156,6 +156,11 @@ impl WslProfileStore {
                 "the WSL store could not be written",
             )
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o600));
+        }
         fs::rename(&temp, &self.path).map_err(|_| {
             VibexError::storage(
                 "wsl_profile_rename_failed",

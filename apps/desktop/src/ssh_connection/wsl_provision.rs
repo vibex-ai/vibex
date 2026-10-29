@@ -222,6 +222,34 @@ impl WslProvisioner {
         }
     }
 
+    /// Starts the runtime as a foreground child of a held `wsl.exe` and waits
+    /// for health. The returned keepalive must stay alive for the runtime.
+    pub fn start_foreground(&self) -> Result<(WslKeepalive, ServerStatus), WslProvisionError> {
+        self.write_env()?;
+        let keepalive = WslKeepalive::spawn_runtime(
+            &self.program,
+            &self.distro,
+            &self.launch.env_file,
+            &self.launch.binary,
+        )
+        .map_err(WslProvisionError::from_wsl)?;
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            if let Ok(status) = self.status()
+                && status.is_healthy()
+            {
+                return Ok((keepalive, status));
+            }
+            if Instant::now() >= deadline {
+                return Err(WslProvisionError::retryable(
+                    "wsl_health_timeout",
+                    "the WSL runtime did not become healthy in time",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
     pub async fn pair(&self, now_ms: i64) -> Result<PairingOutcome, WslProvisionError> {
         let mut command = self.command();
         let output = command
@@ -260,29 +288,7 @@ impl WslProvisioner {
             ));
         }
         self.install(artifact)?;
-        self.write_env()?;
-        let keepalive = WslKeepalive::spawn_runtime(
-            &self.program,
-            &self.distro,
-            &self.launch.env_file,
-            &self.launch.binary,
-        )
-        .map_err(WslProvisionError::from_wsl)?;
-        let deadline = Instant::now() + START_TIMEOUT;
-        loop {
-            if let Ok(status) = self.status()
-                && status.is_healthy()
-            {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(WslProvisionError::retryable(
-                    "wsl_health_timeout",
-                    "the WSL runtime did not become healthy in time",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
+        let (keepalive, _) = self.start_foreground()?;
         let deadline = Instant::now() + FORWARDING_DEADLINE;
         while !localhost_forwarded(self.launch.remote_port) {
             if Instant::now() >= deadline {
@@ -369,6 +375,45 @@ mod windows_tests {
         let status = provisioner.ensure_started().unwrap();
         assert!(status.is_healthy());
         provisioner.stop().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Windows WSL and VIBEX_WSL_E2E_ARTIFACT"]
+    fn real_wsl_restarts_after_keepalive_is_dropped() {
+        let Ok(artifact_path) = std::env::var("VIBEX_WSL_E2E_ARTIFACT") else {
+            return;
+        };
+        let distro =
+            std::env::var("VIBEX_WSL_E2E_DISTRO").unwrap_or_else(|_| "archlinux".to_string());
+        let home =
+            std::env::var("VIBEX_WSL_E2E_HOME").unwrap_or_else(|_| "/home/peatboy".to_string());
+        let bytes = std::fs::read(&artifact_path).unwrap();
+        let artifact = LocalArtifact {
+            path: PathBuf::from(artifact_path),
+            version: "0.1.0-rc.8".to_string(),
+            arch: RemoteArch::X86_64,
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        let provisioner = WslProvisioner::new(
+            "wsl.exe",
+            &distro,
+            &home,
+            &format!("{home}/.local/share/vibex/wsl-e2e-restart"),
+            &[home.clone()],
+            8772,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        provisioner.install(&artifact).unwrap();
+        let (keepalive, _) = provisioner.start_foreground().unwrap();
+        assert!(provisioner.status().unwrap().is_healthy());
+        drop(keepalive);
+        std::thread::sleep(Duration::from_secs(1));
+        let (keepalive, _) = provisioner.start_foreground().unwrap();
+        assert!(provisioner.status().unwrap().is_healthy());
+        provisioner.stop().unwrap();
+        drop(keepalive);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

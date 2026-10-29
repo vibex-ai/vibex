@@ -9403,6 +9403,8 @@ pub struct VibexWorkbench {
     wsl_task: Option<Task<()>>,
     wsl_error: Option<String>,
     wsl_keepalive: Option<crate::ssh_connection::wsl::WslKeepalive>,
+    wsl_watch_generation: u64,
+    wsl_watch_task: Option<Task<()>>,
     #[allow(dead_code)]
     ssh_provisioning_task: Option<Task<()>>,
     #[allow(dead_code)]
@@ -9422,7 +9424,8 @@ pub struct VibexWorkbench {
     runtime_registry_store: Option<Arc<DesktopRuntimeRegistryStore>>,
     /// Last compatibility report per remote runtime id, captured on connect.
     runtime_compatibility: BTreeMap<String, crate::ssh_connection::compat::CompatibilityReport>,
-    /// Runtime id -> WSL distro for the Runtime Manager label.
+    /// Persisted WSL profiles and the runtime labels derived from them.
+    wsl_profiles: Vec<crate::ssh_connection::wsl_profile::WslConnectionProfile>,
     wsl_runtime_labels: BTreeMap<String, String>,
     runtime_manager_open: bool,
     runtime_manager_stage: RuntimeManagerStage,
@@ -11222,6 +11225,23 @@ impl VibexWorkbench {
         // holding a stale one that would swallow the next open.
         let computer_panel_closed_subscription = observe_computer_panel_close(cx.weak_entity(), cx);
         let window_handle = Some(window.window_handle());
+        let wsl_profiles = config
+            .as_ref()
+            .map(|config| {
+                crate::ssh_connection::wsl_profile::WslProfileStore::at_home(&config.home_dir)
+                    .load()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let wsl_runtime_labels = wsl_profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .registered_runtime_id
+                    .clone()
+                    .map(|id| (id, profile.distro.clone()))
+            })
+            .collect();
         let mut this = Self {
             focus_handle,
             config,
@@ -11290,6 +11310,8 @@ impl VibexWorkbench {
             wsl_task: None,
             wsl_error: None,
             wsl_keepalive: None,
+            wsl_watch_generation: 0,
+            wsl_watch_task: None,
             ssh_provisioning_task: None,
             ssh_provisioning_snapshot: None,
             ssh_provisioning_error: None,
@@ -11300,7 +11322,8 @@ impl VibexWorkbench {
             runtime_registry,
             runtime_registry_store,
             runtime_compatibility: BTreeMap::new(),
-            wsl_runtime_labels: BTreeMap::new(),
+            wsl_profiles,
+            wsl_runtime_labels,
             runtime_manager_open: false,
             runtime_manager_stage: RuntimeManagerStage::List,
             runtime_manager_target: None,
@@ -14506,9 +14529,32 @@ impl VibexWorkbench {
             )
             .await
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let now_ms = unix_timestamp_ms();
             let outcome = provisioner
-                .provision(&local, unix_timestamp_ms())
+                .provision(&local, now_ms)
                 .await
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let runtime_id = outcome.pairing.runtime_id;
+            let profile = crate::ssh_connection::wsl_profile::WslConnectionProfile {
+                id: format!("wsl-{now_ms}"),
+                distro: distro.clone(),
+                display_name: distro.clone(),
+                remote_home: remote_home.clone(),
+                install_root: install_root.clone(),
+                workspace_roots: vec![remote_home.clone()],
+                remote_port: 8765,
+                registered_runtime_id: Some(runtime_id.clone()),
+                created_at_ms: now_ms,
+                last_connected_at_ms: Some(now_ms),
+            };
+            let store = crate::ssh_connection::wsl_profile::WslProfileStore::at_home(&desktop_home);
+            let mut profiles = store.load().unwrap_or_default();
+            profiles.retain(|existing| {
+                existing.registered_runtime_id.as_deref() != Some(runtime_id.as_str())
+            });
+            profiles.push(profile.clone());
+            store
+                .save(&profiles)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             Ok::<
                 (
@@ -14517,14 +14563,16 @@ impl VibexWorkbench {
                     DesktopRemoteCredential,
                     Arc<WebRemoteBackend>,
                     crate::ssh_connection::wsl::WslKeepalive,
+                    crate::ssh_connection::wsl_profile::WslConnectionProfile,
                 ),
                 String,
             >((
-                outcome.pairing.runtime_id,
+                runtime_id,
                 distro,
                 outcome.pairing.credential,
                 outcome.backend,
                 outcome.keepalive,
+                profile,
             ))
         });
         self.wsl_task = Some(cx.spawn(
@@ -14532,8 +14580,12 @@ impl VibexWorkbench {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
                     match result {
-                        Ok(Ok((runtime_id, distro, credential, backend, keepalive))) => {
+                        Ok(Ok((runtime_id, distro, credential, backend, keepalive, profile))) => {
                             this.wsl_keepalive = Some(keepalive);
+                            this.arm_wsl_watchdog(runtime_id.clone(), cx);
+                            this.wsl_profiles
+                                .retain(|existing| existing.id != profile.id);
+                            this.wsl_profiles.push(profile);
                             if let Some(store) = this.runtime_registry_store.as_ref() {
                                 this.runtime_registry = store.load_or_migrate();
                             }
@@ -15295,11 +15347,166 @@ impl VibexWorkbench {
     /// connect falls back to the embedded runtime instead of leaving the shell
     /// without an authority.
     fn begin_active_remote_start(&mut self, runtime: RegisteredRuntime, cx: &mut Context<Self>) {
-        if let Some(profile) = self.ssh_profile_for_runtime(&runtime.id) {
+        if let Some(profile) = self.wsl_profile_for_runtime(&runtime.id) {
+            self.begin_wsl_restore(runtime, profile, RuntimeConnectOrigin::Boot, cx);
+        } else if let Some(profile) = self.ssh_profile_for_runtime(&runtime.id) {
             self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Boot, cx);
         } else {
             self.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
         }
+    }
+
+    fn wsl_profile_for_runtime(
+        &self,
+        runtime_id: &str,
+    ) -> Option<crate::ssh_connection::wsl_profile::WslConnectionProfile> {
+        self.wsl_profiles
+            .iter()
+            .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
+            .cloned()
+    }
+
+    /// Watches the held `wsl.exe` child. A `wsl --shutdown` (or server crash)
+    /// exits it; restart the distro and reconnect once.
+    fn arm_wsl_watchdog(&mut self, runtime_id: String, cx: &mut Context<Self>) {
+        self.wsl_watch_generation = self.wsl_watch_generation.wrapping_add(1);
+        let generation = self.wsl_watch_generation;
+        self.wsl_watch_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let action = entity.update(cx, |this, cx| {
+                        if this.wsl_watch_generation != generation {
+                            return None;
+                        }
+                        let exited = this
+                            .wsl_keepalive
+                            .as_mut()
+                            .is_some_and(|keepalive| keepalive.try_wait().ok().flatten().is_some());
+                        if !exited {
+                            return None;
+                        }
+                        this.wsl_keepalive = None;
+                        let runtime = this
+                            .runtime_registry
+                            .runtimes
+                            .iter()
+                            .find(|runtime| runtime.id == runtime_id)
+                            .cloned()?;
+                        let profile = this.wsl_profile_for_runtime(&runtime_id)?;
+                        this.runtime_note = Some(
+                            locale::text(
+                                "WSL runtime exited; restarting…",
+                                "WSL 运行时已退出，正在重启…",
+                                "WSL 執行階段已退出，正在重新啟動…",
+                            )
+                            .to_string(),
+                        );
+                        this.begin_wsl_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
+                        Some(())
+                    });
+                    if matches!(action, Ok(Some(()))) {
+                        break;
+                    }
+                }
+            },
+        ));
+    }
+
+    /// Restores a WSL runtime through the foreground keepalive before the
+    /// existing pinned credential is used to connect.
+    fn begin_wsl_restore(
+        &mut self,
+        runtime: RegisteredRuntime,
+        profile: crate::ssh_connection::wsl_profile::WslConnectionProfile,
+        origin: RuntimeConnectOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_switch_pending.is_some() {
+            return;
+        }
+        let provisioner = match WslProvisioner::new(
+            "wsl.exe",
+            &profile.distro,
+            &profile.remote_home,
+            &profile.install_root,
+            &profile.workspace_roots,
+            profile.remote_port,
+            self.config
+                .as_ref()
+                .map(|config| config.home_dir.clone())
+                .unwrap_or_default(),
+        ) {
+            Ok(provisioner) => provisioner,
+            Err(error) => {
+                self.finish_runtime_connect_failure(
+                    BackendError::offline("wsl_boot_config_invalid", error.message),
+                    origin,
+                    cx,
+                );
+                return;
+            }
+        };
+        self.runtime_switch_pending = Some(runtime.id.clone());
+        self.runtime_status = RuntimeStatus::Starting;
+        self.runtime_note = Some(
+            locale::text(
+                "Restoring WSL runtime…",
+                "正在恢复 WSL 运行时…",
+                "正在恢復 WSL 執行階段…",
+            )
+            .to_string(),
+        );
+        let port = profile.remote_port;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let (keepalive, _) = provisioner
+                .start_foreground()
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !crate::ssh_connection::wsl::localhost_forwarded(port) {
+                if std::time::Instant::now() >= deadline {
+                    return Err("WSL2 localhost forwarding is unavailable".to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            Ok::<_, String>(keepalive)
+        });
+        self.boot_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    match outcome {
+                        Ok(Ok(keepalive)) => {
+                            this.wsl_keepalive = Some(keepalive);
+                            this.arm_wsl_watchdog(runtime.id.clone(), cx);
+                            this.runtime_switch_pending = None;
+                            this.begin_remote_connect(runtime, origin, cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.finish_runtime_connect_failure(
+                                BackendError::offline("wsl_boot_failed", error),
+                                origin,
+                                cx,
+                            );
+                            this.runtime_switch_pending = None;
+                        }
+                        Err(_) => {
+                            this.finish_runtime_connect_failure(
+                                BackendError::offline(
+                                    "wsl_boot_task_failed",
+                                    "the WSL boot task stopped unexpectedly",
+                                ),
+                                origin,
+                                cx,
+                            );
+                            this.runtime_switch_pending = None;
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
     }
 
     #[allow(dead_code)]

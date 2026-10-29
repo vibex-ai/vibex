@@ -266,6 +266,10 @@ impl WslKeepalive {
         Ok(Self { child })
     }
 
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     pub fn spawn(program: &Path, distro: &str) -> Result<Self, WslError> {
         let child = Command::new(program)
             .args(["-d", distro, "--exec", "sleep", "infinity"])
