@@ -23,6 +23,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Cursor => [0x0e1013, 0x1b1e23, 0x2b2f36, 0x464b55, 0x737a86],
         // The logo's white outline, as a light steel frame.
         Guardian::Cline => [0x262b36, 0x4f5767, 0x8f98a8, 0xc9d0db, 0xf2f4f8],
+        // The white ring and slash of the logo on dark.
+        Guardian::Grok => [0x34363d, 0x6a6e78, 0xa9adb6, 0xdcdee3, 0xffffff],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -54,6 +56,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Cline => [
             0x080c18, 0x1a2236, 0x222c45, 0x2d3955, 0x121a2c, 0x34405f, 0x52618a,
         ],
+        // A black observatory floor under a field of stars.
+        Guardian::Grok => [
+            0x020306, 0x0d0f18, 0x121522, 0x1a1e30, 0x08090f, 0x232840, 0x3a4163,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -80,6 +86,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Cursor => [0x236a94, 0x5cd2ff, 0xe4fbff],
         // The vent on the back of the head runs hot.
         Guardian::Cline => [0xa1461c, 0xff8a3d, 0xffe2c4],
+        // The core in the back of the ring burns red.
+        Guardian::Grok => [0x8a1022, 0xff3a52, 0xffc6cd],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();

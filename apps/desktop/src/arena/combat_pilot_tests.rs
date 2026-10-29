@@ -265,6 +265,39 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Grok => {
+            let frenzy = boss.attack == Attack::Frenzy && boss.state == BossState::Striking;
+            if frenzy || boss.state == BossState::Recovery {
+                // Well outside the whirl, which keeps closing in.
+                plan.goal = around(boss.position, if frenzy { 31.0 } else { 20.0 });
+                // Loose so the arrow meets the back as the spin brings it round.
+                let arrive = arrival(boss.core);
+                let mut future = *boss;
+                if frenzy {
+                    future.yaw += 8.0 * arrive;
+                    let closing = player.minus(boss.position).normalized();
+                    future.position = boss.position.plus(closing.scale(7.0 * arrive));
+                }
+                future.direction = Vec2::from_angle(future.yaw + PI * 0.5);
+                future.update_core();
+                // Start drawing only when the back will face us squarely, and
+                // keep drawing while it still mostly will.
+                let align = player.minus(future.core).normalized().dot(future.direction);
+                let needed = if arena.player.charge > 0.0 {
+                    -0.1
+                } else {
+                    -0.6
+                };
+                if boss.exposed > arrive + 0.03 && align < needed {
+                    plan.target = Some(future.core);
+                }
+            } else {
+                // Get behind it so it has to whip round.
+                let behind = boss.position.minus(boss.direction.scale(22.0));
+                plan.goal = arena.map.move_body(boss.position, behind, 2.0);
+                plan.sprint = true;
+            }
+        }
         Guardian::Cline => {
             let body = boss.body_center();
             match arena.arrow.state {
@@ -364,6 +397,13 @@ fn strike(arena: &Arena) -> Option<(Vec2, f32)> {
             Some((boss.target, radius))
         }
         (Guardian::Cursor, Attack::Leap) if aerial => Some((boss.target, radius)),
+        (Guardian::Grok, Attack::Throw) if aerial => {
+            Some((boss.target, crate::arena::combat::GROK_BLADE_RADIUS + 1.0))
+        }
+        (Guardian::Grok, Attack::Frenzy) if boss.state == BossState::Striking => Some((
+            boss.position,
+            crate::arena::combat::GROK_FRENZY_RADIUS + 2.0,
+        )),
         (Guardian::Cursor, Attack::Laser)
             if boss.state == BossState::Windup && boss.facet == crate::arena::cube::DOWN =>
         {
@@ -385,6 +425,9 @@ fn route(arena: &Arena) -> Option<(Vec2, Vec2, f32)> {
             boss.radius(),
         )),
         (Guardian::Copilot, Attack::Dash) if committed => {
+            Some((boss.position, boss.target, boss.radius()))
+        }
+        (Guardian::Grok, Attack::Pull) if boss.state == BossState::Rushing => {
             Some((boss.position, boss.target, boss.radius()))
         }
         (Guardian::Cline, Attack::Glide) if boss.state == BossState::Rushing => {
@@ -453,6 +496,14 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
         let gap = distance - wave.radius;
         if distance < wave.maximum + PLAYER_RADIUS + 0.6 && gap > -1.6 && gap < 4.0 {
             score += 6.0;
+        }
+    }
+    if boss.guardian == Guardian::Grok && boss.detached && boss.state == BossState::Striking {
+        // The blade's swing still to come.
+        if segment_distance(q, boss.hands[0], boss.target)
+            < crate::arena::combat::GROK_BLADE_RADIUS + PLAYER_RADIUS + 3.0
+        {
+            score += 10.0;
         }
     }
     for beam in &arena.beams {
@@ -589,4 +640,8 @@ fn the_cube_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_robot_head_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Cline);
+}
+#[test]
+fn the_slashed_ring_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Grok);
 }

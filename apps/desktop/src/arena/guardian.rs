@@ -16,10 +16,11 @@ pub(super) enum Guardian {
     Copilot,
     Cursor,
     Cline,
+    Grok,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -28,6 +29,7 @@ impl Guardian {
         Self::Copilot,
         Self::Cursor,
         Self::Cline,
+        Self::Grok,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -39,6 +41,7 @@ impl Guardian {
             Self::Copilot => "Copilot",
             Self::Cursor => "Cursor",
             Self::Cline => "Cline",
+            Self::Grok => "Grok",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -51,6 +54,7 @@ impl Guardian {
             "copilot" | "github-copilot" => Some(Self::Copilot),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
             "cline" => Some(Self::Cline),
+            "grok" | "grok-cli" => Some(Self::Grok),
             _ => None,
         }
     }
@@ -69,6 +73,7 @@ impl Guardian {
             Self::Copilot => "copilot",
             Self::Cursor => "cursor",
             Self::Cline => "cline",
+            Self::Grok => "grok",
         }
     }
 }
@@ -110,6 +115,14 @@ pub(super) enum Attack {
     Glide,
     /// A fan of bolts from the eyes.
     Fan,
+    /// The blade hurled out on its swing.
+    Throw,
+    /// The ring hauled along after its lodged blade.
+    Pull,
+    /// A whip round to cover an exposed back.
+    Turn,
+    /// Spinning with the blade whirled out round it.
+    Frenzy,
 }
 
 /// Visual and collision scale of the spark after each split.
@@ -117,6 +130,8 @@ pub(super) const SPARK_SCALE: [f32; 5] = [1.0, 0.8, 0.64, 0.52, 0.42];
 pub(super) const IDLE_LOOP: f32 = 36.0;
 /// The middle of Cline's head above its ground anchor.
 pub(super) const CLINE_HEAD: f32 = 11.0;
+/// The middle of Grok's ring above its ground anchor.
+pub(super) const GROK_RING: f32 = 10.0;
 
 /// Elevation of a spark's center; a landing squash lowers it.
 pub(super) fn spark_height(size: f32, squash: f32) -> f32 {
@@ -212,6 +227,8 @@ pub(super) struct Boss {
     /// The face of the cube that carries Cursor's pointer facet, in model
     /// space (see [`cube`](super::cube)).
     pub facet: u8,
+    /// Grok's blade is out of its ring, at `hands[0]`, `hand_heights[0]` up.
+    pub detached: bool,
 }
 
 impl Boss {
@@ -258,6 +275,7 @@ impl Boss {
             flash: 0.0,
             fired: 0,
             facet: super::cube::FRONT,
+            detached: false,
         };
         if guardian == Guardian::Cursor {
             // The cube stands corner-on, as the logo's hexagon.
@@ -284,6 +302,7 @@ impl Boss {
             Guardian::Copilot => 7.0,
             Guardian::Cursor => 8.5,
             Guardian::Cline => 8.0,
+            Guardian::Grok => 8.5,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -353,6 +372,7 @@ impl Boss {
             Guardian::Copilot => (0.0, 0.0, 11.0),
             Guardian::Cursor => (0.0, 0.0, super::cube::HALF),
             Guardian::Cline => (0.0, 0.0, CLINE_HEAD),
+            Guardian::Grok => (0.0, 0.0, GROK_RING),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -396,6 +416,7 @@ impl Boss {
             Guardian::Copilot => self.articulated(0.0, 0.0, 11.0),
             Guardian::Cursor => self.local(0.0, 0.0, super::cube::HALF),
             Guardian::Cline => self.articulated(0.0, 0.0, CLINE_HEAD),
+            Guardian::Grok => self.articulated(0.0, 0.0, GROK_RING),
         }
     }
     pub fn update_core(&mut self) {
@@ -417,6 +438,8 @@ impl Boss {
             }
             // The vent on the back of the head.
             Guardian::Cline => self.articulated(0.0, -8.6, CLINE_HEAD),
+            // The red core set in the back of the ring.
+            Guardian::Grok => self.articulated(0.0, -2.4, GROK_RING),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -425,6 +448,7 @@ impl Boss {
             Guardian::OpenCode => self.articulated(0.0, 5.0, 9.0 * self.squash_scale()),
             Guardian::Copilot => self.articulated(0.0, 6.0, 12.0),
             Guardian::Cline => self.articulated(0.0, 4.0, CLINE_HEAD),
+            Guardian::Grok => self.articulated(4.0, 0.0, GROK_RING + 4.0),
             _ => self.body_center(),
         }
     }
@@ -452,7 +476,11 @@ impl Boss {
         const COUNTS: [u32; 4] = [3, 5, 6, 6];
         const SPREAD: f32 = 0.2;
         let count = COUNTS[(self.attacks.wrapping_sub(1) % 4) as usize];
-        let even = if count % 2 == 0 { SPREAD * 0.5 } else { 0.0 };
+        let even = if count.is_multiple_of(2) {
+            SPREAD * 0.5
+        } else {
+            0.0
+        };
         (0..count)
             .map(|n| (n as f32 - (count as f32 - 1.0) * 0.5) * SPREAD + even)
             .collect()
@@ -461,6 +489,7 @@ impl Boss {
         match self.guardian {
             Guardian::Copilot => 6.5 + (time * 3.0).sin() * 0.6,
             Guardian::Cline => 3.0 + (time * 2.4).sin() * 0.5,
+            Guardian::Grok => 1.5 + (time * 1.7).sin() * 0.4,
             _ => 0.0,
         }
     }
@@ -623,6 +652,21 @@ impl Boss {
                     0.0
                 };
             }
+            Guardian::Grok => {
+                // Six beats a loop: a drift along the oval, then the blade
+                // spins up and the ring dashes on after it.
+                let (beat_ix, u) = beat(time, IDLE_LOOP / 6.0);
+                let dash = smoothstep((u - 0.6) / 0.2);
+                let s = (beat_ix + (u + 2.0 * dash) / 3.0) * TAU / 6.0;
+                let (position, tangent) = route(guardian, s);
+                boss.position = position;
+                boss.height = 1.5 + (time * TAU / 3.0).sin() * 0.4;
+                boss.spin = (beat_ix + smoothstep((u - 0.5) / 0.35)) * TAU;
+                let heading = tangent.normalized();
+                let rush = (dash * PI).sin();
+                boss.yaw = -heading.x * (0.25 + 0.3 * rush);
+                boss.bank = heading.x * 0.15 * rush;
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -720,6 +764,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::Grok => (
+            s.sin() * 64.0,
+            -s.cos() * 34.0,
+            s.cos() * 64.0,
+            s.sin() * 34.0,
         ),
         Guardian::Cursor | Guardian::Cline => {
             unreachable!("{guardian:?} moves between its own stations instead")

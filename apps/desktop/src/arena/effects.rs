@@ -309,6 +309,25 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
                 frame.ring(pixel(CENTER), (r, r), WATER_LIGHT, true);
             }
         }
+        (Guardian::Grok, Attack::Throw) => {
+            // The swing the blade will fly, closing on where it lodges.
+            let arc: Vec<Vec2> = (0..=12).map(|n| arena.blade_at(n as f32 / 12.0)).collect();
+            for (n, pair) in arc.windows(2).enumerate() {
+                if boss.state == BossState::Striking || n % 2 == 0 {
+                    frame.line(pixel(pair[0]), pixel(pair[1]), color);
+                }
+            }
+            let r = (crate::arena::combat::GROK_BLADE_RADIUS * SCALE) as i32 + 4;
+            landing(frame, c, r, color, progress);
+        }
+        (Guardian::Grok, Attack::Pull) => {
+            route(frame, boss.position, boss.target, boss.radius(), WARN);
+        }
+        (Guardian::Grok, Attack::Frenzy) => {
+            let r = (crate::arena::combat::GROK_FRENZY_RADIUS * SCALE) as i32;
+            frame.ring(pixel(boss.position), (r, r), WARN, false);
+            frame.ring(pixel(boss.position), (r + 3, r + 3), WARN_DARK, true);
+        }
         (Guardian::Cline, Attack::Glide) => {
             route(frame, boss.from, boss.target, boss.radius(), WARN_DARK);
         }

@@ -95,6 +95,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::Copilot => terrace(&mut frame),
         Guardian::Cursor => grid_hall(&mut frame),
         Guardian::Cline => server_room(&mut frame),
+        Guardian::Grok => observatory_floor(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -141,6 +142,51 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Grok's observatory: polished black stone strewn with stars, orbits
+/// engraved round the middle, and one long slash cut across it from lower
+/// left to upper right.
+fn observatory_floor(frame: &mut Raster) {
+    for n in 0..260 {
+        let h = hash(n, 71);
+        let (x, y) = (
+            (h % WIDTH as u32) as i32,
+            ((h >> 11) % HEIGHT as u32) as i32 - TOP_PAD,
+        );
+        let color = match h % 7 {
+            0 => WALL_LIGHT,
+            1 | 2 => WALL,
+            _ => FLOOR_LIGHT,
+        };
+        frame.put(x, y, color);
+        if h % 23 == 0 {
+            frame.put(x + 1, y, color);
+            frame.put(x, y + 1, color);
+        }
+    }
+    let c = pixel(CENTER);
+    for (r, color) in [
+        (70, FLOOR_LIGHT),
+        (132, SEAM),
+        (136, FLOOR_LIGHT),
+        (230, SEAM),
+    ] {
+        frame.ring(c, (r, r), color, r == 230);
+    }
+    for n in 0..12 {
+        let a = n as f32 * TAU / 12.0;
+        let tick = |r: f32| (c.0 + (a.cos() * r) as i32, c.1 + (a.sin() * r) as i32);
+        frame.line(tick(126.0), tick(142.0), FLOOR_LIGHT);
+    }
+    // The slash, as in the logo.
+    let (from, to) = ((c.0 - 210, c.1 + 150), (c.0 + 210, c.1 - 150));
+    for offset in -2..=2 {
+        frame.line(
+            (from.0 + offset, from.1),
+            (to.0 + offset, to.1),
+            if offset == 0 { WALL_LIGHT } else { WALL },
+        );
+    }
+}
 /// Cline's server room: a raised floor of square panels, some vented, with
 /// cable trays down both sides and a pad at each of the four stations it
 /// glides between.
@@ -676,6 +722,20 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                     let y = 10 + ((h >> 9) % 400) as i32 / 36 * 36 + 18;
                     let color = if n % 3 == 0 { CORE } else { WATER_LIGHT };
                     frame.rect(x - 1, y - 1, 3, 2, color);
+                }
+            }
+        }
+        Guardian::Grok => {
+            // Stars twinkle in the polished black.
+            for n in 0..14 {
+                let h = hash(n, 53);
+                let beat = (time * 0.7 + (h % 17) as f32 * 0.11).fract();
+                if beat < 0.25 {
+                    let x = (h % WIDTH as u32) as i32;
+                    let y = ((h >> 10) % 460) as i32;
+                    frame.line((x - 2, y), (x + 2, y), WALL_LIGHT);
+                    frame.line((x, y - 2), (x, y + 2), WALL_LIGHT);
+                    frame.put(x, y, WHITE);
                 }
             }
         }

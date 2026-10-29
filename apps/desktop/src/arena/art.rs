@@ -39,6 +39,7 @@ pub(super) fn floor(guardian: Guardian) -> &'static Raster {
 enum Actor {
     Body,
     Stem(usize),
+    Blade,
     Shard(usize),
     Block(usize),
     Brazier,
@@ -54,6 +55,9 @@ fn guardian_parts(boss: &Boss) -> Vec<(f32, Actor)> {
             for (ix, position) in boss.hands.iter().enumerate() {
                 parts.push((position.y, Actor::Stem(ix)));
             }
+        }
+        Guardian::Grok if boss.detached => {
+            parts.push((boss.hands[0].y, Actor::Blade));
         }
         Guardian::Claude => {
             for (ix, shard) in boss.shards.iter().enumerate() {
@@ -71,6 +75,7 @@ fn draw_part(frame: &mut Raster, boss: &Boss, part: Actor, time: f32, fallen: f3
     match part {
         Actor::Body => guardian(frame, boss, time, fallen, reduced),
         Actor::Stem(ix) if fallen < 2.1 => sculpture::stem(frame, boss, ix, fallen),
+        Actor::Blade => sculpture::blade(frame, boss),
         Actor::Shard(ix) => sculpture::shard(frame, &boss.shards[ix], time),
         _ => {}
     }
@@ -90,6 +95,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::OpenCode | Guardian::Copilot => 30,
             Guardian::Cursor => 38,
             Guardian::Cline => 32,
+            Guardian::Grok => 30,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
         frame.ellipse(
@@ -97,6 +103,10 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             ((width - shrink).max(5), (10 - shrink / 4).max(2)),
             SHADOW,
         );
+    }
+    if boss.guardian == Guardian::Grok && boss.detached {
+        let p = pixel(boss.hands[0]);
+        frame.ellipse((p.0 + 2, p.1 + 2), (14, 3), SHADOW);
     }
     if boss.guardian == Guardian::Pi {
         for ix in 0..2 {
@@ -192,7 +202,8 @@ fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
         | Guardian::DeepSeek
         | Guardian::Copilot
         | Guardian::Cursor
-        | Guardian::Cline => {
+        | Guardian::Cline
+        | Guardian::Grok => {
             frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
             frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
             gleam(frame, (x, y), 4, WHITE);
@@ -228,6 +239,7 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = 
     (-55, -133, 56, 6),
     (-43, -85, 42, 21),
     (-49, -122, 48, -5),
+    (-54, -100, 53, 15),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -236,7 +248,8 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// median over its loop. The window above also has to hold the loop's
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
-pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] = [65, 96, 110, 85, 106, 82, 92, 95];
+pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] =
+    [65, 96, 110, 85, 106, 82, 92, 95, 79];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]
 }

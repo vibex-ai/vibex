@@ -447,6 +447,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Copilot => copilot(&mut mesh, boss, time, fall),
         Guardian::Cursor => cursor::cursor(&mut mesh, boss, time, fall),
         Guardian::Cline => cline::cline(&mut mesh, boss, time, fall),
+        Guardian::Grok => grok::grok(&mut mesh, boss, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -485,6 +486,8 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
             boss.height - fall * 3.0,
             boss.yaw,
         ),
+        // A beaten ring sinks and tips back.
+        Guardian::Grok => (pitch + fall * 0.5, bank, boss.height - fall * 3.0, boss.yaw),
         _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
@@ -1052,6 +1055,9 @@ fn copilot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
 mod cline;
 #[path = "sculpture_cursor.rs"]
 mod cursor;
+#[path = "sculpture_grok.rs"]
+mod grok;
+pub(super) use grok::blade;
 
 #[cfg(test)]
 #[path = "sculpture_tests.rs"]

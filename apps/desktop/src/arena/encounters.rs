@@ -23,6 +23,7 @@ impl Arena {
             Guardian::Copilot => self.tick_copilot(),
             Guardian::Cursor => self.tick_cursor(),
             Guardian::Cline => self.tick_cline(),
+            Guardian::Grok => self.tick_grok(),
         }
         self.boss.update_core();
     }
@@ -101,6 +102,8 @@ mod copilot;
 mod cursor;
 #[path = "encounter_deepseek.rs"]
 mod deepseek;
+#[path = "encounter_grok.rs"]
+pub(super) mod grok;
 #[path = "encounter_opencode.rs"]
 mod opencode;
 #[path = "encounter_pi.rs"]

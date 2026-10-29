@@ -72,6 +72,8 @@ const RACKS: [Pillar; 4] = pillars(
     3.0,
     13.0,
 );
+/// Grok's observatory: two columns on the long axis, clear of its hauls.
+const OBSERVATORY_RIM: [Pillar; 2] = pillars([(38.0, 58.0), (138.0, 58.0)], 3.0, 10.0);
 /// Cursor's grid hall: four square columns that stop its laser.
 const GRID: [Pillar; 4] = pillars(
     [(56.0, 38.0), (120.0, 38.0), (56.0, 80.0), (120.0, 80.0)],
@@ -139,6 +141,7 @@ impl Map {
             Guardian::Copilot => &TERRACE,
             Guardian::Cursor => &GRID,
             Guardian::Cline => &RACKS,
+            Guardian::Grok => &OBSERVATORY_RIM,
         }
     }
 
@@ -166,6 +169,8 @@ impl Map {
                 x < 67.0 - margin && y < 49.0 - margin && !(x > 44.0 - margin && y > 35.0 - margin)
             }
             Guardian::Cline => x < 71.0 - margin && y < 46.0 - margin,
+            // A round floor, wider than it is deep.
+            Guardian::Grok => (x / (74.0 - margin)).powi(2) + (y / (48.0 - margin)).powi(2) < 1.0,
             // A square-cornered hall with its corners cut back on the grid.
             Guardian::Cursor => {
                 x < 72.0 - margin && y < 47.0 - margin && !(x > 58.0 - margin && y > 33.0 - margin)

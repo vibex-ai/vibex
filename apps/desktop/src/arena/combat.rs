@@ -4,6 +4,9 @@ use super::geometry::circle_hit;
 pub(super) use super::geometry::{HEIGHT, Vec2, WIDTH, segment_distance, smoothstep};
 pub(super) use super::guardian::{Attack, Boss, BossState, Guardian, STEMS, Shard};
 use super::map::{BRAZIER, CENTER, FLAME_RADIUS, Map, ScarKind};
+pub(super) use encounters::grok::{
+    BLADE_RADIUS as GROK_BLADE_RADIUS, FRENZY_RADIUS as GROK_FRENZY_RADIUS,
+};
 use std::f32::consts::{PI, TAU};
 
 pub(super) const STEP: f32 = 1.0 / 120.0;
@@ -553,6 +556,7 @@ impl Arena {
         boss.plate = None;
         boss.shield = 0.0;
         boss.dashes = 0;
+        boss.detached = false;
         boss.flash = 0.0;
         boss.generation = 0;
         boss.shards = [Shard::default(); 4];
@@ -656,6 +660,8 @@ impl Arena {
             Guardian::Pi | Guardian::DeepSeek => true,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
+            // The core in the back of the ring, open while it spins and reels.
+            Guardian::Grok => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
             // The whole back is open, but the head always turns to the archer.
             Guardian::Cline => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
             // The pointer facet takes an arrow only from the side it faces.
