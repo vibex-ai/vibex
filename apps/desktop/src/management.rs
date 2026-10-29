@@ -85,7 +85,7 @@ use crate::gpui_ext::{
 };
 use crate::hint_layer::{self, hint_notification};
 use crate::locale::{self, ResolvedLocale};
-use crate::motion::hover_listener;
+use crate::motion::{hover_blend, hover_listener};
 use crate::resize_seam;
 use crate::skeleton;
 use crate::spinner::Spinner;
@@ -156,7 +156,14 @@ const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT: f32 = 148.0;
 /// drawer does, so a suggestion panel can be thrown away with the seam alone.
 const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_CLOSE_THRESHOLD: f32 = 172.0;
 const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_KEYBOARD_STEP: f32 = 24.0;
-const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_RESIZE_HANDLE_HEIGHT: f32 = 12.0;
+/// The sheet's top lip. A card radius would read as a box; this panel is pulled
+/// up from the sidebar's bottom edge, so its top corners are rounder and the
+/// grabber sits on that arc.
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS: f32 = 16.0;
+/// The pill at the top edge: the desktop counterpart of a mobile sheet's
+/// grabber, and the visible promise that the panel can be pulled upward.
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_GRABBER_WIDTH: f32 = 40.0;
+const MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_GRABBER_HEIGHT: f32 = 4.0;
 /// The height the Skill preview keeps before it starts scrolling.
 ///
 /// The body is shown in full rather than summarised, but it must not push the
@@ -31740,18 +31747,14 @@ impl ManagementCenter {
             .min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))
             .flex_none()
             .overflow_hidden()
-            // The seam owns the top edge; the other three make the drawer read
-            // as a docked bar instead of a wash that happens to end the column.
-            .border_l_1()
-            .border_r_1()
-            .border_b_1()
+            // The top edge is a lip, not a divider: rounded corners, one
+            // hairline, and the raised fill of a sheet pulled up from the
+            // bottom of the column.
+            .rounded_tl(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))
+            .rounded_tr(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))
+            .border_t_1()
             .border_color(cx.theme().border)
-            // A hair above the sidebar's own fill: enough to read as a docked
-            // surface, not enough to become a floating card.
-            .bg(management_surface_wash(
-                cx,
-                MANAGEMENT_PANEL_STRIP_WASH * 0.4,
-            ))
+            .bg(theme::semantic_color("card", cx.theme().is_dark()))
             .child(self.render_route_group_recommendations_resize_handle(cx))
             .child(
                 h_flex()
@@ -31860,7 +31863,17 @@ impl ManagementCenter {
         let active = self.route_group_recommendations_resize.is_some();
         let increment_target = cx.weak_entity();
         let decrement_target = cx.weak_entity();
-        let seam_key = resize_seam::seam_hover_key("management-route-group-suggestions");
+        let grabber_key = resize_seam::seam_hover_key("management-route-group-suggestions");
+        let grabber_rest = cx
+            .theme()
+            .muted_foreground
+            .opacity(if cx.theme().is_dark() { 0.55 } else { 0.45 });
+        let grabber_hover = cx.theme().muted_foreground.opacity(0.75);
+        let grabber_color = if active {
+            grabber_hover
+        } else {
+            hover_blend(&grabber_key, grabber_rest, grabber_hover)
+        };
         h_flex()
             .id("management-route-group-suggestions-resize")
             .role(Role::Splitter)
@@ -31879,12 +31892,15 @@ impl ManagementCenter {
             )
             .focusable()
             .tab_index(0)
-            .relative()
-            .h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_RESIZE_HANDLE_HEIGHT))
+            .justify_center()
+            .items_center()
+            .pt_2()
+            .pb_1p5()
             .w_full()
             .flex_none()
             .cursor_ns_resize()
-            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
+            .focus_visible(|style| style.bg(cx.theme().primary.opacity(0.04)))
+            .on_hover(hover_listener(cx.entity_id(), grabber_key))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 let next = match event.keystroke.key.as_str() {
                     "up" => {
@@ -31954,12 +31970,11 @@ impl ManagementCenter {
                 cx.listener(|this, _, _, cx| this.finish_route_group_recommendations_resize(cx)),
             )
             .child(
-                resize_seam::seam_line(&seam_key, cx.theme().border, true, active, true)
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(px(1.0)),
+                div()
+                    .w(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_GRABBER_WIDTH))
+                    .h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_GRABBER_HEIGHT))
+                    .rounded_full()
+                    .bg(grabber_color),
             )
             .into_any_element()
     }
@@ -38593,6 +38608,8 @@ impl Render for ManagementCenter {
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
         let wide = management_uses_wide_layout(viewport_width);
+        let provider_sidebar =
+            management_primary_section(self.navigation.active) == ManagementSection::Providers;
         let (compact_min_height, compact_max_height) =
             management_compact_sidebar_height_limits(viewport_height);
         let compact_sidebar_height = self
@@ -38621,13 +38638,16 @@ impl Render for ManagementCenter {
                     .min_h_0()
                     .flex_1()
                     .gap(px(10.0))
-                    .p_3()
-                    .child(nav)
+                    .child(div().w_full().px_3().pt_3().child(nav))
                     .child(
                         div()
                             .min_h_0()
                             .flex_1()
                             .overflow_hidden()
+                            // The Provider column pads its own list so the
+                            // suggestion sheet can run to the sidebar's edges;
+                            // every other column keeps the shared inset.
+                            .when(!provider_sidebar, |body| body.px_3().pb_3())
                             .child(context_sidebar),
                     ),
             );
@@ -52363,9 +52383,18 @@ mod gateway_surface_tests {
             .expect("the suggestion drawer should remain inspectable");
         assert!(drawer.contains(".h(px(self.route_group_recommendations_height))"));
         assert!(drawer.contains(".min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))"));
-        assert!(drawer.contains(".border_l_1()"));
-        assert!(drawer.contains(".border_r_1()"));
-        assert!(drawer.contains(".border_b_1()"));
+        assert!(
+            drawer.contains(".rounded_tl(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))")
+        );
+        assert!(
+            drawer.contains(".rounded_tr(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))")
+        );
+        assert!(drawer.contains(".border_t_1()"));
+        assert!(
+            !drawer.contains(".border_l_1()") && !drawer.contains(".border_r_1()"),
+            "the sheet reaches both sidebar edges instead of floating inside them"
+        );
+        assert!(drawer.contains(r#".bg(theme::semantic_color("card", cx.theme().is_dark()))"#));
         assert!(drawer.contains("render_route_group_recommendations_resize_handle(cx)"));
         assert!(drawer.contains("management-route-group-suggestions-close"));
         assert!(drawer.contains("overflow_y_scrollbar()"));
@@ -52373,18 +52402,29 @@ mod gateway_surface_tests {
         assert!(drawer.contains("Role::Button"));
         assert!(drawer.contains("event.keystroke.key.as_str()"));
 
+        // The Provider column owns its inset; that is what lets the sheet run
+        // to the sidebar's edges while every other column keeps the shared
+        // padding.
+        assert!(source.contains("provider_sidebar"));
+        assert!(source.contains(".when(!provider_sidebar, |body| body.px_3().pb_3())"));
+
         let handle = source
             .split_once("    fn render_route_group_recommendations_resize_handle(")
             .and_then(|(_, tail)| {
                 tail.split_once("\n    /// Copies a group into an application-local draft record.")
             })
             .map(|(body, _)| body)
-            .expect("the suggestion drawer's seam should remain inspectable");
+            .expect("the suggestion drawer's grabber should remain inspectable");
         assert!(handle.contains("Role::Splitter"));
         assert!(handle.contains("cursor_ns_resize()"));
         assert!(handle.contains("on_drag_move"));
         assert!(handle.contains("AccessibleAction::Increment"));
-        assert!(handle.contains("resize_seam::seam_line"));
+        assert!(handle.contains("MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_GRABBER_WIDTH"));
+        assert!(handle.contains("rounded_full()"));
+        assert!(
+            !handle.contains("resize_seam::seam_line"),
+            "the grabber replaces the seam hairline at the sheet's top edge"
+        );
     }
 
     #[test]
