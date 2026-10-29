@@ -25,7 +25,11 @@ pub(super) fn lane(boss: &mut Boss, moment: Moment) -> f32 {
                 beat(elapsed, STEP)
             };
             let rise = (u * PI).sin();
-            let side = if (step as usize).is_multiple_of(2) { 1.0 } else { -1.0 };
+            let side = if (step as usize).is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
             boss.height = rise * 3.0;
             boss.bank = side * 0.1 * rise;
             boss.pitch = -0.08 * rise;

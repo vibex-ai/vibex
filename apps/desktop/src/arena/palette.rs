@@ -27,6 +27,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Grok => [0x34363d, 0x6a6e78, 0xa9adb6, 0xdcdee3, 0xffffff],
         // Dark slate stone with the logo's crisp edges catching the light.
         Guardian::ZCode => [0x10141c, 0x1f2633, 0x343d4f, 0x55627a, 0x8d9ab3],
+        // The logo's black tile.
+        Guardian::Kimi => [0x020203, 0x0c0c0f, 0x19191e, 0x2c2c33, 0x4a4a54],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -66,6 +68,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::ZCode => [
             0x2a1f17, 0x8a7356, 0xa68c69, 0xbfa57f, 0x6e5a42, 0x5c4a36, 0xd4bd96,
         ],
+        // A pale ruled page, so the black tile and its blue trail stand out.
+        Guardian::Kimi => [
+            0x1e1d1b, 0xc4c0b5, 0xdcd8ce, 0xece9e1, 0xb1ada2, 0x86827a, 0xf6f4ee,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -96,6 +102,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Grok => [0x8a1022, 0xff3a52, 0xffc6cd],
         // The core behind the shutter, and the sweep, burn electric violet.
         Guardian::ZCode => [0x4b1fa0, 0x9d6bff, 0xe6dcff],
+        // The logo's blue square, and the context it lays down.
+        Guardian::Kimi => [0x0b4fb3, 0x1683ff, 0xb3d6ff],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -114,6 +122,12 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         for (ix, value) in [0x0f4a7a, 0x2fa8f0, 0xa8ecff].into_iter().enumerate() {
             colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
         }
+    }
+    if guardian == Guardian::Kimi {
+        // The K is the logo's pure white.
+        colors[ink::WHITE as usize] = rgb(0xffffff).into();
+        colors[ink::IVORY as usize] = rgb(0xe4e4e8).into();
+        colors[ink::DUST as usize] = rgb(0xb4b4bc).into();
     }
     if guardian == Guardian::Cursor {
         // The logo is monochrome: its light facet is a neutral white.

@@ -17,7 +17,7 @@ pub(super) const MAX_CHARGE: f32 = 0.8;
 pub(super) const MAX_PROJECTILES: usize = 48;
 pub(super) const MAX_EFFECTS: usize = 64;
 pub(super) const MAX_WAVES: usize = 8;
-pub(super) const MAX_HAZARDS: usize = 16;
+pub(super) const MAX_HAZARDS: usize = 24;
 pub(super) const MAX_BEAMS: usize = 8;
 pub(super) const PLAYER_RADIUS: f32 = 0.9;
 pub(super) const CORE_RADIUS: f32 = 1.8;
@@ -142,6 +142,9 @@ pub(super) enum HazardKind {
     Drop,
     /// A falling shard from the terrace canopy.
     Icicle,
+    /// A block of Kimi's long context, laid down behind it as it slides. It
+    /// kills on touch until it fades, and an arrow through it clears it.
+    Trail,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Hazard {
@@ -667,6 +670,8 @@ impl Arena {
             Guardian::Claude => self.boss.generation >= 4,
             Guardian::Codex => !self.boss.cube_shielded(),
             Guardian::Pi | Guardian::DeepSeek => true,
+            // The blue square is on the tile's face.
+            Guardian::Kimi => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
             // The bared core looks down the hall.
@@ -712,6 +717,14 @@ impl Arena {
         let from = self.arrow.position;
         let to = from.plus(self.arrow.velocity.scale(STEP));
         let returning = self.arrow.state == ArrowState::Returning;
+        // An arrow through a block of trail clears it and flies on.
+        let before = self.hazards.len();
+        self.hazards.retain(|h| {
+            h.kind != HazardKind::Trail || segment_distance(h.position, from, to) > h.radius
+        });
+        if self.hazards.len() < before {
+            self.effect(EffectKind::Burst, from, 0.4, 4.0);
+        }
         if self.brazier_lit() && segment_distance(flame_center(), from, to) < FLAME_RADIUS {
             if self.arrow.burning <= 0.0 {
                 self.effect(EffectKind::Ignite, flame_center(), 0.5, 4.0);
@@ -1025,7 +1038,7 @@ impl Arena {
                     self.effect(EffectKind::Rubble, position, 0.7, radius + 2.0);
                     self.map.scar(position, radius, ScarKind::Crack);
                 }
-                HazardKind::Goo => {}
+                HazardKind::Goo | HazardKind::Trail => {}
             }
         }
         if hit {
@@ -1087,8 +1100,18 @@ impl Arena {
             return;
         }
         if self.hazards.len() == MAX_HAZARDS {
-            // Old slime yields before a live threat is ever dropped.
-            match self.hazards.iter().position(|h| h.kind == HazardKind::Goo) {
+            // Old slime yields first, then the oldest of a trail; a falling
+            // threat is never dropped.
+            let yields = self
+                .hazards
+                .iter()
+                .position(|h| h.kind == HazardKind::Goo)
+                .or_else(|| {
+                    self.hazards
+                        .iter()
+                        .position(|h| h.kind == HazardKind::Trail)
+                });
+            match yields {
                 Some(ix) => {
                     self.hazards.remove(ix);
                 }

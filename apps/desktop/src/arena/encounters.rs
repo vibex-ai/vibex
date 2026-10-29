@@ -25,6 +25,7 @@ impl Arena {
             Guardian::Cline => self.tick_cline(),
             Guardian::Grok => self.tick_grok(),
             Guardian::ZCode => self.tick_zcode(),
+            Guardian::Kimi => self.tick_kimi(),
         }
         self.boss.update_core();
     }
@@ -105,6 +106,8 @@ mod cursor;
 mod deepseek;
 #[path = "encounter_grok.rs"]
 pub(super) mod grok;
+#[path = "encounter_kimi.rs"]
+pub(super) mod kimi;
 #[path = "encounter_opencode.rs"]
 mod opencode;
 #[path = "encounter_pi.rs"]

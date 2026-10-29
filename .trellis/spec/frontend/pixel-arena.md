@@ -331,6 +331,7 @@ rebirth, without a damage override.
 | Cline | The logo's robot head in light steel: a rounded hollow frame with a point at the middle of each side, two upright cyan pill eyes in a dark face, the large antenna ball, and a rounded shell behind with a hot vent; it glides clockwise between four station pads, always turned to the archer | At each station a fan of lethal bolts flies at the archer, 3, 5, 6, 6 round and round; an even fan is offset half a gap so standing still is still hit. The whole back is always open but never shown: an arrow loosed past the head and recalled through it from behind wins anywhere on the back. |
 | Grok | The logo's white ring, broken where a long double-edged slash crosses it from lower left to upper right, a red core set in the back of its dark disc; it keeps its face to the archer at a throwing distance | It hurls the slash on a swinging arc, lodges it, and hauls itself along the line after it. Getting behind it makes it whip round to cover its back; the third whip-round sends it into a three-second frenzy, spinning with the blade whirled out 15.5 units round it and closing in. The back core is open through the frenzy and the reel after it, and passes the archer once a revolution. |
 | ZCode | The Z.ai logo's Z in slate stone: the long diagonal is a slab standing on a dais at the north with a shuttered core in the middle of its face; the two bars of the Z sit across its ends at home and fly as fists in a fight | The fists slam the archer by turns; one that lands on either of the two floor switches stays to hold it down. Every fourth blow the slab's eye sweeps a laser through a half circle west to east through the south, ended by the hall's two columns; a roll carries the archer through it. With both switches held, the shutter slides open and the core is bare from the south for 1.5 seconds before it fires straight down the hall and lets go. Low fists stop arrows. |
+| Kimi | The logo's black rounded tile standing on edge, the white K raised on its face from the logo's own polygon, and the blue square at its upper right corner; it slides after the archer on a ruled page | Its long context lies behind it: a trail of blue blocks, one every 5.5 units, that kill on touch for 7 seconds, and an arrow through a block clears it. After a three-second chase, and every few seconds after, it charges straight across the floor; it skids out of the charge rocking on its edge as it drifts round to face back the way it came, and the blue square takes an arrow from the front for 1.4 seconds (1.8 after hitting a wall or column). |
 | Cursor | The logo's graphite cube standing corner-on (its hexagon), the pointer cut into one face as a light arrow with its notch; it tumbles four quarter-turns toward the archer along the diagonals, then the pointer charges and fires | A laser fires down the pointer's face normal, telegraphed by rails at its exact width and stopped by the hall's four columns. The pointer is bare while it charges, but only from the side it faces. Facing the sky it flares harmlessly; pressed to the floor it blasts the cube over, and it lands with the pointer toward the viewer, dazed for 1.9 seconds. |
 
 - Keep identity readable: models follow the Agent logos — the spark's uneven
@@ -338,7 +339,8 @@ rebirth, without a damage override.
   frame and window, the orca's markings, fin and curled tail, Copilot's
   goggles and face slots, Cursor's corner-on cube and pointer cut, Cline's
   pointed frame, pill eyes and antenna ball, Grok's broken ring and slash,
-  ZCode's slab and bars as the logo's own parallelograms. Every model
+  ZCode's slab and bars as the logo's own parallelograms, Kimi's tile, K and
+  blue square. Every model
   carries a dark one-pixel silhouette.
 - Cursor's cube (`arena/cube.rs`) names faces in model space with +y the way
   it rolls. A quarter-turn about the leading bottom edge is a pitch about the
@@ -403,6 +405,8 @@ rebirth, without a damage override.
 | Spark hit before four splits / split spark hit | Split and recoil / shatter it; no victory |
 | Ordinary arrow on the knot / shielded cube | Glance off; only a burning arrow melts it, only a shield gap wins |
 | Arrow at Cline's face | Glances off; its back takes the arrow, recalled through it or loosed from behind |
+| Arrow through Kimi's trail | Clears the block it passes and flies on |
+| Hazards full while a trail grows | Old slime, then the oldest trail block, yields; a falling threat is never dropped |
 | Waiting without play | No encounter opens its weak point by itself |
 | Guarding stem in front of Pi's eye | The arrow stops; the eye opens only on a switch |
 | Floe destroyed under a charging archer | Cancel drawing, show swimming, and preserve recall |

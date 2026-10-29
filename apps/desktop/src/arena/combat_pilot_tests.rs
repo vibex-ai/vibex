@@ -265,6 +265,13 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Kimi => {
+            plan.goal = around(boss.position, 28.0);
+            let front = player.minus(boss.core).dot(boss.direction) > 3.0;
+            if front && boss.exposed > arrival(boss.core) + 0.03 {
+                plan.target = Some(boss.core);
+            }
+        }
         Guardian::ZCode => {
             let sweeping = boss.attack == Attack::Sweep
                 && matches!(boss.state, BossState::Windup | BossState::Striking);
@@ -473,6 +480,9 @@ fn route(arena: &Arena) -> Option<(Vec2, Vec2, f32)> {
         (Guardian::Copilot, Attack::Dash) if committed => {
             Some((boss.position, boss.target, boss.radius()))
         }
+        (Guardian::Kimi, Attack::Charge) if committed => {
+            Some((boss.position, boss.target, boss.radius()))
+        }
         (Guardian::Grok, Attack::Pull) if boss.state == BossState::Rushing => {
             Some((boss.position, boss.target, boss.radius()))
         }
@@ -531,6 +541,7 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
             {
                 score += 10.0
             }
+            HazardKind::Trail if distance < h.radius + PLAYER_RADIUS + 1.2 => score += 10.0,
             _ => {}
         }
     }
@@ -706,4 +717,8 @@ fn the_slashed_ring_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_gate_slab_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::ZCode);
+}
+#[test]
+fn the_tile_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Kimi);
 }

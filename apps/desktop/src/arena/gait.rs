@@ -102,6 +102,7 @@ fn itinerary(guardian: Guardian) -> &'static [Leg] {
         Guardian::Cline => &cline::LEGS,
         Guardian::Grok => &grok::LEGS,
         Guardian::ZCode => &zcode::LEGS,
+        Guardian::Kimi => &kimi::LEGS,
     }
 }
 /// How long one guardian takes to walk its whole itinerary once.
@@ -458,6 +459,7 @@ impl Boss {
             Guardian::Cline => cline::lane(&mut boss, moment, phase),
             Guardian::Grok => grok::lane(&mut boss, legs, moment, phase),
             Guardian::ZCode => zcode::lane(&mut boss, moment),
+            Guardian::Kimi => kimi::lane(&mut boss, legs, moment),
         };
         boss.position = lane_point(place);
         if !matches!(guardian, Guardian::Pi | Guardian::ZCode) {
@@ -516,6 +518,7 @@ pub(super) fn entrance(guardian: Guardian) -> f32 {
         Guardian::Cline => cline::ENTRANCE,
         Guardian::Grok => grok::ENTRANCE,
         Guardian::ZCode => zcode::ENTRANCE,
+        Guardian::Kimi => kimi::ENTRANCE,
     }
 }
 /// How long a guardian takes to leave its lane when the turn ends.
@@ -531,6 +534,7 @@ pub(super) fn exit(guardian: Guardian) -> f32 {
         Guardian::Cline => cline::EXIT,
         Guardian::Grok => grok::EXIT,
         Guardian::ZCode => zcode::EXIT,
+        Guardian::Kimi => kimi::EXIT,
     }
 }
 
@@ -618,6 +622,7 @@ pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
         Guardian::Cline => cline::entering(&mut shot, a),
         Guardian::Grok => grok::entering(&mut shot, a),
         Guardian::ZCode => zcode::entering(&mut shot, a),
+        Guardian::Kimi => kimi::entering(&mut shot, a),
     }
     shot.boss = settled(shot.boss);
     shot
@@ -702,6 +707,7 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
         Guardian::Cline => cline::leaving(boss, a),
         Guardian::Grok => grok::leaving(boss, a, side),
         Guardian::ZCode => zcode::leaving(boss, a),
+        Guardian::Kimi => kimi::leaving(boss, a),
     };
     // A turn that ends mid-entrance leaves from where the entrance had got to;
     // that offset hands over to the exit's own as it goes.
@@ -719,5 +725,7 @@ mod cline;
 mod cursor;
 #[path = "gait_grok.rs"]
 mod grok;
+#[path = "gait_kimi.rs"]
+mod kimi;
 #[path = "gait_zcode.rs"]
 mod zcode;

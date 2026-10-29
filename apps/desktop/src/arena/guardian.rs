@@ -18,10 +18,11 @@ pub(super) enum Guardian {
     Cline,
     Grok,
     ZCode,
+    Kimi,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -32,6 +33,7 @@ impl Guardian {
         Self::Cline,
         Self::Grok,
         Self::ZCode,
+        Self::Kimi,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -45,6 +47,7 @@ impl Guardian {
             Self::Cline => "Cline",
             Self::Grok => "Grok",
             Self::ZCode => "ZCode",
+            Self::Kimi => "Kimi",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -59,6 +62,7 @@ impl Guardian {
             "cline" => Some(Self::Cline),
             "grok" | "grok-cli" => Some(Self::Grok),
             "zcode" => Some(Self::ZCode),
+            "kimi" | "kimi-cli" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -79,6 +83,7 @@ impl Guardian {
             Self::Cline => "cline",
             Self::Grok => "grok",
             Self::ZCode => "zcode",
+            Self::Kimi => "kimi",
         }
     }
 }
@@ -132,6 +137,8 @@ pub(super) enum Attack {
     Sweep,
     /// The shutter sliding open over the core.
     Open,
+    /// A straight charge across the floor that ends in a skid.
+    Charge,
 }
 
 /// Visual and collision scale of the spark after each split.
@@ -145,6 +152,8 @@ pub(super) const GROK_RING: f32 = 10.0;
 pub(super) const ZCODE_CORE: f32 = 14.0;
 /// How high ZCode's fists hover when they are not striking.
 pub(super) const ZCODE_HOVER: f32 = 9.0;
+/// The height of Kimi's tile.
+pub(super) const KIMI_TILE: f32 = 15.0;
 /// Stamping steps ZCode marches round the home each loop.
 const ZCODE_STEPS: f32 = 30.0;
 
@@ -324,6 +333,7 @@ impl Boss {
             Guardian::Cline => 8.0,
             Guardian::Grok => 8.5,
             Guardian::ZCode => 9.0,
+            Guardian::Kimi => 8.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -395,6 +405,8 @@ impl Boss {
             Guardian::Cline => (0.0, 0.0, CLINE_HEAD),
             Guardian::Grok => (0.0, 0.0, GROK_RING),
             Guardian::ZCode => (0.0, 0.0, ZCODE_CORE),
+            // A tile tips about the bottom of its face.
+            Guardian::Kimi => (0.0, 0.0, 0.0),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -448,6 +460,7 @@ impl Boss {
             Guardian::Cline => self.articulated(0.0, 0.0, CLINE_HEAD),
             Guardian::Grok => self.articulated(0.0, 0.0, GROK_RING),
             Guardian::ZCode => self.local(0.0, 0.0, ZCODE_CORE),
+            Guardian::Kimi => self.articulated(0.0, 0.0, KIMI_TILE * 0.5),
         }
     }
     pub fn update_core(&mut self) {
@@ -473,6 +486,8 @@ impl Boss {
             Guardian::Grok => self.articulated(0.0, -2.4, GROK_RING),
             // Behind the shutter in the middle of the slab's face.
             Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
+            // The blue square at the tile's upper right corner.
+            Guardian::Kimi => self.articulated(4.35, 3.4, 11.4),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -710,11 +725,29 @@ impl Boss {
                 boss.position = position;
                 let rise = (u * PI).sin();
                 boss.height = rise * 3.0;
-                let side = if (step as usize).is_multiple_of(2) { 1.0 } else { -1.0 };
+                let side = if (step as usize).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
                 boss.bank = side * 0.1 * rise;
                 boss.pitch = -0.08 * rise;
                 boss.yaw = -tangent.normalized().x * 0.2;
                 boss.seat_bars(rise * 0.6);
+            }
+            Guardian::Kimi => {
+                // Long slides round the home, each ending in a sudden charge
+                // that skids and rocks the tile before it slides on.
+                let (beat_ix, u) = beat(time, IDLE_LOOP / 4.0);
+                let charge = smoothstep((u - 0.7) / 0.12);
+                let s = (beat_ix + (u / 0.7).min(1.0) * 0.55 + charge * 0.45) * TAU / 4.0;
+                let (position, tangent) = route(guardian, s);
+                boss.position = position;
+                let heading = tangent.normalized();
+                boss.yaw = -heading.x * 0.3;
+                let skid = ((u - 0.82) / 0.18).clamp(0.0, 1.0);
+                boss.bank = heading.x * 0.18 * (skid * TAU * 1.5).sin() * (1.0 - skid);
+                boss.pitch = -0.12 * (charge * PI).sin();
             }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
@@ -824,6 +857,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::Kimi => (
+            s.sin() * 66.0,
+            -s.cos() * 30.0,
+            s.cos() * 66.0,
+            s.sin() * 30.0,
         ),
         Guardian::ZCode => (
             s.sin() * 58.0,

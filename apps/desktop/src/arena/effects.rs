@@ -101,6 +101,17 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 }
                 frame.rect(c.0 - r / 2, c.1 - r / 2, 2, 1, CORE_LIGHT);
             }
+            HazardKind::Trail => {
+                // A block of context: a lit square that blinks as it fades.
+                let left = h.delay + h.duration - h.time;
+                if left < 1.2 && !reduced && (left * 8.0).fract() < 0.4 {
+                    continue;
+                }
+                let s = r - 2;
+                frame.rect(c.0 - s - 1, c.1 - s - 1, s * 2 + 3, s * 2 + 3, CORE_DARK);
+                frame.rect(c.0 - s, c.1 - s, s * 2 + 1, s * 2 + 1, CORE);
+                frame.rect(c.0 - s + 2, c.1 - s + 2, s, 2, CORE_LIGHT);
+            }
             HazardKind::Drop | HazardKind::Icicle if h.time < h.delay => {
                 // The shadow grows under the falling body.
                 let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
@@ -339,6 +350,9 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             }
             let r = (crate::arena::combat::GROK_BLADE_RADIUS * SCALE) as i32 + 4;
             landing(frame, c, r, color, progress);
+        }
+        (Guardian::Kimi, Attack::Charge) if boss.state == BossState::Windup => {
+            route(frame, boss.position, boss.target, boss.radius(), color);
         }
         (Guardian::ZCode, Attack::Sweep) if boss.state == BossState::Windup => {
             // The half circle the eye will sweep, west to east through the

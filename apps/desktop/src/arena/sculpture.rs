@@ -484,6 +484,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Cline => cline::cline(&mut mesh, boss, time, fall),
         Guardian::Grok => grok::grok(&mut mesh, boss, fall),
         Guardian::ZCode => zcode::zcode(&mut mesh, boss, fall),
+        Guardian::Kimi => kimi::kimi(&mut mesh, boss),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -524,6 +525,8 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         ),
         // A beaten ring sinks and tips back.
         Guardian::Grok => (pitch + fall * 0.5, bank, boss.height - fall * 3.0, boss.yaw),
+        // A beaten tile falls flat on its back.
+        Guardian::Kimi => (pitch + fall * 1.3, bank, boss.height, boss.yaw),
         _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
@@ -1094,6 +1097,8 @@ mod cursor;
 #[path = "sculpture_grok.rs"]
 mod grok;
 pub(super) use grok::blade;
+#[path = "sculpture_kimi.rs"]
+mod kimi;
 #[path = "sculpture_zcode.rs"]
 mod zcode;
 pub(super) use zcode::zbar;

@@ -67,6 +67,8 @@ pub(super) const SWITCHES: [Vec2; 2] = [Vec2::new(36.0, 76.0), Vec2::new(140.0, 
 pub(super) const SWITCH_RADIUS: f32 = 7.0;
 /// ZCode's hall: two columns that stop the sweep.
 const GATE_HALL: [Pillar; 2] = pillars([(62.0, 60.0), (114.0, 60.0)], 3.2, 12.0);
+/// Kimi's hall: three columns to break its charges against.
+const PAGE: [Pillar; 3] = pillars([(58.0, 42.0), (118.0, 42.0), (88.0, 84.0)], 3.2, 10.0);
 /// The four pads Cline glides between, clockwise from the north.
 pub(super) const STATIONS: [Vec2; 4] = [
     Vec2::new(88.0, 28.0),
@@ -151,6 +153,7 @@ impl Map {
             Guardian::Cline => &RACKS,
             Guardian::Grok => &OBSERVATORY_RIM,
             Guardian::ZCode => &GATE_HALL,
+            Guardian::Kimi => &PAGE,
         }
     }
 
@@ -179,6 +182,11 @@ impl Map {
             }
             Guardian::Cline => x < 71.0 - margin && y < 46.0 - margin,
             Guardian::ZCode => x < 72.0 - margin && y < 47.0 - margin,
+            // A page with its corners rounded off, like the logo's tile.
+            Guardian::Kimi => {
+                let (cx, cy) = ((x - 52.0).max(0.0), (y - 26.0).max(0.0));
+                x < 72.0 - margin && y < 46.0 - margin && cx.hypot(cy) < 20.0 - margin
+            }
             // A round floor, wider than it is deep.
             Guardian::Grok => (x / (74.0 - margin)).powi(2) + (y / (48.0 - margin)).powi(2) < 1.0,
             // A square-cornered hall with its corners cut back on the grid.

@@ -97,6 +97,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::Cline => server_room(&mut frame),
         Guardian::Grok => observatory_floor(&mut frame),
         Guardian::ZCode => gate_hall(&mut frame),
+        Guardian::Kimi => page(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -143,6 +144,25 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Kimi's page: ruled lines down a pale floor, a margin rule, and faint
+/// token squares scattered along the lines like words.
+fn page(frame: &mut Raster) {
+    for y in (-TOP_PAD..HEIGHT as i32).step_by(26) {
+        frame.line((0, y), (WIDTH as i32, y), FLOOR_SHADE);
+    }
+    let margin = pixel(CENTER).0 - 250;
+    frame.line((margin, -TOP_PAD), (margin, HEIGHT as i32), WALL);
+    frame.line((margin + 3, -TOP_PAD), (margin + 3, HEIGHT as i32), WALL);
+    for n in 0..140 {
+        let h = hash(n, 83);
+        let row = (h % 18) as i32;
+        let x = margin + 12 + ((h >> 8) % 560) as i32 / 10 * 10;
+        let y = -TOP_PAD + 26 * row + 13;
+        let w = 4 + (h >> 20) as i32 % 12;
+        frame.rect(x, y - 3, w, 6, FLOOR_LIGHT);
+        frame.rect(x, y + 3, w, 1, FLOOR_SHADE);
+    }
+}
 /// ZCode's gate hall: broad sandstone flags, a stepped dais at the north
 /// where the slab stands, and a Z cut into the floor down the middle.
 fn gate_hall(frame: &mut Raster) {
@@ -789,6 +809,21 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                 let x = (h % 600) as i32 + 50 + (t * 20.0) as i32;
                 let y = (t * 420.0) as i32 + 10;
                 frame.rect(x, y, 2, 1, WALL_LIGHT);
+            }
+        }
+        Guardian::Kimi => {
+            // Context being written: tokens light up along the lines.
+            let margin = pixel(CENTER).0 - 250;
+            for n in 0..6 {
+                let h = hash(n, 89);
+                let beat = (time * 0.8 + (h % 11) as f32 * 0.13).fract();
+                let row = (h % 18) as i32;
+                let x = margin + 12 + ((h >> 8) % 560) as i32 / 10 * 10;
+                let y = -TOP_PAD + 26 * row + 10;
+                let on_page = map.inside(Vec2::new(x as f32 / SCALE, y as f32 / SCALE), 2.0);
+                if beat < 0.35 && on_page {
+                    frame.rect(x, y, 8, 6, CORE);
+                }
             }
         }
         Guardian::OpenCode => {}
