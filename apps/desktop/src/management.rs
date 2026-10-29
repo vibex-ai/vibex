@@ -15652,8 +15652,8 @@ impl ManagementCenter {
                     management_locale_text("Tokens", "Token", "Token"),
                     tokens.to_string(),
                 ),
-                ("p50".to_string(), p50),
-                ("p95".to_string(), p95),
+                ("p50", p50),
+                ("p95", p95),
                 (
                     management_locale_text("Top error", "错误 Top", "錯誤 Top"),
                     top_error,
@@ -16632,8 +16632,8 @@ impl ManagementCenter {
                     management_locale_text("Tokens", "Token", "Token"),
                     tokens.to_string(),
                 ),
-                ("p50".to_string(), p50),
-                ("p95".to_string(), p95),
+                ("p50", p50),
+                ("p95", p95),
                 (
                     management_locale_text("Top error", "错误 Top", "錯誤 Top"),
                     top_error,
