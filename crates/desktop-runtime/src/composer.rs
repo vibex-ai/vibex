@@ -29,12 +29,12 @@ pub const COMPOSER_AGENT_REFERENCE_KEY: &str = "vibexUseAgentReference";
 pub const COMPOSER_SELECTION_REFERENCE_KEY: &str = "vibexUseSelectionReference";
 /// Metadata key carrying the stable session reference of an `@session` entry.
 pub const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
-/// Metadata key marking an entry as the direct "delegate now" action.
+/// Metadata key marking a legacy direct-action entry.
 ///
-/// Picking it does not insert a reference into the draft: it hands the draft to
-/// that collaborator through the same delegation service the Agent tools use.
-/// The entry is what makes a delegation reproducible without the main Agent
-/// having to follow a prompt.
+/// Current authorities emit one `@Agent` reference per configuration and let
+/// the client offer the reference and the hand-off as two halves of that row.
+/// The key stays on the wire contract because an older paired authority may
+/// still send the separate entry; clients filter it from the row list.
 pub const COMPOSER_DELEGATE_NOW_KEY: &str = "vibexUseDelegateNow";
 
 /// Resolves one composer discovery request against the authority's state.
@@ -234,48 +234,6 @@ fn runtime_reference_commands(
                 entries.push(entry);
                 remaining -= 1;
             }
-            // The direct action, offered beside the reference. The task text is
-            // whatever the reader already wrote, so it is fully visible before
-            // the delegation exists; the entry only decides that it goes to this
-            // collaborator rather than to the main Agent.
-            if remaining == 0 {
-                break 'rounds;
-            }
-            let action = AgentCommandEntry {
-                id: format!("delegate-now:{}:{selection_ref}", agent_id.as_str()),
-                trigger: AgentCommandTrigger::Mention,
-                source_kind: AgentCommandSourceKind::Reference,
-                label: format!("Delegate now to {}", option.agent_label),
-                description: Some(runtime_reference_description(option)),
-                insertion_text: format!("@{} ", option.agent_label),
-                command_name: None,
-                provider_kind: Some(ProviderKind::Acp),
-                prompt_id: None,
-                skill_id: None,
-                reference_path: None,
-                selection_behavior: AgentCommandSelectionBehavior::Insert,
-                execution_behavior: AgentCommandExecutionBehavior::None,
-                destructive: false,
-                metadata: vec![
-                    ProviderBindingMetadata {
-                        key: COMPOSER_DELEGATE_NOW_KEY.to_string(),
-                        value: "1".to_string(),
-                    },
-                    ProviderBindingMetadata {
-                        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-                        value: agent_id.as_str().to_string(),
-                    },
-                    ProviderBindingMetadata {
-                        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-                        value: selection_ref,
-                    },
-                ],
-            };
-            if !query.is_empty() && !command_entry_matches_query(&action, &query) {
-                continue;
-            }
-            entries.push(action);
-            remaining -= 1;
         }
     }
     entries
@@ -555,9 +513,8 @@ mod tests {
         let mut unavailable = available.clone();
         unavailable.availability = RuntimeOptionAvailability::TemporarilyUnavailable;
         let commands = entries(&[unavailable, available.clone(), available], "", 50);
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 1);
         assert!(commands[0].id.starts_with("reference:agent:"));
-        assert!(commands[1].id.starts_with("delegate-now:"));
     }
 
     #[test]
@@ -585,14 +542,14 @@ mod tests {
             "",
             50,
         );
-        assert_eq!(commands.len(), 8);
+        assert_eq!(commands.len(), 4);
         assert_eq!(
             commands
                 .iter()
                 .map(|entry| &entry.id)
                 .collect::<HashSet<_>>()
                 .len(),
-            8
+            4
         );
         assert!(
             commands
@@ -602,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_mode_effort_and_direct_action_are_searchable_without_expanding_the_catalog() {
+    fn selected_mode_and_effort_are_searchable_without_expanding_the_catalog() {
         let mut configured = option("provider_main", "model-a");
         configured.selection.mode_id = Some("plan".into());
         configured.selection.reasoning_effort = Some("high".into());
@@ -615,14 +572,11 @@ mod tests {
             label: Some("High reasoning".into()),
         }];
         let commands = entries(std::slice::from_ref(&configured), "high reasoning", 50);
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 1);
         assert_eq!(
             commands[0].description.as_deref(),
             Some("provider_main · model-a · Plan · High reasoning")
         );
-        let actions = entries(std::slice::from_ref(&configured), "delegate now", 50);
-        assert_eq!(actions.len(), 1);
-        assert!(actions[0].id.starts_with("delegate-now:"));
         assert_eq!(entries(&[configured], "", 1).len(), 1);
     }
 
@@ -638,21 +592,11 @@ mod tests {
                 agent_option("opencode", "OpenCode", "provider_main", "model-b"),
             ],
             "",
-            6,
+            3,
         );
         // The first round covers every Agent; the second is what the bound cuts.
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 3);
         let labels: Vec<_> = commands.iter().map(|entry| entry.label.clone()).collect();
-        assert_eq!(
-            labels,
-            vec![
-                "@Codex",
-                "Delegate now to Codex",
-                "@Claude",
-                "Delegate now to Claude",
-                "@OpenCode",
-                "Delegate now to OpenCode",
-            ]
-        );
+        assert_eq!(labels, vec!["@Codex", "@Claude", "@OpenCode"]);
     }
 }

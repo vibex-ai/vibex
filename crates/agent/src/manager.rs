@@ -3468,6 +3468,11 @@ impl AgentManager {
         }
         Self::ensure_session_accepts_turn(&session)?;
         validate_transition(session.state, AgentSessionState::Running)?;
+        // A task the user delegated from this session lives in a child session,
+        // so the parent Agent never saw the tool response that created it. Put
+        // the active children in front of its next prompt; this is context, not
+        // a new turn, and it is bounded by the formatter below.
+        let team_context = team_awareness_context(&conn, &session.id);
         let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)?
             .ok_or_else(|| {
             VibexError::conflict(
@@ -3627,7 +3632,9 @@ impl AgentManager {
         // input only: the user timeline item above was written from
         // `request.text`, so the transcript, the auto title and search all keep
         // exactly what the user wrote.
-        let provider_turn_text = match request.prompt_context.as_deref() {
+        let prompt_context =
+            compose_prompt_context(team_context.as_deref(), request.prompt_context.as_deref());
+        let provider_turn_text = match prompt_context.as_deref() {
             Some(context) if !context.trim().is_empty() => {
                 format!("{context}\n\n{provider_turn_text}")
             }
@@ -6571,6 +6578,83 @@ fn bounded_text(value: &str, limit: usize) -> String {
     text.trim().to_string()
 }
 
+/// How much child-task context one parent prompt may carry.
+const MAX_TEAM_AWARENESS_TASKS: usize = 8;
+const MAX_TEAM_AWARENESS_TITLE_CHARS: usize = 120;
+const MAX_TEAM_AWARENESS_CHARS: usize = 2_400;
+
+/// The active child tasks a session's Agent should know about on its next run.
+///
+/// A task the user delegates from this session is created by a human service,
+/// not by the Agent's tool call, so the parent never sees the tool response.
+/// The collaboration card is visible to the reader but not to the model. This
+/// gathers the active children so the provider prompt can carry them without
+/// starting a turn of its own.
+fn team_awareness_context(conn: &DbConnection, session_id: &VibexSessionId) -> Option<String> {
+    let root = vibex_db::vibex_use_root_session(conn, session_id).ok()?;
+    let tasks = vibex_db::list_delegations_for_root(conn, &root, false).ok()?;
+    team_awareness_prompt(session_id, &tasks)
+}
+
+/// Formats the bounded child-task block. Kept separate from the query so the
+/// wording and the parent filter can be tested without a database.
+fn team_awareness_prompt(session_id: &VibexSessionId, tasks: &[AgentDelegation]) -> Option<String> {
+    let mut lines = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|task| task.parent_session_id == *session_id)
+    {
+        if task.phase().is_terminal() {
+            continue;
+        }
+        let Some(child) = task.child_session_id.as_ref() else {
+            continue;
+        };
+        let agent = task
+            .effective_agent_id
+            .as_ref()
+            .or(task.requested_agent_id.as_ref())
+            .map(AgentId::as_str)
+            .unwrap_or("another Agent");
+        let state = if task.blocked_on.is_some() {
+            "needs input".to_string()
+        } else {
+            task.phase().as_str().replace('_', " ")
+        };
+        lines.push(format!(
+            "- \"{}\" — {} ({}); child session {}; task {}",
+            bounded_text(&task.title, MAX_TEAM_AWARENESS_TITLE_CHARS),
+            agent,
+            state,
+            VibexUseRef::session(child).as_uri(),
+            VibexUseRef::task(&task.id).as_uri()
+        ));
+        if lines.len() == MAX_TEAM_AWARENESS_TASKS {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "This session has delegated work running in child Agent sessions. Some of it may have been started by the user rather than by you. This is context, not an instruction to act; read a child session before reporting its result.\n",
+    );
+    text.push_str(&lines.join("\n"));
+    Some(bounded_text(&text, MAX_TEAM_AWARENESS_CHARS))
+}
+
+/// Puts the team block ahead of the context the caller already composed.
+fn compose_prompt_context(team: Option<&str>, requested: Option<&str>) -> Option<String> {
+    let team = team.filter(|value| !value.trim().is_empty());
+    let requested = requested.filter(|value| !value.trim().is_empty());
+    match (team, requested) {
+        (Some(team), Some(requested)) => Some(format!("{team}\n\n{requested}")),
+        (Some(team), None) => Some(team.to_string()),
+        (None, Some(requested)) => Some(requested.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Builds the credential-free runtime summary shown for one task.
 ///
 /// Nothing here is a secret: the auth source is reported by kind, and a
@@ -7013,6 +7097,73 @@ mod tests {
         RuntimeLifecycleConfig, RuntimeLifecycleService, RuntimeSweepReport,
     };
     use crate::runtime_switch::RuntimeSwitchCoordinator;
+
+    #[test]
+    fn team_awareness_names_only_this_sessions_live_children() {
+        let parent = VibexSessionId::new();
+        let child = VibexSessionId::new();
+        let agent = AgentId::parse("codex").expect("a literal Agent id is valid");
+        let mut active = AgentDelegation::single_turn_legacy(
+            parent.clone(),
+            "active",
+            "Fix the parser",
+            "Fix the parser",
+            Some(agent.clone()),
+            AgentDelegationStatus::Running,
+            1,
+        );
+        active.child_session_id = Some(child.clone());
+        active.phase = DelegationTaskPhase::Active;
+
+        let mut sibling = AgentDelegation::single_turn_legacy(
+            VibexSessionId::new(),
+            "sibling",
+            "Another session's task",
+            "Another session's task",
+            Some(agent.clone()),
+            AgentDelegationStatus::Running,
+            2,
+        );
+        sibling.child_session_id = Some(VibexSessionId::new());
+        sibling.phase = DelegationTaskPhase::Active;
+
+        let mut finished = AgentDelegation::single_turn_legacy(
+            parent.clone(),
+            "finished",
+            "Finished task",
+            "Finished task",
+            Some(agent),
+            AgentDelegationStatus::Completed,
+            3,
+        );
+        finished.child_session_id = Some(VibexSessionId::new());
+        finished.phase = DelegationTaskPhase::Completed;
+
+        let text = team_awareness_prompt(&parent, &[active, sibling, finished])
+            .expect("the live child is named");
+        assert!(text.contains("Fix the parser"));
+        assert!(text.contains("codex"));
+        assert!(text.contains(child.as_str()));
+        assert!(!text.contains("Another session's task"));
+        assert!(!text.contains("Finished task"));
+    }
+
+    #[test]
+    fn team_awareness_sits_ahead_of_the_callers_own_context() {
+        assert_eq!(
+            compose_prompt_context(Some("team"), Some("requested")),
+            Some("team\n\nrequested".to_string())
+        );
+        assert_eq!(
+            compose_prompt_context(Some("  "), Some("requested")),
+            Some("requested".to_string())
+        );
+        assert_eq!(
+            compose_prompt_context(Some("team"), None),
+            Some("team".to_string())
+        );
+        assert_eq!(compose_prompt_context(None, None), None);
+    }
 
     struct TestProvider {
         kind: ProviderKind,

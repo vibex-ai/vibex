@@ -65,9 +65,10 @@ use gpui_component::{
     input::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
         Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
-        InlineTokenClickEvent, InlineTokenSpan, Input, InputContent, InputEvent, InputState,
-        MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
-        MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
+        InlineTokenClickEvent, InlineTokenContext, InlineTokenSpan, Input, InputContent,
+        InputEvent, InputState, InputToken, MoveDown as InputMoveDown, MoveLeft as InputMoveLeft,
+        MoveRight as InputMoveRight, MoveUp as InputMoveUp, Paste as InputPaste, Textarea,
+        TextareaState,
     },
     kbd::Kbd,
     marker::{Marker, MarkerIcon},
@@ -944,12 +945,19 @@ const COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT: f32 = 52.0;
 /// free text, so without a cap a long one takes the whole row: the preview
 /// collapses to nothing and the source badge is pushed out of the row.
 const COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION: f32 = 0.45;
+/// Room a delegation row gives the provider/model copy on its right edge.
+/// The copy is the useful half of a collaborator row, so it is allowed more
+/// width than a source badge and truncates instead of pushing the name out.
+const COMPOSER_SUGGESTION_PROVIDER_WIDTH: f32 = 220.0;
 const COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING: f32 = 8.0;
 /// Height of the quick-phrase footer that owns the manage action. The list
 /// gives up this much of the menu so the footer never squeezes the rows.
 const COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT: f32 = 30.0;
 const COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN: f32 = 12.0;
 const COMPOSER_SUGGESTION_MENU_TRIGGER_GAP: f32 = 6.0;
+/// Rows one discovery answer may offer. The menu draws a ten-row window and
+/// scrolls the rest, so a long collaborator catalogue stays reachable.
+const COMPOSER_SUGGESTION_MAX_ROWS: usize = 50;
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -1091,6 +1099,37 @@ enum ComposerSuggestionAction {
     Next,
     Apply,
     Dismiss,
+}
+
+/// Which half of a delegation row owns the next Enter.
+///
+/// A collaborator row offers both a reference and a direct delegation. The
+/// safe action is the default; the reader moves to the other one with the
+/// arrow keys or by clicking its segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ComposerDelegationAction {
+    #[default]
+    Reference,
+    Delegate,
+}
+
+impl ComposerDelegationAction {
+    /// The action one Left/Right press moves to, if this row owns the key.
+    ///
+    /// At the left edge (`Reference`) a Left press is not consumed, so the
+    /// caller can fall through to the tab strip; at the right edge (`Delegate`)
+    /// a Right press is not consumed either.
+    fn moved(self, forward: bool) -> Option<Self> {
+        match (forward, self) {
+            (true, Self::Reference) => Some(Self::Delegate),
+            (false, Self::Delegate) => Some(Self::Reference),
+            _ => None,
+        }
+    }
+
+    fn is_delegate(self) -> bool {
+        self == Self::Delegate
+    }
 }
 
 /// Which list of the composer popup is showing.
@@ -1399,6 +1438,44 @@ fn composer_suggestion_icon(entry: &AgentCommandEntry) -> IconName {
     command_source_icon(entry.source_kind)
 }
 
+/// Whether one suggestion row is an Agent reference or the direct delegation
+/// action beside it.
+///
+/// The metadata key is the current witness, but an older authority may only
+/// send the stable id shape, so both are read. A workspace file shares the
+/// `Reference` source kind and must not borrow the Agent treatment.
+fn composer_suggestion_is_agent(entry: &AgentCommandEntry) -> bool {
+    entry.source_kind == AgentCommandSourceKind::Reference
+        && (entry
+            .metadata
+            .iter()
+            .any(|metadata| metadata.key == vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY)
+            || entry.id.starts_with("reference:agent:")
+            || entry.id.starts_with("delegate-now:"))
+}
+
+/// Whether one suggestion row is the direct "delegate now" action.
+fn composer_suggestion_is_delegate_now(entry: &AgentCommandEntry) -> bool {
+    entry
+        .metadata
+        .iter()
+        .any(|metadata| metadata.key == vibex_desktop_runtime::COMPOSER_DELEGATE_NOW_KEY)
+        || entry.id.starts_with("delegate-now:")
+}
+
+/// The delegation rows the desktop offers.
+///
+/// A direct-action entry is the old wire shape from an authority that still
+/// sends one per collaborator. The row it belongs to now carries both actions,
+/// so the extra entry is dropped instead of drawn twice. Keeping the filter
+/// here also lets an older paired runtime work with the new row.
+fn delegation_suggestions(entries: Vec<AgentCommandEntry>) -> Vec<AgentCommandEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| !composer_suggestion_is_delegate_now(entry))
+        .collect()
+}
+
 /// One row of the composer's `/` popup, without the app-specific handlers the
 /// caller attaches.
 ///
@@ -1418,13 +1495,30 @@ fn composer_suggestion_row(
     entry: &AgentCommandEntry,
     selected: bool,
     phrase_layout: bool,
+    agent_identity: Option<&str>,
+    trailing: Option<AnyElement>,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let source_label = command_source_label(entry.source_kind);
+    let agent_row = agent_identity.is_some();
+    let agent_copy = agent_row
+        .then(|| composer_suggestion_description(entry))
+        .flatten();
     let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
-    let description = composer_suggestion_description(entry);
+    let description = if agent_row {
+        None
+    } else {
+        composer_suggestion_description(entry)
+    };
+    let source_label = agent_copy.clone().unwrap_or_else(|| {
+        if agent_row {
+            "Agent".to_string()
+        } else {
+            command_source_label(entry.source_kind).to_string()
+        }
+    });
     let aria_label = description
         .as_ref()
+        .or(agent_copy.as_ref())
         .map(|description| format!("{display_label}, {description}"))
         .unwrap_or_else(|| display_label.clone());
 
@@ -1434,7 +1528,6 @@ fn composer_suggestion_row(
         .debug_selector(|| "composer-suggestion-name".to_string())
         .min_w_0()
         .max_w(relative(COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION))
-        .flex_none()
         .truncate()
         .text_sm()
         .font_medium()
@@ -1476,8 +1569,16 @@ fn composer_suggestion_row(
             this.bg(theme.accent).text_color(theme.accent_foreground)
         })
         .hover(|this| this.bg(theme.accent).text_color(theme.accent_foreground))
-        .child(
-            div()
+        .child(match agent_identity {
+            Some(identity) => div()
+                .debug_selector(|| "composer-suggestion-agent-logo".to_string())
+                .size(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(runtime_agent_icon_sized(identity, px(18.0))),
+            None => div()
                 .size(px(22.0))
                 .flex_none()
                 .flex()
@@ -1488,7 +1589,7 @@ fn composer_suggestion_row(
                         .small()
                         .text_color(theme.muted_foreground),
                 ),
-        )
+        })
         .child(
             h_flex()
                 .min_w_0()
@@ -1497,12 +1598,22 @@ fn composer_suggestion_row(
                 .when_some(description, |this, description| this.child(description)),
         )
         .child(
-            div()
-                .debug_selector(|| "composer-suggestion-source".to_string())
+            h_flex()
+                .min_w_0()
                 .flex_none()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(source_label),
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .debug_selector(|| "composer-suggestion-source".to_string())
+                        .min_w_0()
+                        .max_w(px(COMPOSER_SUGGESTION_PROVIDER_WIDTH))
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(source_label),
+                )
+                .when_some(trailing, |this, trailing| this.child(trailing)),
         )
 }
 
@@ -4985,6 +5096,11 @@ pub struct SessionView {
     delegation_suggestions: Vec<AgentCommandEntry>,
     suggestion_tab: ComposerSuggestionTab,
     suggestion_selection: ComposerSuggestionSelection,
+    /// Which half of the selected delegation row owns Enter.
+    suggestion_delegation_action: ComposerDelegationAction,
+    /// Scrolls the popup's rows so a keyboard selection past the viewport
+    /// stays visible; the list can hold more than the ten-row window.
+    suggestion_scroll: ScrollHandle,
     suggestion_context: Option<ComposerSuggestionContext>,
     suggestion_loading: bool,
     suggestion_request_serial: u64,
@@ -5121,6 +5237,8 @@ impl SessionView {
             delegation_suggestions: Vec::new(),
             suggestion_tab: ComposerSuggestionTab::default(),
             suggestion_selection: ComposerSuggestionSelection::default(),
+            suggestion_delegation_action: ComposerDelegationAction::default(),
+            suggestion_scroll: ScrollHandle::new(),
             suggestion_context: None,
             suggestion_loading: false,
             suggestion_request_serial: 0,
@@ -28560,6 +28678,8 @@ impl VibexWorkbench {
         self.delegation_suggestions.clear();
         self.suggestion_tab = ComposerSuggestionTab::default();
         self.suggestion_selection.dismiss();
+        self.suggestion_delegation_action = ComposerDelegationAction::default();
+        self.suggestion_scroll.scroll_to_item(0);
         self.suggestion_context = None;
         self.suggestion_loading = false;
         self.suggestion_request_serial = self.suggestion_request_serial.saturating_add(1);
@@ -28717,7 +28837,7 @@ impl VibexWorkbench {
             workspace_id,
             trigger: Some(trigger_kind),
             query: Some(trigger.query),
-            limit: Some(10),
+            limit: Some(COMPOSER_SUGGESTION_MAX_ROWS as u32),
         };
         let context = ComposerSuggestionContext {
             target,
@@ -28745,6 +28865,8 @@ impl VibexWorkbench {
             self.delegation_suggestions.clear();
             self.suggestion_tab = ComposerSuggestionTab::default();
             self.suggestion_selection.dismiss();
+            self.suggestion_delegation_action = ComposerDelegationAction::default();
+            self.suggestion_scroll.scroll_to_item(0);
         }
         self.suggestion_loading = true;
 
@@ -28753,6 +28875,7 @@ impl VibexWorkbench {
             self.phrase_suggestions.clear();
             self.delegation_suggestions.clear();
             self.suggestion_selection.dismiss();
+            self.suggestion_delegation_action = ComposerDelegationAction::default();
             self.suggestion_loading = false;
             cx.notify();
             return;
@@ -28793,10 +28916,13 @@ impl VibexWorkbench {
                     };
                     this.suggestions = entries;
                     this.phrase_suggestions = quick_phrases;
-                    this.delegation_suggestions = delegation_entries;
+                    this.delegation_suggestions = delegation_suggestions(delegation_entries);
                     // Keep the selected row where it was across a query update;
                     // the active tab decides which list supplies the count.
                     this.reseat_suggestion_selection(false);
+                    if let Some(index) = this.suggestion_selection.selected_index {
+                        this.suggestion_scroll.scroll_to_item(index);
+                    }
                     cx.notify();
                 });
             },
@@ -28913,9 +29039,13 @@ impl VibexWorkbench {
     fn reseat_suggestion_selection(&mut self, reset: bool) {
         if reset {
             self.suggestion_selection.dismiss();
+            self.suggestion_delegation_action = ComposerDelegationAction::default();
         }
-        let rows = self.visible_suggestions().len().min(10);
+        let rows = self.visible_suggestions().len();
         self.suggestion_selection.replace_items(rows);
+        if reset {
+            self.suggestion_scroll.scroll_to_item(0);
+        }
     }
 
     /// `Left`/`Right` on an open `/` or `@` popup moves between its tabs.
@@ -28940,6 +29070,43 @@ impl VibexWorkbench {
         }
         self.suggestion_tab = next;
         self.reseat_suggestion_selection(true);
+        cx.notify();
+        true
+    }
+
+    /// Whether the selected row is a collaborator that can be delegated to.
+    fn selected_suggestion_is_agent(&self) -> bool {
+        let Some(index) = self.suggestion_selection.selected_index else {
+            return false;
+        };
+        self.visible_suggestions()
+            .get(index)
+            .is_some_and(|entry| delegation_target(entry).is_some())
+    }
+
+    /// `Left`/`Right` on a selected collaborator row moves between its
+    /// `Reference` and `Delegate` halves.
+    ///
+    /// The key is consumed only while it changes the half. At the left edge a
+    /// Left press falls through to the tab strip, and at the right edge a Right
+    /// press is left to the caret; that keeps the tab keys reachable from the
+    /// delegation panel without a second modifier.
+    fn capture_composer_delegation_action(
+        &mut self,
+        target: ComposerTarget,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if target != ComposerTarget::Session
+            || self.active_suggestion_tab() != ComposerSuggestionTab::Delegation
+            || !self.selected_suggestion_is_agent()
+        {
+            return false;
+        }
+        let Some(next) = self.suggestion_delegation_action.moved(forward) else {
+            return false;
+        };
+        self.suggestion_delegation_action = next;
         cx.notify();
         true
     }
@@ -29124,12 +29291,26 @@ impl VibexWorkbench {
         }
         match action {
             ComposerSuggestionAction::Previous => {
+                let before = self.suggestion_selection.selected_index;
                 self.suggestion_selection.select_previous();
+                if before != self.suggestion_selection.selected_index {
+                    self.suggestion_delegation_action = ComposerDelegationAction::default();
+                    if let Some(index) = self.suggestion_selection.selected_index {
+                        self.suggestion_scroll.scroll_to_item(index);
+                    }
+                }
                 cx.stop_propagation();
                 cx.notify();
             }
             ComposerSuggestionAction::Next => {
+                let before = self.suggestion_selection.selected_index;
                 self.suggestion_selection.select_next();
+                if before != self.suggestion_selection.selected_index {
+                    self.suggestion_delegation_action = ComposerDelegationAction::default();
+                    if let Some(index) = self.suggestion_selection.selected_index {
+                        self.suggestion_scroll.scroll_to_item(index);
+                    }
+                }
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -29137,7 +29318,15 @@ impl VibexWorkbench {
                 if let Some(index) = self.suggestion_selection.selected_index
                     && let Some(entry) = self.visible_suggestions().get(index).cloned()
                 {
-                    self.apply_suggestion(target, entry, window, cx);
+                    let choice = if target == ComposerTarget::Session
+                        && self.active_suggestion_tab() == ComposerSuggestionTab::Delegation
+                        && composer_suggestion_is_agent(&entry)
+                    {
+                        self.suggestion_delegation_action
+                    } else {
+                        ComposerDelegationAction::Reference
+                    };
+                    self.apply_suggestion(target, entry, choice, window, cx);
                 }
                 cx.stop_propagation();
             }
@@ -29159,10 +29348,11 @@ impl VibexWorkbench {
             .suggestion_context
             .as_ref()
             .is_some_and(|context| context.target == target)
-            && index < self.visible_suggestions().len().min(10)
+            && index < self.visible_suggestions().len()
             && self.suggestion_selection.selected_index != Some(index)
         {
             self.suggestion_selection.selected_index = Some(index);
+            self.suggestion_delegation_action = ComposerDelegationAction::default();
             cx.notify();
         }
     }
@@ -29171,6 +29361,7 @@ impl VibexWorkbench {
         &mut self,
         target: ComposerTarget,
         entry: AgentCommandEntry,
+        choice: ComposerDelegationAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -29184,8 +29375,20 @@ impl VibexWorkbench {
         };
         let range = character_offset_to_byte(&value, trigger.character_range.start)
             ..character_offset_to_byte(&value, trigger.character_range.end);
-        if let Some((agent_id, selection_ref)) = delegate_now_entry(&entry) {
-            // The direct entry does not insert anything: the draft becomes the
+        if target == ComposerTarget::NewSession && composer_suggestion_is_delegate_now(&entry) {
+            // A new-session page has no parent session to hang a child task
+            // from. The row is filtered out of that composer, but an older or
+            // stale popup must not be able to fire it either.
+            return;
+        }
+        if choice.is_delegate() {
+            if target != ComposerTarget::Session {
+                return;
+            }
+            let Some((agent_id, selection_ref)) = delegation_target(&entry) else {
+                return;
+            };
+            // The delegate half does not insert anything: the draft becomes the
             // task, minus the trigger the reader was typing. Removing the
             // trigger first is what keeps the task text exactly what they wrote.
             input.update(cx, |input, cx| {
@@ -55027,6 +55230,15 @@ impl VibexWorkbench {
                                                     ))
                                                     .child(
                                                         Textarea::new(&self.new_session_input)
+                                                            .token({
+                                                                let agents = self
+                                                                    .composer_agent_token_identities();
+                                                                move |context, _, cx| {
+                                                                    render_composer_inline_token(
+                                                                        context, &agents, cx,
+                                                                    )
+                                                                }
+                                                            })
                                                             .appearance(false)
                                                             .h_full()
                                                             .on_token_click(cx.listener(
@@ -58883,6 +59095,180 @@ impl VibexWorkbench {
             .find(|agent| agent.label == agent_label)
             .map(agent_brand_identity)
             .unwrap_or_else(|| agent_label.to_string())
+    }
+
+    /// The brand identity behind one delegation suggestion row.
+    ///
+    /// The row is not a generic `Reference`: it names a collaborator, so it
+    /// draws that Agent's own mark. The stable metadata key is preferred; the
+    /// id shape and the visible label are fallbacks for an authority that
+    /// predates the key.
+    fn composer_suggestion_agent_identity(&self, entry: &AgentCommandEntry) -> Option<String> {
+        if !composer_suggestion_is_agent(entry) {
+            return None;
+        }
+        let metadata_agent = entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY)
+            .and_then(|metadata| AgentId::parse(&metadata.value).ok());
+        let id_agent = entry
+            .id
+            .strip_prefix("reference:agent:")
+            .or_else(|| entry.id.strip_prefix("delegate-now:"))
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|id| AgentId::parse(id).ok());
+        if let Some(agent_id) = metadata_agent.or(id_agent)
+            && let Some(agent) = self
+                .agent_snapshots
+                .iter()
+                .find(|agent| agent.id == agent_id)
+        {
+            return Some(agent_brand_identity(agent));
+        }
+        let label = entry
+            .label
+            .trim_start_matches('@')
+            .strip_prefix("Delegate now to ")
+            .unwrap_or(entry.label.trim_start_matches('@'));
+        Some(self.agent_identity_for_label(label))
+    }
+
+    /// Agent label → brand identity, for the inline `@Agent` chips.
+    ///
+    /// The chip renderer is a `'static` closure on the textarea, so it cannot
+    /// read the live snapshot list; this is the small owned map it carries
+    /// instead. Labels are unique in the Agent catalogue.
+    fn composer_agent_token_identities(&self) -> Vec<(String, String)> {
+        self.agent_snapshots
+            .iter()
+            .map(|agent| (agent.label.clone(), agent_brand_identity(agent)))
+            .collect()
+    }
+
+    /// The `Mention | Delegate` half of one collaborator row.
+    ///
+    /// The row itself is the reference; this control owns the direct hand-off.
+    /// Only the selected row shows a filled half, so the list does not read as
+    /// a column of toggles. Clicking a half applies that half immediately and
+    /// stops the row's own click from also firing.
+    fn composer_delegation_action_control(
+        &self,
+        target: ComposerTarget,
+        entry: &AgentCommandEntry,
+        selected: bool,
+        active: ComposerDelegationAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = selected.then_some(active);
+        let active_bg = if selected {
+            cx.theme().accent_foreground.opacity(0.18)
+        } else {
+            cx.theme().muted
+        };
+        let active_fg = if selected {
+            cx.theme().accent_foreground
+        } else {
+            cx.theme().popover_foreground
+        };
+        let idle_fg = if selected {
+            cx.theme().accent_foreground.opacity(0.72)
+        } else {
+            cx.theme().muted_foreground
+        };
+        let border = if selected {
+            cx.theme().accent_foreground.opacity(0.28)
+        } else {
+            cx.theme().border.opacity(0.6)
+        };
+        let reference_entry = entry.clone();
+        let delegate_entry = entry.clone();
+        let reference = div()
+            .id(format!(
+                "composer-suggestion-delegation-reference:{}",
+                entry.id
+            ))
+            .debug_selector(|| "composer-suggestion-delegation-reference".to_string())
+            .flex()
+            .h(px(24.0))
+            .items_center()
+            .px_2()
+            .text_xs()
+            .cursor_pointer()
+            .when(
+                active == Some(ComposerDelegationAction::Reference),
+                |this| this.bg(active_bg).text_color(active_fg),
+            )
+            .when(
+                active != Some(ComposerDelegationAction::Reference),
+                |this| {
+                    this.text_color(idle_fg)
+                        .hover(|this| this.text_color(active_fg))
+                },
+            )
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.apply_suggestion(
+                    target,
+                    reference_entry.clone(),
+                    ComposerDelegationAction::Reference,
+                    window,
+                    cx,
+                );
+                cx.stop_propagation();
+            }))
+            .child(locale::text("Mention", "引用", "引用"));
+        let delegate = div()
+            .id(format!(
+                "composer-suggestion-delegation-delegate:{}",
+                entry.id
+            ))
+            .debug_selector(|| "composer-suggestion-delegation-delegate".to_string())
+            .flex()
+            .h(px(24.0))
+            .items_center()
+            .px_2()
+            .border_l_1()
+            .border_color(border)
+            .text_xs()
+            .cursor_pointer()
+            .when(active == Some(ComposerDelegationAction::Delegate), |this| {
+                this.bg(active_bg).text_color(active_fg)
+            })
+            .when(active != Some(ComposerDelegationAction::Delegate), |this| {
+                this.text_color(idle_fg)
+                    .hover(|this| this.text_color(active_fg))
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.apply_suggestion(
+                    target,
+                    delegate_entry.clone(),
+                    ComposerDelegationAction::Delegate,
+                    window,
+                    cx,
+                );
+                cx.stop_propagation();
+            }))
+            .child(locale::text("Delegate", "委派", "委派"));
+        h_flex()
+            .id(format!("composer-suggestion-delegation:{}", entry.id))
+            .debug_selector(|| "composer-suggestion-delegation".to_string())
+            .flex_none()
+            .items_center()
+            .overflow_hidden()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(border)
+            .child(reference)
+            .child(delegate)
+            .into_any_element()
     }
 
     fn render_agent_answer_metadata(
@@ -65460,23 +65846,49 @@ impl VibexWorkbench {
 
         let rows = visible_entries
             .iter()
-            .take(10)
+            .take(COMPOSER_SUGGESTION_MAX_ROWS)
             .cloned()
             .enumerate()
             .map(|(index, entry)| {
                 let selected = self.suggestion_selection.selected_index == Some(index);
                 let selected_entry = entry.clone();
-                composer_suggestion_row(target, &entry, selected, phrase_layout, cx.theme())
-                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                        window.prevent_default();
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                        this.hover_composer_suggestion(target, index, cx)
-                    }))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.apply_suggestion(target, selected_entry.clone(), window, cx)
-                    }))
+                let agent_identity = self.composer_suggestion_agent_identity(&entry);
+                let agent_row = target == ComposerTarget::Session
+                    && active_tab == ComposerSuggestionTab::Delegation
+                    && composer_suggestion_is_agent(&entry);
+                let trailing = agent_row.then(|| {
+                    self.composer_delegation_action_control(
+                        target,
+                        &entry,
+                        selected,
+                        self.suggestion_delegation_action,
+                        cx,
+                    )
+                });
+                let body_choice = if agent_row && selected {
+                    self.suggestion_delegation_action
+                } else {
+                    ComposerDelegationAction::Reference
+                };
+                composer_suggestion_row(
+                    target,
+                    &entry,
+                    selected,
+                    phrase_layout,
+                    agent_identity.as_deref(),
+                    trailing,
+                    cx.theme(),
+                )
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                    this.hover_composer_suggestion(target, index, cx)
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.apply_suggestion(target, selected_entry.clone(), body_choice, window, cx)
+                }))
             })
             .collect::<Vec<_>>();
 
@@ -65535,6 +65947,7 @@ impl VibexWorkbench {
         // the absolutely positioned shell or it will shrink the workbench.
         let scroll_content = v_flex()
             .id(format!("composer-command-menu-scroll:{}", target.id()))
+            .track_scroll(&self.suggestion_scroll)
             .w_full()
             .max_h(px(list_max_height))
             .p(px(4.0))
@@ -67583,6 +67996,14 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputMoveLeft, window, cx| {
+                                                    if this.capture_composer_delegation_action(
+                                                        ComposerTarget::Session,
+                                                        false,
+                                                        cx,
+                                                    ) {
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     if this.capture_composer_suggestion_tab(
                                                         ComposerTarget::Session,
                                                         false,
@@ -67601,6 +68022,14 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputMoveRight, window, cx| {
+                                                    if this.capture_composer_delegation_action(
+                                                        ComposerTarget::Session,
+                                                        true,
+                                                        cx,
+                                                    ) {
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     if this.capture_composer_suggestion_tab(
                                                         ComposerTarget::Session,
                                                         true,
@@ -67672,6 +68101,15 @@ impl VibexWorkbench {
                                             ))
                                             .child(
                                                 Textarea::new(&composer_input)
+                                                    .token({
+                                                        let agents = self
+                                                            .composer_agent_token_identities();
+                                                        move |context, _, cx| {
+                                                            render_composer_inline_token(
+                                                                context, &agents, cx,
+                                                            )
+                                                        }
+                                                    })
                                                     .appearance(false)
                                                     // Read-only, not disabled: a
                                                     // disabled input swallows
@@ -73498,6 +73936,84 @@ fn composer_entry_mention(entry: &AgentCommandEntry) -> Option<VibexUseMention> 
     None
 }
 
+/// The Agent identity behind one inline `@Agent` chip.
+///
+/// The label is the fast path; a restored mention also carries a
+/// `vibex://runtime-option/...` id, which survives a rename of the visible
+/// label. A file or session token returns `None` and keeps the stock chip.
+fn composer_token_agent_identity(
+    token: &InlineToken,
+    agents: &[(String, String)],
+) -> Option<String> {
+    let label = token.label().trim_start_matches('@').trim();
+    if let Some((_, identity)) = agents.iter().find(|(name, _)| name.trim() == label) {
+        return Some(identity.clone());
+    }
+    let mention = VibexUseMention::parse(token.id())?;
+    if !matches!(mention.kind, vibex_core::VibexUseMentionKind::Agent) {
+        return None;
+    }
+    let label = mention
+        .label
+        .as_deref()
+        .unwrap_or(label)
+        .trim_start_matches('@')
+        .trim();
+    agents
+        .iter()
+        .find(|(name, _)| name.trim() == label)
+        .map(|(_, identity)| identity.clone())
+}
+
+/// One inline token: the stock chip unless it names a collaborator, in which
+/// case the Agent's own mark leads the label.
+fn render_composer_inline_token(
+    context: &InlineTokenContext,
+    agents: &[(String, String)],
+    cx: &mut App,
+) -> AnyElement {
+    let Some(identity) = composer_token_agent_identity(context.token(), agents) else {
+        return InputToken::new(context).into_any_element();
+    };
+    let theme = cx.theme();
+    let selected = context.is_selected();
+    div()
+        .id("input-token")
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .h(context.line_height())
+        .max_w(context.available_width())
+        .rounded(theme.radius)
+        .border_1()
+        .bg(if selected {
+            theme.selection
+        } else {
+            theme.muted
+        })
+        .border_color(if selected {
+            theme.selection.alpha(1.)
+        } else {
+            theme.border
+        })
+        .text_color(theme.foreground)
+        .when(context.is_disabled(), |this| this.opacity(0.5))
+        .child(
+            div()
+                .flex_none()
+                .debug_selector(|| "composer-inline-agent-logo".to_string())
+                .child(agent_brand_icon(&identity, px(14.0), None)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(context.token().label().clone()),
+        )
+        .into_any_element()
+}
+
 /// The workspace path a composer token points at, when it points at a file.
 fn composer_token_reference_path(id: &str) -> Option<&str> {
     id.strip_prefix(COMPOSER_FILE_TOKEN_PREFIX)
@@ -73541,8 +74057,12 @@ fn replace_composer_trigger(
     input.set_selected_range(cursor..cursor, cx);
 }
 
-/// Reads the direct-delegation action out of one suggestion entry.
-fn delegate_now_entry(entry: &AgentCommandEntry) -> Option<(String, String)> {
+/// Reads the collaborator target out of one suggestion entry.
+///
+/// The same two metadata keys ride on a plain `@Agent` reference and on the
+/// legacy direct-action entry, so a row can offer the delegate half without a
+/// second wire row.
+fn delegation_target(entry: &AgentCommandEntry) -> Option<(String, String)> {
     let metadata = |key: &str| {
         entry
             .metadata
@@ -73550,7 +74070,6 @@ fn delegate_now_entry(entry: &AgentCommandEntry) -> Option<(String, String)> {
             .find(|metadata| metadata.key == key)
             .map(|metadata| metadata.value.clone())
     };
-    metadata(vibex_desktop_runtime::COMPOSER_DELEGATE_NOW_KEY)?;
     Some((
         metadata(vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY)?,
         metadata(vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY)?,
@@ -92791,6 +93310,7 @@ mod tests {
     struct ComposerSuggestionRowProbe {
         entry: AgentCommandEntry,
         phrase_layout: bool,
+        agent_identity: Option<String>,
         width: Pixels,
     }
 
@@ -92801,6 +93321,8 @@ mod tests {
                 &self.entry,
                 false,
                 self.phrase_layout,
+                self.agent_identity.as_deref(),
+                None,
                 cx.theme(),
             ))
         }
@@ -92810,22 +93332,29 @@ mod tests {
     /// written into a real editing state and read back.
     struct ComposerTokenProbe {
         input: Entity<TextareaState>,
+        agent_identity: Option<String>,
     }
 
     impl Render for ComposerTokenProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             // Narrow enough that the path a mention inserts cannot fit as text,
             // so the test can tell the chip's box from the run it replaced.
-            div()
-                .w(px(160.0))
-                .h(px(240.0))
-                .child(Textarea::new(&self.input).appearance(false).size_full())
+            let textarea = Textarea::new(&self.input).appearance(false).size_full();
+            let textarea = match self.agent_identity.clone() {
+                Some(identity) => textarea.token({
+                    let agents = vec![("Claude Code".to_string(), identity)];
+                    move |context, _, cx| render_composer_inline_token(context, &agents, cx)
+                }),
+                None => textarea,
+            };
+            div().w(px(160.0)).h(px(240.0)).child(textarea)
         }
     }
 
     /// A composer window holding `text`, and its input.
     fn composer_token_window<'a>(
         text: &str,
+        agent_identity: Option<&str>,
         cx: &'a mut TestAppContext,
     ) -> (Entity<TextareaState>, &'a mut VisualTestContext) {
         cx.update(gpui_component::init);
@@ -92837,6 +93366,7 @@ mod tests {
             *input_slot_for_view.borrow_mut() = Some(input.clone());
             let probe = cx.new(|_| ComposerTokenProbe {
                 input: input.clone(),
+                agent_identity: agent_identity.map(str::to_string),
             });
             gpui_component::Root::new(probe, window, cx)
         });
@@ -92854,7 +93384,7 @@ mod tests {
     /// backspace at its end deletes the whole thing instead of one character.
     #[gpui::test]
     fn an_accepted_reference_becomes_one_atomic_token(cx: &mut TestAppContext) {
-        let (input, cx) = composer_token_window("@app", cx);
+        let (input, cx) = composer_token_window("@app", None, cx);
         let mention = "@apps/desktop/src/app.rs";
         let mut entry = command_entry(
             AgentCommandSourceKind::Reference,
@@ -92941,10 +93471,47 @@ mod tests {
         );
     }
 
+    /// A collaborator chip leads with the Agent's mark, so the reader can tell
+    /// who the reference names without reading the label first.
+    #[gpui::test]
+    fn an_agent_reference_chip_draws_the_agents_mark(cx: &mut TestAppContext) {
+        let (input, cx) = composer_token_window("@Claude", Some("claude Claude Code"), cx);
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        entry.id = "reference:agent:claude:sha256:test".into();
+        entry.label = "@Claude Code".into();
+        entry.insertion_text = "@Claude Code ".into();
+        entry.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: "claude".into(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                value: vibex_core::VibexUseRef::runtime_option("test").as_uri(),
+            },
+        ];
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                replace_composer_trigger(input, &entry, 0..7, window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            cx.debug_bounds("composer-inline-agent-logo").is_some(),
+            "the chip should draw the Agent mark before its label"
+        );
+    }
+
     /// Prose is not a reference, so a quick phrase stays ordinary text.
     #[gpui::test]
     fn a_quick_phrase_inserts_prose_without_a_token(cx: &mut TestAppContext) {
-        let (input, cx) = composer_token_window("/rev", cx);
+        let (input, cx) = composer_token_window("/rev", None, cx);
         let body = "review the working tree and summarize every risky change";
         let mut entry = command_entry(
             AgentCommandSourceKind::Prompt,
@@ -93036,6 +93603,20 @@ mod tests {
             "a command token has nothing to open"
         );
         assert_eq!(composer_token_reference_path("skill:local:user:abc"), None);
+    }
+
+    #[test]
+    fn an_agent_token_keeps_the_brand_mark_it_was_inserted_with() {
+        let agents = vec![("Claude Code".to_string(), "claude Claude Code".to_string())];
+        let token = InlineToken::new("reference:agent:claude:sha256:test", "@Claude Code")
+            .with_label("@Claude Code");
+        assert_eq!(
+            composer_token_agent_identity(&token, &agents),
+            Some("claude Claude Code".to_string())
+        );
+
+        let file = InlineToken::new("reference:file:src/lib.rs", "@src/lib.rs");
+        assert_eq!(composer_token_agent_identity(&file, &agents), None);
     }
 
     /// Mirrors the active composer's height chain (workbench → composer root →
@@ -93947,6 +94528,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_direct_actions_are_dropped_from_the_collaborator_list() {
+        let mut reference = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        reference.id = "reference:agent:codex:sha256:test".into();
+        reference.label = "@Codex".into();
+        reference.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: "codex".into(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                value: "sha256:test".into(),
+            },
+        ];
+        let mut direct = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        direct.id = "delegate-now:codex:sha256:test".into();
+        direct.label = "Delegate now to Codex".into();
+        direct.metadata = vec![vibex_core::ProviderBindingMetadata {
+            key: vibex_desktop_runtime::COMPOSER_DELEGATE_NOW_KEY.to_string(),
+            value: "1".into(),
+        }];
+        let rows = delegation_suggestions(vec![reference, direct]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "reference:agent:codex:sha256:test");
+        assert_eq!(rows[0].label, "@Codex");
+        assert_eq!(
+            delegation_target(&rows[0]),
+            Some(("codex".to_string(), "sha256:test".to_string()))
+        );
+    }
+
+    #[test]
+    fn delegation_row_arrows_stop_at_the_two_halves() {
+        assert_eq!(
+            ComposerDelegationAction::Reference.moved(true),
+            Some(ComposerDelegationAction::Delegate)
+        );
+        assert_eq!(ComposerDelegationAction::Delegate.moved(true), None);
+        assert_eq!(
+            ComposerDelegationAction::Delegate.moved(false),
+            Some(ComposerDelegationAction::Reference)
+        );
+        assert_eq!(ComposerDelegationAction::Reference.moved(false), None);
+    }
+
+    /// A collaborator row is not a generic reference: its left column is the
+    /// Agent's own mark, and its right column is the provider/model copy that
+    /// used to sit under the name (or, before that, nowhere at all).
+    #[gpui::test]
+    fn agent_suggestion_rows_draw_the_agent_mark_and_move_provider_copy_right(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        entry.id = "reference:agent:codex:sha256:test".into();
+        entry.label = "@Codex".into();
+        entry.description = Some("oc · deepseek-v4.1-flash".into());
+
+        let (_, cx) = cx.add_window_view(|_, _| ComposerSuggestionRowProbe {
+            entry,
+            phrase_layout: false,
+            agent_identity: Some("codex Codex".into()),
+            width: px(420.0),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let row = cx
+            .debug_bounds("composer-suggestion-row")
+            .expect("the row is laid out");
+        let logo = cx
+            .debug_bounds("composer-suggestion-agent-logo")
+            .expect("the Agent mark is laid out");
+        let provider = cx
+            .debug_bounds("composer-suggestion-source")
+            .expect("the provider copy is laid out");
+        assert!(logo.left() >= row.left());
+        assert!(
+            provider.right() <= row.right() + px(0.5),
+            "provider copy {} escaped the row {}",
+            provider.right(),
+            row.right()
+        );
+        assert!(
+            cx.debug_bounds("composer-suggestion-description").is_none(),
+            "the provider copy must not be painted twice"
+        );
+    }
+
     /// Lays a single suggestion row out and reports the boxes it painted.
     ///
     /// The row builders register flat `debug_selector` keys, so this only makes
@@ -93965,6 +94650,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| ComposerSuggestionRowProbe {
             entry,
             phrase_layout,
+            agent_identity: None,
             width: px(width),
         });
         cx.run_until_parked();
@@ -103931,7 +104617,9 @@ mod tests {
             .find("if navigation_changed {\n            self.clear_sidebar_move_selection();")
             .expect("the multi-selection clear must be fenced on real navigation");
         let navigation = selection
-            .find("let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);")
+            .find(
+                "let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);",
+            )
             .expect("the navigation change should be resolved before it is used");
         assert!(navigation < clear);
         let snapshot = pending_open
@@ -110891,7 +111579,9 @@ mod tests {
         let source = include_str!("app.rs");
         let page = source
             .split_once("    fn apply_delegated_page(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Whether a session is known to own delegated children."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether a session is known to own delegated children.")
+            })
             .map(|(body, _)| body)
             .expect("the delegated page applier should remain inspectable");
 
