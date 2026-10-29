@@ -1515,6 +1515,10 @@ pub struct DeveloperUiState {
     /// restore.
     #[serde(default)]
     pub show_fps_monitor: bool,
+    /// Shows the SSH and WSL remote runtime entry points. Off until the feature
+    /// leaves beta; `VIBEX_SSH_REMOTE_RUNTIME` overrides it either way.
+    #[serde(default)]
+    pub ssh_remote_runtime: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3116,6 +3120,10 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("developer");
         let legacy: DesktopUiStateV1 = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.developer.show_fps_monitor);
+        assert!(
+            !legacy.developer.ssh_remote_runtime,
+            "the SSH remote runtime stays behind its flag for state files that predate it"
+        );
 
         // The HUD's placement used to be persisted as `fpsMonitorPlacement`.
         // The workbench places it now, and a state file that still carries the
@@ -3130,9 +3138,11 @@ mod tests {
 
         let mut state = DesktopUiStateV1::default();
         state.developer.show_fps_monitor = true;
+        state.developer.ssh_remote_runtime = true;
         state.normalize().unwrap();
         let serialized = serde_json::to_value(&state.developer).unwrap();
         assert_eq!(serialized["showFpsMonitor"], serde_json::json!(true));
+        assert_eq!(serialized["sshRemoteRuntime"], serde_json::json!(true));
         assert!(
             serialized.get("fpsMonitorPlacement").is_none(),
             "the HUD opens in the middle of the window, so no placement is stored"
@@ -3140,6 +3150,7 @@ mod tests {
         let round_trip: DesktopUiStateV1 =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(round_trip.developer.show_fps_monitor);
+        assert!(round_trip.developer.ssh_remote_runtime);
     }
 
     #[test]
