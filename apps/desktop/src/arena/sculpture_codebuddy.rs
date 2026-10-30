@@ -31,7 +31,7 @@ pub(super) fn codebuddy(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
     }
     // The head: wide and soft-cornered, as the logo's silhouette.
     let head = p3(0.0, 0.6, 13.2 - droop * 0.5);
-    rounded(mesh, head, p3(9.0, 6.0, 6.2), CLAY);
+    mesh.rounded(head, p3(9.0, 6.0, 6.2), CLAY);
     for side in [-1.0f32, 1.0] {
         // A big pointed ear, leaning out, with its lilac inside.
         let ear = |inset: f32| -> [(f32, f32); 4] {
@@ -48,7 +48,7 @@ pub(super) fn codebuddy(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
     }
     // The screen, set into the front of the head.
     let screen = head.add(p3(0.4, 5.4, -0.8));
-    rounded(mesh, screen, p3(7.0, 0.9, 4.4), SCREEN);
+    mesh.rounded(screen, p3(7.0, 0.9, 4.4), SCREEN);
     // The eyes: white pills slanted down to the right, the right one higher.
     let blink = if fall > 0.3 {
         0.35
@@ -95,21 +95,4 @@ pub(super) fn codebuddy(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
     let squash = boss.squash_scale();
     let bulge = 1.0 + 0.18 * boss.squash;
     mesh.deform(|p| p3(p.x * bulge, p.y * bulge, p.z * squash));
-}
-
-/// A soft-cornered block: a sphere pushed out toward its bounding box, so it
-/// reads as one smooth rounded shape rather than a cube or a ball.
-fn rounded(mesh: &mut Mesh, center: Point3, half: Point3, ramp: [u8; 5]) {
-    let first = mesh.faces.len();
-    mesh.sphere(Point3::default(), p3(1.0, 1.0, 1.0), 10, 20, |_| ramp);
-    let square = |v: f32| v.signum() * v.abs().powf(0.55);
-    for face in &mut mesh.faces[first..] {
-        for point in &mut face.points {
-            *point = center.add(p3(
-                square(point.x) * half.x,
-                square(point.y) * half.y,
-                square(point.z) * half.z,
-            ));
-        }
-    }
 }

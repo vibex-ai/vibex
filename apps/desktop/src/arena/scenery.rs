@@ -102,6 +102,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::Antigravity => plaza(&mut frame),
         Guardian::Devin => greenhouse(&mut frame),
         Guardian::Gemini => constellations(&mut frame),
+        Guardian::Hermes => marble(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -148,6 +149,38 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Hermes's hall: black and white marble in a checker, a winged staff inlaid
+/// in the middle.
+fn marble(frame: &mut Raster) {
+    const SQUARE: i32 = 40;
+    for row in -4..(HEIGHT as i32 / SQUARE + 1) {
+        for col in 0..(WIDTH as i32 / SQUARE + 1) {
+            let (x, y) = (col * SQUARE, row * SQUARE);
+            if (row + col).rem_euclid(2) == 0 {
+                frame.rect(x, y, SQUARE, SQUARE, FLOOR_SHADE);
+            }
+            let seed = hash(col, row + 3);
+            frame.line(
+                (x + (seed % 30) as i32, y + 4),
+                (x + 6 + (seed % 26) as i32, y + 30),
+                SEAM,
+            );
+        }
+    }
+    let c = pixel(CENTER);
+    frame.rect(c.0 - 2, c.1 - 34, 4, 68, WALL);
+    for side in [-1, 1] {
+        frame.polygon(
+            &[
+                (c.0, c.1 - 30),
+                (c.0 + side * 30, c.1 - 40),
+                (c.0 + side * 22, c.1 - 24),
+            ],
+            WALL,
+        );
+    }
+    frame.ellipse((c.0, c.1 - 36), (5, 5), WALL_LIGHT);
+}
 /// The constellation of the twins, charted on Gemini's terrace: two
 /// figures side by side, each star an offset from the middle.
 const GEMINI_STARS: [(f32, f32); 12] = [
@@ -1003,6 +1036,22 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                     let c = pixel(CENTER.plus(Vec2::new(*x, *y)));
                     frame.line((c.0 - 4, c.1), (c.0 + 4, c.1), WHITE);
                     frame.line((c.0, c.1 - 4), (c.0, c.1 + 4), WHITE);
+                }
+            }
+        }
+        Guardian::Hermes => {
+            // Feathers drift down through the hall.
+            for n in 0..7 {
+                let h = hash(n, 131);
+                let t = (time * 0.06 + n as f32 * 0.14).fract();
+                let p = Vec2::new(
+                    24.0 + (h % 128) as f32 + (t * 12.0).sin() * 4.0,
+                    12.0 + t * 92.0,
+                );
+                if map.inside(p, 2.0) {
+                    let (x, y) = pixel(p);
+                    frame.line((x - 2, y + 1), (x + 2, y - 1), WALL_LIGHT);
+                    frame.put(x, y, WHITE);
                 }
             }
         }

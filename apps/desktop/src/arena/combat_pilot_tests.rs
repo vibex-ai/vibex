@@ -265,6 +265,24 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Hermes => {
+            plan.goal = around(boss.position, 30.0);
+            let relic = boss.relic;
+            if boss.exposed > 0.0 {
+                if boss.exposed > arrival(boss.core) + 0.03 {
+                    plan.target = Some(boss.core);
+                }
+            } else if relic.state == crate::arena::guardian::RelicState::Flying {
+                // Lead the caduceus: it flies straight between ricochets.
+                let mut aim = relic.position;
+                for _ in 0..3 {
+                    aim = relic.position.plus(relic.velocity.scale(arrival(aim)));
+                }
+                if arena.map.inside(aim, 3.0) {
+                    plan.target = Some(aim);
+                }
+            }
+        }
         Guardian::Gemini => {
             if boss.detached && boss.exposed > 0.0 {
                 // After the twin that broke away, while it is bare.
@@ -639,6 +657,16 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
             score += 6.0;
         }
     }
+    if boss.guardian == Guardian::Hermes
+        && boss.relic.state == crate::arena::guardian::RelicState::Flying
+    {
+        let ahead = boss.relic.position.plus(boss.relic.velocity.scale(0.6));
+        if segment_distance(q, boss.relic.position, ahead)
+            < crate::arena::combat::HERMES_RELIC_RADIUS + PLAYER_RADIUS + 2.0
+        {
+            score += 10.0;
+        }
+    }
     if boss.guardian == Guardian::Devin {
         // The vines, where they are and where the turn is taking them.
         let mut ahead = *boss;
@@ -825,4 +853,8 @@ fn the_flower_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_twin_stars_are_winnable_through_ordinary_inputs() {
     winnable(Guardian::Gemini);
+}
+#[test]
+fn the_messenger_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Hermes);
 }

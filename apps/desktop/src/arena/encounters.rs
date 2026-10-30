@@ -30,6 +30,7 @@ impl Arena {
             Guardian::Antigravity => self.tick_antigravity(),
             Guardian::Devin => self.tick_devin(),
             Guardian::Gemini => self.tick_gemini(),
+            Guardian::Hermes => self.tick_hermes(),
         }
         self.boss.update_core();
     }
@@ -118,6 +119,8 @@ mod devin;
 mod gemini;
 #[path = "encounter_grok.rs"]
 pub(super) mod grok;
+#[path = "encounter_hermes.rs"]
+pub(super) mod hermes;
 #[path = "encounter_kimi.rs"]
 pub(super) mod kimi;
 #[path = "encounter_opencode.rs"]

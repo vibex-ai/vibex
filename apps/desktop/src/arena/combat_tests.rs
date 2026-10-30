@@ -94,6 +94,7 @@ fn agent_identity_selects_only_the_supported_guardians() {
         ("antigravity", Guardian::Antigravity),
         ("devin", Guardian::Devin),
         ("gemini", Guardian::Gemini),
+        ("hermes", Guardian::Hermes),
     ] {
         assert_eq!(Guardian::from_agent(id), Some(g));
     }

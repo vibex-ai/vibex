@@ -107,6 +107,7 @@ fn itinerary(guardian: Guardian) -> &'static [Leg] {
         Guardian::Antigravity => &antigravity::LEGS,
         Guardian::Devin => &devin::LEGS,
         Guardian::Gemini => &gemini::LEGS,
+        Guardian::Hermes => &hermes::LEGS,
     }
 }
 /// How long one guardian takes to walk its whole itinerary once.
@@ -468,6 +469,7 @@ impl Boss {
             Guardian::Antigravity => antigravity::lane(&mut boss, moment, phase),
             Guardian::Devin => devin::lane(&mut boss, legs, moment),
             Guardian::Gemini => gemini::lane(&mut boss, moment, phase),
+            Guardian::Hermes => hermes::lane(&mut boss, moment, phase),
         };
         boss.position = lane_point(place);
         if !matches!(guardian, Guardian::Pi | Guardian::ZCode | Guardian::Gemini) {
@@ -531,6 +533,7 @@ pub(super) fn entrance(guardian: Guardian) -> f32 {
         Guardian::Antigravity => antigravity::ENTRANCE,
         Guardian::Devin => devin::ENTRANCE,
         Guardian::Gemini => gemini::ENTRANCE,
+        Guardian::Hermes => hermes::ENTRANCE,
     }
 }
 /// How long a guardian takes to leave its lane when the turn ends.
@@ -551,6 +554,7 @@ pub(super) fn exit(guardian: Guardian) -> f32 {
         Guardian::Antigravity => antigravity::EXIT,
         Guardian::Devin => devin::EXIT,
         Guardian::Gemini => gemini::EXIT,
+        Guardian::Hermes => hermes::EXIT,
     }
 }
 
@@ -643,6 +647,7 @@ pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
         Guardian::Antigravity => antigravity::entering(&mut shot, a),
         Guardian::Devin => devin::entering(&mut shot, a),
         Guardian::Gemini => gemini::entering(&mut shot, a),
+        Guardian::Hermes => hermes::entering(&mut shot, a),
     }
     shot.boss = settled(shot.boss);
     shot
@@ -732,6 +737,7 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
         Guardian::Antigravity => antigravity::leaving(boss, a),
         Guardian::Devin => devin::leaving(boss, a),
         Guardian::Gemini => gemini::leaving(boss, a),
+        Guardian::Hermes => hermes::leaving(boss, a),
     };
     // A turn that ends mid-entrance leaves from where the entrance had got to;
     // that offset hands over to the exit's own as it goes.
@@ -757,6 +763,8 @@ mod devin;
 mod gemini;
 #[path = "gait_grok.rs"]
 mod grok;
+#[path = "gait_hermes.rs"]
+mod hermes;
 #[path = "gait_kimi.rs"]
 mod kimi;
 #[path = "gait_zcode.rs"]

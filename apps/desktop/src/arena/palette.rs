@@ -37,6 +37,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Devin => [0x0b2a2a, 0x134646, 0x1f6b66, 0x3f9b90, 0x8fd6c8],
         // Gemini wears the gradient inks; its body ramp only lights edges.
         Guardian::Gemini => [0x232a44, 0x4a5580, 0x7f8cc0, 0xbcc6ec, 0xf2f5ff],
+        // Her black hair, with a cold blue sheen where the light catches it.
+        Guardian::Hermes => [0x07070c, 0x111119, 0x1c1c29, 0x2d2d42, 0x4a4a6a],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -96,6 +98,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Gemini => [
             0x0d1026, 0x1f2550, 0x272e62, 0x313a75, 0x181d42, 0x2d356b, 0x5560a8,
         ],
+        // A marble hall in black and white, as the logo is drawn.
+        Guardian::Hermes => [
+            0x15151b, 0xb9bac2, 0xd2d3da, 0xe6e7ec, 0x9fa0aa, 0x6e6f7a, 0xf5f5f8,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -136,6 +142,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Devin => [0x4f7a00, 0xb6ff3b, 0xeaffc0],
         // The logo's red, for the bare twin's heart.
         Guardian::Gemini => [0xa52714, 0xea4335, 0xffc9c2],
+        // The badge glows violet when it is bare.
+        Guardian::Hermes => [0x6a2c9e, 0xc07bff, 0xf1e0ff],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -152,6 +160,15 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
     if guardian == Guardian::Cline {
         // Its eyes and bolts are a bright terminal cyan.
         for (ix, value) in [0x0f4a7a, 0x2fa8f0, 0xa8ecff].into_iter().enumerate() {
+            colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
+        }
+    }
+    if guardian == Guardian::Hermes {
+        // Pale skin and her white blouse and band; teal serpents.
+        colors[ink::WHITE as usize] = rgb(0xfff6ef).into();
+        colors[ink::IVORY as usize] = rgb(0xf2dccd).into();
+        colors[ink::DUST as usize] = rgb(0xc6a493).into();
+        for (ix, value) in [0x0f5c5c, 0x1f9a96, 0x7fe0d6].into_iter().enumerate() {
             colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
         }
     }

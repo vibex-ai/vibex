@@ -42,6 +42,7 @@ enum Actor {
     Blade,
     Bar(usize),
     Twin,
+    Relic,
     Shard(usize),
     Block(usize),
     Brazier,
@@ -62,6 +63,9 @@ fn guardian_parts(boss: &Boss) -> Vec<(f32, Actor)> {
             for (ix, position) in boss.hands.iter().enumerate() {
                 parts.push((position.y, Actor::Bar(ix)));
             }
+        }
+        Guardian::Hermes if boss.relic.state != crate::arena::guardian::RelicState::Held => {
+            parts.push((boss.relic.position.y, Actor::Relic));
         }
         Guardian::Gemini if boss.detached => {
             parts.push((boss.hands[0].y, Actor::Twin));
@@ -88,6 +92,7 @@ fn draw_part(frame: &mut Raster, boss: &Boss, part: Actor, time: f32, fallen: f3
         Actor::Blade => sculpture::blade(frame, boss),
         Actor::Bar(ix) => sculpture::zbar(frame, boss, ix, fallen),
         Actor::Twin => sculpture::twin(frame, boss),
+        Actor::Relic => sculpture::caduceus(frame, boss, time),
         Actor::Shard(ix) => sculpture::shard(frame, &boss.shards[ix], time),
         _ => {}
     }
@@ -114,6 +119,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::Antigravity => 40,
             Guardian::Devin => 46,
             Guardian::Gemini => 30,
+            Guardian::Hermes => 34,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
         frame.ellipse(
@@ -240,7 +246,8 @@ fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
         | Guardian::CodeBuddy
         | Guardian::Antigravity
         | Guardian::Devin
-        | Guardian::Gemini => {
+        | Guardian::Gemini
+        | Guardian::Hermes => {
             frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
             frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
             gleam(frame, (x, y), 4, WHITE);
@@ -283,6 +290,7 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = 
     (-57, -142, 58, 8),
     (-46, -94, 45, 5),
     (-46, -118, 73, 0),
+    (-53, -122, 54, 6),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -292,7 +300,7 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
 pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] = [
-    65, 96, 110, 85, 106, 82, 92, 95, 79, 117, 72, 130, 96, 81, 87,
+    65, 96, 110, 85, 106, 82, 92, 95, 79, 117, 72, 130, 96, 81, 87, 98,
 ];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]

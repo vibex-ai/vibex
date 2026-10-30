@@ -589,6 +589,14 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 frame.ellipse(c, (3, 3), WATER_LIGHT);
                 frame.rect(c.0 - 1, c.1 - 1, 2, 2, WHITE);
             }
+            ProjectileKind::Quill => {
+                // A white quill, its dark tip foremost.
+                let tail = p.position.minus(direction.scale(4.0));
+                let side = direction.perpendicular().scale(0.6);
+                frame.polygon(&[pixel(tail.plus(side)), c, pixel(tail.minus(side))], WHITE);
+                frame.line(pixel(tail), c, DUST);
+                frame.rect(c.0 - 1, c.1 - 1, 2, 2, OUTLINE);
+            }
             ProjectileKind::Spore => {
                 // A puff of spores, swelling and shrinking as it drifts.
                 let swell = if reduced {

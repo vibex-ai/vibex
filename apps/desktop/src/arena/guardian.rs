@@ -23,10 +23,11 @@ pub(super) enum Guardian {
     Antigravity,
     Devin,
     Gemini,
+    Hermes,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -42,6 +43,7 @@ impl Guardian {
         Self::Antigravity,
         Self::Devin,
         Self::Gemini,
+        Self::Hermes,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -60,6 +62,7 @@ impl Guardian {
             Self::Antigravity => "Antigravity",
             Self::Devin => "Devin",
             Self::Gemini => "Gemini",
+            Self::Hermes => "Hermes",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -79,6 +82,7 @@ impl Guardian {
             "antigravity" => Some(Self::Antigravity),
             "devin" => Some(Self::Devin),
             "gemini" | "gemini-cli" => Some(Self::Gemini),
+            "hermes" | "hermes-agent" => Some(Self::Hermes),
             _ => None,
         }
     }
@@ -104,6 +108,7 @@ impl Guardian {
             Self::Antigravity => "antigravity",
             Self::Devin => "devin",
             Self::Gemini => "gemini",
+            Self::Hermes => "hermes",
         }
     }
 }
@@ -167,6 +172,22 @@ pub(super) enum Attack {
     Inhale,
 }
 
+/// Where Hermes's caduceus is: in her keeping, in flight, or dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum RelicState {
+    #[default]
+    Held,
+    Flying,
+    Fallen,
+}
+/// Hermes's caduceus: the relic she sends ricocheting round the hall.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Relic {
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub state: RelicState,
+}
+
 /// Visual and collision scale of the spark after each split.
 pub(super) const SPARK_SCALE: [f32; 5] = [1.0, 0.8, 0.64, 0.52, 0.42];
 pub(super) const IDLE_LOOP: f32 = 36.0;
@@ -193,6 +214,8 @@ fn devin_roll(guardian: Guardian, s: f32) -> f32 {
         1.0
     }
 }
+/// The middle of Hermes's head above her ground anchor.
+pub(super) const HERMES_HEAD: f32 = 14.0;
 /// The middle of Gemini's star above its ground anchor.
 pub(super) const GEMINI_STAR: f32 = 10.0;
 /// The height of Devin's hub above its ground anchor, lying flat.
@@ -311,6 +334,8 @@ pub(super) struct Boss {
     pub torn: u8,
     /// Devin has an arrow in its mouth.
     pub swallowed: bool,
+    /// Hermes's caduceus.
+    pub relic: Relic,
 }
 
 impl Boss {
@@ -364,6 +389,7 @@ impl Boss {
             vines: [DEVIN_VINE; 3],
             torn: 0,
             swallowed: false,
+            relic: Relic::default(),
         };
         if guardian == Guardian::Cursor {
             // The cube stands corner-on, as the logo's hexagon.
@@ -397,6 +423,7 @@ impl Boss {
             Guardian::Antigravity => 9.0,
             Guardian::Devin => 9.0,
             Guardian::Gemini => 8.0,
+            Guardian::Hermes => 7.5,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -475,6 +502,7 @@ impl Boss {
             Guardian::Antigravity => (0.0, 0.0, ARCH_HEART),
             Guardian::Devin => (0.0, 0.0, DEVIN_HUB),
             Guardian::Gemini => (0.0, 0.0, GEMINI_STAR),
+            Guardian::Hermes => (0.0, 0.0, HERMES_HEAD - 4.0),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -533,6 +561,7 @@ impl Boss {
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
             Guardian::Devin => self.articulated(0.0, 0.0, DEVIN_HUB),
             Guardian::Gemini => self.articulated(0.0, 0.0, GEMINI_STAR),
+            Guardian::Hermes => self.articulated(0.0, 0.0, HERMES_HEAD - 3.0),
         }
     }
     pub fn update_core(&mut self) {
@@ -571,6 +600,8 @@ impl Boss {
                 self.hands[0].plus(Vec2::new(0.0, -self.hand_heights[0] - GEMINI_STAR))
             }
             Guardian::Gemini => self.articulated(0.0, 2.0, GEMINI_STAR),
+            // The "N" badge on her choker.
+            Guardian::Hermes => self.articulated(0.0, 2.3, 6.4),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -582,6 +613,7 @@ impl Boss {
             Guardian::Grok => self.articulated(4.0, 0.0, GROK_RING + 4.0),
             Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
             Guardian::CodeBuddy => self.articulated(0.0, 5.0, 14.0 * self.squash_scale()),
+            Guardian::Hermes => self.articulated(0.0, 5.0, HERMES_HEAD),
             _ => self.body_center(),
         }
     }
@@ -634,6 +666,7 @@ impl Boss {
             Guardian::Copilot => 6.5 + (time * 3.0).sin() * 0.6,
             Guardian::Antigravity => 4.0 + (time * 1.6).sin() * 0.8,
             Guardian::Gemini => 6.0 + (time * 2.0).sin() * 0.8,
+            Guardian::Hermes => 4.0 + (time * 1.8).sin() * 0.7,
             Guardian::Cline => 3.0 + (time * 2.4).sin() * 0.5,
             Guardian::Grok => 1.5 + (time * 1.7).sin() * 0.4,
             _ => 0.0,
@@ -941,6 +974,19 @@ impl Boss {
                     boss.hand_heights[0] = boss.height + 2.0 * apart;
                 }
             }
+            Guardian::Hermes => {
+                // A messenger's figure of eight round the home, swooping low
+                // where the loops cross and floating high at their ends, her
+                // hair streaming after her.
+                let (position, tangent) = route(guardian, t);
+                boss.position = position;
+                let heading = tangent.normalized();
+                let swoop = (t * 2.0).cos().abs();
+                boss.height = 2.5 + (1.0 - swoop) * 4.0;
+                boss.yaw = -heading.x * 0.35;
+                boss.pitch = -0.12 * swoop;
+                boss.bank = heading.y * 0.15;
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -1049,6 +1095,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::Hermes => (
+            s.sin() * 62.0,
+            (s * 2.0).sin() * 28.0,
+            s.cos() * 62.0,
+            (s * 2.0).cos() * 56.0,
         ),
         Guardian::Gemini => (
             s.sin() * 62.0 + (s * 2.0).sin() * 8.0,

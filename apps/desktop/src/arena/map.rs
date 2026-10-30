@@ -65,6 +65,12 @@ pub(super) const GATE_RADIUS: f32 = 10.0;
 /// ZCode's hall: three columns, shelter from the slab's breath and an end to
 /// its arms' lasers.
 const GATE_HALL: [Pillar; 3] = pillars([(52.0, 64.0), (88.0, 72.0), (124.0, 64.0)], 3.4, 12.0);
+/// Hermes's hall: four columns, for the caduceus to ricochet off.
+const MARBLE: [Pillar; 4] = pillars(
+    [(54.0, 42.0), (122.0, 42.0), (54.0, 78.0), (122.0, 78.0)],
+    3.2,
+    13.0,
+);
 /// Gemini's terrace: three stones to break a star-bolt's line.
 const TWINS: [Pillar; 3] = pillars([(50.0, 42.0), (126.0, 42.0), (88.0, 86.0)], 3.0, 10.0);
 /// Devin's greenhouse: two planters at the ends, out of its vines' reach.
@@ -168,6 +174,7 @@ impl Map {
             Guardian::Antigravity => &PLAZA,
             Guardian::Devin => &GREENHOUSE,
             Guardian::Gemini => &TWINS,
+            Guardian::Hermes => &MARBLE,
         }
     }
 
@@ -197,6 +204,7 @@ impl Map {
             Guardian::Cline => x < 71.0 - margin && y < 46.0 - margin,
             Guardian::ZCode => x < 72.0 - margin && y < 47.0 - margin,
             Guardian::Devin => x < 72.0 - margin && y < 46.0 - margin,
+            Guardian::Hermes => x < 72.0 - margin && y < 46.0 - margin,
             // A diamond-cornered terrace, like the star's points.
             Guardian::Gemini => {
                 x < 72.0 - margin && y < 47.0 - margin && x * 0.6 + y < 82.0 - margin * 1.17

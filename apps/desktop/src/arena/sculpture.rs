@@ -327,6 +327,22 @@ impl Mesh {
             );
         }
     }
+    /// A soft-cornered block: a sphere pushed out toward its bounding box, so
+    /// it reads as one smooth rounded shape rather than a cube or a ball.
+    fn rounded(&mut self, center: Point3, half: Point3, ramp: [u8; 5]) {
+        let first = self.faces.len();
+        self.sphere(Point3::default(), p3(1.0, 1.0, 1.0), 10, 20, |_| ramp);
+        let square = |v: f32| v.signum() * v.abs().powf(0.55);
+        for face in &mut self.faces[first..] {
+            for point in &mut face.points {
+                *point = center.add(p3(
+                    square(point.x) * half.x,
+                    square(point.y) * half.y,
+                    square(point.z) * half.z,
+                ));
+            }
+        }
+    }
     /// A flat outline in the (x, z) plane about `center`, extruded `depth`
     /// along y: the logo's parallelograms, given body.
     fn prism(&mut self, outline: [(f32, f32); 4], center: Point3, depth: f32, ramp: [u8; 5]) {
@@ -489,6 +505,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Antigravity => antigravity::antigravity(&mut mesh, boss, time, fall),
         Guardian::Devin => devin::devin(&mut mesh, boss, fall),
         Guardian::Gemini => gemini::gemini(&mut mesh, boss, fall),
+        Guardian::Hermes => hermes::hermes(&mut mesh, boss, time, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -535,6 +552,8 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::CodeBuddy => (pitch, bank + fall * 1.2, boss.height, boss.yaw),
         // A beaten arch loses its lift and settles, splaying its feet.
         Guardian::Antigravity => (pitch, bank, boss.height * (1.0 - fall), boss.yaw),
+        // A beaten bust sinks and bows its head.
+        Guardian::Hermes => (pitch - fall * 0.5, bank, boss.height - fall * 3.0, boss.yaw),
         _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
@@ -1113,7 +1132,10 @@ mod gemini;
 pub(super) use gemini::twin;
 #[path = "sculpture_grok.rs"]
 mod grok;
+#[path = "sculpture_hermes.rs"]
+mod hermes;
 pub(super) use grok::blade;
+pub(super) use hermes::caduceus;
 #[path = "sculpture_kimi.rs"]
 mod kimi;
 #[path = "sculpture_zcode.rs"]

@@ -8,6 +8,7 @@ pub(super) use encounters::codebuddy::BUG_RADIUS as CODEBUDDY_BUG_RADIUS;
 pub(super) use encounters::grok::{
     BLADE_RADIUS as GROK_BLADE_RADIUS, FRENZY_RADIUS as GROK_FRENZY_RADIUS,
 };
+pub(super) use encounters::hermes::RELIC_RADIUS as HERMES_RELIC_RADIUS;
 use std::f32::consts::{PI, TAU};
 
 pub(super) const STEP: f32 = 1.0 / 120.0;
@@ -70,6 +71,8 @@ pub(super) struct Player {
     pub sprinting: bool,
     pub slowed: bool,
     pub knockback: Vec2,
+    /// Seconds the archer is left reeling, unable to move, draw or recall.
+    pub stunned: f32,
     roll_direction: Vec2,
     buffered_roll: Option<(Vec2, f32)>,
     dust: f32,
@@ -89,6 +92,7 @@ impl Player {
             sprinting: false,
             slowed: false,
             knockback: Vec2::default(),
+            stunned: 0.0,
             roll_direction: Vec2::default(),
             buffered_roll: None,
             dust: 0.0,
@@ -119,6 +123,8 @@ pub(super) enum ProjectileKind {
     Mote,
     /// A puff of Devin's spores that drifts after the archer, lethal to touch.
     Spore,
+    /// A quill dart loosed by Hermes, fast and lethal.
+    Quill,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Projectile {
@@ -405,6 +411,7 @@ impl Arena {
         let from = self.player.position;
         self.move_player(controls);
         let recalling = self.player.roll_remaining <= 0.0
+            && self.player.stunned <= 0.0
             && self.arrow.state != ArrowState::Ready
             && (controls.recall || controls.shoot);
         self.tick_boss();
@@ -472,6 +479,11 @@ impl Arena {
         self.player.moving = false;
         self.player.sprinting = false;
         let from = self.player.position;
+        if self.player.stunned > 0.0 {
+            self.player.stunned = (self.player.stunned - STEP).max(0.0);
+            self.player.charge = 0.0;
+            return;
+        }
         self.player.swimming =
             self.boss.guardian == Guardian::DeepSeek && !self.map.on_island(from);
         self.player.slowed = self.hazards.iter().any(|h| {
@@ -601,6 +613,7 @@ impl Arena {
         boss.vines = [super::guardian::DEVIN_VINE; 3];
         boss.torn = 0;
         boss.swallowed = false;
+        boss.relic = super::guardian::Relic::default();
         boss.flash = 0.0;
         boss.generation = 0;
         boss.shards = [Shard::default(); 4];
@@ -670,7 +683,7 @@ impl Arena {
         }
     }
     pub fn roll(&mut self, movement: Vec2) {
-        if self.phase != Phase::Battle || self.player.swimming {
+        if self.phase != Phase::Battle || self.player.swimming || self.player.stunned > 0.0 {
             return;
         }
         if self.player.roll_cooldown > 0.0 || self.player.knocked() {
@@ -701,7 +714,7 @@ impl Arena {
         match self.boss.guardian {
             Guardian::Claude => self.boss.generation >= 4,
             Guardian::Codex => !self.boss.cube_shielded(),
-            Guardian::Pi | Guardian::DeepSeek | Guardian::CodeBuddy => true,
+            Guardian::Pi | Guardian::DeepSeek | Guardian::CodeBuddy | Guardian::Hermes => true,
             // The blue square is on the tile's face.
             Guardian::Kimi => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
@@ -803,6 +816,7 @@ impl Arena {
             Knot,
             Mouth,
             Vine(usize),
+            Relic,
         }
         let mut contact: Option<(f32, Contact)> = self
             .map
@@ -890,6 +904,15 @@ impl Arena {
                 }
             }
         }
+        if !returning
+            && boss.guardian == Guardian::Hermes
+            && boss.relic.state == super::guardian::RelicState::Flying
+        {
+            consider(
+                circle_hit(boss.relic.position, from, to, HERMES_RELIC_RADIUS),
+                Contact::Relic,
+            );
+        }
         if !returning && boss.guardian == Guardian::Devin {
             // An open mouth swallows the arrow; a vine loses a segment to it.
             if boss.attack == Attack::Inhale && boss.state == BossState::Windup {
@@ -954,6 +977,11 @@ impl Arena {
                 }
                 Contact::Mouth => {
                     self.swallow();
+                    return;
+                }
+                Contact::Relic => {
+                    self.lodge(position);
+                    self.strike_relic();
                     return;
                 }
                 Contact::Vine(arm) => {
@@ -1065,6 +1093,7 @@ impl Arena {
                 ProjectileKind::Yarn => 1.8,
                 ProjectileKind::Mote => 1.4,
                 ProjectileKind::Spore => 2.0,
+                ProjectileKind::Quill => 1.1,
             };
             if segment_distance(
                 Vec2::default(),
@@ -1078,7 +1107,8 @@ impl Arena {
                     | ProjectileKind::Bolt
                     | ProjectileKind::Yarn
                     | ProjectileKind::Mote
-                    | ProjectileKind::Spore => hit = true,
+                    | ProjectileKind::Spore
+                    | ProjectileKind::Quill => hit = true,
                     ProjectileKind::Orb if !shielded => {
                         pushes.push(projectile.velocity.normalized());
                     }
