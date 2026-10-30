@@ -15,6 +15,10 @@ const PROVIDER_TABS: [ProviderDetailTab; 4] = [
     ProviderDetailTab::Advanced,
 ];
 
+/// A model row, and the settings that open under it, in the virtual list.
+const MODEL_ROW_HEIGHT: f32 = 52.0;
+const MODEL_EDITOR_HEIGHT: f32 = 430.0;
+
 fn provider_tab_label(tab: ProviderDetailTab) -> &'static str {
     match tab {
         ProviderDetailTab::Keys => management_locale_text("Keys", "Key", "Key"),
@@ -972,6 +976,24 @@ impl ManagementCenter {
                     .on_click(set_all(false)),
                 )
             });
+        // Fetching is the first thing a Provider with no models needs, so it
+        // is a visible command, as it is in the Agent dialog, not a menu item.
+        let fetching = matches!(
+            &self.mutation,
+            Some(ManagementMutation::ProviderProbe(action))
+                if action == &format!("shared-models:{}", profile.id.as_str())
+        );
+        let fetch = Button::new("management-provider-models-fetch")
+            .small()
+            .outline()
+            .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+            .label(management_fetch_models_label())
+            .loading(fetching)
+            .disabled(self.mutation.is_some())
+            .on_click(cx.listener({
+                let id = profile.id.clone();
+                move |this, _, _, cx| this.refresh_shared_provider_models(id.clone(), cx)
+            }));
         let toolbar = h_flex()
             .w_full()
             .items_center()
@@ -986,7 +1008,35 @@ impl ManagementCenter {
                     )),
             )
             .child(filter)
+            .child(fetch)
             .child(bulk);
+        // A model the endpoint does not list is added by id, the same
+        // "Custom model" row the Agent dialog's picker ends with.
+        let add_row = h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .pt_1()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.provider_model_add_input).small().w_full()),
+            )
+            .child(
+                Button::new("management-provider-model-add")
+                    .small()
+                    .secondary()
+                    .icon(IconName::Plus)
+                    .label(management_add_label())
+                    .disabled(self.mutation.is_some())
+                    .on_click(cx.listener({
+                        let id = profile.id.clone();
+                        move |this, _, window, cx| {
+                            this.add_shared_provider_model(id.clone(), window, cx)
+                        }
+                    })),
+            );
         let matched = profile
             .configured_models
             .iter()
@@ -1009,9 +1059,9 @@ impl ManagementCenter {
             ws_empty_line(
                 if profile.configured_models.is_empty() {
                     management_locale_text(
-                        "No models yet. Refresh from the Provider, or add them in Settings.",
-                        "还没有模型。可从供应商刷新，或在设置中添加。",
-                        "還沒有模型。可從供應商重新整理，或在設定中新增。",
+                        "No models yet. Fetch the Provider's list, or add a model id below.",
+                        "还没有模型。可以拉取供应商的模型列表，也可以在下方直接添加模型 ID。",
+                        "還沒有模型。可以擷取供應商的模型清單，也可以在下方直接新增模型 ID。",
                     )
                 } else {
                     management_locale_text(
@@ -1031,16 +1081,20 @@ impl ManagementCenter {
                     .iter()
                     .map(|model| {
                         let height = if expanded.as_deref() == Some(model.id.as_str()) {
-                            340.0
+                            MODEL_ROW_HEIGHT + MODEL_EDITOR_HEIGHT
                         } else {
-                            52.0
+                            MODEL_ROW_HEIGHT
                         };
                         gpui_size(px(0.0), px(height))
                     })
                     .collect::<Vec<GpuiSize<gpui::Pixels>>>(),
             );
-            let height = (models_rc.len() as f32 * 52.0).clamp(160.0, 560.0)
-                + if expanded.is_some() { 288.0 } else { 0.0 };
+            let height = (models_rc.len() as f32 * MODEL_ROW_HEIGHT).clamp(160.0, 560.0)
+                + if expanded.is_some() {
+                    MODEL_EDITOR_HEIGHT
+                } else {
+                    0.0
+                };
             div()
                 .w_full()
                 .h(px(height))
@@ -1088,6 +1142,7 @@ impl ManagementCenter {
                 .gap_3()
                 .child(toolbar)
                 .child(content)
+                .child(add_row)
                 .into_any_element(),
             cx,
         )])

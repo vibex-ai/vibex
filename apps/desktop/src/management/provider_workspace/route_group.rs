@@ -1,29 +1,48 @@
-//! One route group's page, and the page that authors one.
+//! One route group's page, the page that authors one, and the form both
+//! share with the Agent dialog.
 //!
 //! A route group is one model name that tries several Provider models in an
-//! order. Its page leads with that order: who answers first, what happens on
-//! failure, and which Agents ask for it.
+//! order. Its page reads like a Provider's: an identity header with the
+//! switch that turns it on, then tabs — Overview (who answers and who asks),
+//! Members (the order, edited in place), Settings (how it picks, its limits,
+//! whether pickers list it) and Traffic. The new-group page and the Agent
+//! dialog draw the very same sections, so a setting found in one entry is
+//! found, worded the same, in every other.
 
 use super::*;
 
-const ROUTE_TABS: [RouteGroupDetailTab; 3] = [
+const ROUTE_TABS: [RouteGroupDetailTab; 4] = [
     RouteGroupDetailTab::Overview,
     RouteGroupDetailTab::Members,
+    RouteGroupDetailTab::Settings,
     RouteGroupDetailTab::Traffic,
 ];
 
 fn route_tab_label(tab: RouteGroupDetailTab) -> &'static str {
     match tab {
         RouteGroupDetailTab::Members => management_locale_text("Members", "成员", "成員"),
+        RouteGroupDetailTab::Settings => management_locale_text("Settings", "设置", "設定"),
         RouteGroupDetailTab::Traffic => management_locale_text("Traffic", "流量", "流量"),
         _ => management_locale_text("Overview", "概览", "概覽"),
     }
 }
 
+/// Where the shared route-group form is drawn; only its closing commands
+/// differ between the three.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::management) enum RouteGroupFormScope {
+    /// The Provider page's new-group page.
+    Page,
+    /// The Agent's route-group dialog.
+    Dialog,
+    /// A saved group's Members or Settings tab.
+    Detail,
+}
+
 impl ManagementCenter {
     pub(super) fn render_workspace_route_group(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rows = shared_route_group_rows(&self.model_routes, &self.agent_model_route_bindings);
@@ -43,8 +62,15 @@ impl ManagementCenter {
         };
         let tab = self.route_group_detail_tab;
         let selected = ROUTE_TABS.iter().position(|item| *item == tab).unwrap_or(0);
+        if matches!(
+            tab,
+            RouteGroupDetailTab::Members | RouteGroupDetailTab::Settings
+        ) {
+            self.ensure_workspace_route_draft(&row.route, window, cx);
+        }
         let body = match tab {
-            RouteGroupDetailTab::Members => self.render_workspace_route_members(&row.route, cx),
+            RouteGroupDetailTab::Members => self.render_workspace_route_members(cx),
+            RouteGroupDetailTab::Settings => self.render_workspace_route_settings(cx),
             RouteGroupDetailTab::Traffic => self.render_workspace_route_traffic(&row.route, cx),
             _ => self.render_workspace_route_overview(&row, cx),
         };
@@ -70,6 +96,32 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// Loads the group on screen into the shared draft, the way a Provider's
+    /// Settings form loads its record: on first view, and again whenever the
+    /// record's revision moves underneath it.
+    fn ensure_workspace_route_draft(
+        &mut self,
+        route: &vibex_core::ModelRoute,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A dialog that is authoring a group owns the draft until it closes.
+        if self.route_group_editor_open {
+            return;
+        }
+        if self.route_group_editing_id.as_ref() == Some(&route.id)
+            && self.workspace_route_edit_revision == Some(route.revision)
+        {
+            return;
+        }
+        if self.load_route_group_draft(route.id.clone(), false, window, cx) {
+            // Loading prepares the dialog's draft; on the page nothing is
+            // presented, so the dialog flag must not stay raised.
+            self.route_group_editor_open = false;
+            self.workspace_route_edit_revision = Some(route.revision);
+        }
+    }
+
     fn render_workspace_route_header(
         &self,
         row: &SharedRouteGroupRow,
@@ -77,9 +129,10 @@ impl ManagementCenter {
     ) -> AnyElement {
         let route = &row.route;
         let pending = self.mutation.is_some();
+        let enabled = route.status == vibex_core::RouteStatus::Enabled;
         let enabled_members = route.members.iter().filter(|member| member.enabled).count();
         let mut badges = Vec::new();
-        if route.status != vibex_core::RouteStatus::Enabled {
+        if !enabled {
             badges.push(
                 Tag::color(ColorName::Neutral)
                     .xsmall()
@@ -111,7 +164,6 @@ impl ManagementCenter {
             ],
             cx,
         );
-        let route_id = route.id.clone();
         let center = cx.weak_entity();
         let menu_route = route.id.clone();
         let more = Button::new("management-route-group-more")
@@ -166,18 +218,22 @@ impl ManagementCenter {
                     .on_click(delete),
                 )
             });
+        // The same pair of commands a Provider's header holds: the switch
+        // that says whether the record answers at all, then the overflow.
         let actions = h_flex()
             .items_center()
             .gap_2()
             .child(
-                Button::new("management-route-group-page-edit")
+                Switch::new("management-route-group-enabled")
                     .small()
-                    .outline()
-                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
-                    .label(management_locale_text("Edit…", "编辑…", "編輯…"))
+                    .checked(enabled)
                     .disabled(pending)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.edit_route_group_on_page(route_id.clone(), window, cx)
+                    .label(management_locale_text("Enabled", "启用", "啟用"))
+                    .on_click(cx.listener({
+                        let id = route.id.clone();
+                        move |this, checked, _, cx| {
+                            this.set_route_group_enabled(id.clone(), *checked, cx)
+                        }
                     })),
             )
             .child(more)
@@ -193,6 +249,59 @@ impl ManagementCenter {
             facts,
             actions,
         )
+    }
+
+    /// Turns a saved group on or off without touching anything else on it.
+    fn set_route_group_enabled(
+        &mut self,
+        route_id: vibex_core::ModelRouteId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let Some(mut route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        let expected_revision = route.revision;
+        route.status = if enabled {
+            vibex_core::RouteStatus::Enabled
+        } else {
+            vibex_core::RouteStatus::Disabled
+        };
+        self.error = None;
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     fn render_workspace_route_overview(
@@ -233,6 +342,23 @@ impl ManagementCenter {
                 cx,
             ),
             management_stat_tile(
+                management_locale_text("Strategy", "策略", "策略"),
+                management_route_strategy_label(route.strategy),
+                match route.failover {
+                    vibex_core::GatewayFailover::Auto => management_locale_text(
+                        "Switch on failure",
+                        "失败时自动切换",
+                        "失敗時自動切換",
+                    ),
+                    vibex_core::GatewayFailover::Ask => {
+                        management_locale_text("Ask on failure", "失败时先询问", "失敗時先詢問")
+                    }
+                }
+                .to_string(),
+                None,
+                cx,
+            ),
+            management_stat_tile(
                 "Agent",
                 row.agents.len().to_string(),
                 management_locale_text("Using this group", "正在使用", "正在使用").to_string(),
@@ -241,8 +367,7 @@ impl ManagementCenter {
             ),
         ]);
 
-        // The order, as a short read-only pipeline: the full table is the
-        // Members tab.
+        // The order, as a short read-only pipeline: the Members tab edits it.
         let mut order = v_flex().w_full().min_w_0();
         for (index, member) in route.members.iter().enumerate() {
             order = order.child(self.render_workspace_route_member_row(index, member, cx));
@@ -250,9 +375,9 @@ impl ManagementCenter {
         if route.members.is_empty() {
             order = order.child(ws_empty_line(
                 management_locale_text(
-                    "No member yet. Edit the group to add Provider models.",
-                    "还没有成员。编辑路由组即可添加供应商模型。",
-                    "還沒有成員。編輯路由組即可新增供應商模型。",
+                    "No member yet. Add Provider models on the Members tab.",
+                    "还没有成员。可在“成员”标签页添加供应商模型。",
+                    "還沒有成員。可在「成員」分頁新增供應商模型。",
                 ),
                 cx,
             ));
@@ -330,110 +455,6 @@ impl ManagementCenter {
             cx,
         );
 
-        // Policy, read-only; Edit changes it.
-        let pin = match route.pin {
-            vibex_core::GatewayPinScope::Off => {
-                management_locale_text("Chosen per request", "每次请求重新选择", "每次請求重新選擇")
-            }
-            vibex_core::GatewayPinScope::Conversation => management_locale_text(
-                "Kept for the whole conversation",
-                "整个对话保持同一个",
-                "整個對話保持同一個",
-            ),
-        };
-        let failover = match route.failover {
-            vibex_core::GatewayFailover::Auto => {
-                management_locale_text("Switch automatically", "自动切换", "自動切換")
-            }
-            vibex_core::GatewayFailover::Ask => {
-                management_locale_text("Ask first", "先询问", "先詢問")
-            }
-        };
-        let value = |text: String| {
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(text)
-                .into_any_element()
-        };
-        let policy = management_settings_list(
-            vec![
-                management_setting_row(
-                    management_locale_text("Strategy", "策略", "策略"),
-                    management_locale_text(
-                        "How the next member is chosen.",
-                        "如何选择下一个成员。",
-                        "如何選擇下一個成員。",
-                    ),
-                    value(management_route_strategy_label(route.strategy)),
-                    cx,
-                ),
-                management_setting_row(
-                    management_locale_text("Session pinning", "会话固定", "會話固定"),
-                    management_locale_text(
-                        "Vendors cache a prompt per account; moving a conversation loses it.",
-                        "厂商按账号缓存提示词，换成员会丢掉缓存。",
-                        "廠商按帳號快取提示詞，換成員會遺失快取。",
-                    ),
-                    value(pin.to_string()),
-                    cx,
-                ),
-                management_setting_row(
-                    management_locale_text("On failure", "失败时", "失敗時"),
-                    management_locale_text(
-                        "What happens when the current member stops answering.",
-                        "当前成员无法响应时的处理方式。",
-                        "目前成員無法回應時的處理方式。",
-                    ),
-                    value(failover.to_string()),
-                    cx,
-                ),
-                management_setting_row(
-                    management_locale_text("First token timeout", "首 Token 超时", "首 Token 逾時"),
-                    management_locale_text(
-                        "How long to wait before moving on.",
-                        "等待多久后切换到下一个成员。",
-                        "等待多久後切換到下一個成員。",
-                    ),
-                    value(
-                        route
-                            .first_token_timeout_ms
-                            .map(|ms| format!("{} s", (ms / 1000).max(1)))
-                            .unwrap_or_else(|| {
-                                management_locale_text("Gateway default", "网关默认", "閘道預設")
-                                    .to_string()
-                            }),
-                    ),
-                    cx,
-                ),
-                management_setting_row(
-                    management_locale_text("Token ceiling", "Token 上限", "Token 上限"),
-                    management_locale_text(
-                        "Counted locally from what the gateway observed.",
-                        "由网关按本地观测计数。",
-                        "由閘道按本機觀測計數。",
-                    ),
-                    value(
-                        route
-                            .token_limit
-                            .map(|limit| {
-                                format!(
-                                    "{} / {}",
-                                    gateway_token_count(limit.tokens),
-                                    gateway_token_window_label(limit.window)
-                                )
-                            })
-                            .unwrap_or_else(|| {
-                                management_locale_text("Not limited", "不限制", "不限制")
-                                    .to_string()
-                            }),
-                    ),
-                    cx,
-                ),
-            ],
-            cx,
-        );
-
         let model_chips = h_flex()
             .w_full()
             .flex_wrap()
@@ -490,13 +511,6 @@ impl ManagementCenter {
                 )),
                 None,
                 agent_list,
-                cx,
-            ),
-            ws_section(
-                management_locale_text("Policy", "策略", "策略"),
-                None,
-                None,
-                policy,
                 cx,
             ),
         ])
@@ -585,92 +599,51 @@ impl ManagementCenter {
         .into_any_element()
     }
 
-    fn render_workspace_route_members(
-        &mut self,
-        route: &vibex_core::ModelRoute,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut list = v_flex().w_full().min_w_0();
-        for (index, member) in route.members.iter().enumerate() {
-            list = list.child(self.render_workspace_route_member_row(index, member, cx));
-        }
-        if route.members.is_empty() {
-            list = list.child(ws_empty_line(
-                management_locale_text(
-                    "No member yet. Edit the group to add Provider models.",
-                    "还没有成员。编辑路由组即可添加供应商模型。",
-                    "還沒有成員。編輯路由組即可新增供應商模型。",
-                ),
-                cx,
-            ));
-        }
-        let route_id = route.id.clone();
-        ws_stack(vec![ws_section(
-            management_locale_text("Members", "成员", "成員"),
-            Some(management_locale_text(
-                "Each member is one model on one Provider, tried in this order.",
-                "每个成员是某个供应商上的一个模型，按此顺序尝试。",
-                "每個成員是某個供應商上的一個模型，依此順序嘗試。",
-            )),
-            Some(
-                Button::new("management-route-group-members-edit")
-                    .small()
-                    .outline()
-                    .label(management_locale_text(
-                        "Edit members…",
-                        "编辑成员…",
-                        "編輯成員…",
-                    ))
-                    .disabled(self.mutation.is_some())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.edit_route_group_on_page(route_id.clone(), window, cx)
-                    }))
-                    .into_any_element(),
-            ),
-            list.into_any_element(),
-            cx,
-        )])
+    // ----- Members & Settings, edited in place ------------------------------
+
+    /// The Members tab: the attempt order itself, editable where it is read.
+    fn render_workspace_route_members(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        ws_stack(vec![
+            self.render_route_group_members_section(cx),
+            self.render_route_group_form_footer(RouteGroupFormScope::Detail, cx),
+        ])
     }
 
-    fn render_workspace_route_traffic(
-        &mut self,
-        route: &vibex_core::ModelRoute,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let members = route
-            .members
-            .iter()
-            .map(|member| member.model_provider_profile_id.clone())
-            .collect::<BTreeSet<_>>();
-        let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
-        let traffic = WorkspaceTraffic::collect(self.gateway_requests.iter().filter(|request| {
-            members.contains(&request.model_provider_profile_id) && request.created_at_ms >= cutoff
-        }));
-        ws_stack(vec![ws_section(
-            management_locale_text("Traffic", "流量", "流量"),
-            Some(management_locale_text(
-                "Requests the gateway sent to this group's members. No cost or quota is tracked.",
-                "网关发往该组成员的请求；不统计费用或额度。",
-                "閘道發往該組成員的請求；不統計費用或額度。",
-            )),
-            Some(self.workspace_range_menu("management-route-traffic-range", cx)),
-            traffic.tiles(cx),
-            cx,
-        )])
+    /// The Settings tab: everything about the group that is not its members.
+    fn render_workspace_route_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        ws_stack(vec![
+            self.render_route_group_name_section(cx),
+            self.render_route_group_strategy_section(cx),
+            self.render_route_group_limits_section(cx),
+            self.render_route_group_visibility_section(cx),
+            self.render_route_group_simulator_section(cx),
+            self.render_route_group_form_footer(RouteGroupFormScope::Detail, cx),
+        ])
     }
 
-    // ----- Editor ----------------------------------------------------------
+    // ----- The shared form ---------------------------------------------------
 
-    pub(super) fn render_workspace_route_group_editor(
+    /// Every section of the route-group form, in the order each entry reads
+    /// them. The new-group page and the Agent dialog draw all of them; a saved
+    /// group spreads them across its Members and Settings tabs.
+    pub(in crate::management) fn render_route_group_form(
         &mut self,
-        _window: &mut Window,
+        scope: RouteGroupFormScope,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let editing = self.route_group_editing_id.is_some();
-        let members = self.route_group_model_members.clone();
+        ws_stack(vec![
+            self.render_route_group_name_section(cx),
+            self.render_route_group_members_section(cx),
+            self.render_route_group_strategy_section(cx),
+            self.render_route_group_limits_section(cx),
+            self.render_route_group_visibility_section(cx),
+            self.render_route_group_simulator_section(cx),
+            self.render_route_group_form_footer(scope, cx),
+        ])
+    }
 
-        let basics = ws_section(
+    fn render_route_group_name_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        ws_section(
             management_locale_text("Name", "名称", "名稱"),
             None,
             None,
@@ -690,9 +663,12 @@ impl ManagementCenter {
                 cx,
             ),
             cx,
-        );
+        )
+    }
 
-        // Members, editable.
+    fn render_route_group_members_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let members = self.route_group_model_members.clone();
         let mut pipeline = v_flex().w_full().min_w_0();
         for (index, member) in members.iter().enumerate() {
             pipeline = pipeline.child(self.render_workspace_route_member_editor(
@@ -713,7 +689,7 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        let members_section = ws_section(
+        ws_section(
             management_locale_text("Members", "成员", "成員"),
             Some(management_locale_text(
                 "Tried from the top. Move a member to change its place.",
@@ -746,9 +722,11 @@ impl ManagementCenter {
                 .child(self.render_model_group_palette(pending, cx))
                 .into_any_element(),
             cx,
-        );
+        )
+    }
 
-        // Strategy.
+    fn render_route_group_strategy_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
         let strategy = self.route_group_strategy;
         let strategy_choices = vibex_core::RouteStrategy::ALL
             .into_iter()
@@ -778,35 +756,38 @@ impl ManagementCenter {
             },
             cx,
         );
-        let mut behaviour = vec![management_setting_row(
-            management_locale_text(
-                "Keep a conversation on one member",
-                "同一对话固定成员",
-                "同一對話固定成員",
+        let behaviour = vec![
+            management_setting_row(
+                management_locale_text(
+                    "Keep a conversation on one member",
+                    "同一对话固定成员",
+                    "同一對話固定成員",
+                ),
+                management_locale_text(
+                    "Vendors cache a prompt per account; moving a conversation loses that cache.",
+                    "厂商按账号缓存提示词，换成员会丢掉缓存。",
+                    "廠商按帳號快取提示詞，換成員會遺失快取。",
+                ),
+                Switch::new("management-model-group-pin")
+                    .small()
+                    .checked(self.route_group_pin)
+                    .disabled(pending)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        this.route_group_pin = *checked;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                cx,
             ),
-            management_locale_text(
-                "Vendors cache a prompt per account; moving a conversation loses that cache.",
-                "厂商按账号缓存提示词，换成员会丢掉缓存。",
-                "廠商按帳號快取提示詞，換成員會遺失快取。",
-            ),
-            Switch::new("management-model-group-pin")
-                .small()
-                .checked(self.route_group_pin)
-                .disabled(pending)
-                .on_click(cx.listener(|this, checked, _, cx| {
-                    this.route_group_pin = *checked;
-                    cx.notify();
-                }))
-                .into_any_element(),
-            cx,
-        )];
-        if members.len() >= 2 {
-            behaviour.push(management_setting_row(
+            // Shown whatever the member count, so the setting does not appear
+            // and vanish as members come and go; with one member it simply
+            // has nothing to switch to.
+            management_setting_row(
                 management_locale_text("Switch on failure", "失败时自动切换", "失敗時自動切換"),
                 management_locale_text(
-                    "Move to the next member without asking when the current one fails.",
-                    "当前成员失败时，不经询问直接切换到下一个。",
-                    "目前成員失敗時，不經詢問直接切換到下一個。",
+                    "Move to the next member without asking when the current one fails. Off asks first.",
+                    "当前成员失败时，不经询问直接切换到下一个；关闭则先询问。",
+                    "目前成員失敗時，不經詢問直接切換到下一個；關閉則先詢問。",
                 ),
                 Switch::new("management-model-group-auto-failover")
                     .small()
@@ -818,9 +799,9 @@ impl ManagementCenter {
                     }))
                     .into_any_element(),
                 cx,
-            ));
-        }
-        let strategy_section = ws_section(
+            ),
+        ];
+        ws_section(
             management_locale_text("Strategy", "策略", "策略"),
             Some(management_locale_text(
                 "How the gateway picks a member for each request.",
@@ -835,10 +816,42 @@ impl ManagementCenter {
                 .child(management_settings_list(behaviour, cx))
                 .into_any_element(),
             cx,
-        );
+        )
+    }
 
-        // Limits.
-        let limits = ws_section(
+    fn render_route_group_limits_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let windows: [(&'static str, &'static str); 3] = [
+            (
+                vibex_core::GatewayTokenWindow::Day.id(),
+                management_locale_text("Per day", "每天", "每天"),
+            ),
+            (
+                vibex_core::GatewayTokenWindow::Week.id(),
+                management_locale_text("Per week", "每周", "每週"),
+            ),
+            (
+                vibex_core::GatewayTokenWindow::Month.id(),
+                management_locale_text("Per month", "每月", "每月"),
+            ),
+        ];
+        let window_menu = management_option_menu(
+            "management-model-group-token-window",
+            &windows,
+            self.route_group_token_limit_window.id(),
+            pending,
+            cx.weak_entity(),
+            |this, value, cx| {
+                if let Some(window) = vibex_core::GatewayTokenWindow::ALL
+                    .into_iter()
+                    .find(|window| window.id() == value)
+                {
+                    this.route_group_token_limit_window = window;
+                    cx.notify();
+                }
+            },
+        );
+        ws_section(
             management_locale_text("Limits", "限制", "限制"),
             Some(management_locale_text(
                 "Leave a field empty to use the gateway's default.",
@@ -856,7 +869,11 @@ impl ManagementCenter {
                             "首 Token 超时（秒）",
                             "首 Token 逾時（秒）",
                         ),
-                        None,
+                        Some(management_locale_text(
+                            "How long to wait before moving on.",
+                            "等待多久后切换到下一个成员。",
+                            "等待多久後切換到下一個成員。",
+                        )),
                         ws_input(&self.route_group_first_token_timeout, false, None, cx),
                         cx,
                     ),
@@ -888,17 +905,34 @@ impl ManagementCenter {
                             "Token 上限（本地）",
                             "Token 上限（本機）",
                         ),
-                        None,
-                        ws_input(&self.route_group_token_limit, false, None, cx),
+                        Some(management_locale_text(
+                            "Counted locally from what the gateway observed.",
+                            "由网关按本地观测计数。",
+                            "由閘道按本機觀測計數。",
+                        )),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().child(ws_input(
+                                &self.route_group_token_limit,
+                                false,
+                                None,
+                                cx,
+                            )))
+                            .child(window_menu)
+                            .into_any_element(),
                         cx,
                     ),
                 ))
                 .into_any_element(),
             cx,
-        );
+        )
+    }
 
-        // Visibility.
-        let visibility = ws_section(
+    fn render_route_group_visibility_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        ws_section(
             management_locale_text("Visibility", "可见性", "可見性"),
             None,
             None,
@@ -948,9 +982,13 @@ impl ManagementCenter {
                 cx,
             ),
             cx,
-        );
+        )
+    }
 
-        let simulator = ws_section(
+    fn render_route_group_simulator_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let members = self.route_group_model_members.clone();
+        ws_section(
             management_locale_text("Try it", "试运行", "試執行"),
             Some(management_locale_text(
                 "See which member would answer a request, without sending one.",
@@ -960,23 +998,58 @@ impl ManagementCenter {
             None,
             self.render_model_group_simulator(&members, pending, cx),
             cx,
-        );
+        )
+    }
 
-        let enabled = members.iter().filter(|member| member.enabled).count();
-        let footer = ws_form_footer(
-            None,
-            vec![
+    /// The form's closing commands. Every entry commits with the same Save;
+    /// what Cancel means differs: close the page, close the dialog, or drop
+    /// the unsaved edits of the group on screen.
+    fn render_route_group_form_footer(
+        &mut self,
+        scope: RouteGroupFormScope,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let editing = self.route_group_editing_id.is_some();
+        let enabled = self
+            .route_group_model_members
+            .iter()
+            .filter(|member| member.enabled)
+            .count();
+        let cancel = match scope {
+            RouteGroupFormScope::Detail => Button::new("management-model-group-discard")
+                .ghost()
+                .label(management_locale_text(
+                    "Discard changes",
+                    "放弃修改",
+                    "放棄修改",
+                ))
+                .disabled(pending)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.workspace_route_edit_revision = None;
+                    cx.notify();
+                })),
+            RouteGroupFormScope::Page | RouteGroupFormScope::Dialog => {
                 Button::new("management-model-group-cancel")
                     .ghost()
                     .label(management_locale_text("Cancel", "取消", "取消"))
                     .disabled(pending)
                     .on_click(cx.listener(|this, _, window, cx| {
+                        // The same draft is drawn in the dialog and on the
+                        // Provider page, so abandoning it ends both.
                         this.close_route_group_editor(cx);
                         if window.has_active_dialog(cx) {
                             window.close_dialog(cx);
                         }
                     }))
-                    .into_any_element(),
+            }
+        };
+        ws_form_footer(
+            (scope != RouteGroupFormScope::Page)
+                .then(|| self.error.clone())
+                .flatten(),
+            vec![
+                cancel.into_any_element(),
                 Button::new("management-model-group-save")
                     .primary()
                     .label(if editing {
@@ -990,8 +1063,18 @@ impl ManagementCenter {
                     .into_any_element(),
             ],
             cx,
-        );
+        )
+    }
 
+    // ----- The new-group page ------------------------------------------------
+
+    pub(super) fn render_workspace_route_group_editor(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let editing = self.route_group_editing_id.is_some();
         let back = Button::new("management-route-group-page-back")
             .small()
             .ghost()
@@ -1000,15 +1083,16 @@ impl ManagementCenter {
             .disabled(pending)
             .on_click(cx.listener(|this, _, _, cx| this.close_route_group_editor(cx)))
             .into_any_element();
+        let mark = ws_icon_tile(
+            "icons/vibex/git-branch.svg",
+            px(44.0),
+            Some(cx.theme().primary),
+            cx,
+        );
         ws_authoring_page(
             "management-route-group-page-editor",
             back,
-            Some(ws_icon_tile(
-                "icons/vibex/git-branch.svg",
-                px(44.0),
-                Some(cx.theme().primary),
-                cx,
-            )),
+            Some(mark),
             if editing {
                 management_locale_text("Edit route group", "编辑路由组", "編輯路由組")
             } else {
@@ -1019,17 +1103,36 @@ impl ManagementCenter {
                 "把多个供应商的模型合成一个模型名，并按顺序依次回退。",
                 "把多個供應商的模型合成一個模型名，並依順序依次回退。",
             ),
-            ws_stack(vec![
-                basics,
-                members_section,
-                strategy_section,
-                limits,
-                visibility,
-                simulator,
-                footer,
-            ]),
+            self.render_route_group_form(RouteGroupFormScope::Page, cx),
             cx,
         )
+    }
+
+    fn render_workspace_route_traffic(
+        &mut self,
+        route: &vibex_core::ModelRoute,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let members = route
+            .members
+            .iter()
+            .map(|member| member.model_provider_profile_id.clone())
+            .collect::<BTreeSet<_>>();
+        let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
+        let traffic = WorkspaceTraffic::collect(self.gateway_requests.iter().filter(|request| {
+            members.contains(&request.model_provider_profile_id) && request.created_at_ms >= cutoff
+        }));
+        ws_stack(vec![ws_section(
+            management_locale_text("Traffic", "流量", "流量"),
+            Some(management_locale_text(
+                "Requests the gateway sent to this group's members. No cost or quota is tracked.",
+                "网关发往该组成员的请求；不统计费用或额度。",
+                "閘道發往該組成員的請求；不統計費用或額度。",
+            )),
+            Some(self.workspace_range_menu("management-route-traffic-range", cx)),
+            traffic.tiles(cx),
+            cx,
+        )])
     }
 
     /// One editable member: its place, identity, and the controls that change

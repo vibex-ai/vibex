@@ -17,6 +17,7 @@ mod route_stage;
 mod routes;
 mod sidebar;
 
+pub(in crate::management) use route_group::RouteGroupFormScope;
 pub(crate) use route_stage::RouteStage;
 pub(crate) use routes::GatewayRouteTrail;
 
@@ -91,7 +92,7 @@ impl ManagementCenter {
 
     /// The Agents that may bind a model source, in the order the snapshot
     /// lists them.
-    fn workspace_configurable_agents(&self) -> Vec<(String, String)> {
+    pub(super) fn workspace_configurable_agents(&self) -> Vec<(String, String)> {
         let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
         self.snapshot
             .agents
@@ -930,12 +931,28 @@ mod tests {
         assert!(PROVIDER.contains("save_shared_provider_editor(profile_id.clone(), cx)"));
     }
 
-    /// Editing a group from its page stays on the page instead of opening the
-    /// Agent dialog over it.
+    /// A saved group edits on its own tabs, like a Provider does, instead of
+    /// reopening the authoring page or the Agent dialog over it; the page,
+    /// the dialog and the tabs all draw one shared form.
     #[test]
-    fn route_groups_edit_on_their_page() {
-        assert!(ROUTE_GROUP.contains("edit_route_group_on_page("));
+    fn route_groups_edit_on_their_own_tabs() {
+        assert!(ROUTE_GROUP.contains("RouteGroupDetailTab::Settings"));
+        assert!(ROUTE_GROUP.contains("self.ensure_workspace_route_draft(&row.route, window, cx)"));
+        assert!(ROUTE_GROUP.contains("self.workspace_route_edit_revision == Some(route.revision)"));
+        assert!(ROUTE_GROUP.contains("management-route-group-enabled"));
+        assert!(!ROUTE_GROUP.contains("\"management-route-group-page-edit\""));
         assert!(!ROUTE_GROUP.contains("this.edit_route_group(route_id"));
+        let page = ROUTE_GROUP
+            .split_once("fn render_workspace_route_group_editor(")
+            .map(|(_, tail)| tail)
+            .unwrap();
+        assert!(page.contains("render_route_group_form(RouteGroupFormScope::Page"));
+        let dialog = include_str!("../../management.rs")
+            .split_once("    fn render_model_group_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_route_group_editor("))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(dialog.contains("RouteGroupFormScope::Dialog"));
     }
 
     /// New Provider starts at the preset gallery, and a preset moves the page

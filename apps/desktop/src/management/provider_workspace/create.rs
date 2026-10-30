@@ -340,16 +340,36 @@ impl ManagementCenter {
                 .child(ws_field(
                     management_locale_text("Models to turn on", "启用的模型", "啟用的模型"),
                     Some(management_locale_text(
-                        "Model ids separated by commas. Leave empty to fetch the list after saving.",
-                        "用逗号分隔的模型 ID；留空则保存后自动获取列表。",
-                        "用逗號分隔的模型 ID；留空則儲存後自動取得清單。",
+                        "Model ids separated by commas. Fetch fills it from the address and Key above; each model's settings live on the Models tab after saving.",
+                        "用逗号分隔的模型 ID。“拉取模型”会按上方地址与 Key 自动填入；保存后可在“模型”标签页逐个设置。",
+                        "用逗號分隔的模型 ID。「擷取模型」會依上方位址與 Key 自動填入；儲存後可在「模型」分頁逐一設定。",
                     )),
-                    ws_input(
-                        &self.provider_create_models,
-                        false,
-                        self.provider_create_models_error.as_deref(),
-                        cx,
-                    ),
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().child(ws_input(
+                            &self.provider_create_models,
+                            false,
+                            self.provider_create_models_error.as_deref(),
+                            cx,
+                        )))
+                        .child(
+                            Button::new("management-provider-create-fetch-models")
+                                .outline()
+                                .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                                .label(management_fetch_models_label())
+                                .loading(matches!(
+                                    &self.mutation,
+                                    Some(ManagementMutation::ProviderProbe(action))
+                                        if action == "create-page-models"
+                                ))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.fetch_provider_create_models(window, cx)
+                                })),
+                        )
+                        .into_any_element(),
                     cx,
                 ))
                 .child(ws_field(
