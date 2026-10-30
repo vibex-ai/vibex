@@ -1229,6 +1229,12 @@ pub struct ManagementCenter {
     /// running is the answer to "what is happening" while the page is open,
     /// and it is gone from every later read once it finishes.
     gateway_inflight: Vec<vibex_core::GatewayInflight>,
+    /// The gateway's route map, a cached view of its own.
+    gateway_route_stage: Option<Entity<provider_workspace::RouteStage>>,
+    /// The request the route map is pinned to, picked from the request list.
+    gateway_route_pinned: Option<vibex_core::RequestId>,
+    /// A pending re-read of the request ledger after a request ended.
+    gateway_requests_reload_task: Option<Task<()>>,
     /// The failover prompt a session is currently showing, if any.
     ///
     /// At most one at a time: two prompts would mean two held requests against
@@ -2762,6 +2768,9 @@ impl ManagementCenter {
             }),
             gateway_request_filter: GatewayRequestFilter::All,
             gateway_inflight: Vec::new(),
+            gateway_route_stage: None,
+            gateway_route_pinned: None,
+            gateway_requests_reload_task: None,
             gateway_failover_prompt: None,
             gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
@@ -16244,6 +16253,10 @@ impl ManagementCenter {
             vibex_core::GatewayEvent::Ended { request_id, .. } => {
                 self.gateway_inflight
                     .retain(|entry| entry.request_id != request_id);
+                // The ledger row that describes how it ended is written as it
+                // ends: re-read it so the request list and the route map show
+                // the result instead of the request vanishing.
+                self.schedule_gateway_requests_reload(cx);
             }
             vibex_core::GatewayEvent::FailoverAsked(prompt) => {
                 self.gateway_failover_prompt = Some(prompt);
@@ -16262,6 +16275,33 @@ impl ManagementCenter {
             vibex_core::GatewayEvent::FailoverSwitched { .. } => {}
         }
         cx.notify();
+    }
+
+    /// Re-reads the request ledger shortly after a request ends.
+    ///
+    /// Requests often end in bursts; one read a moment later covers all of
+    /// them instead of one round trip each.
+    fn schedule_gateway_requests_reload(&mut self, cx: &mut Context<Self>) {
+        if self.gateway_requests_reload_task.is_some() {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let this = cx.entity();
+        self.gateway_requests_reload_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let requests = backend.management().model_gateway_requests().await;
+            this.update(cx, |this, cx| {
+                this.gateway_requests_reload_task = None;
+                if let Ok(requests) = requests {
+                    this.gateway_requests = requests;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     /// Opens the header's display-name editor with the current name.

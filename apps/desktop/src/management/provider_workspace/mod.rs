@@ -13,7 +13,11 @@ mod create;
 mod gateway;
 mod provider;
 mod route_group;
+mod route_stage;
+mod routes;
 mod sidebar;
+
+pub(crate) use route_stage::RouteStage;
 
 impl ManagementCenter {
     /// The detail pane: whichever record the left column selected, or the
