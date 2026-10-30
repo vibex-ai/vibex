@@ -7081,7 +7081,7 @@ fn shared_provider_probe_profile(
 ) -> VibexResult<ProviderProfile> {
     let mut probe = ProviderProfile::local_default(ProviderKind::Acp);
     probe.id = ProviderProfileId::new();
-    probe.agent_id = AgentId::parse("provider_probe").map_err(|_| {
+    probe.agent_id = AgentId::parse("provider-probe").map_err(|_| {
         VibexError::validation(
             "model_provider_probe_agent_invalid",
             "the internal probe Agent id is invalid",
@@ -13870,5 +13870,22 @@ Authorization = "Bearer should-not-be-stored"
             .expect_err("a draft without a key must not reach the endpoint");
 
         assert_eq!(error.code, "agent_model_provider_secret_missing");
+    }
+}
+
+#[cfg(test)]
+mod shared_provider_probe_tests {
+    use super::*;
+
+    /// Fetching or testing a shared Provider builds its probe Profile first;
+    /// an invalid internal Agent id failed every such request up front.
+    #[test]
+    fn a_shared_provider_probe_profile_builds() {
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "Probe".to_string(),
+            ..Default::default()
+        };
+        let probe = shared_provider_probe_profile(&profile).expect("probe profile builds");
+        assert_eq!(probe.agent_id.as_str(), "provider-probe");
     }
 }
