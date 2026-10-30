@@ -31,6 +31,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Kimi => [0x020203, 0x0c0c0f, 0x19191e, 0x2c2c33, 0x4a4a54],
         // The mascot's white, cooled toward the logo's lilac in shadow.
         Guardian::CodeBuddy => [0x3a3260, 0x6e66a8, 0xb2acdc, 0xe2def5, 0xffffff],
+        // The arch wears the gradient inks; its body ramp only lights edges.
+        Guardian::Antigravity => [0x2b3242, 0x56607a, 0x8d97b0, 0xc4cbdb, 0xf1f4f9],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -78,6 +80,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::CodeBuddy => [
             0x120e26, 0x2d2559, 0x3a3170, 0x4a3f8a, 0x231d48, 0x2b2453, 0x6c5fc0,
         ],
+        // A pale plaza, so the gradient arch reads as the logo does on white.
+        Guardian::Antigravity => [
+            0x1c2230, 0xc6ceda, 0xdbe1e9, 0xedf1f5, 0xb2bcc9, 0x8a95a5, 0xf8fafc,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -112,6 +118,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Kimi => [0x0b4fb3, 0x1683ff, 0xb3d6ff],
         // The teal glow at the foot of the logo.
         Guardian::CodeBuddy => [0x0f7a62, 0x32e6b9, 0xc5fff0],
+        // The logo's red, for the right of the arch and its heart.
+        Guardian::Antigravity => [0xa3171b, 0xfc413d, 0xffc2bd],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -128,6 +136,18 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
     if guardian == Guardian::Cline {
         // Its eyes and bolts are a bright terminal cyan.
         for (ix, value) in [0x0f4a7a, 0x2fa8f0, 0xa8ecff].into_iter().enumerate() {
+            colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
+        }
+    }
+    if guardian == Guardian::Antigravity {
+        // The rest of the logo's gradient: green, yellow and blue.
+        for (ix, value) in [0x006b35, 0x00b95c, 0x7de0a6].into_iter().enumerate() {
+            colors[ink::MOSS_DARK as usize + ix] = rgb(value).into();
+        }
+        colors[ink::GOLD_DARK as usize] = rgb(0xc9a300).into();
+        colors[ink::GOLD as usize] = rgb(0xffe432).into();
+        colors[ink::IVORY as usize] = rgb(0xfff6c2).into();
+        for (ix, value) in [0x1b4fbf, 0x3186ff, 0x9fc6ff].into_iter().enumerate() {
             colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
         }
     }

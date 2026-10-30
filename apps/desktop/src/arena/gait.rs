@@ -104,6 +104,7 @@ fn itinerary(guardian: Guardian) -> &'static [Leg] {
         Guardian::ZCode => &zcode::LEGS,
         Guardian::Kimi => &kimi::LEGS,
         Guardian::CodeBuddy => &codebuddy::LEGS,
+        Guardian::Antigravity => &antigravity::LEGS,
     }
 }
 /// How long one guardian takes to walk its whole itinerary once.
@@ -462,6 +463,7 @@ impl Boss {
             Guardian::ZCode => zcode::lane(&mut boss, moment),
             Guardian::Kimi => kimi::lane(&mut boss, legs, moment),
             Guardian::CodeBuddy => codebuddy::lane(&mut boss, legs, moment),
+            Guardian::Antigravity => antigravity::lane(&mut boss, moment, phase),
         };
         boss.position = lane_point(place);
         if !matches!(guardian, Guardian::Pi | Guardian::ZCode) {
@@ -522,6 +524,7 @@ pub(super) fn entrance(guardian: Guardian) -> f32 {
         Guardian::ZCode => zcode::ENTRANCE,
         Guardian::Kimi => kimi::ENTRANCE,
         Guardian::CodeBuddy => codebuddy::ENTRANCE,
+        Guardian::Antigravity => antigravity::ENTRANCE,
     }
 }
 /// How long a guardian takes to leave its lane when the turn ends.
@@ -539,6 +542,7 @@ pub(super) fn exit(guardian: Guardian) -> f32 {
         Guardian::ZCode => zcode::EXIT,
         Guardian::Kimi => kimi::EXIT,
         Guardian::CodeBuddy => codebuddy::EXIT,
+        Guardian::Antigravity => antigravity::EXIT,
     }
 }
 
@@ -628,6 +632,7 @@ pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
         Guardian::ZCode => zcode::entering(&mut shot, a),
         Guardian::Kimi => kimi::entering(&mut shot, a),
         Guardian::CodeBuddy => codebuddy::entering(&mut shot, a),
+        Guardian::Antigravity => antigravity::entering(&mut shot, a),
     }
     shot.boss = settled(shot.boss);
     shot
@@ -714,6 +719,7 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
         Guardian::ZCode => zcode::leaving(boss, a),
         Guardian::Kimi => kimi::leaving(boss, a),
         Guardian::CodeBuddy => codebuddy::leaving(boss, a, side),
+        Guardian::Antigravity => antigravity::leaving(boss, a),
     };
     // A turn that ends mid-entrance leaves from where the entrance had got to;
     // that offset hands over to the exit's own as it goes.
@@ -725,6 +731,8 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
     shot
 }
 
+#[path = "gait_antigravity.rs"]
+mod antigravity;
 #[path = "gait_cline.rs"]
 mod cline;
 #[path = "gait_codebuddy.rs"]

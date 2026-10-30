@@ -27,6 +27,7 @@ impl Arena {
             Guardian::ZCode => self.tick_zcode(),
             Guardian::Kimi => self.tick_kimi(),
             Guardian::CodeBuddy => self.tick_codebuddy(),
+            Guardian::Antigravity => self.tick_antigravity(),
         }
         self.boss.update_core();
     }
@@ -93,6 +94,8 @@ impl Arena {
     }
 }
 
+#[path = "encounter_antigravity.rs"]
+pub(super) mod antigravity;
 #[path = "encounter_claude.rs"]
 mod claude;
 #[path = "encounter_cline.rs"]

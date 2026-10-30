@@ -509,6 +509,20 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 frame.ellipse(c, (3, 3), WATER_LIGHT);
                 frame.rect(c.0 - 1, c.1 - 1, 2, 2, WHITE);
             }
+            ProjectileKind::Mote => {
+                // A weightless mote in one of the logo's colours.
+                let quarter = ((p.velocity.angle() + PI) / (PI * 0.5)) as usize % 4;
+                let color = [MOSS, GOLD, CORE, WATER][quarter];
+                let bob = if reduced {
+                    0
+                } else {
+                    ((p.age * 9.0).sin() * 1.5) as i32
+                };
+                frame.ellipse((c.0 + 2, c.1 + 4), (4, 1), SHADOW);
+                frame.ellipse((c.0, c.1 - 5 + bob), (4, 4), OUTLINE);
+                frame.ellipse((c.0, c.1 - 5 + bob), (3, 3), color);
+                frame.rect(c.0 - 1, c.1 - 7 + bob, 2, 2, WHITE);
+            }
             ProjectileKind::Yarn => {
                 frame.ellipse((c.0 + 2, c.1 + 5), (6, 2), SHADOW);
                 yarn(frame, (c.0, c.1 - 2), p.age * 14.0);

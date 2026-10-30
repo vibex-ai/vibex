@@ -99,6 +99,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::ZCode => gate_hall(&mut frame),
         Guardian::Kimi => page(&mut frame),
         Guardian::CodeBuddy => playroom(&mut frame),
+        Guardian::Antigravity => plaza(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -145,6 +146,27 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Antigravity's plaza: broad pale slabs, and a ring inlaid round the
+/// middle in the logo's four colours.
+fn plaza(frame: &mut Raster) {
+    tiles(frame, 56, 34, false);
+    let c = pixel(CENTER);
+    for (ix, color) in [MOSS, GOLD, CORE, WATER].into_iter().enumerate() {
+        let start = ix as f32 * TAU / 4.0 - PI * 0.75;
+        for n in 0..40 {
+            let a = start + n as f32 * TAU / 160.0;
+            for r in [150.0f32, 154.0, 158.0] {
+                let p = (
+                    c.0 + (a.cos() * r) as i32,
+                    c.1 + (a.sin() * r * 0.62) as i32,
+                );
+                frame.rect(p.0, p.1, 2, 2, color);
+            }
+        }
+    }
+    frame.ring(c, (146, 90), SEAM, false);
+    frame.ring(c, (162, 100), SEAM, false);
+}
 /// CodeBuddy's playroom: a round violet rug in rings, paw prints wandering
 /// across it, and a ball of yarn's trail looping round the middle.
 fn playroom(frame: &mut Raster) {
@@ -868,6 +890,19 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                 if map.inside(p, 3.0) {
                     let (x, y) = pixel(p);
                     frame.rect(x, y, 2, 2, if n % 3 == 0 { CORE_LIGHT } else { CORE });
+                }
+            }
+        }
+        Guardian::Antigravity => {
+            // Grit floats up off the plaza, weightless.
+            for n in 0..12 {
+                let h = hash(n, 107);
+                let t = (time * 0.15 + n as f32 * 0.083).fract();
+                let p = Vec2::new(24.0 + (h % 128) as f32, 104.0 - t * 96.0);
+                if map.inside(p, 2.0) {
+                    let (x, y) = pixel(p);
+                    let color = [MOSS, GOLD, CORE, WATER][n as usize % 4];
+                    frame.rect(x, y, 2, 2, color);
                 }
             }
         }

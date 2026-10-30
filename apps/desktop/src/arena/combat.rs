@@ -115,6 +115,8 @@ pub(super) enum ProjectileKind {
     Bolt,
     /// A hairball rolling back to CodeBuddy, lethal on the way.
     Yarn,
+    /// A slow, weightless mote flung off Antigravity, lethal to touch.
+    Mote,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Projectile {
@@ -683,6 +685,15 @@ impl Arena {
             Guardian::Kimi => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
             Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
+            // The heart hangs inside the arch: it takes an arrow only through
+            // the opening, never past a leg.
+            Guardian::Antigravity => {
+                from.minus(self.boss.core)
+                    .normalized()
+                    .dot(self.boss.direction)
+                    .abs()
+                    > 0.75
+            }
             // The bared core looks down the hall.
             Guardian::ZCode => from.y > self.boss.core.y - 1.0,
             // The core in the back of the ring, open while it spins and reels.
@@ -965,6 +976,7 @@ impl Arena {
                 ProjectileKind::Block => 1.5,
                 ProjectileKind::Bolt => 1.2,
                 ProjectileKind::Yarn => 1.8,
+                ProjectileKind::Mote => 1.4,
             };
             if segment_distance(
                 Vec2::default(),
@@ -974,9 +986,10 @@ impl Arena {
             {
                 projectile.remaining = 0.0;
                 match projectile.kind {
-                    ProjectileKind::Block | ProjectileKind::Bolt | ProjectileKind::Yarn => {
-                        hit = true
-                    }
+                    ProjectileKind::Block
+                    | ProjectileKind::Bolt
+                    | ProjectileKind::Yarn
+                    | ProjectileKind::Mote => hit = true,
                     ProjectileKind::Orb if !shielded => {
                         pushes.push(projectile.velocity.normalized());
                     }

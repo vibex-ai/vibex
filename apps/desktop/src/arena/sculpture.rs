@@ -486,6 +486,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::ZCode => zcode::zcode(&mut mesh, boss, fall),
         Guardian::Kimi => kimi::kimi(&mut mesh, boss),
         Guardian::CodeBuddy => codebuddy::codebuddy(&mut mesh, boss, time, fall),
+        Guardian::Antigravity => antigravity::antigravity(&mut mesh, boss, time, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -530,6 +531,8 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Kimi => (pitch + fall * 1.3, bank, boss.height, boss.yaw),
         // A beaten cat flops over onto its side.
         Guardian::CodeBuddy => (pitch, bank + fall * 1.2, boss.height, boss.yaw),
+        // A beaten arch loses its lift and settles, splaying its feet.
+        Guardian::Antigravity => (pitch, bank, boss.height * (1.0 - fall), boss.yaw),
         _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
@@ -1093,6 +1096,8 @@ fn copilot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
     }
 }
 
+#[path = "sculpture_antigravity.rs"]
+mod antigravity;
 #[path = "sculpture_cline.rs"]
 mod cline;
 #[path = "sculpture_codebuddy.rs"]

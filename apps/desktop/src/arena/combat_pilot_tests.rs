@@ -265,6 +265,29 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Antigravity => {
+            let spinning = boss.attack == Attack::Frenzy
+                && matches!(boss.state, BossState::Striking | BossState::Recovery);
+            plan.goal = around(boss.position, if spinning { 26.0 } else { 30.0 });
+            if spinning {
+                // Loose so the arrow comes through the opening as it turns.
+                let arrive = arrival(boss.core);
+                let mut future = *boss;
+                if boss.state == BossState::Striking {
+                    future.yaw += super::encounters::antigravity::SPIN_RATE * arrive;
+                }
+                future.direction = Vec2::from_angle(future.yaw + PI * 0.5);
+                let align = player
+                    .minus(boss.core)
+                    .normalized()
+                    .dot(future.direction)
+                    .abs();
+                let needed = if arena.player.charge > 0.0 { 0.78 } else { 0.9 };
+                if boss.exposed > arrive + 0.03 && align > needed {
+                    plan.target = Some(boss.core);
+                }
+            }
+        }
         Guardian::CodeBuddy => {
             let bug = arena
                 .hazards
@@ -469,7 +492,9 @@ fn strike(arena: &Arena) -> Option<(Vec2, f32)> {
         {
             Some((boss.target, radius))
         }
-        (Guardian::Cursor, Attack::Leap) if aerial => Some((boss.target, radius)),
+        (Guardian::Cursor | Guardian::Antigravity, Attack::Leap) if aerial => {
+            Some((boss.target, radius))
+        }
         (Guardian::Grok, Attack::Throw) if aerial => {
             Some((boss.target, crate::arena::combat::GROK_BLADE_RADIUS + 1.0))
         }
@@ -755,4 +780,8 @@ fn the_tile_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_cat_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::CodeBuddy);
+}
+#[test]
+fn the_arch_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Antigravity);
 }

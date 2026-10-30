@@ -20,10 +20,11 @@ pub(super) enum Guardian {
     ZCode,
     Kimi,
     CodeBuddy,
+    Antigravity,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -36,6 +37,7 @@ impl Guardian {
         Self::ZCode,
         Self::Kimi,
         Self::CodeBuddy,
+        Self::Antigravity,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -51,6 +53,7 @@ impl Guardian {
             Self::ZCode => "ZCode",
             Self::Kimi => "Kimi",
             Self::CodeBuddy => "CodeBuddy",
+            Self::Antigravity => "Antigravity",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -67,6 +70,7 @@ impl Guardian {
             "zcode" => Some(Self::ZCode),
             "kimi" | "kimi-cli" => Some(Self::Kimi),
             "codebuddy-code" | "codebuddy" => Some(Self::CodeBuddy),
+            "antigravity" => Some(Self::Antigravity),
             _ => None,
         }
     }
@@ -89,6 +93,7 @@ impl Guardian {
             Self::ZCode => "zcode",
             Self::Kimi => "kimi",
             Self::CodeBuddy => "codebuddy-code",
+            Self::Antigravity => "antigravity",
         }
     }
 }
@@ -161,6 +166,8 @@ pub(super) const GROK_RING: f32 = 10.0;
 pub(super) const ZCODE_CORE: f32 = 14.0;
 /// How high ZCode's fists hover when they are not striking.
 pub(super) const ZCODE_HOVER: f32 = 9.0;
+/// Where the heart hangs under the apex of Antigravity's arch.
+pub(super) const ARCH_HEART: f32 = 12.0;
 /// The height of Kimi's tile.
 pub(super) const KIMI_TILE: f32 = 15.0;
 /// Stamping steps ZCode marches round the home each loop.
@@ -344,6 +351,7 @@ impl Boss {
             Guardian::ZCode => 9.0,
             Guardian::Kimi => 8.0,
             Guardian::CodeBuddy => 8.0,
+            Guardian::Antigravity => 9.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -419,6 +427,7 @@ impl Boss {
             // A tile tips about the bottom of its face.
             Guardian::Kimi => (0.0, 0.0, 0.0),
             Guardian::CodeBuddy => (0.0, 0.0, 8.0 * squash),
+            Guardian::Antigravity => (0.0, 0.0, ARCH_HEART),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -474,6 +483,7 @@ impl Boss {
             Guardian::ZCode => self.local(0.0, 0.0, ZCODE_CORE),
             Guardian::Kimi => self.articulated(0.0, 0.0, KIMI_TILE * 0.5),
             Guardian::CodeBuddy => self.articulated(0.0, 0.0, 10.0 * squash),
+            Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
         }
     }
     pub fn update_core(&mut self) {
@@ -503,6 +513,8 @@ impl Boss {
             Guardian::Kimi => self.articulated(4.35, 3.4, 11.4),
             // The gem on its chest.
             Guardian::CodeBuddy => self.articulated(0.0, 6.0, 7.2 * squash),
+            // The heart hanging under the apex, between the legs.
+            Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -553,6 +565,7 @@ impl Boss {
     pub fn hover_height(&self, time: f32) -> f32 {
         match self.guardian {
             Guardian::Copilot => 6.5 + (time * 3.0).sin() * 0.6,
+            Guardian::Antigravity => 4.0 + (time * 1.6).sin() * 0.8,
             Guardian::Cline => 3.0 + (time * 2.4).sin() * 0.5,
             Guardian::Grok => 1.5 + (time * 1.7).sin() * 0.4,
             _ => 0.0,
@@ -798,6 +811,19 @@ impl Boss {
                     boss.squash = 0.6 * (1.0 - smoothstep(land));
                 }
             }
+            Guardian::Antigravity => {
+                // It drifts round the home as if there were no weight to it,
+                // bobbing high and low, and twice a loop turns a slow
+                // somersault in the air.
+                let s = t;
+                let (position, tangent) = route(guardian, s);
+                boss.position = position;
+                boss.height = 5.0 + (t * 6.0).sin() * 2.5;
+                boss.yaw = tangent.normalized().x * 0.5 + (t * 3.0).sin() * 0.3;
+                boss.bank = (t * 5.0).sin() * 0.12;
+                let (_, u) = beat(time, IDLE_LOOP / 2.0);
+                boss.pitch = TAU * smoothstep((u - 0.55) / 0.25);
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -906,6 +932,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::Antigravity => (
+            s.sin() * 60.0 + (s * 3.0).sin() * 6.0,
+            -s.cos() * 30.0,
+            s.cos() * 60.0 + (s * 3.0).cos() * 18.0,
+            s.sin() * 30.0,
         ),
         Guardian::CodeBuddy => (
             s.sin() * 62.0,
