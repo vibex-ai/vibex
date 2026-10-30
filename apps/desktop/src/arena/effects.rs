@@ -394,6 +394,13 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             }
             frame.ring(mouth, (12, 8), CORE, true);
         }
+        (Guardian::Gemini, Attack::Volley) if boss.state == BossState::Windup => {
+            let p = pixel(boss.attack_origin());
+            let r = 3 + (progress * 7.0) as i32;
+            frame.ring(p, (r, r), color, false);
+            frame.line((p.0 - r - 3, p.1), (p.0 + r + 3, p.1), color);
+            frame.line((p.0, p.1 - r - 3), (p.0, p.1 + r + 3), color);
+        }
         (Guardian::Devin, Attack::Volley) if boss.state == BossState::Windup => {
             let mouth = pixel(boss.body_center());
             let r = 4 + (progress * 10.0) as i32;

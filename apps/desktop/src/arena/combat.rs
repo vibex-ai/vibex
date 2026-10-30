@@ -422,7 +422,11 @@ impl Arena {
     fn awaken(&mut self) {
         let transition = smoothstep(self.phase_time / INTRO_DURATION);
         self.boss.position = self.intro.position.lerp(self.intro_target, transition);
-        self.boss.face(self.player.position, STEP * 1.8);
+        // Gemini's star keeps its face to the viewer; everything else wakes
+        // turning to the archer.
+        if self.boss.guardian != Guardian::Gemini {
+            self.boss.face(self.player.position, STEP * 1.8);
+        }
         let upright = |angle: f32| angle + ((-angle + PI).rem_euclid(TAU) - PI) * transition;
         self.boss.pitch = upright(self.intro.pitch);
         self.boss.bank = upright(self.intro.bank);
@@ -440,13 +444,20 @@ impl Arena {
             0.0
         };
         for ix in 0..2 {
-            self.boss.hands[ix] = self.intro.hands[ix].lerp(self.boss.resting_hand(ix), transition);
+            // Gemini's true twin, if it was out, comes home to the white one.
+            let (rest, lift) = if self.boss.guardian == Guardian::Gemini {
+                (self.boss.position, self.boss.height)
+            } else {
+                (self.boss.resting_hand(ix), hover)
+            };
+            self.boss.hands[ix] = self.intro.hands[ix].lerp(rest, transition);
             self.boss.hand_heights[ix] =
-                self.intro.hand_heights[ix] + (hover - self.intro.hand_heights[ix]) * transition;
+                self.intro.hand_heights[ix] + (lift - self.intro.hand_heights[ix]) * transition;
         }
         self.boss.update_core();
         self.boss.previous_core = self.boss.core;
         if self.phase_time >= INTRO_DURATION {
+            self.boss.detached = false;
             let wrap = |angle: f32| (angle + PI).rem_euclid(TAU) - PI;
             self.boss.pitch = wrap(self.boss.pitch);
             self.boss.bank = wrap(self.boss.bank);
@@ -702,6 +713,8 @@ impl Arena {
                     .abs()
                     > 0.75
             }
+            // Only the true twin, and only while it is away from the white one.
+            Guardian::Gemini => self.boss.detached,
             // The bared heart shows only through the gap of a torn petal.
             Guardian::Devin => (0..3).any(|arm| {
                 self.boss.torn & (1 << arm) != 0 && {

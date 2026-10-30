@@ -101,6 +101,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::CodeBuddy => playroom(&mut frame),
         Guardian::Antigravity => plaza(&mut frame),
         Guardian::Devin => greenhouse(&mut frame),
+        Guardian::Gemini => constellations(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -147,6 +148,54 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// The constellation of the twins, charted on Gemini's terrace: two
+/// figures side by side, each star an offset from the middle.
+const GEMINI_STARS: [(f32, f32); 12] = [
+    (-30.0, -28.0),
+    (-34.0, -10.0),
+    (-38.0, 8.0),
+    (-44.0, 26.0),
+    (-22.0, 10.0),
+    (-26.0, 28.0),
+    (10.0, -30.0),
+    (14.0, -12.0),
+    (18.0, 6.0),
+    (12.0, 26.0),
+    (34.0, 8.0),
+    (40.0, 26.0),
+];
+/// The lines that join the twins' stars.
+const GEMINI_LINES: [(usize, usize); 11] = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (1, 4),
+    (4, 5),
+    (0, 6),
+    (6, 7),
+    (7, 8),
+    (8, 9),
+    (7, 10),
+    (10, 11),
+];
+/// Gemini's terrace: dusk-blue flags with the constellation of the twins
+/// charted on them in faint lines and bright stars.
+fn constellations(frame: &mut Raster) {
+    tiles(frame, 44, 30, true);
+    for (a, b) in GEMINI_LINES {
+        let (from, to) = (GEMINI_STARS[a], GEMINI_STARS[b]);
+        frame.line(
+            pixel(CENTER.plus(Vec2::new(from.0, from.1))),
+            pixel(CENTER.plus(Vec2::new(to.0, to.1))),
+            WALL_LIGHT,
+        );
+    }
+    for (x, y) in GEMINI_STARS {
+        let c = pixel(CENTER.plus(Vec2::new(x, y)));
+        frame.ellipse(c, (3, 3), WALL_LIGHT);
+        frame.rect(c.0 - 1, c.1 - 1, 2, 2, WHITE);
+    }
+}
 /// Devin's greenhouse: slate flags with moss in the joints, and a round bed
 /// of dark soil in the middle where the flower is rooted, edged in stone.
 fn greenhouse(frame: &mut Raster) {
@@ -944,6 +993,16 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                 if map.inside(p, 2.0) {
                     let (x, y) = pixel(p);
                     frame.rect(x, y, 2, 1, CORE);
+                }
+            }
+        }
+        Guardian::Gemini => {
+            // The charted stars twinkle by turns.
+            for (ix, (x, y)) in GEMINI_STARS.iter().enumerate() {
+                if (time * 0.6 + ix as f32 * 0.29).fract() < 0.2 {
+                    let c = pixel(CENTER.plus(Vec2::new(*x, *y)));
+                    frame.line((c.0 - 4, c.1), (c.0 + 4, c.1), WHITE);
+                    frame.line((c.0, c.1 - 4), (c.0, c.1 + 4), WHITE);
                 }
             }
         }

@@ -67,6 +67,8 @@ pub(super) const SWITCHES: [Vec2; 2] = [Vec2::new(36.0, 76.0), Vec2::new(140.0, 
 pub(super) const SWITCH_RADIUS: f32 = 7.0;
 /// ZCode's hall: two columns that stop the sweep.
 const GATE_HALL: [Pillar; 2] = pillars([(62.0, 60.0), (114.0, 60.0)], 3.2, 12.0);
+/// Gemini's terrace: three stones to break a star-bolt's line.
+const TWINS: [Pillar; 3] = pillars([(50.0, 42.0), (126.0, 42.0), (88.0, 86.0)], 3.0, 10.0);
 /// Devin's greenhouse: two planters at the ends, out of its vines' reach.
 const GREENHOUSE: [Pillar; 2] = pillars([(28.0, 58.0), (148.0, 58.0)], 3.4, 9.0);
 /// Antigravity's plaza: four floating stones.
@@ -167,6 +169,7 @@ impl Map {
             Guardian::CodeBuddy => &PLAYROOM,
             Guardian::Antigravity => &PLAZA,
             Guardian::Devin => &GREENHOUSE,
+            Guardian::Gemini => &TWINS,
         }
     }
 
@@ -196,6 +199,10 @@ impl Map {
             Guardian::Cline => x < 71.0 - margin && y < 46.0 - margin,
             Guardian::ZCode => x < 72.0 - margin && y < 47.0 - margin,
             Guardian::Devin => x < 72.0 - margin && y < 46.0 - margin,
+            // A diamond-cornered terrace, like the star's points.
+            Guardian::Gemini => {
+                x < 72.0 - margin && y < 47.0 - margin && x * 0.6 + y < 82.0 - margin * 1.17
+            }
             // An octagonal plaza.
             Guardian::Antigravity => {
                 x < 72.0 - margin && y < 46.0 - margin && x + y < 104.0 - margin * 1.42

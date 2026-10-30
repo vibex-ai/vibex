@@ -29,6 +29,7 @@ impl Arena {
             Guardian::CodeBuddy => self.tick_codebuddy(),
             Guardian::Antigravity => self.tick_antigravity(),
             Guardian::Devin => self.tick_devin(),
+            Guardian::Gemini => self.tick_gemini(),
         }
         self.boss.update_core();
     }
@@ -113,6 +114,8 @@ mod cursor;
 mod deepseek;
 #[path = "encounter_devin.rs"]
 mod devin;
+#[path = "encounter_gemini.rs"]
+mod gemini;
 #[path = "encounter_grok.rs"]
 pub(super) mod grok;
 #[path = "encounter_kimi.rs"]

@@ -265,6 +265,19 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Gemini => {
+            if boss.detached && boss.exposed > 0.0 {
+                // After the twin that broke away, while it is bare.
+                plan.goal = around(boss.hands[0], 22.0);
+                if boss.exposed > arrival(boss.core) + 0.03 {
+                    plan.target = Some(boss.core);
+                }
+            } else {
+                // Close in: near enough, the true twin breaks away.
+                plan.goal = around(boss.position, 18.0);
+                plan.sprint = true;
+            }
+        }
         Guardian::Devin => {
             let mouth = boss.body_center();
             let clear_of_vines = |from: Vec2, to: Vec2| {
@@ -837,4 +850,8 @@ fn the_arch_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_flower_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Devin);
+}
+#[test]
+fn the_twin_stars_are_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Gemini);
 }

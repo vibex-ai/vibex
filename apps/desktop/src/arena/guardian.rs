@@ -22,10 +22,11 @@ pub(super) enum Guardian {
     CodeBuddy,
     Antigravity,
     Devin,
+    Gemini,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -40,6 +41,7 @@ impl Guardian {
         Self::CodeBuddy,
         Self::Antigravity,
         Self::Devin,
+        Self::Gemini,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -57,6 +59,7 @@ impl Guardian {
             Self::CodeBuddy => "CodeBuddy",
             Self::Antigravity => "Antigravity",
             Self::Devin => "Devin",
+            Self::Gemini => "Gemini",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -75,6 +78,7 @@ impl Guardian {
             "codebuddy-code" | "codebuddy" => Some(Self::CodeBuddy),
             "antigravity" => Some(Self::Antigravity),
             "devin" => Some(Self::Devin),
+            "gemini" | "gemini-cli" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -99,6 +103,7 @@ impl Guardian {
             Self::CodeBuddy => "codebuddy-code",
             Self::Antigravity => "antigravity",
             Self::Devin => "devin",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -188,6 +193,8 @@ fn devin_roll(guardian: Guardian, s: f32) -> f32 {
         1.0
     }
 }
+/// The middle of Gemini's star above its ground anchor.
+pub(super) const GEMINI_STAR: f32 = 10.0;
 /// The height of Devin's hub above its ground anchor, lying flat.
 pub(super) const DEVIN_HUB: f32 = 3.0;
 /// Segments on a full vine of Devin's.
@@ -293,7 +300,8 @@ pub(super) struct Boss {
     /// The face of the cube that carries Cursor's pointer facet, in model
     /// space (see [`cube`](super::cube)).
     pub facet: u8,
-    /// Grok's blade is out of its ring, at `hands[0]`, `hand_heights[0]` up.
+    /// A part is out of the body, at `hands[0]`, `hand_heights[0]` up:
+    /// Grok's blade, or Gemini's true twin.
     pub detached: bool,
     /// ZCode's fists that hold a floor switch down.
     pub pinned: [bool; 2],
@@ -388,6 +396,7 @@ impl Boss {
             Guardian::CodeBuddy => 8.0,
             Guardian::Antigravity => 9.0,
             Guardian::Devin => 9.0,
+            Guardian::Gemini => 8.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -465,6 +474,7 @@ impl Boss {
             Guardian::CodeBuddy => (0.0, 0.0, 8.0 * squash),
             Guardian::Antigravity => (0.0, 0.0, ARCH_HEART),
             Guardian::Devin => (0.0, 0.0, DEVIN_HUB),
+            Guardian::Gemini => (0.0, 0.0, GEMINI_STAR),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -522,6 +532,7 @@ impl Boss {
             Guardian::CodeBuddy => self.articulated(0.0, 0.0, 10.0 * squash),
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
             Guardian::Devin => self.articulated(0.0, 0.0, DEVIN_HUB),
+            Guardian::Gemini => self.articulated(0.0, 0.0, GEMINI_STAR),
         }
     }
     pub fn update_core(&mut self) {
@@ -555,6 +566,11 @@ impl Boss {
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
             // The heart down in the hub's open mouth.
             Guardian::Devin => self.articulated(0.0, 0.0, DEVIN_HUB + 1.2),
+            // The true twin: in front of the white one, or wherever it darted.
+            Guardian::Gemini if self.detached => {
+                self.hands[0].plus(Vec2::new(0.0, -self.hand_heights[0] - GEMINI_STAR))
+            }
+            Guardian::Gemini => self.articulated(0.0, 2.0, GEMINI_STAR),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -617,6 +633,7 @@ impl Boss {
         match self.guardian {
             Guardian::Copilot => 6.5 + (time * 3.0).sin() * 0.6,
             Guardian::Antigravity => 4.0 + (time * 1.6).sin() * 0.8,
+            Guardian::Gemini => 6.0 + (time * 2.0).sin() * 0.8,
             Guardian::Cline => 3.0 + (time * 2.4).sin() * 0.5,
             Guardian::Grok => 1.5 + (time * 1.7).sin() * 0.4,
             _ => 0.0,
@@ -902,10 +919,32 @@ impl Boss {
                 boss.height = DEVIN_STANDING + (roll * PI).sin() * 1.2;
                 boss.yaw = -tangent.normalized().x * 0.15;
             }
+            Guardian::Gemini => {
+                // It glides round the home in long arcs, turning a quarter
+                // at a time, and twice a loop its true twin slips out of the
+                // white one and back.
+                let (position, tangent) = route(guardian, t);
+                boss.position = position;
+                boss.height = 6.0 + (t * 9.0).sin() * 0.8;
+                boss.yaw = -tangent.normalized().x * 0.25;
+                let (quarter, u) = beat(time, IDLE_LOOP / 12.0);
+                boss.spin = (quarter + smoothstep((u - 0.7) / 0.3)) * PI * 0.5;
+                let (_, w) = beat(time, IDLE_LOOP / 2.0);
+                let apart = (((w - 0.4) / 0.25).clamp(0.0, 1.0) * PI).sin();
+                boss.hands[0] = position;
+                boss.hand_heights[0] = boss.height;
+                if apart > 0.0 {
+                    boss.detached = true;
+                    let (s, c) = boss.yaw.sin_cos();
+                    let out = 9.0 * apart;
+                    boss.hands[0] = position.plus(Vec2::new(out * c, out * s * 0.62));
+                    boss.hand_heights[0] = boss.height + 2.0 * apart;
+                }
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
-        if !matches!(guardian, Guardian::Pi | Guardian::ZCode) {
+        if !matches!(guardian, Guardian::Pi | Guardian::ZCode | Guardian::Gemini) {
             boss.rest_hands();
         }
         boss.update_core();
@@ -1010,6 +1049,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::Gemini => (
+            s.sin() * 62.0 + (s * 2.0).sin() * 8.0,
+            -s.cos() * 32.0,
+            s.cos() * 62.0 + (s * 2.0).cos() * 16.0,
+            s.sin() * 32.0,
         ),
         Guardian::Devin => (
             s.sin() * 60.0,

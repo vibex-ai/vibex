@@ -86,10 +86,18 @@ fn agent_identity_selects_only_the_supported_guardians() {
         ("copilot", Guardian::Copilot),
         ("cursor", Guardian::Cursor),
         ("cursor-agent", Guardian::Cursor),
+        ("cline", Guardian::Cline),
+        ("grok", Guardian::Grok),
+        ("zcode", Guardian::ZCode),
+        ("kimi", Guardian::Kimi),
+        ("codebuddy-code", Guardian::CodeBuddy),
+        ("antigravity", Guardian::Antigravity),
+        ("devin", Guardian::Devin),
+        ("gemini", Guardian::Gemini),
     ] {
         assert_eq!(Guardian::from_agent(id), Some(g));
     }
-    for id in ["gemini", "qwen-code", "custom-agent", ""] {
+    for id in ["qwen-code", "custom-agent", ""] {
         assert_eq!(Guardian::from_agent(id), None);
     }
 }

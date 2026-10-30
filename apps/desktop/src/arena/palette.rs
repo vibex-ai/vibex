@@ -35,6 +35,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Antigravity => [0x2b3242, 0x56607a, 0x8d97b0, 0xc4cbdb, 0xf1f4f9],
         // Deep teal hexagons, a greenhouse flower.
         Guardian::Devin => [0x0b2a2a, 0x134646, 0x1f6b66, 0x3f9b90, 0x8fd6c8],
+        // Gemini wears the gradient inks; its body ramp only lights edges.
+        Guardian::Gemini => [0x232a44, 0x4a5580, 0x7f8cc0, 0xbcc6ec, 0xf2f5ff],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -90,6 +92,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Devin => [
             0x0c1410, 0x1e2b22, 0x26372b, 0x304537, 0x18231b, 0x2e4235, 0x4b6852,
         ],
+        // A dusk floor charted with constellations.
+        Guardian::Gemini => [
+            0x0d1026, 0x1f2550, 0x272e62, 0x313a75, 0x181d42, 0x2d356b, 0x5560a8,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -128,6 +134,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Antigravity => [0xa3171b, 0xfc413d, 0xffc2bd],
         // A poisonous lime heart, and its spores.
         Guardian::Devin => [0x4f7a00, 0xb6ff3b, 0xeaffc0],
+        // The logo's red, for the bare twin's heart.
+        Guardian::Gemini => [0xa52714, 0xea4335, 0xffc9c2],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();
@@ -146,6 +154,20 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         for (ix, value) in [0x0f4a7a, 0x2fa8f0, 0xa8ecff].into_iter().enumerate() {
             colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
         }
+    }
+    if guardian == Guardian::Gemini {
+        // The logo's blue, green and yellow.
+        for (ix, value) in [0x1f57c3, 0x4285f4, 0xa9c8ff].into_iter().enumerate() {
+            colors[ink::WATER_DARK as usize + ix] = rgb(value).into();
+        }
+        for (ix, value) in [0x1e6e36, 0x34a853, 0x8edba4].into_iter().enumerate() {
+            colors[ink::MOSS_DARK as usize + ix] = rgb(value).into();
+        }
+        colors[ink::GOLD_DARK as usize] = rgb(0xc98f00).into();
+        colors[ink::GOLD as usize] = rgb(0xfbbc04).into();
+        colors[ink::IVORY as usize] = rgb(0xe9edf8).into();
+        colors[ink::DUST as usize] = rgb(0xaab4d4).into();
+        colors[ink::WHITE as usize] = rgb(0xffffff).into();
     }
     if guardian == Guardian::Antigravity {
         // The rest of the logo's gradient: green, yellow and blue.
