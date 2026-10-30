@@ -670,7 +670,7 @@ fn workspace_nav_row(
         .id(id)
         .w_full()
         .min_w_0()
-        .items_start()
+        .items_center()
         .gap_2p5()
         .p_2()
         .rounded(px(8.0))
