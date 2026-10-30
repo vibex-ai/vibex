@@ -85831,8 +85831,10 @@ impl FoundationSettings {
         let is_dark = cx.theme().is_dark();
         let muted = theme::semantic_color("muted-foreground", is_dark);
         let border = theme::semantic_color("border", is_dark);
-        let success = theme::semantic_color("success", is_dark);
-        let danger = theme::semantic_color("danger", is_dark);
+        // The shared catalog has no `success`/`danger` roles: the framework
+        // theme carries them as aliases of `chart-2` and `destructive`.
+        let success = cx.theme().success;
+        let danger = cx.theme().danger;
         let step = snapshot
             .map(|snapshot| snapshot.step)
             .unwrap_or(ProvisioningStep::ResolvingHost);
@@ -86245,7 +86247,7 @@ impl FoundationSettings {
         let is_dark = cx.theme().is_dark();
         let foreground = theme::semantic_color("foreground", is_dark);
         let muted = theme::semantic_color("muted-foreground", is_dark);
-        let status_color = Self::connection_status_color(row.status, is_dark);
+        let status_color = Self::connection_status_color(row.status, cx.theme());
         let identity = v_flex()
             .min_w_0()
             .flex_1()
@@ -86371,12 +86373,12 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_status_color(status: ConnectionRowStatus, is_dark: bool) -> Hsla {
+    fn connection_status_color(status: ConnectionRowStatus, theme: &Theme) -> Hsla {
         match status {
-            ConnectionRowStatus::Connected => theme::semantic_color("success", is_dark),
-            ConnectionRowStatus::Offline => theme::semantic_color("muted-foreground", is_dark),
-            ConnectionRowStatus::NeedsAttention => theme::semantic_color("danger", is_dark),
-            ConnectionRowStatus::Connecting => theme::semantic_color("warning", is_dark),
+            ConnectionRowStatus::Connected => theme.success,
+            ConnectionRowStatus::Offline => theme.muted_foreground,
+            ConnectionRowStatus::NeedsAttention => theme.danger,
+            ConnectionRowStatus::Connecting => theme.warning,
         }
     }
 
@@ -110551,6 +110553,39 @@ mod tests {
         assert!(row.contains("IconName::Ellipsis"));
         assert!(row.contains("connection_primary_label"));
         assert!(row.contains("semantic_color(\"muted-foreground\""));
+    }
+
+    /// The Connections page paints its status inks from the framework theme,
+    /// whose `success` and `danger` roles are aliases of the catalog's
+    /// `chart-2` and `destructive`. Naming either alias on the catalog panics
+    /// while the panel paints, so every role this page looks up must be one
+    /// the shared token source actually authors.
+    #[test]
+    fn connections_page_only_reads_authored_semantic_roles() {
+        let source = include_str!("app.rs");
+        let connections = source
+            .split_once("    fn connections_progress_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn connection_detail("))
+            .map(|(body, _)| body)
+            .expect("the Connections renderers should remain inspectable");
+        let authored: BTreeSet<&str> = vibex_ui::default_theme(GpuiThemeMode::Dark)
+            .tokens
+            .iter()
+            .map(|token| token.name)
+            .collect();
+        let mut checked = 0;
+        for (index, _) in connections.match_indices("semantic_color(\"") {
+            let remainder = &connections[index + "semantic_color(\"".len()..];
+            let (role, _) = remainder
+                .split_once('"')
+                .expect("a semantic role name ends its literal");
+            assert!(
+                authored.contains(role),
+                "the Connections page reads unknown semantic role {role:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 2, "the page should read authored roles");
     }
 
     /// The import button lives on the settings page, and the settings page is
