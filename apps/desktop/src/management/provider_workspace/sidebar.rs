@@ -486,12 +486,14 @@ impl ManagementCenter {
                 cx,
             ),
             gateway_display_name(&gateway.settings),
-            div()
-                .min_w_0()
-                .truncate()
-                .font_family(cx.theme().mono_font_family.clone())
-                .child(subtitle)
-                .into_any_element(),
+            Some(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .child(subtitle)
+                    .into_any_element(),
+            ),
             Some(ws_state_fact(state, color)),
             None,
             cx.listener(|this, _, _, cx| this.select_workspace_gateway(cx)),
@@ -510,15 +512,11 @@ impl ManagementCenter {
             && !self.provider_create_page_open
             && !self.route_group_page_open;
         let enabled = row.profile.status == vibex_core::ModelProviderProfileStatus::Enabled;
-        let models = row
-            .profile
-            .configured_models
-            .iter()
-            .filter(|model| model.enabled)
-            .count();
         let (health, health_status) = self.shared_provider_health_label(&row.profile);
         let favorite = self.provider_favorites.contains(id.as_str());
-        let subtitle = if row.profile.credentials.is_empty() {
+        // Counts are redundant with the section header and the detail page, but
+        // a missing Key is the one state the card still has to call out.
+        let subtitle = row.profile.credentials.is_empty().then(|| {
             div()
                 .text_color(cx.theme().warning)
                 .child(management_locale_text(
@@ -527,18 +525,7 @@ impl ManagementCenter {
                     "需要 Key",
                 ))
                 .into_any_element()
-        } else {
-            div()
-                .min_w_0()
-                .truncate()
-                .child(format!(
-                    "{models} {} · {} {}",
-                    management_locale_text("models", "个模型", "個模型"),
-                    row.profile.credentials.len(),
-                    management_locale_text("Keys", "个 Key", "個 Key"),
-                ))
-                .into_any_element()
-        };
+        });
         let trailing = if !enabled {
             Tag::color(ColorName::Neutral)
                 .xsmall()
@@ -604,23 +591,13 @@ impl ManagementCenter {
             && !self.provider_create_page_open
             && !self.route_group_page_open;
         let enabled = row.route.status == vibex_core::RouteStatus::Enabled;
-        let subtitle = format!(
-            "{} {} · {}",
-            row.route.members.len(),
-            management_locale_text("members", "个成员", "個成員"),
-            management_route_strategy_label(row.route.strategy)
-        );
         let select_id = id.clone();
         workspace_nav_row(
             SharedString::from(format!("management-global-route-row-{id}")),
             selected,
             ws_icon_tile("icons/vibex/git-branch.svg", px(30.0), None, cx),
             row.route.display_name.clone(),
-            div()
-                .min_w_0()
-                .truncate()
-                .child(subtitle)
-                .into_any_element(),
+            None,
             (!enabled).then(|| {
                 Tag::color(ColorName::Neutral)
                     .xsmall()
@@ -673,16 +650,17 @@ pub(super) fn workspace_gateway_state(
 /// One card of the left column.
 ///
 /// Each record is a bordered card: the mark leads, the name and its state share
-/// the first line, a summary sits under them, and the Agents that use the
-/// record close the card as a row of logos. Selection fills the card with the
-/// accent plate; hover is a lighter wash, so pointing never outshines a click.
+/// the first line, an optional summary sits under them, and the Agents that use
+/// the record close the card as a row of logos. Selection fills the card with
+/// the accent plate; hover is a lighter wash, so pointing never outshines a
+/// click.
 #[allow(clippy::too_many_arguments)]
 fn workspace_nav_row(
     id: SharedString,
     selected: bool,
     mark: AnyElement,
     title: impl Into<SharedString>,
-    subtitle: AnyElement,
+    subtitle: Option<AnyElement>,
     trailing: Option<AnyElement>,
     footer: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -740,13 +718,13 @@ fn workspace_nav_row(
                             trailing.map(|trailing| div().flex_none().text_xs().child(trailing)),
                         ),
                 )
-                .child(
+                .children(subtitle.map(|subtitle| {
                     div()
                         .min_w_0()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(subtitle),
-                )
+                        .child(subtitle)
+                }))
                 .children(footer.map(|footer| div().pt_0p5().child(footer))),
         )
         .on_click(on_click)
