@@ -6,8 +6,8 @@
 //! it, and the story under the map says in words what the map shows.
 
 use super::route_stage::{
-    FlightPhase, HopResult, RouteStage, StageAgent, StageFlight, StageHop, StageModel,
-    StageTarget, TargetState, agent_hue,
+    FlightPhase, HopResult, RouteStage, StageAgent, StageFlight, StageHop, StageModel, StageTarget,
+    TargetState, agent_hue,
 };
 use super::*;
 
@@ -34,8 +34,14 @@ impl ManagementCenter {
         // A pinned request that has left the ledger and the live table
         // unpins: the map must not describe a request nobody can see.
         if let Some(pinned) = self.gateway_route_pinned.clone()
-            && !self.gateway_requests.iter().any(|request| request.request_id == pinned)
-            && !self.gateway_inflight.iter().any(|request| request.request_id == pinned)
+            && !self
+                .gateway_requests
+                .iter()
+                .any(|request| request.request_id == pinned)
+            && !self
+                .gateway_inflight
+                .iter()
+                .any(|request| request.request_id == pinned)
         {
             self.gateway_route_pinned = None;
         }
@@ -120,7 +126,11 @@ impl ManagementCenter {
                         Button::new("management-route-live")
                             .small()
                             .outline()
-                            .label(management_locale_text("Back to live", "回到实时", "回到即時"))
+                            .label(management_locale_text(
+                                "Back to live",
+                                "回到实时",
+                                "回到即時",
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.gateway_route_pinned = None;
                                 cx.notify();
@@ -148,19 +158,18 @@ impl ManagementCenter {
                     .child(actions),
             )
             .child(
-                div()
-                    .w_full()
-                    .px_4()
-                    .pb_2()
-                    .child(
-                        AnyView::from(stage)
-                            .cached(StyleRefinement::default().w_full())
-                            .into_any_element(),
-                    ),
+                div().w_full().px_4().pb_2().child(
+                    AnyView::from(stage)
+                        .cached(StyleRefinement::default().w_full())
+                        .into_any_element(),
+                ),
             )
             .child(self.render_workspace_route_story(cx));
 
-        ws_stack(vec![map.into_any_element(), self.render_workspace_route_list(cx)])
+        ws_stack(vec![
+            map.into_any_element(),
+            self.render_workspace_route_list(cx),
+        ])
     }
 
     /// The request the story tells: the picked one, else the newest.
@@ -200,7 +209,10 @@ impl ManagementCenter {
             let (mark, color) = match kind {
                 StoryKind::Ask => ("icons/vibex/send.svg", cx.theme().foreground),
                 StoryKind::Why => ("icons/vibex/git-branch.svg", cx.theme().muted_foreground),
-                StoryKind::Skip => ("icons/vibex/chevrons-right.svg", cx.theme().muted_foreground),
+                StoryKind::Skip => (
+                    "icons/vibex/chevrons-right.svg",
+                    cx.theme().muted_foreground,
+                ),
                 StoryKind::Failed => ("icons/vibex/rotate-ccw.svg", cx.theme().danger),
                 StoryKind::Answered => ("icons/vibex/zap.svg", cx.theme().success),
                 StoryKind::Broke => ("icons/vibex/shield-alert.svg", cx.theme().danger),
@@ -213,9 +225,10 @@ impl ManagementCenter {
                     .items_start()
                     .gap_2()
                     .child(
-                        div().flex_none().pt(px(2.0)).child(
-                            Icon::default().path(mark).size(px(13.0)).text_color(color),
-                        ),
+                        div()
+                            .flex_none()
+                            .pt(px(2.0))
+                            .child(Icon::default().path(mark).size(px(13.0)).text_color(color)),
                     )
                     .child(
                         div()
@@ -251,11 +264,16 @@ impl ManagementCenter {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(div().text_xs().font_semibold().child(management_locale_text(
-                        "How it was routed",
-                        "路由经过",
-                        "路由經過",
-                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .child(management_locale_text(
+                                "How it was routed",
+                                "路由经过",
+                                "路由經過",
+                            )),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -288,11 +306,11 @@ impl ManagementCenter {
                         live.requested_model
                     ),
                 ));
-                if let Some(route) = live
-                    .model_route_id
-                    .as_deref()
-                    .and_then(|id| self.model_routes.iter().find(|route| route.id.as_str() == id))
-                {
+                if let Some(route) = live.model_route_id.as_deref().and_then(|id| {
+                    self.model_routes
+                        .iter()
+                        .find(|route| route.id.as_str() == id)
+                }) {
                     lines.push((StoryKind::Why, self.workspace_route_group_line(route)));
                 }
                 let provider = self.workspace_provider_name(&live.model_provider_profile_id);
@@ -384,7 +402,11 @@ impl ManagementCenter {
                         if decision.retries > 0 {
                             parts.push(format!(
                                 "{} {}",
-                                management_locale_text("whole walk retried", "整轮重试", "整輪重試"),
+                                management_locale_text(
+                                    "whole walk retried",
+                                    "整轮重试",
+                                    "整輪重試"
+                                ),
                                 decision.retries
                             ));
                         }
@@ -408,12 +430,8 @@ impl ManagementCenter {
                             format!(
                                 "{} {} · {}",
                                 management_locale_text("Skipped", "跳过", "跳過"),
-                                skipped
-                                    .provider_name
-                                    .clone()
-                                    .unwrap_or_else(|| self.workspace_provider_name(
-                                        &skipped.model_provider_profile_id
-                                    )),
+                                skipped.provider_name.clone().unwrap_or_else(|| self
+                                    .workspace_provider_name(&skipped.model_provider_profile_id)),
                                 gateway_failure_text(skipped.failure, locale)
                             ),
                         ));
@@ -423,9 +441,17 @@ impl ManagementCenter {
                             StoryKind::Skip,
                             format!(
                                 "{} {} · {} {}",
-                                management_locale_text("Stepped over", "跳过冷却中的 Key", "跳過冷卻中的 Key"),
+                                management_locale_text(
+                                    "Stepped over",
+                                    "跳过冷却中的 Key",
+                                    "跳過冷卻中的 Key"
+                                ),
                                 trace.skipped_cooling,
-                                management_locale_text("over their ceiling", "超出上限的 Key", "超出上限的 Key"),
+                                management_locale_text(
+                                    "over their ceiling",
+                                    "超出上限的 Key",
+                                    "超出上限的 Key"
+                                ),
                                 trace.skipped_over_limit
                             ),
                         ));
@@ -435,7 +461,8 @@ impl ManagementCenter {
                             .workspace_provider_of_credential(&attempt.credential_id)
                             .map(|profile| profile.display_name.clone())
                             .unwrap_or_else(|| done.provider_name.clone());
-                        let key = gateway_credential_name(attempt.credential_name.as_deref(), locale);
+                        let key =
+                            gateway_credential_name(attempt.credential_name.as_deref(), locale);
                         let rest = attempt
                             .failure
                             .cooldown_ms()
@@ -459,7 +486,8 @@ impl ManagementCenter {
                 let key = gateway_credential_name(done.credential_name.as_deref(), locale);
                 let ok = matches!(
                     done.outcome,
-                    vibex_core::GatewayRequestOutcome::Ok | vibex_core::GatewayRequestOutcome::Failover
+                    vibex_core::GatewayRequestOutcome::Ok
+                        | vibex_core::GatewayRequestOutcome::Failover
                 );
                 if ok {
                     let mut parts = vec![format!(
@@ -539,9 +567,12 @@ impl ManagementCenter {
         &self,
         id: &vibex_core::RequestId,
     ) -> Option<&vibex_core::ModelProviderProfile> {
-        self.providers
-            .iter()
-            .find(|profile| profile.credentials.iter().any(|credential| &credential.id == id))
+        self.providers.iter().find(|profile| {
+            profile
+                .credentials
+                .iter()
+                .any(|credential| &credential.id == id)
+        })
     }
 
     fn workspace_key_name(&self, id: &vibex_core::RequestId) -> Option<String> {
@@ -593,11 +624,16 @@ impl ManagementCenter {
         let mut targets = Vec::<StageTarget>::new();
         let mut hops = Vec::new();
         let profile_of = |id: &vibex_core::ModelProviderProfileId| {
-            self.providers.iter().find(|profile| &profile.id == id).cloned()
+            self.providers
+                .iter()
+                .find(|profile| &profile.id == id)
+                .cloned()
         };
         if let Some(trace) = done.route.as_ref() {
             for attempt in &trace.failed_attempts {
-                let profile = self.workspace_provider_of_credential(&attempt.credential_id).cloned();
+                let profile = self
+                    .workspace_provider_of_credential(&attempt.credential_id)
+                    .cloned();
                 targets.push(StageTarget {
                     title: profile
                         .as_ref()
@@ -625,7 +661,9 @@ impl ManagementCenter {
             subtitle: format!(
                 "{} · {}",
                 gateway_credential_name(done.credential_name.as_deref(), locale),
-                done.model_served.clone().unwrap_or_else(|| done.model_requested.clone())
+                done.model_served
+                    .clone()
+                    .unwrap_or_else(|| done.model_requested.clone())
             ),
             state: TargetState::Ready,
         });
@@ -633,9 +671,9 @@ impl ManagementCenter {
             target: targets.len() - 1,
             result: if ok { HopResult::Ok } else { HopResult::Failed },
             tag: SharedString::from(if ok {
-                done.latency_ms
-                    .map(gateway_duration)
-                    .unwrap_or_else(|| management_locale_text("answered", "已响应", "已回應").to_string())
+                done.latency_ms.map(gateway_duration).unwrap_or_else(|| {
+                    management_locale_text("answered", "已响应", "已回應").to_string()
+                })
             } else {
                 done.status
                     .map(|status| format!("HTTP {status}"))
@@ -646,10 +684,9 @@ impl ManagementCenter {
             for skipped in &trace.skipped_members {
                 targets.push(StageTarget {
                     profile: profile_of(&skipped.model_provider_profile_id),
-                    title: skipped
-                        .provider_name
-                        .clone()
-                        .unwrap_or_else(|| self.workspace_provider_name(&skipped.model_provider_profile_id)),
+                    title: skipped.provider_name.clone().unwrap_or_else(|| {
+                        self.workspace_provider_name(&skipped.model_provider_profile_id)
+                    }),
                     subtitle: skipped.wire_protocol_id.clone(),
                     state: TargetState::Skipped(SharedString::from(gateway_failure_text(
                         skipped.failure,
@@ -699,10 +736,16 @@ impl ManagementCenter {
             }
         };
         for request in &self.gateway_inflight {
-            push_agent(request.agent_id.as_deref().unwrap_or("agent"), &mut agent_ids);
+            push_agent(
+                request.agent_id.as_deref().unwrap_or("agent"),
+                &mut agent_ids,
+            );
         }
         for request in &landed {
-            push_agent(request.agent_id.as_deref().unwrap_or("agent"), &mut agent_ids);
+            push_agent(
+                request.agent_id.as_deref().unwrap_or("agent"),
+                &mut agent_ids,
+            );
         }
         let gateway_routes = self
             .model_routes
@@ -710,7 +753,10 @@ impl ManagementCenter {
             .filter(|route| route.kind.via_gateway())
             .collect::<Vec<_>>();
         for binding in &self.agent_model_route_bindings {
-            if gateway_routes.iter().any(|route| route.id == binding.model_route_id) {
+            if gateway_routes
+                .iter()
+                .any(|route| route.id == binding.model_route_id)
+            {
                 push_agent(binding.agent_id.as_str(), &mut agent_ids);
             }
         }
@@ -718,12 +764,13 @@ impl ManagementCenter {
 
         // Members: the Providers with traffic first, then the groups' members.
         let mut provider_ids = Vec::<vibex_core::ModelProviderProfileId>::new();
-        let mut push_provider = |id: &vibex_core::ModelProviderProfileId,
-                                 providers: &mut Vec<vibex_core::ModelProviderProfileId>| {
-            if !providers.contains(id) {
-                providers.push(id.clone());
-            }
-        };
+        let mut push_provider =
+            |id: &vibex_core::ModelProviderProfileId,
+             providers: &mut Vec<vibex_core::ModelProviderProfileId>| {
+                if !providers.contains(id) {
+                    providers.push(id.clone());
+                }
+            };
         for request in &self.gateway_inflight {
             push_provider(&request.model_provider_profile_id, &mut provider_ids);
         }
@@ -745,14 +792,16 @@ impl ManagementCenter {
                     .upstreams
                     .iter()
                     .find(|upstream| &upstream.model_provider_profile_id == id);
-                let keys = upstream.map(|upstream| upstream.keys.as_slice()).unwrap_or_default();
+                let keys = upstream
+                    .map(|upstream| upstream.keys.as_slice())
+                    .unwrap_or_default();
                 let ready = keys
                     .iter()
                     .filter(|key| key.state == vibex_core::GatewayKeyState::Ready)
                     .count();
                 let cooling = keys
                     .iter()
-                    .filter(|key| key.state == vibex_core::GatewayKeyState::Cooling)
+                    .filter(|key| matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. }))
                     .count();
                 let state = if !keys.is_empty() && ready == 0 && cooling > 0 {
                     TargetState::Cooling(SharedString::from(management_locale_text(
@@ -766,7 +815,11 @@ impl ManagementCenter {
                     TargetState::Ready
                 };
                 StageTarget {
-                    profile: self.providers.iter().find(|profile| &profile.id == id).cloned(),
+                    profile: self
+                        .providers
+                        .iter()
+                        .find(|profile| &profile.id == id)
+                        .cloned(),
                     title: self.workspace_provider_name(id),
                     subtitle: format!(
                         "{ready}/{} {}",
@@ -834,10 +887,7 @@ impl ManagementCenter {
                     target,
                     result: if ok { HopResult::Ok } else { HopResult::Failed },
                     tag: SharedString::from(if ok {
-                        request
-                            .latency_ms
-                            .map(gateway_duration)
-                            .unwrap_or_default()
+                        request.latency_ms.map(gateway_duration).unwrap_or_default()
                     } else {
                         request
                             .status
@@ -858,7 +908,8 @@ impl ManagementCenter {
                 .into_iter()
                 .map(|id| StageAgent {
                     label: if id == "agent" {
-                        management_locale_text("Unknown Agent", "未知 Agent", "未知 Agent").to_string()
+                        management_locale_text("Unknown Agent", "未知 Agent", "未知 Agent")
+                            .to_string()
                     } else {
                         self.workspace_agent_label(&id)
                     },
@@ -935,7 +986,10 @@ impl ManagementCenter {
                 matches!(
                     (active, request.outcome),
                     (GatewayRequestFilter::All, _)
-                        | (GatewayRequestFilter::Ok, vibex_core::GatewayRequestOutcome::Ok)
+                        | (
+                            GatewayRequestFilter::Ok,
+                            vibex_core::GatewayRequestOutcome::Ok
+                        )
                         | (
                             GatewayRequestFilter::Failover,
                             vibex_core::GatewayRequestOutcome::Failover
@@ -1001,7 +1055,7 @@ impl ManagementCenter {
                         range
                             .filter_map(|index| {
                                 let row = rows.get(index)?;
-                                Some(this.render_workspace_route_row(row, cx))
+                                Some(this.render_workspace_routes_list_row(row, cx))
                             })
                             .collect()
                     },
@@ -1049,11 +1103,10 @@ impl ManagementCenter {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .w(rems(14.0))
-                            .child(management_search_input_compact(&self.gateway_request_search, cx)),
-                    )
+                    .child(div().w(rems(14.0)).child(management_search_input_compact(
+                        &self.gateway_request_search,
+                        cx,
+                    )))
                     .child(filter)
                     .into_any_element(),
             ),
@@ -1067,7 +1120,11 @@ impl ManagementCenter {
         )
     }
 
-    fn render_workspace_route_row(&self, row: &RouteListRow, cx: &mut Context<Self>) -> AnyElement {
+    fn render_workspace_routes_list_row(
+        &self,
+        row: &RouteListRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let locale = locale::current_locale();
         let (id, at_ms, agent, model, outcome, result, metrics) = match row {
             RouteListRow::Live(live) => {
@@ -1100,7 +1157,9 @@ impl ManagementCenter {
                 let outcome = match done.outcome {
                     vibex_core::GatewayRequestOutcome::Ok if failovers == 0 => RowOutcome::Ok,
                     vibex_core::GatewayRequestOutcome::Ok
-                    | vibex_core::GatewayRequestOutcome::Failover => RowOutcome::Moved(failovers.max(1)),
+                    | vibex_core::GatewayRequestOutcome::Failover => {
+                        RowOutcome::Moved(failovers.max(1))
+                    }
                     _ => RowOutcome::Failed,
                 };
                 let result = match outcome {
@@ -1171,7 +1230,9 @@ impl ManagementCenter {
                 cx.theme().transparent
             })
             .when(selected, |row| row.bg(cx.theme().accent))
-            .when(!selected, |row| row.hover(|style| style.bg(cx.theme().muted.opacity(0.6))))
+            .when(!selected, |row| {
+                row.hover(|style| style.bg(cx.theme().muted.opacity(0.6)))
+            })
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.gateway_route_pinned = if this.gateway_route_pinned.as_ref() == Some(&pick) {
@@ -1235,12 +1296,10 @@ impl ManagementCenter {
                             _ => None,
                         },
                         |line, count| {
-                            line.child(
-                                Tag::color(ColorName::Blue).xsmall().child(format!(
-                                    "{} ×{count}",
-                                    management_locale_text("moved", "转移", "轉移")
-                                )),
-                            )
+                            line.child(Tag::color(ColorName::Blue).xsmall().child(format!(
+                                "{} ×{count}",
+                                management_locale_text("moved", "转移", "轉移")
+                            )))
                         },
                     )
                     .when(matches!(outcome, RowOutcome::Live), |line| {
@@ -1296,25 +1355,32 @@ fn route_list_header(cx: &App) -> AnyElement {
         .pb_1()
         .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .child(div().flex_none().w(rems(4.5)).child(management_locale_text("Time", "时间", "時間")))
         .child(
             div()
-                .flex_1()
-                .min_w_0()
-                .child(management_locale_text("Agent · model asked", "Agent · 请求模型", "Agent · 請求模型")),
+                .flex_none()
+                .w(rems(4.5))
+                .child(management_locale_text("Time", "时间", "時間")),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(management_locale_text("Answered by", "响应方", "回應方")),
-        )
+        .child(div().flex_1().min_w_0().child(management_locale_text(
+            "Agent · model asked",
+            "Agent · 请求模型",
+            "Agent · 請求模型",
+        )))
+        .child(div().flex_1().min_w_0().child(management_locale_text(
+            "Answered by",
+            "响应方",
+            "回應方",
+        )))
         .child(
             div()
                 .flex_none()
                 .w(rems(8.0))
                 .text_right()
-                .child(management_locale_text("Tokens · time", "Token · 用时", "Token · 用時")),
+                .child(management_locale_text(
+                    "Tokens · time",
+                    "Token · 用时",
+                    "Token · 用時",
+                )),
         )
         .into_any_element()
 }

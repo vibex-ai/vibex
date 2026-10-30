@@ -139,12 +139,7 @@ impl RouteStage {
     }
 
     fn stage_height(&self) -> f32 {
-        let rows = self
-            .model
-            .agents
-            .len()
-            .max(self.model.targets.len())
-            .max(2) as f32;
+        let rows = self.model.agents.len().max(self.model.targets.len()).max(2) as f32;
         PAD_Y * 2.0 + rows * ROW_H
     }
 }
@@ -152,12 +147,12 @@ impl RouteStage {
 /// A wire's two ends.
 #[derive(Clone, Copy)]
 struct Wire {
-    from: Point<Pixels>,
-    to: Point<Pixels>,
+    from: gpui::Point<Pixels>,
+    to: gpui::Point<Pixels>,
 }
 
 impl Wire {
-    fn at(&self, t: f32) -> Point<Pixels> {
+    fn at(&self, t: f32) -> gpui::Point<Pixels> {
         let t = t.clamp(0.0, 1.0);
         let mx = (self.from.x + self.to.x) / 2.0;
         let p0 = self.from;
@@ -262,11 +257,19 @@ fn replay_frame(flight: &StageFlight, elapsed: f32) -> FlightFrame {
                 Leg::Hold(target, _) => (DotPlace::At { target }, DotStyle::Held),
                 Leg::Back(target, ok) => (
                     DotPlace::TargetWire { target, t: 1.0 - t },
-                    if ok { DotStyle::HomeOk } else { DotStyle::HomeErr },
+                    if ok {
+                        DotStyle::HomeOk
+                    } else {
+                        DotStyle::HomeErr
+                    },
                 ),
                 Leg::Home(_, ok) => (
                     DotPlace::AgentWire { t: 1.0 - t },
-                    if ok { DotStyle::HomeOk } else { DotStyle::HomeErr },
+                    if ok {
+                        DotStyle::HomeOk
+                    } else {
+                        DotStyle::HomeErr
+                    },
                 ),
             };
             return FlightFrame {
@@ -291,7 +294,12 @@ fn replay_frame(flight: &StageFlight, elapsed: f32) -> FlightFrame {
     }
 }
 
-fn flight_frame(flight: &StageFlight, now_ms: i64, replay_elapsed: f32, reduce_motion: bool) -> FlightFrame {
+fn flight_frame(
+    flight: &StageFlight,
+    now_ms: i64,
+    replay_elapsed: f32,
+    reduce_motion: bool,
+) -> FlightFrame {
     match flight.phase {
         FlightPhase::Replay => {
             if reduce_motion {
@@ -318,9 +326,19 @@ fn flight_frame(flight: &StageFlight, now_ms: i64, replay_elapsed: f32, reduce_m
             let elapsed = (now_ms - started_ms).max(0) as f32;
             let revealed = flight.hops.len() - 1;
             let dot = if reduce_motion || elapsed >= LEG_IN + LEG_OUT {
-                (DotPlace::At { target: current.target }, DotStyle::Held)
+                (
+                    DotPlace::At {
+                        target: current.target,
+                    },
+                    DotStyle::Held,
+                )
             } else if elapsed < LEG_IN {
-                (DotPlace::AgentWire { t: ease(elapsed / LEG_IN) }, DotStyle::Out)
+                (
+                    DotPlace::AgentWire {
+                        t: ease(elapsed / LEG_IN),
+                    },
+                    DotStyle::Out,
+                )
             } else {
                 (
                     DotPlace::TargetWire {
@@ -346,7 +364,11 @@ fn flight_frame(flight: &StageFlight, now_ms: i64, replay_elapsed: f32, reduce_m
                     ..FlightFrame::default()
                 };
             };
-            let style = if ok { DotStyle::HomeOk } else { DotStyle::HomeErr };
+            let style = if ok {
+                DotStyle::HomeOk
+            } else {
+                DotStyle::HomeErr
+            };
             let travel = LEG_BACK + LEG_HOME;
             let dot = if reduce_motion || elapsed >= travel {
                 None
@@ -393,9 +415,9 @@ pub(crate) fn agent_hue(agent_id: &str, cx: &App) -> Hsla {
         theme.cyan,
         theme.magenta,
     ];
-    let hash = agent_id
-        .bytes()
-        .fold(0u32, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u32));
+    let hash = agent_id.bytes().fold(0u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u32)
+    });
     palette[hash as usize % palette.len()]
 }
 
@@ -404,8 +426,8 @@ impl Render for RouteStage {
         let height = self.stage_height();
         let hub_y = height / 2.0;
         let now_ms = vibex_core::unix_timestamp_ms();
-        let reduce_motion = cx.reduce_motion()
-            || crate::motion::pauses_while_inactive(!window.is_window_active());
+        let reduce_motion =
+            cx.reduce_motion() || crate::motion::pauses_while_inactive(!window.is_window_active());
         let replay_elapsed = self
             .replay_started
             .map(|started| started.elapsed().as_secs_f32() * 1000.0)
@@ -438,7 +460,8 @@ impl Render for RouteStage {
 
         // What each target shows now: a tag for a decided hop, a highlight for
         // a member being waited on.
-        let mut target_tags: Vec<Option<(SharedString, HopResult)>> = vec![None; self.model.targets.len()];
+        let mut target_tags: Vec<Option<(SharedString, HopResult)>> =
+            vec![None; self.model.targets.len()];
         let mut target_waiting = vec![None::<Hsla>; self.model.targets.len()];
         let mut agent_active = vec![None::<Hsla>; self.model.agents.len()];
         for (flight, frame) in self.model.flights.iter().zip(&frames) {
@@ -502,7 +525,10 @@ impl Render for RouteStage {
                     if frame.gone {
                         continue;
                     }
-                    let hue = hues.get(flight.agent).copied().unwrap_or(theme.muted_foreground);
+                    let hue = hues
+                        .get(flight.agent)
+                        .copied()
+                        .unwrap_or(theme.muted_foreground);
                     if let Some(slot) = lit_agents.get_mut(flight.agent) {
                         *slot = Some((hue, frame.glow));
                     }
@@ -520,11 +546,8 @@ impl Render for RouteStage {
                     for (index, hop) in flight.hops.iter().take(shown).enumerate() {
                         let failed = hop.result == HopResult::Failed && index < frame.revealed;
                         if let Some(slot) = lit_targets.get_mut(hop.target) {
-                            *slot = Some((
-                                if failed { theme.danger } else { hue },
-                                frame.glow,
-                                failed,
-                            ));
+                            *slot =
+                                Some((if failed { theme.danger } else { hue }, frame.glow, failed));
                         }
                     }
                 }
@@ -579,7 +602,7 @@ impl Render for RouteStage {
                             center.x - px(HUB_W / 2.0 + grow),
                             center.y - px(HUB_H / 2.0 + grow),
                         ),
-                        size(px(HUB_W + grow * 2.0), px(HUB_H + grow * 2.0)),
+                        gpui::size(px(HUB_W + grow * 2.0), px(HUB_H + grow * 2.0)),
                     );
                     window.paint_quad(
                         gpui::outline(
@@ -599,7 +622,10 @@ impl Render for RouteStage {
                     let Some(current) = flight.hops.last() else {
                         continue;
                     };
-                    let hue = hues.get(flight.agent).copied().unwrap_or(theme.muted_foreground);
+                    let hue = hues
+                        .get(flight.agent)
+                        .copied()
+                        .unwrap_or(theme.muted_foreground);
                     let phase = (now_ms % 1400) as f32 / 1400.0;
                     for particle in 0..3 {
                         let t = (phase + particle as f32 / 3.0) % 1.0;
@@ -619,7 +645,10 @@ impl Render for RouteStage {
                     let Some((place, style)) = frame.dot else {
                         continue;
                     };
-                    let hue = hues.get(flight.agent).copied().unwrap_or(theme.muted_foreground);
+                    let hue = hues
+                        .get(flight.agent)
+                        .copied()
+                        .unwrap_or(theme.muted_foreground);
                     let position = match place {
                         DotPlace::AgentWire { t } => agent_wire(flight.agent).at(t),
                         DotPlace::TargetWire { target, t } => target_wire(target).at(t),
@@ -632,7 +661,13 @@ impl Render for RouteStage {
                         }
                         DotStyle::Held => {
                             let breath = 0.5 + 0.5 * (pulse_phase * std::f32::consts::TAU).sin();
-                            paint_dot(window, position, 7.0 + 4.0 * breath, hue.opacity(0.22), None);
+                            paint_dot(
+                                window,
+                                position,
+                                7.0 + 4.0 * breath,
+                                hue.opacity(0.22),
+                                None,
+                            );
                             paint_dot(window, position, 4.5, hue, None);
                         }
                         DotStyle::HomeOk => {
@@ -881,10 +916,16 @@ impl Render for RouteStage {
     }
 }
 
-fn paint_dot(window: &mut Window, center: Point<Pixels>, radius: f32, color: Hsla, ring: Option<Hsla>) {
+fn paint_dot(
+    window: &mut Window,
+    center: gpui::Point<Pixels>,
+    radius: f32,
+    color: Hsla,
+    ring: Option<Hsla>,
+) {
     let bounds = Bounds::new(
         point(center.x - px(radius), center.y - px(radius)),
-        size(px(radius * 2.0), px(radius * 2.0)),
+        gpui::size(px(radius * 2.0), px(radius * 2.0)),
     );
     let mut quad = gpui::fill(bounds, color).corner_radii(px(radius));
     if let Some(ring) = ring {

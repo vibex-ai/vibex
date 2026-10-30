@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use crate::typography::code_font_weight;
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
-    Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle, SharedString,
-    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window,
-    canvas, div, point, prelude::*, px, rems, size as gpui_size,
+    AccessibleAction, Anchor, AnyElement, AnyView, App, Bounds, ClickEvent, Context, DragMoveEvent,
+    Empty, Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle,
+    SharedString, Size as GpuiSize, StatefulInteractiveElement as _, StyleRefinement, Subscription,
+    Task, WeakEntity, Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
