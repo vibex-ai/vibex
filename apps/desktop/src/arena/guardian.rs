@@ -561,7 +561,7 @@ impl Boss {
             // The blue square at the tile's upper right corner.
             Guardian::Kimi => self.articulated(4.35, 3.4, 11.4),
             // The gem on its chest.
-            Guardian::CodeBuddy => self.articulated(0.0, 6.0, 7.2 * squash),
+            Guardian::CodeBuddy => self.articulated(0.0, 5.2, 6.6 * squash),
             // The heart hanging under the apex, between the legs.
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
             // The heart down in the hub's open mouth.
