@@ -847,6 +847,39 @@ mod tests {
         assert!(SIDEBAR.contains("import_shared_providers("));
     }
 
+    /// The Agents that use a record sit on the card's trailing edge, and the
+    /// row stops at five marks so it never pushes the name out of its column.
+    #[test]
+    fn card_agent_logos_trail_the_card_and_stop_at_five() {
+        let logos = SIDEBAR
+            .split_once("fn workspace_agent_logos(")
+            .map(|(_, tail)| tail)
+            .expect("the card's Agent logo row should remain inspectable");
+        assert!(logos.contains("const LIMIT: usize = 5;"));
+        assert!(logos.contains(".take(LIMIT)"));
+        assert!(logos.contains("format!(\"+{}\", agents.len() - LIMIT)"));
+        assert!(!logos.contains(".w_full()"));
+
+        let row = SIDEBAR
+            .split_once("fn workspace_nav_row(")
+            .map(|(_, tail)| tail)
+            .expect("the card's row should remain inspectable");
+        let logos_slot = row
+            .find(".children(agent_logos)")
+            .expect("the row draws the Agent logos itself");
+        let title = row
+            .find(".child(title.into())")
+            .expect("the row draws its name");
+        assert!(
+            title < logos_slot,
+            "the Agent logos belong after the name, on the card's trailing edge"
+        );
+        assert!(
+            !row.contains(".children(footer"),
+            "the card has no line under the name: the logos trail it instead"
+        );
+    }
+
     /// Every detail view opens with the same identity header and underline
     /// tabs, so the three records read as one page family.
     #[test]

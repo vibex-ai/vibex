@@ -649,11 +649,10 @@ pub(super) fn workspace_gateway_state(
 
 /// One card of the left column.
 ///
-/// Each record is a bordered card: the mark leads, the name and its state share
-/// the first line, an optional summary sits under them, and the Agents that use
-/// the record close the card as a row of logos. Selection fills the card with
-/// the accent plate; hover is a lighter wash, so pointing never outshines a
-/// click.
+/// Each record is a bordered card: the mark leads, the name and its state fill
+/// the middle, and the Agents that use the record trail the card as a row of
+/// logos. Selection fills the card with the accent plate; hover is a lighter
+/// wash, so pointing never outshines a click.
 #[allow(clippy::too_many_arguments)]
 fn workspace_nav_row(
     id: SharedString,
@@ -662,7 +661,7 @@ fn workspace_nav_row(
     title: impl Into<SharedString>,
     subtitle: Option<AnyElement>,
     trailing: Option<AnyElement>,
-    footer: Option<AnyElement>,
+    agent_logos: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
@@ -700,23 +699,13 @@ fn workspace_nav_row(
                 .min_w_0()
                 .gap_0p5()
                 .child(
-                    h_flex()
+                    div()
                         .w_full()
                         .min_w_0()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .font_medium()
-                                .child(title.into()),
-                        )
-                        .children(
-                            trailing.map(|trailing| div().flex_none().text_xs().child(trailing)),
-                        ),
+                        .truncate()
+                        .text_sm()
+                        .font_medium()
+                        .child(title.into()),
                 )
                 .children(subtitle.map(|subtitle| {
                     div()
@@ -724,27 +713,32 @@ fn workspace_nav_row(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(subtitle)
-                }))
-                .children(footer.map(|footer| div().pt_0p5().child(footer))),
+                })),
         )
+        .children(agent_logos)
+        .children(trailing.map(|trailing| div().flex_none().text_xs().child(trailing)))
         .on_click(on_click)
         .into_any_element()
 }
 
-/// The Agents that use a record, as a row of logos with an overflow count.
+/// The Agents that use a record, trailing the card as a row of logos.
+///
+/// The row keeps the card's right edge stable: it draws at most five marks and
+/// summarises the rest as one count, so a record shared by every Agent never
+/// pushes the name out of its column.
 fn workspace_agent_logos(
     id: &str,
     agents: &BTreeSet<String>,
     labels: impl Fn(&str) -> String,
     cx: &App,
 ) -> Option<AnyElement> {
-    const LIMIT: usize = 12;
+    const LIMIT: usize = 5;
     if agents.is_empty() {
         return None;
     }
     Some(
         h_flex()
-            .w_full()
+            .flex_none()
             .items_center()
             .gap_1()
             .children(agents.iter().take(LIMIT).map(|agent_id| {
@@ -758,10 +752,26 @@ fn workspace_agent_logos(
                     .child(agent_brand_icon(agent_id, px(14.0), None))
             }))
             .when(agents.len() > LIMIT, |stack| {
+                // The count is the card's only clipped fact, so hovering it
+                // names the Agents it stands for instead of leaving them
+                // unreachable from the card.
+                let rest = SharedString::from(
+                    agents
+                        .iter()
+                        .skip(LIMIT)
+                        .map(|agent_id| labels(agent_id))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
                 stack.child(
                     div()
+                        .id(SharedString::from(format!("{id}-agent-rest")))
+                        .flex_none()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(rest.clone()).build(window, cx)
+                        })
                         .child(format!("+{}", agents.len() - LIMIT)),
                 )
             })
