@@ -774,6 +774,14 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
+/// How far short of the bottom a closing disclosure may land and still hand the
+/// live edge back. A spring stops inside its tolerance, and measured heights
+/// are rounded up, so the last frame can sit a pixel or two off.
+const AGENT_TIMELINE_DISCLOSURE_LANDING_SLACK_PX: f32 = 2.0;
+/// Frames a disclosure keeps its rows hung after it stops moving. A height
+/// reaches the row table through a windowed group's reservation, the process
+/// run's and the turn's own measurement, one frame each.
+const AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES: u8 = 3;
 /// Where the permission alert aims the card it points at. The alert names a
 /// card rather than a keyword inside one, so a card taller than the viewport
 /// opens on its header instead of on an arbitrary line.
@@ -5037,6 +5045,14 @@ pub struct SessionView {
     #[cfg(test)]
     timeline_group_rows_built: Vec<usize>,
     timeline_disclosure_animating: bool,
+    /// Frames until the row table has caught up with the last disclosure that
+    /// moved. A virtual row's box is the height an earlier frame measured, so a
+    /// disclosure that has stopped moving still draws against a stale box.
+    timeline_disclosure_settle_frames: u8,
+    /// The moving disclosure was opened with the screen held still, so the
+    /// rows stay on their boxes' tops while the extent catches up with them.
+    /// See [`Self::timeline_rows_hang_from_bottom`].
+    timeline_disclosure_holds_screen: bool,
     timeline_load_updates: std::rc::Weak<RefCell<timeline_loading::TimelineLoadUpdates>>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
@@ -5205,6 +5221,8 @@ impl SessionView {
             #[cfg(test)]
             timeline_group_rows_built: Vec::new(),
             timeline_disclosure_animating: false,
+            timeline_disclosure_settle_frames: 0,
+            timeline_disclosure_holds_screen: false,
             timeline_load_updates: Default::default(),
             timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
@@ -10548,9 +10566,14 @@ impl VibexWorkbench {
         self.timeline_file_diff_previews
             .retain(|_, (sequence, _)| *sequence != item.sequence);
         self.timeline_item_index.get_mut().invalidate();
+        // The row is open and usually still travelling. Its turn keeps the
+        // extent it was last drawn at: an estimate in the row table for even
+        // one frame moves the whole timeline when the viewport sits on the
+        // bottom edge, which is the extent the scroll offset is resolved from.
         if let Some(turn_id) = self.timeline_row_turn_id(row_id) {
-            self.invalidate_timeline_turn_measurement(&turn_id);
+            self.remeasure_timeline_turn(&turn_id);
         }
+        self.timeline_disclosure_animating = true;
         self.rebuild_timeline_sizes();
     }
 
@@ -28732,7 +28755,8 @@ impl VibexWorkbench {
         self.clear_timeline_turn_layout(turn_id);
     }
 
-    /// Keep the last rendered geometry as the seed for a content update.
+    /// Keep the last rendered geometry as the seed for a content or disclosure
+    /// update.
     /// Nested process runs must retain it too: their reserved total is the
     /// outer turn's intrinsic height, so re-estimating a unit would reintroduce
     /// the same scroll jump one level below the turn.
@@ -29537,6 +29561,116 @@ impl VibexWorkbench {
         // switched-to session paints the anchored content in its first frame.
         if std::mem::take(&mut self.timeline_scroll_anchor_pending) {
             self.apply_timeline_scroll_anchor();
+        }
+    }
+
+    /// Holds the timeline for a disclosure the reader is toggling.
+    ///
+    /// Opening a row of a finished turn is an instruction about that row, not
+    /// about the live edge: following the bottom would grow it upward, out from
+    /// under the pointer, and lift whatever was on screen with it. Leave the
+    /// follow and the row opens below an unmoved screen, the way it does
+    /// anywhere else in the timeline. A turn still running stays on the live
+    /// edge, which is where the reader is watching it arrive, and so does a row
+    /// closing there: it gives height back to a viewport that has to come down
+    /// to meet it either way.
+    fn hold_timeline_for_disclosure(&mut self, turn_id: Option<&str>, opening: bool) {
+        // A row of the child Agent rail names a turn of another timeline: this
+        // one's screen and follow are not that row's to move.
+        let Some(turn) = turn_id.and_then(|turn_id| {
+            self.conversation_turns_cache
+                .iter()
+                .rev()
+                .find(|turn| turn.id == turn_id)
+        }) else {
+            return;
+        };
+        let holds_screen = opening && timeline_turn_finished(turn);
+        if holds_screen {
+            // The idle task carries a decision made before this click.
+            self.timeline_scroll_wheel_idle_task = None;
+            self.timeline_follow.set_following_bottom(false);
+        }
+        self.capture_timeline_scroll_anchor();
+        self.timeline_disclosure_holds_screen = holds_screen;
+        // A body with no spring lands in the next frame, against a stale box.
+        self.timeline_disclosure_animating = true;
+    }
+
+    /// Readies a turn for a disclosure that changes its height.
+    ///
+    /// The turn and its process units keep their measured extents as the seed
+    /// for the next prepaint. Dropping them hands the row table an estimate,
+    /// and at the bottom edge the scroll offset is resolved from that table, so
+    /// the whole timeline would jump for a frame and come back.
+    fn prepare_timeline_disclosure(&mut self, turn_id: Option<&str>, opening: bool) {
+        self.hold_timeline_for_disclosure(turn_id, opening);
+        if let Some(turn_id) = turn_id {
+            self.remeasure_timeline_turn(turn_id);
+        }
+    }
+
+    /// Toggles a disclosure kept in [`Self::timeline_command_expansion`].
+    fn set_timeline_disclosure(&mut self, row_id: String, turn_id: Option<&str>, expanded: bool) {
+        self.prepare_timeline_disclosure(turn_id, expanded);
+        self.timeline_command_expansion.insert(row_id, expanded);
+    }
+
+    /// Whether this frame's rows are drawn against the bottom of their boxes.
+    ///
+    /// A row's box is the height the previous frame measured, so while a
+    /// disclosure travels the content is a frame ahead of it. Top-aligned, that
+    /// difference lands on the box's bottom edge, which is harmless anywhere a
+    /// reader is holding the top of the screen still. On the bottom edge it is
+    /// the visible edge: the content below the disclosure is thrown down by a
+    /// frame of the spring and comes back, and a closing row flashes a blank
+    /// band. Hanging the rows from the bottom keeps that edge exact and moves
+    /// the difference to the top of the turn.
+    ///
+    /// The windowed run and group body place their rows the same way, because
+    /// each reserves a height another frame behind the rows it places. See
+    /// [`timeline_window_origins`].
+    ///
+    /// Only a disclosure may do this. A stream's shorter reparse is held in
+    /// place by the same slack, and hanging it would bounce the whole turn.
+    fn timeline_rows_hang_from_bottom(&self) -> bool {
+        self.timeline_disclosure_settle_frames > 0
+            && !self.timeline_disclosure_holds_screen
+            && !self.rendering_child_agent_timeline()
+            && self.timeline_scroll.max_offset().y > px(0.0)
+            && self.timeline_distance_to_bottom() < 1.0
+    }
+
+    /// Picks the follow back up when a disclosure lands on the bottom edge.
+    ///
+    /// A row opened with the screen held leaves the live edge, and closing it
+    /// returns the reader there. Nothing else would resume the follow, because
+    /// the reader never scrolled. The handle's extent is still the last
+    /// prepaint's, so the distance is taken from the row table this render
+    /// settled: a row that opened in one frame would otherwise read as landing
+    /// where it started.
+    fn resume_timeline_follow_after_disclosure(&mut self) {
+        self.timeline_disclosure_holds_screen = false;
+        if self.timeline_follow.following_bottom
+            || self.timeline_scroll_wheel_idle_task.is_some()
+            || self.timeline_scrollbar_interaction_active
+        {
+            return;
+        }
+        let content = self
+            .timeline_row_sizes
+            .iter()
+            .map(|row| row.height)
+            .sum::<Pixels>()
+            + px(self.timeline_list_padding_top_px * 2.0);
+        let max_offset = content - self.timeline_scroll.bounds().size.height;
+        let distance = timeline_distance_to_bottom(
+            f32::from(self.timeline_scroll.offset().y),
+            f32::from(max_offset).max(0.0),
+        );
+        if distance <= AGENT_TIMELINE_DISCLOSURE_LANDING_SLACK_PX {
+            self.timeline_follow.set_following_bottom(true);
+            self.request_timeline_scroll_to_latest();
         }
     }
 
@@ -57030,7 +57164,20 @@ impl VibexWorkbench {
         // size rebuild on every frame.
         self.flush_deferred_timeline_turn_heights(cx);
         self.apply_pending_timeline_row_heights();
+        let disclosure_was_settling = self.timeline_disclosure_settle_frames > 0;
+        self.timeline_disclosure_settle_frames = if self.timeline_disclosure_animating {
+            AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES
+        } else {
+            self.timeline_disclosure_settle_frames.saturating_sub(1)
+        };
+        let disclosure_landed =
+            disclosure_was_settling && self.timeline_disclosure_settle_frames == 0;
         self.timeline_disclosure_animating = false;
+        if self.timeline_disclosure_settle_frames > 0 {
+            // The spring asks for no frame once it stops, and the settling that
+            // follows is only seen by the renders after that.
+            window.request_animation_frame();
+        }
         // The list inset and activity columns share the window's rem scale.
         // Resolved heights from another scale cannot seed this layout.
         if self.timeline_list_padding_top_px != f32::from(window.rem_size()) {
@@ -57043,6 +57190,9 @@ impl VibexWorkbench {
         if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
             self.rebuild_timeline_sizes();
             turns = self.conversation_turns_cached();
+        }
+        if disclosure_landed {
+            self.resume_timeline_follow_after_disclosure();
         }
         // Resolve a pending bottom scroll only after the row extent is rebuilt:
         // an invalidated size table would otherwise swallow the request because
@@ -57221,6 +57371,8 @@ impl VibexWorkbench {
                                         |this| {
                                             let rendered_turns = rendered_turns.borrow().clone();
                                             let turn_count = rendered_turns.len();
+                                            let hangs_from_bottom =
+                                                this.timeline_rows_hang_from_bottom();
                                             visible_range
                                                 .filter_map(|index| {
                                                     let turn = rendered_turns.get(index)?;
@@ -57246,7 +57398,11 @@ impl VibexWorkbench {
                                                             // `h_flex` defaults to items_center; rows must
                                                             // top-align so estimation slack stays below the
                                                             // content instead of re-centering it.
-                                                            .items_start()
+                                                            .when_else(
+                                                                hangs_from_bottom,
+                                                                |row| row.items_end(),
+                                                                |row| row.items_start(),
+                                                            )
                                                             .overflow_hidden()
                                                             .child(
                                                                 div()
@@ -59687,7 +59843,11 @@ impl VibexWorkbench {
             cx,
         )
         .clamp(0.0, 1.0);
-        self.timeline_disclosure_animating |= progress != target;
+        // The child Agent rail scrolls by itself, so its disclosures are no
+        // reason to release or hang anything in the timeline it is drawn beside.
+        if !self.rendering_child_agent_timeline() {
+            self.timeline_disclosure_animating |= progress != target;
+        }
         progress
     }
 
@@ -59844,8 +60004,10 @@ impl VibexWorkbench {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.capture_timeline_scroll_anchor();
-                        this.invalidate_timeline_turn_measurement(&process_toggle_id);
+                        this.prepare_timeline_disclosure(
+                            Some(&process_toggle_id),
+                            !process_expanded,
+                        );
                         this.timeline_process_expansion
                             .insert(process_toggle_id.clone(), !process_expanded);
                         cx.notify();
@@ -60127,10 +60289,9 @@ impl VibexWorkbench {
                 })
                 .label(label)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.invalidate_timeline_turn_measurement(&turn_id);
+                    this.prepare_timeline_disclosure(Some(&turn_id), !expanded);
                     this.timeline_file_changes_expansion
                         .insert(turn_id.clone(), !expanded);
-                    this.rebuild_timeline_sizes();
                     cx.notify();
                 }))
         });
@@ -60574,6 +60735,7 @@ impl VibexWorkbench {
                 origins,
                 total_height,
                 pinned_unit,
+                hangs_from_bottom: self.timeline_rows_hang_from_bottom(),
                 session_id: run_session_id,
                 entity,
                 build_unit: Box::new(move |index, window, cx| {
@@ -62031,6 +62193,7 @@ impl VibexWorkbench {
                 origins,
                 total_height,
                 px(TIMELINE_BODY_CHUNK_OVERSCAN_PX),
+                self.timeline_rows_hang_from_bottom(),
                 build_row,
                 record,
             ))
@@ -62275,9 +62438,8 @@ impl VibexWorkbench {
     /// Open or fold a settled body.
     ///
     /// The click changes the row's height, so the turn's measurement is
-    /// invalidated under a captured anchor — the same pair a tool card's
-    /// disclosure uses, which keeps the reader's place while the row grows or
-    /// shrinks under them.
+    /// invalidated under a captured anchor, which keeps the reader's place
+    /// while the row grows or shrinks under them.
     fn toggle_timeline_row_body(
         &mut self,
         row_id: String,
@@ -63843,7 +64005,7 @@ impl VibexWorkbench {
         open: bool,
         cx: &mut Context<Self>,
     ) {
-        self.capture_timeline_scroll_anchor();
+        self.hold_timeline_for_disclosure(turn_id.as_deref(), !open);
         self.set_reasoning_expanded(row_id, turn_id.as_deref(), !open);
         if let Some(turn_id) = turn_id
             && let Some(session_id) = self.timeline.session_id.clone()
@@ -63898,12 +64060,7 @@ impl VibexWorkbench {
             .get(&row_id)
             .copied()
             .unwrap_or(false);
-        self.timeline_command_expansion
-            .insert(row_id.clone(), !expanded);
-        if let Some(turn_id) = turn_id {
-            self.invalidate_timeline_turn_measurement(&turn_id);
-        }
-        self.rebuild_timeline_sizes();
+        self.set_timeline_disclosure(row_id, turn_id.as_deref(), !expanded);
         cx.notify();
     }
 
@@ -64377,10 +64534,7 @@ impl VibexWorkbench {
             self.strings().agent_expand_process
         })
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.capture_timeline_scroll_anchor();
-            this.invalidate_timeline_turn_measurement(&turn_id);
-            this.timeline_command_expansion
-                .insert(group_id.clone(), !expanded);
+            this.set_timeline_disclosure(group_id.clone(), Some(&turn_id), !expanded);
             cx.notify();
         }));
         let mut body = v_flex()
@@ -64549,6 +64703,7 @@ impl VibexWorkbench {
             origins,
             total_height,
             timeline_group_row_overscan(),
+            self.timeline_rows_hang_from_bottom(),
             build_row,
             record,
         )
@@ -64732,12 +64887,7 @@ impl VibexWorkbench {
         .tab_stop(has_details)
         .when(has_details, |this| {
             this.on_click(cx.listener(move |this, _, _, cx| {
-                this.capture_timeline_scroll_anchor();
-                if let Some(turn_id) = turn_id.as_deref() {
-                    this.invalidate_timeline_turn_measurement(turn_id);
-                }
-                this.timeline_command_expansion
-                    .insert(toggle_id.clone(), !expanded);
+                this.set_timeline_disclosure(toggle_id.clone(), turn_id.as_deref(), !expanded);
                 cx.notify();
             }))
         });
@@ -64892,12 +65042,11 @@ impl VibexWorkbench {
                     .accessibility_label(title)
                     .child(header)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.capture_timeline_scroll_anchor();
-                        if let Some(turn_id) = turn_id.as_deref() {
-                            this.invalidate_timeline_turn_measurement(turn_id);
-                        }
-                        this.timeline_command_expansion
-                            .insert(toggle_id.clone(), !expanded);
+                        this.set_timeline_disclosure(
+                            toggle_id.clone(),
+                            turn_id.as_deref(),
+                            !expanded,
+                        );
                         cx.notify();
                     })),
             );
@@ -65026,12 +65175,7 @@ impl VibexWorkbench {
             cx,
         )
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.capture_timeline_scroll_anchor();
-            if let Some(turn_id) = turn_id.as_deref() {
-                this.invalidate_timeline_turn_measurement(turn_id);
-            }
-            this.timeline_command_expansion
-                .insert(toggle_id.clone(), !expanded);
+            this.set_timeline_disclosure(toggle_id.clone(), turn_id.as_deref(), !expanded);
             cx.notify();
         }));
         let header = h_flex()
@@ -65283,12 +65427,11 @@ impl VibexWorkbench {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(turn_id) = measured_turn_id.as_deref() {
-                                    this.invalidate_timeline_turn_measurement(turn_id);
-                                }
-                                this.timeline_command_expansion
-                                    .insert(toggle_id.clone(), !expanded);
-                                this.rebuild_timeline_sizes();
+                                this.set_timeline_disclosure(
+                                    toggle_id.clone(),
+                                    measured_turn_id.as_deref(),
+                                    !expanded,
+                                );
                                 cx.notify();
                             }))
                     })
@@ -74173,6 +74316,8 @@ struct TimelineProcessRun {
     /// Unit holding the pending find-in-conversation reveal, built even when it
     /// falls outside the window so the match can still be scrolled to.
     pinned_unit: Option<usize>,
+    /// See [`VibexWorkbench::timeline_rows_hang_from_bottom`].
+    hangs_from_bottom: bool,
     /// The session whose view this run's units belong to.
     ///
     /// Prepaint borrows it back before building or measuring a unit, so a run
@@ -74380,6 +74525,49 @@ fn timeline_process_measured_origin(
     }
 }
 
+/// Where the units a window built go this frame, given what each one measured.
+///
+/// The table's origins are a frame behind a unit whose height just changed, so
+/// neighbours are placed against each other's measured edges. Normally that is
+/// the bottom of the unit above: the window's top stays and the difference falls
+/// below it, which is [`timeline_process_measured_origin`]. On the bottom edge
+/// of the timeline it is the top of the unit below instead: the window's bottom
+/// stays, so what is under a disclosure holds still, and the difference falls
+/// above it. A unit with no measured neighbour starts from the table.
+fn timeline_window_origins(
+    origins: &[Pixels],
+    total_height: Pixels,
+    measured: &[(usize, f32)],
+    gap: Pixels,
+    hangs_from_bottom: bool,
+) -> Vec<Pixels> {
+    if !hangs_from_bottom {
+        let mut previous_end = None;
+        return measured
+            .iter()
+            .map(|(index, height)| {
+                let origin =
+                    timeline_process_measured_origin(*index, origins[*index], previous_end, gap);
+                previous_end = Some((*index, origin + px(*height)));
+                origin
+            })
+            .collect();
+    }
+    let mut placed = vec![px(0.0); measured.len()];
+    let mut next_top = None;
+    for (slot, (index, height)) in measured.iter().enumerate().rev() {
+        let bottom = match next_top {
+            Some((next, top)) if *index + 1 == next => top - gap,
+            _ => origins
+                .get(*index + 1)
+                .map_or(total_height, |next| *next - gap),
+        };
+        placed[slot] = bottom - px(*height);
+        next_top = Some((*index, placed[slot]));
+    }
+    placed
+}
+
 /// The flow child a run reserves its height with, and the units it placed.
 struct TimelineProcessRunLayout {
     spacer: AnyElement,
@@ -74456,29 +74644,30 @@ impl Element for TimelineProcessRun {
             .filter(|index| !visible.contains(index))
             .into_iter();
         let mut measurements = Vec::new();
-        let mut previous_end = None;
         for index in visible.chain(pinned) {
-            let Some(origin) = self.origins.get(index).copied() else {
+            if index >= self.origins.len() {
                 continue;
-            };
+            }
             let mut unit = (self.build_unit)(index, window, cx);
             let measured = unit.layout_as_root(available_space, window, cx);
-            // The preceding disclosure may have changed height in this very
-            // frame. Place siblings after its measured bottom, not its stale
-            // cached bottom. A pinned offscreen unit keeps its own origin.
-            let origin = timeline_process_measured_origin(
-                index,
-                origin,
-                previous_end,
-                px(TIMELINE_PROCESS_UNIT_GAP),
-            );
-            previous_end = Some((index, origin + measured.height));
-            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                unit.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);
-            });
             measurements.push((index, f32::from(measured.height)));
             layout.units.push(unit);
         }
+        // A disclosure may have changed height in this very frame, so siblings
+        // are placed from what was just measured, not their stale cached
+        // origins. A pinned offscreen unit keeps its own origin.
+        let origins = timeline_window_origins(
+            &self.origins,
+            self.total_height,
+            &measurements,
+            px(TIMELINE_PROCESS_UNIT_GAP),
+            self.hangs_from_bottom,
+        );
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            for (unit, origin) in layout.units.iter_mut().zip(origins) {
+                unit.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);
+            }
+        });
         if !measurements.is_empty() {
             let units = self.units.clone();
             let session_id = self.session_id.clone();

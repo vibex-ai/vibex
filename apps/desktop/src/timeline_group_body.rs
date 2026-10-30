@@ -59,6 +59,8 @@ struct TimelineGroupBody {
     total_height: Pixels,
     /// Slack the window keeps above and below the viewport, in pixels.
     overscan: Pixels,
+    /// See `VibexWorkbench::timeline_rows_hang_from_bottom`.
+    hangs_from_bottom: bool,
     /// Builds row `index` on demand.
     build_row: TimelineGroupRowBuilder,
     /// Records the heights this body measured.
@@ -70,6 +72,7 @@ impl TimelineGroupBody {
         origins: Rc<Vec<Pixels>>,
         total_height: Pixels,
         overscan: Pixels,
+        hangs_from_bottom: bool,
         build_row: TimelineGroupRowBuilder,
         record: TimelineGroupRowRecorder,
     ) -> Self {
@@ -77,6 +80,7 @@ impl TimelineGroupBody {
             origins,
             total_height,
             overscan,
+            hangs_from_bottom,
             build_row,
             record,
         }
@@ -164,29 +168,34 @@ impl Element for TimelineGroupBody {
             self.overscan,
         );
         let mut measurements = Vec::new();
-        let mut previous_end = None;
         for index in visible {
-            let Some(origin) = self.origins.get(index).copied() else {
+            if index >= self.origins.len() {
                 continue;
-            };
+            }
             let mut row = (self.build_row)(index, window, cx);
             let measured = row.layout_as_root(available_space, window, cx);
-            // The preceding disclosure may have changed height in this very
-            // frame. Place siblings after its measured bottom, not its stale
-            // cached bottom. The body's rows are adjacent, exactly as the
-            // inline body stacks them: the row table the reserved height is
-            // summed from holds no gap either, so placing them with the unit
-            // run's gap instead would push every row after the first past the
-            // bottom this element reserves and clip the group's newest rows.
-            let origin =
-                super::timeline_process_measured_origin(index, origin, previous_end, px(0.0));
-            previous_end = Some((index, origin + measured.height));
-            window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                row.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);
-            });
             measurements.push((index, f32::from(measured.height)));
             layout.rows.push(row);
         }
+        // A disclosure may have changed height in this very frame, so siblings
+        // are placed from what was just measured, not their stale cached
+        // origins. The body's rows are adjacent, exactly as the inline body
+        // stacks them: the row table the reserved height is summed from holds
+        // no gap either, so placing them with the unit run's gap instead would
+        // push every row after the first past the bottom this element reserves
+        // and clip the group's newest rows.
+        let origins = super::timeline_window_origins(
+            &self.origins,
+            self.total_height,
+            &measurements,
+            px(0.0),
+            self.hangs_from_bottom,
+        );
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for (row, origin) in layout.rows.iter_mut().zip(origins) {
+                row.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);
+            }
+        });
         if !measurements.is_empty() {
             (self.record)(&measurements, cx);
         }
@@ -216,8 +225,17 @@ pub(super) fn timeline_group_body(
     origins: Rc<Vec<Pixels>>,
     total_height: Pixels,
     overscan: Pixels,
+    hangs_from_bottom: bool,
     build_row: TimelineGroupRowBuilder,
     record: TimelineGroupRowRecorder,
 ) -> AnyElement {
-    TimelineGroupBody::new(origins, total_height, overscan, build_row, record).into_any_element()
+    TimelineGroupBody::new(
+        origins,
+        total_height,
+        overscan,
+        hangs_from_bottom,
+        build_row,
+        record,
+    )
+    .into_any_element()
 }

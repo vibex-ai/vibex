@@ -677,6 +677,7 @@ impl Render for ReasoningTimelineProbe {
                         origins: origins.clone(),
                         total_height: total,
                         pinned_unit: None,
+                        hangs_from_bottom: false,
                         session_id: None,
                         entity: WeakEntity::new_invalid(),
                         build_unit: Box::new(build_unit),
@@ -1080,6 +1081,7 @@ impl Render for ProcessRunProbe {
                 origins: Arc::new(vec![px(0.0), px(36.0), px(72.0)]),
                 total_height: px(300.0),
                 pinned_unit: None,
+                hangs_from_bottom: false,
                 session_id: None,
                 entity: WeakEntity::new_invalid(),
                 build_unit: Box::new(move |index, _, _| {
@@ -3399,5 +3401,585 @@ fn a_body_toggle_leaves_the_screen_where_the_reader_left_it(cx: &mut TestAppCont
     assert!(
         (after - before).abs() <= 2.0,
         "opening a body leaves the screen where it was: {before} then {after}"
+    );
+}
+
+/// A tool call the reader can open, carrying enough output to be worth it.
+fn finished_tool(sequence: i64, tool: usize) -> TimelineItem {
+    live_timeline_item(
+        sequence,
+        TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+            tool_call_id: format!("tool-{tool}"),
+            tool_name: "exec_command".into(),
+            status: vibex_core::ToolCallStatus::Completed,
+            summary: format!("Ran cargo test {tool}"),
+            input_summary: Some(format!("cargo test --locked -p crate-{tool}")),
+            output_summary: Some((0..6).map(|line| format!("result line {line}\n")).collect()),
+            raw_extension: None,
+        }),
+    )
+}
+
+/// Two turns of tool calls, the last of them on screen at the live edge.
+fn conversation_with_tools(finished: bool) -> Vec<TimelineItem> {
+    let mut items = Vec::new();
+    for turn in 0..2_usize {
+        let next = |items: &Vec<TimelineItem>| items.len() as i64 + 1;
+        items.push(live_timeline_item(
+            next(&items),
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        for tool in 0..4 {
+            items.push(finished_tool(next(&items), turn * 10 + tool));
+        }
+        if finished || turn == 0 {
+            items.push(live_timeline_item(
+                next(&items),
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: format!("answer {turn}"),
+                    is_final: true,
+                }),
+            ));
+        }
+    }
+    items
+}
+
+/// The conversation parked on its bottom edge, following, with the last turn's
+/// tool rows drawn. `open_row` is one the reader opened before they got there.
+fn tool_rows_at_the_live_edge(
+    cx: &mut TestAppContext,
+    items: Vec<TimelineItem>,
+    open_row: Option<usize>,
+) -> (Entity<VibexWorkbench>, Vec<String>, &mut VisualTestContext) {
+    tool_rows_in_display_at_the_live_edge(cx, items, open_row, false)
+}
+
+fn tool_rows_in_display_at_the_live_edge(
+    cx: &mut TestAppContext,
+    items: Vec<TimelineItem>,
+    open_row: Option<usize>,
+    enhanced_command_display: bool,
+) -> (Entity<VibexWorkbench>, Vec<String>, &mut VisualTestContext) {
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        let workbench = cx.new(|cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.enhanced_command_execution_display = enhanced_command_display;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            workbench
+                .timeline
+                .replace_authoritative(session_id.clone(), items);
+            let turn = workbench
+                .conversation_turns_cached()
+                .last()
+                .unwrap()
+                .clone();
+            workbench
+                .timeline_process_expansion
+                .insert(turn.id.clone(), true);
+            for group in
+                timeline_process_activity_groups_for_display(&turn, enhanced_command_display)
+            {
+                workbench
+                    .timeline_command_expansion
+                    .insert(group.id.clone(), true);
+            }
+            if let Some(index) = open_row {
+                workbench
+                    .timeline_command_expansion
+                    .insert(turn.process_rows[index].id.clone(), true);
+            }
+            workbench.rebuild_timeline_sizes();
+            workbench.request_timeline_scroll_to_latest();
+            workbench
+        });
+        LiveTimelineProbe { workbench }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    for _ in 0..40 {
+        draw_disclosure_frame(cx);
+    }
+    let rows = workbench.read_with(cx, |workbench, _| {
+        assert!(workbench.timeline_follow.following_bottom);
+        assert!(workbench.timeline_scroll.max_offset().y > px(0.0));
+        workbench
+            .conversation_turns_cache
+            .last()
+            .unwrap()
+            .process_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    (workbench, rows, cx)
+}
+
+fn draw_disclosure_frame(cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(Duration::from_millis(16));
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+}
+
+fn activity_row_bounds(cx: &mut VisualTestContext, row_id: &str) -> Bounds<Pixels> {
+    let selector = format!("activity-row:{row_id}").leak();
+    cx.debug_bounds(selector).expect("the row is on screen")
+}
+
+/// Clicks a row's header where it is painted now.
+fn click_activity_header(cx: &mut VisualTestContext, row_id: &str) -> Point<Pixels> {
+    let position = activity_row_bounds(cx, row_id).origin + point(px(80.0), px(8.0));
+    cx.simulate_click(position, Modifiers::none());
+    position
+}
+
+fn timeline_offset(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Pixels {
+    workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.offset().y)
+}
+
+fn timeline_is_on_the_bottom_edge(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &VisualTestContext,
+) -> bool {
+    workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_follow.following_bottom
+            && workbench.timeline_scroll.offset().y == -workbench.timeline_scroll.max_offset().y
+    })
+}
+
+/// A row opens where it is, wherever the reader is.
+///
+/// Further up the timeline the row grows below a still screen. Following the
+/// bottom used to grow it upward, out from under the pointer, and resolved each
+/// frame's offset from a row table a frame behind the content, so everything
+/// under the row was thrown down by a frame of the spring and came back.
+#[gpui::test]
+fn a_row_opened_at_the_live_edge_leaves_the_screen_where_it_was(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, rows, cx) = tool_rows_at_the_live_edge(cx, conversation_with_tools(true), None);
+    let row = &rows[3];
+    let header = activity_row_bounds(cx, row).top();
+    let offset = timeline_offset(&workbench, cx);
+
+    let pointer = click_activity_header(cx, row);
+    for _ in 0..30 {
+        draw_disclosure_frame(cx);
+        assert_eq!(activity_row_bounds(cx, row).top(), header);
+        assert_eq!(timeline_offset(&workbench, cx), offset);
+    }
+    let (following, max_offset) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_follow.following_bottom,
+            workbench.timeline_scroll.max_offset().y,
+        )
+    });
+    assert!(!following, "the opened row hands the screen to the reader");
+    assert!(max_offset > -offset, "the row opened into the extent");
+
+    // The header never left the pointer, so the same click closes it, and the
+    // row gives back exactly what it took: the reader is on the live edge again
+    // and nothing else would resume the follow.
+    cx.simulate_click(pointer, Modifiers::none());
+    for _ in 0..30 {
+        draw_disclosure_frame(cx);
+        assert_eq!(activity_row_bounds(cx, row).top(), header);
+        assert_eq!(timeline_offset(&workbench, cx), offset);
+    }
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// A row closing on the bottom edge cannot leave the screen where it was: the
+/// content has to come down to meet the viewport. What it can do is come down
+/// in one piece, with what is under the row sitting still.
+#[gpui::test]
+fn a_row_closing_on_the_bottom_edge_keeps_that_edge_still(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, rows, cx) =
+        tool_rows_at_the_live_edge(cx, conversation_with_tools(true), Some(2));
+    let header = activity_row_bounds(cx, &rows[2]).top();
+    let below = activity_row_bounds(cx, &rows[3]).top();
+
+    click_activity_header(cx, &rows[2]);
+    let mut previous = header;
+    for _ in 0..30 {
+        draw_disclosure_frame(cx);
+        let drawn = activity_row_bounds(cx, &rows[3]).top();
+        assert!(
+            (drawn - below).abs() <= px(1.0),
+            "the row below moved with the spring: {below:?} then {drawn:?}"
+        );
+        let top = activity_row_bounds(cx, &rows[2]).top();
+        assert!(
+            top >= previous,
+            "the closing row reversed: {previous:?} then {top:?}"
+        );
+        previous = top;
+    }
+    assert!(
+        previous > header,
+        "the viewport came down to the new bottom"
+    );
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+    workbench.read_with(cx, |workbench, _| {
+        assert!(
+            !workbench.timeline_rows_hang_from_bottom(),
+            "a stream's held slack must stay under the content"
+        );
+    });
+}
+
+/// A running turn is what the live edge is for, so a row opening in it stays
+/// there, and grows into the viewport without disturbing what is under it.
+#[gpui::test]
+fn a_row_opened_in_a_running_turn_stays_on_the_live_edge(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, rows, cx) =
+        tool_rows_at_the_live_edge(cx, conversation_with_tools(false), None);
+    let below = activity_row_bounds(cx, &rows[3]).top();
+    let header = activity_row_bounds(cx, &rows[2]).top();
+    let turn_id = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .conversation_turns_cache
+            .last()
+            .unwrap()
+            .id
+            .clone()
+    });
+
+    workbench.update(cx, |workbench, cx| {
+        workbench.set_timeline_disclosure(rows[2].clone(), Some(&turn_id), true);
+        cx.notify();
+    });
+    let mut previous = header;
+    for _ in 0..30 {
+        draw_disclosure_frame(cx);
+        let drawn = activity_row_bounds(cx, &rows[3]).top();
+        assert!(
+            (drawn - below).abs() <= px(1.0),
+            "the row below moved with the spring: {below:?} then {drawn:?}"
+        );
+        let top = activity_row_bounds(cx, &rows[2]).top();
+        assert!(
+            top <= previous,
+            "the opening row reversed: {previous:?} then {top:?}"
+        );
+        previous = top;
+    }
+    assert!(previous < header, "the viewport rose to the new bottom");
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// Opening a row reads its detail back, and the answer lands while the row is
+/// still travelling. The turn's extent stands until prepaint measures the new
+/// content: an estimate in the row table for one frame moved the whole timeline
+/// on the bottom edge, where the scroll offset is resolved from that table.
+#[gpui::test]
+fn a_detail_landing_keeps_the_extent_the_turn_was_drawn_at(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let items = conversation_with_tools(true);
+    let summaries = items
+        .iter()
+        .cloned()
+        .map(TimelineItem::into_summary)
+        .collect();
+    let (workbench, rows, cx) = tool_rows_at_the_live_edge(cx, summaries, None);
+    let row = rows[3].clone();
+    let header = activity_row_bounds(cx, &row).top();
+    click_activity_header(cx, &row);
+    draw_disclosure_frame(cx);
+    draw_disclosure_frame(cx);
+
+    workbench.update(cx, |workbench, _| {
+        let drawn = workbench.timeline_row_sizes.clone();
+        let sequence = workbench.timeline_row_sequence(&row).unwrap();
+        let detail = items
+            .iter()
+            .find(|item| item.sequence == sequence)
+            .unwrap()
+            .clone();
+        let session_id = workbench.timeline.session_id.clone().unwrap();
+        let generation = workbench.session_generation;
+        workbench.finish_timeline_detail(&row, &session_id, generation, Ok(detail));
+        assert_eq!(
+            workbench.timeline_row_sizes, drawn,
+            "the row table keeps what prepaint measured"
+        );
+    });
+    for _ in 0..30 {
+        draw_disclosure_frame(cx);
+        assert_eq!(activity_row_bounds(cx, &row).top(), header);
+    }
+}
+
+/// One turn of `units` commentary-and-tool pairs: past the flow limit, its
+/// process section is the windowed run.
+fn turn_of_units(units: usize, finished: bool) -> Vec<TimelineItem> {
+    let mut items = vec![live_timeline_item(
+        1,
+        TimelinePayload::UserMessage(UserMessagePayload {
+            text: "question".into(),
+            ..Default::default()
+        }),
+    )];
+    for unit in 0..units {
+        items.push(live_timeline_item(
+            items.len() as i64 + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("checking package {unit}"),
+                is_final: false,
+            }),
+        ));
+        items.push(finished_tool(items.len() as i64 + 1, unit));
+    }
+    if finished {
+        items.push(live_timeline_item(
+            items.len() as i64 + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "answer".into(),
+                is_final: true,
+            }),
+        ));
+    }
+    items
+}
+
+/// One turn of a single long tool run, whose group body windows its rows.
+fn turn_of_one_long_group(rows: usize) -> Vec<TimelineItem> {
+    let mut items = vec![live_timeline_item(
+        1,
+        TimelinePayload::UserMessage(UserMessagePayload {
+            text: "question".into(),
+            ..Default::default()
+        }),
+    )];
+    for tool in 0..rows {
+        items.push(finished_tool(items.len() as i64 + 1, tool));
+    }
+    items
+}
+
+/// The tool rows of the last turn, in order, whatever separates them.
+fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
+    workbench.read_with(cx, |workbench, _| {
+        workbench
+            .conversation_turns_cache
+            .last()
+            .unwrap()
+            .process_rows
+            .iter()
+            .filter(|row| row.kind == TimelineRowKind::ToolCall)
+            .map(|row| row.id.clone())
+            .collect()
+    })
+}
+
+/// Toggles `row` and asserts the row under it never leaves its place, while the
+/// row itself, and the whole timeline above it, travels one way and never back.
+fn assert_toggling_keeps_the_row_below_still(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &mut VisualTestContext,
+    row: &str,
+    below: &str,
+    expanded: bool,
+) {
+    let turn_id = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .conversation_turns_cache
+            .last()
+            .unwrap()
+            .id
+            .clone()
+    });
+    let rest = activity_row_bounds(cx, below).top();
+    let mut previous = activity_row_bounds(cx, row).top();
+    workbench.update(cx, |workbench, cx| {
+        workbench.set_timeline_disclosure(row.to_string(), Some(&turn_id), expanded);
+        cx.notify();
+    });
+    for frame in 0..40 {
+        draw_disclosure_frame(cx);
+        let drawn = activity_row_bounds(cx, below).top();
+        assert!(
+            (drawn - rest).abs() <= px(1.0),
+            "frame {frame}: the row below moved with the spring: {rest:?} then {drawn:?}"
+        );
+        let top = activity_row_bounds(cx, row).top();
+        let reversed = if expanded {
+            top > previous + px(1.0)
+        } else {
+            top < previous - px(1.0)
+        };
+        assert!(
+            !reversed,
+            "frame {frame}: the toggled row reversed: {previous:?} then {top:?}"
+        );
+        previous = top;
+    }
+}
+
+/// A long turn draws its process section through the windowed run, whose
+/// reserved height is another frame behind the rows it places.
+#[gpui::test]
+fn a_windowed_run_keeps_the_rows_under_a_disclosure_still_on_the_live_edge(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, turn_of_units(24, false), None);
+    let rows = tool_row_ids(&workbench, cx);
+    let (row, below) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, true);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, false);
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// A long group's body is windowed too, and reserves its height the same way.
+#[gpui::test]
+fn a_windowed_group_keeps_the_rows_under_a_disclosure_still_on_the_live_edge(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, turn_of_one_long_group(40), None);
+    let rows = tool_row_ids(&workbench, cx);
+    let (row, below) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, true);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, false);
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// The same long turn once it has finished: the row was opened earlier, the
+/// reader has come to the bottom edge, and closing it brings the viewport down.
+#[gpui::test]
+fn a_windowed_run_keeps_the_rows_under_a_closing_row_still_on_the_bottom_edge(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    // Commentary and tool rows alternate, so the second to last tool is here.
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, turn_of_units(24, true), Some(45));
+    let rows = tool_row_ids(&workbench, cx);
+    let (row, below) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, false);
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// A group in the enhanced display opens from the height it was drawn at too.
+#[gpui::test]
+fn a_windowed_group_in_the_enhanced_display_keeps_the_rows_under_a_disclosure_still(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (workbench, _, cx) =
+        tool_rows_in_display_at_the_live_edge(cx, turn_of_one_long_group(40), None, true);
+    let rows = tool_row_ids(&workbench, cx);
+    let (row, below) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, true);
+    assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, false);
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// With reduced motion a row lands in one frame, and everything it changes
+/// reaches the row table over the next few. Nothing may move while they do.
+#[gpui::test]
+fn a_row_that_lands_in_one_frame_keeps_the_rows_under_it_still(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for items in [turn_of_units(24, false), turn_of_one_long_group(40)] {
+        let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+        // After the fixture: a workbench applies its own appearance settings.
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        let rows = tool_row_ids(&workbench, cx);
+        let (row, below) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
+        assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, true);
+        assert_toggling_keeps_the_row_below_still(&workbench, cx, row, below, false);
+        assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+    }
+}
+
+/// A row that opened in one frame has not landed where it started, even though
+/// the scroll handle still reports the extent it was last laid out against.
+#[gpui::test]
+fn a_row_that_opens_in_one_frame_leaves_the_follow_until_it_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, rows, cx) = tool_rows_at_the_live_edge(cx, conversation_with_tools(true), None);
+    // After the fixture: a workbench applies its own appearance settings.
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    let row = &rows[3];
+    let header = activity_row_bounds(cx, row).top();
+    let closed = activity_row_bounds(cx, row).size.height;
+    let pointer = click_activity_header(cx, row);
+    draw_disclosure_frame(cx);
+    assert!(
+        activity_row_bounds(cx, row).size.height > closed,
+        "with reduced motion the row is open in the first frame"
+    );
+    assert!(workbench.read_with(cx, |workbench, _| !workbench.timeline_disclosure_animating));
+    for _ in 0..8 {
+        draw_disclosure_frame(cx);
+        assert_eq!(activity_row_bounds(cx, row).top(), header);
+        assert!(
+            workbench.read_with(cx, |workbench, _| !workbench
+                .timeline_follow
+                .following_bottom),
+            "the opened row hands the screen to the reader"
+        );
+    }
+    cx.simulate_click(pointer, Modifiers::none());
+    for _ in 0..8 {
+        draw_disclosure_frame(cx);
+        assert_eq!(activity_row_bounds(cx, row).top(), header);
+    }
+    assert!(timeline_is_on_the_bottom_edge(&workbench, cx));
+}
+
+/// A disclosure of the child Agent rail names a turn of another timeline. The
+/// parent's follow, and the rows it hangs, are not that row's to move.
+#[gpui::test]
+fn a_disclosure_of_another_timeline_leaves_this_one_alone(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, conversation_with_tools(true), None);
+    workbench.update(cx, |workbench, _| {
+        workbench.hold_timeline_for_disclosure(Some("turn-of-the-child-session"), true);
+        assert!(workbench.timeline_follow.following_bottom);
+        assert!(!workbench.timeline_disclosure_animating);
+        assert!(!workbench.timeline_disclosure_holds_screen);
+    });
+}
+
+#[test]
+fn a_window_places_its_units_from_the_edge_that_holds_still() {
+    // Three units of 100 with a gap of 10, the middle one measuring 130 now.
+    let origins = [px(0.0), px(110.0), px(220.0)];
+    let total = px(320.0);
+    let measured = [(0, 100.0), (1, 130.0), (2, 100.0)];
+    let gap = px(10.0);
+    assert_eq!(
+        timeline_window_origins(&origins, total, &measured, gap, false),
+        vec![px(0.0), px(110.0), px(250.0)],
+        "the top holds, and the unit under the change moves"
+    );
+    assert_eq!(
+        timeline_window_origins(&origins, total, &measured, gap, true),
+        vec![px(-30.0), px(80.0), px(220.0)],
+        "the bottom holds, and the unit under the change stays"
+    );
+    // A window that stops short of the run hangs from the table's own edge.
+    assert_eq!(
+        timeline_window_origins(&origins, total, &measured[..2], gap, true),
+        vec![px(-30.0), px(80.0)],
+    );
+    // A pinned unit is not a neighbour of the window it was built beside.
+    let pinned = [(0, 100.0), (2, 130.0)];
+    assert_eq!(
+        timeline_window_origins(&origins, total, &pinned, gap, true),
+        vec![px(0.0), px(190.0)],
     );
 }
