@@ -43475,6 +43475,24 @@ impl VibexWorkbench {
         self.open_right_rail_mode(RightRailMode::Files, cx);
     }
 
+    /// Moves the rail off a Git column the current workspace cannot fill.
+    ///
+    /// A folder that is not a Git repository keeps its Files panel; only the
+    /// Git activity disappears. The panel stays open on the surface that still
+    /// has content, so a workspace switch does not also close the rail the
+    /// reader was using.
+    pub(crate) fn fall_back_right_rail_to_files(&mut self, cx: &mut Context<Self>) {
+        if self.right_rail_mode == RightRailMode::Git {
+            self.right_rail_mode = RightRailMode::Files;
+        }
+        self.ui_state.right_rail.selected_activity_id =
+            Some(right_rail_activity_id(RightRailMode::Files).to_string());
+        self.code_right_rail
+            .update(cx, |right_rail, cx| right_rail.set_mode(RightRailMode::Files, cx));
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     pub(crate) fn close_right_rail(&mut self, cx: &mut Context<Self>) {
         let visibility_changed = self.ui_state.workbench.right_rail_visible;
         self.ui_state.workbench.right_rail_visible = false;

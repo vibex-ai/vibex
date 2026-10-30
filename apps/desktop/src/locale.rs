@@ -1695,6 +1695,12 @@ fn error_code_summary(locale: ResolvedLocale, code: &str) -> &'static str {
             "当前分支没有可拉取的远端分支",
             "目前分支沒有可拉取的遠端分支",
         )
+    } else if code.contains("not_git") || code.contains("not_working_tree") {
+        (
+            "This folder is not a Git repository",
+            "此目录不是 Git 仓库",
+            "此目錄不是 Git 儲存庫",
+        )
     } else if code.contains("denied") || code.contains("permission") || code.contains("forbidden") {
         ("Permission was denied", "权限不足", "權限不足")
     } else if code.contains("timeout") || code.contains("timed_out") {
@@ -1937,6 +1943,13 @@ mod tests {
                 "git_pull_diverged: the branch and its upstream have diverged; pull cannot fast-forward",
             ),
             "git_pull_diverged: 本地分支无法快进到远端"
+        );
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhCn,
+                "not_git_repository: path is not inside a Git work tree",
+            ),
+            "not_git_repository: 此目录不是 Git 仓库"
         );
     }
 

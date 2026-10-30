@@ -970,6 +970,7 @@ struct CodeRightRailRevision {
     git: u64,
     workspace_generation: u64,
     workspace_available: bool,
+    git_repository_available: bool,
     tree_loading: bool,
     file_mutation_pending: bool,
     status_loading: bool,
@@ -1067,6 +1068,10 @@ struct CodeRightRailProjection {
     files: CodeRightRailFileProjection,
     git: CodeRightRailGitProjection,
     workspace_name: String,
+    /// Whether the workspace can answer Git reads at all. A plain folder shows
+    /// an explanation instead of the "select a session" prompt, which would be
+    /// wrong: a session is selected, the folder simply has no repository.
+    git_repository_available: bool,
     commit_message: Entity<TextareaState>,
     amend_commit: bool,
     selected_git_path: Option<String>,
@@ -1411,6 +1416,14 @@ pub struct CodeWorkbench {
     preview_visible: bool,
     files_surface_visible: bool,
     git_surface_visible: bool,
+    /// Whether the workspace on screen is known to be a Git working tree.
+    ///
+    /// A folder that is not a repository is a normal thing to open, not a
+    /// failure: the Files panel still works, and every Git read would only
+    /// return `not_git_repository`. The first status probe settles this, and
+    /// from then on the Git reads and polling stay off instead of raising a
+    /// toast the reader cannot act on.
+    git_repository_available: bool,
     pub(crate) editors: EditorBufferRegistry,
     editor_bindings: BTreeMap<String, EditorBinding>,
     next_editor_binding_id: u64,
@@ -1626,6 +1639,7 @@ impl CodeWorkbench {
             preview_visible: false,
             files_surface_visible: false,
             git_surface_visible: false,
+            git_repository_available: true,
             editors,
             editor_bindings: BTreeMap::new(),
             next_editor_binding_id: 0,
@@ -1992,6 +2006,7 @@ impl CodeWorkbench {
             git: self.git.presentation_revision(),
             workspace_generation: self.workspace_generation,
             workspace_available: self.workspace.is_some(),
+            git_repository_available: self.git_repository_available,
             tree_loading: self.tree_loading,
             file_mutation_pending: self.file_mutation_pending,
             status_loading: self.status_loading,
@@ -2052,6 +2067,7 @@ impl CodeWorkbench {
                 self.git_scroll.clone(),
             ),
             workspace_name,
+            git_repository_available: self.git_repository_available,
             commit_message: self.commit_message.clone(),
             amend_commit: self.amend_commit,
             selected_git_path: self.selected_git_path.clone(),
@@ -3077,6 +3093,10 @@ impl CodeWorkbench {
             .to_string();
         self.file_tree.set_root_name(root_name);
         self.git.reset_workspace(workspace_id);
+        // The incoming workspace starts out unprobed: the first status read
+        // settles whether it is a repository at all. A folder that is not one
+        // keeps its Files panel and simply never arms the Git surface.
+        self.git_repository_available = true;
         let restored_expanded_paths = adopted_panel
             .as_ref()
             .map(|panel| {
@@ -3691,8 +3711,12 @@ impl CodeWorkbench {
                         // branch sync (ahead) count, so branch data must stay
                         // fresh even while the Git panel itself stays hidden.
                         // The gate skips workspaces that never reported
-                        // branches (non-Git roots) and in-flight mutations.
-                        if this.git.branches.is_some() && this.git.pending_mutation.is_none() {
+                        // branches (non-Git roots), in-flight mutations, and
+                        // folders already known to have no repository.
+                        if this.git_repository_available
+                            && this.git.branches.is_some()
+                            && this.git.pending_mutation.is_none()
+                        {
                             this.load_branches(cx);
                         }
                         true
@@ -3900,12 +3924,59 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        if !self.git_repository_available {
+            return;
+        }
         self.load_git_status(cx);
         self.load_worktree_lifecycle(cx);
         self.load_branches(cx);
         if self.git.mode == GitWorkbenchMode::History {
             self.load_history(false, cx);
         }
+    }
+
+    /// Retires the Git surface for a workspace that has no repository.
+    ///
+    /// Opening a plain folder is a supported way to work: the Files panel and
+    /// every editor keep working, and only the Git reads stop. The rail drops
+    /// out of a Git column that can never fill, and the parent's workspace
+    /// projection is refreshed so the Git activity hides itself instead of
+    /// inviting a click that would only fail again.
+    fn disable_git_for_workspace(&mut self, cx: &mut Context<Self>) {
+        if !self.git_repository_available {
+            return;
+        }
+        self.git_repository_available = false;
+        self.status_loading = false;
+        self.history_loading = false;
+        self.lifecycle_loading = false;
+        self.status_task = None;
+        self.history_task = None;
+        self.branch_task = None;
+        self.lifecycle_task = None;
+        self.lifecycle_snapshot = None;
+        self.set_lifecycle_confirmation(None);
+        if self.right_rail_mode == RightRailMode::Git {
+            self.right_rail_mode = RightRailMode::Files;
+            if let Some(parent) = self.parent.clone() {
+                cx.defer(move |cx| {
+                    let _ = parent.update(cx, |parent, cx| {
+                        parent.fall_back_right_rail_to_files(cx)
+                    });
+                });
+            }
+        }
+        self.request_parent_lifecycle_refresh(cx);
+        cx.notify();
+    }
+
+    /// Whether a Git read failed only because the folder is not a repository.
+    ///
+    /// The backend reports a plain folder as a validation failure, so the
+    /// callers have to tell that apart from a real error before deciding
+    /// whether the reader is owed a notification.
+    fn is_missing_repository(error: &BackendError) -> bool {
+        matches!(error.code.as_str(), "not_git_repository" | "not_working_tree")
     }
 
     pub(crate) fn git_status(&self) -> Option<&GitStatusSummary> {
@@ -3927,6 +3998,9 @@ impl CodeWorkbench {
     }
 
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
+        if !self.git_repository_available {
+            return;
+        }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
@@ -3947,6 +4021,7 @@ impl CodeWorkbench {
                 this.status_loading = false;
                 match outcome {
                     Ok(Ok(status)) => {
+                        this.git_repository_available = true;
                         if this.git.apply_status(&ticket, status.clone()) {
                             this.file_tree.set_git_changes(&status.changes);
                             this.reconcile_git_selection();
@@ -3956,6 +4031,13 @@ impl CodeWorkbench {
                                 this.load_history(false, cx);
                             }
                         }
+                    }
+                    Ok(Err(error)) if Self::is_missing_repository(&error) => {
+                        // A plain folder is not a failure: close the Git
+                        // surface quietly and let the Files panel carry on.
+                        this.git.fail_query(&ticket, &error.code);
+                        this.file_tree.set_git_changes(&[]);
+                        this.disable_git_for_workspace(cx);
                     }
                     Ok(Err(error)) => {
                         this.git.fail_query(&ticket, &error.code);
@@ -4007,6 +4089,9 @@ impl CodeWorkbench {
     }
 
     fn load_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if !self.git_repository_available {
+            return;
+        }
         if self.lifecycle_loading {
             self.lifecycle_reload_requested = true;
             return;
@@ -4040,6 +4125,9 @@ impl CodeWorkbench {
                 let reload = std::mem::take(&mut this.lifecycle_reload_requested);
                 match outcome {
                     Ok(Ok(snapshot)) => this.apply_worktree_lifecycle_snapshot(snapshot),
+                    Ok(Err(error)) if Self::is_missing_repository(&error) => {
+                        this.disable_git_for_workspace(cx);
+                    }
                     Ok(Err(error)) => {
                         this.pending_error = Some(format!("{}: {}", error.code, error.message));
                     }
@@ -4758,6 +4846,9 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn load_history(&mut self, append: bool, cx: &mut Context<Self>) {
+        if !self.git_repository_available {
+            return;
+        }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
@@ -4815,6 +4906,10 @@ impl CodeWorkbench {
                     Ok(Ok(history)) => {
                         this.git.apply_history(&ticket, history, append);
                     }
+                    Ok(Err(error)) if Self::is_missing_repository(&error) => {
+                        this.git.fail_query(&ticket, &error.code);
+                        this.disable_git_for_workspace(cx);
+                    }
                     Ok(Err(error)) => {
                         this.git.fail_query(&ticket, &error.code);
                         this.pending_error = Some(format!("{}: {}", error.code, error.message));
@@ -4836,6 +4931,9 @@ impl CodeWorkbench {
     }
 
     fn load_branches(&mut self, cx: &mut Context<Self>) {
+        if !self.git_repository_available {
+            return;
+        }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
@@ -4861,6 +4959,9 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.git.fail_query(&ticket, &error.code);
+                        if Self::is_missing_repository(&error) {
+                            this.disable_git_for_workspace(cx);
+                        }
                     }
                     Err(_) => {}
                 }
@@ -15203,6 +15304,7 @@ impl CodeRightRail {
         let git = &self.projection.git;
         let (
             workspace_available,
+            git_repository_available,
             mode,
             pending,
             pending_kind,
@@ -15219,6 +15321,7 @@ impl CodeRightRail {
             lifecycle_mutations_available,
         ) = (
             self.projection.files.workspace_available,
+            self.projection.git_repository_available,
             git.mode,
             git.pending,
             git.pending_kind,
@@ -15241,6 +15344,24 @@ impl CodeRightRail {
                     "Select an Agent session to load Git",
                     "选择 Agent 会话以加载 Git",
                     "選擇 Agent 會話以載入 Git",
+                ),
+                cx,
+            );
+        }
+        if !git_repository_available {
+            // A selected session on a plain folder lands here: there is
+            // nothing wrong with the workspace, it just has no repository to
+            // show. The Files panel is the surface that still applies.
+            return rail_empty_card(
+                locale::text(
+                    "This folder is not a Git repository",
+                    "此目录不是 Git 仓库",
+                    "此目錄不是 Git 儲存庫",
+                ),
+                locale::text(
+                    "Use the Files panel to browse and edit its contents",
+                    "请使用「文件」面板浏览和编辑其中的内容",
+                    "請使用「檔案」面板瀏覽和編輯其中的內容",
                 ),
                 cx,
             );
@@ -20293,6 +20414,66 @@ mod tests {
             [RightRailMode::Files, RightRailMode::Git].map(RightRailMode::title),
             ["Files", "Git"]
         );
+    }
+
+    #[test]
+    fn a_folder_without_a_repository_does_not_raise_a_git_error() {
+        let source = include_str!("code_workbench.rs");
+        let (_, after_disable) = source
+            .split_once("fn disable_git_for_workspace(")
+            .expect("the workspace Git opt-out should remain inspectable");
+        let body = after_disable
+            .split_once("fn is_missing_repository(")
+            .map(|(body, _)| body)
+            .expect("the Git opt-out body should end at the classifier");
+
+        // The opt-out is silent: it retires the surface and never notifies.
+        assert!(!body.contains("pending_error"));
+        assert!(body.contains("git_repository_available = false"));
+        assert!(body.contains("RightRailMode::Files"));
+        assert!(body.contains("request_parent_lifecycle_refresh(cx)"));
+
+        // Every Git read consults the flag, so one failed probe stops the rest.
+        for loader in [
+            "fn load_git_status(",
+            "fn load_branches(",
+            "fn load_worktree_lifecycle(",
+            "pub(crate) fn load_history(",
+        ] {
+            let (_, tail) = source
+                .split_once(loader)
+                .unwrap_or_else(|| panic!("{loader} should remain inspectable"));
+            let head: String = tail.lines().take(6).collect::<Vec<_>>().join("\n");
+            assert!(
+                head.contains("git_repository_available"),
+                "{loader} should stop on a workspace without a repository"
+            );
+        }
+
+        // The plain-folder failure is classified as a state, not an error.
+        assert!(source.contains(
+            "matches!(error.code.as_str(), \"not_git_repository\" | \"not_working_tree\")"
+        ));
+        assert!(
+            source
+                .matches("this.disable_git_for_workspace(cx);")
+                .count()
+                >= 3,
+            "each Git read should fall back through the shared opt-out"
+        );
+    }
+
+    #[test]
+    fn git_panel_explains_a_folder_without_a_repository() {
+        let source = include_str!("code_workbench.rs");
+        let (_, tail) = source
+            .split_once("if !git_repository_available {")
+            .expect("the Git panel should branch on a missing repository");
+        let branch: String = tail.lines().take(14).collect::<Vec<_>>().join("\n");
+
+        assert!(branch.contains("locale::text("));
+        assert!(branch.contains("Git repository"));
+        assert!(!branch.contains("pending_error"));
     }
 
     #[test]
