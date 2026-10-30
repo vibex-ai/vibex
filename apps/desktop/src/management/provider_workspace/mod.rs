@@ -15,10 +15,6 @@ mod provider;
 mod route_group;
 mod sidebar;
 
-/// The width a workspace page stops growing at. Forms and lists read worse
-/// when a line runs across a very wide window.
-const WORKSPACE_PAGE_MAX_WIDTH: f32 = 60.0;
-
 impl ManagementCenter {
     /// The detail pane: whichever record the left column selected, or the
     /// draft the page is authoring.
@@ -54,7 +50,6 @@ impl ManagementCenter {
             .id("management-provider-workspace")
             .w_full()
             .min_w_0()
-            .max_w(rems(WORKSPACE_PAGE_MAX_WIDTH))
             .child(page)
             .into_any_element()
     }

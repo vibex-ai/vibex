@@ -46,7 +46,7 @@ impl ManagementCenter {
             self.selected_global_route_id = None;
         }
 
-        let mut list = v_flex().w_full().min_w_0().gap_1();
+        let mut list = v_flex().w_full().min_w_0().gap_1p5();
         list = list.child(self.render_workspace_gateway_row(cx));
 
         // Providers.
@@ -493,6 +493,7 @@ impl ManagementCenter {
                 .child(subtitle)
                 .into_any_element(),
             Some(ws_state_fact(state, color)),
+            None,
             cx.listener(|this, _, _, cx| this.select_workspace_gateway(cx)),
             cx,
         )
@@ -533,8 +534,8 @@ impl ManagementCenter {
                 .child(format!(
                     "{models} {} · {} {}",
                     management_locale_text("models", "个模型", "個模型"),
-                    row.agents.len(),
-                    management_locale_text("Agents", "个 Agent", "個 Agent"),
+                    row.profile.credentials.len(),
+                    management_locale_text("Keys", "个 Key", "個 Key"),
                 ))
                 .into_any_element()
         };
@@ -579,6 +580,12 @@ impl ManagementCenter {
             row.profile.display_name.clone(),
             subtitle,
             Some(trailing),
+            workspace_agent_logos(
+                &format!("management-provider-row-{id}"),
+                &row.agents,
+                |agent| self.workspace_agent_label(agent),
+                cx,
+            ),
             cx.listener(move |this, _, _, cx| {
                 this.select_workspace_provider(select_id.clone(), cx)
             }),
@@ -620,6 +627,12 @@ impl ManagementCenter {
                     .child(management_locale_text("Off", "已停用", "已停用"))
                     .into_any_element()
             }),
+            workspace_agent_logos(
+                &format!("management-route-row-{id}"),
+                &row.agents,
+                |agent| self.workspace_agent_label(agent),
+                cx,
+            ),
             cx.listener(move |this, _, _, cx| {
                 this.select_workspace_route_group(select_id.clone(), cx)
             }),
@@ -657,11 +670,12 @@ pub(super) fn workspace_gateway_state(
     }
 }
 
-/// One navigable row of the left column.
+/// One card of the left column.
 ///
-/// Every row has the same three lanes — mark, two lines of text, one trailing
-/// state — so names and states form columns down the whole list. Selection is
-/// a filled plate; hover is a lighter wash of the same colour.
+/// Each record is a bordered card: the mark leads, the name and its state share
+/// the first line, a summary sits under them, and the Agents that use the
+/// record close the card as a row of logos. Selection fills the card with the
+/// accent plate; hover is a lighter wash, so pointing never outshines a click.
 #[allow(clippy::too_many_arguments)]
 fn workspace_nav_row(
     id: SharedString,
@@ -670,6 +684,7 @@ fn workspace_nav_row(
     title: impl Into<SharedString>,
     subtitle: AnyElement,
     trailing: Option<AnyElement>,
+    footer: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
@@ -677,28 +692,53 @@ fn workspace_nav_row(
         .id(id)
         .w_full()
         .min_w_0()
-        .items_center()
+        .items_start()
         .gap_2p5()
-        .px_2()
-        .py_1p5()
-        .rounded(cx.theme().radius_lg)
+        .p_2()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if selected {
+            cx.theme().primary.opacity(0.0)
+        } else {
+            cx.theme().border.opacity(0.65)
+        })
+        .bg(if selected {
+            cx.theme().accent
+        } else {
+            cx.theme().background.opacity(0.70)
+        })
         .cursor_pointer()
-        .when(selected, |row| row.bg(cx.theme().accent))
-        .when(!selected, |row| {
-            row.hover(|style| style.bg(cx.theme().primary.opacity(0.06)))
+        .hover(|style| {
+            style.bg(if selected {
+                cx.theme().accent
+            } else {
+                cx.theme().primary.opacity(0.08)
+            })
         })
         .child(mark)
         .child(
             v_flex()
                 .flex_1()
                 .min_w_0()
+                .gap_0p5()
                 .child(
-                    div()
+                    h_flex()
+                        .w_full()
                         .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .font_medium()
-                        .child(title.into()),
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_medium()
+                                .child(title.into()),
+                        )
+                        .children(
+                            trailing.map(|trailing| div().flex_none().text_xs().child(trailing)),
+                        ),
                 )
                 .child(
                     div()
@@ -706,9 +746,47 @@ fn workspace_nav_row(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(subtitle),
-                ),
+                )
+                .children(footer.map(|footer| div().pt_0p5().child(footer))),
         )
-        .children(trailing.map(|trailing| div().flex_none().text_xs().child(trailing)))
         .on_click(on_click)
         .into_any_element()
+}
+
+/// The Agents that use a record, as a row of logos with an overflow count.
+fn workspace_agent_logos(
+    id: &str,
+    agents: &BTreeSet<String>,
+    labels: impl Fn(&str) -> String,
+    cx: &App,
+) -> Option<AnyElement> {
+    const LIMIT: usize = 12;
+    if agents.is_empty() {
+        return None;
+    }
+    Some(
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_1()
+            .children(agents.iter().take(LIMIT).map(|agent_id| {
+                let tooltip = SharedString::from(labels(agent_id));
+                div()
+                    .id(SharedString::from(format!("{id}-agent-{agent_id}")))
+                    .flex_none()
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                    })
+                    .child(agent_brand_icon(agent_id, px(14.0), None))
+            }))
+            .when(agents.len() > LIMIT, |stack| {
+                stack.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("+{}", agents.len() - LIMIT)),
+                )
+            })
+            .into_any_element(),
+    )
 }
