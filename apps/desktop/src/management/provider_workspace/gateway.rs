@@ -1,17 +1,17 @@
 //! The gateway's page.
 //!
 //! The gateway is the local address an Agent reaches when it uses a route
-//! group. Its page answers, in tab order: is it serving (Overview), with
-//! which accounts (Keys), how well (Traffic), what exactly happened
-//! (Requests), and under which rules (Settings).
+//! group. Its page answers, in tab order: is it serving (Overview), where each
+//! request went and why (Routing), how well over time (Traffic), with which
+//! accounts (Keys), and under which rules (Settings).
 
 use super::*;
 
 const GATEWAY_TABS: [GatewayDetailTab; 5] = [
     GatewayDetailTab::Overview,
-    GatewayDetailTab::Keys,
+    GatewayDetailTab::Routing,
     GatewayDetailTab::Traffic,
-    GatewayDetailTab::Requests,
+    GatewayDetailTab::Keys,
     GatewayDetailTab::Advanced,
 ];
 
@@ -19,7 +19,7 @@ fn gateway_tab_label(tab: GatewayDetailTab) -> &'static str {
     match tab {
         GatewayDetailTab::Keys => management_locale_text("Keys", "Key", "Key"),
         GatewayDetailTab::Traffic => management_locale_text("Traffic", "流量", "流量"),
-        GatewayDetailTab::Requests => management_locale_text("Requests", "请求记录", "請求記錄"),
+        GatewayDetailTab::Routing => management_locale_text("Routing", "路由", "路由"),
         GatewayDetailTab::Advanced => management_locale_text("Settings", "设置", "設定"),
         GatewayDetailTab::Overview => management_locale_text("Overview", "概览", "概覽"),
     }
@@ -39,11 +39,8 @@ impl ManagementCenter {
             .unwrap_or(0);
         let body = match tab {
             GatewayDetailTab::Keys => self.render_workspace_gateway_keys(window, cx),
-            GatewayDetailTab::Traffic => ws_stack(vec![
-                self.render_workspace_gateway_traffic(cx),
-                self.render_gateway_topology(cx),
-            ]),
-            GatewayDetailTab::Requests => self.render_workspace_gateway_requests(cx),
+            GatewayDetailTab::Routing => self.render_workspace_gateway_routes(cx),
+            GatewayDetailTab::Traffic => self.render_workspace_gateway_traffic(cx),
             GatewayDetailTab::Advanced => self.render_workspace_gateway_settings(window, cx),
             GatewayDetailTab::Overview => self.render_workspace_gateway_overview(cx),
         };
@@ -917,188 +914,6 @@ impl ManagementCenter {
                 .into_any_element(),
             cx,
         )
-    }
-
-    fn render_workspace_gateway_requests(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let query = self
-            .gateway_request_search
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-        let active = self.gateway_request_filter;
-        let center = cx.weak_entity();
-        let filter = Button::new("management-gateway-request-filter")
-            .small()
-            .outline()
-            .label(active.label())
-            .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _, _| {
-                for filter in GatewayRequestFilter::ALL {
-                    let center = center.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(filter.label())
-                            .checked(filter == active)
-                            .on_click(move |_, _, cx| {
-                                center
-                                    .update(cx, |this, cx| {
-                                        this.gateway_request_filter = filter;
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            }),
-                    );
-                }
-                menu
-            });
-        let requests = self
-            .gateway_requests
-            .iter()
-            .filter(|request| {
-                matches!(
-                    (active, request.outcome),
-                    (GatewayRequestFilter::All, _)
-                        | (
-                            GatewayRequestFilter::Ok,
-                            vibex_core::GatewayRequestOutcome::Ok
-                        )
-                        | (
-                            GatewayRequestFilter::Failover,
-                            vibex_core::GatewayRequestOutcome::Failover
-                        )
-                        | (
-                            GatewayRequestFilter::Failed,
-                            vibex_core::GatewayRequestOutcome::Failed
-                                | vibex_core::GatewayRequestOutcome::Cooldown
-                        )
-                )
-            })
-            .filter(|request| {
-                query.is_empty()
-                    || request.provider_name.to_lowercase().contains(&query)
-                    || request.model_requested.to_lowercase().contains(&query)
-                    || request
-                        .agent_id
-                        .as_deref()
-                        .is_some_and(|agent| agent.to_lowercase().contains(&query))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let content = if requests.is_empty() {
-            ws_empty_line(
-                if self.gateway_requests.is_empty() {
-                    management_locale_text(
-                        "No request yet. Once an Agent goes through the gateway, each request is listed here without its prompt or reply.",
-                        "还没有请求。Agent 经过网关后，每个请求都会列在这里，但不含提示词和回复。",
-                        "還沒有請求。Agent 經過閘道後，每個請求都會列在這裡，但不含提示詞和回覆。",
-                    )
-                } else {
-                    management_locale_text(
-                        "No request matches. Clear the search or the filter.",
-                        "没有匹配的请求，请清除搜索或筛选。",
-                        "沒有符合的請求，請清除搜尋或篩選。",
-                    )
-                },
-                cx,
-            )
-        } else {
-            let expanded = self.gateway_request_detail.clone();
-            let sizes = Rc::new(
-                requests
-                    .iter()
-                    .map(|request| {
-                        let height = if expanded.as_ref() == Some(&request.request_id) {
-                            340.0
-                        } else {
-                            52.0
-                        };
-                        gpui_size(px(0.0), px(height))
-                    })
-                    .collect::<Vec<GpuiSize<gpui::Pixels>>>(),
-            );
-            let requests = Rc::new(requests);
-            div()
-                .w_full()
-                .h(px(560.0))
-                .min_h_0()
-                .child(v_virtual_list(
-                    cx.entity(),
-                    "management-gateway-request-virtual-list",
-                    sizes,
-                    move |this, range: Range<usize>, _, cx| {
-                        range
-                            .filter_map(|index| {
-                                let request = requests.get(index)?;
-                                Some(this.render_gateway_request_row(request, cx))
-                            })
-                            .collect()
-                    },
-                ))
-                .into_any_element()
-        };
-        let foot = h_flex()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .pt_3()
-            .child(
-                div()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Metadata from the last 7 days is kept. It never contains the prompt, the reply, a Key, or image content.",
-                        "保留最近 7 天的请求元数据，不含提示词、回复、Key 和图片内容。",
-                        "保留最近 7 天的請求中繼資料，不含提示詞、回覆、Key 和圖片內容。",
-                    )),
-            )
-            .when(!self.gateway_requests.is_empty(), |foot| {
-                foot.child(
-                    Button::new("management-gateway-clear-requests")
-                        .small()
-                        .ghost()
-                        .label(management_locale_text("Clear records…", "清除记录…", "清除記錄…"))
-                        .disabled(pending)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_clear_gateway_requests(window, cx)
-                        })),
-                )
-            });
-        ws_stack(vec![ws_section(
-            management_locale_text("Requests", "请求记录", "請求記錄"),
-            Some(management_locale_text(
-                "Which Provider answered, which protocol changed, and what it cost in tokens. Select a row for its route.",
-                "由哪个供应商响应、协议是否转换、消耗多少 Token；点击一行查看路由详情。",
-                "由哪個供應商回應、協定是否轉換、消耗多少 Token；點擊一列查看路由詳情。",
-            )),
-            None,
-            v_flex()
-                .w_full()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(management_search_input_compact(
-                                    &self.gateway_request_search,
-                                    cx,
-                                )),
-                        )
-                        .child(filter),
-                )
-                .child(content)
-                .child(foot)
-                .into_any_element(),
-            cx,
-        )])
     }
 
     fn render_workspace_gateway_settings(

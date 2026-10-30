@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use crate::typography::code_font_weight;
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, AnyView, App, Bounds, ClickEvent, Context, DragMoveEvent,
-    Empty, Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle,
-    SharedString, Size as GpuiSize, StatefulInteractiveElement as _, StyleRefinement, Subscription,
-    Task, WeakEntity, Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
+    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
+    Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle, SharedString,
+    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window,
+    canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
@@ -1229,10 +1229,15 @@ pub struct ManagementCenter {
     /// running is the answer to "what is happening" while the page is open,
     /// and it is gone from every later read once it finishes.
     gateway_inflight: Vec<vibex_core::GatewayInflight>,
-    /// The gateway's route map, a cached view of its own.
+    /// The gateway's route map, a view of its own so its animation frames
+    /// re-render the map rather than invalidate the page around it.
     gateway_route_stage: Option<Entity<provider_workspace::RouteStage>>,
     /// The request the route map is pinned to, picked from the request list.
     gateway_route_pinned: Option<vibex_core::RequestId>,
+    /// What this window heard of each recent request while it ran: the
+    /// members the gateway announced, in order. The live table keeps only the
+    /// member a request is on now; the map needs the ones it left.
+    gateway_route_trails: Vec<provider_workspace::GatewayRouteTrail>,
     /// A pending re-read of the request ledger after a request ended.
     gateway_requests_reload_task: Option<Task<()>>,
     /// The failover prompt a session is currently showing, if any.
@@ -1242,9 +1247,6 @@ pub struct ManagementCenter {
     /// expired. A newer prompt replaces an older one, whose request then takes
     /// the countdown's default.
     gateway_failover_prompt: Option<vibex_core::GatewayFailoverPrompt>,
-    /// The ledger row whose detail is open, if any. A request carries no
-    /// prompt and no reply, so this expands an explanation, not a transcript.
-    gateway_request_detail: Option<vibex_core::RequestId>,
     /// Per-credential limit drafts, keyed by credential id. Created on demand
     /// so a Key with no limit has no inputs at all.
     gateway_limit_inputs: BTreeMap<String, GatewayLimitInputs>,
@@ -2770,9 +2772,9 @@ impl ManagementCenter {
             gateway_inflight: Vec::new(),
             gateway_route_stage: None,
             gateway_route_pinned: None,
+            gateway_route_trails: Vec::new(),
             gateway_requests_reload_task: None,
             gateway_failover_prompt: None,
-            gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
             gateway_limits_error: None,
             gateway_token_limit_input: None,
@@ -16232,6 +16234,7 @@ impl ManagementCenter {
         event: vibex_core::GatewayEvent,
         cx: &mut Context<Self>,
     ) {
+        self.note_gateway_trail(&event);
         match event {
             vibex_core::GatewayEvent::Began(inflight) => {
                 self.gateway_inflight
@@ -16748,463 +16751,6 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn render_gateway_topology(&self, cx: &mut Context<Self>) -> AnyElement {
-        // Live state, newest last. The cap is the same one the graph would use:
-        // past a couple of dozen concurrent attempts the picture is noise, and
-        // the aggregate below says how many were left out.
-        let total_inflight = self.gateway_inflight.len();
-        let live = self
-            .gateway_inflight
-            .iter()
-            .rev()
-            .take(24)
-            .cloned()
-            .collect::<Vec<_>>();
-        let now = vibex_core::unix_timestamp_ms();
-        let waiting = live
-            .iter()
-            .filter(|request| request.first_token_at_ms.is_none())
-            .count();
-        let producing = live.len().saturating_sub(waiting);
-        // Only routes that actually reach the gateway are drawn. A direct route
-        // deliberately has no live events, and pretending it did would make the
-        // graph claim traffic it cannot see.
-        let gateway_routes = self
-            .model_routes
-            .iter()
-            .filter(|route| route.kind.via_gateway())
-            .collect::<Vec<_>>();
-        let mut agent_ids = BTreeSet::new();
-        for binding in &self.agent_model_route_bindings {
-            let gateway_route = self
-                .model_routes
-                .iter()
-                .any(|route| route.id == binding.model_route_id && route.kind.via_gateway());
-            if gateway_route {
-                agent_ids.insert(binding.agent_id.as_str().to_string());
-            }
-        }
-        for request in &live {
-            if let Some(agent) = request.agent_id.as_deref() {
-                agent_ids.insert(agent.to_string());
-            }
-        }
-        let agent_label = |agent_id: &str| {
-            self.snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.id.as_str() == agent_id)
-                .map(|agent| agent.label.clone())
-                .unwrap_or_else(|| agent_id.to_string())
-        };
-        let mut agents = v_flex().w_full().gap_1();
-        for agent_id in &agent_ids {
-            let active = live
-                .iter()
-                .filter(|request| request.agent_id.as_deref() == Some(agent_id.as_str()))
-                .count();
-            agents = agents.child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(agent_brand_icon(agent_id, px(14.0), None))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .child(agent_label(agent_id)),
-                    )
-                    .when(active > 0, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .rounded(px(8.0))
-                                .bg(cx.theme().success.opacity(0.16))
-                                .px_1()
-                                .text_xs()
-                                .text_color(cx.theme().success)
-                                .child(active.to_string()),
-                        )
-                    }),
-            );
-        }
-        if agent_ids.is_empty() {
-            agents = agents.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "No gateway-bound Agents",
-                        "没有绑定网关的 Agent",
-                        "沒有綁定閘道的 Agent",
-                    )),
-            );
-        }
-        let mut providers = v_flex().w_full().gap_2();
-        for route in gateway_routes.iter().take(6) {
-            let mut names = Vec::new();
-            let mut member_models = Vec::new();
-            for member in route.enabled_members() {
-                if let Some(profile) = self
-                    .providers
-                    .iter()
-                    .find(|profile| profile.id == member.model_provider_profile_id)
-                {
-                    if !names.contains(&profile.display_name) {
-                        names.push(profile.display_name.clone());
-                    }
-                    if route.is_model_group() {
-                        member_models
-                            .push(format!("{} · {}", profile.display_name, member.model_id));
-                    }
-                }
-            }
-            let attempts = live
-                .iter()
-                .filter(|request| request.model_route_id.as_deref() == Some(route.id.as_str()))
-                .collect::<Vec<_>>();
-            let mut route_column = v_flex()
-                .w_full()
-                .gap_0p5()
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(if attempts.is_empty() {
-                    cx.theme().border.opacity(0.45)
-                } else {
-                    cx.theme().primary.opacity(0.55)
-                })
-                .px_2()
-                .py_1()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_1()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .font_medium()
-                                .child(route.display_name.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_route_strategy_label(route.strategy)),
-                        ),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if route.is_model_group() {
-                            route
-                                .agent_model()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| names.join(" + "))
-                        } else {
-                            names.join(" + ")
-                        }),
-                );
-            if route.is_model_group() && member_models.len() <= 3 {
-                route_column = route_column.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(member_models.join("  ")),
-                );
-            }
-            for request in attempts {
-                let provider_name = self
-                    .providers
-                    .iter()
-                    .find(|profile| profile.id == request.model_provider_profile_id)
-                    .map(|profile| profile.display_name.clone())
-                    .unwrap_or_else(|| request.model_provider_profile_id.as_str().to_string());
-                let (state, color) = match request.first_token_at_ms {
-                    Some(at) => (
-                        format!(
-                            "TTFT {} ms",
-                            at.saturating_sub(request.started_at_ms).max(0)
-                        ),
-                        cx.theme().success,
-                    ),
-                    None => (
-                        management_locale_text("waiting", "等待中", "等待中").to_string(),
-                        cx.theme().warning,
-                    ),
-                };
-                route_column = route_column.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_1()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .child(format!("{} · #{}", provider_name, request.attempt)),
-                        )
-                        .child(div().flex_none().text_xs().text_color(color).child(state)),
-                );
-            }
-            providers = providers.child(route_column);
-        }
-        if gateway_routes.is_empty() {
-            providers = providers.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "No route groups",
-                        "没有路由组",
-                        "沒有路由組",
-                    )),
-            );
-        }
-        let gateway_state =
-            if self.gateway.runtime.status == vibex_core::ModelGatewayStatus::Running {
-                management_locale_text("Running", "运行中", "執行中")
-            } else {
-                management_locale_text("Stopped", "已停止", "已停止")
-            };
-        let topology = h_flex()
-            .w_full()
-            .items_start()
-            .gap_3()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text("Agents", "Agent", "Agent")),
-                    )
-                    .child(agents),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().primary)
-                            .child(management_locale_text("Gateway", "网关", "閘道")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(gateway_state),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} {}",
-                                live.len(),
-                                management_locale_text("inflight", "进行中", "進行中")
-                            )),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().success)
-                                    .child(format!("{producing} streaming")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().warning)
-                                    .child(format!("{waiting} waiting")),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text("Route groups", "路由组", "路由組")),
-                    )
-                    .child(providers),
-            );
-        // One row per live attempt. This is the same event stream the graph
-        // draws, rendered as a list so a reader can still use the information
-        // when motion is reduced or the window is narrow.
-        let mut live_rows = v_flex().w_full().gap_1();
-        for request in &live {
-            let provider_name = self
-                .providers
-                .iter()
-                .find(|profile| profile.id == request.model_provider_profile_id)
-                .map(|profile| profile.display_name.clone())
-                .unwrap_or_else(|| request.model_provider_profile_id.as_str().to_string());
-            let route_name = request
-                .model_route_id
-                .as_deref()
-                .and_then(|route_id| {
-                    self.model_routes
-                        .iter()
-                        .find(|route| route.id.as_str() == route_id)
-                })
-                .map(|route| route.display_name.clone())
-                .unwrap_or_else(|| management_locale_text("Direct", "直连", "直連").to_string());
-            let elapsed = now.saturating_sub(request.started_at_ms).max(0);
-            let (state, color) = match request.first_token_at_ms {
-                Some(at) => (
-                    format!(
-                        "TTFT {} ms · {} ms",
-                        at.saturating_sub(request.started_at_ms).max(0),
-                        elapsed
-                    ),
-                    cx.theme().success,
-                ),
-                None => (
-                    format!(
-                        "{} · {} ms",
-                        management_locale_text("waiting", "等待中", "等待中"),
-                        elapsed
-                    ),
-                    cx.theme().warning,
-                ),
-            };
-            live_rows = live_rows.child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .rounded(px(4.0))
-                    .px_2()
-                    .py_1()
-                    .bg(cx.theme().background.opacity(0.6))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(7.0))
-                            .h(px(7.0))
-                            .rounded(px(4.0))
-                            .bg(color),
-                    )
-                    .child(div().min_w_0().truncate().text_xs().child(format!(
-                                "{} → {} → {}",
-                                request
-                                    .agent_id
-                                    .as_deref()
-                                    .map(agent_label)
-                                    .unwrap_or_else(|| {
-                                        management_locale_text("Agent", "Agent", "Agent")
-                                            .to_string()
-                                    }),
-                                route_name,
-                                provider_name
-                            )))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "#{} · {}",
-                                request.attempt, request.wire_protocol_id
-                            )),
-                    )
-                    .child(div().flex_none().text_xs().text_color(color).child(state)),
-            );
-        }
-        if live.is_empty() {
-            live_rows = live_rows.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "No requests are in flight. Rows appear from real Began, FirstToken, and Ended events only.",
-                        "当前没有进行中的请求。列表只来自真实的 Began、FirstToken 和 Ended 事件。",
-                        "目前沒有進行中的請求。列表只來自真實的 Began、FirstToken 和 Ended 事件。",
-                    )),
-            );
-        }
-        management_card_with_icon(
-            management_locale_text("Live routing", "实时路由", "即時路由"),
-            management_locale_text(
-                "Agents reach Providers through the gateway and its route groups. Every marker below is a real request event; direct Providers are not drawn.",
-                "Agent 通过网关和路由组到达供应商。下方每个标记都来自真实请求事件；直连供应商不绘制。",
-                "Agent 透過閘道和路由組到達供應商。下方每個標記都來自真實請求事件；直連供應商不繪製。",
-            ),
-            "icons/vibex/boxes.svg",
-            v_flex()
-                .w_full()
-                .gap_2()
-                .child(topology)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if total_inflight > live.len() {
-                                    format!(
-                                        "{} / {} {}",
-                                        live.len(),
-                                        total_inflight,
-                                        management_locale_text(
-                                            "shown; the rest are aggregated",
-                                            "已显示；其余已聚合",
-                                            "已顯示；其餘已聚合"
-                                        )
-                                    )
-                                } else {
-                                    management_locale_text(
-                                        "Fed by Begin, FirstToken, and End events. No simulated traffic.",
-                                        "由 Begin、FirstToken、End 事件驱动，不伪造流量。",
-                                        "由 Begin、FirstToken、End 事件驅動，不偽造流量。",
-                                    )
-                                    .to_string()
-                                }),
-                        ),
-                )
-                .child(live_rows)
-                .into_any_element(),
-            cx,
-        )
-    }
-
     fn confirm_clear_gateway_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -17231,210 +16777,6 @@ impl ManagementCenter {
                     true
                 })
         });
-    }
-
-    /// Opens or closes one ledger row's detail.
-    ///
-    /// Only one row is open at a time: the detail is read against the list
-    /// around it, and a page of open rows would push the rest of the ledger
-    /// out of sight.
-    fn toggle_gateway_request_detail(
-        &mut self,
-        request_id: vibex_core::RequestId,
-        cx: &mut Context<Self>,
-    ) {
-        self.gateway_request_detail =
-            (self.gateway_request_detail.as_ref() != Some(&request_id)).then_some(request_id);
-        cx.notify();
-    }
-
-    /// One request in full: the model that was asked for and answered, where
-    /// the request actually went, and what it cost in tokens.
-    ///
-    /// This is the surface the "which Key answered, and why not the other one"
-    /// question is answered on. It shows metadata only, because that is all the
-    /// ledger keeps.
-    fn render_gateway_request_row(
-        &mut self,
-        request: &vibex_core::GatewayRequestSummary,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let outcome = match request.outcome {
-            vibex_core::GatewayRequestOutcome::Ok => Tag::color(ColorName::Green)
-                .xsmall()
-                .child(management_locale_text("ok", "成功", "成功"))
-                .into_any_element(),
-            vibex_core::GatewayRequestOutcome::Failover => Tag::color(ColorName::Blue)
-                .xsmall()
-                .child(management_locale_text("failover", "已切换", "已切換"))
-                .into_any_element(),
-            vibex_core::GatewayRequestOutcome::Cooldown => Tag::color(ColorName::Amber)
-                .xsmall()
-                .child(management_locale_text("cooling", "冷却中", "冷卻中"))
-                .into_any_element(),
-            _ => Tag::color(ColorName::Red)
-                .xsmall()
-                .child(management_locale_text("failed", "失败", "失敗"))
-                .into_any_element(),
-        };
-        let wire = if request.wire_in == request.wire_out {
-            management_locale_text("direct", "直通", "直通").to_string()
-        } else {
-            format!("{} → {}", request.wire_in, request.wire_out)
-        };
-        let request_id = request.request_id.clone();
-        let expanded = self.gateway_request_detail.as_ref() == Some(&request_id);
-        let toggle_id = request_id.clone();
-        let key_id = request_id.clone();
-        let row = h_flex()
-            .id(SharedString::from(format!(
-                "management-gateway-request-row-{}",
-                request_id.as_str()
-            )))
-            .w_full()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .py_1()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_gateway_request_detail(toggle_id.clone(), cx)
-            }))
-            .focusable()
-            .tab_index(0)
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "enter" {
-                    this.toggle_gateway_request_detail(key_id.clone(), cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(div().min_w_0().truncate().text_sm().child(format!(
-                        "{} · {}",
-                        request.provider_name, request.model_requested
-                    )))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{wire} · {} tokens", request.total_tokens)),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .child(outcome)
-                    .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronUp
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(px(14.0))
-                        .text_color(cx.theme().muted_foreground),
-                    ),
-            );
-        let mut entry = v_flex().w_full().child(row);
-        if expanded {
-            entry = entry.child(self.render_gateway_request_detail(request, cx));
-        }
-        entry.into_any_element()
-    }
-
-    fn render_gateway_request_detail(
-        &self,
-        request: &vibex_core::GatewayRequestSummary,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let _ = cx;
-        let mut model_rows = vec![(
-            management_locale_text("Asked", "请求", "請求"),
-            request.model_requested.clone(),
-        )];
-        if let Some(served) = request.model_served.clone() {
-            model_rows.push((management_locale_text("Served", "实际", "實際"), served));
-        }
-        let model_mismatch =
-            request.model_served.as_deref() != Some(request.model_requested.as_str());
-        let route_rows = gateway_route_lines(request, locale::current_locale())
-            .into_iter()
-            .enumerate()
-            .map(|(index, line)| {
-                (
-                    if index == 0 {
-                        management_locale_text("Route", "经过", "經過")
-                    } else {
-                        ""
-                    },
-                    line,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut meta_rows = vec![(
-            management_locale_text("Status", "状态", "狀態"),
-            format!(
-                "{} · {} ms",
-                request
-                    .status
-                    .map(|status| status.to_string())
-                    .unwrap_or_else(|| "—".to_string()),
-                request.latency_ms.unwrap_or_default()
-            ),
-        )];
-        if let Some(code) = gateway_request_error_code(request) {
-            meta_rows.push((management_locale_text("Failure", "失败", "失敗"), code));
-        }
-        meta_rows.push((
-            management_locale_text("Usage", "用量", "用量"),
-            format!(
-                "{} {} · {} {} · {} {} · {} {}",
-                management_locale_text("in", "输入", "輸入"),
-                request.input_tokens,
-                management_locale_text("out", "输出", "輸出"),
-                request.output_tokens,
-                management_locale_text("cached", "缓存命中", "快取命中"),
-                request.cached_read_tokens,
-                management_locale_text("total", "合计", "合計"),
-                request.total_tokens
-            ),
-        ));
-
-        v_flex()
-            .id(SharedString::from(format!(
-                "management-gateway-request-{}",
-                request.request_id.as_str()
-            )))
-            .w_full()
-            .gap_1()
-            .px_3()
-            .py_2()
-            .mb_1()
-            .rounded(px(6.0))
-            .bg(cx.theme().muted.opacity(0.35))
-            .child(description_rows_plain(model_rows))
-            .when(model_mismatch, |this| {
-                this.child(
-                    div()
-                        .pl(px(12.0))
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "The Agent asked for one model and the upstream answered with another.",
-                            "Agent 请求的模型与上游实际返回的不是同一个。",
-                            "Agent 請求的模型與上游實際回傳的不是同一個。",
-                        )),
-                )
-            })
-            .child(description_rows_plain(route_rows))
-            .child(description_rows_plain(meta_rows))
-            .into_any_element()
     }
 
     /// Clears the ledger and refreshes the card.
@@ -35142,107 +34484,6 @@ fn gateway_request_error_code(request: &vibex_core::GatewayRequestSummary) -> Op
         .and_then(|route| route.error_code.clone())
 }
 
-/// The route one request took, as the lines the detail view shows.
-///
-/// The first line is always the chain; every later line is a reason the chain
-/// is not simply "gateway, Provider, first Key". A single failover is folded
-/// into the chain the way it reads aloud — the Key that answered, followed by
-/// the Key that did not and why — while a chain with more than one dead Key
-/// lists them, because the parenthesis stops being readable at that point.
-fn gateway_route_lines(
-    request: &vibex_core::GatewayRequestSummary,
-    locale: ResolvedLocale,
-) -> Vec<String> {
-    let gateway = management_locale_text_for(locale, "Vibex gateway", "Vibex 网关", "Vibex 閘道");
-    let serving = gateway_credential_name(request.credential_name.as_deref(), locale);
-    let mut chain = format!("{gateway} → {} → {serving}", request.provider_name);
-    let mut lines = Vec::new();
-    let route = request.route.as_ref();
-    if let Some(failure) = route.and_then(|route| {
-        (route.failed_attempts.len() == 1).then(|| route.failed_attempts[0].clone())
-    }) {
-        let failed = gateway_credential_name(failure.credential_name.as_deref(), locale);
-        chain.push_str(&format!(
-            "（{failed} · {}）",
-            gateway_failure_text(failure.failure, locale)
-        ));
-    }
-    lines.push(chain);
-    // Only the single-failure case is folded into the chain, so only that one
-    // is skipped here; a longer list names every Key it stepped over.
-    let failures = route
-        .map(|route| route.failed_attempts.as_slice())
-        .unwrap_or_default();
-    let folded = failures.len() == 1;
-    for (index, failure) in failures.iter().enumerate() {
-        if folded && index == 0 {
-            continue;
-        }
-        let failed = gateway_credential_name(failure.credential_name.as_deref(), locale);
-        lines.push(format!(
-            "{} · {}",
-            failed,
-            gateway_failure_text(failure.failure, locale)
-        ));
-    }
-    if let Some(route) = route {
-        if route.skipped_cooling > 0 {
-            lines.push(match locale {
-                ResolvedLocale::En => format!("skipped {} cooling keys", route.skipped_cooling),
-                ResolvedLocale::ZhCn => format!("已跳过 {} 个冷却中的 Key", route.skipped_cooling),
-                ResolvedLocale::ZhTw => format!("已跳過 {} 個冷卻中的 Key", route.skipped_cooling),
-            });
-        }
-        if route.skipped_over_limit > 0 {
-            lines.push(match locale {
-                ResolvedLocale::En => {
-                    format!(
-                        "skipped {} keys over their token ceiling",
-                        route.skipped_over_limit
-                    )
-                }
-                ResolvedLocale::ZhCn => {
-                    format!("已跳过 {} 个超出额度上限的 Key", route.skipped_over_limit)
-                }
-                ResolvedLocale::ZhTw => {
-                    format!("已跳過 {} 個超出額度上限的 Key", route.skipped_over_limit)
-                }
-            });
-        }
-        // A cross-member failover is the one thing a Key-level trace cannot
-        // express: it says a whole source was unavailable, not that a Key
-        // cooled. Naming the Provider is what makes "why did this go to the
-        // second one" answerable from the ledger.
-        for member in &route.skipped_members {
-            let provider = member
-                .provider_name
-                .clone()
-                .unwrap_or_else(|| member.model_provider_profile_id.as_str().to_string());
-            lines.push(match locale {
-                ResolvedLocale::En => {
-                    format!(
-                        "skipped {provider} · {}",
-                        gateway_failure_text(member.failure, locale)
-                    )
-                }
-                ResolvedLocale::ZhCn => {
-                    format!(
-                        "已跳过 {provider} · {}",
-                        gateway_failure_text(member.failure, locale)
-                    )
-                }
-                ResolvedLocale::ZhTw => {
-                    format!(
-                        "已跳過 {provider} · {}",
-                        gateway_failure_text(member.failure, locale)
-                    )
-                }
-            });
-        }
-    }
-    lines
-}
-
 /// The two limit fields for one Key.
 struct GatewayLimitInputs {
     concurrency: Entity<InputState>,
@@ -35439,9 +34680,9 @@ impl GatewayRequestFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayDetailTab {
     Overview,
-    Keys,
+    Routing,
     Traffic,
-    Requests,
+    Keys,
     Advanced,
 }
 
@@ -40590,25 +39831,6 @@ fn description_rows(
         )
 }
 
-/// A borderless description list for facts that already live inside a card.
-///
-/// `stat_line` rows used to draw their own separator under every pair. The kit
-/// list owns the label column and the value alignment, so a detail card keeps
-/// the same density without another box inside it.
-fn description_rows_plain(
-    rows: impl IntoIterator<Item = (impl Into<DescriptionText>, impl Into<DescriptionText>)>,
-) -> DescriptionList {
-    DescriptionList::new()
-        .columns(1)
-        .label_width(px(140.0))
-        .bordered(false)
-        .with_size(Size::Small)
-        .children(
-            rows.into_iter()
-                .map(|(label, value)| DescriptionItem::new(label).value(value)),
-        )
-}
-
 fn status_line(message: String, error: bool, cx: &mut Context<ManagementCenter>) -> AnyElement {
     div()
         .w_full()
@@ -45358,45 +44580,46 @@ mod gateway_surface_tests {
         }
     }
 
+    /// The route map plays what the gateway announced, not a guess: every
+    /// event reaches the trails it is drawn from, and a request already
+    /// running when the page opens is drawn from the live table.
     #[test]
-    fn the_gateway_page_draws_live_routing_from_events() {
+    fn the_route_map_is_drawn_from_gateway_events() {
         let source = include_str!("management.rs");
-        let topology = source
-            .split_once("fn render_gateway_topology(")
-            .and_then(|(_, tail)| tail.split_once("fn confirm_clear_gateway_requests("))
+        let handler = source
+            .split_once("    pub(crate) fn apply_gateway_event(")
+            .and_then(|(_, tail)| tail.split_once("    fn schedule_gateway_requests_reload("))
             .map(|(body, _)| body)
-            .expect("the live routing card should remain inspectable");
+            .expect("the gateway event handler should remain inspectable");
+        assert!(handler.contains("self.note_gateway_trail(&event)"));
+
+        let routes = include_str!("management/provider_workspace/routes.rs");
         for marker in [
-            "self.gateway_inflight",
-            "take(24)",
-            "first_token_at_ms",
-            "TTFT",
-            "Began",
-            "FirstToken",
-            "Ended",
-            "icons/vibex/boxes.svg",
+            "GatewayEvent::Began",
+            "GatewayEvent::FirstToken",
+            "GatewayEvent::Ended",
+            "GatewayRouteTrail::from_inflight(inflight)",
             "route.kind.via_gateway()",
+            "fn ledger_walk(",
         ] {
-            assert!(
-                topology.contains(marker),
-                "the live routing card must keep {marker}"
-            );
+            assert!(routes.contains(marker), "the route map must keep {marker}");
         }
     }
 
     #[test]
     fn gateway_requests_can_be_searched_and_filtered() {
-        let source = include_str!("management.rs");
+        let source = include_str!("management/provider_workspace/routes.rs");
         for marker in [
-            "management-gateway-request-filter-",
+            "\"management-gateway-request-filter\"",
             "GatewayRequestFilter::Failover",
             "GatewayRequestFilter::Failed",
-            "management_search_input(&self.gateway_request_search",
-            "render_gateway_request_detail",
+            "management_search_input_compact(",
+            "&self.gateway_request_search",
+            "v_virtual_list(",
         ] {
             assert!(
                 source.contains(marker),
-                "the request ledger must keep {marker}"
+                "the request records must keep {marker}"
             );
         }
     }
@@ -45420,24 +44643,34 @@ mod gateway_surface_tests {
         }
     }
 
+    /// The route map and the requests it is picked from are one tab: a
+    /// record that pins nothing it can be seen beside is the old split.
     #[test]
-    fn the_gateway_workbench_has_six_tabs() {
-        let source = include_str!("management.rs");
-        for marker in [
-            "management-gateway-detail-tabs",
+    fn the_gateway_workbench_has_five_tabs() {
+        let source = include_str!("management/provider_workspace/gateway.rs");
+        let tabs = source
+            .split_once("const GATEWAY_TABS: [GatewayDetailTab; 5] = [")
+            .and_then(|(_, tail)| tail.split_once("];"))
+            .map(|(body, _)| body)
+            .expect("the gateway tab list should remain inspectable");
+        let order = [
             "GatewayDetailTab::Overview",
-            "GatewayDetailTab::Keys",
-            "GatewayDetailTab::Protocol",
+            "GatewayDetailTab::Routing",
             "GatewayDetailTab::Traffic",
-            "GatewayDetailTab::Requests",
+            "GatewayDetailTab::Keys",
             "GatewayDetailTab::Advanced",
-            "self.gateway_detail_tab = *tab",
-        ] {
-            assert!(
-                source.contains(marker),
-                "the gateway workbench must keep {marker}"
-            );
-        }
+        ];
+        let positions = order
+            .iter()
+            .map(|tab| tabs.find(tab).unwrap_or_else(|| panic!("missing {tab}")))
+            .collect::<Vec<_>>();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            source
+                .contains("GatewayDetailTab::Routing => self.render_workspace_gateway_routes(cx)")
+        );
+        assert!(source.contains("management-gateway-detail-tabs"));
+        assert!(source.contains("this.gateway_detail_tab = *tab"));
     }
 
     #[test]
@@ -46506,112 +45739,6 @@ mod gateway_surface_tests {
         }
     }
 
-    fn failed_attempt(
-        name: &str,
-        failure: vibex_core::GatewayFailureKind,
-    ) -> vibex_core::GatewayRouteAttemptSummary {
-        vibex_core::GatewayRouteAttemptSummary {
-            credential_name: Some(name.to_string()),
-            credential_id: vibex_core::RequestId::new(),
-            failure,
-        }
-    }
-
-    /// The route line names the Key that answered, and — folded into the same
-    /// line — the Key that did not and why.
-    ///
-    /// This is the whole point of the detail view: a failover that only said
-    /// "another Key answered" would leave the reader unable to tell a rate
-    /// limit from a dead account.
-    #[test]
-    fn the_route_line_names_the_key_that_answered_and_the_one_it_stepped_over() {
-        let request = ledger_request(
-            Some("Backup"),
-            Some(vibex_core::GatewayRouteSummary {
-                skipped_cooling: 1,
-                skipped_over_limit: 0,
-                failed_attempts: vec![failed_attempt(
-                    "Primary",
-                    vibex_core::GatewayFailureKind::Quota,
-                )],
-                skipped_members: Vec::new(),
-                error_code: None,
-                error_message: None,
-                decision: None,
-            }),
-        );
-
-        let english = gateway_route_lines(&request, ResolvedLocale::En);
-        assert_eq!(
-            english,
-            vec![
-                "Vibex gateway → DeepSeek → Backup（Primary · out of quota）".to_string(),
-                "skipped 1 cooling keys".to_string(),
-            ]
-        );
-
-        let simplified = gateway_route_lines(&request, ResolvedLocale::ZhCn);
-        assert_eq!(
-            simplified,
-            vec![
-                "Vibex 网关 → DeepSeek → Backup（Primary · 额度用尽）".to_string(),
-                "已跳过 1 个冷却中的 Key".to_string(),
-            ]
-        );
-
-        // The over-ceiling count is its own line, because it is a different
-        // reason to have skipped a Key and it has a different fix.
-        let over_limit = ledger_request(
-            Some("Primary"),
-            Some(vibex_core::GatewayRouteSummary {
-                skipped_cooling: 0,
-                skipped_over_limit: 2,
-                failed_attempts: Vec::new(),
-                skipped_members: Vec::new(),
-                error_code: None,
-                error_message: None,
-                decision: None,
-            }),
-        );
-        let lines = gateway_route_lines(&over_limit, ResolvedLocale::ZhCn);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "Vibex 网关 → DeepSeek → Primary");
-        assert_eq!(lines[1], "已跳过 2 个超出额度上限的 Key");
-    }
-
-    /// A chain with more than one dead Key lists them rather than folding them
-    /// into a parenthesis, and a request with nothing to explain is one line.
-    #[test]
-    fn a_route_with_several_dead_keys_lists_them_and_a_plain_one_stays_one_line() {
-        let plain = ledger_request(None, None);
-        let lines = gateway_route_lines(&plain, ResolvedLocale::En);
-        assert_eq!(
-            lines,
-            vec!["Vibex gateway → DeepSeek → a removed key".to_string()],
-        );
-
-        let two_dead = ledger_request(
-            Some("Tertiary"),
-            Some(vibex_core::GatewayRouteSummary {
-                skipped_cooling: 0,
-                skipped_over_limit: 0,
-                failed_attempts: vec![
-                    failed_attempt("Primary", vibex_core::GatewayFailureKind::Credit),
-                    failed_attempt("Backup", vibex_core::GatewayFailureKind::Rate),
-                ],
-                skipped_members: Vec::new(),
-                error_code: None,
-                error_message: None,
-                decision: None,
-            }),
-        );
-        let lines = gateway_route_lines(&two_dead, ResolvedLocale::En);
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "Vibex gateway → DeepSeek → Tertiary");
-        assert_eq!(lines[1], "Primary · out of credit");
-        assert_eq!(lines[2], "Backup · rate limited");
-    }
-
     /// Every failure kind is said in words, in every locale, and never as the
     /// stored enum id.
     #[test]
@@ -46641,37 +45768,25 @@ mod gateway_surface_tests {
         }
     }
 
-    /// The ledger row opens its detail, and the detail renders the route it
-    /// was given. The row is the only entry point, so the wiring is the
-    /// feature.
+    /// A request record pins the route map to that request, by pointer and by
+    /// keyboard, and shows that it is the one pinned. The record is the way
+    /// into a request's route, so the wiring is the feature.
     #[test]
-    fn the_ledger_row_opens_the_route_detail() {
-        let source = include_str!("management.rs");
+    fn a_request_record_pins_the_route_map() {
+        let source = include_str!("management/provider_workspace/routes.rs");
         let row = source
-            .split_once("        let row = h_flex()")
-            .and_then(|(_, tail)| tail.split_once("        let mut entry = v_flex()"))
+            .split_once("    fn render_workspace_routes_list_row(")
+            .and_then(|(_, tail)| tail.split_once("\nenum RouteListRow {"))
             .map(|(body, _)| body)
-            .expect("the ledger row should remain inspectable");
-        assert!(row.contains("toggle_gateway_request_detail"));
+            .expect("the request record should remain inspectable");
         assert!(row.contains("management-gateway-request-row-"));
-        assert!(row.contains("IconName::ChevronDown"));
-
-        let detail = source
-            .split_once("    fn render_gateway_request_detail(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Clears the ledger and refreshes the card.")
-            })
-            .map(|(body, _)| body)
-            .expect("the request detail should remain inspectable");
-        assert!(detail.contains("gateway_route_lines(request"));
-        assert!(detail.contains("request.input_tokens"));
-        assert!(detail.contains("request.latency_ms"));
-        // A failed request names why in the ledger, not only in the message the
+        assert!(row.contains(".on_click(cx.listener(move |this, _, _, cx|"));
+        assert!(row.contains("this.pick_gateway_route(pick.clone(), cx)"));
+        assert!(row.contains("event.keystroke.key == \"enter\""));
+        assert!(row.contains("cx.theme().list_active"));
+        // A failed request names why in the record, not only in the message the
         // Agent showed: the code is the one thing a reader can look up.
-        assert!(detail.contains("gateway_request_error_code(request"));
-        // The detail is a reading of one row; it must not offer a mutation.
-        assert!(!detail.contains("Button::new"));
-        assert!(!detail.contains("on_click"));
+        assert!(row.contains("gateway_request_error_code(done)"));
     }
 
     /// A failed row names its code; a successful one has none to name.

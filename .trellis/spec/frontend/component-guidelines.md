@@ -244,6 +244,24 @@ that touch instead of performing it inline: the archived list loads through
 panics on `read_with` too, and `WeakEntity::read_with(..).ok()` does not turn
 that panic into an `Err`.
 
+### GPUI Cached Views Take Their Size From the Cache Style
+
+`AnyView::cached(style)` / `Entity::cached(style)` lays the view's root out at
+`style` alone: the cached subtree is not measured, so its content cannot size
+it. A view cached with only `w_full()` gets no height, and whatever it paints
+overlaps the elements after it. Give a cached view a style that fixes both
+axes, or embed the entity uncached (`.child(entity)`) and let its content size
+it. Caching does not shorten an animation either: a view's
+`window.request_animation_frame()` marks every ancestor view dirty, so the
+parents re-render each frame regardless.
+
+When a view draws between nodes that ordinary layout places — wires between
+cards — measure instead of hard-coding geometry: give each node an absolutely
+positioned `canvas` whose prepaint records its bounds into shared state, and
+let the drawing canvases read those bounds in their paint closure. Prepaint
+runs for the whole tree before paint, so the drawing always matches the frame
+it is painted in (see `management/provider_workspace/route_stage.rs`).
+
 ### GPUI Dialog Input Lifetime
 
 A `window.open_dialog` builder is evaluated again on every repaint of the view

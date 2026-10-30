@@ -18,6 +18,7 @@ mod routes;
 mod sidebar;
 
 pub(crate) use route_stage::RouteStage;
+pub(crate) use routes::GatewayRouteTrail;
 
 impl ManagementCenter {
     /// The detail pane: whichever record the left column selected, or the

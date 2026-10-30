@@ -5545,6 +5545,31 @@ ProviderConfigService::{
   The outcome follows the recorded attempts. A request served on the first try
   from a Provider holding five Keys is `ok`; labelling it `failover` made the
   column useless exactly where it mattered.
+- **The route map and the request records are one tab.** The gateway page's
+  Routing tab (`provider_workspace/routes.rs`) draws the route map
+  (`route_stage.rs`: Agents → gateway → the route group's members, each member
+  with its Key chips), the story of one request under it, and the request
+  records below. Picking a record pins the map to that request and replays its
+  walk; picking it again replays it; Back to live unpins. Traffic keeps only the
+  aggregates. Splitting the map and the records across two tabs left a record
+  with no way to show its route.
+- **The map plays what the gateway announced, never a guess.** Every
+  `GatewayEvent` is folded into a per-request trail (`note_gateway_trail`): one
+  step per member the gateway announced, timed by when the window heard it, plus
+  the first token and the end. A request already running when the page opens is
+  drawn from the live table. Member failover is therefore visible while it
+  happens; which Key refused and why arrives with the ledger row, and
+  `ledger_walk` rebuilds the order from it: a member's refusing Keys precede the
+  member in `failedAttempts`, a member none of whose Keys refused was passed
+  over, and the Keys left over belong to the member that answered. A `rejected`
+  row walked nowhere — the map shows the gateway turning it back.
+- **The map asks for frames only while something travels.** A dot in flight,
+  a shaking member or a fresh refusal tag asks for animation frames; a request
+  that is only waiting redraws on a ~15 fps timer for its pulse and flowing
+  wire; with reduced motion, or the pause-when-inactive setting on an inactive
+  window, nothing moves and the map shows where each request stands. Every
+  animation frame re-renders the views above the map as well, so the map owns
+  no work beyond its own frame.
 - **A created Provider is verified by one real minimal request, and the check
   cannot undo it.** The save writes the row first and probes it afterwards, so a
   blocked probe — a proxy, a rate limit, a vendor that refuses this client — is
