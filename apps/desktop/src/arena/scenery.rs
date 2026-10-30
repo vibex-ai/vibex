@@ -1,5 +1,6 @@
-//! Six authored sanctuaries. Terrain silhouettes and column anchors come from
-//! the collision map; props are painted in the actors' ground-depth order.
+//! One authored sanctuary per guardian. Terrain silhouettes and column
+//! anchors come from the collision map; props are painted in the actors'
+//! ground-depth order.
 
 use super::{
     art::{HEIGHT, SCALE, TOP_PAD, WIDTH, pixel},

@@ -1,5 +1,6 @@
 //! ZCode's Z, after the Z.ai logo: a long diagonal slab, and two bars that
-//! sit across its ends at home and fly off as fists in a fight.
+//! sit across its ends at home and in a fight are arms that tunnel under the
+//! floor.
 //!
 //! Model space: x across the face, z up, +y toward the viewer. The outlines
 //! are the logo's own parallelograms, scaled so the Z stands 24 units tall.

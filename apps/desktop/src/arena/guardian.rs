@@ -1,4 +1,4 @@
-//! Six encounter identities and their visible, spatial combat state.
+//! Sixteen encounter identities and their visible, spatial combat state.
 
 use super::{
     geometry::{Vec2, smoothstep},
@@ -195,9 +195,10 @@ pub(super) const IDLE_LOOP: f32 = 36.0;
 pub(super) const CLINE_HEAD: f32 = 11.0;
 /// The middle of Grok's ring above its ground anchor.
 pub(super) const GROK_RING: f32 = 10.0;
-/// The middle of ZCode's slab, where the core sits behind its shutter.
+/// The middle of ZCode's slab, where the core sits behind its teeth.
 pub(super) const ZCODE_CORE: f32 = 14.0;
-/// How high ZCode's fists hover when they are not striking.
+/// How high ZCode's arms hover beside the slab as it wakes, before they sink
+/// into the floor.
 pub(super) const ZCODE_HOVER: f32 = 9.0;
 /// Steps Devin cartwheels round the home each loop: a whole number of
 /// three, so the flower comes home on the same petal.
@@ -526,7 +527,7 @@ impl Boss {
     }
     pub fn resting_hand(&self, ix: usize) -> Vec2 {
         if self.guardian == Guardian::ZCode {
-            // The fists hover out to either side of the slab, a little ahead.
+            // The arms hover out to either side of the slab, a little ahead.
             return self.ground(if ix == 0 { -17.0 } else { 17.0 }, 9.0);
         }
         self.ground(if ix == 0 { -8.3 } else { 8.6 }, 0.0)
@@ -585,11 +586,11 @@ impl Boss {
             Guardian::Cline => self.articulated(0.0, -8.6, CLINE_HEAD),
             // The red core set in the back of the ring.
             Guardian::Grok => self.articulated(0.0, -2.4, GROK_RING),
-            // Behind the shutter in the middle of the slab's face.
+            // Behind the teeth in the mouth in the middle of the slab's face.
             Guardian::ZCode => self.local(0.0, 3.4, ZCODE_CORE),
             // The blue square at the tile's upper right corner.
             Guardian::Kimi => self.articulated(4.35, 3.4, 11.4),
-            // The gem on its chest.
+            // The gem at its collar.
             Guardian::CodeBuddy => self.articulated(0.0, 5.2, 6.6 * squash),
             // The heart hanging under the apex, between the legs.
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),

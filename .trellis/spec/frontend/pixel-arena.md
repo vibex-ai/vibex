@@ -91,14 +91,18 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   home opacity, and one cancellable clock. Closing or navigating away releases
   the clock and all input. The existing composer entity and draft survive.
   Both surfaces drive the same view; only one of them can hold it at a time.
-- `combat.rs`, `guardian.rs`, `encounters.rs`, the six `encounter_*.rs` modules,
-  `map.rs`, and `geometry.rs` are independent of GPUI. `encounters.rs` owns shared
-  targeting, ballistic arcs and rolling/dash collisions; each encounter module
-  owns its choreography.
-  `sculpture.rs` authors spatial meshes; `scenery.rs` authors terrain; `art.rs`
-  composes actors and the `effects.rs` cues. `raster.rs` owns integer primitives,
-  depth rasterization, and rectangle merging; `palette.rs` owns artwork materials;
-  `scene.rs` owns projection/painting; `copy.rs` owns localized copy.
+- `combat.rs`, `guardian.rs`, `encounters.rs`, one `encounter_*.rs` module per
+  guardian, the shape helpers `cube.rs`, `zed.rs` and `devin.rs`, `map.rs`, and
+  `geometry.rs` are independent of GPUI. `encounters.rs` owns shared targeting,
+  ballistic arcs and rolling/dash collisions; each encounter module owns its
+  choreography. `gait.rs` owns the composer lane and the first six guardians'
+  gaits; each later guardian's lane, entrance and exit live in its `gait_*.rs`
+  module. `sculpture.rs` owns the mesh builder and the first six models; each
+  later guardian's model lives in its `sculpture_*.rs` module. `scenery.rs`
+  authors terrain; `art.rs` composes actors and the `effects.rs` cues.
+  `raster.rs` owns integer primitives, depth rasterization, and rectangle
+  merging; `palette.rs` owns artwork materials; `scene.rs` owns
+  projection/painting; `copy.rs` owns localized copy.
 - `Unbound` action context and element IDs remain stable internal identifiers.
   Localized naming is AI Souls / AI 之魂.
 
@@ -389,7 +393,8 @@ rebirth, without a damage override.
   letterboxing or derive pointer aim from window size alone.
 - One canvas paints cached floor rectangles and dynamic actor rectangles.
   Merge horizontal runs vertically; work/memory stay linear in raster size.
-  Caches are limited to six floors, their rectangles, and the hero sprite.
+  Caches are limited to one floor per guardian, their rectangles, and the hero
+  sprite.
   No glyph rendering, emoji, filtered texture scaling, or element per pixel.
 - Authored material ramps are raster content, not application chrome. Preview
   and combat use identical colors on light and dark home surfaces. Terrain
@@ -458,7 +463,7 @@ rebirth, without a damage override.
   floe damage, discharge shelter, orb knockback and wall crush, wall stun,
   committed targets, swept collisions, cover, random rebirth, threat cleanup,
   finite victory, continuous transitions, bounded long runs, input
-  buffering/cancellation, and normal-input wins for all six guardians across
+  buffering/cancellation, and normal-input wins for all sixteen guardians across
   spawn seeds. Gameplay pilots must not override damage,
   position, puzzle state, or encounter timers.
 - Raster/camera: distinct maps, exact quad reconstruction and bounded count,
