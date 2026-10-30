@@ -67,6 +67,8 @@ pub(super) const SWITCHES: [Vec2; 2] = [Vec2::new(36.0, 76.0), Vec2::new(140.0, 
 pub(super) const SWITCH_RADIUS: f32 = 7.0;
 /// ZCode's hall: two columns that stop the sweep.
 const GATE_HALL: [Pillar; 2] = pillars([(62.0, 60.0), (114.0, 60.0)], 3.2, 12.0);
+/// Devin's greenhouse: two planters at the ends, out of its vines' reach.
+const GREENHOUSE: [Pillar; 2] = pillars([(28.0, 58.0), (148.0, 58.0)], 3.4, 9.0);
 /// Antigravity's plaza: four floating stones.
 const PLAZA: [Pillar; 4] = pillars(
     [(46.0, 36.0), (130.0, 36.0), (46.0, 80.0), (130.0, 80.0)],
@@ -164,6 +166,7 @@ impl Map {
             Guardian::Kimi => &PAGE,
             Guardian::CodeBuddy => &PLAYROOM,
             Guardian::Antigravity => &PLAZA,
+            Guardian::Devin => &GREENHOUSE,
         }
     }
 
@@ -192,6 +195,7 @@ impl Map {
             }
             Guardian::Cline => x < 71.0 - margin && y < 46.0 - margin,
             Guardian::ZCode => x < 72.0 - margin && y < 47.0 - margin,
+            Guardian::Devin => x < 72.0 - margin && y < 46.0 - margin,
             // An octagonal plaza.
             Guardian::Antigravity => {
                 x < 72.0 - margin && y < 46.0 - margin && x + y < 104.0 - margin * 1.42

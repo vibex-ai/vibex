@@ -33,6 +33,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::CodeBuddy => [0x3a3260, 0x6e66a8, 0xb2acdc, 0xe2def5, 0xffffff],
         // The arch wears the gradient inks; its body ramp only lights edges.
         Guardian::Antigravity => [0x2b3242, 0x56607a, 0x8d97b0, 0xc4cbdb, 0xf1f4f9],
+        // Deep teal hexagons, a greenhouse flower.
+        Guardian::Devin => [0x0b2a2a, 0x134646, 0x1f6b66, 0x3f9b90, 0x8fd6c8],
     };
     for (ix, value) in body.into_iter().enumerate() {
         colors[ink::BODY_SHADOW as usize + ix] = rgb(value).into();
@@ -84,6 +86,10 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::Antigravity => [
             0x1c2230, 0xc6ceda, 0xdbe1e9, 0xedf1f5, 0xb2bcc9, 0x8a95a5, 0xf8fafc,
         ],
+        // A greenhouse floor of dark slate under trailing leaves.
+        Guardian::Devin => [
+            0x0c1410, 0x1e2b22, 0x26372b, 0x304537, 0x18231b, 0x2e4235, 0x4b6852,
+        ],
     };
     for (ix, color) in [
         ink::DEPTH,
@@ -120,6 +126,8 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         Guardian::CodeBuddy => [0x0f7a62, 0x32e6b9, 0xc5fff0],
         // The logo's red, for the right of the arch and its heart.
         Guardian::Antigravity => [0xa3171b, 0xfc413d, 0xffc2bd],
+        // A poisonous lime heart, and its spores.
+        Guardian::Devin => [0x4f7a00, 0xb6ff3b, 0xeaffc0],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();

@@ -7,6 +7,7 @@ mod combat;
 mod companion;
 mod copy;
 mod cube;
+mod devin;
 mod gait;
 mod geometry;
 mod guardian;

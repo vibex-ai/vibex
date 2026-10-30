@@ -107,6 +107,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::Kimi => 34,
             Guardian::CodeBuddy => 36,
             Guardian::Antigravity => 40,
+            Guardian::Devin => 46,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
         frame.ellipse(
@@ -225,7 +226,8 @@ fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
         | Guardian::ZCode
         | Guardian::Kimi
         | Guardian::CodeBuddy
-        | Guardian::Antigravity => {
+        | Guardian::Antigravity
+        | Guardian::Devin => {
             frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
             frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
             gleam(frame, (x, y), 4, WHITE);
@@ -266,6 +268,7 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = 
     (-47, -77, 46, 50),
     (-42, -143, 42, 18),
     (-57, -142, 58, 8),
+    (-46, -94, 45, 5),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -275,7 +278,7 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
 pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] =
-    [65, 96, 110, 85, 106, 82, 92, 95, 79, 117, 72, 122, 96];
+    [65, 96, 110, 85, 106, 82, 92, 95, 79, 117, 72, 122, 96, 81];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]
 }

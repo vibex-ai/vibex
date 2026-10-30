@@ -334,6 +334,7 @@ rebirth, without a damage override.
 | Kimi | The logo's black rounded tile standing on edge, the white K raised on its face from the logo's own polygon, and the blue square at its upper right corner; it slides after the archer on a ruled page | Its long context lies behind it: a trail of blue blocks, one every 5.5 units, that kill on touch for 7 seconds, and an arrow through a block clears it. After a three-second chase, and every few seconds after, it charges straight across the floor; it skids out of the charge rocking on its edge as it drifts round to face back the way it came, and the blue square takes an arrow from the front for 1.4 seconds (1.8 after hitting a wall or column). |
 | CodeBuddy | The logo's mascot as a chubby white cat-bot: pointed ears, a broad violet-to-blue visor face with two slanted white pill eyes, a small round body, a teal gem on its chest and a teal-tipped tail; it waddles after the archer. Its archetype is Mol-Qayin rather than the Yeti: Copilot already has the Yeti's wall-stun opening | It coughs up six hairballs that rain round the archer, lethal where they land; each lies 2.5 seconds, twitching at the end, then rolls back to the cat, lethal on the way. Then it spits a bug bomb at the archer's feet that ticks 2.6 seconds before a 9-unit burst, and keeps waddling after them. Lead it over its own bug: caught in the burst it lies dazed for 2.6 seconds with the gem bare. |
 | Antigravity | The logo's arch: an A whose legs meet in a rounded top and taper to curled feet, coloured along its length in the logo's gradient (blue feet, green left, yellow top, red right), with a red heart hung under the apex; it hovers with a leg turned to the archer | Two leaps and slams, each landing flinging lethal weightless motes toward the four corners; then it floats in place for 3.6 seconds, spinning and hopping, sprinkling a spiral of motes. The heart takes an arrow only through the arch's opening, within about 40 degrees of its axis, never past a leg; the opening sweeps past the archer twice a turn through the spin and for 0.8 seconds after. |
+| Devin | The logo's three linked hexagons as a teal flower rooted in a soil bed in the middle of a greenhouse: hexagon petals round a dark hub with a lime heart in its mouth, curving links between them, and a vine of smaller hexagons running out from each petal along the floor. At home and on the lane it stands up to show the logo and cartwheels a third of a turn a step | It turns, sweeping its vines, lethal to touch; an arrow knocks the outermost segment off a vine, and they regrow one at a time. It opens with homing spore puffs, then breathes in with its mouth open: an arrow loosed into it between the vines is swallowed, and recalling it tears away the petal nearest the archer, coming out through the gap. The heart is bare through that gap for 3.5 seconds as the flower turns; the petal grows back after. |
 | Cursor | The logo's graphite cube standing corner-on (its hexagon), the pointer cut into one face as a light arrow with its notch; it tumbles four quarter-turns toward the archer along the diagonals, then the pointer charges and fires | A laser fires down the pointer's face normal, telegraphed by rails at its exact width and stopped by the hall's four columns. The pointer is bare while it charges, but only from the side it faces. Facing the sky it flares harmlessly; pressed to the floor it blasts the cube over, and it lands with the pointer toward the viewer, dazed for 1.9 seconds. |
 
 - Keep identity readable: models follow the Agent logos — the spark's uneven
@@ -343,7 +344,7 @@ rebirth, without a damage override.
   pointed frame, pill eyes and antenna ball, Grok's broken ring and slash,
   ZCode's slab and bars as the logo's own parallelograms, Kimi's tile, K and
   blue square, CodeBuddy's ears, visor and slanted eyes, Antigravity's
-  gradient A. Every model
+  gradient A, Devin's three linked hexagons. Every model
   carries a dark one-pixel silhouette.
 - Cursor's cube (`arena/cube.rs`) names faces in model space with +y the way
   it rolls. A quarter-turn about the leading bottom edge is a pitch about the
@@ -409,6 +410,7 @@ rebirth, without a damage override.
 | Ordinary arrow on the knot / shielded cube | Glance off; only a burning arrow melts it, only a shield gap wins |
 | Arrow at Cline's face | Glances off; its back takes the arrow, recalled through it or loosed from behind |
 | Arrow through Kimi's trail | Clears the block it passes and flies on |
+| Arrow into Devin's open mouth | Swallowed; recall tears a petal and the arrow comes out through the gap, not through the heart; left alone, it is spat out after 5 seconds |
 | Hazards full while a trail grows | Old slime, then the oldest trail block, yields; a falling threat is never dropped |
 | Waiting without play | No encounter opens its weak point by itself |
 | Guarding stem in front of Pi's eye | The arrow stops; the eye opens only on a switch |

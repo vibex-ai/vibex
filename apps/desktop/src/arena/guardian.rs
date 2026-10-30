@@ -21,10 +21,11 @@ pub(super) enum Guardian {
     Kimi,
     CodeBuddy,
     Antigravity,
+    Devin,
 }
 
 impl Guardian {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Claude,
         Self::Codex,
         Self::Pi,
@@ -38,6 +39,7 @@ impl Guardian {
         Self::Kimi,
         Self::CodeBuddy,
         Self::Antigravity,
+        Self::Devin,
     ];
     pub fn agent(self) -> &'static str {
         match self {
@@ -54,6 +56,7 @@ impl Guardian {
             Self::Kimi => "Kimi",
             Self::CodeBuddy => "CodeBuddy",
             Self::Antigravity => "Antigravity",
+            Self::Devin => "Devin",
         }
     }
     pub fn from_agent(id: &str) -> Option<Self> {
@@ -71,6 +74,7 @@ impl Guardian {
             "kimi" | "kimi-cli" => Some(Self::Kimi),
             "codebuddy-code" | "codebuddy" => Some(Self::CodeBuddy),
             "antigravity" => Some(Self::Antigravity),
+            "devin" => Some(Self::Devin),
             _ => None,
         }
     }
@@ -94,6 +98,7 @@ impl Guardian {
             Self::Kimi => "kimi",
             Self::CodeBuddy => "codebuddy-code",
             Self::Antigravity => "antigravity",
+            Self::Devin => "devin",
         }
     }
 }
@@ -153,6 +158,8 @@ pub(super) enum Attack {
     Rain,
     /// A bug bomb spat at the archer's feet.
     Bomb,
+    /// A long breath in through the open mouth.
+    Inhale,
 }
 
 /// Visual and collision scale of the spark after each split.
@@ -166,6 +173,25 @@ pub(super) const GROK_RING: f32 = 10.0;
 pub(super) const ZCODE_CORE: f32 = 14.0;
 /// How high ZCode's fists hover when they are not striking.
 pub(super) const ZCODE_HOVER: f32 = 9.0;
+/// Steps Devin cartwheels round the home each loop: a whole number of
+/// three, so the flower comes home on the same petal.
+const DEVIN_STEPS: usize = 24;
+/// How high a standing Devin lifts its hub, so its lowest petal meets the
+/// ground.
+pub(super) const DEVIN_STANDING: f32 = 7.6;
+/// Which way Devin's cartwheel turns at route parameter `s`: against its
+/// travel, as a wheel rolls.
+fn devin_roll(guardian: Guardian, s: f32) -> f32 {
+    if route(guardian, s).1.x > 0.0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+/// The height of Devin's hub above its ground anchor, lying flat.
+pub(super) const DEVIN_HUB: f32 = 3.0;
+/// Segments on a full vine of Devin's.
+pub(super) const DEVIN_VINE: u8 = 3;
 /// Where the heart hangs under the apex of Antigravity's arch.
 pub(super) const ARCH_HEART: f32 = 12.0;
 /// The height of Kimi's tile.
@@ -271,6 +297,12 @@ pub(super) struct Boss {
     pub detached: bool,
     /// ZCode's fists that hold a floor switch down.
     pub pinned: [bool; 2],
+    /// Devin's vines: how many segments each petal's vine has left.
+    pub vines: [u8; 3],
+    /// Devin's petals torn away by a swallowed arrow, as bits.
+    pub torn: u8,
+    /// Devin has an arrow in its mouth.
+    pub swallowed: bool,
 }
 
 impl Boss {
@@ -321,6 +353,9 @@ impl Boss {
             facet: super::cube::FRONT,
             detached: false,
             pinned: [false; 2],
+            vines: [DEVIN_VINE; 3],
+            torn: 0,
+            swallowed: false,
         };
         if guardian == Guardian::Cursor {
             // The cube stands corner-on, as the logo's hexagon.
@@ -352,6 +387,7 @@ impl Boss {
             Guardian::Kimi => 8.0,
             Guardian::CodeBuddy => 8.0,
             Guardian::Antigravity => 9.0,
+            Guardian::Devin => 9.0,
         }
     }
     pub fn progress(&self) -> f32 {
@@ -428,6 +464,7 @@ impl Boss {
             Guardian::Kimi => (0.0, 0.0, 0.0),
             Guardian::CodeBuddy => (0.0, 0.0, 8.0 * squash),
             Guardian::Antigravity => (0.0, 0.0, ARCH_HEART),
+            Guardian::Devin => (0.0, 0.0, DEVIN_HUB),
         }
     }
     pub fn tilt(&self) -> (f32, f32) {
@@ -484,6 +521,7 @@ impl Boss {
             Guardian::Kimi => self.articulated(0.0, 0.0, KIMI_TILE * 0.5),
             Guardian::CodeBuddy => self.articulated(0.0, 0.0, 10.0 * squash),
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
+            Guardian::Devin => self.articulated(0.0, 0.0, DEVIN_HUB),
         }
     }
     pub fn update_core(&mut self) {
@@ -515,6 +553,8 @@ impl Boss {
             Guardian::CodeBuddy => self.articulated(0.0, 6.0, 7.2 * squash),
             // The heart hanging under the apex, between the legs.
             Guardian::Antigravity => self.articulated(0.0, 0.0, ARCH_HEART),
+            // The heart down in the hub's open mouth.
+            Guardian::Devin => self.articulated(0.0, 0.0, DEVIN_HUB + 1.2),
         };
     }
     pub fn attack_origin(&self) -> Vec2 {
@@ -545,6 +585,17 @@ impl Boss {
             (Guardian::DeepSeek, _) => 6.5,
             _ => 6.0,
         }
+    }
+    /// The ground point of segment `k` on the vine of Devin's petal `arm`.
+    pub fn vine_point(&self, arm: usize, k: usize) -> Vec2 {
+        let a = super::devin::petal_angle(self.spin, arm);
+        let r = super::devin::segment_radius(k);
+        self.ground(a.cos() * r, a.sin() * r)
+    }
+    /// The ground point under the middle of Devin's petal `arm`.
+    pub fn petal_point(&self, arm: usize) -> Vec2 {
+        let a = super::devin::petal_angle(self.spin, arm);
+        self.ground(a.cos() * super::devin::PETAL, a.sin() * super::devin::PETAL)
     }
     /// Angles of the bolts in Cline's current fan, relative to its aim. The
     /// fans run 3, 5, 6, 6: an odd fan is centred on the archer and an even
@@ -589,7 +640,16 @@ impl Boss {
         if reduced {
             boss.position = CENTER.plus(Vec2::new(0.0, -34.0));
             boss.previous_position = boss.position;
-            boss.rest_hands();
+            if guardian == Guardian::Devin {
+                // Stood up to show the logo, as it is on the move.
+                boss.pitch = -PI * 0.5;
+                boss.height = DEVIN_STANDING;
+            }
+            if guardian == Guardian::ZCode {
+                boss.seat_bars(0.0);
+            } else {
+                boss.rest_hands();
+            }
             boss.update_core();
             boss.previous_core = boss.core;
             return boss;
@@ -824,6 +884,24 @@ impl Boss {
                 let (_, u) = beat(time, IDLE_LOOP / 2.0);
                 boss.pitch = TAU * smoothstep((u - 0.55) / 0.25);
             }
+            Guardian::Devin => {
+                // Stood up to show the logo, the flower cartwheels round the
+                // home on its petals, a third of a turn a step.
+                let steps = DEVIN_STEPS as f32;
+                let (step, u) = beat(time, IDLE_LOOP / steps);
+                let roll = smoothstep((u / 0.6).min(1.0));
+                let s = (step + roll) * TAU / steps;
+                let (position, tangent) = route(guardian, s);
+                boss.position = position;
+                let turned: f32 = (0..step as usize)
+                    .map(|k| devin_roll(guardian, (k as f32 + 0.5) * TAU / steps))
+                    .sum();
+                let rolling = devin_roll(guardian, (step + 0.5) * TAU / steps);
+                boss.spin = (turned + rolling * roll) * TAU / 3.0;
+                boss.pitch = -PI * 0.5;
+                boss.height = DEVIN_STANDING + (roll * PI).sin() * 1.2;
+                boss.yaw = -tangent.normalized().x * 0.15;
+            }
         }
         boss.direction = Vec2::from_angle(boss.yaw + PI * 0.5);
         boss.previous_position = boss.position;
@@ -932,6 +1010,12 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
             -s.cos() * 36.0,
             s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
             s.sin() * 36.0,
+        ),
+        Guardian::Devin => (
+            s.sin() * 60.0,
+            -s.cos() * 30.0,
+            s.cos() * 60.0,
+            s.sin() * 30.0,
         ),
         Guardian::Antigravity => (
             s.sin() * 60.0 + (s * 3.0).sin() * 6.0,

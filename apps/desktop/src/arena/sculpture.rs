@@ -487,6 +487,7 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
         Guardian::Kimi => kimi::kimi(&mut mesh, boss),
         Guardian::CodeBuddy => codebuddy::codebuddy(&mut mesh, boss, time, fall),
         Guardian::Antigravity => antigravity::antigravity(&mut mesh, boss, time, fall),
+        Guardian::Devin => devin::devin(&mut mesh, boss, fall),
     }
     let (x, y, z) = boss.pivot();
     let (pitch, bank) = boss.tilt();
@@ -1104,6 +1105,8 @@ mod cline;
 mod codebuddy;
 #[path = "sculpture_cursor.rs"]
 mod cursor;
+#[path = "sculpture_devin.rs"]
+mod devin;
 #[path = "sculpture_grok.rs"]
 mod grok;
 pub(super) use grok::blade;

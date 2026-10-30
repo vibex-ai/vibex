@@ -380,6 +380,25 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             let r = (crate::arena::combat::CODEBUDDY_BUG_RADIUS * SCALE) as i32;
             landing(frame, c, r, color, progress);
         }
+        (Guardian::Devin, Attack::Inhale) if boss.state == BossState::Windup => {
+            // Air drawn in to the open mouth.
+            let mouth = pixel(boss.body_center());
+            for n in 0..8 {
+                let a = n as f32 * TAU / 8.0 + progress * 3.0;
+                let r = 30.0 * (1.0 - (progress * 4.0 + n as f32 * 0.25).fract());
+                let p = (
+                    mouth.0 + (a.cos() * r) as i32,
+                    mouth.1 + (a.sin() * r * 0.6) as i32,
+                );
+                frame.rect(p.0, p.1, 2, 2, CORE_LIGHT);
+            }
+            frame.ring(mouth, (12, 8), CORE, true);
+        }
+        (Guardian::Devin, Attack::Volley) if boss.state == BossState::Windup => {
+            let mouth = pixel(boss.body_center());
+            let r = 4 + (progress * 10.0) as i32;
+            frame.ring(mouth, (r, r), color, false);
+        }
         (Guardian::Kimi, Attack::Charge) if boss.state == BossState::Windup => {
             route(frame, boss.position, boss.target, boss.radius(), color);
         }
@@ -508,6 +527,19 @@ pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 }
                 frame.ellipse(c, (3, 3), WATER_LIGHT);
                 frame.rect(c.0 - 1, c.1 - 1, 2, 2, WHITE);
+            }
+            ProjectileKind::Spore => {
+                // A puff of spores, swelling and shrinking as it drifts.
+                let swell = if reduced {
+                    0
+                } else {
+                    ((p.age * 6.0).sin() * 1.5) as i32
+                };
+                frame.ellipse((c.0 + 2, c.1 + 4), (6, 2), SHADOW);
+                frame.ellipse((c.0, c.1 - 4), (7 + swell, 6 + swell), CORE_DARK);
+                frame.ellipse((c.0 - 2, c.1 - 6), (4 + swell / 2, 3), CORE);
+                frame.ellipse((c.0 + 3, c.1 - 3), (3, 3), CORE);
+                frame.rect(c.0 - 2, c.1 - 8, 2, 2, CORE_LIGHT);
             }
             ProjectileKind::Mote => {
                 // A weightless mote in one of the logo's colours.

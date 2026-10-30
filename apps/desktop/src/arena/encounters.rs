@@ -28,6 +28,7 @@ impl Arena {
             Guardian::Kimi => self.tick_kimi(),
             Guardian::CodeBuddy => self.tick_codebuddy(),
             Guardian::Antigravity => self.tick_antigravity(),
+            Guardian::Devin => self.tick_devin(),
         }
         self.boss.update_core();
     }
@@ -110,6 +111,8 @@ mod copilot;
 mod cursor;
 #[path = "encounter_deepseek.rs"]
 mod deepseek;
+#[path = "encounter_devin.rs"]
+mod devin;
 #[path = "encounter_grok.rs"]
 pub(super) mod grok;
 #[path = "encounter_kimi.rs"]

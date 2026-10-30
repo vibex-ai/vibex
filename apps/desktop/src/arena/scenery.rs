@@ -100,6 +100,7 @@ fn build(guardian: Guardian) -> Raster {
         Guardian::Kimi => page(&mut frame),
         Guardian::CodeBuddy => playroom(&mut frame),
         Guardian::Antigravity => plaza(&mut frame),
+        Guardian::Devin => greenhouse(&mut frame),
     }
     // Keep the visible rim identical to the movement boundary. The front edge
     // is extruded downward and the camera can reveal its actual vertical face.
@@ -146,6 +147,31 @@ fn build(guardian: Guardian) -> Raster {
     frame
 }
 
+/// Devin's greenhouse: slate flags with moss in the joints, and a round bed
+/// of dark soil in the middle where the flower is rooted, edged in stone.
+fn greenhouse(frame: &mut Raster) {
+    tiles(frame, 40, 28, true);
+    let c = pixel(CENTER);
+    frame.ellipse(c, (120, 74), WALL);
+    frame.ellipse(c, (114, 70), DEPTH);
+    for n in 0..90 {
+        let h = hash(n, 109);
+        let a = (h % 628) as f32 * 0.01;
+        let r = (h >> 10) % 100;
+        let p = (
+            c.0 + (a.cos() * r as f32) as i32,
+            c.1 + (a.sin() * r as f32 * 0.6) as i32,
+        );
+        frame.rect(p.0, p.1, 2, 1, FLOOR_SHADE);
+    }
+    for n in 0..40 {
+        let h = hash(n, 127);
+        let x = (h % WIDTH as u32) as i32;
+        let y = ((h >> 10) % 460) as i32 - TOP_PAD / 2;
+        frame.polygon(&[(x, y), (x + 5, y - 3), (x + 9, y)], MOSS);
+        frame.line((x, y), (x + 9, y), MOSS_DARK);
+    }
+}
 /// Antigravity's plaza: broad pale slabs, and a ring inlaid round the
 /// middle in the logo's four colours.
 fn plaza(frame: &mut Raster) {
@@ -903,6 +929,21 @@ pub(super) fn ambient(frame: &mut Raster, map: &Map, time: f32, reduced: bool) {
                     let (x, y) = pixel(p);
                     let color = [MOSS, GOLD, CORE, WATER][n as usize % 4];
                     frame.rect(x, y, 2, 2, color);
+                }
+            }
+        }
+        Guardian::Devin => {
+            // Pollen drifts across the greenhouse.
+            for n in 0..10 {
+                let h = hash(n, 113);
+                let t = (time * 0.05 + n as f32 * 0.1).fract();
+                let p = Vec2::new(
+                    20.0 + t * 136.0,
+                    18.0 + (h % 80) as f32 + (t * 9.0).sin() * 3.0,
+                );
+                if map.inside(p, 2.0) {
+                    let (x, y) = pixel(p);
+                    frame.rect(x, y, 2, 1, CORE);
                 }
             }
         }

@@ -117,6 +117,8 @@ pub(super) enum ProjectileKind {
     Yarn,
     /// A slow, weightless mote flung off Antigravity, lethal to touch.
     Mote,
+    /// A puff of Devin's spores that drifts after the archer, lethal to touch.
+    Spore,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Projectile {
@@ -254,6 +256,9 @@ impl Arena {
             super::map::THRONE
         } else if boss.guardian == Guardian::ZCode {
             super::map::GATE
+        } else if boss.guardian == Guardian::Devin {
+            // The flower is rooted in the middle of its greenhouse.
+            CENTER
         } else if map.is_clear(boss.position, boss.radius() + 1.0) {
             boss.position
         } else {
@@ -580,6 +585,9 @@ impl Arena {
         boss.dashes = 0;
         boss.detached = false;
         boss.pinned = [false; 2];
+        boss.vines = [super::guardian::DEVIN_VINE; 3];
+        boss.torn = 0;
+        boss.swallowed = false;
         boss.flash = 0.0;
         boss.generation = 0;
         boss.shards = [Shard::default(); 4];
@@ -694,6 +702,16 @@ impl Arena {
                     .abs()
                     > 0.75
             }
+            // The bared heart shows only through the gap of a torn petal.
+            Guardian::Devin => (0..3).any(|arm| {
+                self.boss.torn & (1 << arm) != 0 && {
+                    let gap = self.boss.petal_point(arm).minus(self.boss.position);
+                    from.minus(self.boss.core)
+                        .normalized()
+                        .dot(gap.normalized())
+                        > 0.6
+                }
+            }),
             // The bared core looks down the hall.
             Guardian::ZCode => from.y > self.boss.core.y - 1.0,
             // The core in the back of the ring, open while it spins and reels.
@@ -712,6 +730,16 @@ impl Arena {
             return;
         }
         self.arrow.burning = (self.arrow.burning - STEP).max(0.0);
+        if self.boss.swallowed {
+            if recalling {
+                // Hauled out of the mouth, the arrow tears a petal away.
+                self.tear_petal();
+            } else {
+                self.arrow.state = ArrowState::Lodged;
+                self.arrow.position = self.boss.body_center();
+                return;
+            }
+        }
         if recalling {
             let speed = if self.arrow.state == ArrowState::Returning {
                 (self.arrow.velocity.length() + STEP * 260.0).clamp(48.0, 130.0)
@@ -758,6 +786,8 @@ impl Arena {
             Carrier,
             Shard(usize),
             Knot,
+            Mouth,
+            Vine(usize),
         }
         let mut contact: Option<(f32, Contact)> = self
             .map
@@ -812,7 +842,10 @@ impl Arena {
         {
             consider(circle_hit(boss.body_center(), from, to, 8.5), Contact::Knot);
         }
-        if !returning && visible && !open && boss.guardian != Guardian::Claude {
+        let gaping = boss.guardian == Guardian::Devin
+            && boss.attack == Attack::Inhale
+            && boss.state == BossState::Windup;
+        if !returning && visible && !open && !gaping && boss.guardian != Guardian::Claude {
             let radius = if boss.guardian == Guardian::Codex && boss.exposed > 0.0 {
                 3.5
             } else {
@@ -839,6 +872,28 @@ impl Arena {
                     let rise = boss.hand_heights[ix] + length * (part as f32 + 0.5) / 3.0;
                     let point = boss.hands[ix].plus(Vec2::new(0.0, -rise));
                     consider(circle_hit(point, from, to, width * 0.5), Contact::Armor);
+                }
+            }
+        }
+        if !returning && boss.guardian == Guardian::Devin {
+            // An open mouth swallows the arrow; a vine loses a segment to it.
+            if boss.attack == Attack::Inhale && boss.state == BossState::Windup {
+                consider(
+                    circle_hit(boss.body_center(), from, to, 2.8),
+                    Contact::Mouth,
+                );
+            }
+            for arm in 0..3 {
+                for k in 0..boss.vines[arm] as usize {
+                    consider(
+                        circle_hit(
+                            boss.vine_point(arm, k),
+                            from,
+                            to,
+                            super::devin::SEGMENT_REACH,
+                        ),
+                        Contact::Vine(arm),
+                    );
                 }
             }
         }
@@ -879,6 +934,18 @@ impl Arena {
                 }
                 Contact::Knot => {
                     self.unravel_knot();
+                    self.lodge(position);
+                    return;
+                }
+                Contact::Mouth => {
+                    self.swallow();
+                    return;
+                }
+                Contact::Vine(arm) => {
+                    let k = self.boss.vines[arm].saturating_sub(1) as usize;
+                    let tip = self.boss.vine_point(arm, k);
+                    self.boss.vines[arm] = self.boss.vines[arm].saturating_sub(1);
+                    self.effect(EffectKind::Burst, tip, 0.5, 5.0);
                     self.lodge(position);
                     return;
                 }
@@ -955,7 +1022,12 @@ impl Arena {
             let from = projectile.position;
             projectile.previous_position = from;
             projectile.age += STEP;
-            if projectile.kind == ProjectileKind::Orb && projectile.age < 0.9 {
+            let homing = match projectile.kind {
+                ProjectileKind::Orb => projectile.age < 0.9,
+                ProjectileKind::Spore => projectile.age < 2.4,
+                _ => false,
+            };
+            if homing {
                 let toward = player.minus(from).normalized();
                 let speed = projectile.velocity.length();
                 projectile.velocity = projectile
@@ -977,6 +1049,7 @@ impl Arena {
                 ProjectileKind::Bolt => 1.2,
                 ProjectileKind::Yarn => 1.8,
                 ProjectileKind::Mote => 1.4,
+                ProjectileKind::Spore => 2.0,
             };
             if segment_distance(
                 Vec2::default(),
@@ -989,7 +1062,8 @@ impl Arena {
                     ProjectileKind::Block
                     | ProjectileKind::Bolt
                     | ProjectileKind::Yarn
-                    | ProjectileKind::Mote => hit = true,
+                    | ProjectileKind::Mote
+                    | ProjectileKind::Spore => hit = true,
                     ProjectileKind::Orb if !shielded => {
                         pushes.push(projectile.velocity.normalized());
                     }

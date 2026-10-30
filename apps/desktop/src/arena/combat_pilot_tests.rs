@@ -265,6 +265,39 @@ fn plan(arena: &Arena) -> Plan {
                 plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
             }
         }
+        Guardian::Devin => {
+            let mouth = boss.body_center();
+            let clear_of_vines = |from: Vec2, to: Vec2| {
+                (0..3).all(|arm| {
+                    (0..boss.vines[arm] as usize).all(|k| {
+                        segment_distance(boss.vine_point(arm, k), from, to)
+                            > crate::arena::devin::SEGMENT_REACH + 0.6
+                    })
+                })
+            };
+            plan.goal = around(boss.position, 30.0);
+            if boss.swallowed {
+                plan.recall = Some(true);
+            } else if let Some(arm) = (0..3).find(|arm| boss.torn & (1 << arm) != 0) {
+                // Into the gap the torn petal left, and shoot through it.
+                let gap = boss.petal_point(arm).minus(boss.position).normalized();
+                plan.goal =
+                    arena
+                        .map
+                        .move_body(boss.position, boss.position.plus(gap.scale(28.0)), 2.0);
+                plan.sprint = true;
+                let through = player.minus(boss.core).normalized().dot(gap) > 0.75;
+                if through && boss.exposed > arrival(boss.core) + 0.03 {
+                    plan.target = Some(boss.core);
+                }
+            } else if boss.attack == Attack::Inhale
+                && boss.state == BossState::Windup
+                && boss.duration - boss.time > arrival(mouth) + 0.05
+                && clear_of_vines(player, mouth)
+            {
+                plan.target = Some(mouth);
+            }
+        }
         Guardian::Antigravity => {
             let spinning = boss.attack == Attack::Frenzy
                 && matches!(boss.state, BossState::Striking | BossState::Recovery);
@@ -610,6 +643,22 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
             score += 6.0;
         }
     }
+    if boss.guardian == Guardian::Devin {
+        // The vines, where they are and where the turn is taking them.
+        let mut ahead = *boss;
+        ahead.spin += 0.35;
+        for flower in [boss, &ahead] {
+            for arm in 0..3 {
+                for k in 0..flower.vines[arm] as usize {
+                    if q.minus(flower.vine_point(arm, k)).length()
+                        < crate::arena::devin::SEGMENT_REACH + PLAYER_RADIUS + 2.0
+                    {
+                        score += 10.0;
+                    }
+                }
+            }
+        }
+    }
     if boss.guardian == Guardian::ZCode
         && boss.attack == Attack::Sweep
         && boss.state == BossState::Striking
@@ -784,4 +833,8 @@ fn the_cat_is_winnable_through_ordinary_inputs() {
 #[test]
 fn the_arch_is_winnable_through_ordinary_inputs() {
     winnable(Guardian::Antigravity);
+}
+#[test]
+fn the_flower_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Devin);
 }

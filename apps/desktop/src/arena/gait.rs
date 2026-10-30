@@ -105,6 +105,7 @@ fn itinerary(guardian: Guardian) -> &'static [Leg] {
         Guardian::Kimi => &kimi::LEGS,
         Guardian::CodeBuddy => &codebuddy::LEGS,
         Guardian::Antigravity => &antigravity::LEGS,
+        Guardian::Devin => &devin::LEGS,
     }
 }
 /// How long one guardian takes to walk its whole itinerary once.
@@ -464,6 +465,7 @@ impl Boss {
             Guardian::Kimi => kimi::lane(&mut boss, legs, moment),
             Guardian::CodeBuddy => codebuddy::lane(&mut boss, legs, moment),
             Guardian::Antigravity => antigravity::lane(&mut boss, moment, phase),
+            Guardian::Devin => devin::lane(&mut boss, legs, moment),
         };
         boss.position = lane_point(place);
         if !matches!(guardian, Guardian::Pi | Guardian::ZCode) {
@@ -525,6 +527,7 @@ pub(super) fn entrance(guardian: Guardian) -> f32 {
         Guardian::Kimi => kimi::ENTRANCE,
         Guardian::CodeBuddy => codebuddy::ENTRANCE,
         Guardian::Antigravity => antigravity::ENTRANCE,
+        Guardian::Devin => devin::ENTRANCE,
     }
 }
 /// How long a guardian takes to leave its lane when the turn ends.
@@ -543,6 +546,7 @@ pub(super) fn exit(guardian: Guardian) -> f32 {
         Guardian::Kimi => kimi::EXIT,
         Guardian::CodeBuddy => codebuddy::EXIT,
         Guardian::Antigravity => antigravity::EXIT,
+        Guardian::Devin => devin::EXIT,
     }
 }
 
@@ -633,6 +637,7 @@ pub(super) fn shot(guardian: Guardian, time: f32) -> Shot {
         Guardian::Kimi => kimi::entering(&mut shot, a),
         Guardian::CodeBuddy => codebuddy::entering(&mut shot, a),
         Guardian::Antigravity => antigravity::entering(&mut shot, a),
+        Guardian::Devin => devin::entering(&mut shot, a),
     }
     shot.boss = settled(shot.boss);
     shot
@@ -720,6 +725,7 @@ pub(super) fn leaving(guardian: Guardian, from: f32, time: f32) -> Shot {
         Guardian::Kimi => kimi::leaving(boss, a),
         Guardian::CodeBuddy => codebuddy::leaving(boss, a, side),
         Guardian::Antigravity => antigravity::leaving(boss, a),
+        Guardian::Devin => devin::leaving(boss, a),
     };
     // A turn that ends mid-entrance leaves from where the entrance had got to;
     // that offset hands over to the exit's own as it goes.
@@ -739,6 +745,8 @@ mod cline;
 mod codebuddy;
 #[path = "gait_cursor.rs"]
 mod cursor;
+#[path = "gait_devin.rs"]
+mod devin;
 #[path = "gait_grok.rs"]
 mod grok;
 #[path = "gait_kimi.rs"]
