@@ -7,8 +7,9 @@ use crate::arena::{
         Arena, Attack, BossState, EffectKind, Guardian, HazardKind, Phase, ProjectileKind, Vec2,
         WaveKind, smoothstep,
     },
-    map::{CENTER, ISLANDS, PLATE_RADIUS, PLATES, SWITCH_RADIUS, SWITCHES},
+    map::{CENTER, ISLANDS, PLATE_RADIUS, PLATES},
     raster::{Raster, hash, ink::*},
+    zed::{Breath, breath},
 };
 use std::f32::consts::{PI, TAU};
 
@@ -69,7 +70,7 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
         plates(frame, arena, reduced);
     }
     if arena.boss.guardian == Guardian::ZCode {
-        switches(frame, arena);
+        zcode_ground(frame, arena, reduced);
     }
     for h in &arena.hazards {
         let c = pixel(h.position);
@@ -135,6 +136,26 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
                         c,
                         !reduced && (h.time * (4.0 + progress * 10.0)).fract() < 0.5,
                     );
+                }
+            }
+            HazardKind::Spike => {
+                if h.time < h.delay {
+                    // Frost where the ice will break through.
+                    frame.ring(c, (r, r / 2 + 1), WATER_LIGHT, true);
+                } else {
+                    let left = h.delay + h.duration - h.time;
+                    let sink = if left < 0.6 {
+                        ((0.6 - left) * 12.0) as i32
+                    } else {
+                        0
+                    };
+                    for (dx, tall) in [(-4, 9), (0, 14), (4, 8)] {
+                        let x = c.0 + dx;
+                        let top = c.1 - tall + sink;
+                        frame.polygon(&[(x - 3, c.1), (x, top), (x + 3, c.1)], WATER);
+                        frame.polygon(&[(x - 3, c.1), (x, top), (x, c.1)], WATER_LIGHT);
+                        frame.put(x, top, WHITE);
+                    }
                 }
             }
             HazardKind::Drop | HazardKind::Icicle | HazardKind::Hairball if h.time < h.delay => {
@@ -253,20 +274,67 @@ fn plates(frame: &mut Raster, arena: &Arena, reduced: bool) {
     }
 }
 
-/// ZCode's two floor switches, lit while a fist holds each down.
-fn switches(frame: &mut Raster, arena: &Arena) {
+/// ZCode on the floor: the churn of an arm tunnelling toward the archer,
+/// and the slab's breath — the mouth glowing as it rears back, then the
+/// gust streaming out of it down the hall.
+fn zcode_ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
     let boss = &arena.boss;
-    for switch in SWITCHES {
-        let held = (0..2).any(|ix| boss.pinned[ix] && boss.hands[ix].minus(switch).length() < 1.0);
-        let c = pixel(switch);
-        let r = (SWITCH_RADIUS * SCALE) as i32;
-        frame.ring(c, (r, r), if held { CORE_LIGHT } else { WALL }, false);
-        frame.ring(c, (r - 4, r - 4), if held { CORE } else { SEAM }, false);
-        // A Z on every switch.
-        let color = if held { CORE_LIGHT } else { WALL };
-        frame.line((c.0 - 8, c.1 - 7), (c.0 + 8, c.1 - 7), color);
-        frame.line((c.0 + 8, c.1 - 7), (c.0 - 8, c.1 + 7), color);
-        frame.line((c.0 - 8, c.1 + 7), (c.0 + 8, c.1 + 7), color);
+    if arena.phase != Phase::Battle {
+        return;
+    }
+    for ix in 0..2 {
+        if boss.hand_heights[ix] < -1.0
+            && (boss.attack == Attack::Burrow && boss.guard == ix || boss.hand_heights[ix] > -5.5)
+        {
+            let c = pixel(boss.hands[ix]);
+            let tick = if reduced {
+                0
+            } else {
+                (arena.visual_time * 12.0) as i32
+            };
+            frame.ellipse(c, (11, 6), FLOOR_SHADE);
+            for n in 0..6 {
+                let seed = hash(n, tick + ix as i32 * 31);
+                let a = n as f32 * TAU / 6.0 + (seed % 7) as f32 * 0.1;
+                let p = (
+                    c.0 + (a.cos() * 8.0) as i32,
+                    c.1 + (a.sin() * 4.0) as i32 - (seed % 3) as i32,
+                );
+                frame.rect(p.0, p.1, 3, 2, DUST);
+            }
+        }
+    }
+    let mouth = pixel(arena.zcode_mouth());
+    match breath(boss.shield) {
+        Breath::Rise(u) => {
+            let r = 6 + (u * 10.0) as i32;
+            frame.ring(mouth, (r, r / 2 + 2), CORE_LIGHT, u < 0.5);
+            frame.ring(mouth, (r + 6, r / 2 + 5), WARN, true);
+        }
+        Breath::Blow(u) => {
+            let flow = if reduced {
+                0.5
+            } else {
+                (arena.visual_time * 2.5).fract()
+            };
+            for n in 0..9 {
+                let a = PI * 0.5 + (n as f32 - 4.0) * 0.16;
+                let ray = Vec2::from_angle(a);
+                let start = arena
+                    .zcode_mouth()
+                    .plus(ray.scale(8.0 + (flow + n as f32 * 0.37).fract() * 60.0));
+                let end = start.plus(ray.scale(8.0));
+                frame.line(
+                    pixel(start),
+                    pixel(end),
+                    if n % 2 == 0 { WHITE } else { DUST },
+                );
+            }
+            if u < 0.1 {
+                frame.ring(mouth, (24, 12), WHITE, false);
+            }
+        }
+        Breath::Rest => {}
     }
 }
 
@@ -298,7 +366,7 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
             };
             landing(frame, c, r, color, closing);
         }
-        (Guardian::Pi | Guardian::ZCode, Attack::LeftFist | Attack::RightFist) if aerial => {
+        (Guardian::Pi, Attack::LeftFist | Attack::RightFist) if aerial => {
             landing(frame, c, r, color, progress);
             frame.line((c.0 - 4, c.1), (c.0 + 4, c.1), color);
             frame.line((c.0, c.1 - 4), (c.0, c.1 + 4), color);
@@ -408,20 +476,6 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
         }
         (Guardian::Kimi, Attack::Charge) if boss.state == BossState::Windup => {
             route(frame, boss.position, boss.target, boss.radius(), color);
-        }
-        (Guardian::ZCode, Attack::Sweep) if boss.state == BossState::Windup => {
-            // The half circle the eye will sweep, west to east through the
-            // south, drawn ahead of it as rays that grow as it charges.
-            let eye = arena.zcode_eye();
-            for n in 0..=8 {
-                let a = PI - PI * n as f32 / 8.0;
-                let ray = Vec2::from_angle(a);
-                frame.line(
-                    pixel(eye.plus(ray.scale(10.0))),
-                    pixel(eye.plus(ray.scale(12.0 + progress * 14.0))),
-                    if n == 0 { WARN } else { color },
-                );
-            }
         }
         (Guardian::Grok, Attack::Pull) => {
             route(frame, boss.position, boss.target, boss.radius(), WARN);

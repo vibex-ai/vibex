@@ -123,7 +123,8 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
         );
     }
     if boss.guardian == Guardian::ZCode {
-        for ix in 0..2 {
+        // An arm under the floor casts no shadow; its churn shows instead.
+        for ix in (0..2).filter(|ix| boss.hand_heights[*ix] >= -1.0) {
             let p = pixel(boss.hands[ix]);
             let r = (16.0 - boss.hand_heights[ix] * 0.3).max(6.0) as i32;
             frame.ellipse((p.0 + 2, p.1 + 2), (r, (r / 3).max(2)), SHADOW);

@@ -153,9 +153,9 @@ pub(super) enum Attack {
     Turn,
     /// Spinning with the blade whirled out round it.
     Frenzy,
-    /// A laser swept through a half circle from the slab's eye.
-    Sweep,
-    /// The shutter sliding open over the core.
+    /// An arm tunnelling under the floor to its next spot.
+    Burrow,
+    /// A mouth or a shell opening over the core.
     Open,
     /// A straight charge across the floor that ends in a skid.
     Charge,
@@ -303,8 +303,8 @@ pub(super) struct Boss {
     /// A part is out of the body, at `hands[0]`, `hand_heights[0]` up:
     /// Grok's blade, or Gemini's true twin.
     pub detached: bool,
-    /// ZCode's fists that hold a floor switch down.
-    pub pinned: [bool; 2],
+    /// ZCode's teeth still standing before its core.
+    pub teeth: u8,
     /// Devin's vines: how many segments each petal's vine has left.
     pub vines: [u8; 3],
     /// Devin's petals torn away by a swallowed arrow, as bits.
@@ -360,7 +360,7 @@ impl Boss {
             fired: 0,
             facet: super::cube::FRONT,
             detached: false,
-            pinned: [false; 2],
+            teeth: super::zed::TEETH,
             vines: [DEVIN_VINE; 3],
             torn: 0,
             swallowed: false,

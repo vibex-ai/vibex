@@ -158,6 +158,8 @@ pub(super) enum HazardKind {
     Yarn,
     /// CodeBuddy's bug bomb: it ticks for `delay`, then bursts.
     Bug,
+    /// Ice erupting along the line of ZCode's freezing laser.
+    Spike,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Hazard {
@@ -595,7 +597,7 @@ impl Arena {
         boss.shield = 0.0;
         boss.dashes = 0;
         boss.detached = false;
-        boss.pinned = [false; 2];
+        boss.teeth = super::zed::TEETH;
         boss.vines = [super::guardian::DEVIN_VINE; 3];
         boss.torn = 0;
         boss.swallowed = false;
@@ -911,9 +913,9 @@ impl Arena {
             }
         }
         if !returning && boss.guardian == Guardian::ZCode {
-            // A fist near the floor is stone in the arrow's path.
+            // An arm risen out of the floor is stone in the arrow's path.
             for ix in 0..2 {
-                if boss.hand_heights[ix] < 8.0 {
+                if (0.0..8.0).contains(&boss.hand_heights[ix]) {
                     let point = boss.hands[ix].plus(Vec2::new(0.0, -boss.hand_heights[ix]));
                     consider(circle_hit(point, from, to, 3.5), Contact::Armor);
                 }
@@ -1165,6 +1167,9 @@ impl Arena {
                     self.hazard(HazardKind::Yarn, position, 0.0, 2.5, 2.0);
                 }
                 HazardKind::Bug => self.bug_burst(position, radius),
+                HazardKind::Spike => {
+                    self.effect(EffectKind::Rubble, position, 0.4, radius + 1.0);
+                }
                 HazardKind::Goo | HazardKind::Trail | HazardKind::Yarn => {}
             }
         }

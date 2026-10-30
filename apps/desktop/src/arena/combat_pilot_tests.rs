@@ -1,5 +1,5 @@
 use super::*;
-use crate::arena::map::{GATE, ISLANDS, PLATES, SWITCHES, THRONE};
+use crate::arena::map::{GATE, ISLANDS, PLATES, THRONE};
 
 /// What the pilot wants this frame, read from visible state only.
 struct Plan {
@@ -362,49 +362,31 @@ fn plan(arena: &Arena) -> Plan {
             }
         }
         Guardian::ZCode => {
-            let sweeping = boss.attack == Attack::Sweep
-                && matches!(boss.state, BossState::Windup | BossState::Striking);
-            if boss.exposed > 0.0 {
-                // Just off the line it fires down when it closes again.
-                plan.goal = Vec2::new(GATE.x + 14.0, 70.0);
-                if boss.exposed > arrival(boss.core) + 0.03 && player.y > boss.core.y + 2.0 {
+            let mouth = arena.zcode_mouth();
+            // The middle of the hall rides out the breath: the shove only
+            // crushes an archer already near a wall.
+            plan.goal = Vec2::new(GATE.x + 10.0, 60.0);
+            if boss.teeth == 0 {
+                if boss.exposed > arrival(boss.core) + 0.02 {
                     plan.target = Some(boss.core);
                 }
-            } else if sweeping {
-                // In a column's shadow from the eye.
-                let eye = arena.zcode_eye();
-                plan.goal = arena
-                    .map
-                    .pillars()
-                    .iter()
-                    .enumerate()
-                    .filter(|(ix, _)| arena.map.intact(*ix))
-                    .map(|(_, p)| {
-                        p.position
-                            .plus(p.position.minus(eye).normalized().scale(5.5))
-                    })
-                    .min_by(|a, b| {
-                        a.minus(player)
-                            .length()
-                            .total_cmp(&b.minus(player).length())
-                    })
-                    .unwrap_or(player);
-                plan.sprint = true;
             } else {
-                // Stand on a switch nobody holds, so the next fist lands there.
-                let held = |switch: Vec2| {
-                    (0..2).any(|ix| boss.pinned[ix] && boss.hands[ix].minus(switch).length() < 1.0)
+                let arm = match (boss.state, boss.attack) {
+                    (BossState::Rushing, Attack::Burrow) => Some(boss.target),
+                    (BossState::Windup, Attack::Laser) if !boss.target_locked() => {
+                        Some(boss.hands[boss.guard])
+                    }
+                    _ => None,
                 };
-                plan.goal = SWITCHES
-                    .into_iter()
-                    .filter(|s| !held(*s))
-                    .min_by(|a, b| {
-                        a.minus(player)
-                            .length()
-                            .total_cmp(&b.minus(player).length())
-                    })
-                    .unwrap_or(player);
-                plan.sprint = true;
+                if let Some(arm) = arm {
+                    // With the mouth behind us on the laser's line, it takes
+                    // a tooth when we step aside.
+                    let line = arm.minus(mouth).normalized();
+                    plan.goal = arena
+                        .map
+                        .move_body(mouth, mouth.plus(line.scale(18.0)), 2.0);
+                    plan.sprint = true;
+                }
             }
         }
         Guardian::Grok => {
@@ -522,7 +504,7 @@ fn strike(arena: &Arena) -> Option<(Vec2, f32)> {
         (Guardian::Codex | Guardian::OpenCode, Attack::Leap) if aerial => {
             Some((boss.target, radius))
         }
-        (Guardian::Pi | Guardian::ZCode, Attack::LeftFist | Attack::RightFist) if aerial => {
+        (Guardian::Pi, Attack::LeftFist | Attack::RightFist) if aerial => {
             Some((boss.target, radius))
         }
         (Guardian::OpenCode, Attack::Bite) if aerial => {
@@ -633,6 +615,7 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
                 score += 10.0
             }
             HazardKind::Trail if distance < h.radius + PLAYER_RADIUS + 1.2 => score += 10.0,
+            HazardKind::Spike if distance < h.radius + PLAYER_RADIUS + 1.2 => score += 10.0,
             HazardKind::Hairball
                 if h.time < h.delay + 0.02 && distance < h.radius + PLAYER_RADIUS + 1.2 =>
             {
@@ -670,18 +653,6 @@ fn threat(arena: &Arena, q: Vec2) -> f32 {
                     }
                 }
             }
-        }
-    }
-    if boss.guardian == Guardian::ZCode
-        && boss.attack == Attack::Sweep
-        && boss.state == BossState::Striking
-    {
-        // Ground the sweep is about to cross, unless a column shades it.
-        let eye = arena.zcode_eye();
-        let now = PI - PI * boss.progress();
-        let at = q.minus(eye).angle();
-        if (now - 0.4..=now).contains(&at) && !arena.map.cover_hit(eye, q) {
-            score += 8.0;
         }
     }
     if boss.guardian == Guardian::Grok && boss.detached && boss.state == BossState::Striking {

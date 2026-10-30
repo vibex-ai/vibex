@@ -35,3 +35,29 @@ pub(super) fn seated(position: Vec2, yaw: f32, height: f32, ix: usize) -> (Vec2,
     let (s, c) = yaw.sin_cos();
     (position.plus(Vec2::new(x * c, x * s * 0.62)), height + z)
 }
+
+/// Teeth across the slab's mouth before its core.
+pub(super) const TEETH: u8 = 2;
+/// The slab's breath: it rests, rears back with its mouth open, then blows.
+pub(super) const REST: f32 = 2.6;
+pub(super) const RISE: f32 = 1.0;
+pub(super) const BLOW: f32 = 1.4;
+
+/// Where the slab is in its breath, `timer` seconds into it, and how far
+/// through that part.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Breath {
+    Rest,
+    Rise(f32),
+    Blow(f32),
+}
+pub(super) fn breath(timer: f32) -> Breath {
+    let t = timer.rem_euclid(REST + RISE + BLOW);
+    if t < REST {
+        Breath::Rest
+    } else if t < REST + RISE {
+        Breath::Rise((t - REST) / RISE)
+    } else {
+        Breath::Blow((t - REST - RISE) / BLOW)
+    }
+}
