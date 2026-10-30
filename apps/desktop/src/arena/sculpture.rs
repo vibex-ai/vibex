@@ -343,6 +343,207 @@ impl Mesh {
             }
         }
     }
+    /// [`Self::rounded`] with a narrower crown than jaw: a chibi head, a pear
+    /// of a body, anything that should not read as a pebble.
+    fn rounded_tapered(
+        &mut self,
+        center: Point3,
+        half: Point3,
+        crown: f32,
+        jaw: f32,
+        ramp: [u8; 5],
+    ) {
+        let first = self.faces.len();
+        self.sphere(Point3::default(), p3(1.0, 1.0, 1.0), 12, 24, |_| ramp);
+        let square = |v: f32| v.signum() * v.abs().powf(0.55);
+        for face in &mut self.faces[first..] {
+            for point in &mut face.points {
+                let t = (point.z + 1.0) * 0.5;
+                let wide = jaw + (crown - jaw) * t;
+                *point = center.add(p3(
+                    square(point.x) * half.x * wide,
+                    square(point.y) * half.y * wide,
+                    square(point.z) * half.z,
+                ));
+            }
+        }
+    }
+    /// A block tapering from a `base` rectangle to a `top` one along z, then
+    /// turned: an ear, a lock of hair or a feather, which a cuboid cannot show
+    /// and a sphere rounds away. The capped ends keep it solid from every side.
+    fn taper_box(
+        &mut self,
+        center: Point3,
+        base: (f32, f32),
+        top: (f32, f32),
+        height: f32,
+        angles: Point3,
+        ramp: [u8; 5],
+    ) {
+        let (bx, by) = (base.0 * 0.5, base.1 * 0.5);
+        let (tx, ty) = (top.0 * 0.5, top.1 * 0.5);
+        let (below, above) = (-height * 0.5, height * 0.5);
+        let corners = [
+            (-bx, -by, below),
+            (bx, -by, below),
+            (bx, by, below),
+            (-bx, by, below),
+            (-tx, -ty, above),
+            (tx, -ty, above),
+            (tx, ty, above),
+            (-tx, ty, above),
+        ]
+        .map(|(x, y, z)| {
+            Point3::new(x, y, z)
+                .rotate(angles.z, angles.x, angles.y)
+                .add(center)
+        });
+        for face in [
+            [0, 3, 2, 1],
+            [4, 5, 6, 7],
+            [0, 1, 5, 4],
+            [1, 2, 6, 5],
+            [2, 3, 7, 6],
+            [3, 0, 4, 7],
+        ] {
+            self.quad(face.map(|ix| corners[ix]), ramp);
+        }
+    }
+    /// An extruded slab whose silhouette is any convex outline: the app-icon
+    /// shape a rounded box cannot give. `bevel` cuts the front and back rims so
+    /// the rim takes a lit and a shaded side, and the side wall is one band of
+    /// quads so an outline with many points still reads as a solid edge.
+    fn slab(
+        &mut self,
+        outline: &[(f32, f32)],
+        center: Point3,
+        angles: Point3,
+        depth: f32,
+        bevel: f32,
+        ramp: [u8; 5],
+    ) {
+        let count = outline.len();
+        let half = depth * 0.5;
+        let middle = outline.iter().fold((0.0, 0.0), |(x, z), p| {
+            (x + p.0 / count as f32, z + p.1 / count as f32)
+        });
+        let shrink = |(x, z): (f32, f32)| {
+            let (dx, dz) = (middle.0 - x, middle.1 - z);
+            let length = dx.hypot(dz).max(0.0001);
+            let step = bevel.min(length * 0.45);
+            (x + dx / length * step, z + dz / length * step)
+        };
+        let put = |(x, z): (f32, f32), y: f32| {
+            Point3::new(x, y, z)
+                .rotate(angles.z, angles.x, angles.y)
+                .add(center)
+        };
+        let back: Vec<Point3> = outline.iter().map(|p| put(*p, -half)).collect();
+        let front: Vec<Point3> = outline.iter().map(|p| put(*p, half)).collect();
+        let inner_back: Vec<Point3> = outline
+            .iter()
+            .map(|p| put(shrink(*p), -half + bevel))
+            .collect();
+        let inner_front: Vec<Point3> = outline
+            .iter()
+            .map(|p| put(shrink(*p), half - bevel))
+            .collect();
+        let outwards = |ix: usize| {
+            let next = (ix + 1) % count;
+            Point3::new(
+                (outline[ix].0 + outline[next].0) * 0.5 - middle.0,
+                0.0,
+                (outline[ix].1 + outline[next].1) * 0.5 - middle.1,
+            )
+            .rotate(angles.z, angles.x, angles.y)
+        };
+        for ix in 0..count {
+            let next = (ix + 1) % count;
+            let out = outwards(ix);
+            // The side wall, between the two outer rims.
+            self.quad(
+                facing([back[ix], back[next], front[next], front[ix]], out),
+                ramp,
+            );
+            // The front and back chamfers, each turned onto the face it cuts.
+            let up = Point3::new(0.0, 1.0, 0.0).rotate(angles.z, angles.x, angles.y);
+            self.quad(
+                facing(
+                    [front[ix], front[next], inner_front[next], inner_front[ix]],
+                    out.add(up),
+                ),
+                ramp,
+            );
+            self.quad(
+                facing(
+                    [back[next], back[ix], inner_back[ix], inner_back[next]],
+                    out.add(up.scale(-1.0)),
+                ),
+                ramp,
+            );
+        }
+        let cap = |mesh: &mut Self, ring: &[Point3], up: Point3| {
+            let middle = ring
+                .iter()
+                .fold(Point3::default(), |sum, p| sum.add(*p))
+                .scale(1.0 / count as f32);
+            for ix in 0..count {
+                let next = (ix + 1) % count;
+                mesh.quad(facing([middle, ring[ix], ring[next], ring[next]], up), ramp);
+            }
+        };
+        let up = Point3::new(0.0, 1.0, 0.0).rotate(angles.z, angles.x, angles.y);
+        cap(self, &inner_front, up);
+        cap(self, &inner_back, up.scale(-1.0));
+    }
+    /// A flat outline in the (x, z) plane about `center`, extruded `depth`
+    /// along y and chamfered at the front, so a carved letter catches light on
+    /// its edge instead of reading as a sheet of paper laid on the surface.
+    fn bevel_prism(
+        &mut self,
+        outline: [(f32, f32); 4],
+        center: Point3,
+        depth: f32,
+        bevel: f32,
+        ramp: [u8; 5],
+        edge: [u8; 5],
+    ) {
+        let at = |(x, z): (f32, f32), y: f32| center.add(p3(x, y, z));
+        let half = depth * 0.5;
+        let middle = outline
+            .iter()
+            .fold((0.0, 0.0), |(x, z), p| (x + p.0 * 0.25, z + p.1 * 0.25));
+        let inset = outline.map(|(x, z)| {
+            let (dx, dz) = (middle.0 - x, middle.1 - z);
+            let step = bevel.min(dx.hypot(dz) * 0.45);
+            let length = dx.hypot(dz).max(0.0001);
+            (x + dx / length * step, z + dz / length * step)
+        });
+        let back = outline.map(|p| at(p, -half));
+        let front = outline.map(|p| at(p, half));
+        let raised = inset.map(|p| at(p, half + bevel));
+        self.quad(facing(back, p3(0.0, -1.0, 0.0)), edge);
+        self.quad(facing(raised, p3(0.0, 1.0, 0.0)), ramp);
+        for ix in 0..4 {
+            let next = (ix + 1) % 4;
+            let out = p3(
+                (outline[ix].0 + outline[next].0) * 0.5 - middle.0,
+                0.0,
+                (outline[ix].1 + outline[next].1) * 0.5 - middle.1,
+            );
+            self.quad(
+                facing([back[ix], back[next], front[next], front[ix]], out),
+                edge,
+            );
+            self.quad(
+                facing(
+                    [front[ix], front[next], raised[next], raised[ix]],
+                    out.add(p3(0.0, 1.0, 0.0)),
+                ),
+                ramp,
+            );
+        }
+    }
     /// A flat outline in the (x, z) plane about `center`, extruded `depth`
     /// along y: the logo's parallelograms, given body.
     fn prism(&mut self, outline: [(f32, f32); 4], center: Point3, depth: f32, ramp: [u8; 5]) {

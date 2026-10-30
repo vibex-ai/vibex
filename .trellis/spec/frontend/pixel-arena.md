@@ -348,11 +348,13 @@ rebirth, without a damage override.
   frame and window, the orca's markings, fin and curled tail, Copilot's
   goggles and face slots, Cursor's corner-on cube and pointer cut, Cline's
   pointed frame, pill eyes and antenna ball, Grok's broken ring and slash,
-  ZCode's slab and bars as the logo's own parallelograms, Kimi's tile, K and
-  blue square, CodeBuddy's ears, visor and slanted eyes, Antigravity's
-  gradient A, Devin's three linked hexagons, Gemini's coloured four-point
-  star, Hermes's hair, band and "N" badge. Every model
-  carries a dark one-pixel silhouette.
+  ZCode's slab and bars as the logo's own parallelograms, Kimi's rounded
+  app-icon slab with its routed margin, chamfered K and raised blue square,
+  CodeBuddy's tapered head, lilac-lined ears, bezelled visor and slanted pill
+  eyes, Antigravity's gradient A, Devin's three linked hexagons, Gemini's
+  coloured four-point star, Hermes's crown and fringe of locks, white band
+  with gold wings, and "N" badge. Every model carries a dark one-pixel
+  silhouette.
 - Cursor's cube (`arena/cube.rs`) names faces in model space with +y the way
   it rolls. A quarter-turn about the leading bottom edge is a pitch about the
   center plus `cube::tumble`'s lift and travel. In combat the facet is

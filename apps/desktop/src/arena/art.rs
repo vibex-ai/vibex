@@ -285,12 +285,12 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); Guardian::ALL.len()] = 
     (-49, -122, 48, -5),
     (-54, -100, 53, 15),
     (-92, -161, 91, 7),
-    (-47, -77, 46, 50),
-    (-45, -152, 44, 18),
+    (-46, -77, 45, 53),
+    (-47, -137, 45, 18),
     (-57, -142, 58, 8),
     (-46, -94, 45, 5),
     (-46, -118, 73, 0),
-    (-53, -122, 54, 6),
+    (-59, -123, 60, 17),
 ];
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
@@ -300,7 +300,7 @@ pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
 /// extremes, so it is a poor measure of how large the model reads; a companion
 /// sizes the model by this instead.
 pub(super) const COMPANION_HEIGHTS: [i32; Guardian::ALL.len()] = [
-    65, 96, 110, 85, 106, 82, 92, 95, 79, 117, 72, 130, 96, 81, 87, 98,
+    65, 96, 110, 85, 106, 82, 92, 95, 79, 117, 75, 112, 96, 81, 87, 103,
 ];
 pub(super) fn companion_height(guardian: Guardian) -> i32 {
     COMPANION_HEIGHTS[guardian as usize]
