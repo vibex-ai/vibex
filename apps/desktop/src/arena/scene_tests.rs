@@ -142,6 +142,39 @@ fn the_home_button_follows_the_visible_model_and_fits_the_page() {
         }
     }
 }
+/// The guardian is the page's entry, so its pointer target has to be forgiving
+/// rather than exactly the silhouette of a moving raster. A margin around the
+/// fitted art is what a reader aims at; empty home space beyond it must stay
+/// empty, and the target may never leave the scene it is drawn in.
+#[test]
+fn the_home_entry_target_grows_past_the_art_but_not_past_the_scene() {
+    let scene = Bounds::new(point(px(10.0), px(20.0)), size(px(800.0), px(600.0)));
+    // An ordinary figure away from the scene's edges gains the margin evenly.
+    let art = Bounds::new(point(px(300.0), px(200.0)), size(px(90.0), px(80.0)));
+    let target = entry_target(scene, art, px(ENTRY_SLOP));
+    assert_eq!(target.left(), art.left() - px(ENTRY_SLOP));
+    assert_eq!(target.top(), art.top() - px(ENTRY_SLOP));
+    assert_eq!(target.right(), art.right() + px(ENTRY_SLOP));
+    assert_eq!(target.bottom(), art.bottom() + px(ENTRY_SLOP));
+    assert!(target.contains(&art.center()));
+
+    // A figure against an edge keeps its margin on the inside and is clipped on
+    // the outside, so the target never reaches outside the scene.
+    let edge = Bounds::new(point(scene.left(), scene.top()), size(px(40.0), px(30.0)));
+    let target = entry_target(scene, edge, px(ENTRY_SLOP));
+    assert_eq!(target.left(), scene.left());
+    assert_eq!(target.top(), scene.top());
+    assert_eq!(target.right(), edge.right() + px(ENTRY_SLOP));
+    assert_eq!(target.bottom(), edge.bottom() + px(ENTRY_SLOP));
+    assert!(target.left() >= scene.left() && target.top() >= scene.top());
+
+    // A scene too small to hold the margin collapses onto it rather than
+    // inverting the rectangle.
+    let cramped = Bounds::new(scene.origin, size(px(8.0), px(8.0)));
+    let target = entry_target(scene, cramped, px(ENTRY_SLOP));
+    assert!(target.size.width >= px(0.0) && target.size.height >= px(0.0));
+}
+
 #[test]
 fn spatial_rotation_changes_visible_faces_and_flight_keeps_the_upper_model() {
     for guardian in Guardian::ALL {

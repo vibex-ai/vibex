@@ -57072,7 +57072,12 @@ impl VibexWorkbench {
                     .child(
                         v_flex()
                             .id("new-session-intro")
-                            .occlude()
+                            // The guardian roams behind this copy and the copy
+                            // itself does nothing, so the band stays transparent
+                            // to the pointer. An occluding band here covered a
+                            // wide part of the guardian's travel and made the
+                            // entry feel unreachable; the Agent mark inside the
+                            // sentence keeps its own hit target.
                             .w_full()
                             .min_w_0()
                             .items_center()
@@ -106422,6 +106427,47 @@ mod tests {
             .map(|(body, _)| body)
             .expect("new session panel should remain inspectable");
         assert!(!panel.contains("self.new_session_error"));
+    }
+
+    /// The guardian roams the whole new-session page behind the heading, so
+    /// nothing that merely carries the copy may take the pointer from it.
+    ///
+    /// The heading band used to be `occlude`d, which put an invisible
+    /// full-width hitbox over a wide strip of the guardian's travel: aiming at
+    /// the boss where it crossed the wordmark or the sentence hit the page's
+    /// text instead, and the entry only answered once the model had roamed out
+    /// from under the band. The band is copy, not a control, so it stays
+    /// transparent to the pointer while the Agent mark inside the sentence
+    /// keeps its own hit target.
+    #[test]
+    fn the_new_session_heading_never_covers_the_roaming_guardian() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        let intro = panel
+            .split_once(".id(\"new-session-intro\")")
+            .and_then(|(_, tail)| tail.split_once(".child("))
+            .map(|(body, _)| body)
+            .expect("the heading band should remain inspectable");
+        assert!(
+            !intro.contains(".occlude()"),
+            "an occluding heading band steals the pointer from the guardian behind it"
+        );
+
+        // The prompt card still owns its own area: it really is a control
+        // surface, so it keeps occluding the guardian there.
+        let compose = panel
+            .split_once(".id(\"new-session-compose\")")
+            .and_then(|(_, tail)| tail.split_once(".child("))
+            .map(|(body, _)| body)
+            .expect("the composer block should remain inspectable");
+        assert!(
+            compose.contains(".occlude()"),
+            "the composer really is a control surface and still occludes"
+        );
     }
 
     /// The new-session page leads with the same sentence the phone does, and

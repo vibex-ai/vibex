@@ -335,6 +335,19 @@ pub(super) fn battle(
         .into_any_element()
 }
 
+/// How far the guardian's click target reaches past its fitted art, in
+/// logical pixels.
+///
+/// The model is drawn from a moving raster that is re-fitted every frame, so
+/// its outer pixels are a jagged outline and its silhouette changes as it
+/// hops, rolls and turns. Fitting the button to the raster's exact bounds made
+/// the target move with every one of those pixels: a reader aiming at a wing
+/// tip, or at the empty notch between a limb and the body, missed the control
+/// and had to chase the model around the page. A small constant margin keeps
+/// the whole figure comfortably clickable without turning empty home space
+/// into the entry.
+const ENTRY_SLOP: f32 = 12.0;
+
 /// The custom element only measures a moving raster. A normal Button still
 /// owns keyboard activation, focus, accessibility and pointer dispatch.
 pub(super) struct Entry {
@@ -426,15 +439,23 @@ impl Element for Entry {
                 pixel * left as f32,
                 pixel * (top as f32 - art::TOP_PAD as f32),
             );
+        let target = entry_target(
+            bounds,
+            Bounds::new(
+                hit_origin,
+                size(pixel * (right - left) as f32, pixel * (bottom - top) as f32),
+            ),
+            px(ENTRY_SLOP),
+        );
         self.button.layout_as_root(
             size(
-                AvailableSpace::Definite(pixel * (right - left) as f32),
-                AvailableSpace::Definite(pixel * (bottom - top) as f32),
+                AvailableSpace::Definite(target.size.width),
+                AvailableSpace::Definite(target.size.height),
             ),
             window,
             cx,
         );
-        self.button.prepaint_at(hit_origin, window, cx);
+        self.button.prepaint_at(target.origin, window, cx);
         ActorsLayout {
             rectangles: frame.rectangles(),
             geometry,
@@ -455,6 +476,23 @@ impl Element for Entry {
         paint_rectangles(&layout.rectangles, layout.geometry, &layout.colors, window);
     }
 }
+/// The guardian's pointer target: its fitted art grown by `slop` on every side,
+/// kept inside `limit`.
+///
+/// The art moves and re-fits every frame, so a margin is what makes the figure
+/// forgiving to aim at. It never leaves the scene's own bounds, which keeps the
+/// target from reaching the title bar or the page's padding.
+fn entry_target(limit: Bounds<Pixels>, art: Bounds<Pixels>, slop: Pixels) -> Bounds<Pixels> {
+    let left = (art.left() - slop).max(limit.left());
+    let top = (art.top() - slop).max(limit.top());
+    let right = (art.right() + slop).min(limit.right());
+    let bottom = (art.bottom() + slop).min(limit.bottom());
+    Bounds::new(
+        point(left, top),
+        size((right - left).max(px(0.0)), (bottom - top).max(px(0.0))),
+    )
+}
+
 fn model_bounds(frame: &Raster) -> (usize, usize, usize, usize) {
     let mut left = frame.width;
     let mut top = frame.height;
