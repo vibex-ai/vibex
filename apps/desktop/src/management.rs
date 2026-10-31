@@ -98,6 +98,19 @@ use crate::theme;
 
 const MANAGEMENT_SIDEBAR_WIDTH: f32 = 368.0;
 const MANAGEMENT_WIDE_BREAKPOINT: f32 = 1024.0;
+/// The size both authoring dialogs open at: adding a Provider and composing a
+/// route group are two steps of one flow, so the window must not resize between
+/// them. The bounds keep a short window usable and a large one from turning a
+/// dialog into a page.
+fn management_authoring_dialog_size(window: &Window) -> (f32, f32) {
+    let viewport = window.viewport_size();
+    let window_width = f32::from(viewport.width);
+    let window_height = f32::from(viewport.height);
+    (
+        (window_width - 32.0).clamp(360.0, 1040.0),
+        (window_height - 32.0).clamp(360.0, 760.0),
+    )
+}
 /// Below this the Provider editor stacks its Model picker and its settings
 /// instead of showing them side by side.
 const MANAGEMENT_PROFILE_PANES_MIN_WIDTH: f32 = 960.0;
@@ -1383,6 +1396,24 @@ pub struct ManagementCenter {
     /// form: the fields a preset fills are the ones most users cannot fill
     /// from memory, and a blank form hides that the choice existed.
     provider_preset_picker: bool,
+    /// Which half of the chooser is on screen: saved Providers or route groups.
+    ///
+    /// Both answer "which model source will this Agent use", but they are
+    /// different records with different authors: a Provider is an address and a
+    /// Key, a route group is a composition of saved Providers. Reading them as
+    /// two tabs keeps each list's own actions beside it instead of stacking one
+    /// under the other.
+    provider_picker_tab: ProviderPickerTab,
+    /// Where the picker was reached from, so a form opened from it can return.
+    provider_picker_origin: ProviderPickerOrigin,
+    /// Whether the open Provider form came from the picker rather than from an
+    /// edit, which is what gives it a Back button instead of a Close one.
+    provider_form_from_picker: bool,
+    /// Whether the open route-group form was reached through the picker.
+    ///
+    /// Its Back button returns to the chooser instead of closing the overlay;
+    /// a group opened from the Agent card closes.
+    route_group_form_from_picker: bool,
     provider_detail_tab: ProviderDetailTab,
     route_group_detail_tab: RouteGroupDetailTab,
     /// The gateway detail's selected section, so its cards stay one page
@@ -2922,6 +2953,10 @@ impl ManagementCenter {
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
+            provider_picker_tab: ProviderPickerTab::default(),
+            provider_picker_origin: ProviderPickerOrigin::default(),
+            provider_form_from_picker: false,
+            route_group_form_from_picker: false,
             provider_detail_tab: ProviderDetailTab::Overview,
             route_group_detail_tab: RouteGroupDetailTab::Overview,
             gateway_detail_tab: GatewayDetailTab::Overview,
@@ -5915,7 +5950,19 @@ impl ManagementCenter {
         }));
     }
 
-    fn open_profile_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the chooser from a known surface.
+    ///
+    /// The add buttons on the Agent card and on the global Providers page open
+    /// the same chooser but disagree about what a save binds, so the origin is
+    /// recorded here rather than guessed at save time.
+    fn open_profile_creator_from(
+        &mut self,
+        window: &mut Window,
+        origin: ProviderPickerOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        self.provider_picker_origin = origin;
+        self.provider_picker_tab = ProviderPickerTab::Providers;
         // The dialog is opened from an Agent card, so the new shared record is
         // enabled for that Agent after it is written.
         self.provider_editor_bind_agent = true;
@@ -6206,6 +6253,44 @@ impl ManagementCenter {
                 cx.notify();
             });
         }));
+    }
+
+    /// Returns from the Provider form to the chooser that opened it.
+    ///
+    /// The draft is abandoned on the way back: the chooser is where a source is
+    /// chosen, and keeping half-filled fields behind it would let a later
+    /// choice inherit addresses the user had already walked away from.
+    fn return_to_provider_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        self.provider_preset_draft = None;
+        self.provider_preset_region = None;
+        self.profile_name
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_note
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_website_url
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_base_url
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_api_key.update(cx, |state, cx| {
+            state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
+            state.set_value("", window, cx);
+        });
+        self.profile_configured_models.clear();
+        self.profile_available_models.clear();
+        self.profile_detached_models.clear();
+        self.profile_model_selection = None;
+        self.profile_name_error = None;
+        self.error = None;
+        self.editing_profile_id = None;
+        self.provider_form_from_picker = false;
+        self.provider_preset_picker = true;
+        self.provider_preset_query
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.navigation.mark_dirty(ManagementSection::Agents, false);
+        cx.notify();
     }
 
     fn reset_profile_editor_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6639,10 +6724,13 @@ impl ManagementCenter {
         let dialog_content = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
         // Wide enough for the Model picker and its settings side by side, and
         // tall enough that the two panes, not the whole form, are what scrolls.
-        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 1040.0);
-        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(360.0, 760.0);
+        let (dialog_width, dialog_height) = management_authoring_dialog_size(window);
         let title = if self.editing_profile_id.is_some() {
             management_locale_text("Edit model provider", "编辑模型供应商", "編輯模型供應商")
+        } else if self.provider_preset_picker {
+            // The overlay's first step is choosing a source, and it covers both
+            // a Provider and a route group; the Provider form comes after it.
+            management_locale_text("Add configuration", "添加配置", "新增配置")
         } else {
             management_locale_text("Add model provider", "添加模型供应商", "新增模型供應商")
         };
@@ -23008,6 +23096,22 @@ impl ManagementCenter {
             );
         }
 
+        // A form reached through the chooser is one step of choosing a source,
+        // so its leading edge carries the way back rather than leaving the
+        // reader to Cancel the whole overlay to change their mind.
+        let back_to_picker = self.provider_form_from_picker.then(|| {
+            Button::new("provider-profile-back")
+                .small()
+                .ghost()
+                .icon(IconName::ArrowLeft)
+                .label(management_locale_text("Back", "返回", "返回"))
+                .disabled(saving)
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.return_to_provider_picker(window, cx)),
+                )
+                .into_any_element()
+        });
+
         v_flex()
             .size_full()
             .min_h_0()
@@ -23022,33 +23126,43 @@ impl ManagementCenter {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .pt_3()
-                    // A saved Provider is one shared record; its global settings
-                    // (Keys, proxy, kind, behaviour) live on the Provider page,
-                    // one press away, at the leading edge.
-                    .when_some(shared_profile_id, |row, shared_id| {
-                        row.child(
-                            Button::new("provider-profile-open-global")
-                                .small()
-                                .ghost()
-                                .icon(Icon::default().path("icons/vibex/settings.svg"))
-                                .label(management_locale_text(
-                                    "All Provider settings",
-                                    "全部供应商设置",
-                                    "全部供應商設定",
-                                ))
-                                .disabled(cancel_disabled)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_profile_editor(window, cx);
-                                    this.provider_detail_tab = ProviderDetailTab::Advanced;
-                                    this.open_shared_provider_editor_by_id(
-                                        shared_id.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(div().flex_1())
-                    })
+                    // Both leading-edge commands share one lane so the trailing
+                    // actions stay on the dialog's trailing spine.
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .justify_start()
+                            .gap_2()
+                            .children(back_to_picker)
+                            // A saved Provider is one shared record; its global
+                            // settings (Keys, proxy, kind, behaviour) live on the
+                            // Provider page, one press away.
+                            .when_some(shared_profile_id, |row, shared_id| {
+                                row.child(
+                                    Button::new("provider-profile-open-global")
+                                        .small()
+                                        .ghost()
+                                        .icon(Icon::default().path("icons/vibex/settings.svg"))
+                                        .label(management_locale_text(
+                                            "All Provider settings",
+                                            "全部供应商设置",
+                                            "全部供應商設定",
+                                        ))
+                                        .disabled(cancel_disabled)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.close_profile_editor(window, cx);
+                                            this.provider_detail_tab = ProviderDetailTab::Advanced;
+                                            this.open_shared_provider_editor_by_id(
+                                                shared_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            }),
+                    )
                     // Every command that ends the dialog's work sits together on
                     // the trailing edge: probe, abandon, commit.
                     .when_some(self.editing_profile_id.clone(), |row, profile_id| {
@@ -23350,17 +23464,19 @@ impl ManagementCenter {
         });
         let mut group_rows = v_flex().w_full().gap_1();
         if !available_groups.is_empty() {
+            // The tab already names this list, so the caption only says what
+            // one row's members are: a group is a model an Agent can ask for.
             group_rows = group_rows.child(
                 div()
+                    .w_full()
                     .px_2()
-                    .pt_2()
+                    .pt_1()
                     .text_xs()
-                    .font_medium()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "Use a route group",
-                        "使用路由组",
-                        "使用路由組",
+                        "Saved groups this Agent can use",
+                        "此 Agent 可使用的已保存路由组",
+                        "此 Agent 可使用的已儲存路由組",
                     )),
             );
             for row in available_groups {
@@ -23420,186 +23536,125 @@ impl ManagementCenter {
                 );
             }
         }
-        // Creating one is next to referencing one, because composing a group is
-        // the other answer to the same question. The new group is global like
-        // every other, and this Agent gets a reference to it.
-        group_rows = group_rows.child(
-            h_flex()
-                .id("management-provider-new-group")
-                .w_full()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .rounded(px(6.0))
-                .when(!pending, |this| {
-                    this.cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.create_route_group_from_agent(window, cx)
-                        }))
-                })
-                .child(
-                    Icon::new(IconName::Plus)
-                        .size(px(14.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .flex_1()
-                        .gap_0p5()
-                        .child(div().text_sm().font_medium().child(management_locale_text(
-                            "New route group",
-                            "新建路由组",
-                            "新增路由組",
-                        )))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Combine Providers into one model source",
-                                    "把多个供应商组合成一个模型来源",
-                                    "把多個供應商組合成一個模型來源",
-                                )),
-                        ),
-                )
-                .child(
-                    Tag::color(ColorName::Neutral)
-                        .xsmall()
-                        .child(management_locale_text("New", "新建", "新增")),
-                ),
-        );
 
-        let recent_presets = self
-            .provider_recent_presets
-            .iter()
-            .filter_map(|id| vibex_core::provider_preset(id))
-            .collect::<Vec<_>>();
-        let matching = provider_preset_tiles(vibex_core::provider_presets(), &query);
-        let mut recent_row = h_flex().w_full().min_w_0().flex_wrap().gap_1();
-        for preset in &recent_presets {
-            let preset_id = preset.id.clone();
-            let icon = Icon::default()
-                .path(provider_preset_icon_path(preset).unwrap_or("icons/vibex/database.svg"));
-            recent_row = recent_row.child(
-                Button::new(SharedString::from(format!(
-                    "management-provider-recent-{}",
-                    preset.id
-                )))
-                .xsmall()
-                .ghost()
-                .icon(icon)
-                .label(preset.display_name.clone())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.choose_provider_preset(&preset_id, window, cx)
-                })),
-            );
-        }
+        let tab = self.provider_picker_tab;
+        // Copied so each row's listener owns the answer instead of borrowing
+        // the local across a `'static` closure.
+        let providers_tab = tab == ProviderPickerTab::Providers;
 
-        // The library is read in kinds, not as one flat grid: a vendor's own
-        // API, a relay, and a server on this machine are different answers to
-        // the same question, and a name alone does not say which is which.
-        // Every block therefore leads with a mark and the sentence its rows
-        // share, and a kind the search emptied is left out entirely.
-        let mut sources = v_flex().w_full().min_w_0().gap_1();
-        for category in ProviderPresetCategory::ALL {
-            let mut tiles = h_flex().w_full().min_w_0().flex_wrap().gap_1();
-            let mut listed = 0usize;
-            for preset in matching
+        // Each half of the chooser is its own list with its own actions: the
+        // Provider tab searches the library and the saved records, the route
+        // group tab lists compositions and the command that makes one. The tabs
+        // exist because the two records are authored differently, so stacking
+        // them made the page read as one long list of unequal things.
+        let search =
+            providers_tab.then(|| management_search_input(&self.provider_preset_query, cx));
+        let mut body = v_flex().w_full().min_w_0().gap_2();
+        if providers_tab {
+            let recent_presets = self
+                .provider_recent_presets
                 .iter()
-                .filter(|preset| provider_preset_category(preset) == category)
-            {
-                listed += 1;
-                tiles = tiles.child(provider_source_tile(preset, pending, cx));
+                .filter_map(|id| vibex_core::provider_preset(id))
+                .collect::<Vec<_>>();
+            let mut recent_row = h_flex().w_full().min_w_0().flex_wrap().gap_1();
+            for preset in &recent_presets {
+                let preset_id = preset.id.clone();
+                let icon = Icon::default()
+                    .path(provider_preset_icon_path(preset).unwrap_or("icons/vibex/database.svg"));
+                recent_row = recent_row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-recent-{}",
+                        preset.id
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .icon(icon)
+                    .label(preset.display_name.clone())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_provider_preset(&preset_id, window, cx)
+                    })),
+                );
             }
-            if listed == 0 {
-                continue;
-            }
-            sources = sources.child(provider_source_section(
-                SharedString::from(format!(
-                    "management-provider-sources-{}",
-                    category.metadata_value()
-                )),
-                category.icon(),
-                category.label(),
-                category.hint(),
-                tiles.into_any_element(),
-                cx,
-            ));
-        }
 
-        let mut sections = v_flex().w_full().min_w_0().gap_1();
-        if !recent_presets.is_empty() {
-            sections = sections.child(provider_source_section(
-                SharedString::from("management-provider-sources-recent"),
-                "icons/vibex/clock.svg",
-                management_locale_text("Recent", "最近使用", "最近使用"),
-                "",
-                recent_row.into_any_element(),
-                cx,
-            ));
-        }
-        if !existing.is_empty() {
-            sections = sections.child(provider_source_section(
-                SharedString::from("management-provider-sources-existing"),
-                "icons/vibex/database.svg",
-                management_locale_text("Already configured", "已配置的供应商", "已設定的供應商"),
-                management_locale_text(
-                    "Shared records you can reuse",
-                    "已有的共享记录，可直接复用",
-                    "既有的共用記錄，可直接重用",
-                ),
-                rows.into_any_element(),
-                cx,
-            ));
-        }
-        // A route group is a model source like the others, and composing one is
-        // available even before any group exists, so this block never hides.
-        sections = sections.child(provider_source_section(
-            SharedString::from("management-provider-sources-groups"),
-            "icons/vibex/git-branch.svg",
-            management_locale_text("Route groups", "路由组", "路由組"),
-            management_locale_text(
-                "One model source composed from Providers",
-                "由多个供应商组合成一个模型来源",
-                "由多個供應商組合成一個模型來源",
-            ),
-            group_rows.into_any_element(),
-            cx,
-        ));
-        sections = sections.child(sources);
-        if matching.is_empty() {
-            sections = sections.child(compact_empty_state(
-                management_locale_text("No matching sources", "没有匹配的来源", "沒有符合的來源"),
-                management_locale_text(
-                    "Try another name, host, or kind.",
-                    "换一个名称、地址或类别试试。",
-                    "換一個名稱、位址或類別試試。",
-                ),
-                cx,
-            ));
-        }
-
-        v_flex()
-            .w_full()
-            .min_h_0()
-            .flex_1()
-            .gap_2()
-            .child(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Reuse a saved Provider, choose a source below, or start from an empty form.",
-                        "可以复用已有供应商、选择下方来源，或从空表单开始。",
-                        "可以重用既有供應商、選擇下方來源，或從空白表單開始。",
+            let matching = provider_preset_tiles(vibex_core::provider_presets(), &query);
+            // The library is read in kinds, not as one flat grid: a vendor's own
+            // API, a relay, and a server on this machine are different answers to
+            // the same question, and a name alone does not say which is which.
+            // Every block therefore leads with a mark and the sentence its rows
+            // share, and a kind the search emptied is left out entirely.
+            let mut sources = v_flex().w_full().min_w_0().gap_1();
+            for category in ProviderPresetCategory::ALL {
+                let mut tiles = h_flex().w_full().min_w_0().flex_wrap().gap_1();
+                let mut listed = 0usize;
+                for preset in matching
+                    .iter()
+                    .filter(|preset| provider_preset_category(preset) == category)
+                {
+                    listed += 1;
+                    tiles = tiles.child(provider_source_tile(preset, pending, cx));
+                }
+                if listed == 0 {
+                    continue;
+                }
+                sources = sources.child(provider_source_section(
+                    SharedString::from(format!(
+                        "management-provider-sources-{}",
+                        category.metadata_value()
                     )),
-            )
-            .child(management_search_input(&self.provider_preset_query, cx))
-            .child(
+                    category.icon(),
+                    category.label(),
+                    category.hint(),
+                    tiles.into_any_element(),
+                    cx,
+                ));
+            }
+
+            let mut sections = v_flex().w_full().min_w_0().gap_1();
+            if !recent_presets.is_empty() {
+                sections = sections.child(provider_source_section(
+                    SharedString::from("management-provider-sources-recent"),
+                    "icons/vibex/clock.svg",
+                    management_locale_text("Recent", "最近使用", "最近使用"),
+                    "",
+                    recent_row.into_any_element(),
+                    cx,
+                ));
+            }
+            if !existing.is_empty() {
+                sections = sections.child(provider_source_section(
+                    SharedString::from("management-provider-sources-existing"),
+                    "icons/vibex/database.svg",
+                    management_locale_text(
+                        "Already configured",
+                        "已配置的供应商",
+                        "已設定的供應商",
+                    ),
+                    management_locale_text(
+                        "Shared records you can reuse",
+                        "已有的共享记录，可直接复用",
+                        "既有的共用記錄，可直接重用",
+                    ),
+                    rows.into_any_element(),
+                    cx,
+                ));
+            }
+            sections = sections.child(sources);
+            if matching.is_empty() {
+                sections = sections.child(compact_empty_state(
+                    management_locale_text(
+                        "No matching sources",
+                        "没有匹配的来源",
+                        "沒有符合的來源",
+                    ),
+                    management_locale_text(
+                        "Try another name, host, or kind.",
+                        "换一个名称、地址或类别试试。",
+                        "換一個名稱、位址或類別試試。",
+                    ),
+                    cx,
+                ));
+            }
+            body = body.child(
                 div()
                     .id("provider-picker-list")
                     .w_full()
@@ -23609,14 +23664,56 @@ impl ManagementCenter {
                     .scroll_gutter()
                     .pb_1()
                     .child(sections),
-            )
-            // Importing no longer lives in this step. It reads every Agent's
-            // native configuration and writes shared records, so it belongs to
-            // the Providers list's own header, where it is visible before the
-            // reader has chosen between "new" and "existing".
+            );
+        } else {
+            // The group tab keeps its list and its own New command together, so
+            // the tab states what exists and how to add one without the Provider
+            // library underneath answering a different question.
+            body = body.child(
+                div()
+                    .id("provider-picker-groups")
+                    .w_full()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .scroll_gutter()
+                    .pb_1()
+                    .child(group_rows),
+            );
+        }
+
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .flex_1()
+            .gap_2()
+            .child(self.render_provider_picker_tabs(cx))
             .child(
-                // The manual path never disappears: a preset library that
-                // covered every Provider would still be a wall, not a shortcut.
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if providers_tab {
+                        management_locale_text(
+                            "Reuse a saved Provider, choose a source below, or start from an empty form.",
+                            "可以复用已有供应商、选择下方来源，或从空表单开始。",
+                            "可以重用既有供應商、選擇下方來源，或從空白表單開始。",
+                        )
+                    } else {
+                        management_locale_text(
+                            "Compose saved Providers into one model source, then use it like any other.",
+                            "把已保存的供应商组合成一个模型来源，之后像普通来源一样使用。",
+                            "把已儲存的供應商組合成一個模型來源，之後像一般來源一樣使用。",
+                        )
+                    }),
+            )
+            .children(search)
+            .child(body)
+            // A new source starts from an empty form, which is the one answer
+            // neither tab's list can offer. Importing no longer lives in this
+            // step: it reads every Agent's native configuration and writes
+            // shared records, so it belongs to the Providers list's own header.
+            .child(
                 h_flex()
                     .id("management-provider-preset-custom")
                     .w_full()
@@ -23629,8 +23726,12 @@ impl ManagementCenter {
                     .when(!pending, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.choose_custom_provider(window, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if providers_tab {
+                                    this.choose_custom_provider(window, cx)
+                                } else {
+                                    this.create_route_group_from_picker(window, cx)
+                                }
                             }))
                     })
                     .child(
@@ -23653,22 +23754,30 @@ impl ManagementCenter {
                             .min_w_0()
                             .flex_1()
                             .gap_0p5()
-                            .child(div().text_sm().font_medium().child(management_locale_text(
-                                "Custom provider",
-                                "自定义供应商",
-                                "自訂供應商",
-                            )))
+                            .child(div().text_sm().font_medium().child(if providers_tab {
+                                management_locale_text("Custom provider", "自定义供应商", "自訂供應商")
+                            } else {
+                                management_locale_text("New route group", "新建路由组", "新增路由組")
+                            }))
                             .child(
                                 div()
                                     .min_w_0()
                                     .truncate()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Any OpenAI- or Anthropic-compatible address",
-                                        "任意兼容 OpenAI 或 Anthropic 的地址",
-                                        "任意相容 OpenAI 或 Anthropic 的位址",
-                                    )),
+                                    .child(if providers_tab {
+                                        management_locale_text(
+                                            "Any OpenAI- or Anthropic-compatible address",
+                                            "任意兼容 OpenAI 或 Anthropic 的地址",
+                                            "任意相容 OpenAI 或 Anthropic 的位址",
+                                        )
+                                    } else {
+                                        management_locale_text(
+                                            "Combine Providers into one model source",
+                                            "把多个供应商组合成一个模型来源",
+                                            "把多個供應商組合成一個模型來源",
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -23677,6 +23786,62 @@ impl ManagementCenter {
                             .text_color(cx.theme().muted_foreground),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// The two halves of the chooser, as one bar.
+    ///
+    /// Both tabs carry a count so an empty half says so before it is opened,
+    /// and the selected tab is a real selection state rather than a hover.
+    fn render_provider_picker_tabs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.provider_picker_tab;
+        let providers = self
+            .providers
+            .iter()
+            .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+            .count();
+        let groups = shared_route_group_rows(&self.model_routes, &self.agent_model_route_bindings)
+            .into_iter()
+            .filter(|row| row.route.status == vibex_core::RouteStatus::Enabled)
+            .count();
+        let selected_index = ProviderPickerTab::ALL
+            .iter()
+            .position(|tab| *tab == active)
+            .unwrap_or(0);
+        TabBar::new("management-provider-picker-tabs")
+            .w_full()
+            .pill()
+            .selected_index(selected_index)
+            .children(ProviderPickerTab::ALL.into_iter().map(|tab| {
+                let count = match tab {
+                    ProviderPickerTab::Providers => providers,
+                    ProviderPickerTab::RouteGroups => groups,
+                };
+                Tab::new().flex_1().aria_label(tab.label()).child(
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::default().path(tab.icon()).size(px(13.0)))
+                        .child(tab.label())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(count.to_string()),
+                        ),
+                )
+            }))
+            .on_click(cx.listener(|this, index: &usize, window, cx| {
+                if let Some(tab) = ProviderPickerTab::ALL.get(*index) {
+                    this.provider_picker_tab = *tab;
+                    // The term was typed against the list that was on screen,
+                    // so it does not carry into the other one.
+                    this.provider_preset_query
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    cx.notify();
+                }
+            }))
             .into_any_element()
     }
 
@@ -23736,16 +23901,53 @@ impl ManagementCenter {
     /// dialog is opened on the next frame: closing the active dialog and
     /// opening another in the same update leaves the window without an overlay
     /// to show, because the close is what tears the first one down.
-    fn create_route_group_from_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the route-group author from the chooser's Route groups tab.
+    ///
+    /// Unlike the Agent card's own "new group" path, this one keeps the chooser
+    /// behind it: the group dialog's Back button returns here rather than
+    /// closing the overlay, because the reader is still choosing a source.
+    fn create_route_group_from_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_preset_picker = false;
-        self.close_profile_editor(window, cx);
-        // `defer_in` hands the callback `&mut Self`; it has already leased the
-        // entity for the call. A second `update` on the same entity nests a
-        // lease and panics with "cannot update ManagementCenter while it is
-        // already being updated", which is what this path used to do.
+        self.provider_form_from_picker = false;
+        self.route_group_form_from_picker = true;
+        // The chooser's step is kept but its dialog is closed, because the group
+        // editor brings its own dialog and two hosts in one window would each
+        // try to close the other. The Back button restores the step by opening
+        // the chooser again.
+        self.provider_preset_picker = true;
+        self.profile_editor_open = false;
         cx.defer_in(window, move |center, window, cx| {
             center.open_route_group_editor(true, window, cx);
         });
+        cx.notify();
+    }
+
+    /// Returns from a route group authored in the chooser to the chooser.
+    ///
+    /// A group opened from an Agent card has no step behind it inside the
+    /// overlay, so the button closes instead: the same word, the same place, but
+    /// the only honest destination.
+    fn return_from_route_group_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let from_picker = self.route_group_form_from_picker;
+        self.close_route_group_editor(cx);
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
+        if !from_picker {
+            return;
+        }
+        // The chooser's step was kept while the group editor replaced it, so
+        // returning only has to present that step again, on the half the reader
+        // was using.
+        self.route_group_form_from_picker = false;
+        self.provider_preset_picker = true;
+        self.provider_form_from_picker = false;
+        self.provider_picker_tab = ProviderPickerTab::RouteGroups;
+        self.profile_editor_open = true;
+        self.present_profile_editor_dialog(window, cx);
         cx.notify();
     }
 
@@ -23759,6 +23961,8 @@ impl ManagementCenter {
         self.remember_provider_preset(preset_id);
         self.apply_provider_preset(preset_id, window, cx);
         self.provider_preset_picker = false;
+        // The form is one step past the chooser, so it offers the way back.
+        self.provider_form_from_picker = true;
         cx.notify();
     }
 
@@ -23768,8 +23972,10 @@ impl ManagementCenter {
     /// "start from an empty form" cannot inherit the addresses of the choice
     /// that was just abandoned.
     fn choose_custom_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_profile_creator(window, cx);
+        let origin = self.provider_picker_origin;
+        self.open_profile_creator_from(window, origin, cx);
         self.provider_preset_picker = false;
+        self.provider_form_from_picker = true;
         cx.notify();
     }
 
@@ -28664,13 +28870,47 @@ impl ManagementCenter {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .id("management-model-group-editor-scroll")
+        // The dialog matches the Provider form's frame: a scrolling body over a
+        // pinned action bar. The form's own footer is therefore left out of the
+        // scroll region and drawn here, where a long member list cannot push the
+        // commit out of reach.
+        let form = self
+            .render_route_group_form_sections(provider_workspace::RouteGroupFormScope::Dialog, cx);
+        // Returning from a group authored in the chooser restores the step the
+        // reader came from; a group opened from the Agent card has nothing behind
+        // it in the overlay, so the button closes the dialog as it always did.
+        let back = Button::new("management-route-group-dialog-back")
+            .small()
+            .ghost()
+            .icon(IconName::ArrowLeft)
+            .label(management_locale_text("Back", "返回", "返回"))
+            .disabled(self.mutation.is_some())
+            .on_click(
+                cx.listener(|this, _, window, cx| this.return_from_route_group_editor(window, cx)),
+            )
+            .into_any_element();
+        v_flex()
             .size_full()
             .min_h_0()
-            .overflow_y_scroll()
+            .child(div().w_full().flex_none().pb_2().child(back))
             .child(
-                self.render_route_group_form(provider_workspace::RouteGroupFormScope::Dialog, cx),
+                div()
+                    .id("management-model-group-editor-scroll")
+                    .w_full()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(form),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .pt_3()
+                    .child(self.render_route_group_form_footer(
+                        provider_workspace::RouteGroupFormScope::Dialog,
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -28693,8 +28933,10 @@ impl ManagementCenter {
         let dialog_center = center.clone();
         let confirm_center = center.clone();
         let dialog_content = cx.new(|cx| ManagementRouteGroupDialog::new(center.clone(), cx));
-        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 720.0);
-        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
+        // The two authoring dialogs are steps of one flow, so they share one
+        // window: a group editor that opened at a different size would jump as
+        // the reader moved from choosing a source to composing one.
+        let (dialog_width, dialog_height) = management_authoring_dialog_size(window);
         let title = if self.route_group_editing_id.is_some() {
             management_locale_text("Edit route group", "编辑路由组", "編輯路由組")
         } else {
@@ -29312,7 +29554,7 @@ impl ManagementCenter {
                     .icon(IconName::Plus)
                     .disabled(pending)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_profile_creator(window, cx);
+                        this.open_profile_creator_from(window, ProviderPickerOrigin::AgentCard, cx);
                     })),
                 copy.add_configuration,
             ))
@@ -29333,7 +29575,7 @@ impl ManagementCenter {
                 cx,
             )
             .on_click(cx.listener(|this, _, window, cx| {
-                this.open_profile_creator(window, cx);
+                this.open_profile_creator_from(window, ProviderPickerOrigin::AgentCard, cx);
             }))
             .into_any_element()
         } else {
@@ -34918,6 +35160,56 @@ enum ProviderSidebarTab {
     RouteGroups,
 }
 
+/// The two halves of the chooser that opens when a source is added.
+///
+/// A saved Provider and a route group are both model sources, but they are
+/// authored differently: one is an address plus a Key, the other is a
+/// composition of saved Providers. Two tabs keep each list's own actions beside
+/// it instead of stacking one list above the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProviderPickerTab {
+    #[default]
+    Providers,
+    RouteGroups,
+}
+
+impl ProviderPickerTab {
+    const ALL: [Self; 2] = [Self::Providers, Self::RouteGroups];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Providers => management_locale_text("Providers", "供应商", "供應商"),
+            Self::RouteGroups => management_locale_text("Route groups", "路由组", "路由組"),
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Providers => "icons/vibex/database.svg",
+            Self::RouteGroups => "icons/vibex/git-branch.svg",
+        }
+    }
+}
+
+/// Where the chooser was opened from.
+///
+/// A form reached through the chooser returns to it; the same form opened by an
+/// Edit button has no step to return to and closes instead. The dialog lives in
+/// one window, so the origin has to be remembered rather than inferred from
+/// which button was pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProviderPickerOrigin {
+    /// The Agent card's add button, or an empty list on that card.
+    #[default]
+    AgentCard,
+    /// The global Providers page's add button. It opens the page's own
+    /// authoring surface rather than this overlay, so nothing constructs it
+    /// today; it stays so the origin is stated rather than inferred when that
+    /// page grows a chooser too.
+    #[allow(dead_code)]
+    ProvidersPage,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProviderPresetCategory {
     Vendor,
@@ -38138,7 +38430,7 @@ fn provider_preset_tiles(
 /// The bundled mark for the presets that ship their own logo.
 ///
 /// Only the few whose mark is not in the catalogue bundle need an entry here;
-/// everything else resolves through [`provider_preset_logo`]. The Recent row is
+/// everything else resolves through [`provider_source_logo`]. The Recent row is
 /// a compact list of buttons, so it takes the path rather than the tile.
 fn provider_preset_icon_path(preset: &vibex_core::ProviderPreset) -> Option<&'static str> {
     match preset.id.as_str() {
@@ -38148,22 +38440,6 @@ fn provider_preset_icon_path(preset: &vibex_core::ProviderPreset) -> Option<&'st
         "qwen" => Some("icons/vibex/qwen.svg"),
         _ => None,
     }
-}
-
-fn provider_preset_logo(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &App) -> AnyElement {
-    // A preset has no record yet, so the mark is looked up from the ids the
-    // record would be written with. That keeps the tile a user picks and the
-    // row it later becomes on the same helper.
-    let profile = vibex_core::ModelProviderProfile {
-        display_name: preset.display_name.clone(),
-        vendor_hint: Some(preset.id.clone()),
-        metadata: vibex_core::ModelProviderMetadata {
-            catalog_id: preset.catalog_id.clone(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    provider_logo_tile(&profile, size, cx)
 }
 
 /// One titled block of the source chooser: a mark, a name, the sentence its
@@ -38233,23 +38509,6 @@ fn provider_source_tile(
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let preset_id = preset.id.clone();
-    let detail = if preset.no_key {
-        management_locale_text("No key needed", "无需 Key", "無需 Key").to_string()
-    } else if let Some(plan_note) = preset.plan_note.as_deref() {
-        plan_note.to_string()
-    } else {
-        preset
-            .catalog_id
-            .clone()
-            .or_else(|| {
-                preset
-                    .endpoints
-                    .values()
-                    .next()
-                    .map(|url| provider_preset_host(url))
-            })
-            .unwrap_or_else(|| management_locale_text("Preset", "预设", "預設").to_string())
-    };
     let badge = if preset.plan_note.is_some() {
         Some(management_locale_text("Plan", "套餐", "套餐"))
     } else if !preset.regions.is_empty() {
@@ -38257,23 +38516,24 @@ fn provider_source_tile(
     } else {
         None
     };
-    // A row that shares its line: the basis is wide enough for a name and its
-    // second line, so a wide dialog reads three sources across instead of
-    // stacking dozens of full-width rows, while a narrow one falls back to a
-    // single column without any breakpoint.
+    // One source is one line. The columns are all equal and the row fills its
+    // column, so a wide dialog reads as an even grid instead of a ragged one,
+    // and a narrow one wraps to fewer columns rather than clipping a name. The
+    // name is the whole caption: the catalogue id under it repeated a fact the
+    // reader was not choosing between.
     h_flex()
         .id(SharedString::from(format!(
             "management-provider-preset-{}",
             preset.id
         )))
         .min_w_0()
-        .flex_grow(1.0)
-        .flex_basis(rems(13.0))
-        .min_w(rems(13.0))
+        .flex_1()
+        .flex_basis(rems(10.0))
+        .min_w(rems(10.0))
         .items_center()
         .gap_2()
-        .px_2()
-        .py_1p5()
+        .px_1()
+        .py_1()
         .rounded(cx.theme().radius)
         .when(!pending, |this| {
             this.cursor_pointer()
@@ -38282,39 +38542,75 @@ fn provider_source_tile(
                     this.choose_provider_preset(&preset_id, window, cx)
                 }))
         })
-        .child(provider_preset_logo(preset, px(22.0), cx))
+        .child(provider_source_logo(preset, px(20.0), cx))
         .child(
-            v_flex()
+            div()
                 .min_w_0()
                 .flex_1()
-                .gap_0()
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .items_center()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .font_medium()
-                                .child(preset.display_name.clone()),
-                        )
-                        .children(
-                            badge.map(|badge| Tag::color(ColorName::Neutral).xsmall().child(badge)),
-                        ),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(detail),
-                ),
+                .truncate()
+                .text_sm()
+                .font_medium()
+                .child(preset.display_name.clone()),
         )
+        .children(badge.map(|badge| Tag::color(ColorName::Neutral).xsmall().child(badge)))
         .into_any_element()
+}
+
+/// One preset's logo, drawn at its own colours and without a plate.
+///
+/// A branded mark is identifiable by its shape and colour; the rounded tile
+/// that used to sit behind it added a second outline around every row and made
+/// the marks read as buttons. A preset with no known mark shows its initial in
+/// the same slot, so the names still line up.
+fn provider_source_logo(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &App) -> AnyElement {
+    let profile = vibex_core::ModelProviderProfile {
+        display_name: preset.display_name.clone(),
+        vendor_hint: Some(preset.id.clone()),
+        metadata: vibex_core::ModelProviderMetadata {
+            catalog_id: preset.catalog_id.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let logo = [
+        profile.metadata.catalog_id.as_deref(),
+        profile.metadata.icon.as_deref(),
+        profile.vendor_hint.as_deref(),
+        Some(profile.display_name.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|candidate| model_brand_icon(candidate, size * 0.8, None));
+    match logo {
+        Some(logo) => div()
+            .flex_none()
+            .size(size)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(logo)
+            .into_any_element(),
+        None => {
+            let initial = preset
+                .display_name
+                .trim()
+                .chars()
+                .next()
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            div()
+                .flex_none()
+                .size(size)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(size * 0.55)
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(initial)
+                .into_any_element()
+        }
+    }
 }
 
 /// The Model entries a preset wants for one fetched catalogue.
@@ -43416,7 +43712,7 @@ mod tests {
             .expect("the heading actions should remain inspectable");
         assert!(header_actions.contains("provider-import-existing"));
         assert!(header_actions.contains("provider-add-configuration"));
-        assert!(header_actions.contains("this.open_profile_creator(window, cx)"));
+        assert!(header_actions.contains("this.open_profile_creator_from("));
         assert!(header_actions.contains("this.import_shared_providers("));
         assert!(header_actions.contains("this.present_native_import_picker(window, cx)"));
         assert!(render.contains("management_card_with_icon_action("));
@@ -43438,7 +43734,7 @@ mod tests {
         assert!(render.contains("provider-empty-card"));
         assert!(render.contains("management_empty_source_card("));
         assert!(render.contains("Add model provider"));
-        assert!(render.contains("this.open_profile_creator(window, cx)"));
+        assert!(render.contains("this.open_profile_creator_from("));
         // The two headings show their own counts.
         assert!(render.contains("management_section_heading("));
         assert!(render.contains("profiles.len()"));
@@ -43472,7 +43768,7 @@ mod tests {
     fn a_new_provider_is_shared_and_enabled_for_the_opening_agent() {
         let source = include_str!("management.rs");
         let creator = source
-            .split_once("    fn open_profile_creator(")
+            .split_once("    fn open_profile_creator_from(")
             .and_then(|(_, tail)| tail.split_once("\n    fn open_profile_editor("))
             .map(|(body, _)| body)
             .expect("the Agent create entry should remain inspectable");
@@ -44596,7 +44892,7 @@ mod gateway_surface_tests {
             center.update(cx, |center, cx| {
                 center.provider_preset_picker = true;
                 center.profile_editor_open = true;
-                center.create_route_group_from_agent(window, cx);
+                center.create_route_group_from_picker(window, cx);
             });
         });
         // Running the frame flushes the deferred callback, which is the step
@@ -45906,7 +46202,7 @@ mod gateway_surface_tests {
     fn creating_a_provider_from_the_global_page_borrows_a_configurable_agent() {
         let source = include_str!("management.rs");
         let opening = source
-            .split_once("    fn open_profile_creator(")
+            .split_once("    fn open_profile_creator_from(")
             .and_then(|(_, tail)| tail.split_once("\n    fn open_profile_editor("))
             .map(|(body, _)| body)
             .expect("the creator should remain inspectable");
@@ -46077,6 +46373,133 @@ mod gateway_surface_tests {
         );
     }
 
+    /// The chooser is two tabs, and each half owns the list and the command
+    /// that belongs to it.
+    ///
+    /// A saved Provider and a route group are both model sources, but they are
+    /// authored differently: an address plus a Key, and a composition of saved
+    /// Providers. One stacked list made the page read as unequal things; two
+    /// tabs let each list carry its own search and its own New command.
+    #[test]
+    fn the_chooser_splits_providers_and_route_groups_into_tabs() {
+        let source = include_str!("management.rs");
+        let picker = source
+            .split_once("    fn render_provider_picker_step(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives this Agent an existing shared Provider.")
+            })
+            .map(|(body, _)| body)
+            .expect("the picker step should remain inspectable");
+        assert!(picker.contains("render_provider_picker_tabs(cx)"));
+        assert!(picker.contains("ProviderPickerTab::Providers"));
+        // The search belongs to the Provider half: the group list has no
+        // catalogue to search, only the groups this Agent can reference.
+        assert!(picker.contains("providers_tab.then("));
+        assert_eq!(
+            ProviderPickerTab::ALL.map(|tab| tab.label()),
+            ["Providers", "Route groups"]
+        );
+        assert_ne!(
+            ProviderPickerTab::Providers.icon(),
+            ProviderPickerTab::RouteGroups.icon(),
+            "each tab carries its own mark"
+        );
+
+        let tabs = source
+            .split_once("    fn render_provider_picker_tabs(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives this Agent an existing shared Provider.")
+            })
+            .map(|(body, _)| body)
+            .expect("the tab bar should remain inspectable");
+        assert!(tabs.contains("TabBar::new(\"management-provider-picker-tabs\")"));
+        // A saved selection, not a hover: the tab bar owns the active state.
+        assert!(tabs.contains(".selected_index(selected_index)"));
+        assert!(tabs.contains("this.provider_picker_tab = *tab;"));
+        // The term was typed against the list on screen, so it is cleared when
+        // the other list takes over.
+        assert!(tabs.contains("state.set_value(\"\", window, cx)"));
+    }
+
+    /// Both authoring dialogs open at one size, so stepping from choosing a
+    /// source to composing one does not resize the window under the reader.
+    #[test]
+    fn both_authoring_dialogs_share_one_window_size() {
+        let source = include_str!("management.rs");
+        let size = source
+            .split_once("fn management_authoring_dialog_size(window: &Window) -> (f32, f32) {")
+            .map(|(_, tail)| tail)
+            .expect("the shared dialog size should remain inspectable");
+        assert!(size.contains("clamp(360.0, 1040.0)"));
+        assert!(size.contains("clamp(360.0, 760.0)"));
+
+        for entry in [
+            "    fn present_profile_editor_dialog(",
+            "    fn present_route_group_dialog(",
+        ] {
+            let body = source
+                .split_once(entry)
+                .map(|(_, tail)| tail)
+                .expect("both presenters should remain inspectable");
+            let presenter = body
+                .split_once("window.open_dialog(")
+                .map(|(before, _)| before)
+                .unwrap_or(body);
+            assert!(
+                presenter.contains("management_authoring_dialog_size(window)"),
+                "{entry} must use the shared size"
+            );
+        }
+    }
+
+    /// A form reached through the chooser returns to it; the same form opened
+    /// by an edit closes instead, because there is no step behind it.
+    #[test]
+    fn the_authoring_forms_carry_a_way_back_to_the_chooser() {
+        let source = include_str!("management.rs");
+
+        let back = source
+            .split_once("    fn return_to_provider_picker(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reset_profile_editor_state("))
+            .map(|(body, _)| body)
+            .expect("the Provider form's way back should remain inspectable");
+        assert!(back.contains("self.provider_form_from_picker = false;"));
+        assert!(back.contains("self.provider_preset_picker = true;"));
+        // The draft is abandoned on the way back, so a later choice cannot
+        // inherit addresses the reader had already walked away from.
+        assert!(back.contains("self.profile_api_key.update("));
+        assert!(back.contains("self.profile_configured_models.clear();"));
+
+        assert!(source.contains("this.return_to_provider_picker(window, cx)"));
+        assert!(source.contains("Button::new(\"provider-profile-back\")"));
+        assert!(source.contains("management-route-group-dialog-back"));
+        assert!(source.contains("this.return_from_route_group_editor(window, cx)"));
+
+        let leave = source
+            .split_once("    fn return_from_route_group_editor(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Enters the form with one preset applied.")
+            })
+            .map(|(body, _)| body)
+            .expect("the group form's way back should remain inspectable");
+        assert!(leave.contains("self.present_profile_editor_dialog(window, cx);"));
+        assert!(leave.contains("ProviderPickerTab::RouteGroups"));
+    }
+
+    /// Choosing a source replaces the chooser's own title, which names the
+    /// whole step rather than one kind of record.
+    #[test]
+    fn the_chooser_is_titled_add_configuration() {
+        let source = include_str!("management.rs");
+        let presenter = source
+            .split_once("    fn present_profile_editor_dialog(")
+            .and_then(|(_, tail)| tail.split_once("window.open_dialog("))
+            .map(|(body, _)| body)
+            .expect("the dialog presenter should remain inspectable");
+        assert!(presenter.contains("self.provider_preset_picker"));
+        assert!(presenter.contains("\"Add configuration\", \"添加配置\", \"新增配置\""));
+    }
+
     /// Creating a Provider starts on the picker, and the manual path leaves it.
     ///
     /// The step is the feature: an empty form used to be what "add a provider"
@@ -46086,7 +46509,7 @@ mod gateway_surface_tests {
     fn a_new_provider_starts_on_the_provider_picker() {
         let source = include_str!("management.rs");
         let opening = source
-            .split_once("    fn open_profile_creator(")
+            .split_once("    fn open_profile_creator_from(")
             .and_then(|(_, tail)| {
                 tail.split_once("\n    /// The first step of adding a Provider to an Agent.")
             })
@@ -46140,16 +46563,23 @@ mod gateway_surface_tests {
             })
             .map(|(body, _)| body)
             .expect("the source row should remain inspectable");
-        assert!(tile.contains("provider_preset_logo("));
+        // A source is one line: its mark, its name, and at most the plan or
+        // region note. The catalogue id under the name was a second caption for
+        // a choice that is made by the name.
+        assert!(tile.contains("provider_source_logo("));
         assert!(tile.contains("choose_provider_preset("));
+        assert!(!tile.contains("text_xs()"));
         assert!(!picker.contains("management-provider-source-scope-"));
-        // The chooser also answers the other half of the same question: a route
-        // group is a model source too, so referencing one and creating one sit
-        // on this step rather than behind a second button on the card.
+        // The chooser splits into two tabs, because a saved Provider and a route
+        // group are different records with different authors. The group half owns
+        // its own list and its own New command.
+        assert!(picker.contains("render_provider_picker_tabs(cx)"));
+        assert!(picker.contains("ProviderPickerTab::Providers"));
+        assert!(picker.contains("ProviderPickerTab::RouteGroups"));
         assert!(picker.contains("management-provider-existing-group-"));
         assert!(picker.contains("use_existing_route_group(route_id.clone(), cx)"));
-        assert!(picker.contains("management-provider-new-group"));
-        assert!(picker.contains("create_route_group_from_agent(window, cx)"));
+        assert!(picker.contains("management-provider-preset-custom"));
+        assert!(picker.contains("create_route_group_from_picker(window, cx)"));
 
         let reusing = source
             .split_once("    fn use_existing_provider(")
@@ -46179,10 +46609,12 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the custom chooser should remain inspectable");
         assert!(
-            custom.contains("self.open_profile_creator(window, cx);"),
+            custom.contains("self.open_profile_creator_from(window, origin, cx);"),
             "an abandoned preset must not leave its addresses in the empty form"
         );
         assert!(custom.contains("self.provider_preset_picker = false;"));
+        // The form is one step past the chooser, so it carries the way back.
+        assert!(custom.contains("self.provider_form_from_picker = true;"));
 
         assert!(picker.contains("management-provider-preset-custom"));
         assert!(picker.contains("management_search_input"));

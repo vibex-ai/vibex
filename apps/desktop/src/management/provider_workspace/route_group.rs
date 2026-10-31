@@ -632,13 +632,28 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         ws_stack(vec![
+            self.render_route_group_form_sections(scope, cx),
+            self.render_route_group_form_footer(scope, cx),
+        ])
+    }
+
+    /// Every field of the form, without its closing commands.
+    ///
+    /// The dialog pins those commands below a scrolling body, so it draws the
+    /// sections here and the footer separately; the page and the detail tabs
+    /// keep them in one stack so the buttons follow the last field.
+    pub(in crate::management) fn render_route_group_form_sections(
+        &mut self,
+        _scope: RouteGroupFormScope,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        ws_stack(vec![
             self.render_route_group_name_section(cx),
             self.render_route_group_members_section(cx),
             self.render_route_group_strategy_section(cx),
             self.render_route_group_limits_section(cx),
             self.render_route_group_visibility_section(cx),
             self.render_route_group_simulator_section(cx),
-            self.render_route_group_form_footer(scope, cx),
         ])
     }
 
@@ -1004,7 +1019,7 @@ impl ManagementCenter {
     /// The form's closing commands. Every entry commits with the same Save;
     /// what Cancel means differs: close the page, close the dialog, or drop
     /// the unsaved edits of the group on screen.
-    fn render_route_group_form_footer(
+    pub(in crate::management) fn render_route_group_form_footer(
         &mut self,
         scope: RouteGroupFormScope,
         cx: &mut Context<Self>,
