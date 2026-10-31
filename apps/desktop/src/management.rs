@@ -112,6 +112,12 @@ fn management_authoring_dialog_size(window: &Window) -> (f32, f32) {
         (window_height - 32.0).clamp(360.0, 760.0),
     )
 }
+/// How many sources one line of the preset library holds.
+///
+/// A fixed count rather than a wrapping row: a wrap stretches the line it does
+/// fill and leaves the last one short, which reads as ragged columns. Three
+/// fits the narrowest dialog the chooser opens at without truncating a name.
+const PROVIDER_SOURCE_COLUMNS: usize = 3;
 /// Below this the Provider editor stacks its Model picker and its settings
 /// instead of showing them side by side.
 const MANAGEMENT_PROFILE_PANES_MIN_WIDTH: f32 = 960.0;
@@ -1233,8 +1239,6 @@ pub struct ManagementCenter {
     /// Providers the user starred, persisted beside the other desktop UI state.
     provider_favorites: BTreeSet<String>,
     provider_favorites_path: Option<PathBuf>,
-    provider_recent_presets: Vec<String>,
-    provider_recent_presets_path: Option<PathBuf>,
     /// Which half of the Providers page the left column is showing.
     ///
     /// Providers and route groups are two kinds of record the same page owns,
@@ -3027,8 +3031,6 @@ impl ManagementCenter {
             provider_sort: ProviderSort::Name,
             provider_favorites: BTreeSet::new(),
             provider_favorites_path: None,
-            provider_recent_presets: Vec::new(),
-            provider_recent_presets_path: None,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
             selected_global_route_id: None,
             profile_editor_open: false,
@@ -14656,18 +14658,6 @@ impl ManagementCenter {
             }
             self.provider_favorites_path = Some(path);
         }
-        if self.provider_recent_presets_path.is_none() {
-            let path = runtime
-                .config()
-                .home_dir
-                .join("management-provider-recents.json");
-            if let Ok(bytes) = std::fs::read(&path)
-                && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
-            {
-                self.provider_recent_presets = ids;
-            }
-            self.provider_recent_presets_path = Some(path);
-        }
     }
 
     fn save_provider_favorites(&self) {
@@ -14676,18 +14666,6 @@ impl ManagementCenter {
         };
         if let Ok(bytes) =
             serde_json::to_vec_pretty(&self.provider_favorites.iter().cloned().collect::<Vec<_>>())
-        {
-            let _ = std::fs::write(path, bytes);
-        }
-    }
-
-    fn remember_provider_preset(&mut self, preset_id: &str) {
-        self.provider_recent_presets.retain(|id| id != preset_id);
-        self.provider_recent_presets
-            .insert(0, preset_id.to_string());
-        self.provider_recent_presets.truncate(6);
-        if let Some(path) = self.provider_recent_presets_path.as_ref()
-            && let Ok(bytes) = serde_json::to_vec_pretty(&self.provider_recent_presets)
         {
             let _ = std::fs::write(path, bytes);
         }
@@ -23571,75 +23549,15 @@ impl ManagementCenter {
         // content height of zero and the chooser looks empty.
         let mut body = v_flex().w_full().min_w_0().min_h_0().flex_1().gap_2();
         if providers_tab {
-            let recent_presets = self
-                .provider_recent_presets
-                .iter()
-                .filter_map(|id| vibex_core::provider_preset(id))
-                .collect::<Vec<_>>();
-            let mut recent_row = h_flex().w_full().min_w_0().flex_wrap().gap_1();
-            for preset in &recent_presets {
-                let preset_id = preset.id.clone();
-                let icon = Icon::default()
-                    .path(provider_preset_icon_path(preset).unwrap_or("icons/vibex/database.svg"));
-                recent_row = recent_row.child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-recent-{}",
-                        preset.id
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .icon(icon)
-                    .label(preset.display_name.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_provider_preset(&preset_id, window, cx)
-                    })),
-                );
-            }
-
             let matching = provider_preset_tiles(vibex_core::provider_presets(), &query);
             // The library is read in kinds, not as one flat grid: a vendor's own
             // API, a relay, and a server on this machine are different answers to
             // the same question, and a name alone does not say which is which.
             // Every block therefore leads with a mark and the sentence its rows
             // share, and a kind the search emptied is left out entirely.
-            let mut sources = v_flex().w_full().min_w_0().gap_1();
-            for category in ProviderPresetCategory::ALL {
-                let mut tiles = h_flex().w_full().min_w_0().flex_wrap().gap_1();
-                let mut listed = 0usize;
-                for preset in matching
-                    .iter()
-                    .filter(|preset| provider_preset_category(preset) == category)
-                {
-                    listed += 1;
-                    tiles = tiles.child(provider_source_tile(preset, pending, cx));
-                }
-                if listed == 0 {
-                    continue;
-                }
-                sources = sources.child(provider_source_section(
-                    SharedString::from(format!(
-                        "management-provider-sources-{}",
-                        category.metadata_value()
-                    )),
-                    category.icon(),
-                    category.label(),
-                    category.hint(),
-                    tiles.into_any_element(),
-                    cx,
-                ));
-            }
-
+            // A saved record and a preset are different kinds of answer, so the
+            // two lists are divided by a rule rather than by a heading alone.
             let mut sections = v_flex().w_full().min_w_0().gap_1();
-            if !recent_presets.is_empty() {
-                sections = sections.child(provider_source_section(
-                    SharedString::from("management-provider-sources-recent"),
-                    "icons/vibex/clock.svg",
-                    management_locale_text("Recent", "最近使用", "最近使用"),
-                    "",
-                    recent_row.into_any_element(),
-                    cx,
-                ));
-            }
             if !existing.is_empty() {
                 sections = sections.child(provider_source_section(
                     SharedString::from("management-provider-sources-existing"),
@@ -23649,16 +23567,35 @@ impl ManagementCenter {
                         "已配置的供应商",
                         "已設定的供應商",
                     ),
-                    management_locale_text(
-                        "Shared records you can reuse",
-                        "已有的共享记录，可直接复用",
-                        "既有的共用記錄，可直接重用",
-                    ),
                     rows.into_any_element(),
                     cx,
                 ));
+                sections = sections.child(Separator::horizontal());
             }
-            sections = sections.child(sources);
+            // The library is read in kinds: a vendor's own API, a relay, and a
+            // server on this machine are different answers to the same question,
+            // and a name alone does not say which is which. A kind the search
+            // emptied is left out entirely.
+            for category in ProviderPresetCategory::ALL {
+                let listed = matching
+                    .iter()
+                    .filter(|preset| provider_preset_category(preset) == category)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if listed.is_empty() {
+                    continue;
+                }
+                sections = sections.child(provider_source_section(
+                    SharedString::from(format!(
+                        "management-provider-sources-{}",
+                        category.metadata_value()
+                    )),
+                    category.icon(),
+                    category.label(),
+                    provider_source_rows(&listed, pending, cx),
+                    cx,
+                ));
+            }
             if matching.is_empty() {
                 sections = sections.child(compact_empty_state(
                     management_locale_text(
@@ -23709,43 +23646,36 @@ impl ManagementCenter {
             .min_h_0()
             .flex_1()
             .gap_2()
-            .child(div().w_full().flex_none().child(self.render_provider_picker_tabs(cx)))
             .child(
                 div()
                     .w_full()
                     .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if providers_tab {
-                        management_locale_text(
-                            "Reuse a saved Provider, choose a source below, or start from an empty form.",
-                            "可以复用已有供应商、选择下方来源，或从空表单开始。",
-                            "可以重用既有供應商、選擇下方來源，或從空白表單開始。",
-                        )
-                    } else {
-                        management_locale_text(
-                            "Compose saved Providers into one model source, then use it like any other.",
-                            "把已保存的供应商组合成一个模型来源，之后像普通来源一样使用。",
-                            "把已儲存的供應商組合成一個模型來源，之後像一般來源一樣使用。",
-                        )
-                    }),
+                    .child(self.render_provider_picker_tabs(cx)),
             )
+            // The tab, the search, and the block headings say what is here. The
+            // sentence that used to sit between them explained the tabs to
+            // someone already looking at them.
             .children(search.map(|search| div().w_full().flex_none().child(search)))
             .child(body)
             // A new source starts from an empty form, which is the one answer
             // neither tab's list can offer. Importing no longer lives in this
             // step: it reads every Agent's native configuration and writes
             // shared records, so it belongs to the Providers list's own header.
+            .child(Separator::horizontal())
             .child(
+                // The manual path is not one more row in the library: it is the
+                // answer for a source the library does not list, so it sits on
+                // its own band under the rule, trailing a chevron that says it
+                // opens a form rather than choosing a row.
                 h_flex()
                     .id("management-provider-preset-custom")
                     .w_full()
                     .min_w_0()
                     .items_center()
                     .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_2()
+                    .px_2()
+                    .py_2()
+                    .rounded(cx.theme().radius)
                     .when(!pending, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
@@ -23764,11 +23694,12 @@ impl ManagementCenter {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().muted.opacity(0.45))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(cx.theme().border)
                             .child(
                                 Icon::new(IconName::Plus)
-                                    .size(px(13.0))
+                                    .size(px(12.0))
                                     .text_color(cx.theme().muted_foreground),
                             ),
                     )
@@ -23778,9 +23709,17 @@ impl ManagementCenter {
                             .flex_1()
                             .gap_0p5()
                             .child(div().text_sm().font_medium().child(if providers_tab {
-                                management_locale_text("Custom provider", "自定义供应商", "自訂供應商")
+                                management_locale_text(
+                                    "Custom provider",
+                                    "自定义供应商",
+                                    "自訂供應商",
+                                )
                             } else {
-                                management_locale_text("New route group", "新建路由组", "新增路由組")
+                                management_locale_text(
+                                    "New route group",
+                                    "新建路由组",
+                                    "新增路由組",
+                                )
                             }))
                             .child(
                                 div()
@@ -23981,7 +23920,6 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.remember_provider_preset(preset_id);
         self.apply_provider_preset(preset_id, window, cx);
         self.provider_preset_picker = false;
         // The form is one step past the chooser, so it offers the way back.
@@ -35285,29 +35223,6 @@ impl ProviderPresetCategory {
         }
     }
 
-    /// The sentence under the category's name, saying what its rows have in
-    /// common. A name alone does not tell a reader why one address is a vendor
-    /// and another is a relay, so the chooser says it before the rows.
-    fn hint(self) -> &'static str {
-        match self {
-            Self::Vendor => management_locale_text(
-                "The makers' own APIs",
-                "模型厂商自己的接口",
-                "模型廠商自己的介面",
-            ),
-            Self::Relay => management_locale_text(
-                "One key, many vendors",
-                "一个密钥，多家模型",
-                "一個金鑰，多家模型",
-            ),
-            Self::Local => management_locale_text(
-                "Servers running on this machine, no key",
-                "在本机运行的服务，无需密钥",
-                "在本機執行的服務，無需金鑰",
-            ),
-        }
-    }
-
     /// The mark a category's heading carries, beside its name.
     fn icon(self) -> &'static str {
         match self {
@@ -38475,23 +38390,7 @@ fn provider_preset_tiles(
         .collect()
 }
 
-/// The bundled mark for the presets that ship their own logo.
-///
-/// Only the few whose mark is not in the catalogue bundle need an entry here;
-/// everything else resolves through [`provider_source_logo`]. The Recent row is
-/// a compact list of buttons, so it takes the path rather than the tile.
-fn provider_preset_icon_path(preset: &vibex_core::ProviderPreset) -> Option<&'static str> {
-    match preset.id.as_str() {
-        "openai" => Some("icons/vibex/openai.svg"),
-        "anthropic" => Some("icons/vibex/claude.svg"),
-        "google-gemini" => Some("icons/vibex/gemini.svg"),
-        "qwen" => Some("icons/vibex/qwen.svg"),
-        _ => None,
-    }
-}
-
-/// One titled block of the source chooser: a mark, a name, the sentence its
-/// rows share, then the rows themselves.
+/// One titled block of the source chooser: a mark, a name, then the rows.
 ///
 /// The library is long, so the chooser is read as kinds rather than as one
 /// undifferentiated grid. The heading is the same for an existing record, a
@@ -38501,23 +38400,25 @@ fn provider_source_section(
     id: SharedString,
     icon: &'static str,
     title: &'static str,
-    hint: &'static str,
     body: AnyElement,
     cx: &App,
 ) -> AnyElement {
+    // A heading names its block; the rows below it say the rest. The hint that
+    // used to trail the title repeated what the rows already showed, and on a
+    // narrow dialog it was the part that got truncated.
     v_flex()
         .id(id)
         .w_full()
         .min_w_0()
         .gap_1()
-        .py_1()
+        .pt_2()
         .child(
             h_flex()
                 .w_full()
                 .min_w_0()
                 .items_center()
                 .gap_1p5()
-                .px_2()
+                .px_1()
                 .child(
                     // The same slot a source row gives its mark, so the
                     // block's name and its rows' names share one spine.
@@ -38530,20 +38431,37 @@ fn provider_source_section(
                         .text_color(cx.theme().muted_foreground)
                         .child(Icon::default().path(icon).size(px(13.0))),
                 )
-                .child(div().flex_none().text_sm().font_semibold().child(title))
-                .when(!hint.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(hint),
-                    )
-                }),
+                .child(div().flex_none().text_sm().font_semibold().child(title)),
         )
         .child(body)
         .into_any_element()
+}
+
+/// One line of the preset library, filled to whole columns.
+///
+/// A wrapping row stretches whatever it has: the last line of a kind would end
+/// with one wide row and read as a different size. The library is therefore
+/// sliced into lines of a fixed column count, so every row is the same width and
+/// a short last line stays short instead of spreading out.
+fn provider_source_rows(
+    presets: &[vibex_core::ProviderPreset],
+    pending: bool,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let mut rows = v_flex().w_full().min_w_0().gap_0p5();
+    for line in presets.chunks(PROVIDER_SOURCE_COLUMNS) {
+        let mut row = h_flex().w_full().min_w_0().gap_1();
+        for preset in line {
+            row = row.child(provider_source_tile(preset, pending, cx));
+        }
+        // A partially filled line keeps the empty column widths in place, so a
+        // kind's rows line up with the rows above them instead of centring.
+        for _ in line.len()..PROVIDER_SOURCE_COLUMNS {
+            row = row.child(div().flex_1().min_w_0());
+        }
+        rows = rows.child(row);
+    }
+    rows.into_any_element()
 }
 
 /// One preset as a quiet row: its mark, its name, and the line under it.
@@ -38564,11 +38482,10 @@ fn provider_source_tile(
     } else {
         None
     };
-    // One source is one line. The columns are all equal and the row fills its
-    // column, so a wide dialog reads as an even grid instead of a ragged one,
-    // and a narrow one wraps to fewer columns rather than clipping a name. The
-    // name is the whole caption: the catalogue id under it repeated a fact the
-    // reader was not choosing between.
+    // One source is one line: its mark, then its name. The row takes an equal
+    // share of a line that holds a fixed number of columns, so every line of the
+    // library is the same height and the same widths, and the name is the whole
+    // caption rather than a second line the reader was not choosing between.
     h_flex()
         .id(SharedString::from(format!(
             "management-provider-preset-{}",
@@ -38576,8 +38493,6 @@ fn provider_source_tile(
         )))
         .min_w_0()
         .flex_1()
-        .flex_basis(rems(10.0))
-        .min_w(rems(10.0))
         .items_center()
         .gap_2()
         .px_1()
@@ -46481,8 +46396,6 @@ mod gateway_surface_tests {
             !picker.contains("preview_native_import("),
             "the picker offers presets and existing records, not a second import"
         );
-        assert!(source.contains("management-provider-recent-"));
-        assert!(source.contains("management-provider-recents.json"));
     }
 
     /// Every preset lands in exactly one kind, and every kind says in words
@@ -46506,12 +46419,11 @@ mod gateway_surface_tests {
         );
         assert!(counts.len() >= 3, "all three kinds ship presets");
 
-        // Each kind is named, explained, and given a mark: the heading is what
-        // keeps a long library readable, so none of the three may be empty.
+        // Each kind is named and given a mark: the heading is what keeps a long
+        // library readable, so none of the three may be blank.
         let mut icons = BTreeSet::new();
         for category in ProviderPresetCategory::ALL {
             assert!(!category.label().trim().is_empty());
-            assert!(!category.hint().trim().is_empty());
             assert!(icons.insert(category.icon()), "each kind has its own mark");
             assert!(
                 counts.contains_key(&category),
@@ -46523,6 +46435,10 @@ mod gateway_surface_tests {
         let tile = include_str!("management.rs");
         assert!(tile.contains("provider_source_section("));
         assert!(tile.contains("provider_source_tile("));
+        // A line of the library holds a fixed number of columns, so its last
+        // line stays short instead of stretching a row across the dialog.
+        assert!(tile.contains("PROVIDER_SOURCE_COLUMNS"));
+        assert!(tile.contains("presets.chunks(PROVIDER_SOURCE_COLUMNS)"));
     }
 
     /// The filter matches what a user remembers: the id, the name, or the
@@ -46705,15 +46621,9 @@ mod gateway_surface_tests {
             "the list body must claim the height the chrome leaves"
         );
         // The chrome above it must not compete for that height.
-        assert!(
-            picker
-                .contains("div().w_full().flex_none().child(self.render_provider_picker_tabs(cx))")
-        );
-        assert!(
-            picker.contains(
-                ".children(search.map(|search| div().w_full().flex_none().child(search)))"
-            )
-        );
+        assert!(picker.contains("self.render_provider_picker_tabs(cx)"));
+        assert!(picker.contains(".flex_none()"));
+        assert!(picker.contains("search.map(|search| div().w_full().flex_none()"));
         // Each half's scroll region is the only thing that scrolls.
         assert!(picker.contains(".id(\"provider-picker-list\")"));
         assert!(picker.contains(".id(\"provider-picker-groups\")"));
@@ -46806,9 +46716,16 @@ mod gateway_surface_tests {
         assert!(picker.contains("provider_preset_tiles"));
         // Each source is one row in a kind's block, so the row's own mark and
         // the block's heading live in the helpers the step calls, not inline.
-        assert!(picker.contains("provider_source_tile("));
+        assert!(picker.contains("provider_source_rows("));
         assert!(picker.contains("provider_source_section("));
         assert!(picker.contains("ProviderPresetCategory::ALL"));
+        // The chooser no longer offers a "recently used" strip: the library is
+        // read by kind, so a second ordering of the same presets competed with
+        // the blocks and pushed them down.
+        assert!(!picker.contains("management-provider-recent-"));
+        // The line under the tabs is gone too; the tab and the block headings
+        // say what is here.
+        assert!(!picker.contains("Reuse a saved Provider, choose a source below"));
         let tile = source
             .split_once("fn provider_source_tile(")
             .and_then(|(_, tail)| {
