@@ -12,6 +12,7 @@ pub mod browser_transport;
 pub mod code_workbench;
 pub mod computer_surface;
 pub mod directory_picker;
+pub mod file_watch;
 pub mod gpui_ext;
 pub mod hint_layer;
 pub mod image_editor;

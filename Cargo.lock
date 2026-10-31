@@ -10091,6 +10091,7 @@ dependencies = [
  "image",
  "libc",
  "markdown",
+ "notify",
  "pdfium-render",
  "percent-encoding",
  "qrcode",

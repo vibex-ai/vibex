@@ -2,6 +2,7 @@ use super::*;
 use gpui::{Bounds, Pixels, TestAppContext, VisualTestContext, size};
 use vibex_backend::{FileBackend, NativeBackend, WorkspaceBackend};
 use vibex_core::OpenWorkspaceRequest;
+use vibex_desktop_model::{EditorBufferModel, EditorCloseGuard};
 use vibex_desktop_runtime::{DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade};
 
 fn files_panel(cx: &mut TestAppContext) -> (Entity<CodeRightRail>, &mut VisualTestContext) {
@@ -461,4 +462,317 @@ async fn file_panel_remote_directories_are_not_read_as_files() {
         .await
         .unwrap_err();
     assert_eq!(error.code, "remote_directory_open_unavailable");
+}
+
+/// Opens a file tab on a real runtime and returns the workbench, wired the
+/// way the panel is wired in production.
+async fn editor_workbench<'a>(
+    cx: &'a mut TestAppContext,
+    project: &std::path::Path,
+) -> (
+    Entity<CodeWorkbench>,
+    &'a mut VisualTestContext,
+    Arc<DesktopRuntime>,
+) {
+    cx.executor().allow_parking();
+    cx.update(gpui_tokio::init);
+    let home = tempfile::tempdir().expect("isolated runtime home");
+    let home_path = home.path().to_path_buf();
+    let project_path = project.to_path_buf();
+    let (runtime, backend, workspace) = cx
+        .update(|cx| {
+            gpui_tokio::Tokio::spawn(cx, async move {
+                let runtime = DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(home_path))
+                    .await
+                    .unwrap();
+                let backend = Arc::new(NativeBackend::new(runtime.clone()));
+                let workspace = backend
+                    .open_workspace(MutationRequest::new(OpenWorkspaceRequest {
+                        root_path: project_path.to_string_lossy().into_owned(),
+                        mode: None,
+                    }))
+                    .await
+                    .unwrap();
+                (runtime, backend, workspace.workspace)
+            })
+        })
+        .await
+        .unwrap();
+    // The runtime home has to outlive the runtime handle the test drives.
+    std::mem::forget(home);
+    let (workbench, cx) = crate::code_workbench::tests::fixture_workbench_with_root(cx);
+    workbench.update(cx, |workbench, _| {
+        workbench.backend = Some(backend.facade());
+        workbench.local_workspace_root = Some(
+            project
+                .canonicalize()
+                .expect("the project directory canonicalizes"),
+        );
+        workbench.workspace = Some(WorkbenchWorkspace {
+            id: workspace.id.clone(),
+            root: project.to_path_buf(),
+            generation: workbench.workspace_generation,
+        });
+        workbench.file_tree.reset_workspace(workspace.id.clone());
+    });
+    (workbench, cx, runtime)
+}
+
+fn buffer_of(
+    workbench: &Entity<CodeWorkbench>,
+    path: &str,
+    cx: &VisualTestContext,
+) -> EditorBufferModel {
+    workbench.read_with(cx, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| panic!("expected an editor buffer for {path}"))
+    })
+}
+
+/// A rewrite on disk reaches a clean open buffer: the tab follows the file
+/// without the reader doing anything.
+#[gpui::test]
+async fn a_watched_clean_buffer_follows_an_external_rewrite(cx: &mut TestAppContext) {
+    let project = tempfile::tempdir().expect("isolated project");
+    std::fs::write(project.path().join("lib.rs"), "fn one() {}\n").unwrap();
+    let (workbench, cx, runtime) = editor_workbench(cx, project.path()).await;
+    workbench.update_in(cx, |workbench, window, cx| {
+        workbench.open_file("lib.rs".into(), false, window, cx);
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get("lib.rs")
+            .is_some_and(|buffer| buffer.saved_content == "fn one() {}\n")
+    })
+    .await;
+    workbench.update(cx, |workbench, cx| workbench.sync_file_watch(cx));
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench.file_watch.is_some()),
+        "opening a local file registers a watcher"
+    );
+
+    std::fs::write(project.path().join("lib.rs"), "fn two() {}\n").unwrap();
+    cx.condition(&workbench, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get("lib.rs")
+            .is_some_and(|buffer| buffer.saved_content == "fn two() {}\n")
+    })
+    .await;
+    let buffer = buffer_of(&workbench, "lib.rs", cx);
+    assert_eq!(buffer.content, "fn two() {}\n");
+    assert!(!buffer.dirty, "following the disk is not a local edit");
+    assert_eq!(buffer.external, EditorExternalState::Current);
+
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
+/// A dirty buffer is never overwritten by a rewrite: it becomes a conflict the
+/// reader resolves, and its text survives.
+#[gpui::test]
+async fn a_watched_dirty_buffer_reports_a_conflict_instead_of_reloading(cx: &mut TestAppContext) {
+    let project = tempfile::tempdir().expect("isolated project");
+    std::fs::write(project.path().join("lib.rs"), "fn one() {}\n").unwrap();
+    let (workbench, cx, runtime) = editor_workbench(cx, project.path()).await;
+    workbench.update_in(cx, |workbench, window, cx| {
+        workbench.open_file("lib.rs".into(), false, window, cx);
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench.editors.buffers.contains_key("lib.rs")
+    })
+    .await;
+    workbench.update(cx, |workbench, cx| workbench.sync_file_watch(cx));
+
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get_mut("lib.rs")
+            .unwrap()
+            .update_content("fn mine() {}\n");
+    });
+    std::fs::write(project.path().join("lib.rs"), "fn theirs() {}\n").unwrap();
+    cx.condition(&workbench, |workbench, _| {
+        matches!(
+            workbench
+                .editors
+                .buffers
+                .get("lib.rs")
+                .map(|buffer| &buffer.external),
+            Some(EditorExternalState::Changed { .. })
+        )
+    })
+    .await;
+    let buffer = buffer_of(&workbench, "lib.rs", cx);
+    assert_eq!(
+        buffer.content, "fn mine() {}\n",
+        "the watcher never replaces the text the reader typed"
+    );
+    assert!(buffer.dirty);
+    assert_eq!(editor_status(&buffer), "External conflict");
+
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
+/// Asking for the file on disk wins over the local text: `Reload` discards the
+/// edits and the buffer becomes clean again.
+#[gpui::test]
+async fn reloading_from_disk_replaces_the_local_text(cx: &mut TestAppContext) {
+    let project = tempfile::tempdir().expect("isolated project");
+    std::fs::write(project.path().join("lib.rs"), "fn one() {}\n").unwrap();
+    let (workbench, cx, runtime) = editor_workbench(cx, project.path()).await;
+    workbench.update_in(cx, |workbench, window, cx| {
+        workbench.open_file("lib.rs".into(), false, window, cx);
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench.editors.buffers.contains_key("lib.rs")
+    })
+    .await;
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get_mut("lib.rs")
+            .unwrap()
+            .update_content("fn mine() {}\n");
+    });
+    std::fs::write(project.path().join("lib.rs"), "fn theirs() {}\n").unwrap();
+
+    workbench.update_in(cx, |workbench, window, cx| {
+        workbench.reload_editor_from_disk("lib.rs".into(), window, cx);
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get("lib.rs")
+            .is_some_and(|buffer| !buffer.dirty && buffer.content == "fn theirs() {}\n")
+    })
+    .await;
+    let buffer = buffer_of(&workbench, "lib.rs", cx);
+    assert_eq!(buffer.content, "fn theirs() {}\n");
+    assert!(!buffer.dirty);
+
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
+/// Deleting the file behind an open tab is reported as a deletion, and the
+/// text stays in the recovery buffer instead of the tab going blank.
+#[gpui::test]
+async fn deleting_a_watched_file_keeps_its_content_recoverable(cx: &mut TestAppContext) {
+    let project = tempfile::tempdir().expect("isolated project");
+    std::fs::write(project.path().join("lib.rs"), "fn one() {}\n").unwrap();
+    let (workbench, cx, runtime) = editor_workbench(cx, project.path()).await;
+    workbench.update_in(cx, |workbench, window, cx| {
+        workbench.open_file("lib.rs".into(), false, window, cx);
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench.editors.buffers.contains_key("lib.rs")
+    })
+    .await;
+    workbench.update(cx, |workbench, cx| workbench.sync_file_watch(cx));
+    // A buffer with unsaved work is the case that matters: the deleted file
+    // must not take the reader's text with it.
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get_mut("lib.rs")
+            .unwrap()
+            .update_content("fn mine() {}\n");
+    });
+
+    std::fs::remove_file(project.path().join("lib.rs")).unwrap();
+    cx.condition(&workbench, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get("lib.rs")
+            .is_some_and(|buffer| buffer.external == EditorExternalState::Deleted)
+    })
+    .await;
+    let buffer = buffer_of(&workbench, "lib.rs", cx);
+    assert_eq!(buffer.content, "fn mine() {}\n");
+    assert_eq!(buffer.close_guard(), EditorCloseGuard::DirtyMissingFile);
+    assert_eq!(editor_status(&buffer), "Deleted - recovery buffer");
+
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
+/// A save this editor makes is not reported back to itself as an external
+/// change: after every save the buffer stays clean and the tab keeps following
+/// the file.
+#[gpui::test]
+async fn the_editor_does_not_conflict_with_its_own_save(cx: &mut TestAppContext) {
+    let project = tempfile::tempdir().expect("isolated project");
+    std::fs::write(project.path().join("lib.rs"), "fn one() {}\n").unwrap();
+    let (workbench, cx, runtime) = editor_workbench(cx, project.path()).await;
+    workbench.update_in(cx, |workbench, window, cx| {
+        workbench.open_file("lib.rs".into(), false, window, cx);
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench.editors.buffers.contains_key("lib.rs")
+    })
+    .await;
+    workbench.update(cx, |workbench, cx| workbench.sync_file_watch(cx));
+
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get_mut("lib.rs")
+            .unwrap()
+            .update_content("fn mine() {}\n");
+    });
+    workbench.update(cx, |workbench, cx| {
+        assert!(workbench.save_editor("lib.rs".into(), false, cx));
+    });
+    cx.condition(&workbench, |workbench, _| {
+        workbench
+            .editors
+            .buffers
+            .get("lib.rs")
+            .is_some_and(|buffer| !buffer.dirty && buffer.pending_save.is_none())
+    })
+    .await;
+    // Let the watcher's debounce and read run, then check the buffer is still
+    // clean: the save must not come back as an external change.
+    draw(cx);
+    cx.background_executor
+        .timer(std::time::Duration::from_millis(300))
+        .await;
+    draw(cx);
+    let buffer = buffer_of(&workbench, "lib.rs", cx);
+    assert!(!buffer.dirty);
+    assert_eq!(buffer.external, EditorExternalState::Current);
+    assert_eq!(buffer.content, "fn mine() {}\n");
+
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
 }

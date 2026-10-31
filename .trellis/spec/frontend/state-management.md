@@ -42,6 +42,126 @@ Persisted preferences:
   list plus bounded numeric font size and font weight values. Do not store
   arbitrary CSS strings or backend-synced configuration.
 
+## Scenario: Open Editor Files Follow The Disk
+
+### 1. Scope / Trigger
+
+- Trigger: changing how an open editor tab reacts to that file being rewritten
+  or removed by an Agent, a formatter, or another editor; changing the file
+  watcher, its registration set, or the conflict-recovery controls.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/file_watch.rs
+pub struct WatchTargets { /* editor key -> canonical file path */ }
+pub enum WatchEventKind { Changed, Removed }
+pub struct WatchEvent { pub path: PathBuf, pub kind: WatchEventKind }
+pub fn route(targets: &WatchTargets, batch: Vec<WatchEvent>)
+    -> BTreeMap<String, WatchEventKind>;
+
+// apps/desktop/src/code_workbench.rs
+fn file_watch_targets(&self) -> WatchTargets;
+fn sync_file_watch(&mut self, cx: &mut Context<Self>);
+pub(crate) fn reload_editor_from_disk(
+    &mut self,
+    path: String,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+);
+```
+
+### 3. Contracts
+
+- One `notify` watcher per `CodeWorkbench`, registering each target's **parent
+  directory** non-recursively. A watch on the file itself goes silent when an
+  editor saves by replacing the inode; the directory watch survives the swap.
+- The watched set is derived from `self.editors.buffers` joined against
+  `local_workspace_root`, and excludes absolute out-of-project paths (read-only
+  previews). It is reconciled after an open, a close, a rename, a workspace
+  switch, and a remote-backend attach/detach. `clear_backend` and
+  `apply_workspace` drop the watcher outright: the files it describes belong to
+  a client or workspace that is no longer on screen.
+- Raw platform events are debounced for 120 ms on a dedicated thread and
+  collapsed per path. `Access(Open|Close(Read))` is dropped (a Linux read would
+  otherwise re-trigger the watcher); a removal followed by a creation or write
+  in one burst is `Changed`, because it describes one atomic save.
+- The workbench re-reads through `FileBackend::read_file`, not `std::fs`, so the
+  result carries the authoritative `content_revision`. Only `file_path_missing`
+  means deleted; every other read error leaves the buffer untouched and is
+  logged at `debug`.
+- Conflict rules, in this order:
+  1. `pending_save.is_some()` — ignore. This buffer's own write is in flight and
+     its completion is the newer truth.
+  2. Same `content_revision` — ignore. A metadata-only touch is not a change.
+  3. Dirty buffer — keep the local text, set `EditorExternalState::Changed`, and
+     report a warning hint. Never overwrite unsaved work.
+  4. Clean buffer — accept the disk content, replace the editor text, preserve
+     the caret line/column clamped to the new text, restart the Markdown scan for
+     a Markdown preview, and persist recovery.
+- `EditorState::set_value` needs a `Window`, and the watcher task has none. The
+  buffer is updated immediately and the editor is repainted from
+  `pending_editor_refresh` on the next paint, deferred so an editor is never
+  rewritten mid-render.
+- A deletion keeps the content in the buffer (`mark_deleted`) and surfaces
+  `Deleted - recovery buffer`; it is never silently emptied. Dirty and clean
+  buffers both keep their text.
+- The conflict state always has an explicit way out: the editor toolbar shows a
+  `Reload from disk` control while `external_conflict` is true. Reload discards
+  local text via `EditorBufferModel::accept_external`, which refuses while a save
+  is pending.
+- Watched-file news is a warning hint, not an error hint: it is information
+  about a tab, not a failed action the reader took.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Clean buffer, file rewritten | Buffer follows the new content; stays clean |
+| Dirty buffer, file rewritten | Local text kept; `External conflict` status; warning hint |
+| Buffer saving, file event arrives | Ignored; the save result wins |
+| Metadata-only change (`chmod`, same bytes written) | No repaint, no hint |
+| File removed | `Deleted - recovery buffer`; content retained |
+| Read error other than `file_path_missing` | Buffer untouched; `debug` log only |
+| Absolute out-of-project path | Not watched (read-only preview) |
+| Paired remote runtime | Watcher released; no local watch of another machine's files |
+| Platform watcher unavailable | `debug` log; tabs stay read-on-open, no panic |
+
+### 5. Good/Base/Bad Cases
+
+- Good: an Agent rewrites `src/lib.rs` under a clean tab, the tab shows the new
+  text, the caret stays on the same line, and the file still shows `Saved`.
+- Base: a dirty tab whose file changed shows `External conflict` and offers
+  `Reload from disk`; the reader chooses.
+- Bad: auto-replacing a dirty buffer, reporting a deleted-but-recreated file as
+  deleted, treating a failed read as a deletion, or leaving a watch registered
+  after switching to a workspace or runtime it does not describe.
+
+### 6. Tests Required
+
+- `file_watch` unit tests cover burst collapsing, read-access filtering,
+  removal-then-recreation, rename, directory deduplication, routing by editor
+  key, and routing a removed path.
+- `apps/desktop/src/code_workbench/file_panel_tests.rs` covers, against a real
+  isolated runtime: a clean buffer following a rewrite, a dirty buffer keeping
+  its text as a conflict, `reload_editor_from_disk` replacing local text, a
+  deleted file keeping recoverable content, and a save not conflicting with
+  itself.
+- Run `cargo test -p vibex-desktop --lib --locked` and
+  `cargo clippy -p vibex-desktop --all-targets --locked`.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: re-read from the watcher task and jump the reader to line 1.
+input.update(cx, |state, cx| state.set_value(content, cx));
+
+// Correct: update the model now; repaint from a paint that has a window and
+// restore the caret against the new text.
+buffer.observe_external(file);
+self.pending_editor_refresh.insert(path);
+```
+
 ## Scenario: Desktop Project Icons
 
 ### 1. Scope / Trigger

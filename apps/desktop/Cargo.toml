@@ -50,6 +50,9 @@ gpui-kit-assets.workspace = true
 anyhow.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 markdown.workspace = true
+# The open-editor watcher: one registration per open file, so an Agent or an
+# external editor that rewrites a file reaches the tab that is showing it.
+notify.workspace = true
 qrcode.workspace = true
 resvg.workspace = true
 pdfium-render.workspace = true

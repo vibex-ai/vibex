@@ -177,6 +177,12 @@ struct WorkbenchErrorNotification;
 /// id keeps the newest result on screen instead of stacking a queue of them.
 struct WorkbenchNoteNotification;
 
+/// Replace-by-id marker for the workbench's warning hints.
+///
+/// A watched file changing or disappearing is news about a tab, and one id
+/// keeps the newest warning on screen instead of stacking a queue of them.
+struct WorkbenchWarningNotification;
+
 fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
         GitMutationKind::Pull => Some(locale::text("Pull completed", "拉取已完成", "拉取已完成")),
@@ -1466,6 +1472,12 @@ pub struct CodeWorkbench {
     /// the message waits here until [`Self::present_pending_note`] takes it
     /// during a paint that has the window `hint_layer::push` needs.
     pending_note: Option<String>,
+    /// A warning the workbench owes the hint layer.
+    ///
+    /// Watched-file conflicts and deletions are news about a tab, not failures
+    /// of an action the reader took, so they read as warnings and never as
+    /// errors. Same deferred delivery as [`Self::pending_error`].
+    pending_warning: Option<String>,
     tree_loading: bool,
     status_loading: bool,
     history_loading: bool,
@@ -1532,6 +1544,24 @@ pub struct CodeWorkbench {
     autosave_task: Option<Task<()>>,
     pending_close_after_save: BTreeSet<String>,
     window_activation_subscription: Option<Subscription>,
+    /// The platform watcher over the directories of every open editor.
+    ///
+    /// A file's tab is only as live as this registration: `load_file` reads it
+    /// once, and without the watch a rewrite by an Agent or another editor
+    /// would stay invisible until the next save failed its revision check.
+    file_watch: Option<crate::file_watch::FileWatch>,
+    /// Keeps the watcher's event task alive for as long as the workbench is.
+    file_watch_task: Option<Task<()>>,
+    /// Set while a watch-driven read is in flight, so an event that arrives
+    /// during the read does not queue a second one for the same path.
+    file_watch_reads: BTreeSet<String>,
+    /// Buffers whose content the watcher replaced but whose editor has not
+    /// been told yet.
+    ///
+    /// `EditorState::set_value` needs a window, and the watcher drains its
+    /// events with no window in hand. The paths wait here until a paint that
+    /// has one flushes them.
+    pending_editor_refresh: BTreeSet<String>,
 }
 
 impl gpui::EventEmitter<CodeWorkbenchEvent> for CodeWorkbench {}
@@ -1663,6 +1693,7 @@ impl CodeWorkbench {
             commit_reset_window: None,
             pending_error: None,
             pending_note: None,
+            pending_warning: None,
             tree_loading: false,
             status_loading: false,
             history_loading: false,
@@ -1719,6 +1750,10 @@ impl CodeWorkbench {
             autosave_task: None,
             pending_close_after_save: BTreeSet::new(),
             window_activation_subscription: None,
+            file_watch: None,
+            file_watch_task: None,
+            file_watch_reads: BTreeSet::new(),
+            pending_editor_refresh: BTreeSet::new(),
         };
         this.window_activation_subscription =
             Some(cx.observe_window_activation(window, |this, window, cx| {
@@ -1995,6 +2030,27 @@ impl CodeWorkbench {
                 )
                 .id::<WorkbenchNoteNotification>()
                 .autohide(true),
+                cx,
+            );
+        });
+    }
+
+    /// Hands the warning the workbench is holding to its hint layer.
+    ///
+    /// A watched file that changed under a dirty buffer, or was deleted, is
+    /// news rather than a failed action: it must not paint with the error tone,
+    /// or the reader would read it as "your last action failed".
+    fn present_pending_warning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(warning) = self.pending_warning.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(NotificationType::Warning, warning)
+                    .id::<WorkbenchWarningNotification>()
+                    .autohide(true),
                 cx,
             );
         });
@@ -2971,6 +3027,14 @@ impl CodeWorkbench {
     pub(crate) fn clear_backend(&mut self, cx: &mut Context<Self>) {
         self.backend = None;
         self.terminal_transport = None;
+        // The watcher describes files on *this* machine. Once the panel is
+        // driven by a paired runtime, those reads come from the other side, so
+        // a local watch would only produce conflicts with content this client
+        // did not read.
+        self.file_watch = None;
+        self.file_watch_task = None;
+        self.file_watch_reads.clear();
+        self.pending_editor_refresh.clear();
         self.lifecycle_task = None;
         self.lifecycle_action_task = None;
         self.lifecycle_loading = false;
@@ -3068,6 +3132,11 @@ impl CodeWorkbench {
         self.markdown_edit_paths.clear();
         self.close_all_lifecycles();
         self.file_tasks.clear();
+        // The watcher is keyed by the paths of the workspace that is leaving;
+        // its registrations must go with the buffers they described.
+        self.file_watch = None;
+        self.file_watch_task = None;
+        self.file_watch_reads.clear();
         self.tree_tasks.clear();
         self.tree_refreshing = false;
         self.tree_refresh_task = None;
@@ -6395,6 +6464,292 @@ impl CodeWorkbench {
         self.file_tasks.insert(task_key, task);
     }
 
+    /// The editor paths a watch should cover.
+    ///
+    /// Only files this client can actually watch are listed: a workspace on a
+    /// paired runtime lives on another machine, and an absolute path outside
+    /// the project is a read-only preview this client never writes back.
+    fn file_watch_targets(&self) -> crate::file_watch::WatchTargets {
+        let Some(root) = self.local_workspace_root.as_deref() else {
+            return crate::file_watch::WatchTargets::default();
+        };
+        crate::file_watch::WatchTargets::new(
+            self.editors
+                .buffers
+                .keys()
+                .filter(|path| !is_local_external_path(path))
+                .map(|path| (path.clone(), root.join(path))),
+        )
+    }
+
+    /// Brings the platform watcher in line with the files the editor has open.
+    ///
+    /// The watcher registers directories, so a re-declaration that changed
+    /// nothing costs a comparison and no syscall.
+    fn sync_file_watch(&mut self, cx: &mut Context<Self>) {
+        let targets = self.file_watch_targets();
+        if targets.is_empty() {
+            // No local file to watch: release the platform registrations and
+            // the task that drains them instead of leaving a thread behind for
+            // a workspace it no longer serves.
+            self.file_watch = None;
+            self.file_watch_task = None;
+            self.file_watch_reads.clear();
+            return;
+        }
+        if self.file_watch.is_none() {
+            let Some(mut watch) = crate::file_watch::FileWatch::start(targets.clone()) else {
+                tracing::debug!(
+                    target: "vibex_desktop",
+                    "The platform file watcher is unavailable; open files stay read-on-open"
+                );
+                return;
+            };
+            let Some(mut events) = watch.take_stream() else {
+                return;
+            };
+            self.file_watch = Some(watch);
+            self.file_watch_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                while let Some(batch) = events.recv().await {
+                    let alive =
+                        entity.update(cx, |this, cx| this.apply_file_watch_batch(batch, cx));
+                    if alive.is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        if let Some(watch) = self.file_watch.as_mut() {
+            watch.reconcile(targets);
+        }
+    }
+
+    /// Turns one settled batch of filesystem changes into buffer updates.
+    ///
+    /// A clean buffer follows the disk; a dirty buffer keeps its content and
+    /// becomes an explicit conflict; a removed file is called deleted only
+    /// after a re-read confirms it, because a save that replaces the inode
+    /// briefly looks like a removal.
+    fn apply_file_watch_batch(
+        &mut self,
+        batch: Vec<crate::file_watch::WatchEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        if self.local_workspace_root.is_none() {
+            return;
+        }
+        let Some(watch) = self.file_watch.as_ref() else {
+            return;
+        };
+        let routed = crate::file_watch::route(watch.targets(), batch);
+        for path in routed.into_keys() {
+            // A read already in flight for this path settles the state; a
+            // second one for the same event would only duplicate the work.
+            if !self.file_watch_reads.insert(path.clone()) {
+                continue;
+            }
+            self.read_watched_file(path, workspace.generation, cx);
+        }
+    }
+
+    /// Re-reads one watched file and applies the result to its buffer.
+    fn read_watched_file(
+        &mut self,
+        path: String,
+        workspace_generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            self.file_watch_reads.remove(&path);
+            return;
+        };
+        let Some(workspace_id) = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.id.clone())
+        else {
+            self.file_watch_reads.remove(&path);
+            return;
+        };
+        let request_path = path.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let request = FileReadRequest {
+                workspace_id,
+                path: request_path,
+                max_bytes: Some(FILE_PREVIEW_MAX_BYTES),
+            };
+            match backend.file().read_file(request).await {
+                Ok(file) => Ok(Some(file)),
+                // `file_path_missing` is the backend saying the file is gone.
+                // Any other failure is a read that did not happen, which must
+                // not be reported as a deletion.
+                Err(error) if error.code == "file_path_missing" => Ok(None),
+                Err(error) => Err(error),
+            }
+        });
+        let task_path = path.clone();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.file_watch_reads.remove(&task_path);
+                if this
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.generation)
+                    != Some(workspace_generation)
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(Some(file))) => this.accept_watched_file(task_path, file, cx),
+                    Ok(Ok(None)) => this.mark_watched_file_missing(&task_path, cx),
+                    Ok(Err(error)) => tracing::debug!(
+                        target: "vibex_desktop",
+                        path = %task_path,
+                        error_code = %error.code,
+                        "Watched file could not be re-read"
+                    ),
+                    // The read was cancelled with the workbench.
+                    Err(_) => {}
+                }
+            });
+        });
+        self.file_tasks.insert(format!("watch:{path}"), task);
+    }
+
+    /// Applies a fresh read of a watched file to the buffer that shows it.
+    fn accept_watched_file(
+        &mut self,
+        path: String,
+        file: FileReadResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(buffer) = self.editors.buffers.get_mut(&path) else {
+            // The tab closed while the read was in flight.
+            return;
+        };
+        if buffer.pending_save.is_some() {
+            // The write in flight is this buffer's own save; its completion is
+            // the authoritative answer, and reading the file mid-write would
+            // turn our own save into a conflict with itself.
+            return;
+        }
+        if file.content_revision == buffer.saved_revision
+            && buffer.external == EditorExternalState::Current
+        {
+            // A touch with no content change: a `chmod`, or a save that wrote
+            // back exactly what was already there.
+            return;
+        }
+        // `pending_save` returned above, so a dirty buffer is the only way
+        // this read can conflict with local work.
+        let conflicted = buffer.dirty;
+        if !buffer.observe_external(file) {
+            return;
+        }
+        if conflicted {
+            // The buffer keeps the reader's text. The status line already says
+            // "External conflict" and the toolbar's Reload control is now
+            // available, so the choice of which side wins stays with them.
+            self.pending_warning = Some(format!(
+                "{} changed on disk; reload it or keep your edits",
+                path
+            ));
+            self.persist_editor_recovery(cx);
+            cx.notify();
+            return;
+        }
+        self.pending_editor_refresh.insert(path);
+        self.persist_editor_recovery(cx);
+        cx.notify();
+    }
+
+    /// Pushes every content the watcher installed into its editor.
+    ///
+    /// The watcher owns the read and the buffer model, but not a window, so it
+    /// records what changed and this pass is what moves the text into the
+    /// view. The write itself is deferred: an editor cannot be rewritten while
+    /// the workbench is still deciding what to draw.
+    fn flush_pending_editor_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_editor_refresh.is_empty() {
+            return;
+        }
+        let paths = std::mem::take(&mut self.pending_editor_refresh);
+        let view = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                for path in paths {
+                    // The file may have changed again while this pass waited;
+                    // the buffer is the newest truth either way.
+                    let Some(content) = this
+                        .editors
+                        .buffers
+                        .get(&path)
+                        .map(|buffer| buffer.content.clone())
+                    else {
+                        continue;
+                    };
+                    this.show_buffer_content(&path, content, window, cx);
+                }
+            });
+        });
+    }
+
+    /// Marks one watched path deleted once the backend has confirmed it.
+    fn mark_watched_file_missing(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(buffer) = self.editors.buffers.get_mut(path) else {
+            return;
+        };
+        if matches!(buffer.external, EditorExternalState::Deleted) {
+            return;
+        }
+        // A dirty buffer keeps its text as the recovery copy; a clean one keeps
+        // the last content too, which is what makes "Deleted - recovery
+        // buffer" a state the reader can act on rather than an empty tab.
+        buffer.mark_deleted();
+        self.pending_warning = Some(format!("{} was deleted on disk", path));
+        self.persist_editor_recovery(cx);
+        cx.notify();
+    }
+
+    /// Shows a buffer's content in its editor without moving the caret.
+    ///
+    /// `set_value` resets the selection, which would jump the reader to the top
+    /// of the file whenever a formatter rewrote it underneath them. The caret
+    /// is captured first and restored against the new text, clamped to it.
+    fn show_buffer_content(
+        &mut self,
+        path: &str,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self
+            .editor_bindings
+            .get(path)
+            .map(|binding| binding.input.clone())
+        else {
+            return;
+        };
+        let cursor = input.read(cx).cursor_position();
+        input.update(cx, |state, cx| {
+            state.set_value(content.clone(), window, cx);
+            let text = state.text().clone();
+            let line = (cursor.line as usize).min(text.lines_len().saturating_sub(1));
+            let line_chars = text.slice_line(line).len_chars();
+            let character = (cursor.character as usize).min(line_chars);
+            state.set_cursor_position(Position::new(line as u32, character as u32), window, cx);
+        });
+        if content_preview_kind_for_path(path) == ContentPreviewKind::Markdown {
+            // The rendered preview owns the document's first frame, so its
+            // resource scan restarts around the bytes that just replaced it.
+            self.start_markdown_scan(path.to_string(), content, cx);
+        }
+    }
+
     fn load_file(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.presentations
             .insert(path.clone(), FilePresentation::Loading);
@@ -6505,6 +6860,7 @@ impl CodeWorkbench {
                 {
                     this.schedule_file_search_reveal(task_path.clone(), window, cx);
                 }
+                this.sync_file_watch(cx);
                 this.persist(cx);
                 cx.notify();
             });
@@ -6859,6 +7215,8 @@ impl CodeWorkbench {
                 self.file_tasks.remove(&format!("markdown:{path}"));
                 self.file_tasks.remove(&format!("markdown-scan:{path}"));
                 self.file_tasks.remove(&format!("save:{path}"));
+                self.file_tasks.remove(&format!("watch:{path}"));
+                self.sync_file_watch(cx);
             }
         }
     }
@@ -7078,6 +7436,86 @@ impl CodeWorkbench {
         self.file_tasks.insert(format!("save:{path}"), task);
         cx.notify();
         true
+    }
+
+    /// Replaces the editor's content with what is on disk right now.
+    ///
+    /// This is the reader's answer to "external conflict": it discards the
+    /// local text and takes the file as it stands. A read that fails leaves the
+    /// buffer exactly as it was, because a reload that quietly emptied a tab
+    /// would be worse than the conflict it was asked to resolve.
+    pub(crate) fn reload_editor_from_disk(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if is_local_external_path(&path) {
+            self.pending_error = Some(
+                locale::text(
+                    "Files outside the project are read-only previews",
+                    "项目外文件仅支持只读预览",
+                    "專案外檔案僅支援唯讀預覽",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
+        else {
+            return;
+        };
+        let request = FileReadRequest {
+            workspace_id: workspace.id.clone(),
+            path: path.clone(),
+            max_bytes: Some(FILE_PREVIEW_MAX_BYTES),
+        };
+        let workspace_generation = workspace.generation;
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.file().read_file(request).await });
+        let task_path = path.clone();
+        let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                this.file_tasks.remove(&format!("reload:{task_path}"));
+                if this
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.generation)
+                    != Some(workspace_generation)
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(file)) => {
+                        let Some(buffer) = this.editors.buffers.get_mut(&task_path) else {
+                            return;
+                        };
+                        if !buffer.accept_external(file) {
+                            // A write of this buffer is in flight; its result
+                            // is the newer truth.
+                            return;
+                        }
+                        let content = buffer.content.clone();
+                        this.show_buffer_content(&task_path, content, window, cx);
+                        this.sync_file_watch(cx);
+                        this.persist(cx);
+                        this.persist_editor_recovery(cx);
+                        cx.notify();
+                    }
+                    Ok(Err(error)) => {
+                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.pending_error = Some(format!("file reload task failed: {error}"));
+                        cx.notify();
+                    }
+                }
+            });
+        });
+        self.file_tasks.insert(format!("reload:{path}"), task);
     }
 
     pub(crate) fn save_active_editor(&mut self, cx: &mut Context<Self>) {
@@ -10568,6 +11006,7 @@ impl CodeWorkbench {
         if let Some(binding) = self.editor_bindings.get(&path).cloned() {
             let buffer = self.editors.buffers.get(&path).cloned();
             let save_path = path.clone();
+            let reload_path = path.clone();
             let markdown_path = path.clone();
             let reveal_path = path.clone();
             let external_file = is_local_external_path(&path);
@@ -10796,6 +11235,27 @@ impl CodeWorkbench {
                                             });
                                         }),
                                 )
+                                .when(external_conflict, |this| {
+                                    this.child(
+                                        Button::new(format!("reload-editor:{path}"))
+                                            .small()
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::Replace)
+                                            .tooltip(locale::text(
+                                                "Reload from disk",
+                                                "从磁盘重新加载",
+                                                "從磁碟重新載入",
+                                            ))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.reload_editor_from_disk(
+                                                    reload_path.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                })
                                 .child(
                                     Button::new(format!("save-editor:{path}"))
                                         .small()
@@ -11677,8 +12137,10 @@ impl Render for CodeWorkbench {
             let _ = window.drop_image(image);
         }
         self.schedule_restore_hydration(window, cx);
+        self.flush_pending_editor_refresh(window, cx);
         self.present_pending_error(window, cx);
         self.present_pending_note(window, cx);
+        self.present_pending_warning(window, cx);
         if !cx.has_active_drag() {
             self.preview_tab_drop_target = None;
             self.preview_pane_drop_target = None;
@@ -23398,7 +23860,7 @@ mod tests {
     /// a `gpui_component::Root` carrying the registered plugin. The production
     /// shell always installs both, so a test that skips them is testing a
     /// window the app never builds.
-    fn fixture_workbench_with_root(
+    pub(super) fn fixture_workbench_with_root(
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<CodeWorkbench>, &mut gpui::VisualTestContext) {
         cx.update(gpui_component::init);
