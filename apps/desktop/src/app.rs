@@ -1811,6 +1811,19 @@ enum SessionToolAvailability {
     Unavailable(&'static str),
 }
 
+/// One panel's answer for one session, as every surface draws it.
+///
+/// `enabled` is what the session runs with; `availability` says whether the
+/// Agent could have offered the panel at all. They are separate because "off
+/// because the reader turned it off" and "off because this Agent can never
+/// have it" must not look the same.
+#[derive(Debug, Clone, Copy)]
+struct SessionToolState {
+    tool: AgentBuiltinTool,
+    enabled: bool,
+    availability: SessionToolAvailability,
+}
+
 #[derive(Debug, Clone)]
 enum RuntimeChoiceMenuAction {
     NewSession(SessionRuntimeSelection),
@@ -45247,7 +45260,20 @@ impl VibexWorkbench {
                 "請先選擇 Agent",
             ));
         };
-        let agent_id = agent_id.as_str();
+        self.tool_availability_for(agent_id.as_str(), tool)
+    }
+
+    /// Whether one panel can reach one Agent at all, and the reason when it
+    /// cannot.
+    ///
+    /// The new-session toggles and a session's read-only surfaces both ask
+    /// here, so the two can never disagree about an Agent that carries its own
+    /// computer use or cannot receive MCP servers.
+    fn tool_availability_for(
+        &self,
+        agent_id: &str,
+        tool: AgentBuiltinTool,
+    ) -> SessionToolAvailability {
         match tool {
             AgentBuiltinTool::Browser => {
                 if vibex_desktop_runtime::BrowserRuntime::delivery_for(agent_id)
@@ -46424,13 +46450,21 @@ impl VibexWorkbench {
     /// resolution the runtime performed when it assembled this session. The
     /// card is only consulted for panels the session left alone, so editing a
     /// default is visible here exactly when it also reaches the session.
-    fn session_tool_states(&self, session: &AgentSession) -> Vec<(AgentBuiltinTool, bool)> {
+    fn session_tool_states(&self, session: &AgentSession) -> Vec<SessionToolState> {
         let enabled = session
             .tools
             .resolve(&self.ui_state.agent_tools, session.agent_id.as_str());
         AgentBuiltinTool::ALL
             .into_iter()
-            .map(|tool| (tool, enabled.contains(&tool)))
+            .map(|tool| SessionToolState {
+                tool,
+                enabled: enabled.contains(&tool),
+                // Read the same delivery tables the new-session toggles use:
+                // an Agent that carries its own computer use, or one no MCP
+                // server can reach, is not "off" and must not be painted as
+                // though the session could have turned it on.
+                availability: self.tool_availability_for(session.agent_id.as_str(), tool),
+            })
             .collect()
     }
 
@@ -46449,7 +46483,7 @@ impl VibexWorkbench {
             && self.session_capabilities_session.as_ref() == Some(&session.id);
         let session_id = session.id.clone();
         let trigger_session_id = session_id.clone();
-        let enabled_count = states.iter().filter(|(_, enabled)| *enabled).count();
+        let enabled_count = states.iter().filter(|state| state.enabled).count();
         let summary = match enabled_count {
             0 => locale::text("No session tools", "未启用会话能力", "未啟用會話能力").to_string(),
             2 => locale::text(
@@ -46461,8 +46495,8 @@ impl VibexWorkbench {
             _ => {
                 let name = states
                     .iter()
-                    .find(|(_, enabled)| *enabled)
-                    .map(|(tool, _)| match tool {
+                    .find(|state| state.enabled)
+                    .map(|state| match state.tool {
                         AgentBuiltinTool::Browser => {
                             locale::text("Browser tools", "浏览器工具", "瀏覽器工具")
                         }
@@ -46478,31 +46512,18 @@ impl VibexWorkbench {
             }
         };
         let glyphs = states
-            .into_iter()
-            .map(|(tool, enabled)| {
-                let (icon, available) = match tool {
-                    AgentBuiltinTool::Browser => (
-                        "icons/vibex/globe.svg",
-                        vibex_desktop_runtime::BrowserRuntime::delivery_for(
-                            session.agent_id.as_str(),
-                        ) != vibex_core::BrowserToolDelivery::Unavailable,
-                    ),
-                    AgentBuiltinTool::Computer => (
-                        "icons/vibex/monitor.svg",
-                        !matches!(
-                            vibex_desktop_runtime::ComputerRuntime::use_delivery_for(
-                                session.agent_id.as_str()
-                            ),
-                            vibex_core::ComputerUseDelivery::Unavailable
-                        ),
-                    ),
+            .iter()
+            .map(|state| {
+                let icon = match state.tool {
+                    AgentBuiltinTool::Browser => "icons/vibex/globe.svg",
+                    AgentBuiltinTool::Computer => "icons/vibex/monitor.svg",
                 };
-                let color = if !available {
-                    cx.theme().muted_foreground.opacity(0.45)
-                } else if enabled {
-                    cx.theme().success
-                } else {
-                    cx.theme().muted_foreground
+                let color = match (&state.availability, state.enabled) {
+                    (SessionToolAvailability::Unavailable(_), _) => {
+                        cx.theme().muted_foreground.opacity(0.40)
+                    }
+                    (SessionToolAvailability::Available, true) => cx.theme().success,
+                    (SessionToolAvailability::Available, false) => cx.theme().muted_foreground,
                 };
                 Icon::default().path(icon).size(px(14.0)).text_color(color)
             })
@@ -46574,7 +46595,12 @@ impl VibexWorkbench {
         let states = self.session_tool_states(&session);
         let rows = states
             .into_iter()
-            .map(|(tool, enabled)| {
+            .map(|state| {
+                let SessionToolState {
+                    tool,
+                    enabled,
+                    availability,
+                } = state;
                 let (icon, label, description) = match tool {
                     AgentBuiltinTool::Browser => (
                         "icons/vibex/globe.svg",
@@ -46596,21 +46622,37 @@ impl VibexWorkbench {
                     ),
                 };
                 let inherited = matches!(session.tools.choice(tool), SessionToolChoice::Inherit);
-                let source = if inherited {
-                    locale::text("Agent default", "跟随 Agent 默认", "跟隨 Agent 預設")
-                } else {
-                    locale::text("This session", "本会话设置", "本次會話設定")
+                // An unavailable panel never had a choice to record: say why
+                // it cannot run instead of claiming the session turned it off.
+                let source = match &availability {
+                    SessionToolAvailability::Unavailable(reason) => (*reason).to_string(),
+                    SessionToolAvailability::Available => {
+                        if inherited {
+                            locale::text("Agent default", "跟随 Agent 默认", "跟隨 Agent 預設")
+                                .to_string()
+                        } else {
+                            locale::text("This session", "本会话设置", "本次會話設定").to_string()
+                        }
+                    }
                 };
                 let source = format!("{}: {source}", locale::text("Source", "来源", "來源"));
-                let dot = if enabled {
-                    success
-                } else {
-                    cx.theme().muted_foreground.opacity(0.55)
+                let dot = match (&availability, enabled) {
+                    (SessionToolAvailability::Unavailable(_), _) => {
+                        cx.theme().muted_foreground.opacity(0.40)
+                    }
+                    (SessionToolAvailability::Available, true) => success,
+                    (SessionToolAvailability::Available, false) => {
+                        cx.theme().muted_foreground.opacity(0.55)
+                    }
                 };
-                let state_label = if enabled {
-                    locale::text("On", "已启用", "已啟用")
-                } else {
-                    locale::text("Off", "未启用", "未啟用")
+                let state_label = match &availability {
+                    SessionToolAvailability::Unavailable(_) => {
+                        locale::text("Unavailable", "不可用", "不可用")
+                    }
+                    SessionToolAvailability::Available if enabled => {
+                        locale::text("On", "已启用", "已啟用")
+                    }
+                    SessionToolAvailability::Available => locale::text("Off", "未启用", "未啟用"),
                 };
                 let state_color = if enabled {
                     success
@@ -47276,7 +47318,7 @@ impl VibexWorkbench {
         pinned: bool,
         deletion_pending: bool,
         archive_pending: bool,
-        tool_states: Vec<(AgentBuiltinTool, bool)>,
+        tool_states: Vec<SessionToolState>,
         strings: &'static Strings,
         entity: WeakEntity<Self>,
         window: &mut Window,
@@ -47329,8 +47371,8 @@ impl VibexWorkbench {
                 PopupMenuItem::label(locale::text("Session tools", "会话能力", "會話能力"))
                     .disabled(true),
             );
-        for (tool, enabled) in tool_states {
-            let (icon, label) = match tool {
+        for tool_state in tool_states {
+            let (icon, label) = match tool_state.tool {
                 AgentBuiltinTool::Browser => (
                     sidebar_icon("icons/vibex/globe.svg"),
                     locale::text("Browser tools", "浏览器工具", "瀏覽器工具"),
@@ -47340,12 +47382,16 @@ impl VibexWorkbench {
                     locale::text("Computer use", "电脑操作", "電腦操作"),
                 ),
             };
-            let state = if enabled {
-                locale::text("On", "已启用", "已啟用")
-            } else {
-                locale::text("Off", "未启用", "未啟用")
+            let label_state = match &tool_state.availability {
+                SessionToolAvailability::Unavailable(_) => {
+                    locale::text("Unavailable", "不可用", "不可用")
+                }
+                SessionToolAvailability::Available if tool_state.enabled => {
+                    locale::text("On", "已启用", "已啟用")
+                }
+                SessionToolAvailability::Available => locale::text("Off", "未启用", "未啟用"),
             };
-            menu = menu.item(PopupMenuItem::new(format!("{label} · {state}")).icon(icon));
+            menu = menu.item(PopupMenuItem::new(format!("{label} · {label_state}")).icon(icon));
         }
         menu = menu
             .separator()
@@ -53321,11 +53367,11 @@ impl VibexWorkbench {
         // Agent's defaults. Marking every row that follows the default would
         // turn the list into a wall of icons that says nothing.
         let sidebar_tool_mark = {
-            let enabled = session
-                .tools
-                .resolve(&self.ui_state.agent_tools, session.agent_id.as_str());
+            let states = self.session_tool_states(session);
             let deviates = AgentBuiltinTool::ALL.iter().any(|tool| {
-                let session_wants = enabled.contains(tool);
+                let session_wants = states
+                    .iter()
+                    .any(|state| state.tool == *tool && state.enabled);
                 let inherited = matches!(session.tools.choice(*tool), SessionToolChoice::Inherit);
                 !inherited
                     && session_wants
@@ -53335,11 +53381,11 @@ impl VibexWorkbench {
                             .enabled(session.agent_id.as_str(), *tool)
             });
             deviates.then(|| {
-                AgentBuiltinTool::ALL
-                    .into_iter()
-                    .filter(|tool| enabled.contains(tool))
-                    .map(|tool| {
-                        let icon = match tool {
+                states
+                    .iter()
+                    .filter(|state| state.enabled)
+                    .map(|state| {
+                        let icon = match state.tool {
                             AgentBuiltinTool::Browser => "icons/vibex/globe.svg",
                             AgentBuiltinTool::Computer => "icons/vibex/monitor.svg",
                         };
@@ -106230,6 +106276,33 @@ mod tests {
                 "session\n            .tools\n            .resolve(&self.ui_state.agent_tools"
             ),
             "the session's recorded answer must win over the Agent card"
+        );
+        assert!(
+            states.contains("self.tool_availability_for(session.agent_id.as_str(), tool)"),
+            "the pill must read the same delivery tables the new-session toggles use"
+        );
+
+        // The reported bug: a panel the Agent can never receive was painted as
+        // a green "on" by the pill while the new-session toggle showed it as
+        // unavailable. Both now come from one availability answer.
+        let helper = source
+            .split_once("    fn tool_availability_for(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One capability toggle"))
+            .map(|(body, _)| body)
+            .expect("the shared availability helper should remain inspectable");
+        assert!(helper.contains("SessionToolAvailability::Unavailable"));
+        assert!(helper.contains("NativeAgentFeature"));
+        assert!(helper.contains("computer_tools_ready()"));
+        let toggle = source
+            .split_once("    fn new_session_tool_availability(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether one panel can reach one Agent at all")
+            })
+            .map(|(body, _)| body)
+            .expect("the new-session availability shim should remain inspectable");
+        assert!(
+            toggle.contains("self.tool_availability_for(agent_id.as_str(), tool)"),
+            "the new-session toggle must not keep a second copy of the rules"
         );
     }
 

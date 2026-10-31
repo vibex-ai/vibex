@@ -10187,6 +10187,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_created_session_row_keeps_the_requested_tool_answer() {
+        use vibex_core::{AgentBuiltinTool, SessionToolChoice};
+
+        // The pill in the title bar reads this row, so the answer has to
+        // survive the real creation path rather than only a direct UPDATE.
+        let db_path = temp_db_path("creation-tool-answer-round-trip");
+        let workspace_root = temp_workspace_path("creation-tool-answer-round-trip");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = crate::test_support::TestRuntimeHarness::new(
+            &db_path,
+            AgentId::parse("codex").unwrap(),
+            Arc::new(CompletingTurnProvider),
+        );
+        let selection = manager
+            .resolve_initial_runtime_selection(None, ProviderKind::Codex, None, None)
+            .unwrap();
+        let mut tools = vibex_core::SessionToolSettings::default();
+        tools.set(AgentBuiltinTool::Browser, SessionToolChoice::Off);
+
+        // The desktop creates with a deferred materialization so the first
+        // message can queue behind runtime startup; that path has its own
+        // reload of the row after creation.
+        let session = manager
+            .create_session(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: true,
+                runtime: selection,
+                workspace_root: workspace_root.to_string_lossy().to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("Tool answer round trip".to_string()),
+                safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: tools.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            session.tools, tools,
+            "the creation reply must describe what was persisted"
+        );
+
+        let conn = manager.open_migrated().unwrap();
+        let stored = SessionRepository::get(&conn, &session.id).unwrap().unwrap();
+        drop(conn);
+        assert_eq!(stored.tools, tools);
+        assert_eq!(
+            stored.tools.choice(AgentBuiltinTool::Browser),
+            SessionToolChoice::Off
+        );
+
+        drop(manager);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn turn_boundaries_publish_the_running_and_settled_session_snapshots() {
         let db_path = temp_db_path("turn-boundary-session-snapshots");
         let workspace_root = temp_workspace_path("turn-boundary-session-snapshots");
