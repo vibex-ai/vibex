@@ -37848,9 +37848,11 @@ fn provider_source_section(
                 .gap_1p5()
                 .px_2()
                 .child(
+                    // The same slot a source row gives its mark, so the
+                    // block's name and its rows' names share one spine.
                     div()
                         .flex_none()
-                        .size(px(18.0))
+                        .size(px(22.0))
                         .flex()
                         .items_center()
                         .justify_center()
