@@ -46725,29 +46725,11 @@ impl VibexWorkbench {
             .text_color(cx.theme().popover_foreground)
             .p_3()
             .shadow_lg()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(locale::text("Session tools", "会话能力", "會話能力")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(locale::text(
-                                "Fixed at creation",
-                                "创建时固定",
-                                "建立時固定",
-                            )),
-                    ),
-            )
+            .child(div().w_full().text_sm().font_semibold().child(locale::text(
+                "Session tools",
+                "会话能力",
+                "會話能力",
+            )))
             .child(
                 div()
                     .my_1()
@@ -46756,36 +46738,6 @@ impl VibexWorkbench {
                     .bg(cx.theme().border.opacity(0.60)),
             )
             .children(rows)
-            .child(
-                div()
-                    .my_1()
-                    .h(px(1.0))
-                    .w_full()
-                    .bg(cx.theme().border.opacity(0.60)),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_start()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::Info)
-                            .size(px(13.0))
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(locale::text(
-                                "These tools are fixed when the session starts and do not change mid-run. Change the Agent default in Agent settings, or start a new session to choose differently.",
-                                "这些能力在会话启动时确定，运行中不会变更。可到 Agent 设置修改默认值，或新建会话重新选择。",
-                                "這些能力在會話啟動時確定，執行中不會變更。可到 Agent 設定修改預設值，或新增會話重新選擇。",
-                            )),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -106262,8 +106214,12 @@ mod tests {
             !panel.contains("Switch::new"),
             "a running session cannot re-register tools, so the panel must not offer a switch"
         );
-        assert!(panel.contains("do not change mid-run") || panel.contains("运行中不会变更"));
-        // The source line that identifies each row's provenance.
+        // The panel is a state readout, not an essay: no "fixed at creation"
+        // caption and no closing explanation block.
+        assert!(!panel.contains("Fixed at creation"));
+        assert!(!panel.contains("do not change mid-run"));
+        assert!(!panel.contains("IconName::Info"));
+        // The source line that identifies each row's provenance stays.
         assert!(panel.contains("Agent default") && panel.contains("This session"));
 
         let states = source
