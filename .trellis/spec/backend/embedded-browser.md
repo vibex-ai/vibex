@@ -591,6 +591,14 @@ Two input translations are easy to get wrong and are pinned by tests:
   `Input.dispatchMouseEvent` follows, scrolls *down* on a positive `deltaY`.
   `wheel_delta_cdp` flips both axes and converts line deltas first. Passing the
   GPUI value through inverts every page.
+- **A line delta is worth 40 CSS pixels, not a text line.** Every desktop
+  backend reports a wheel notch as three lines (X11 and Wayland's
+  `SCROLL_LINES = 3.0`, Windows' `WHEEL_DELTA` converted through the system's
+  lines-per-notch), while Chromium's own step is
+  `cc::kPixelsPerLineStep = 40` — so one notch is 120 px in Chrome.
+  `WHEEL_LINE_STEP` must stay 40: scaling by a line of text (16 px) made a notch
+  travel 48 px, and the panel scrolled visibly shorter than the system browser.
+  Precise pixel deltas from a trackpad pass through untouched.
 - **A move must say which buttons are held.** CDP's `buttons` mask is what turns
   a `mouseMoved` into a drag; without it a scrollbar drag, a text selection, a
   slider and an HTML5 drop all die at the first move. `BrowserInput::MouseMove`

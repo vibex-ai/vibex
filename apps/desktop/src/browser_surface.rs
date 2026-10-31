@@ -2120,7 +2120,7 @@ impl BrowserSurface {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
                     return;
                 };
-                let (delta_x, delta_y) = wheel_delta_cdp(event.delta, WHEEL_LINE_HEIGHT);
+                let (delta_x, delta_y) = wheel_delta_cdp(event.delta, WHEEL_LINE_STEP);
                 this.dispatch(
                     vibex_browser::BrowserInput::Wheel {
                         x,
@@ -3296,11 +3296,16 @@ struct OpenSelectMenu {
 /// the popup the panel was trying to replace.
 const SELECT_HINT_TOLERANCE: f64 = 6.0;
 
-/// How many pixels one wheel line is worth when the platform reports lines.
+/// How many CSS pixels one wheel line is worth when the platform reports lines.
 ///
-/// Roughly a line of text; Chrome's own wheel handling treats a notch as a few
-/// lines, and the panel only has to feel like a browser.
-const WHEEL_LINE_HEIGHT: Pixels = px(16.0);
+/// This is Chromium's own line step, `cc::kPixelsPerLineStep = 40`, and it is
+/// deliberately not the height of a line of text. A wheel notch arrives as
+/// three lines on every desktop backend (X11, Wayland and Windows all report
+/// `SCROLL_LINES`/`WHEEL_DELTA`-sized steps), so 40 px makes one notch travel
+/// 120 px — what Chrome itself does for `WHEEL_DELTA`. Scaling by a text line
+/// height of 16 px moved the page 48 px per notch, which is why the panel felt
+/// short next to the system browser.
+const WHEEL_LINE_STEP: Pixels = px(40.0);
 
 /// Converts a GPUI wheel delta into the convention the DevTools protocol uses.
 ///
@@ -3309,8 +3314,12 @@ const WHEEL_LINE_HEIGHT: Pixels = px(16.0);
 /// `Input.dispatchMouseEvent` follows the DOM, where a positive `deltaY`
 /// scrolls the page *down*. Passing one to the other unchanged inverts the
 /// wheel — which is exactly what the panel did.
-fn wheel_delta_cdp(delta: gpui::ScrollDelta, line_height: Pixels) -> (f64, f64) {
-    let delta = delta.pixel_delta(line_height);
+///
+/// A precise (pixel) delta passes through untouched; a line delta is expanded
+/// with [`WHEEL_LINE_STEP`], not with the height of a text line, so a notch
+/// travels as far here as it does in Chrome.
+fn wheel_delta_cdp(delta: gpui::ScrollDelta, line_step: Pixels) -> (f64, f64) {
+    let delta = delta.pixel_delta(line_step);
     (-f64::from(delta.x), -f64::from(delta.y))
 }
 
@@ -3798,16 +3807,21 @@ mod tests {
     fn a_wheel_delta_is_flipped_into_the_dom_convention() {
         // Scrolling up: GPUI says +100, the page must be told -100.
         let up = gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(100.0)));
-        assert_eq!(wheel_delta_cdp(up, WHEEL_LINE_HEIGHT), (0.0, -100.0));
+        assert_eq!(wheel_delta_cdp(up, WHEEL_LINE_STEP), (0.0, -100.0));
         // Scrolling down: GPUI says -50, the page must be told +50.
         let down = gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-50.0)));
-        assert_eq!(wheel_delta_cdp(down, WHEEL_LINE_HEIGHT), (0.0, 50.0));
+        assert_eq!(wheel_delta_cdp(down, WHEEL_LINE_STEP), (0.0, 50.0));
         // Horizontal follows the same rule.
         let left = gpui::ScrollDelta::Pixels(gpui::point(px(30.0), px(0.0)));
-        assert_eq!(wheel_delta_cdp(left, WHEEL_LINE_HEIGHT), (-30.0, 0.0));
-        // Lines are converted before the flip.
-        let lines = gpui::ScrollDelta::Lines(gpui::point(0.0, 3.0));
-        assert_eq!(wheel_delta_cdp(lines, px(16.0)), (0.0, -48.0));
+        assert_eq!(wheel_delta_cdp(left, WHEEL_LINE_STEP), (-30.0, 0.0));
+        // Lines are converted before the flip. One notch is three lines on
+        // every desktop backend, and Chromium's line step is 40 px, so a notch
+        // must travel 120 px — the same distance as in the system browser.
+        let notch = gpui::ScrollDelta::Lines(gpui::point(0.0, 3.0));
+        assert_eq!(wheel_delta_cdp(notch, WHEEL_LINE_STEP), (0.0, -120.0));
+        // A text line height would have made the same notch travel 48 px, which
+        // is the short-scroll regression this pins: the step is not typography.
+        assert_eq!(wheel_delta_cdp(notch, px(16.0)), (0.0, -48.0));
     }
 
     #[test]
