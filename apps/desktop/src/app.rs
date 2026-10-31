@@ -45295,14 +45295,15 @@ impl VibexWorkbench {
         }
     }
 
-    /// One capability chip: icon, label, and a switch, or an inert reason.
+    /// One capability toggle: just its icon, lit while the panel is on.
     ///
-    /// The chip carries a dot when the draft overrides the Agent, which is the
-    /// same "this is not the default" marker the row's reset button explains.
-    fn render_session_tool_chip(
+    /// Icon-only keeps the row as quiet as the workspace pickers beside it,
+    /// and "lit means on" is the whole state model: the resolved answer is
+    /// what the icon paints, so the draft can never show a panel the created
+    /// session would not run with.
+    fn render_session_tool_toggle(
         &self,
         tool: AgentBuiltinTool,
-        compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let unavailable = self.new_session_tool_availability(tool);
@@ -45321,167 +45322,99 @@ impl VibexWorkbench {
                 locale::text("Computer use", "电脑操作", "電腦操作"),
             ),
         };
-        let (glyph, text_color) = match (&unavailable, enabled) {
-            (SessionToolAvailability::Unavailable(_), _) => (
-                cx.theme().muted_foreground.opacity(0.55),
-                cx.theme().muted_foreground.opacity(0.70),
-            ),
-            (SessionToolAvailability::Available, true) => {
-                (cx.theme().success, cx.theme().foreground)
-            }
-            (SessionToolAvailability::Available, false) => {
-                (cx.theme().muted_foreground, cx.theme().muted_foreground)
-            }
-        };
+        let disabled = self.agent_action_pending
+            || matches!(unavailable, SessionToolAvailability::Unavailable(_));
         let tooltip = match &unavailable {
             SessionToolAvailability::Unavailable(reason) => (*reason).to_string(),
             SessionToolAvailability::Available => {
-                if enabled {
-                    locale::text(
-                        "On for this session. Click to turn it off.",
-                        "本次会话启用，点击可关闭。",
-                        "本次會話啟用，點擊可關閉。",
-                    )
-                    .to_string()
+                let state = if enabled {
+                    locale::text("on", "已开启", "已開啟")
                 } else {
-                    locale::text(
-                        "Off for this session. Click to turn it on.",
-                        "本次会话未启用，点击可启用。",
-                        "本次會話未啟用，點擊可啟用。",
-                    )
-                    .to_string()
-                }
+                    locale::text("off", "未开启", "未開啟")
+                };
+                let source = if overridden {
+                    locale::text("this session", "本会话", "本次會話")
+                } else {
+                    locale::text("Agent default", "跟随 Agent", "跟隨 Agent")
+                };
+                format!("{label} · {state} · {source}")
             }
         };
-        let chip = h_flex()
-            .id(SharedString::from(format!(
-                "new-session-tool-{}",
-                tool.as_str()
-            )))
+        let glyph = if matches!(unavailable, SessionToolAvailability::Unavailable(_)) {
+            cx.theme().muted_foreground.opacity(0.40)
+        } else if enabled {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
+        };
+        let button = Button::new(SharedString::from(format!(
+            "new-session-tool-{}",
+            tool.as_str()
+        )))
+        .xsmall()
+        .ghost()
+        .compact()
+        .size(px(28.0))
+        .rounded(px(6.0))
+        .disabled(disabled)
+        .tooltip(SharedString::from(tooltip))
+        .child(Icon::default().path(icon).size(px(16.0)).text_color(glyph))
+        .when(enabled && !disabled, |this| {
+            this.bg(cx.theme().success.opacity(0.10))
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let next = !this.new_session_tool_enabled(tool);
+            this.set_new_session_tool(tool, next, cx);
+        }));
+        div()
             .relative()
             .flex_none()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(30.0))
-            .px(px(10.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(
-                if matches!(unavailable, SessionToolAvailability::Unavailable(_)) {
-                    cx.theme().border.opacity(0.45)
-                } else if enabled {
-                    cx.theme().success.opacity(0.34)
-                } else {
-                    cx.theme().border
-                },
-            )
-            .bg(
-                if enabled && matches!(unavailable, SessionToolAvailability::Available) {
-                    cx.theme().success.opacity(0.10)
-                } else {
-                    cx.theme().transparent
-                },
-            )
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .child(Icon::default().path(icon).size(px(14.0)).text_color(glyph))
-            .when(!compact, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .text_xs()
-                        .text_color(text_color)
-                        .child(label),
-                )
-            });
-        let chip = match unavailable {
-            SessionToolAvailability::Unavailable(_) => chip.child(
-                Icon::default()
-                    .path("icons/vibex/circle-slash.svg")
-                    .size(px(13.0))
-                    .text_color(cx.theme().muted_foreground.opacity(0.55)),
-            ),
-            SessionToolAvailability::Available => chip.child(
-                Switch::new(SharedString::from(format!(
-                    "new-session-tool-switch-{}",
-                    tool.as_str()
-                )))
-                .small()
-                .checked(enabled)
-                .disabled(self.agent_action_pending)
-                .on_click(cx.listener(move |this, enabled: &bool, _, cx| {
-                    this.set_new_session_tool(tool, *enabled, cx)
-                })),
-            ),
-        };
-        chip.when(overridden, |this| {
-            this.child(
-                div()
-                    .absolute()
-                    .top(px(3.0))
-                    .right(px(3.0))
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(cx.theme().success),
-            )
-        })
-        .into_any_element()
-    }
-
-    /// The "this session" row under the new-session prompt.
-    fn render_new_session_tool_row(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
-        let overridden = !self.new_session_tools.is_inherit();
-        let status = if overridden {
-            locale::text(
-                "Overrides the Agent default",
-                "已覆盖 Agent 默认",
-                "已覆寫 Agent 預設",
-            )
-        } else {
-            locale::text(
-                "Follows the Agent settings",
-                "跟随 Agent 配置",
-                "跟隨 Agent 設定",
-            )
-        };
-        h_flex()
-            .id("new-session-tool-row")
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text("This session", "本次会话", "本次會話")),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1p5()
-                    .overflow_hidden()
-                    .child(self.render_session_tool_chip(AgentBuiltinTool::Browser, compact, cx))
-                    .child(self.render_session_tool_chip(AgentBuiltinTool::Computer, compact, cx)),
-            )
+            .child(button)
+            // A dot marks the draft as departing from the Agent card; the
+            // icon alone cannot say "this is an override" versus "this is the
+            // default that happens to be on".
             .when(overridden, |this| {
                 this.child(
                     div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(status),
+                        .absolute()
+                        .top(px(1.0))
+                        .right(px(1.0))
+                        .size(px(4.0))
+                        .rounded_full()
+                        .bg(cx.theme().success),
                 )
-                .child(
+            })
+            .into_any_element()
+    }
+
+    /// Both capability toggles, and a way back to the Agent's defaults.
+    ///
+    /// This rides the new-session page's bottom row beside the workspace and
+    /// location menus: they are all "where and how this session runs", and the
+    /// prompt area stays reserved for what the reader is asking for.
+    fn render_new_session_tool_toggles(&self, cx: &mut Context<Self>) -> AnyElement {
+        let overridden = !self.new_session_tools.is_inherit();
+        h_flex()
+            .id("new-session-tool-toggles")
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .child(self.render_session_tool_toggle(AgentBuiltinTool::Browser, cx))
+            .child(self.render_session_tool_toggle(AgentBuiltinTool::Computer, cx))
+            .when(overridden, |this| {
+                this.child(
                     Button::new("new-session-tools-reset")
                         .xsmall()
                         .ghost()
-                        .h(px(24.0))
-                        .label(locale::text("Reset", "恢复默认", "還原預設"))
+                        .compact()
+                        .size(px(24.0))
+                        .rounded(px(6.0))
+                        .icon(
+                            Icon::default()
+                                .path("icons/vibex/rotate-ccw.svg")
+                                .size(px(13.0))
+                                .text_color(cx.theme().muted_foreground),
+                        )
                         .tooltip(locale::text(
                             "Follow the Agent settings again",
                             "两项都恢复为跟随 Agent 配置",
@@ -45489,15 +45422,6 @@ impl VibexWorkbench {
                         ))
                         .disabled(self.agent_action_pending)
                         .on_click(cx.listener(|this, _, _, cx| this.reset_new_session_tools(cx))),
-                )
-            })
-            .when(!overridden, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground.opacity(0.80))
-                        .child(status),
                 )
             })
             .into_any_element()
@@ -57096,6 +57020,24 @@ impl VibexWorkbench {
                 })
                 .when(worktree_selected, |this| {
                     this.child(div().flex_none().child(base_ref_button))
+                })
+                .when(has_agent_choices, |this| {
+                    // The two built-in panels sit with the workspace and
+                    // location menus: they all answer "where and how this
+                    // session runs", which keeps the prompt area for the task.
+                    this.child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .h(px(12.0))
+                                    .w(px(1.0))
+                                    .bg(cx.theme().border.opacity(0.60)),
+                            )
+                            .child(self.render_new_session_tool_toggles(cx)),
+                    )
                 }),
         );
 
@@ -57472,26 +57414,6 @@ impl VibexWorkbench {
                                     )
                             .when_some(self.new_session_schedule, |this, schedule| {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
-                            })
-                            // Built-in panels are chosen here, beside the
-                            // model and permission controls, because they
-                            // answer the same question: how this one session
-                            // runs. An Agent with no choices has no runtime to
-                            // launch, so the row would only be noise.
-                            .when(has_agent_choices, |this| {
-                                let compact_tools = composer_runtime_controls_are_compact(
-                                    self.last_visibility.layout.viewport_width,
-                                );
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .px_2()
-                                        .pb_1()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border.opacity(0.60))
-                                        .child(self.render_new_session_tool_row(compact_tools, cx)),
-                                )
                             })
                             .child(
                                 v_flex()
@@ -106204,24 +106126,55 @@ mod tests {
         );
     }
 
-    /// The new-session row offers both panels, and its switches show the
-    /// resolved answer rather than "unset".
+    /// The new-session page offers both panels as icon toggles, lit by the
+    /// resolved answer rather than by "unset".
     #[test]
-    fn the_new_session_row_shows_resolved_tool_answers() {
+    fn the_new_session_page_shows_resolved_tool_answers() {
         let source = include_str!("app.rs");
-        let row = source
-            .split_once("    fn render_new_session_tool_row(")
+        let toggle = source
+            .split_once("    fn render_session_tool_toggle(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// The read-only panel behind a session's capability pill.")
+                tail.split_once("\n    /// Both capability toggles, and a way back")
             })
             .map(|(body, _)| body)
-            .expect("the new-session tool row should remain inspectable");
-        assert!(row.contains("AgentBuiltinTool::Browser"));
-        assert!(row.contains("AgentBuiltinTool::Computer"));
-        assert!(row.contains("new-session-tools-reset"));
+            .expect("the new-session tool toggle should remain inspectable");
+        assert!(toggle.contains("cx.theme().success"));
         assert!(
-            row.contains("self.new_session_tools.is_inherit()"),
-            "the row must say whether the draft follows the Agent or overrides it"
+            toggle.contains("new_session_tool_enabled(tool)"),
+            "the icon has to be lit from the answer the session would be created with"
+        );
+        assert!(
+            !toggle.contains("Switch::new"),
+            "the toggle is the icon itself"
+        );
+
+        let toggles = source
+            .split_once("    fn render_new_session_tool_toggles(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Applies every persisted per-Agent tool answer")
+            })
+            .map(|(body, _)| body)
+            .expect("the toggle group should remain inspectable");
+        assert!(toggles.contains("AgentBuiltinTool::Browser"));
+        assert!(toggles.contains("AgentBuiltinTool::Computer"));
+        assert!(toggles.contains("new-session-tools-reset"));
+        assert!(
+            toggles.contains("self.new_session_tools.is_inherit()"),
+            "the reset entry must only appear once the draft overrides the Agent"
+        );
+
+        // The group rides the bottom row, beside the workspace pickers, rather
+        // than taking a row inside the prompt card.
+        let page = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("the new-session panel should remain inspectable");
+        assert!(page.contains("self.render_new_session_tool_toggles(cx)"));
+        assert!(page.contains("let workspace_controls = v_flex()"));
+        assert!(
+            !page.contains("render_new_session_tool_row("),
+            "the capability row must not come back into the prompt card"
         );
 
         let resolved = source
