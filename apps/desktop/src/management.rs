@@ -126,14 +126,15 @@ const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
-/// What the Prompt editor's chrome takes above and below its Markdown body.
+/// The interface chrome the Prompt editor's body must leave visible.
 ///
-/// The card's heading and padding, the selected record's meta row, the name
-/// field and its label, the action row, and the section's own heading and
-/// insets. Subtracted from the window so the body grows with the pane.
-const MANAGEMENT_PROMPT_BODY_RESERVED_HEIGHT: f32 = 330.0;
+/// The management title bar, the section heading, the pane's inset, the card's
+/// padding and heading, the selected record's meta row, the name field with its
+/// label, and the action row. Subtracting it from the window makes the editor
+/// as tall as the interface while the form still fits; a window too short for
+/// the remainder floors the editor and lets the pane scroll.
+const MANAGEMENT_PROMPT_BODY_CHROME_HEIGHT: f32 = 380.0;
 const MANAGEMENT_PROMPT_BODY_MIN_HEIGHT: f32 = 160.0;
-const MANAGEMENT_PROMPT_BODY_MAX_HEIGHT: f32 = 640.0;
 /// The height of the controls in a resource sidebar.
 ///
 /// One band for the commands, the market entry and the search field. The kit's
@@ -29664,8 +29665,8 @@ impl ManagementCenter {
     /// The sidebar owns the list and the selection; this card is the one place
     /// a Prompt is written, so creating one and editing one share the same
     /// fields, labels, and commit button. The body is Markdown and is sized
-    /// from the window, so a long Prompt is read in the same surface that
-    /// writes it rather than in a 96px box.
+    /// from the interface, so the editor is as tall as the window rather than a
+    /// fixed box.
     fn render_prompts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let editing = self.selected_prompt_id.is_some();
@@ -33413,13 +33414,13 @@ fn management_textarea_field(
         .into_any_element()
 }
 
-/// A labeled Markdown body sized from the window rather than by its content.
+/// A labeled Markdown body sized to the interface rather than by its content.
 ///
 /// The label repeats `Field`'s label typography, but the control is not put
 /// inside a `Field`: a Field sizes its control to its content, which would
-/// leave the editor's own height undecided. The body is given a definite
-/// height, so the card's spare space belongs to the text being written and the
-/// form stays inside the pane's scroll.
+/// leave the editor's own height undecided. The body is given the window's
+/// height less the chrome above and below it, so the editor is as tall as the
+/// interface and its own text scrolls inside.
 fn management_markdown_body_field(
     label: impl Into<SharedString>,
     state: &Entity<EditorState>,
@@ -33436,18 +33437,16 @@ fn management_markdown_body_field(
         .into_any_element()
 }
 
-/// The height the Prompt body gets from the window.
+/// How tall the Prompt body is in a window of `viewport_height`.
 ///
-/// The card sits under the section heading, the selected record's meta row,
-/// the name field and the action row; what is left at the bottom of the pane
-/// is what the body may use. The bounds keep a short window from squeezing the
-/// editor to nothing and a tall one from turning the card into a full-page
-/// text area with no visible actions.
+/// The editor should be the interface's height, so only the chrome that has to
+/// stay visible is subtracted: the management title bar, the section's own
+/// heading and inset, the card's padding and heading, the selected record's
+/// meta row, the name field and the action row. There is no upper bound — a
+/// maximized window gets a maximized editor — while the lower bound keeps the
+/// field from collapsing in a short window, where the pane scrolls instead.
 fn management_prompt_body_height(viewport_height: f32) -> f32 {
-    (viewport_height - MANAGEMENT_PROMPT_BODY_RESERVED_HEIGHT).clamp(
-        MANAGEMENT_PROMPT_BODY_MIN_HEIGHT,
-        MANAGEMENT_PROMPT_BODY_MAX_HEIGHT,
-    )
+    (viewport_height - MANAGEMENT_PROMPT_BODY_CHROME_HEIGHT).max(MANAGEMENT_PROMPT_BODY_MIN_HEIGHT)
 }
 
 /// Sources a native export can name.
@@ -41135,8 +41134,8 @@ mod tests {
         assert!(editor.contains("this.save_prompt(cx)"));
         // A Prompt body is Markdown, so it is written in the component's
         // Markdown editor rather than the single-line input the name field
-        // uses, and the editor's height comes from the window so a long
-        // Prompt fills the pane instead of a 96px box.
+        // uses, and it is sized from the interface so the editor is as tall as
+        // the window instead of a 96px box.
         assert!(editor.contains("management_markdown_body_field("));
         assert!(editor.contains("management_prompt_body_height("));
         assert!(!editor.contains("management_textarea_field("));
@@ -41337,19 +41336,33 @@ mod tests {
         assert_eq!(maximum, 192.0);
     }
 
-    /// A Prompt body grows with the window but never collapses or takes the
-    /// whole card, so the name field and the save row stay reachable.
+    /// The Prompt body is as tall as the interface, with only the chrome that
+    /// must stay visible taken out, so a bigger window gives the editor more
+    /// rows instead of leaving it at a fixed height.
     #[test]
-    fn the_prompt_body_grows_with_the_window_within_bounds() {
+    fn the_prompt_editor_is_as_tall_as_the_interface() {
+        // A maximized window has no upper cap: the editor grows with it.
         assert_eq!(
-            management_prompt_body_height(1_080.0),
-            MANAGEMENT_PROMPT_BODY_MAX_HEIGHT
+            management_prompt_body_height(1_440.0),
+            1_440.0 - MANAGEMENT_PROMPT_BODY_CHROME_HEIGHT
         );
-        assert_eq!(management_prompt_body_height(780.0), 450.0);
+        assert!(
+            management_prompt_body_height(1_600.0) > management_prompt_body_height(1_080.0),
+            "a taller interface must give the editor more rows"
+        );
+        // A short window floors the editor and lets the pane scroll.
         assert_eq!(
             management_prompt_body_height(400.0),
             MANAGEMENT_PROMPT_BODY_MIN_HEIGHT
         );
+
+        let source = include_str!("management.rs");
+        let field = source
+            .split_once("fn management_markdown_body_field(")
+            .and_then(|(_, tail)| tail.split_once("\n/// How tall the Prompt body is"))
+            .map(|(body, _)| body)
+            .expect("the Markdown body field should remain inspectable");
+        assert!(field.contains("Editor::new(state).w_full().h(px(height))"));
     }
 
     #[test]
