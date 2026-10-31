@@ -15,10 +15,14 @@
 //! - The fade *sets* an alpha rather than multiplying one, so the pass is
 //!   idempotent: a client that maps a role and a framework bridge that maps the
 //!   same role land on the same color.
-//! - The page and the chrome fades by the same amount in both appearances, so
-//!   the two modes read as the same glass over the same image. The plates fade
-//!   further in a light appearance, where a white plate has no tone of its own
-//!   to separate it from the page.
+//! - The tiers are tuned per appearance rather than shared. A dark appearance
+//!   veils with a near-black page color, so the image keeps its detail through
+//!   it; the light appearance's veil is white, which at the same alpha reads as
+//!   milk over a bright picture and leaves the wallpaper looking like a faded
+//!   print. Light therefore fades less at every tier, and the reader's own
+//!   dimming control is what buys contrast when a picture needs it. A light
+//!   tier must stay below the dark one at the same level — that is the
+//!   regression this tuning exists to prevent.
 //!
 //! A light appearance also fades the plates that a dark one keeps authored —
 //! cards, the composer, the right rail. There the page, the cards, and the
@@ -62,15 +66,19 @@ impl WallpaperSurfaces {
 
     /// The tiers a light appearance paints with.
     ///
-    /// The page keeps the dark appearance's alpha — the two modes should read as
-    /// the same glass over the same image, and the veil mixed from the page color
-    /// already keeps ink crisp at that alpha. The plates sit higher: a dark plate
-    /// separates itself from a bright image by tone, while a white one has no
-    /// tone of its own, so at the dark alpha it would read as a grey wash rather
-    /// than as frosted glass.
+    /// Lower than the dark appearance at both tiers, not higher. The veil is
+    /// mixed from the page color, and a white veil at the dark tuning reads as
+    /// a milky sheet over a bright picture: the image keeps its shape but loses
+    /// the color and the contrast that made it worth setting. What the light
+    /// page needs is not more coverage but the reader's veil, which is the
+    /// control that exists for a picture that turns out too bright.
+    ///
+    /// The plates still sit a step above the page. They are the same white as
+    /// it, so they need that one step of separation to read as a surface rather
+    /// than as a hole — but one step, not a lid.
     pub const LIGHT: Self = Self {
-        base: 0.55,
-        raised: 0.84,
+        base: 0.36,
+        raised: 0.56,
     };
 
     pub fn for_appearance(is_dark: bool) -> Self {
@@ -282,6 +290,36 @@ mod tests {
                 wallpaper_surface(role, color, false).a,
                 WallpaperSurfaces::LIGHT.raised,
                 "{role} fades in a light appearance"
+            );
+        }
+    }
+
+    /// The light tuning has to stay under the dark one at every tier.
+    ///
+    /// The veil is mixed from the page color, so the same alpha is a soft
+    /// neutral dim in a dark appearance and a milky white sheet in a light one:
+    /// at the dark tuning a bright picture loses its color and its contrast and
+    /// stops reading as a wallpaper. This is a rule rather than a value because
+    /// the light alphas are the ones most tempting to raise, and raising them
+    /// past the dark ones is what the regression looked like.
+    #[test]
+    fn a_light_appearance_fades_less_than_a_dark_one() {
+        assert!(
+            WallpaperSurfaces::LIGHT.base < WallpaperSurfaces::DARK.base,
+            "the light page must stay clearer than the dark one"
+        );
+        assert!(
+            WallpaperSurfaces::LIGHT.raised < WallpaperSurfaces::DARK.raised,
+            "the light plates must stay clearer than the dark ones"
+        );
+        // Still frosted rather than transparent: the page keeps enough of the
+        // veil for ink to read, and a plate stays a step above the page it sits
+        // on so the two never collapse into one surface.
+        for surfaces in [WallpaperSurfaces::DARK, WallpaperSurfaces::LIGHT] {
+            assert!(surfaces.base > 0.0, "the page is never fully clear");
+            assert!(
+                surfaces.raised > surfaces.base,
+                "a plate sits above the page it is painted on"
             );
         }
     }

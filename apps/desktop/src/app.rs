@@ -46941,10 +46941,17 @@ impl VibexWorkbench {
                             .w(px(sidebar_width))
                             .flex_none()
                             .items_center()
-                            // The cluster sits on the chrome instead of owning a
-                            // surface: opening the sidebar lets the rail's tone
-                            // and seam run up behind these controls, and a
-                            // collapsed rail leaves the corner plain.
+                            // While the rail is open behind it, the cluster sits
+                            // on the rail instead of owning a surface, so the
+                            // rail's tone and seam run up through the band. A
+                            // collapsed rail leaves that corner with no surface
+                            // under it at all — and with a wallpaper behind the
+                            // window, an unpainted band shows the image at full
+                            // strength beside a washed one, which reads as a
+                            // hole in the chrome. The collapsed segment
+                            // therefore takes the same page the rest of the
+                            // strip paints.
+                            .when(!sidebar_inline_open, |this| this.bg(cx.theme().background))
                             .px(px(TITLE_BAR_CLUSTER_PAD))
                             .when(cfg!(target_os = "macos"), |this| this.pl(px(80.0)))
                             .child(
@@ -114312,9 +114319,13 @@ mod tests {
         assert!(title_bar.contains(".left(px(hairline_left))"));
 
         let sidebar = &title_bar[sidebar_start..main_start];
-        // The control cluster owns no surface either: the rail behind it shows,
-        // and the controls keep the shared chrome metrics.
-        assert!(!sidebar.contains(".bg("));
+        // The control cluster owns no surface of its own while the rail is open:
+        // the rail behind it shows through, and the controls keep the shared
+        // chrome metrics. A collapsed rail is the one state that needs one, and
+        // it takes the page the rest of the strip paints rather than a surface
+        // of its own choosing.
+        assert!(sidebar.contains(".when(!sidebar_inline_open, |this| this.bg("));
+        assert!(sidebar.contains(".bg(cx.theme().background)"));
         assert!(!sidebar.contains(".border_r_1()"));
         assert!(sidebar.contains(".px(px(TITLE_BAR_CLUSTER_PAD))"));
         assert!(sidebar.contains("size(px(TITLE_BAR_CONTROL_SIZE))"));

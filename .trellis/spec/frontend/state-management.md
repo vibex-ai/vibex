@@ -291,12 +291,15 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
 - The containers of the theme fade while an image is behind them, on both paint
   paths: `vibex_ui::let_wallpaper_through(theme, is_dark)` for the framework's
   roles, and `theme::semantic_color` for the roles the workbench paints from the
-  shared catalog (a card, the composer, the right rail). The page and the chrome
-  that frames it fade to the same alpha in both appearances, so the two modes
-  read as the same glass over the same image; the plates that sit on the page
-  fade a step less, and further still in a light appearance, where a white plate
-  has no tone of its own to separate it from the page. Scrollbar tracks and
-  thumbs are plates and fade with them.
+  shared catalog (a card, the composer, the right rail). The plates that sit on
+  the page fade a step less than the page so they stay readable as surfaces.
+  The tiers are tuned **per appearance**, and the light ones are lower than the
+  dark ones at both tiers: the veil is mixed from the page color, so the same
+  alpha is a soft neutral dim over a dark page but a milky white sheet over a
+  bright picture, which drains the image's color and contrast. Light therefore
+  lets more of the image through, and the reader's own `dim_percent` veil is
+  what buys contrast on a picture that needs it. Scrollbar tracks and thumbs
+  are plates and fade with them.
 - Ink, lines, status colors, selection plates, and the hairline an input is
   outlined with keep the authored color. A card keeps it in a dark appearance —
   where the page and the plates are already separated by tone — and fades in a
@@ -307,6 +310,14 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
 - The theme is one process-wide palette, so every window applies the same
   `Backdrop` the workbench resolved. A window that applied a different one would
   repaint every other window with its own choice.
+- The title bar floats over the shell and carries no surface of its own, but
+  every segment of it must still paint the page: with a wallpaper behind the
+  window, an unpainted segment shows the raw image at full strength beside
+  washed neighbours, which reads as a hole in the chrome — and at a zero veil
+  it is genuinely the untouched image. The workbench end of the strip, both
+  window-control clusters, and the collapsed sidebar cluster all take
+  `cx.theme().background`; the expanded sidebar cluster deliberately does not,
+  because the rail's own tone runs up through the band behind it.
 - A missing home, a malformed stored name, or a missing stored file resolves to
   no image: the workbench paints the theme's page color again, and the
   appearance page shows the upload control without a thumbnail.
