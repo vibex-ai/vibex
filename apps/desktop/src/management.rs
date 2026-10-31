@@ -17,8 +17,8 @@ use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
     Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle, SharedString,
-    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window,
-    canvas, div, point, prelude::*, px, rems, size as gpui_size,
+    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, Toggled, WeakEntity,
+    Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
@@ -29674,7 +29674,7 @@ impl ManagementCenter {
                 .as_ref()
                 .filter(|(resource_id, _, _)| resource_id == &id)
                 .map(|(_, message, failed)| (message.clone(), *failed));
-            let mut agent_matrix_rows = v_flex().w_full().gap_1();
+            let mut agent_matrix_rows = h_flex().w_full().min_w_0().flex_wrap().gap_2();
             for agent in matrix_agents.clone() {
                 let agent_id = agent.id.clone();
                 let server_id = id.clone();
@@ -29686,56 +29686,38 @@ impl ManagementCenter {
                 let matrix_source = matrix_entry
                     .map(|entry| management_resource_matrix_source_label(entry.source_kind))
                     .unwrap_or("manual");
-                agent_matrix_rows = agent_matrix_rows.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.60))
-                        .px_2()
-                        .py_2()
-                        .child(management_agent_glyph(
-                            agent.id.as_str(),
-                            &agent.label,
-                            false,
-                            cx,
-                        ))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(div().truncate().text_sm().font_medium().child(agent.label))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("{} · {matrix_source}", agent.id)),
-                                ),
-                        )
-                        .child(
-                            Switch::new(SharedString::from(format!(
-                                "mcp-agent-matrix-{server_id}-{}",
-                                agent_id.as_str()
-                            )))
-                            .small()
-                            .checked(enabled_for_agent)
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, checked, _, cx| {
-                                    this.set_mcp_agent_matrix(
-                                        server_id.clone(),
-                                        agent_id.clone(),
-                                        *checked,
-                                        cx,
-                                    )
-                                },
-                            )),
-                        ),
+                let tooltip = format!(
+                    "{} · {} · {}",
+                    agent.label,
+                    if enabled_for_agent {
+                        management_locale_text("Enabled", "已启用", "已啟用")
+                    } else {
+                        management_locale_text("Disabled", "未启用", "未啟用")
+                    },
+                    matrix_source
                 );
+                agent_matrix_rows = agent_matrix_rows.child(management_agent_capsule(
+                    AgentCapsule::new(
+                        SharedString::from(format!(
+                            "mcp-agent-matrix-{server_id}-{}",
+                            agent_id.as_str()
+                        )),
+                        agent.id.as_str(),
+                        agent.label.clone(),
+                        enabled_for_agent,
+                        SharedString::from(tooltip),
+                    )
+                    .disabled(pending),
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_mcp_agent_matrix(
+                            server_id.clone(),
+                            agent_id.clone(),
+                            !enabled_for_agent,
+                            cx,
+                        )
+                    }),
+                    cx,
+                ));
             }
             rows = rows.child(
                 v_flex()
@@ -29934,7 +29916,7 @@ impl ManagementCenter {
                 .as_ref()
                 .filter(|(resource_id, _, _)| resource_id == &id)
                 .map(|(_, message, failed)| (message.clone(), *failed));
-            let mut agent_matrix_rows = v_flex().w_full().gap_1();
+            let mut agent_matrix_rows = h_flex().w_full().min_w_0().flex_wrap().gap_2();
             for agent in matrix_agents.clone() {
                 let agent_id = agent.id.clone();
                 let skill_id = id.clone();
@@ -29946,56 +29928,38 @@ impl ManagementCenter {
                 let matrix_source = matrix_entry
                     .map(|entry| management_resource_matrix_source_label(entry.source_kind))
                     .unwrap_or("manual");
-                agent_matrix_rows = agent_matrix_rows.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.60))
-                        .px_2()
-                        .py_2()
-                        .child(management_agent_glyph(
-                            agent.id.as_str(),
-                            &agent.label,
-                            false,
-                            cx,
-                        ))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(div().truncate().text_sm().font_medium().child(agent.label))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("{} · {matrix_source}", agent.id)),
-                                ),
-                        )
-                        .child(
-                            Switch::new(SharedString::from(format!(
-                                "skill-agent-matrix-{skill_id}-{}",
-                                agent_id.as_str()
-                            )))
-                            .small()
-                            .checked(enabled_for_agent)
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, checked, _, cx| {
-                                    this.set_skill_agent_matrix(
-                                        skill_id.clone(),
-                                        agent_id.clone(),
-                                        *checked,
-                                        cx,
-                                    )
-                                },
-                            )),
-                        ),
+                let tooltip = format!(
+                    "{} · {} · {}",
+                    agent.label,
+                    if enabled_for_agent {
+                        management_locale_text("Enabled", "已启用", "已啟用")
+                    } else {
+                        management_locale_text("Disabled", "未启用", "未啟用")
+                    },
+                    matrix_source
                 );
+                agent_matrix_rows = agent_matrix_rows.child(management_agent_capsule(
+                    AgentCapsule::new(
+                        SharedString::from(format!(
+                            "skill-agent-matrix-{skill_id}-{}",
+                            agent_id.as_str()
+                        )),
+                        agent.id.as_str(),
+                        agent.label.clone(),
+                        enabled_for_agent,
+                        SharedString::from(tooltip),
+                    )
+                    .disabled(pending),
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_skill_agent_matrix(
+                            skill_id.clone(),
+                            agent_id.clone(),
+                            !enabled_for_agent,
+                            cx,
+                        )
+                    }),
+                    cx,
+                ));
             }
             rows =
                 rows.child(
@@ -34735,6 +34699,144 @@ fn management_agent_glyph(identity: &str, label: &str, active: bool, cx: &App) -
         .into_any_element()
 }
 
+/// One Agent as a clickable capsule: its logo and name, filled and checked when
+/// the surrounding feature is enabled for it.
+///
+/// This is the one control the Config Center uses to say "this feature applies
+/// to this Agent". A switch could only carry that answer for a single Agent; a
+/// capsule names the Agent it enables, so a feature's whole audience reads as
+/// one row of logos and labels, and clicking a capsule is the toggle itself.
+///
+/// The capsule is a real button for assistive technology: it reports its agent
+/// name and its toggled state, takes focus, and answers Enter/Space as well as a
+/// pointer. Anything that does something else for the same Agent — setting it
+/// as the default model source — is a sibling control, never a nested one.
+struct AgentCapsule {
+    id: SharedString,
+    agent_id: String,
+    label: SharedString,
+    enabled: bool,
+    disabled: bool,
+    tooltip: SharedString,
+}
+
+impl AgentCapsule {
+    fn new(
+        id: SharedString,
+        agent_id: &str,
+        label: impl Into<SharedString>,
+        enabled: bool,
+        tooltip: SharedString,
+    ) -> Self {
+        Self {
+            id,
+            agent_id: agent_id.to_string(),
+            label: label.into(),
+            enabled,
+            disabled: false,
+            tooltip,
+        }
+    }
+
+    /// Dims the capsule while the surrounding list is waiting on a write.
+    fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+fn management_agent_capsule(
+    capsule: AgentCapsule,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let AgentCapsule {
+        id,
+        agent_id,
+        label,
+        enabled,
+        disabled,
+        tooltip,
+    } = capsule;
+    let (background, border, foreground) = if enabled {
+        (
+            cx.theme().primary.opacity(0.12),
+            cx.theme().primary.opacity(0.45),
+            cx.theme().foreground,
+        )
+    } else {
+        (
+            cx.theme().transparent,
+            cx.theme().border,
+            cx.theme().muted_foreground,
+        )
+    };
+    let identity = format!("{agent_id} {label}");
+    let hover_background = if enabled {
+        cx.theme().primary.opacity(0.18)
+    } else {
+        cx.theme().muted.opacity(0.45)
+    };
+    let handler = Rc::new(on_click);
+    let keyboard = handler.clone();
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .aria_toggled(if enabled {
+            Toggled::True
+        } else {
+            Toggled::False
+        })
+        .flex_none()
+        .max_w_full()
+        .h(px(30.0))
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_2p5()
+        .rounded_full()
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .text_color(foreground)
+        .when(disabled, |capsule| capsule.opacity(0.45))
+        .when(!disabled, |capsule| {
+            capsule
+                .cursor_pointer()
+                .focusable()
+                .tab_index(0)
+                .hover(move |style| style.bg(hover_background))
+                .focus_visible(|style| style.border_color(cx.theme().primary))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(move |event, window, cx| handler(event, window, cx))
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        keyboard(&ClickEvent::default(), window, cx);
+                    }
+                })
+        })
+        .child(agent_brand_icon(&identity, px(14.0), None))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .font_medium()
+                .child(label),
+        )
+        .when(enabled, |capsule| {
+            capsule.child(
+                Icon::new(IconName::Check)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(cx.theme().primary),
+            )
+        })
+        .into_any_element()
+}
+
 fn management_agent_detail_header(agent: &AgentSnapshotEntry, cx: &App) -> AnyElement {
     h_flex()
         .w_full()
@@ -37119,10 +37221,11 @@ fn management_market_section(
 
 /// The enable-for section both market install forms share.
 ///
-/// The rows are the ones the resource's own detail panel draws — the Agent's
-/// glyph, its label, its id, and a switch — so a scope chosen during install
-/// reads exactly like the one edited afterwards. The two shortcuts on the
-/// heading are the whole answer in one click, which is what most installs want.
+/// The capsules are the ones the resource's own detail panel draws — the
+/// Agent's logo, its name, and its fill for the state — so a scope chosen
+/// during install reads exactly like the one edited afterwards. The two
+/// shortcuts on the heading are the whole answer in one click, which is what
+/// most installs want.
 fn management_market_enablement_section(
     id_prefix: &'static str,
     agents: Vec<AgentSnapshotEntry>,
@@ -37136,7 +37239,7 @@ fn management_market_enablement_section(
     + 'static,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
-    let mut rows = v_flex().w_full().gap_1();
+    let mut rows = h_flex().w_full().min_w_0().flex_wrap().gap_2();
     let mut any_agent = false;
     for agent in agents.into_iter().filter(|agent| agent.added) {
         any_agent = true;
@@ -37144,56 +37247,29 @@ fn management_market_enablement_section(
         let checked = selected.contains(&agent_id);
         let toggle = on_toggle.clone();
         let toggle_id = agent_id.clone();
-        rows = rows.child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_2()
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(cx.theme().border.opacity(0.60))
-                .px_2()
-                .py_2()
-                .child(management_agent_glyph(
-                    agent.id.as_str(),
-                    &agent.label,
-                    false,
-                    cx,
-                ))
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .flex_1()
-                        .gap_1()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_sm()
-                                .font_medium()
-                                .child(agent.label.clone()),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                // A scope chosen here is the user's own answer,
-                                // which is the same thing the detail panel calls
-                                // `manual` once it is saved.
-                                .child(format!("{} · manual", agent.id)),
-                        ),
-                )
-                .child(
-                    Switch::new(SharedString::from(format!("{id_prefix}-agent-{agent_id}")))
-                        .small()
-                        .checked(checked)
-                        .disabled(pending)
-                        .on_click(cx.listener(move |this, checked, window, cx| {
-                            toggle(this, &toggle_id, *checked, window, cx);
-                        })),
-                ),
+        let tooltip = format!(
+            "{} · {}",
+            agent.label,
+            if checked {
+                management_locale_text("Enabled", "已启用", "已啟用")
+            } else {
+                management_locale_text("Disabled", "未启用", "未啟用")
+            }
         );
+        rows = rows.child(management_agent_capsule(
+            AgentCapsule::new(
+                SharedString::from(format!("{id_prefix}-agent-{agent_id}")),
+                agent.id.as_str(),
+                agent.label.clone(),
+                checked,
+                SharedString::from(tooltip),
+            )
+            .disabled(pending),
+            cx.listener(move |this, _, window, cx| {
+                toggle(this, &toggle_id, !checked, window, cx);
+            }),
+            cx,
+        ));
     }
 
     let enable_all = on_set_all.clone();
@@ -42111,6 +42187,55 @@ mod tests {
                 && !entry.enabled
                 && entry.source_kind == vibex_core::ResourceAgentMatrixSourceKind::NativeImport
         }));
+    }
+
+    /// Every per-Agent feature in the Config Center asks "which Agents?" with
+    /// the same control: a capsule carrying the Agent's logo and name, filled
+    /// when the feature is on for it and clicked to change that answer.
+    ///
+    /// A switch can only answer for one Agent, and a settings row per Agent
+    /// turns a short audience into a column of indistinguishable toggles. The
+    /// capsule also carries the Agent's own name, so the state reads without a
+    /// second "Enabled" column.
+    #[test]
+    fn per_agent_features_are_chosen_with_logo_capsules() {
+        let source = include_str!("management.rs");
+        let capsule = source
+            .split_once("fn management_agent_capsule(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_agent_detail_header("))
+            .map(|(body, _)| body)
+            .expect("the shared Agent capsule should remain inspectable");
+        assert!(capsule.contains("agent_brand_icon("));
+        assert!(capsule.contains(".rounded_full()"));
+        assert!(capsule.contains(".aria_toggled("));
+        assert!(capsule.contains("Role::Button"));
+        assert!(capsule.contains("\"enter\" | \"space\""));
+        assert!(capsule.contains(".on_click("));
+
+        // The three surfaces that ask which Agents a feature reaches all draw
+        // the capsule, and none of them still draws a per-Agent switch.
+        for (name, marker) in [
+            ("MCP server detail", "mcp-agent-matrix-{server_id}-"),
+            ("Skill detail", "skill-agent-matrix-{skill_id}-"),
+            ("market install", "{id_prefix}-agent-{agent_id}"),
+        ] {
+            assert!(source.contains(marker), "{name} must keep {marker}");
+        }
+        for body in ["fn render_mcp(", "fn management_market_enablement_section("] {
+            let section = source
+                .split_once(body)
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| panic!("{body} should remain inspectable"));
+            let section = section
+                .split_once("\n    fn ")
+                .or_else(|| section.split_once("\nfn "))
+                .map(|(body, _)| body)
+                .unwrap_or(section);
+            assert!(
+                !section.contains("Switch::new("),
+                "{body} must not keep a per-Agent switch"
+            );
+        }
     }
 
     #[test]

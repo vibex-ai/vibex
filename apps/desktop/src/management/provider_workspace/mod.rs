@@ -712,8 +712,11 @@ fn ws_authoring_page(
         .into_any_element()
 }
 
-/// The Agents that use a model source and the ones that could, each with a
-/// switch that says the state and changes it.
+/// The Agents that use a model source and the ones that could.
+///
+/// Each Agent is a capsule carrying its logo and name; a filled capsule says
+/// the source is enabled for it and clicking the capsule is the toggle. The
+/// default marker rides inside the capsule it belongs to.
 struct WorkspaceAgentRow {
     agent_id: String,
     label: String,
@@ -721,21 +724,14 @@ struct WorkspaceAgentRow {
     is_default: bool,
 }
 
-fn ws_agent_mark(agent_id: &str, cx: &App) -> AnyElement {
-    div()
-        .flex_none()
-        .size(px(30.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(cx.theme().radius)
-        .bg(cx.theme().muted.opacity(0.5))
-        .child(agent_brand_icon(agent_id, px(16.0), None))
-        .into_any_element()
-}
-
 impl ManagementCenter {
-    /// The Agent list a Provider or a route group shows on its overview.
+    /// The Agents a Provider or a route group is enabled for.
+    ///
+    /// The list is a wrapped row of [`management_agent_capsule`]s: every Agent
+    /// that can use the source is one click away, its state is the capsule's
+    /// own fill, and the default marker sits inside the capsule it qualifies.
+    /// A trailing star on a bound, non-default capsule sets that default
+    /// without changing the binding.
     fn render_workspace_agent_list(
         &self,
         id_prefix: &'static str,
@@ -763,79 +759,87 @@ impl ManagementCenter {
                 cx,
             );
         }
-        let mut list = v_flex().w_full().min_w_0();
-        for (index, row) in rows.into_iter().enumerate() {
+        let mut capsules = h_flex().w_full().min_w_0().flex_wrap().gap_2();
+        for row in rows {
             let agent_id = row.agent_id.clone();
-            let on_toggle = on_toggle.clone();
-            let on_set_default = on_set_default.clone();
-            let default_agent = agent_id.clone();
             let toggle_agent = agent_id.clone();
+            let toggle = on_toggle.clone();
             let bound = row.bound;
-            let trailing = h_flex()
-                .items_center()
-                .gap_2()
-                .when(bound && !row.is_default, |trailing| {
-                    trailing.child(
-                        Button::new(SharedString::from(format!(
-                            "{id_prefix}-agent-default-{agent_id}"
-                        )))
-                        .small()
-                        .ghost()
-                        .label(management_set_default_label())
-                        .disabled(pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            on_set_default(this, default_agent.clone(), cx)
-                        })),
-                    )
-                })
-                .child(
-                    Switch::new(SharedString::from(format!(
-                        "{id_prefix}-agent-switch-{agent_id}"
-                    )))
-                    .small()
-                    .checked(bound)
-                    .disabled(pending)
-                    .accessibility_label(SharedString::from(row.label.clone()))
-                    .on_click(cx.listener(
-                        move |this, checked, window, cx| {
-                            on_toggle(this, toggle_agent.clone(), *checked, window, cx)
-                        },
-                    )),
+            let state_label = if bound {
+                management_locale_text("Enabled", "已启用", "已啟用")
+            } else {
+                management_locale_text("Disabled", "未启用", "未啟用")
+            };
+            let tooltip = format!(
+                "{} · {}",
+                row.label,
+                if row.is_default {
+                    management_locale_text("Default", "默认", "預設")
+                } else {
+                    state_label
+                }
+            );
+            let capsule = management_agent_capsule(
+                AgentCapsule::new(
+                    SharedString::from(format!("{id_prefix}-agent-{agent_id}")),
+                    &agent_id,
+                    row.label,
+                    bound,
+                    SharedString::from(tooltip),
                 )
-                .into_any_element();
-            list = list.child(ws_row(
-                SharedString::from(format!("{id_prefix}-agent-{agent_id}")),
-                ws_agent_mark(&agent_id, cx),
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(div().min_w_0().truncate().text_sm().child(row.label))
-                    .when(row.is_default, |title| {
-                        title.child(
-                            Tag::color(ColorName::Neutral)
-                                .xsmall()
-                                .child(management_locale_text("Default", "默认", "預設")),
-                        )
-                    })
-                    .into_any_element(),
-                Some(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if bound {
-                            management_locale_text("Using it", "正在使用", "正在使用")
-                        } else {
-                            management_locale_text("Not using it", "未使用", "未使用")
-                        })
-                        .into_any_element(),
-                ),
-                trailing,
-                index == 0,
+                .disabled(pending),
+                cx.listener(move |this, _, window, cx| {
+                    toggle(this, toggle_agent.clone(), !bound, window, cx)
+                }),
                 cx,
-            ));
+            );
+            // The default marker is a sibling of the capsule, not a child: a
+            // control inside a control would hand the same press to two
+            // answers. A bound Agent keeps its marker next to its name, and an
+            // unbound one has no default to mark.
+            let mut entry = h_flex().flex_none().items_center().gap_0p5().child(capsule);
+            if row.is_default {
+                let tip = SharedString::from(management_set_default_label());
+                entry = entry.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "{id_prefix}-agent-default-mark-{agent_id}"
+                        )))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::StarFill)
+                                .size(px(12.0))
+                                .text_color(cx.theme().primary),
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+                );
+            } else if bound {
+                let default_agent = agent_id.clone();
+                let on_default = on_set_default.clone();
+                entry = entry.child(button_with_aria_label(
+                    Button::new(SharedString::from(format!(
+                        "{id_prefix}-agent-default-{default_agent}"
+                    )))
+                    .ghost()
+                    .compact()
+                    .size(px(20.0))
+                    .icon(
+                        Icon::new(IconName::Star)
+                            .size(px(12.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        on_default(this, default_agent.clone(), cx)
+                    })),
+                    management_set_default_label(),
+                ));
+            }
+            capsules = capsules.child(entry);
         }
-        list.into_any_element()
+        capsules.into_any_element()
     }
 }
 
@@ -997,17 +1001,22 @@ mod tests {
         assert!(super::ws_tabs_are_underlined());
     }
 
-    /// Agents bind and unbind through a switch on their own row; nothing on
-    /// the list unbinds on a stray click.
+    /// Agents bind and unbind by clicking their own capsule; nothing on the
+    /// list unbinds on a stray click, and the capsule carries the state.
     #[test]
-    fn agent_lists_use_switches_for_binding() {
+    fn agent_lists_use_capsules_for_binding() {
         let kit = include_str!("mod.rs");
         let list = kit
             .split_once("fn render_workspace_agent_list(")
-            .map(|(_, tail)| tail)
+            .and_then(|(_, tail)| tail.split_once("\n#[cfg(test)]"))
+            .map(|(body, _)| body)
             .unwrap();
-        assert!(list.contains("Switch::new("));
-        assert!(list.contains("on_toggle(this, toggle_agent.clone(), *checked, window, cx)"));
+        assert!(list.contains("management_agent_capsule("));
+        assert!(
+            !list.contains("Switch::new("),
+            "a feature's Agent audience is a row of capsules, not switches"
+        );
+        assert!(list.contains("toggle(this, toggle_agent.clone(), !bound, window, cx)"));
         assert!(PROVIDER.contains("try_unbind_model_source("));
         assert!(ROUTE_GROUP.contains("try_unbind_model_source("));
     }

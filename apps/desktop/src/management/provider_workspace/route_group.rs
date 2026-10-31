@@ -505,9 +505,9 @@ impl ManagementCenter {
             ws_section(
                 management_locale_text("Agents", "Agent", "Agent"),
                 Some(management_locale_text(
-                    "Turn an Agent on to let it ask for this group's models.",
-                    "打开开关即可让 Agent 使用该路由组的模型。",
-                    "打開開關即可讓 Agent 使用該路由組的模型。",
+                    "Click an Agent to let it ask for this group's models.",
+                    "点选 Agent 即可让它使用该路由组的模型。",
+                    "點選 Agent 即可讓它使用該路由組的模型。",
                 )),
                 None,
                 agent_list,
