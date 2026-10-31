@@ -23655,7 +23655,9 @@ impl ManagementCenter {
             // The tab, the search, and the block headings say what is here. The
             // sentence that used to sit between them explained the tabs to
             // someone already looking at them.
-            .children(search.map(|search| div().w_full().flex_none().child(search)))
+            // Switching the list and filtering it are two different gestures,
+            // so the field sits apart from the switch instead of touching it.
+            .children(search.map(|search| div().w_full().flex_none().pt_3().child(search)))
             .child(body)
             // A new source starts from an empty form, which is the one answer
             // neither tab's list can offer. Importing no longer lives in this
@@ -28846,6 +28848,9 @@ impl ManagementCenter {
         // Returning from a group authored in the chooser restores the step the
         // reader came from; a group opened from the Agent card has nothing behind
         // it in the overlay, so the button closes the dialog as it always did.
+        // It sits on the action bar's leading edge, the same place the Provider
+        // form puts its own: the way back and the way forward belong together,
+        // not one above the form and one below it.
         let back = Button::new("management-route-group-dialog-back")
             .small()
             .ghost()
@@ -28856,10 +28861,14 @@ impl ManagementCenter {
                 cx.listener(|this, _, window, cx| this.return_from_route_group_editor(window, cx)),
             )
             .into_any_element();
+        let footer = self.render_route_group_form_footer_with(
+            provider_workspace::RouteGroupFormScope::Dialog,
+            Some(back),
+            cx,
+        );
         v_flex()
             .size_full()
             .min_h_0()
-            .child(div().w_full().flex_none().pb_2().child(back))
             .child(
                 div()
                     .id("management-model-group-editor-scroll")
@@ -28869,16 +28878,7 @@ impl ManagementCenter {
                     .overflow_y_scroll()
                     .child(form),
             )
-            .child(
-                div()
-                    .w_full()
-                    .flex_none()
-                    .pt_3()
-                    .child(self.render_route_group_form_footer(
-                        provider_workspace::RouteGroupFormScope::Dialog,
-                        cx,
-                    )),
-            )
+            .child(div().w_full().flex_none().child(footer))
             .into_any_element()
     }
 
@@ -38411,7 +38411,9 @@ fn provider_source_section(
         .w_full()
         .min_w_0()
         .gap_1()
-        .pt_2()
+        // A block starts a little below the one above it: the space keeps a
+        // heading from reading as part of the previous block's rows.
+        .pt_3()
         .child(
             h_flex()
                 .w_full()
@@ -38424,7 +38426,7 @@ fn provider_source_section(
                     // block's name and its rows' names share one spine.
                     div()
                         .flex_none()
-                        .size(px(22.0))
+                        .size(px(24.0))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -38475,13 +38477,6 @@ fn provider_source_tile(
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let preset_id = preset.id.clone();
-    let badge = if preset.plan_note.is_some() {
-        Some(management_locale_text("Plan", "套餐", "套餐"))
-    } else if !preset.regions.is_empty() {
-        Some(management_locale_text("Region", "地区", "地區"))
-    } else {
-        None
-    };
     // One source is one line: its mark, then its name. The row takes an equal
     // share of a line that holds a fixed number of columns, so every line of the
     // library is the same height and the same widths, and the name is the whole
@@ -38505,7 +38500,7 @@ fn provider_source_tile(
                     this.choose_provider_preset(&preset_id, window, cx)
                 }))
         })
-        .child(provider_source_logo(preset, px(20.0), cx))
+        .child(provider_source_logo(preset, px(24.0), cx))
         .child(
             div()
                 .min_w_0()
@@ -38515,7 +38510,6 @@ fn provider_source_tile(
                 .font_medium()
                 .child(preset.display_name.clone()),
         )
-        .children(badge.map(|badge| Tag::color(ColorName::Neutral).xsmall().child(badge)))
         .into_any_element()
 }
 
@@ -46439,6 +46433,19 @@ mod gateway_surface_tests {
         // line stays short instead of stretching a row across the dialog.
         assert!(tile.contains("PROVIDER_SOURCE_COLUMNS"));
         assert!(tile.contains("presets.chunks(PROVIDER_SOURCE_COLUMNS)"));
+        // A row is its mark and its name: the Plan and Region tags that used to
+        // trail the name were a property of the record, and only a third of the
+        // rows had one, which is what made the columns look uneven.
+        let row = tile
+            .split_once("fn provider_source_tile(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// One preset's logo, drawn at its own colours")
+            })
+            .map(|(body, _)| body)
+            .expect("the source row should remain inspectable");
+        assert!(!row.contains("Tag::color"));
+        assert!(!row.contains("\"Plan\", \"套餐\""));
+        assert!(!row.contains("\"Region\", \"地区\""));
     }
 
     /// The filter matches what a user remembers: the id, the name, or the
