@@ -26,9 +26,8 @@ impl ManagementCenter {
     fn render_workspace_create_gallery(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.workspace_create_search.read(cx).value().to_string();
         let active = self.workspace_create_category;
-        let presets = vibex_core::provider_presets()
+        let presets = provider_preset_tiles(vibex_core::provider_presets(), &query)
             .into_iter()
-            .filter(|preset| provider_preset_matches(preset, &query))
             .filter(|preset| {
                 active.is_none_or(|category| provider_preset_category(preset) == category)
             })

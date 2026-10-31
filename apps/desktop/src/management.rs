@@ -1381,7 +1381,6 @@ pub struct ManagementCenter {
     /// form: the fields a preset fills are the ones most users cannot fill
     /// from memory, and a blank form hides that the choice existed.
     provider_preset_picker: bool,
-    provider_source_categories: BTreeSet<ProviderPresetCategory>,
     provider_detail_tab: ProviderDetailTab,
     route_group_detail_tab: RouteGroupDetailTab,
     /// The gateway detail's selected section, so its cards stay one page
@@ -2883,7 +2882,6 @@ impl ManagementCenter {
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
-            provider_source_categories: ProviderPresetCategory::ALL.into_iter().collect(),
             provider_detail_tab: ProviderDetailTab::Overview,
             route_group_detail_tab: RouteGroupDetailTab::Overview,
             gateway_detail_tab: GatewayDetailTab::Overview,
@@ -22835,7 +22833,7 @@ impl ManagementCenter {
     /// the fallback, and it keeps the preset library behind it.
     fn render_provider_picker_step(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.mutation.is_some();
@@ -23151,168 +23149,132 @@ impl ManagementCenter {
                 ),
         );
 
-        let mut category_chips = h_flex().w_full().flex_wrap().gap_1();
-        for category in ProviderPresetCategory::ALL {
-            let selected = self.provider_source_categories.contains(&category);
-            category_chips = category_chips.child(
-                Button::new(SharedString::from(format!(
-                    "management-provider-source-category-{:?}",
-                    category
-                )))
-                .xsmall()
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.ghost())
-                .label(category.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.provider_source_categories.contains(&category) {
-                        if this.provider_source_categories.len() > 1 {
-                            this.provider_source_categories.remove(&category);
-                        }
-                    } else {
-                        this.provider_source_categories.insert(category);
-                    }
-                    cx.notify();
-                })),
-            );
-        }
         let recent_presets = self
             .provider_recent_presets
             .iter()
             .filter_map(|id| vibex_core::provider_preset(id))
             .collect::<Vec<_>>();
-        let mut recent_row = h_flex().w_full().flex_wrap().gap_1();
-        if !recent_presets.is_empty() {
-            recent_row = recent_row.child(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text("Recent", "最近使用", "最近使用")),
-            );
-            for preset in recent_presets {
-                let preset_id = preset.id.clone();
-                recent_row = recent_row.child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-recent-{}",
-                        preset.id
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .icon(Icon::default().path(
-                        provider_preset_icon_path(&preset).unwrap_or("icons/vibex/database.svg"),
-                    ))
-                    .label(preset.display_name)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_provider_preset(&preset_id, window, cx)
-                    })),
-                );
-            }
-        }
-        let preset_tiles = provider_preset_tiles(
-            vibex_core::provider_presets(),
-            &query,
-            &self.provider_source_categories,
-        );
-        let mut tile_grid = h_flex().w_full().flex_wrap().gap_2();
-        for preset in &preset_tiles {
+        let matching = provider_preset_tiles(vibex_core::provider_presets(), &query);
+        let mut recent_row = h_flex().w_full().min_w_0().flex_wrap().gap_1();
+        for preset in &recent_presets {
             let preset_id = preset.id.clone();
-            let badge = if preset.plan_note.is_some() {
-                Some(management_locale_text("Plan", "套餐", "套餐"))
-            } else if !preset.regions.is_empty() {
-                Some(management_locale_text("Region", "地区", "地區"))
-            } else if preset.no_key {
-                Some(management_locale_text("Local", "本机", "本機"))
-            } else if preset.catalog_id.is_some() {
-                Some(management_locale_text("Official", "官方", "官方"))
-            } else {
-                None
-            };
-            let detail = if preset.no_key {
-                management_locale_text("No key needed", "无需 Key", "無需 Key").to_string()
-            } else {
-                preset
-                    .catalog_id
-                    .clone()
-                    .or_else(|| {
-                        preset
-                            .endpoints
-                            .values()
-                            .next()
-                            .map(|url| provider_preset_host(url))
-                    })
-                    .unwrap_or_else(|| management_locale_text("Preset", "预设", "預設").to_string())
-            };
-            tile_grid =
-                tile_grid.child(
-                    v_flex()
-                        .id(SharedString::from(format!(
-                            "management-provider-preset-{}",
-                            preset.id
-                        )))
-                        .w(px(172.0))
-                        .min_h(px(88.0))
-                        .gap_1p5()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p_2()
-                        .when(!pending, |this| {
-                            this.cursor_pointer()
-                                .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.choose_provider_preset(&preset_id, window, cx)
-                                }))
-                        })
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .gap_2()
-                                .child(provider_preset_logo(preset, cx))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_sm()
-                                        .font_medium()
-                                        .child(preset.display_name.clone()),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(detail),
-                                )
-                                .children(badge.map(|badge| {
-                                    Tag::color(ColorName::Neutral).xsmall().child(badge)
-                                })),
-                        ),
-                );
+            let icon = Icon::default()
+                .path(provider_preset_icon_path(preset).unwrap_or("icons/vibex/database.svg"));
+            recent_row = recent_row.child(
+                Button::new(SharedString::from(format!(
+                    "management-provider-recent-{}",
+                    preset.id
+                )))
+                .xsmall()
+                .ghost()
+                .icon(icon)
+                .label(preset.display_name.clone())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_provider_preset(&preset_id, window, cx)
+                })),
+            );
         }
-        let _ = window;
+
+        // The library is read in kinds, not as one flat grid: a vendor's own
+        // API, a relay, and a server on this machine are different answers to
+        // the same question, and a name alone does not say which is which.
+        // Every block therefore leads with a mark and the sentence its rows
+        // share, and a kind the search emptied is left out entirely.
+        let mut sources = v_flex().w_full().min_w_0().gap_1();
+        for category in ProviderPresetCategory::ALL {
+            let mut tiles = h_flex().w_full().min_w_0().flex_wrap().gap_1();
+            let mut listed = 0usize;
+            for preset in matching
+                .iter()
+                .filter(|preset| provider_preset_category(preset) == category)
+            {
+                listed += 1;
+                tiles = tiles.child(provider_source_tile(preset, pending, cx));
+            }
+            if listed == 0 {
+                continue;
+            }
+            sources = sources.child(provider_source_section(
+                SharedString::from(format!(
+                    "management-provider-sources-{}",
+                    category.metadata_value()
+                )),
+                category.icon(),
+                category.label(),
+                category.hint(),
+                tiles.into_any_element(),
+                cx,
+            ));
+        }
+
+        let mut sections = v_flex().w_full().min_w_0().gap_1();
+        if !recent_presets.is_empty() {
+            sections = sections.child(provider_source_section(
+                SharedString::from("management-provider-sources-recent"),
+                "icons/vibex/clock.svg",
+                management_locale_text("Recent", "最近使用", "最近使用"),
+                "",
+                recent_row.into_any_element(),
+                cx,
+            ));
+        }
+        if !existing.is_empty() {
+            sections = sections.child(provider_source_section(
+                SharedString::from("management-provider-sources-existing"),
+                "icons/vibex/database.svg",
+                management_locale_text("Already configured", "已配置的供应商", "已設定的供應商"),
+                management_locale_text(
+                    "Shared records you can reuse",
+                    "已有的共享记录，可直接复用",
+                    "既有的共用記錄，可直接重用",
+                ),
+                rows.into_any_element(),
+                cx,
+            ));
+        }
+        // A route group is a model source like the others, and composing one is
+        // available even before any group exists, so this block never hides.
+        sections = sections.child(provider_source_section(
+            SharedString::from("management-provider-sources-groups"),
+            "icons/vibex/git-branch.svg",
+            management_locale_text("Route groups", "路由组", "路由組"),
+            management_locale_text(
+                "One model source composed from Providers",
+                "由多个供应商组合成一个模型来源",
+                "由多個供應商組合成一個模型來源",
+            ),
+            group_rows.into_any_element(),
+            cx,
+        ));
+        sections = sections.child(sources);
+        if matching.is_empty() {
+            sections = sections.child(compact_empty_state(
+                management_locale_text("No matching sources", "没有匹配的来源", "沒有符合的來源"),
+                management_locale_text(
+                    "Try another name, host, or kind.",
+                    "换一个名称、地址或类别试试。",
+                    "換一個名稱、位址或類別試試。",
+                ),
+                cx,
+            ));
+        }
 
         v_flex()
             .w_full()
             .min_h_0()
             .flex_1()
             .gap_2()
-            .child(management_field_label(management_locale_text(
-                "Use a Provider",
-                "使用供应商",
-                "使用供應商",
-            )))
-            .child(recent_row)
-            .child(category_chips)
+            .child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Reuse a saved Provider, choose a source below, or start from an empty form.",
+                        "可以复用已有供应商、选择下方来源，或从空表单开始。",
+                        "可以重用既有供應商、選擇下方來源，或從空白表單開始。",
+                    )),
+            )
             .child(management_search_input(&self.provider_preset_query, cx))
             .child(
                 div()
@@ -23322,55 +23284,8 @@ impl ManagementCenter {
                     .flex_1()
                     .overflow_y_scrollbar()
                     .scroll_gutter()
-                    .pb_2()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Already configured",
-                                        "已配置的供应商",
-                                        "已設定的供應商",
-                                    )),
-                            )
-                            .child(rows)
-                            .child(group_rows)
-                            .child(
-                                div()
-                                    .px_2()
-                                    .pt_2()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Sources",
-                                        "供应商来源",
-                                        "供應商來源",
-                                    )),
-                            )
-                            .child(tile_grid)
-                            .when(preset_tiles.is_empty(), |list| {
-                                list.child(compact_empty_state(
-                                    management_locale_text(
-                                        "No matching sources",
-                                        "没有匹配的来源",
-                                        "沒有符合的來源",
-                                    ),
-                                    management_locale_text(
-                                        "Try another name, host, or category.",
-                                        "换一个名称、地址或类别试试。",
-                                        "換一個名稱、位址或類別試試。",
-                                    ),
-                                    cx,
-                                ))
-                            }),
-                    ),
+                    .pb_1()
+                    .child(sections),
             )
             // Importing no longer lives in this step. It reads every Agent's
             // native configuration and writes shared records, so it belongs to
@@ -23382,8 +23297,9 @@ impl ManagementCenter {
                 h_flex()
                     .id("management-provider-preset-custom")
                     .w_full()
+                    .min_w_0()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .pt_2()
@@ -23395,13 +23311,24 @@ impl ManagementCenter {
                             }))
                     })
                     .child(
-                        Icon::new(IconName::Plus)
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
+                        div()
+                            .flex_none()
+                            .size(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted.opacity(0.45))
+                            .child(
+                                Icon::new(IconName::Plus)
+                                    .size(px(13.0))
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
                     )
                     .child(
                         v_flex()
                             .min_w_0()
+                            .flex_1()
                             .gap_0p5()
                             .child(div().text_sm().font_medium().child(management_locale_text(
                                 "Custom provider",
@@ -23410,14 +23337,21 @@ impl ManagementCenter {
                             )))
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(management_locale_text(
-                                        "Start from an empty form",
-                                        "从零开始配置",
-                                        "從零開始設定",
+                                        "Any OpenAI- or Anthropic-compatible address",
+                                        "任意兼容 OpenAI 或 Anthropic 的地址",
+                                        "任意相容 OpenAI 或 Anthropic 的位址",
                                     )),
                             ),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(14.0))
+                            .text_color(cx.theme().muted_foreground),
                     ),
             )
             .into_any_element()
@@ -34663,6 +34597,42 @@ impl ProviderPresetCategory {
             Self::Local => management_locale_text("Local", "本机", "本機"),
         }
     }
+
+    /// The sentence under the category's name, saying what its rows have in
+    /// common. A name alone does not tell a reader why one address is a vendor
+    /// and another is a relay, so the chooser says it before the rows.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Vendor => management_locale_text(
+                "The makers' own APIs",
+                "模型厂商自己的接口",
+                "模型廠商自己的介面",
+            ),
+            Self::Relay => management_locale_text(
+                "One key, many vendors",
+                "一个密钥，多家模型",
+                "一個金鑰，多家模型",
+            ),
+            Self::Local => management_locale_text(
+                "Servers running on this machine, no key",
+                "在本机运行的服务，无需密钥",
+                "在本機執行的服務，無需金鑰",
+            ),
+        }
+    }
+
+    /// The mark a category's heading carries, beside its name.
+    fn icon(self) -> &'static str {
+        match self {
+            // A vendor is a company; two boxes read as the organisations a
+            // Provider list is made of.
+            Self::Vendor => "icons/vibex/boxes.svg",
+            // A relay forwards one address to another.
+            Self::Relay => "icons/vibex/git-branch.svg",
+            // A local server is hardware in front of the reader.
+            Self::Local => "icons/vibex/server.svg",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37744,29 +37714,6 @@ fn provider_preset_caveat_text(caveat: vibex_core::ProviderPresetCaveat) -> &'st
     }
 }
 
-/// One preset as the picker lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
-struct ProviderPresetRow {
-    id: String,
-    display_name: String,
-    /// The line under the name: where the vendor answers, or why it needs no
-    /// Key at all.
-    detail: String,
-    /// The plan's own price description. Vendor copy, not a computed amount.
-    plan_note: Option<String>,
-    /// Whether choosing this puts a caveat above the model list.
-    has_caveat: bool,
-}
-
-/// One titled block of the picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
-struct ProviderPresetGroup {
-    title: &'static str,
-    rows: Vec<ProviderPresetRow>,
-}
-
 /// Whether a preset answers to a filter term.
 ///
 /// The term is matched against the three things a user remembers about a
@@ -37827,18 +37774,25 @@ fn provider_preset_category(preset: &vibex_core::ProviderPreset) -> ProviderPres
     ProviderPresetCategory::Vendor
 }
 
+/// The presets a search leaves, in the order they ship.
+///
+/// The picker renders one block per kind, so the filter answers only *which*
+/// presets match; the kind is read again when the blocks are built.
 fn provider_preset_tiles(
     presets: Vec<vibex_core::ProviderPreset>,
     query: &str,
-    categories: &BTreeSet<ProviderPresetCategory>,
 ) -> Vec<vibex_core::ProviderPreset> {
     presets
         .into_iter()
         .filter(|preset| provider_preset_matches(preset, query))
-        .filter(|preset| categories.contains(&provider_preset_category(preset)))
         .collect()
 }
 
+/// The bundled mark for the presets that ship their own logo.
+///
+/// Only the few whose mark is not in the catalogue bundle need an entry here;
+/// everything else resolves through [`provider_preset_logo`]. The Recent row is
+/// a compact list of buttons, so it takes the path rather than the tile.
 fn provider_preset_icon_path(preset: &vibex_core::ProviderPreset) -> Option<&'static str> {
     match preset.id.as_str() {
         "openai" => Some("icons/vibex/openai.svg"),
@@ -37849,116 +37803,169 @@ fn provider_preset_icon_path(preset: &vibex_core::ProviderPreset) -> Option<&'st
     }
 }
 
-fn provider_preset_logo(
-    preset: &vibex_core::ProviderPreset,
-    cx: &mut Context<ManagementCenter>,
+fn provider_preset_logo(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &App) -> AnyElement {
+    // A preset has no record yet, so the mark is looked up from the ids the
+    // record would be written with. That keeps the tile a user picks and the
+    // row it later becomes on the same helper.
+    let profile = vibex_core::ModelProviderProfile {
+        display_name: preset.display_name.clone(),
+        vendor_hint: Some(preset.id.clone()),
+        metadata: vibex_core::ModelProviderMetadata {
+            catalog_id: preset.catalog_id.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    provider_logo_tile(&profile, size, cx)
+}
+
+/// One titled block of the source chooser: a mark, a name, the sentence its
+/// rows share, then the rows themselves.
+///
+/// The library is long, so the chooser is read as kinds rather than as one
+/// undifferentiated grid. The heading is the same for an existing record, a
+/// route group, and a preset library, which is what makes the three read as
+/// answers to one question instead of three separate lists.
+fn provider_source_section(
+    id: SharedString,
+    icon: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    body: AnyElement,
+    cx: &App,
 ) -> AnyElement {
-    let path = provider_preset_icon_path(preset);
-    if let Some(path) = path {
-        return div()
-            .flex_none()
-            .size(px(30.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.0))
-            .bg(cx.theme().muted.opacity(0.45))
-            .child(
-                Icon::default()
-                    .path(path)
-                    .size(px(22.0))
-                    .text_color(cx.theme().foreground),
-            )
-            .into_any_element();
-    }
-    let initial = preset
-        .display_name
-        .chars()
-        .next()
-        .map(|character| character.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string());
-    div()
-        .flex_none()
-        .size(px(30.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(8.0))
-        .bg(cx.theme().muted.opacity(0.45))
-        .text_sm()
-        .font_semibold()
-        .text_color(cx.theme().muted_foreground)
-        .child(initial)
+    v_flex()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .py_1()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(Icon::default().path(icon).size(px(13.0))),
+                )
+                .child(div().flex_none().text_sm().font_semibold().child(title))
+                .when(!hint.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(hint),
+                    )
+                }),
+        )
+        .child(body)
         .into_any_element()
 }
 
-/// What the picker shows for one preset, after the filter.
+/// One preset as a quiet row: its mark, its name, and the line under it.
 ///
-/// Vendors come first because that is what most Providers are; local servers
-/// are their own group because "no Key" is their defining difference; plans are
-/// last because their limits are the thing a user has to read before choosing.
-#[cfg(test)]
-fn provider_preset_picker_groups(
-    presets: Vec<vibex_core::ProviderPreset>,
-    query: &str,
-) -> Vec<ProviderPresetGroup> {
-    let mut vendors = Vec::new();
-    let mut local = Vec::new();
-    let mut plans = Vec::new();
-    for preset in presets {
-        if !provider_preset_matches(&preset, query) {
-            continue;
-        }
-        let is_plan = preset.plan_note.is_some() || preset.only.is_some();
-        let detail = if preset.no_key {
-            management_locale_text(
-                "Runs on this machine · no key needed",
-                "本机运行 · 无需 Key",
-                "本機執行 · 無需 Key",
-            )
-            .to_string()
-        } else if let Some(plan_note) = preset.plan_note.as_deref() {
-            plan_note.to_string()
-        } else if let Some(website) = preset.website.as_deref() {
-            provider_preset_host(website)
-        } else {
-            preset
-                .endpoints
-                .values()
-                .next()
-                .map(|url| provider_preset_host(url))
-                .unwrap_or_default()
-        };
-        let row = ProviderPresetRow {
-            id: preset.id.clone(),
-            display_name: preset.display_name.clone(),
-            detail,
-            plan_note: preset.plan_note.clone(),
-            has_caveat: !preset.caveats.is_empty(),
-        };
-        if is_plan {
-            plans.push(row);
-        } else if preset.no_key {
-            local.push(row);
-        } else {
-            vendors.push(row);
-        }
-    }
-    [
-        (management_locale_text("Vendors", "厂商", "廠商"), vendors),
-        (
-            management_locale_text("Local services", "本地服务", "本機服務"),
-            local,
-        ),
-        (
-            management_locale_text("Third-party plans", "第三方套餐", "第三方套餐"),
-            plans,
-        ),
-    ]
-    .into_iter()
-    .filter(|(_, rows)| !rows.is_empty())
-    .map(|(title, rows)| ProviderPresetGroup { title, rows })
-    .collect()
+/// A row rather than a card: the picker lists dozens of sources, and framing
+/// each one turns the choice into a wall of boxes. The row keeps a fixed mark
+/// slot so names line up across kinds, and the whole row is the hit target.
+fn provider_source_tile(
+    preset: &vibex_core::ProviderPreset,
+    pending: bool,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let preset_id = preset.id.clone();
+    let detail = if preset.no_key {
+        management_locale_text("No key needed", "无需 Key", "無需 Key").to_string()
+    } else if let Some(plan_note) = preset.plan_note.as_deref() {
+        plan_note.to_string()
+    } else {
+        preset
+            .catalog_id
+            .clone()
+            .or_else(|| {
+                preset
+                    .endpoints
+                    .values()
+                    .next()
+                    .map(|url| provider_preset_host(url))
+            })
+            .unwrap_or_else(|| management_locale_text("Preset", "预设", "預設").to_string())
+    };
+    let badge = if preset.plan_note.is_some() {
+        Some(management_locale_text("Plan", "套餐", "套餐"))
+    } else if !preset.regions.is_empty() {
+        Some(management_locale_text("Region", "地区", "地區"))
+    } else {
+        None
+    };
+    // A row that shares its line: the basis is wide enough for a name and its
+    // second line, so a wide dialog reads three sources across instead of
+    // stacking dozens of full-width rows, while a narrow one falls back to a
+    // single column without any breakpoint.
+    h_flex()
+        .id(SharedString::from(format!(
+            "management-provider-preset-{}",
+            preset.id
+        )))
+        .min_w_0()
+        .flex_grow(1.0)
+        .flex_basis(rems(13.0))
+        .min_w(rems(13.0))
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .rounded(cx.theme().radius)
+        .when(!pending, |this| {
+            this.cursor_pointer()
+                .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_provider_preset(&preset_id, window, cx)
+                }))
+        })
+        .child(provider_preset_logo(preset, px(22.0), cx))
+        .child(
+            v_flex()
+                .min_w_0()
+                .flex_1()
+                .gap_0()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_medium()
+                                .child(preset.display_name.clone()),
+                        )
+                        .children(
+                            badge.map(|badge| Tag::color(ColorName::Neutral).xsmall().child(badge)),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(detail),
+                ),
+        )
+        .into_any_element()
 }
 
 /// The Model entries a preset wants for one fetched catalogue.
@@ -45487,7 +45494,7 @@ mod gateway_surface_tests {
     }
 
     /// Every preset lands in exactly one group, and the grouping says what the
-    /// rows have in common: a vendor, a local server, or a plan.
+    /// rows have in common: a vendor, a relay, or a local server.
     #[test]
     fn the_source_step_has_three_categories_and_logo_tiles() {
         let source = include_str!("management.rs");
@@ -45517,9 +45524,8 @@ mod gateway_surface_tests {
             provider_preset_category(ollama),
             ProviderPresetCategory::Local
         );
-        let categories = ProviderPresetCategory::ALL.into_iter().collect();
         assert!(
-            provider_preset_tiles(presets, "ollama", &categories)
+            provider_preset_tiles(presets, "ollama")
                 .iter()
                 .any(|preset| preset.id == "ollama")
         );
@@ -45542,54 +45548,44 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-recents.json"));
     }
 
+    /// Every preset lands in exactly one kind, and every kind says in words
+    /// what its rows have in common.
+    ///
+    /// The chooser reads as blocks, so a preset that matched the search but
+    /// belonged to no block would silently disappear from the library.
     #[test]
-    fn the_preset_picker_groups_vendors_local_services_and_plans() {
-        let groups = provider_preset_picker_groups(vibex_core::provider_presets(), "");
-        assert_eq!(groups.len(), 3, "a full library fills all three groups");
-
-        let ids = groups
-            .iter()
-            .flat_map(|group| group.rows.iter().map(|row| row.id.clone()))
-            .collect::<Vec<_>>();
+    fn the_preset_picker_files_every_preset_under_one_kind() {
+        let presets = vibex_core::provider_presets();
+        let mut counts = std::collections::BTreeMap::new();
+        for preset in &presets {
+            *counts
+                .entry(provider_preset_category(preset))
+                .or_insert(0usize) += 1;
+        }
         assert_eq!(
-            ids.len(),
-            vibex_core::provider_presets().len(),
-            "no preset may be listed twice or dropped"
+            counts.values().sum::<usize>(),
+            presets.len(),
+            "every preset must belong to exactly one kind"
         );
-        assert_eq!(
-            ids.iter().collect::<BTreeSet<_>>().len(),
-            ids.len(),
-            "the picker must not list the same preset in two groups"
-        );
+        assert!(counts.len() >= 3, "all three kinds ship presets");
 
-        let group_of = |id: &str| {
-            groups
-                .iter()
-                .position(|group| group.rows.iter().any(|row| row.id == id))
-                .unwrap_or_else(|| panic!("{id} is missing from the picker"))
-        };
-        assert_eq!(group_of("deepseek"), 0, "a vendor is a vendor");
-        assert_eq!(group_of("ollama"), 1, "a local server needs no key");
-        assert_eq!(
-            group_of("clinepass"),
-            2,
-            "a plan carries limits a vendor row has no room for"
-        );
+        // Each kind is named, explained, and given a mark: the heading is what
+        // keeps a long library readable, so none of the three may be empty.
+        let mut icons = BTreeSet::new();
+        for category in ProviderPresetCategory::ALL {
+            assert!(!category.label().trim().is_empty());
+            assert!(!category.hint().trim().is_empty());
+            assert!(icons.insert(category.icon()), "each kind has its own mark");
+            assert!(
+                counts.contains_key(&category),
+                "{} ships no preset",
+                category.label()
+            );
+        }
 
-        let ollama = groups[1]
-            .rows
-            .iter()
-            .find(|row| row.id == "ollama")
-            .expect("the local group lists the local server");
-        assert!(
-            ollama.detail.to_lowercase().contains("key"),
-            "the local row must say why it has no key field: {}",
-            ollama.detail
-        );
-        assert!(
-            groups[2].rows.iter().any(|row| row.plan_note.is_some()),
-            "a plan row keeps the vendor's own price description"
-        );
+        let tile = include_str!("management.rs");
+        assert!(tile.contains("provider_source_section("));
+        assert!(tile.contains("provider_source_tile("));
     }
 
     /// The filter matches what a user remembers: the id, the name, or the
@@ -45604,10 +45600,10 @@ mod gateway_surface_tests {
         assert!(provider_preset_matches(&deepseek, "api.deepseek.com"));
         assert!(!provider_preset_matches(&deepseek, "gemini"));
 
-        let filtered = provider_preset_picker_groups(presets.clone(), "cline");
+        let filtered = provider_preset_tiles(presets.clone(), "cline");
         let ids = filtered
             .iter()
-            .flat_map(|group| group.rows.iter().map(|row| row.id.clone()))
+            .map(|preset| preset.id.clone())
             .collect::<Vec<_>>();
         assert!(
             ids.contains(&"clinepass".to_string()),
@@ -45618,10 +45614,10 @@ mod gateway_surface_tests {
             "a filter must actually filter: {ids:?}"
         );
 
-        let nothing = provider_preset_picker_groups(presets, "not-a-vendor-anywhere");
+        let nothing = provider_preset_tiles(presets, "not-a-vendor-anywhere");
         assert!(
             nothing.is_empty(),
-            "an unmatched term shows no group at all"
+            "an unmatched term leaves no source to show"
         );
     }
 
@@ -45676,8 +45672,20 @@ mod gateway_surface_tests {
         assert!(picker.contains("use_existing_provider(profile_id.clone(), cx)"));
         assert!(picker.contains("Already configured"));
         assert!(picker.contains("provider_preset_tiles"));
-        assert!(picker.contains("provider_preset_logo"));
-        assert!(picker.contains("management-provider-source-category"));
+        // Each source is one row in a kind's block, so the row's own mark and
+        // the block's heading live in the helpers the step calls, not inline.
+        assert!(picker.contains("provider_source_tile("));
+        assert!(picker.contains("provider_source_section("));
+        assert!(picker.contains("ProviderPresetCategory::ALL"));
+        let tile = source
+            .split_once("fn provider_source_tile(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The Model entries a preset wants for one fetched catalogue.")
+            })
+            .map(|(body, _)| body)
+            .expect("the source row should remain inspectable");
+        assert!(tile.contains("provider_preset_logo("));
+        assert!(tile.contains("choose_provider_preset("));
         assert!(!picker.contains("management-provider-source-scope-"));
         // The chooser also answers the other half of the same question: a route
         // group is a model source too, so referencing one and creating one sit
