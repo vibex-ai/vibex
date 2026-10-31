@@ -881,6 +881,14 @@ mod tests {
         assert!(card.contains("paint_empty_source_border("));
         assert!(card.contains("Icon::new(IconName::Plus)"));
         assert!(card.contains(".on_click(on_click)"));
+        // The card is one line: the section heading above it already names the
+        // list, so a caption underneath would restate context instead of
+        // adding a decision.
+        assert!(
+            !card.contains("subtitle"),
+            "the add card carries its command, not an explanatory caption"
+        );
+        assert!(!card.contains(".text_xs()"));
     }
 
     /// Providers and route groups share one selection mode and one batch strip,

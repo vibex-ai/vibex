@@ -95,11 +95,6 @@ impl ManagementCenter {
                     self.render_workspace_sidebar_add_card(
                         "management-workspace-providers-empty",
                         management_locale_text("New Provider", "新建供应商", "新增供應商"),
-                        management_locale_text(
-                            "Give Agents a model source",
-                            "为 Agent 提供可用的模型来源",
-                            "為 Agent 提供可用的模型來源",
-                        ),
                         cx.listener(|this, _, window, cx| {
                             this.open_provider_create_page(None, window, cx)
                         }),
@@ -159,11 +154,6 @@ impl ManagementCenter {
                     self.render_workspace_sidebar_add_card(
                         "management-workspace-routes-empty",
                         management_locale_text("New route group", "新建路由组", "新增路由組"),
-                        management_locale_text(
-                            "Join models from several Providers under one name",
-                            "把多个供应商的模型合成一个模型名",
-                            "把多個供應商的模型合成一個模型名",
-                        ),
                         cx.listener(|this, _, window, cx| {
                             this.open_route_group_page_editor(window, cx)
                         }),
@@ -549,14 +539,14 @@ impl ManagementCenter {
     ///
     /// It is the same dashed, card-shaped invitation the Agent detail's model
     /// Provider panel draws: a full row the whole of which opens the editor,
-    /// rather than a paragraph that reads like a warning. The dimensions match
-    /// [`workspace_nav_row`] so an empty list and a filled one keep the same
-    /// rhythm in the column.
+    /// rather than a paragraph that reads like a warning. It carries only the
+    /// command's own name — the section heading above it already says which
+    /// list the new record joins, so a second explanatory line would repeat
+    /// that context instead of adding a decision.
     fn render_workspace_sidebar_add_card(
         &self,
         id: &'static str,
         label: &'static str,
-        subtitle: &'static str,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -566,12 +556,11 @@ impl ManagementCenter {
             .relative()
             .w_full()
             .min_w_0()
-            .min_h(px(64.0))
+            .min_h(px(56.0))
             .flex()
-            .flex_col()
             .items_center()
             .justify_center()
-            .gap_1()
+            .gap_2()
             .p_2()
             .rounded(px(8.0))
             .bg(cx.theme().background.opacity(0.45))
@@ -579,32 +568,18 @@ impl ManagementCenter {
             .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
             .on_click(on_click)
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .size(px(16.0))
-                            .text_color(cx.theme().muted_foreground.opacity(0.8)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                            .child(label),
-                    ),
+                Icon::new(IconName::Plus)
+                    .size(px(16.0))
+                    .text_color(cx.theme().muted_foreground.opacity(0.8)),
             )
             .child(
                 div()
                     .min_w_0()
-                    .max_w_full()
                     .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground.opacity(0.8))
-                    .child(subtitle),
+                    .text_sm()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground.opacity(0.9))
+                    .child(label),
             )
             .child(
                 canvas(
