@@ -5509,7 +5509,9 @@ ProviderConfigService::{
   Creating from a preset writes the protocol into `providerOptions["wireApi"]`
   explicitly: the editor's last-resort fallback is "the first protocol that has a
   URL", which otherwise relabels an Anthropic Provider as Chat Completions on
-  reopen.
+  reopen. The v2 record a preset creates carries the same declaration on its
+  API endpoint (`wireProtocolId`) and on each Model's `wireApi` metadata, so a
+  saved record is never protocol-less.
 - **A plan preset states what its vendor's list cannot.** A plan that resells
   models carries its own `models`, an `only` prefix that keeps a metered model
   from being mistaken for a covered one, and a caveat. A fetch that returns none
@@ -6510,6 +6512,19 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - Shared discovery resolves the first API-credential Secret from the v2
   credential references and builds a transient v1 Profile only to reuse the
   protocol-specific fetch path. The transient Profile is never persisted.
+- A shared Provider has no Agent, so it has no descriptor to inherit a protocol
+  from. The record's own declaration is authoritative and travels into the
+  transient Profile: a Model's `wireApi` metadata, else an API endpoint's
+  `wireProtocolId`. When neither exists, discovery asks the endpoint in turn —
+  Chat Completions, Responses, Messages, Gemini — and records the answer as a
+  `wireProtocolId` diagnostic. A record that declares its protocol keeps the
+  single-request path.
+- The walk ends early only on a transport failure, because a host that never
+  answered cannot answer the next protocol. An HTTP answer keeps it going: the
+  protocols do not share an auth header, so a relay that only speaks Messages
+  refuses the bearer request with `401` before its own route is tried.
+- The Provider editor's unsaved draft resolves its protocol the same way, since
+  the Agent it borrows may speak no protocol for the address the user typed.
 - A shared test is a model-list probe: it proves the endpoint, protocol, and
   Secret without sending a prompt or spending completion tokens.
 - Existing configured Models are carried over by id when a refresh returns
@@ -6526,7 +6541,8 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - `vibex-model-catalog`: status reports missing/fresh/stale and its fetch time.
 - `vibex-config-switch`: shared discovery maps credentials/endpoints and carries
   existing model metadata; a missing Secret reports the normal missing-secret
-  error.
+  error; a persisted record with an address, a Key, and no protocol fetches its
+  list instead of failing `agent_model_provider_protocol_missing`.
 - `vibex-desktop`: shared detail exposes Test and Refresh models; the Providers
   page shows catalogue freshness and a refresh control.
 

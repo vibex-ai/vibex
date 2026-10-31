@@ -956,7 +956,10 @@ impl ProviderConfigService {
             ));
         }
         let profile = draft_provider_profile(&request);
-        let (models, diagnostics) = fetch_provider_models_with_secret(&profile, Some(api_key))?;
+        // A draft resolves its protocol the same way a shared Provider's does:
+        // a declaration wins, and one that neither the draft nor its Agent
+        // declares asks the endpoint until one answers.
+        let (models, diagnostics) = fetch_models_resolving_protocol(&profile, Some(api_key))?;
         Ok(AgentModelProviderDraftFetchModelsResponse {
             agent_id: request.agent_id,
             models: models
@@ -997,10 +1000,11 @@ impl ProviderConfigService {
                 request.model_provider_profile_id.as_str(),
             )
         })?;
-        let probe = shared_provider_probe_profile(&profile)?;
         let secret = shared_provider_api_key(&profile)?;
-        let (models, mut diagnostics) =
-            fetch_provider_models_with_secret(&probe, secret.as_deref())?;
+        let (models, mut diagnostics) = fetch_models_resolving_protocol(
+            &shared_provider_probe_profile(&profile)?,
+            secret.as_deref(),
+        )?;
         let existing = profile
             .configured_models
             .iter()
@@ -1100,8 +1104,10 @@ impl ProviderConfigService {
             })?;
         let checked_at_ms = unix_timestamp_ms();
         let secret = shared_provider_credential_secret(credential)?;
-        let probe = shared_provider_probe_profile(&profile)?;
-        match fetch_provider_models_with_secret(&probe, secret.as_deref()) {
+        match fetch_models_resolving_protocol(
+            &shared_provider_probe_profile(&profile)?,
+            secret.as_deref(),
+        ) {
             Ok((models, mut diagnostics)) => {
                 diagnostics.push(vibex_core::ProviderBindingMetadata {
                     key: "modelCount".to_string(),
@@ -7076,6 +7082,12 @@ fn shared_provider_credential_secret(
 }
 
 /// Builds the transient v1 Profile a shared Provider's fetch/test reuses.
+///
+/// A shared record states its protocol on its endpoints, not in a `wireApi`
+/// option the way a v1 Profile does. The probe is the adapter between the two
+/// shapes, so an endpoint that names a protocol is carried over as the pin the
+/// fetch path reads; otherwise a record that is perfectly well described would
+/// still look protocol-less to it.
 fn shared_provider_probe_profile(
     profile: &vibex_core::ModelProviderProfile,
 ) -> VibexResult<ProviderProfile> {
@@ -7114,6 +7126,16 @@ fn shared_provider_probe_profile(
         })
         .collect();
     let mut options = ProviderOptions::empty();
+    // The record's own declaration: a shared Provider names its protocol on the
+    // endpoint, and the fetch path reads the v1 `wireApi` pin. Carrying one to
+    // the other is what lets a record with a protocol-specific address be
+    // fetched without probing at all.
+    if let Some(wire_api) = shared_provider_declared_wire_api(profile) {
+        options.entries.push(vibex_core::ProviderBindingMetadata {
+            key: "wireApi".to_string(),
+            value: wire_api.wire_protocol_id().to_string(),
+        });
+    }
     for endpoint in &profile.endpoints {
         if let Some(wire_protocol_id) = endpoint.wire_protocol_id.as_deref()
             && let Some(wire_api) =
@@ -7158,6 +7180,150 @@ fn draft_provider_profile(request: &AgentModelProviderDraftFetchModelsRequest) -
         .clone()
         .unwrap_or_else(ProviderOptions::empty);
     profile
+}
+
+/// The protocol a shared record itself declares, if any.
+///
+/// A v2 Provider names its API on the endpoint (`wireProtocolId`), or on a
+/// Model's `wireApi` metadata. Both are declarations a save recorded, so they
+/// outrank asking the endpoint what it speaks.
+fn shared_provider_declared_wire_api(
+    profile: &vibex_core::ModelProviderProfile,
+) -> Option<vibex_core::ProviderModelWireApi> {
+    let declared_model = profile
+        .default_model_id
+        .as_deref()
+        .and_then(|default_model| {
+            profile
+                .configured_models
+                .iter()
+                .find(|model| model.id == default_model && model.enabled)
+        })
+        .and_then(shared_model_wire_api)
+        .or_else(|| {
+            profile
+                .configured_models
+                .iter()
+                .find(|model| model.enabled && shared_model_wire_api(model).is_some())
+                .and_then(shared_model_wire_api)
+        });
+    declared_model.or_else(|| {
+        profile
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == vibex_core::ModelProviderEndpointKind::Api)
+            .find_map(|endpoint| {
+                endpoint
+                    .wire_protocol_id
+                    .as_deref()
+                    .and_then(vibex_core::ProviderModelWireApi::from_wire_protocol_id)
+            })
+    })
+}
+
+fn shared_model_wire_api(
+    model: &vibex_core::ModelProviderCatalogEntry,
+) -> Option<vibex_core::ProviderModelWireApi> {
+    model
+        .metadata
+        .iter()
+        .find(|entry| entry.key == "wireApi")
+        .and_then(|entry| vibex_core::ProviderModelWireApi::from_wire_protocol_id(&entry.value))
+}
+
+/// The protocols an undeclared Provider is asked in, widest first.
+///
+/// A record may hold nothing but a provider-wide address — the normal result of
+/// pasting a relay URL — and that address usually still answers a model list.
+/// The order matches the Provider editor's "Detect APIs": the surface most
+/// compatible endpoints speak comes first, so the common case costs one request
+/// and never reaches the rest.
+const PROVIDER_DISCOVERY_PROTOCOLS: [vibex_core::ProviderModelWireApi; 4] = [
+    vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+    vibex_core::ProviderModelWireApi::OpenaiResponses,
+    vibex_core::ProviderModelWireApi::AnthropicMessages,
+    vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+];
+
+/// Fetches a catalogue, asking the endpoint what it speaks when nothing
+/// declares a protocol.
+///
+/// A saved v1 Profile usually has an Agent to inherit a protocol from. Two
+/// callers do not: a shared Provider (no Agent at all) and the Provider editor's
+/// unsaved draft (an Agent, but the user may have typed a relay address it
+/// speaks no protocol for). Refusing those until someone hand-writes a
+/// `wireApi` made "Fetch models" unusable on exactly the Providers that needed
+/// discovery most. A profile that declares its protocol keeps the
+/// single-request path; one that does not is asked in turn, and the answer says
+/// which protocol replied.
+fn fetch_models_resolving_protocol(
+    profile: &ProviderProfile,
+    api_key: Option<&str>,
+) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
+    if let Some(declared) = effective_profile_wire_api(profile)? {
+        let (models, mut diagnostics) = fetch_provider_models_with_secret(profile, api_key)?;
+        diagnosed_protocol(&mut diagnostics, declared);
+        return Ok((models, diagnostics));
+    }
+    if api_key.is_none() {
+        // Nothing declared and no credential: the missing key is the
+        // actionable failure, not the protocol the walk could not guess.
+        return Err(VibexError::validation(
+            "agent_model_provider_secret_missing",
+            "Provider profile is missing an available API key",
+        ));
+    }
+    let mut first_error: Option<VibexError> = None;
+    let mut attempted = Vec::new();
+    for wire_api in PROVIDER_DISCOVERY_PROTOCOLS {
+        attempted.push(wire_api.wire_protocol_id());
+        let mut candidate = profile.clone();
+        candidate
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata {
+                key: "wireApi".to_string(),
+                value: wire_api.wire_protocol_id().to_string(),
+            });
+        match fetch_provider_models_with_secret(&candidate, api_key) {
+            Ok((models, mut diagnostics)) => {
+                diagnosed_protocol(&mut diagnostics, wire_api);
+                return Ok((models, diagnostics));
+            }
+            Err(error) => {
+                // A host that never answered would not answer the next
+                // protocol either, so the walk ends there. Every HTTP answer
+                // keeps it going: the protocols do not share an auth header,
+                // and a relay that only speaks Anthropic rejects the bearer
+                // request with `401` before its own route is ever tried.
+                if error.code == "agent_model_provider_model_fetch_transport_failed" {
+                    return Err(
+                        error.with_diagnostic("attemptedWireProtocols", attempted.join(","))
+                    );
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let mut error = first_error.unwrap_or_else(|| {
+        VibexError::validation(
+            "agent_model_provider_protocol_missing",
+            "No supported model API protocol answered the Provider's address",
+        )
+    });
+    error = error.with_diagnostic("attemptedWireProtocols", attempted.join(","));
+    Err(error)
+}
+
+/// Records which protocol a shared discovery ended up speaking.
+fn diagnosed_protocol(
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+    wire_api: vibex_core::ProviderModelWireApi,
+) {
+    diagnostics.push(ProviderBindingMetadata {
+        key: "wireProtocolId".to_string(),
+        value: wire_api.wire_protocol_id().to_string(),
+    });
 }
 
 /// Fetches a Provider's catalogue with a credential the caller already holds.
@@ -13876,6 +14042,8 @@ Authorization = "Bearer should-not-be-stored"
 #[cfg(test)]
 mod shared_provider_probe_tests {
     use super::*;
+    use std::io::Read;
+    use tempfile::tempdir;
 
     /// Fetching or testing a shared Provider builds its probe Profile first;
     /// an invalid internal Agent id failed every such request up front.
@@ -13887,5 +14055,295 @@ mod shared_provider_probe_tests {
         };
         let probe = shared_provider_probe_profile(&profile).expect("probe profile builds");
         assert_eq!(probe.agent_id.as_str(), "provider-probe");
+    }
+
+    fn shared_profile_with_endpoint(url: &str) -> vibex_core::ModelProviderProfile {
+        vibex_core::ModelProviderProfile {
+            display_name: "Undeclared".to_string(),
+            endpoints: vec![vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: url.to_string(),
+                wire_protocol_id: None,
+            }],
+            configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                id: "relay-model".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            }],
+            default_model_id: Some("relay-model".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Serves a model list at `/models` and answers anything else with `404`,
+    /// recording the paths it was asked for.
+    fn spawn_shared_provider_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .is_none()
+                {
+                    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes_read]);
+                }
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                sender.send(request_line.clone()).ok();
+                let (status, body) =
+                    if request_line.contains("/v1/models ") || request_line.contains(" /models ") {
+                        (
+                            "200 OK",
+                            r#"{"data":[{"id":"relay-model"},{"id":"second-model"}]}"#,
+                        )
+                    } else {
+                        ("404 Not Found", r#"{"error":"no such route"}"#)
+                    };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    #[test]
+    fn an_undeclared_shared_provider_fetches_models_instead_of_refusing() {
+        let (base_url, requested) = spawn_shared_provider_server();
+        let profile = shared_profile_with_endpoint(&base_url);
+
+        let (models, diagnostics) = fetch_models_resolving_protocol(
+            &shared_provider_probe_profile(&profile).expect("probe profile builds"),
+            Some("relay-key"),
+        )
+        .expect("a Provider that names no protocol should still be able to list its models");
+
+        assert!(models.contains(&"relay-model".to_string()));
+        assert!(
+            requested
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the endpoint should have been asked")
+                .ends_with("HTTP/1.1"),
+            "the first candidate is the Chat Completions surface"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.key == "wireProtocolId")
+                .map(|diagnostic| diagnostic.value.as_str()),
+            Some(vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)
+        );
+    }
+
+    /// A record that names its protocol never pays for the walk: one request,
+    /// and the declared endpoint is the one asked.
+    #[test]
+    fn a_declared_shared_provider_asks_only_the_declared_protocol() {
+        let (base_url, requested) = spawn_shared_provider_server();
+        let mut profile = shared_profile_with_endpoint(&base_url);
+        profile.endpoints[0].wire_protocol_id =
+            Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string());
+
+        let (models, diagnostics) = fetch_models_resolving_protocol(
+            &shared_provider_probe_profile(&profile).expect("probe profile builds"),
+            Some("relay-key"),
+        )
+        .expect("declared fetch");
+        assert!(models.contains(&"relay-model".to_string()));
+        let line = requested
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the endpoint should have been asked");
+        assert!(
+            line.contains("/v1/models ") || line.contains(" /models "),
+            "the declared protocol's own list route is used: {line}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.key == "wireProtocolId")
+                .map(|diagnostic| diagnostic.value.as_str()),
+            Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES)
+        );
+    }
+
+    /// The probe carries the endpoint's protocol into the v1 shape the fetch
+    /// path reads, so a declared record does not look protocol-less there.
+    #[test]
+    fn the_probe_pins_the_protocol_the_endpoint_declares() {
+        let mut profile = shared_profile_with_endpoint("https://relay.example.invalid/v1");
+        profile.endpoints[0].wire_protocol_id =
+            Some(vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES.to_string());
+        let probe = shared_provider_probe_profile(&profile).expect("probe profile builds");
+        assert_eq!(
+            effective_profile_wire_api(&probe).unwrap(),
+            Some(vibex_core::ProviderModelWireApi::OpenaiResponses)
+        );
+    }
+
+    /// The real entry point, on a persisted record: a shared Provider with a
+    /// Key, one address, and no declared protocol fetches its list instead of
+    /// refusing with `agent_model_provider_protocol_missing`.
+    #[test]
+    fn a_persisted_shared_provider_without_a_protocol_fetches_its_models() {
+        let (base_url, _requested) = spawn_shared_provider_server();
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let created = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Undeclared relay".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: base_url,
+                    wire_protocol_id: None,
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: created.id.clone(),
+                display_name: None,
+                value: "sk-relay-key".to_string(),
+            })
+            .unwrap();
+
+        let response = service
+            .fetch_model_provider_profile_models(vibex_core::ModelProviderFetchModelsRequest {
+                model_provider_profile_id: created.id,
+            })
+            .expect("a saved shared Provider without a protocol still lists its models");
+        assert_eq!(
+            response
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["relay-model", "second-model"]
+        );
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "wireProtocolId"),
+            "the response says which protocol answered"
+        );
+    }
+
+    /// A host that never answered cannot answer the next protocol either, so
+    /// the walk ends on a transport failure instead of retrying four times.
+    #[test]
+    fn an_unreachable_host_ends_the_protocol_walk() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let profile = shared_profile_with_endpoint(&format!("http://{address}"));
+
+        let error = fetch_models_resolving_protocol(
+            &shared_provider_probe_profile(&profile).expect("probe profile builds"),
+            Some("relay-key"),
+        )
+        .expect_err("a host with nothing listening cannot list models");
+        assert_eq!(
+            error.code, "agent_model_provider_model_fetch_transport_failed",
+            "the failure names the transport, not the protocol"
+        );
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "attemptedWireProtocols"),
+            "the error says which protocols were tried"
+        );
+    }
+
+    /// A relay that only speaks Anthropic answers the bearer request with
+    /// `401`, which is still worth walking past: the protocols do not share
+    /// an auth header, so the next one can succeed where this one was refused.
+    #[test]
+    fn an_unauthorized_answer_does_not_end_the_protocol_walk() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .is_none()
+                {
+                    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes_read]);
+                }
+                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                sender.send(text.contains("x-api-key")).ok();
+                let (status, body) = if text.contains("x-api-key") {
+                    ("200 OK", r#"{"data":[{"id":"claude-relay"}]}"#)
+                } else {
+                    ("401 Unauthorized", r#"{"error":"wrong auth header"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            }
+        });
+        let profile = shared_profile_with_endpoint(&format!("http://{address}"));
+
+        let (models, diagnostics) = fetch_models_resolving_protocol(
+            &shared_provider_probe_profile(&profile).expect("probe profile builds"),
+            Some("relay-key"),
+        )
+        .expect("the walk should reach the protocol whose auth header is accepted");
+        assert_eq!(models, vec!["claude-relay".to_string()]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.key == "wireProtocolId")
+                .map(|diagnostic| diagnostic.value.as_str()),
+            Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES)
+        );
+        assert!(
+            receiver.try_iter().any(|accepted| accepted),
+            "the Anthropic request is the one the endpoint accepted"
+        );
     }
 }

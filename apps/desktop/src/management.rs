@@ -13662,13 +13662,29 @@ impl ManagementCenter {
                 return;
             }
         };
+        // The page may start from a preset, and a preset names the protocol its
+        // address serves. Writing it down here is what stops a saved record
+        // from being protocol-less: a later launch, or "Fetch models" on the
+        // saved Provider, would otherwise have to guess, and a Provider
+        // created from the Anthropic preset would be read as Chat Completions.
+        let created_wire_api = self
+            .provider_create_preset
+            .as_ref()
+            .and_then(vibex_core::ProviderPreset::default_wire_api);
         let models = model_ids
             .iter()
             .map(|id| vibex_core::ModelProviderCatalogEntry {
                 id: id.clone(),
                 display_name: None,
                 enabled: true,
-                metadata: Vec::new(),
+                metadata: created_wire_api
+                    .map(|wire_api| {
+                        vec![vibex_core::ProviderBindingMetadata {
+                            key: "wireApi".to_string(),
+                            value: wire_api.wire_protocol_id().to_string(),
+                        }]
+                    })
+                    .unwrap_or_default(),
                 capabilities: Default::default(),
             })
             .collect::<Vec<_>>();
@@ -13676,7 +13692,8 @@ impl ManagementCenter {
             id: "api".to_string(),
             kind: vibex_core::ModelProviderEndpointKind::Api,
             url: base_url,
-            wire_protocol_id: None,
+            wire_protocol_id: created_wire_api
+                .map(|wire_api| wire_api.wire_protocol_id().to_string()),
         }];
         for (id, kind, url) in [
             (
@@ -42959,6 +42976,41 @@ mod tests {
         assert!(!source.contains(&["provider_editor", "shared"].concat()));
         assert!(!source.contains(&["management-provider-source", "scope-"].concat()));
         assert!(!source.contains(&["Only this ", "Agent"].concat()));
+    }
+
+    /// A Provider created from a preset records the protocol the preset names.
+    ///
+    /// The page's save path used to build its endpoint with no protocol at all,
+    /// so a record created from the Anthropic preset was protocol-less: its
+    /// first "Fetch models" had nothing to read and a launch guessed Chat
+    /// Completions for an address that only answers Messages.
+    #[test]
+    fn a_provider_created_from_a_preset_records_the_preset_protocol() {
+        let source = include_str!("management.rs");
+        let save = source
+            .split_once("    fn save_provider_create_page(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Lets one Agent reference a route group")
+            })
+            .map(|(body, _)| body)
+            .expect("the new-Provider page should remain inspectable");
+        assert!(
+            save.contains("provider_create_preset") && save.contains("default_wire_api"),
+            "the page must read the protocol its preset names"
+        );
+        assert!(
+            save.contains("key: \"wireApi\""),
+            "the created Models carry the protocol the page recorded"
+        );
+        let api_endpoint = save
+            .split_once("let mut endpoints = vec![vibex_core::ModelProviderEndpoint {")
+            .and_then(|(_, tail)| tail.split_once("}];"))
+            .map(|(body, _)| body)
+            .expect("the page should build one API endpoint");
+        assert!(
+            api_endpoint.contains("created_wire_api"),
+            "the saved address must name the preset's protocol"
+        );
     }
 
     #[test]
