@@ -546,6 +546,36 @@ impl ManagementRouteGroupDialog {
     }
 }
 
+/// Hosts the native import picker inside a GPUI dialog.
+///
+/// The body owns its own check state on [`ManagementCenter`] so a repaint — the
+/// dialog builder runs on every frame — cannot clear what the reader has
+/// picked, and the footer reads the same state the rows do.
+struct ManagementNativeImportDialog {
+    center: Entity<ManagementCenter>,
+    _center_subscription: Subscription,
+}
+
+impl ManagementNativeImportDialog {
+    fn new(center: Entity<ManagementCenter>, cx: &mut Context<Self>) -> Self {
+        let center_subscription = cx.observe(&center, |_, _, cx| cx.notify());
+        Self {
+            center,
+            _center_subscription: center_subscription,
+        }
+    }
+}
+
+impl Render for ManagementNativeImportDialog {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.center.read(cx).native_import_picker.is_none() {
+            return div().size_full().into_any_element();
+        }
+        self.center
+            .update(cx, |center, cx| center.render_native_import_picker_body(cx))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ManagementCopy {
     agents: &'static str,
@@ -970,21 +1000,6 @@ impl ManagementTaskSuccess {
         }
     }
 
-    fn with_provider_profiles(
-        message: String,
-        provider_profiles: Vec<vibex_core::ProviderProfile>,
-    ) -> Self {
-        Self {
-            message,
-            agent_install_state: None,
-            provider_profiles,
-            recovery_destination: None,
-            prompt: None,
-            native_import_report: None,
-            native_import_preview: None,
-        }
-    }
-
     fn with_recovery_destination(message: String, destination: String) -> Self {
         Self {
             message,
@@ -995,19 +1010,6 @@ impl ManagementTaskSuccess {
             native_import_report: None,
             native_import_preview: None,
         }
-    }
-
-    fn with_native_import_preview(
-        mut self,
-        preview: vibex_core::ProviderNativeImportPreview,
-    ) -> Self {
-        self.native_import_preview = Some(preview);
-        self
-    }
-
-    fn with_native_import_report(mut self, report: NativeImportReport) -> Self {
-        self.native_import_report = Some(report);
-        self
     }
 
     fn with_prompt(message: String, prompt: vibex_core::Prompt) -> Self {
@@ -1445,6 +1447,39 @@ pub struct ManagementCenter {
     workspace_providers_folded: bool,
     /// Whether the Provider workspace's left column folds its route groups.
     workspace_routes_folded: bool,
+    /// Whether the Provider column is in its multi-select mode.
+    ///
+    /// Selecting is a mode rather than a checkbox that always sits on a card:
+    /// the usual gesture on the column is to open a record, and a checkbox
+    /// competing with that click would make every card a two-target row.
+    workspace_selecting: bool,
+    /// The shared Providers the batch bar will act on while selecting.
+    workspace_selected_providers: BTreeSet<String>,
+    /// The route groups the batch bar will act on while selecting.
+    workspace_selected_routes: BTreeSet<String>,
+    /// The native configuration preview the import picker is showing.
+    ///
+    /// `None` means the picker is closed. The preview is read a real `preview()`
+    /// call, so the rows the picker offers are the ones the authority would
+    /// import, not a guess reconstructed from the snapshot.
+    native_import_picker: Option<vibex_core::ProviderNativeImportPreview>,
+    /// The import items checked in the picker, keyed by import item id.
+    native_import_picked: BTreeSet<String>,
+    /// Why the picker has no rows, when the read itself was fine.
+    ///
+    /// A scoped read can legitimately find nothing — the Agent has no CC Switch
+    /// record, or every one of them is already imported — and that sentence is
+    /// more useful than an empty dialog.
+    native_import_empty_note: Option<String>,
+    /// Counts import reads, so a read that finishes after its dialog closed
+    /// cannot fill a later, unrelated picker.
+    native_import_generation: u64,
+    /// The Agent the picker was opened from, if any.
+    ///
+    /// The list-level command imports for the machine and offers every item;
+    /// the Agent card's command offers only that Agent's own configurations, so
+    /// the same picker answers both questions without a second surface.
+    native_import_target: Option<AgentId>,
     /// Whether the new-Provider page is on its preset step.
     workspace_create_choosing: bool,
     /// The preset category the new-Provider page's gallery is showing.
@@ -2664,6 +2699,11 @@ impl ManagementCenter {
             acp_configs: Vec::new(),
             native_import_preview: None,
             native_import_report: None,
+            native_import_picker: None,
+            native_import_picked: BTreeSet::new(),
+            native_import_empty_note: None,
+            native_import_generation: 0,
+            native_import_target: None,
             agent_profile_states: Vec::new(),
             provider_display_order: BTreeMap::new(),
             projection_states: Vec::new(),
@@ -2913,6 +2953,9 @@ impl ManagementCenter {
             route_group_recommendations_open: true,
             workspace_providers_folded: false,
             workspace_routes_folded: false,
+            workspace_selecting: false,
+            workspace_selected_providers: BTreeSet::new(),
+            workspace_selected_routes: BTreeSet::new(),
             workspace_create_choosing: true,
             workspace_create_category: None,
             workspace_create_search,
@@ -3292,6 +3335,14 @@ impl ManagementCenter {
         self.skill_discovery = None;
         self.native_export_preview = None;
         self.native_import_preview = None;
+        self.native_import_picker = None;
+        self.native_import_picked.clear();
+        self.native_import_empty_note = None;
+        self.native_import_generation = self.native_import_generation.wrapping_add(1);
+        self.native_import_target = None;
+        self.workspace_selecting = false;
+        self.workspace_selected_providers.clear();
+        self.workspace_selected_routes.clear();
         self.notice = Some(
             management_locale_text(
                 "Management runtime is not connected",
@@ -12557,25 +12608,34 @@ impl ManagementCenter {
         });
     }
 
-    /// Imports every native Provider configuration this machine already has.
+    /// Reads the native configurations this machine already has.
     ///
-    /// This is the list-level Import: it is not scoped to the Agent whose page
-    /// the reader came from, because a Provider record is shared and the dialog
-    /// that used to own the action already read every Agent's file. It walks the
-    /// Agents the authority reports as import-capable, imports what their files
-    /// describe, and skips records that already exist so pressing it twice
-    /// cannot duplicate the list.
-    fn import_shared_providers(&mut self, agent_ids: Vec<String>, cx: &mut Context<Self>) {
+    /// This is the list-level Import. It is not scoped to the Agent whose page
+    /// the reader came from, because a Provider record is shared and the files
+    /// belong to the machine. The preview is only a reading: nothing is written
+    /// until the picker that lists the items is confirmed, which is what keeps
+    /// "import" from silently bringing in every configuration at once.
+    fn import_shared_providers(
+        &mut self,
+        agent_ids: Vec<String>,
+        target: Option<AgentId>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
         if self.mutation.is_some() {
             return;
         }
-        let targets = agent_ids
-            .into_iter()
-            .filter_map(|agent_id| AgentId::parse(agent_id).ok())
-            .collect::<Vec<_>>();
+        // A card-scoped read names its own Agent; the list-level one hands over
+        // every Agent the machine reports as import-capable.
+        let targets = match target.clone() {
+            Some(agent_id) => vec![agent_id],
+            None => agent_ids
+                .into_iter()
+                .filter_map(|agent_id| AgentId::parse(agent_id).ok())
+                .collect::<Vec<_>>(),
+        };
         if targets.is_empty() {
             self.notice = Some(
                 management_locale_text(
@@ -12590,62 +12650,44 @@ impl ManagementCenter {
         }
         let active_locale = locale::current_locale();
         let existing_profiles = self.provider_profiles.clone();
+        self.native_import_generation = self.native_import_generation.wrapping_add(1);
+        let generation = self.native_import_generation;
+        self.native_import_target = target.clone();
         self.mutation = Some(ManagementMutation::ProviderPreview(
-            "native-import".to_string(),
+            "native-scan".to_string(),
         ));
         self.error = None;
         self.notice = None;
-        // The preview reads config files and the CC Switch database — blocking
-        // I/O — so it stays on the Tokio bridge rather than the UI executor.
         let preview_request = vibex_core::ProviderNativeImportPreviewRequest {
-            sources: vec![
-                vibex_core::ProviderNativeImportSource::Codex,
-                vibex_core::ProviderNativeImportSource::Claude,
-                vibex_core::ProviderNativeImportSource::CcSwitch,
-            ],
+            sources: native_import_sources(),
         };
         let runner = {
             let backend = backend.clone();
             gpui_tokio::Tokio::spawn(cx, async move {
                 let preview = backend
                     .management()
-                    .preview_native_import(preview_request.clone())
+                    .preview_native_import(preview_request)
                     .await
                     .map_err(crate::app::remote_error_into_vibex)?;
-                let mut imported_profiles = Vec::new();
-                let mut imported_count = 0usize;
-                let mut missing_secret_count = 0usize;
-                for agent_id in &targets {
-                    for import_item_id in
-                        pending_native_import_item_ids(&preview, &existing_profiles, agent_id)
-                    {
-                        let result = backend
-                            .management()
-                            .create_profile_from_import(MutationRequest::new(
-                                vibex_core::ProviderNativeImportCreateRequest {
-                                    preview_request: preview_request.clone(),
-                                    import_item_id,
-                                },
-                            ))
-                            .await
-                            .map_err(crate::app::remote_error_into_vibex)?;
-                        imported_count += 1;
-                        if result.diagnostics.iter().any(|diagnostic| {
-                            diagnostic.code
-                                == "provider_native_import_cc_switch_secret_keychain_unavailable"
-                        }) {
-                            missing_secret_count += 1;
-                        }
-                        imported_profiles.push(result.profile);
-                    }
-                }
-                Ok::<_, VibexError>((imported_count, missing_secret_count, imported_profiles))
+                let scope = match target.as_ref() {
+                    Some(agent_id) => vec![agent_id.clone()],
+                    None => targets,
+                };
+                let items = pending_native_import_items(&preview, &existing_profiles, &scope);
+                Ok::<_, VibexError>((preview, items))
             })
         };
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             this.update(cx, |this, cx| {
+                // A read whose dialog was closed in the meantime is stale: it
+                // must not reopen, or fill, the picker that replaced it.
+                if this.native_import_generation != generation {
+                    this.mutation = None;
+                    cx.notify();
+                    return;
+                }
                 this.mutation = None;
                 match outcome {
                     Err(error) => {
@@ -12657,42 +12699,30 @@ impl ManagementCenter {
                     Ok(Err(error)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message));
                     }
-                    Ok(Ok((0, _, _))) => {
-                        this.notice = Some(
-                            management_locale_text(
-                                "Every native Provider configuration is already imported",
-                                "原生供应商配置都已导入过了",
-                                "原生供應商設定都已匯入過了",
-                            )
-                            .to_string(),
-                        );
-                    }
-                    Ok(Ok((imported, missing_secrets, profiles))) => {
-                        this.notice = Some(match (active_locale, missing_secrets) {
-                            (ResolvedLocale::En, 0) => {
-                                format!("Imported {imported} configuration(s)")
-                            }
-                            (ResolvedLocale::En, missing) => format!(
-                                "Imported {imported} configuration(s); {missing} need API Keys"
-                            ),
-                            (ResolvedLocale::ZhCn, 0) => {
-                                format!("已导入 {imported} 个供应商配置")
-                            }
-                            (ResolvedLocale::ZhCn, missing) => format!(
-                                "已导入 {imported} 个供应商配置，其中 {missing} 个需要补充 API Key"
-                            ),
-                            (ResolvedLocale::ZhTw, 0) => {
-                                format!("已匯入 {imported} 個供應商設定")
-                            }
-                            (ResolvedLocale::ZhTw, missing) => format!(
-                                "已匯入 {imported} 個供應商設定，其中 {missing} 個需要補充 API Key"
-                            ),
-                        });
-                        this.native_import_report = Some(NativeImportReport {
-                            imported,
-                            missing_secrets,
-                        });
-                        this.apply_provider_profile_success(&profiles);
+                    Ok(Ok((preview, items))) => {
+                        if items.is_empty() {
+                            this.notice = Some(match this.native_import_target.clone() {
+                                Some(agent_id) => {
+                                    native_import_empty_reason(&preview, &agent_id, active_locale)
+                                        .into_notice_or_error()
+                                }
+                                None => management_locale_text(
+                                    "Every native Provider configuration is already imported",
+                                    "原生供应商配置都已导入过了",
+                                    "原生供應商設定都已匯入過了",
+                                )
+                                .to_string(),
+                            });
+                            this.native_import_empty_note = this.notice.clone();
+                        } else {
+                            this.native_import_empty_note = None;
+                            // Everything importable starts checked: the picker
+                            // is a way to leave records out, not a quiz that
+                            // makes the reader re-pick what the machine already
+                            // said it could import.
+                            this.native_import_picked = items.into_iter().collect();
+                            this.native_import_picker = Some(preview);
+                        }
                     }
                 }
                 cx.notify();
@@ -12700,181 +12730,289 @@ impl ManagementCenter {
         }));
     }
 
-    fn preview_native_import(
-        &mut self,
-        import: bool,
-        target_agent_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let target_agent_id = match target_agent_id.map(AgentId::parse).transpose() {
-            Ok(agent_id) => agent_id,
-            Err(_) => {
-                self.error = Some(
-                    management_error_text("Invalid Agent id", "Agent 标识无效", "Agent 識別碼無效")
-                        .into(),
-                );
-                cx.notify();
-                return;
-            }
+    /// Presents the picker over the page.
+    ///
+    /// The preview read is what fills it, so the dialog opens immediately and
+    /// its body shows the spinner until the rows arrive. Confirming writes only
+    /// the checked items; cancelling leaves the machine untouched.
+    fn present_native_import_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.native_import_empty_note = None;
+        let center = cx.entity();
+        let confirm_center = center.clone();
+        let close_center = center.clone();
+        let content = cx.new(|cx| ManagementNativeImportDialog::new(center, cx));
+        let scoped = self.native_import_target.is_some();
+        let muted = cx.theme().muted_foreground;
+        let width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 560.0);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let confirm_center = confirm_center.clone();
+            let close_center = close_center.clone();
+            // The footer reads the same check state the rows do, so the count
+            // it shows is the count that will be written, and an empty
+            // selection cannot be submitted by Enter or by the button.
+            let picked = confirm_center.read(cx).native_import_picked.len();
+            dialog
+                .title(if scoped {
+                    management_locale_text(
+                        "Import configuration for this Agent",
+                        "为该 Agent 导入配置",
+                        "為該 Agent 匯入設定",
+                    )
+                } else {
+                    management_locale_text(
+                        "Import existing configuration",
+                        "导入已有配置",
+                        "匯入既有設定",
+                    )
+                })
+                .w(px(width))
+                .max_w(px(width))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(management_locale_text(
+                                    "Choose what to bring in. Imported records become Providers you can edit or remove later.",
+                                    "选择要导入的内容。导入后会成为供应商记录，之后可以编辑或删除。",
+                                    "選擇要匯入的內容。匯入後會成為供應商記錄，之後可以編輯或刪除。",
+                                )),
+                        )
+                        .child(content.clone()),
+                )
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(
+                            gpui_component::dialog::DialogClose::new().child(
+                                Button::new("management-native-import-cancel")
+                                    .outline()
+                                    .label(management_locale_text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            gpui_component::dialog::DialogAction::new().child(
+                                Button::new("management-native-import-confirm")
+                                    .primary()
+                                    .disabled(picked == 0)
+                                    .when(picked > 0, |button| {
+                                        button.label(format!(
+                                            "{} ({picked})",
+                                            management_locale_text("Import", "导入", "匯入")
+                                        ))
+                                    })
+                                    .when(picked == 0, |button| {
+                                        button.label(management_locale_text(
+                                            "Import",
+                                            "导入",
+                                            "匯入",
+                                        ))
+                                    }),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let mut opened = false;
+                    confirm_center.update(cx, |this, cx| {
+                        opened = this.confirm_native_import_picker(cx);
+                    });
+                    opened
+                })
+                .on_close(move |_, _, cx| {
+                    close_center.update(cx, |this, cx| {
+                        this.native_import_picker = None;
+                        this.native_import_picked.clear();
+                        this.native_import_empty_note = None;
+                        this.native_import_generation =
+                            this.native_import_generation.wrapping_add(1);
+                        cx.notify();
+                    });
+                })
+        });
+    }
+
+    /// Writes the configurations checked in the picker.
+    ///
+    /// The picker closes on the click and the writes run as one batch, so a
+    /// second confirm cannot interleave with the first. Only the checked item
+    /// ids are sent: the request still names the preview sources, and the
+    /// authority rebuilds the preview to resolve each item.
+    fn confirm_native_import_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(preview) = self.native_import_picker.take() else {
+            return false;
         };
         let Some(backend) = self.backend.clone() else {
-            return;
+            return false;
         };
-        let existing_profiles = self.provider_profiles.clone();
+        if self.mutation.is_some() {
+            self.native_import_picker = Some(preview);
+            return false;
+        }
+        let picked = self
+            .native_import_picker_items(&preview)
+            .into_iter()
+            .filter(|item| {
+                self.native_import_picked
+                    .contains(item.import_item_id.as_str())
+            })
+            .map(|item| item.import_item_id.clone())
+            .collect::<Vec<_>>();
+        if picked.is_empty() {
+            self.notice = Some(
+                management_locale_text(
+                    "Select at least one configuration to import",
+                    "请至少选择一个要导入的配置",
+                    "請至少選擇一個要匯入的設定",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return false;
+        }
         let active_locale = locale::current_locale();
-        self.begin_task_with_success(
-            ManagementMutation::ProviderPreview(
-                if import {
-                    "native-import"
-                } else {
-                    "native-scan"
-                }
-                .into(),
-            ),
-            cx,
-            async move {
-                let request = vibex_core::ProviderNativeImportPreviewRequest {
-                    sources: vec![
-                        vibex_core::ProviderNativeImportSource::Codex,
-                        vibex_core::ProviderNativeImportSource::Claude,
-                        vibex_core::ProviderNativeImportSource::CcSwitch,
-                    ],
-                };
-                let preview = backend
+        let preview_request = vibex_core::ProviderNativeImportPreviewRequest {
+            sources: native_import_sources(),
+        };
+        self.native_import_picked.clear();
+        self.error = None;
+        self.mutation = Some(ManagementMutation::ProviderPreview(
+            "native-import".to_string(),
+        ));
+        cx.notify();
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let mut imported_profiles = Vec::new();
+            let mut missing_secret_count = 0usize;
+            let mut failures = Vec::new();
+            for import_item_id in picked {
+                let result = backend
                     .management()
-                    .preview_native_import(request.clone())
-                    .await
-                    .map_err(crate::app::remote_error_into_vibex)?;
-                if !import {
-                    return Ok(ManagementTaskSuccess::from(match active_locale {
-                        ResolvedLocale::En => format!(
-                            "Native preview: {} item(s), {} file(s)",
-                            preview.items.len(),
-                            preview.files.len()
-                        ),
-                        ResolvedLocale::ZhCn => format!(
-                            "原生配置预览：{} 个项目、{} 个文件",
-                            preview.items.len(),
-                            preview.files.len()
-                        ),
-                        ResolvedLocale::ZhTw => format!(
-                            "原生配置預覽：{} 個項目、{} 個檔案",
-                            preview.items.len(),
-                            preview.files.len()
-                        ),
-                    })
-                    .with_native_import_preview(preview.clone()));
-                }
-                if let Some(target_agent_id) = target_agent_id.as_ref() {
-                    let import_item_ids = pending_cc_switch_import_item_ids(
-                        &preview,
-                        &existing_profiles,
-                        target_agent_id,
-                    );
-                    if import_item_ids.is_empty() {
-                        return native_import_empty_reason(
-                            &preview,
-                            target_agent_id,
-                            active_locale,
-                        )
-                        .into_task_result();
-                    }
-                    let mut imported_count = 0usize;
-                    let mut missing_secret_count = 0usize;
-                    let mut imported_profiles = Vec::new();
-                    for import_item_id in import_item_ids {
-                        let result = backend
-                            .management()
-                            .create_profile_from_import(MutationRequest::new(
-                                vibex_core::ProviderNativeImportCreateRequest {
-                                    preview_request: request.clone(),
-                                    import_item_id,
-                                },
-                            ))
-                            .await
-                            .map_err(crate::app::remote_error_into_vibex)?;
-                        imported_count += 1;
-                        imported_profiles.push(result.profile);
+                    .create_profile_from_import(MutationRequest::new(
+                        vibex_core::ProviderNativeImportCreateRequest {
+                            preview_request: preview_request.clone(),
+                            import_item_id,
+                        },
+                    ))
+                    .await;
+                match result {
+                    Ok(result) => {
                         if result.diagnostics.iter().any(|diagnostic| {
                             diagnostic.code
                                 == "provider_native_import_cc_switch_secret_keychain_unavailable"
                         }) {
                             missing_secret_count += 1;
                         }
+                        imported_profiles.push(result.profile);
                     }
-                    let message = match active_locale {
-                        ResolvedLocale::En if missing_secret_count > 0 => format!(
-                            "Imported {imported_count} cc-switch configuration(s); {missing_secret_count} require API Key setup"
-                        ),
-                        ResolvedLocale::En => {
-                            format!("Imported {imported_count} cc-switch configuration(s)")
-                        }
-                        ResolvedLocale::ZhCn if missing_secret_count > 0 => format!(
-                            "已导入 {imported_count} 个 cc-switch 配置，其中 {missing_secret_count} 个需要补充 API Key"
-                        ),
-                        ResolvedLocale::ZhCn => {
-                            format!("已导入 {imported_count} 个 cc-switch 配置")
-                        }
-                        ResolvedLocale::ZhTw if missing_secret_count > 0 => format!(
-                            "已匯入 {imported_count} 個 cc-switch 配置，其中 {missing_secret_count} 個需要補充 API Key"
-                        ),
-                        ResolvedLocale::ZhTw => {
-                            format!("已匯入 {imported_count} 個 cc-switch 配置")
-                        }
-                    };
-                    return Ok(ManagementTaskSuccess::with_provider_profiles(
-                        message,
-                        imported_profiles,
-                    )
-                    .with_native_import_report(NativeImportReport {
-                        imported: imported_count,
-                        missing_secrets: missing_secret_count,
-                    }));
+                    Err(error) => failures.push((error.code, error.message)),
                 }
-                let item = preview
+            }
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                let imported = imported_profiles.len();
+                if let Some((code, message)) = failures.first() {
+                    this.error = Some(match active_locale {
+                        ResolvedLocale::En => {
+                            format!("{code}: {message} (imported {imported})")
+                        }
+                        ResolvedLocale::ZhCn => {
+                            format!("{code}：{message}（已导入 {imported} 个）")
+                        }
+                        ResolvedLocale::ZhTw => {
+                            format!("{code}：{message}（已匯入 {imported} 個）")
+                        }
+                    });
+                }
+                if imported > 0 {
+                    this.notice = Some(match (active_locale, missing_secret_count) {
+                        (ResolvedLocale::En, 0) => {
+                            format!("Imported {imported} configuration(s)")
+                        }
+                        (ResolvedLocale::En, missing) => {
+                            format!("Imported {imported} configuration(s); {missing} need API Keys")
+                        }
+                        (ResolvedLocale::ZhCn, 0) => format!("已导入 {imported} 个供应商配置"),
+                        (ResolvedLocale::ZhCn, missing) => {
+                            format!(
+                                "已导入 {imported} 个供应商配置，其中 {missing} 个需要补充 API Key"
+                            )
+                        }
+                        (ResolvedLocale::ZhTw, 0) => format!("已匯入 {imported} 個供應商設定"),
+                        (ResolvedLocale::ZhTw, missing) => format!(
+                            "已匯入 {imported} 個供應商設定，其中 {missing} 個需要補充 API Key"
+                        ),
+                    });
+                    this.native_import_report = Some(NativeImportReport {
+                        imported,
+                        missing_secrets: missing_secret_count,
+                    });
+                    this.apply_provider_profile_success(&imported_profiles);
+                }
+                cx.notify();
+                this.refresh(cx);
+            });
+        }));
+        true
+    }
+
+    /// The preview's items the picker lists, grouped by their import source.
+    fn native_import_picker_items(
+        &self,
+        preview: &vibex_core::ProviderNativeImportPreview,
+    ) -> Vec<vibex_core::ProviderNativeImportItem> {
+        let existing_profiles = self.provider_profiles.clone();
+        let targets = match self.native_import_target.clone() {
+            Some(agent_id) => vec![agent_id],
+            None => self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|agent| agent.added && vibex_core::is_user_visible_agent(&agent.id))
+                .filter(|agent| vibex_core::supports_native_provider_import(&agent.id))
+                .filter_map(|agent| agent.id.as_str().to_string().parse().ok())
+                .collect::<Vec<_>>(),
+        };
+        pending_native_import_items(preview, &existing_profiles, &targets)
+            .into_iter()
+            .filter_map(|id| {
+                preview
                     .items
                     .iter()
-                    .find(|item| native_import_status_is_eligible(item.status))
-                    .ok_or_else(|| {
-                        VibexError::validation(
-                            "provider_native_import_no_candidate",
-                            "no importable native Provider record was found",
-                        )
-                    })?;
-                let result = backend
-                    .management()
-                    .create_profile_from_import(MutationRequest::new(
-                        vibex_core::ProviderNativeImportCreateRequest {
-                            preview_request: request,
-                            import_item_id: item.import_item_id.clone(),
-                        },
-                    ))
-                    .await
-                    .map_err(crate::app::remote_error_into_vibex)?;
-                let message = match active_locale {
-                        ResolvedLocale::En => {
-                            format!("Imported native profile {}", result.profile.display_name)
-                        }
-                        ResolvedLocale::ZhCn => {
-                            format!("已导入原生配置 {}", result.profile.display_name)
-                        }
-                        ResolvedLocale::ZhTw => {
-                            format!("已匯入原生配置 {}", result.profile.display_name)
-                        }
-                    };
-                let missing = usize::from(result.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == "provider_native_import_cc_switch_secret_keychain_unavailable"
-                }));
-                Ok(ManagementTaskSuccess::with_provider_profiles(
-                    message,
-                    vec![result.profile],
-                )
-                .with_native_import_report(NativeImportReport {
-                    imported: 1,
-                    missing_secrets: missing,
-                }))
-            },
-        );
+                    .find(|item| item.import_item_id.as_str() == id)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    fn toggle_native_import_picked(&mut self, id: String, checked: bool, cx: &mut Context<Self>) {
+        if checked {
+            self.native_import_picked.insert(id);
+        } else {
+            self.native_import_picked.remove(&id);
+        }
+        cx.notify();
+    }
+
+    fn toggle_native_import_source(
+        &mut self,
+        items: &[vibex_core::ProviderNativeImportItem],
+        source: vibex_core::ProviderNativeImportSource,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for item in items.iter().filter(|item| item.source == source) {
+            if checked {
+                self.native_import_picked
+                    .insert(item.import_item_id.as_str().to_string());
+            } else {
+                self.native_import_picked
+                    .remove(item.import_item_id.as_str());
+            }
+        }
+        cx.notify();
     }
 
     #[allow(dead_code)]
@@ -14509,6 +14647,191 @@ impl ManagementCenter {
                 vibex_core::ProviderHealthStatus::Unknown,
             ),
         }
+    }
+
+    /// The picker's body: one group per import source, one checkbox per item.
+    ///
+    /// The old Import wrote every candidate on a single click. Grouping by
+    /// source makes the choice legible — "three from Codex, one from CC Switch"
+    /// — and the per-source row plus the per-item checkbox are the two levels a
+    /// batch like this actually needs: everything from one tool, or this one
+    /// account.
+    pub(super) fn render_native_import_picker_body(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(preview) = self.native_import_picker.clone() else {
+            // The preview reads files and a database, so the dialog can be on
+            // screen before its rows are; the spinner is that gap. Once the
+            // read is over and there is still no list, the machine had nothing
+            // to offer and the body says so instead of spinning forever.
+            let scanning = matches!(
+                &self.mutation,
+                Some(ManagementMutation::ProviderPreview(action))
+                    if action == "native-scan" || action == "native-import"
+            );
+            if scanning {
+                return h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .py_6()
+                    .child(Spinner::new().with_size(Size::Small))
+                    .into_any_element();
+            }
+            return div()
+                .w_full()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(self.error.clone().unwrap_or_else(|| {
+                    management_locale_text(
+                        "Everything already on this machine is imported.",
+                        "这台机器上的配置都已导入。",
+                        "這台機器上的設定都已匯入。",
+                    )
+                    .to_string()
+                }))
+                .into_any_element();
+        };
+        let items = self.native_import_picker_items(&preview);
+        if items.is_empty() {
+            return div()
+                .w_full()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Everything already on this machine is imported.",
+                    "这台机器上的配置都已导入。",
+                    "這台機器上的設定都已匯入。",
+                ))
+                .into_any_element();
+        }
+        let picked = self.native_import_picked.clone();
+        let mut groups = v_flex().w_full().min_w_0().gap_3();
+        for source in native_import_sources() {
+            let source_items = items
+                .iter()
+                .filter(|item| item.source == source)
+                .cloned()
+                .collect::<Vec<_>>();
+            if source_items.is_empty() {
+                continue;
+            }
+            let picked_count = source_items
+                .iter()
+                .filter(|item| picked.contains(item.import_item_id.as_str()))
+                .count();
+            let all_picked = picked_count == source_items.len();
+            let source_items_for_toggle = source_items.clone();
+            let mut rows = v_flex().w_full().min_w_0().gap_0p5();
+            for item in &source_items {
+                let id = item.import_item_id.as_str().to_string();
+                let toggled = id.clone();
+                let checked = picked.contains(id.as_str());
+                let status_note = native_import_item_status_note(item.status);
+                let subtitle = match (&item.base_url, status_note) {
+                    (Some(base_url), Some(note)) => format!("{base_url} · {note}"),
+                    (Some(base_url), None) => base_url.clone(),
+                    (None, Some(note)) => note.to_string(),
+                    (None, None) => item.provider_kind.to_string(),
+                };
+                rows = rows.child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(px(6.0))
+                        .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
+                        .child(
+                            Checkbox::new(SharedString::from(format!(
+                                "management-native-import-item-{id}"
+                            )))
+                            .small()
+                            .checked(checked)
+                            .accessibility_label(SharedString::from(item.display_name.clone()))
+                            .on_click(cx.listener(
+                                move |this, checked, _, cx| {
+                                    this.toggle_native_import_picked(toggled.clone(), *checked, cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(item.display_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(subtitle),
+                                ),
+                        )
+                        .when_some(status_note, |row, note| {
+                            row.child(Tag::color(ColorName::Yellow).xsmall().child(note))
+                        }),
+                );
+            }
+            groups =
+                groups.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Checkbox::new(SharedString::from(format!(
+                                        "management-native-import-source-{source:?}"
+                                    )))
+                                    .small()
+                                    .checked(all_picked)
+                                    .accessibility_label(native_import_source_label(source))
+                                    .on_click(cx.listener(move |this, checked, _, cx| {
+                                        this.toggle_native_import_source(
+                                            &source_items_for_toggle,
+                                            source,
+                                            *checked,
+                                            cx,
+                                        )
+                                    })),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(native_import_source_label(source)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                        .child(format!("{picked_count}/{}", source_items.len())),
+                                ),
+                        )
+                        .child(rows),
+                );
+        }
+        groups.into_any_element()
     }
 
     fn render_native_import_report(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -28971,9 +29294,13 @@ impl ManagementCenter {
                         .icon(Icon::default().path("icons/vibex/import.svg"))
                         .loading(native_importing)
                         .disabled(pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let agent_id = this.selected_agent_id.clone();
-                            this.preview_native_import(true, agent_id, cx)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let agent_id = this
+                                .selected_agent_id
+                                .clone()
+                                .and_then(|agent_id| AgentId::parse(agent_id).ok());
+                            this.import_shared_providers(Vec::new(), agent_id, cx);
+                            this.present_native_import_picker(window, cx);
                         })),
                     copy.import_configuration,
                 )
@@ -33992,64 +34319,88 @@ fn pending_native_import_item_ids(
         .collect()
 }
 
-fn pending_cc_switch_import_item_ids(
+/// The sources the list-level Import reads.
+fn native_import_sources() -> Vec<vibex_core::ProviderNativeImportSource> {
+    vec![
+        vibex_core::ProviderNativeImportSource::Codex,
+        vibex_core::ProviderNativeImportSource::Claude,
+        vibex_core::ProviderNativeImportSource::CcSwitch,
+    ]
+}
+
+/// The preview's importable items across every import-capable Agent.
+///
+/// One pass per target Agent through [`pending_native_import_item_ids`], then a
+/// set over the item ids so a preview that reports the same configuration
+/// through two Agents lists it once.
+fn pending_native_import_items(
     preview: &vibex_core::ProviderNativeImportPreview,
     existing_profiles: &[vibex_core::ProviderProfile],
-    target_agent_id: &AgentId,
-) -> Vec<vibex_core::RequestId> {
-    let imported_identities = existing_profiles
-        .iter()
-        .filter(|profile| &profile.agent_id == target_agent_id)
-        .filter_map(|profile| cc_switch_import_identity(&profile.provider_options))
-        .collect::<HashSet<_>>();
+    targets: &[AgentId],
+) -> Vec<String> {
     let mut seen_item_ids = HashSet::new();
-
-    preview
-        .items
+    targets
         .iter()
-        .filter(|item| item.agent_id.as_ref() == Some(target_agent_id))
-        .filter(|item| {
-            item.source == vibex_core::ProviderNativeImportSource::CcSwitch
-                || provider_option_value(&item.provider_options, PROVIDER_OPTION_NATIVE_SOURCE)
-                    == Some("cc-switch")
-        })
-        .filter(|item| native_import_status_is_eligible(item.status))
-        .filter(|item| {
-            cc_switch_import_identity(&item.provider_options)
-                .is_none_or(|identity| !imported_identities.contains(&identity))
-        })
-        .filter(|item| seen_item_ids.insert(item.import_item_id.as_str().to_string()))
-        .map(|item| item.import_item_id.clone())
+        .flat_map(|agent_id| pending_native_import_item_ids(preview, existing_profiles, agent_id))
+        .map(|id| id.as_str().to_string())
+        .filter(|id| seen_item_ids.insert(id.clone()))
         .collect()
 }
 
-/// Explains why a cc-switch import produced no work for `target_agent_id`.
+/// One import source's name in the reader's language.
+fn native_import_source_label(source: vibex_core::ProviderNativeImportSource) -> &'static str {
+    match source {
+        vibex_core::ProviderNativeImportSource::Codex => "Codex",
+        vibex_core::ProviderNativeImportSource::Claude => "Claude",
+        vibex_core::ProviderNativeImportSource::CcSwitch => "CC Switch",
+    }
+}
+
+/// What an import item's status means for the reader, or `None` when it is
+/// simply importable.
+fn native_import_item_status_note(
+    status: vibex_core::ProviderNativeImportItemStatus,
+) -> Option<&'static str> {
+    match status {
+        vibex_core::ProviderNativeImportItemStatus::Importable => None,
+        vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => {
+            Some(management_locale_text(
+                "Needs a Key after import",
+                "导入后需要补充 Key",
+                "匯入後需要補充 Key",
+            ))
+        }
+        vibex_core::ProviderNativeImportItemStatus::Partial => Some(management_locale_text(
+            "Imports what the file declares",
+            "只导入文件中声明的部分",
+            "只匯入檔案中宣告的部分",
+        )),
+        vibex_core::ProviderNativeImportItemStatus::BlockedByParseError => Some(
+            management_locale_text("Cannot be read", "无法读取", "無法讀取"),
+        ),
+    }
+}
+
+/// Why a scoped import listed nothing for its Agent.
 ///
 /// A single `provider_native_import_no_candidate` covered four unrelated
 /// situations, so the UI could only say "operation failed". Most of them are
 /// ordinary states rather than failures — CC Switch is not installed, has no
-/// record for this Agent, or has nothing left to import — and the user asked
-/// for those to read as plain notices instead of error alerts. Only candidates
-/// that exist but cannot be parsed are a real failure.
+/// record for this Agent, or has nothing left to import — and the reader needs
+/// that sentence, not an error code. Only candidates that exist but cannot be
+/// parsed are a real failure.
 enum NativeImportEmptyReason {
     /// Nothing to import; reported as an informational notice.
-    Notice { code: &'static str, message: String },
+    Notice { message: String },
     /// Candidates exist, but none of them can be imported.
-    Failure { code: &'static str, message: String },
+    Failure { message: String },
 }
 
 impl NativeImportEmptyReason {
-    /// The task outcome the UI should show for this reason.
-    fn into_task_result(self) -> VibexResult<ManagementTaskSuccess> {
+    /// The sentence to put in the notice area when the picker has no rows.
+    fn into_notice_or_error(self) -> String {
         match self {
-            Self::Notice { code, message } => {
-                tracing::debug!(
-                    code,
-                    "native provider import found nothing to import; reporting a notice"
-                );
-                Ok(ManagementTaskSuccess::from(message))
-            }
-            Self::Failure { code, message } => Err(VibexError::validation(code, message)),
+            Self::Notice { message } | Self::Failure { message } => message,
         }
     }
 }
@@ -34082,7 +34433,6 @@ fn native_import_empty_reason(
             .any(|diagnostic| diagnostic.code == "provider_native_import_cc_switch_missing")
         {
             return NativeImportEmptyReason::Notice {
-                code: "provider_native_import_cc_switch_missing",
                 message: match locale {
                     ResolvedLocale::En => {
                         "The CC Switch provider database was not found".to_string()
@@ -34093,7 +34443,6 @@ fn native_import_empty_reason(
             };
         }
         return NativeImportEmptyReason::Notice {
-            code: "provider_native_import_agent_not_in_cc_switch",
             message: match locale {
                 ResolvedLocale::En => {
                     format!("CC Switch has no provider configuration for {label}")
@@ -34109,7 +34458,6 @@ fn native_import_empty_reason(
         .any(|item| native_import_status_is_eligible(item.status))
     {
         return NativeImportEmptyReason::Notice {
-            code: "provider_native_import_already_imported",
             message: match locale {
                 ResolvedLocale::En => {
                     format!("Every {label} provider in CC Switch is already imported")
@@ -34121,7 +34469,6 @@ fn native_import_empty_reason(
     }
 
     NativeImportEmptyReason::Failure {
-        code: "provider_native_import_blocked",
         message: match locale {
             ResolvedLocale::En => {
                 format!("Every {label} provider in CC Switch is blocked by a parse error")
@@ -41530,7 +41877,7 @@ mod tests {
     }
 
     #[test]
-    fn cc_switch_import_candidates_match_agent_dedupe_and_skip_imported_profiles() {
+    fn import_candidates_dedupe_by_item_id_and_skip_imported_profiles() {
         let codex = AgentId::parse("codex").expect("valid Agent id");
         let claude = AgentId::parse("claude").expect("valid Agent id");
         let imported_identity = provider_options(&[
@@ -41604,11 +41951,100 @@ mod tests {
             created_at_ms: 1,
         };
 
-        let ids = pending_cc_switch_import_item_ids(&preview, &[imported_profile], &codex)
+        let ids = pending_native_import_item_ids(&preview, &[imported_profile], &codex)
             .into_iter()
             .map(|id| id.into_string())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["request_pending", "request_fallback_source"]);
+    }
+
+    /// The list-level import lists what it found and writes only what the
+    /// reader leaves checked.
+    ///
+    /// The old command wrote every candidate on one click. Every importable
+    /// item across the import-capable Agents is therefore the picker's list,
+    /// and the items already on this machine or blocked by a parse error are
+    /// not offered at all.
+    #[test]
+    fn the_list_import_offers_its_candidates_and_writes_only_the_checked_ones() {
+        let codex = AgentId::parse("codex").expect("valid Agent id");
+        let claude = AgentId::parse("claude").expect("valid Agent id");
+        let imported_identity = provider_options(&[
+            (PROVIDER_OPTION_CC_SWITCH_DB_PATH, "/tmp/cc-switch.db"),
+            (PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID, "already-imported"),
+            (PROVIDER_OPTION_CC_SWITCH_APP_TYPE, "codex"),
+        ]);
+        let mut imported_profile = vibex_core::ProviderProfile::local_default(ProviderKind::Codex);
+        imported_profile.provider_options = imported_identity.clone();
+        let preview = vibex_core::ProviderNativeImportPreview {
+            preview_id: vibex_core::RequestId::parse("request_preview").expect("valid preview id"),
+            sources: native_import_sources(),
+            files: Vec::new(),
+            items: vec![
+                native_import_item(
+                    "request_imported",
+                    vibex_core::ProviderNativeImportSource::CcSwitch,
+                    &codex,
+                    vibex_core::ProviderNativeImportItemStatus::Importable,
+                    imported_identity,
+                ),
+                native_import_item(
+                    "request_blocked",
+                    vibex_core::ProviderNativeImportSource::Codex,
+                    &codex,
+                    vibex_core::ProviderNativeImportItemStatus::BlockedByParseError,
+                    provider_options(&[]),
+                ),
+                native_import_item(
+                    "request_codex",
+                    vibex_core::ProviderNativeImportSource::Codex,
+                    &codex,
+                    vibex_core::ProviderNativeImportItemStatus::Importable,
+                    provider_options(&[]),
+                ),
+                native_import_item(
+                    "request_claude",
+                    vibex_core::ProviderNativeImportSource::Claude,
+                    &claude,
+                    vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup,
+                    provider_options(&[]),
+                ),
+            ],
+            diagnostics: Vec::new(),
+            created_at_ms: 1,
+        };
+
+        let items = pending_native_import_items(&preview, &[imported_profile], &[codex, claude]);
+        assert_eq!(
+            items,
+            vec!["request_codex", "request_claude"],
+            "the picker lists every importable item, in preview order"
+        );
+        // Each item carries the source the picker groups it under, and the
+        // status note that tells the reader a Key will be needed afterwards.
+        assert_eq!(
+            preview.items[2].source,
+            vibex_core::ProviderNativeImportSource::Codex
+        );
+        assert_eq!(
+            native_import_item_status_note(preview.items[3].status),
+            Some(management_locale_text(
+                "Needs a Key after import",
+                "导入后需要补充 Key",
+                "匯入後需要補充 Key",
+            ))
+        );
+        assert_eq!(
+            native_import_item_status_note(vibex_core::ProviderNativeImportItemStatus::Importable),
+            None,
+            "an ordinary item carries no warning"
+        );
+        for source in native_import_sources() {
+            assert!(
+                !native_import_source_label(source).is_empty(),
+                "every group is named"
+            );
+        }
     }
 
     #[test]
@@ -41630,14 +42066,12 @@ mod tests {
         };
 
         // Nothing to import is an ordinary state, so the UI must receive a
-        // notice instead of an error alert.
+        // notice sentence instead of an alert.
         let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        let NativeImportEmptyReason::Notice { code, message } = &reason else {
+        let NativeImportEmptyReason::Notice { message } = &reason else {
             panic!("a missing cc-switch record is a notice, not a failure");
         };
-        assert_eq!(*code, "provider_native_import_agent_not_in_cc_switch");
         assert!(message.contains("Grok Build"));
-        assert!(reason.into_task_result().is_ok());
 
         preview
             .diagnostics
@@ -41648,12 +42082,12 @@ mod tests {
                 file_kind: None,
                 redacted_details: Vec::new(),
             });
-        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        let NativeImportEmptyReason::Notice { code, .. } = &reason else {
+        let NativeImportEmptyReason::Notice { message } =
+            native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn)
+        else {
             panic!("a missing cc-switch database is a notice, not a failure");
         };
-        assert_eq!(*code, "provider_native_import_cc_switch_missing");
-        assert!(reason.into_task_result().is_ok());
+        assert!(message.contains("CC Switch"));
         preview.diagnostics.clear();
 
         preview.items.push(native_import_item(
@@ -41663,24 +42097,20 @@ mod tests {
             vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup,
             options,
         ));
-        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        let NativeImportEmptyReason::Notice { code, message } = &reason else {
+        let NativeImportEmptyReason::Notice { message } =
+            native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn)
+        else {
             panic!("an already imported provider is a notice, not a failure");
         };
-        assert_eq!(*code, "provider_native_import_already_imported");
         assert!(message.contains("Grok Build"));
-        assert!(reason.into_task_result().is_ok());
 
         preview.items[0].status = vibex_core::ProviderNativeImportItemStatus::BlockedByParseError;
-        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        let NativeImportEmptyReason::Failure { code, .. } = &reason else {
+        let NativeImportEmptyReason::Failure { message } =
+            native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn)
+        else {
             panic!("a candidate blocked by a parse error stays a failure");
         };
-        assert_eq!(*code, "provider_native_import_blocked");
-        let Err(error) = reason.into_task_result() else {
-            panic!("a blocked candidate must surface as an error");
-        };
-        assert_eq!(error.code, "provider_native_import_blocked");
+        assert!(message.contains("解析错误"));
     }
 
     #[test]
@@ -42987,7 +43417,8 @@ mod tests {
         assert!(header_actions.contains("provider-import-existing"));
         assert!(header_actions.contains("provider-add-configuration"));
         assert!(header_actions.contains("this.open_profile_creator(window, cx)"));
-        assert!(header_actions.contains("this.preview_native_import(true, agent_id, cx)"));
+        assert!(header_actions.contains("this.import_shared_providers("));
+        assert!(header_actions.contains("this.present_native_import_picker(window, cx)"));
         assert!(render.contains("management_card_with_icon_action("));
         assert!(
             !render.contains("let add_rows = h_flex()"),
@@ -44606,18 +45037,41 @@ mod gateway_surface_tests {
         );
     }
 
+    /// Import is a picker, not a one-click batch.
+    ///
+    /// The dialog owns the check state and the grouping by source, and the
+    /// command that writes the configurations reads that same state: the list
+    /// the reader saw is the list that gets imported.
     #[test]
-    fn native_import_exposes_preview_and_report() {
+    fn native_import_is_a_picker_grouped_by_source() {
         let source = include_str!("management.rs");
         for marker in [
-            "management-provider-page-import",
-            "management-provider-import-report-dismiss",
-            "native_import_preview",
-            "native_import_report",
-            "with_native_import_preview",
+            "management-provider-import-report",
+            "native_import_picker",
+            "ManagementNativeImportDialog",
+            "fn present_native_import_picker(",
+            "fn render_native_import_picker_body(",
+            "fn confirm_native_import_picker(",
+            "management-native-import-item-",
+            "management-native-import-source-",
+            "management-native-import-confirm",
+            "management-native-import-cancel",
         ] {
             assert!(source.contains(marker), "import flow must keep {marker}");
         }
+        // Grouping is by import source, so the picker names the sources the
+        // authority reads rather than inventing its own categories.
+        let body = source
+            .split_once("fn render_native_import_picker_body(")
+            .map(|(_, tail)| tail.split("\n    fn ").next().unwrap_or(tail))
+            .expect("the picker body should remain inspectable");
+        assert!(body.contains("for source in native_import_sources()"));
+        assert!(body.contains("toggle_native_import_source("));
+        assert!(body.contains("toggle_native_import_picked("));
+        // The old command wrote every candidate it could find; that path is
+        // gone, so nothing can import without the reader seeing the list.
+        // Concatenated so this assertion does not match its own source text.
+        assert!(!source.contains(&["fn preview_native_", "import("].concat()));
     }
 
     #[test]

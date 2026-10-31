@@ -13,6 +13,9 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.schedule_gateway_cooldown_refresh(cx);
+        if self.workspace_selecting() {
+            self.reconcile_workspace_selection();
+        }
         let query = self.provider_search.read(cx).value().trim().to_lowercase();
 
         let providers = self.workspace_sidebar_providers(&query);
@@ -48,6 +51,23 @@ impl ManagementCenter {
 
         let mut list = v_flex().w_full().min_w_0().gap_1p5();
         list = list.child(self.render_workspace_gateway_row(cx));
+        // While selecting, one strip above the lists owns every batch command,
+        // so the same click acts on Providers and route groups together.
+        let visible_provider_ids = providers
+            .iter()
+            .map(|row| row.profile.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        let visible_route_ids = routes
+            .iter()
+            .map(|row| row.route.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        if self.workspace_selecting() {
+            list = list.child(self.render_workspace_batch_bar(
+                &visible_provider_ids,
+                &visible_route_ids,
+                cx,
+            ));
+        }
 
         // Providers.
         let provider_total = self.providers.len();
@@ -69,22 +89,32 @@ impl ManagementCenter {
         ));
         if !self.workspace_providers_folded {
             if providers.is_empty() {
-                list = list.child(self.render_workspace_sidebar_empty(
-                    if query.is_empty() && self.provider_list_filter == ProviderListFilter::All {
+                let unfiltered =
+                    query.is_empty() && self.provider_list_filter == ProviderListFilter::All;
+                list = list.child(if unfiltered {
+                    self.render_workspace_sidebar_add_card(
+                        "management-workspace-providers-empty",
+                        management_locale_text("New Provider", "新建供应商", "新增供應商"),
                         management_locale_text(
-                            "No Providers yet. Add one to give Agents a model source.",
-                            "还没有供应商。添加后 Agent 才有可用的模型来源。",
-                            "還沒有供應商。新增後 Agent 才有可用的模型來源。",
-                        )
-                    } else {
+                            "Give Agents a model source",
+                            "为 Agent 提供可用的模型来源",
+                            "為 Agent 提供可用的模型來源",
+                        ),
+                        cx.listener(|this, _, window, cx| {
+                            this.open_provider_create_page(None, window, cx)
+                        }),
+                        cx,
+                    )
+                } else {
+                    self.render_workspace_sidebar_empty(
                         management_locale_text(
                             "No Provider matches.",
                             "没有匹配的供应商。",
                             "沒有符合的供應商。",
-                        )
-                    },
-                    cx,
-                ));
+                        ),
+                        cx,
+                    )
+                });
             }
             for row in &providers {
                 list = list.child(self.render_workspace_provider_row(row, cx));
@@ -125,14 +155,30 @@ impl ManagementCenter {
         ));
         if !self.workspace_routes_folded {
             if routes.is_empty() {
-                list = list.child(self.render_workspace_sidebar_empty(
-                    management_locale_text(
-                        "No route groups. A group joins models from several Providers under one name.",
-                        "还没有路由组。路由组把多个供应商的模型合成一个模型名。",
-                        "還沒有路由組。路由組把多個供應商的模型合成一個模型名。",
-                    ),
-                    cx,
-                ));
+                list = list.child(if query.is_empty() {
+                    self.render_workspace_sidebar_add_card(
+                        "management-workspace-routes-empty",
+                        management_locale_text("New route group", "新建路由组", "新增路由組"),
+                        management_locale_text(
+                            "Join models from several Providers under one name",
+                            "把多个供应商的模型合成一个模型名",
+                            "把多個供應商的模型合成一個模型名",
+                        ),
+                        cx.listener(|this, _, window, cx| {
+                            this.open_route_group_page_editor(window, cx)
+                        }),
+                        cx,
+                    )
+                } else {
+                    self.render_workspace_sidebar_empty(
+                        management_locale_text(
+                            "No route group matches.",
+                            "没有匹配的路由组。",
+                            "沒有符合的路由組。",
+                        ),
+                        cx,
+                    )
+                });
             }
             for row in &routes {
                 list = list.child(self.render_workspace_route_row(row, cx));
@@ -286,13 +332,18 @@ impl ManagementCenter {
                             .ok();
                     }
                 };
+                // Reading the preview and showing what it found are two
+                // steps: the menu reads, and the dialog is the reader's chance
+                // to leave a record out. It used to write every candidate on
+                // this one click.
                 let import = {
                     let center = center.clone();
                     let agents = importable_agents.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                         center
                             .update(cx, |this, cx| {
-                                this.import_shared_providers(agents.clone(), cx)
+                                this.import_shared_providers(agents.clone(), None, cx);
+                                this.present_native_import_picker(window, cx);
                             })
                             .ok();
                     }
@@ -332,6 +383,34 @@ impl ManagementCenter {
                     .flex_1()
                     .min_w_0()
                     .child(management_search_input_compact(&self.provider_search, cx)),
+            )
+            // Selecting is worth offering only once there is more than one
+            // record to choose between; on an empty page it would be a mode
+            // with nothing in it.
+            .when(
+                !self.providers.is_empty() || !self.model_routes.is_empty(),
+                |bar| {
+                    bar.child(
+                        Button::new("management-provider-select")
+                            .small()
+                            .ghost()
+                            .when(self.workspace_selecting(), |button| button.selected(true))
+                            .icon(Icon::default().path("icons/vibex/list-checks.svg"))
+                            .tooltip(management_locale_text(
+                                "Select several",
+                                "批量选择",
+                                "批次選取",
+                            ))
+                            .accessibility_label(management_locale_text(
+                                "Select several",
+                                "批量选择",
+                                "批次選取",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_workspace_selecting(cx)),
+                            ),
+                    )
+                },
             )
             .child(add)
             .into_any_element()
@@ -466,6 +545,80 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// The card that stands in for a list with no records yet.
+    ///
+    /// It is the same dashed, card-shaped invitation the Agent detail's model
+    /// Provider panel draws: a full row the whole of which opens the editor,
+    /// rather than a paragraph that reads like a warning. The dimensions match
+    /// [`workspace_nav_row`] so an empty list and a filled one keep the same
+    /// rhythm in the column.
+    fn render_workspace_sidebar_add_card(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        subtitle: &'static str,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border_color = cx.theme().border.opacity(0.55);
+        div()
+            .id(id)
+            .relative()
+            .w_full()
+            .min_w_0()
+            .min_h(px(64.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .p_2()
+            .rounded(px(8.0))
+            .bg(cx.theme().background.opacity(0.45))
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
+            .on_click(on_click)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(px(16.0))
+                            .text_color(cx.theme().muted_foreground.opacity(0.8)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                            .child(label),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .max_w_full()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                    .child(subtitle),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        paint_empty_source_border(bounds, border_color, window)
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
     /// The pinned gateway row.
     fn render_workspace_gateway_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let gateway = &self.gateway;
@@ -479,6 +632,7 @@ impl ManagementCenter {
         workspace_nav_row(
             SharedString::from("management-global-provider-row-gateway"),
             selected,
+            None,
             ws_icon_tile(
                 "icons/vibex/server.svg",
                 px(30.0),
@@ -556,10 +710,13 @@ impl ManagementCenter {
                 )
                 .into_any_element()
         };
+        let selecting = self.workspace_selecting();
+        let checked = selecting.then(|| self.workspace_provider_selected(id.as_str()));
         let select_id = id.clone();
         workspace_nav_row(
             SharedString::from(format!("management-global-provider-row-{id}")),
             selected,
+            checked,
             div()
                 .when(!enabled, |mark| mark.opacity(0.55))
                 .child(provider_logo_tile(&row.profile, px(30.0), cx))
@@ -574,7 +731,11 @@ impl ManagementCenter {
                 cx,
             ),
             cx.listener(move |this, _, _, cx| {
-                this.select_workspace_provider(select_id.clone(), cx)
+                if this.workspace_selecting() {
+                    this.toggle_workspace_provider_selected(select_id.clone(), cx);
+                } else {
+                    this.select_workspace_provider(select_id.clone(), cx);
+                }
             }),
             cx,
         )
@@ -591,10 +752,13 @@ impl ManagementCenter {
             && !self.provider_create_page_open
             && !self.route_group_page_open;
         let enabled = row.route.status == vibex_core::RouteStatus::Enabled;
+        let selecting = self.workspace_selecting();
+        let checked = selecting.then(|| self.workspace_route_selected(id.as_str()));
         let select_id = id.clone();
         workspace_nav_row(
             SharedString::from(format!("management-global-route-row-{id}")),
             selected,
+            checked,
             ws_icon_tile("icons/vibex/git-branch.svg", px(30.0), None, cx),
             row.route.display_name.clone(),
             None,
@@ -611,7 +775,11 @@ impl ManagementCenter {
                 cx,
             ),
             cx.listener(move |this, _, _, cx| {
-                this.select_workspace_route_group(select_id.clone(), cx)
+                if this.workspace_selecting() {
+                    this.toggle_workspace_route_selected(select_id.clone(), cx);
+                } else {
+                    this.select_workspace_route_group(select_id.clone(), cx);
+                }
             }),
             cx,
         )
@@ -657,6 +825,7 @@ pub(super) fn workspace_gateway_state(
 fn workspace_nav_row(
     id: SharedString,
     selected: bool,
+    checked: Option<bool>,
     mark: AnyElement,
     title: impl Into<SharedString>,
     subtitle: Option<AnyElement>,
@@ -665,6 +834,7 @@ fn workspace_nav_row(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    let check_id = id.clone();
     h_flex()
         .id(id)
         .w_full()
@@ -691,6 +861,23 @@ fn workspace_nav_row(
             } else {
                 cx.theme().primary.opacity(0.08)
             })
+        })
+        // While selecting, a checkbox leads the card: the click names a set in
+        // this mode, so which records are in it has to be the leading fact.
+        // The box stops the click from reaching the row, because the row's
+        // handler would toggle the same record a second time.
+        .when_some(checked, |row, checked| {
+            row.child(
+                div()
+                    .id(SharedString::from(format!("{check_id}-check-wrap")))
+                    .flex_none()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        Checkbox::new(SharedString::from(format!("{check_id}-check")))
+                            .small()
+                            .checked(checked),
+                    ),
+            )
         })
         .child(mark)
         .child(

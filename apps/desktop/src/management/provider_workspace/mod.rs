@@ -9,6 +9,7 @@
 
 use super::*;
 
+mod batch;
 mod create;
 mod gateway;
 mod provider;
@@ -847,6 +848,72 @@ mod tests {
         assert!(SIDEBAR.contains("open_provider_create_page(None, window, cx)"));
         assert!(SIDEBAR.contains("open_route_group_page_editor(window, cx)"));
         assert!(SIDEBAR.contains("import_shared_providers("));
+    }
+
+    /// An empty list invites the first record with the same dashed card the
+    /// Agent detail's model Provider panel draws, not a paragraph.
+    #[test]
+    fn an_empty_column_offers_a_dashed_add_card() {
+        assert!(SIDEBAR.contains("fn render_workspace_sidebar_add_card("));
+        let empty_states = SIDEBAR
+            .split("if providers.is_empty() {")
+            .nth(1)
+            .and_then(|tail| tail.split("for row in &providers").next())
+            .expect("the Provider empty state should remain inspectable");
+        assert!(empty_states.contains("render_workspace_sidebar_add_card("));
+        assert!(empty_states.contains("management-workspace-providers-empty"));
+        // A filtered list is a different answer: nothing matches, and the
+        // invitation to add would be the wrong one.
+        assert!(empty_states.contains("render_workspace_sidebar_empty("));
+        let routes = SIDEBAR
+            .split("if routes.is_empty() {")
+            .nth(1)
+            .and_then(|tail| tail.split("for row in &routes").next())
+            .expect("the route-group empty state should remain inspectable");
+        assert!(routes.contains("render_workspace_sidebar_add_card("));
+        assert!(routes.contains("management-workspace-routes-empty"));
+
+        let card = SIDEBAR
+            .split_once("fn render_workspace_sidebar_add_card(")
+            .and_then(|(_, tail)| tail.split_once("/// The pinned gateway row."))
+            .map(|(body, _)| body)
+            .expect("the add card should remain inspectable");
+        assert!(card.contains("paint_empty_source_border("));
+        assert!(card.contains("Icon::new(IconName::Plus)"));
+        assert!(card.contains(".on_click(on_click)"));
+    }
+
+    /// Providers and route groups share one selection mode and one batch strip,
+    /// so a bulk enable or delete spans both lists.
+    #[test]
+    fn one_batch_strip_acts_on_providers_and_route_groups() {
+        const BATCH: &str = include_str!("batch.rs");
+        for marker in [
+            "enum WorkspaceBatchAction",
+            "fn render_workspace_batch_bar(",
+            "fn apply_workspace_batch(",
+            "fn confirm_workspace_batch_delete(",
+            "delete_model_route(",
+            "delete_model_provider_profile(",
+            "update_model_route(",
+            "update_model_provider_profile(",
+        ] {
+            assert!(BATCH.contains(marker), "batch selection must keep {marker}");
+        }
+        // The strip is one command surface above both lists, not a control on
+        // each card.
+        assert!(SIDEBAR.contains("render_workspace_batch_bar("));
+        assert!(SIDEBAR.contains("workspace_selecting()"));
+        let row = SIDEBAR
+            .split_once("fn workspace_nav_row(")
+            .map(|(_, tail)| tail)
+            .expect("the card's row should remain inspectable");
+        assert!(row.contains("checked: Option<bool>"));
+        assert!(row.contains("Checkbox::new("));
+        assert!(
+            row.contains("cx.stop_propagation()"),
+            "the checkbox must not also toggle the row"
+        );
     }
 
     /// The Agents that use a record sit on the card's trailing edge, and the
