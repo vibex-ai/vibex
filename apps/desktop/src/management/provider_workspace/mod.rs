@@ -631,6 +631,20 @@ fn ws_empty_line(text: &'static str, cx: &App) -> AnyElement {
 
 /// The bottom band of a form: the error, then Cancel and the commit.
 fn ws_form_footer(error: Option<String>, actions: Vec<AnyElement>, cx: &App) -> AnyElement {
+    ws_form_footer_with_leading(error, None, actions, cx)
+}
+
+/// A form's closing bar, with an optional control pinned to its leading edge.
+///
+/// The trailing actions stay on one spine whether or not the leading slot is
+/// filled: the slot is reserved rather than collapsed, so a dialog that gains a
+/// way back does not shift its commit button.
+fn ws_form_footer_with_leading(
+    error: Option<String>,
+    leading: Option<AnyElement>,
+    actions: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
     v_flex()
         .w_full()
         .gap_2()
@@ -648,8 +662,9 @@ fn ws_form_footer(error: Option<String>, actions: Vec<AnyElement>, cx: &App) -> 
             h_flex()
                 .w_full()
                 .items_center()
-                .justify_end()
                 .gap_2()
+                .children(leading)
+                .child(div().flex_1())
                 .children(actions),
         )
         .into_any_element()

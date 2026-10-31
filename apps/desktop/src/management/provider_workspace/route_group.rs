@@ -1024,6 +1024,20 @@ impl ManagementCenter {
         scope: RouteGroupFormScope,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.render_route_group_form_footer_with(scope, None, cx)
+    }
+
+    /// The same closing commands, with one more at the leading edge.
+    ///
+    /// The dialog keeps its step-changing control beside the commit, so the
+    /// reader's way back and their way forward sit on one bar instead of one
+    /// floating above the form.
+    pub(in crate::management) fn render_route_group_form_footer_with(
+        &mut self,
+        scope: RouteGroupFormScope,
+        leading: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pending = self.mutation.is_some();
         let editing = self.route_group_editing_id.is_some();
         let enabled = self
@@ -1059,10 +1073,11 @@ impl ManagementCenter {
                     }))
             }
         };
-        ws_form_footer(
+        ws_form_footer_with_leading(
             (scope != RouteGroupFormScope::Page)
                 .then(|| self.error.clone())
                 .flatten(),
+            leading,
             vec![
                 cancel.into_any_element(),
                 Button::new("management-model-group-save")
