@@ -30,6 +30,7 @@ use gpui_component::{
     clipboard::Clipboard,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList, DescriptionText},
+    dialog::DialogEntrance,
     empty::{
         Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia,
         EmptyMediaVariant, EmptyTitle,
@@ -6264,6 +6265,23 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
+        self.reset_profile_draft_fields(window, cx);
+        self.error = None;
+        self.editing_profile_id = None;
+        self.provider_form_from_picker = false;
+        self.provider_preset_picker = true;
+        self.provider_preset_query
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.navigation.mark_dirty(ManagementSection::Agents, false);
+        cx.notify();
+    }
+
+    /// Empties the Provider draft without changing which step is on screen.
+    ///
+    /// Both answers that leave a half-filled form — Back to the chooser, and
+    /// "custom" replacing the preset the reader had applied — call this, so the
+    /// form can never inherit addresses from a choice that was abandoned.
+    fn reset_profile_draft_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
         self.profile_name
@@ -6283,14 +6301,6 @@ impl ManagementCenter {
         self.profile_detached_models.clear();
         self.profile_model_selection = None;
         self.profile_name_error = None;
-        self.error = None;
-        self.editing_profile_id = None;
-        self.provider_form_from_picker = false;
-        self.provider_preset_picker = true;
-        self.provider_preset_query
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.navigation.mark_dirty(ManagementSection::Agents, false);
-        cx.notify();
     }
 
     fn reset_profile_editor_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6742,6 +6752,12 @@ impl ManagementCenter {
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
                 .h(px(dialog_height))
+                // This overlay is a step in a flow that swaps its own body: the
+                // chooser, the Provider form, and the group form replace one
+                // another in place. A fresh entrance on each swap would replay
+                // the drop-in every time the reader moved one step, so the
+                // surface appears at rest.
+                .entrance(DialogEntrance::None)
                 .child(dialog_content.clone())
                 // The Dialog answers Enter with its own confirm action, whose
                 // default is "close this overlay". Enter in a form means the
@@ -23549,7 +23565,11 @@ impl ManagementCenter {
         // them made the page read as one long list of unequal things.
         let search =
             providers_tab.then(|| management_search_input(&self.provider_preset_query, cx));
-        let mut body = v_flex().w_full().min_w_0().gap_2();
+        // The body owns the leftover height: the tab bar, the hint and the
+        // search above it are fixed, and the list below must be the one region
+        // that scrolls. Without `flex_1` here the list resolves against a
+        // content height of zero and the chooser looks empty.
+        let mut body = v_flex().w_full().min_w_0().min_h_0().flex_1().gap_2();
         if providers_tab {
             let recent_presets = self
                 .provider_recent_presets
@@ -23657,6 +23677,7 @@ impl ManagementCenter {
             body = body.child(
                 div()
                     .id("provider-picker-list")
+                    .debug_selector(|| "provider-picker-list".to_string())
                     .w_full()
                     .min_h_0()
                     .flex_1()
@@ -23672,6 +23693,7 @@ impl ManagementCenter {
             body = body.child(
                 div()
                     .id("provider-picker-groups")
+                    .debug_selector(|| "provider-picker-groups".to_string())
                     .w_full()
                     .min_h_0()
                     .flex_1()
@@ -23687,10 +23709,11 @@ impl ManagementCenter {
             .min_h_0()
             .flex_1()
             .gap_2()
-            .child(self.render_provider_picker_tabs(cx))
+            .child(div().w_full().flex_none().child(self.render_provider_picker_tabs(cx)))
             .child(
                 div()
                     .w_full()
+                    .flex_none()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(if providers_tab {
@@ -23707,7 +23730,7 @@ impl ManagementCenter {
                         )
                     }),
             )
-            .children(search)
+            .children(search.map(|search| div().w_full().flex_none().child(search)))
             .child(body)
             // A new source starts from an empty form, which is the one answer
             // neither tab's list can offer. Importing no longer lives in this
@@ -23972,10 +23995,16 @@ impl ManagementCenter {
     /// "start from an empty form" cannot inherit the addresses of the choice
     /// that was just abandoned.
     fn choose_custom_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let origin = self.provider_picker_origin;
-        self.open_profile_creator_from(window, origin, cx);
+        // Only the step changes: the dialog is already on screen and its
+        // content is decided by these two flags. Re-entering the creator here
+        // would push a second dialog onto the stack, and closing the form would
+        // then uncover the chooser it came from.
         self.provider_preset_picker = false;
         self.provider_form_from_picker = true;
+        self.provider_preset_query
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.reset_profile_draft_fields(window, cx);
+        self.navigation.mark_dirty(ManagementSection::Agents, false);
         cx.notify();
     }
 
@@ -28950,6 +28979,10 @@ impl ManagementCenter {
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
                 .h(px(dialog_height))
+                // Same frame as the Provider form, and the same reason: the two
+                // are steps of one flow, so neither may replay an entrance when
+                // the reader steps between them.
+                .entrance(DialogEntrance::None)
                 .child(dialog_content.clone())
                 .on_ok(move |_, _, cx| {
                     confirm_center.update(cx, |center, cx| center.save_route_group(cx));
@@ -33374,11 +33407,16 @@ impl ManagementCenter {
 impl Render for ManagementProfileDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.center.read(cx).profile_editor_open {
-            cx.defer_in(window, |_, window, cx| {
-                if window.has_active_dialog(cx) {
-                    window.close_dialog(cx);
-                }
-            });
+            // Symmetric with the route-group host: the group editor may own the
+            // overlay, and this host's closed subject must not tear it down.
+            let group_owns_overlay = self.center.read(cx).route_group_editor_open;
+            if !group_owns_overlay {
+                cx.defer_in(window, |_, window, cx| {
+                    if window.has_active_dialog(cx) {
+                        window.close_dialog(cx);
+                    }
+                });
+            }
             return div().size_full().into_any_element();
         }
         self.center.update(cx, |center, cx| {
@@ -33390,11 +33428,21 @@ impl Render for ManagementProfileDialog {
 impl Render for ManagementRouteGroupDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.center.read(cx).route_group_editor_open {
-            cx.defer_in(window, |_, window, cx| {
-                if window.has_active_dialog(cx) {
-                    window.close_dialog(cx);
-                }
-            });
+            // A dialog host closes the topmost dialog when its subject is gone.
+            // When the Provider overlay is the one on top — the reader returned
+            // from a group authored in the chooser — this stale host must not
+            // close it. Only the host whose own subject is on screen closes.
+            let provider_owns_overlay = {
+                let center = self.center.read(cx);
+                center.profile_editor_open && center.provider_preset_picker
+            };
+            if !provider_owns_overlay {
+                cx.defer_in(window, |_, window, cx| {
+                    if window.has_active_dialog(cx) {
+                        window.close_dialog(cx);
+                    }
+                });
+            }
             return div().size_full().into_any_element();
         }
         self.center.update(cx, |center, cx| {
@@ -44944,6 +44992,143 @@ mod gateway_surface_tests {
         );
     }
 
+    /// Both halves of the chooser draw, and choosing the custom form keeps one
+    /// overlay instead of stacking a second.
+    ///
+    /// The step is drawn through the dialog host, so a layout that resolves the
+    /// list against a content height of zero shows an empty overlay even though
+    /// the records and presets are there. Only a real frame catches that; a
+    /// source scan cannot.
+    #[gpui::test]
+    fn both_chooser_tabs_draw_and_the_custom_form_keeps_one_overlay(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_preset_picker = true;
+                center.profile_editor_open = true;
+                center.present_profile_editor_dialog(window, cx);
+            });
+        });
+        for tab in ProviderPickerTab::ALL {
+            cx.update(|window, cx| {
+                center.update(cx, |center, cx| {
+                    center.provider_picker_tab = tab;
+                    cx.notify();
+                });
+                let _ = window.draw(cx);
+            });
+            let list_id = match tab {
+                ProviderPickerTab::Providers => "provider-picker-list",
+                ProviderPickerTab::RouteGroups => "provider-picker-groups",
+            };
+            // The list is drawn *and* has height. A scroll region that resolves
+            // to zero renders nothing while every record is present, which is
+            // exactly how the chooser looked empty with both counts nonzero.
+            let bounds = cx
+                .debug_bounds(list_id)
+                .unwrap_or_else(|| panic!("{} draws its list", tab.label()));
+            assert!(
+                f32::from(bounds.size.height) > 120.0,
+                "{} gave its list {} px",
+                tab.label(),
+                f32::from(bounds.size.height)
+            );
+            assert!(
+                f32::from(bounds.size.width) > 200.0,
+                "{} gave its list {} px wide",
+                tab.label(),
+                f32::from(bounds.size.width)
+            );
+            assert!(
+                cx.update(|window, cx| window.has_active_dialog(cx)),
+                "{} keeps its overlay",
+                tab.label()
+            );
+        }
+        // "Custom provider" changes the step: the overlay stays, the chooser's
+        // body is replaced by the form, and the form remembers how it got there.
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.choose_custom_provider(window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        center.read_with(cx, |center, _| {
+            assert!(!center.provider_preset_picker);
+            assert!(center.provider_form_from_picker);
+            assert!(center.profile_editor_open);
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the custom form is the same overlay, not a second one"
+        );
+    }
+
+    /// Stepping through the flow does not replay a drop-in.
+    ///
+    /// The chooser, the Provider form, and the route-group form swap bodies
+    /// inside one overlay. Each swap mounts a fresh dialog, and the kit's
+    /// default entrance would animate the whole surface down again — a visible
+    /// jump for what is only the next step of one form.
+    #[test]
+    fn the_authoring_dialogs_enter_without_animation() {
+        let source = include_str!("management.rs");
+        for entry in [
+            "    fn present_profile_editor_dialog(",
+            "    fn present_route_group_dialog(",
+        ] {
+            let body = source
+                .split_once(entry)
+                .map(|(_, tail)| tail)
+                .expect("both presenters should remain inspectable");
+            let dialog = body
+                .split_once(".child(dialog_content.clone())")
+                .map(|(before, _)| before)
+                .unwrap_or(body);
+            assert!(
+                dialog.contains(".entrance(DialogEntrance::None)"),
+                "{entry} must not animate a step it is replacing"
+            );
+        }
+    }
+
+    /// The two dialog hosts must not tear down each other's overlay.
+    ///
+    /// A host closes the topmost dialog when its own subject is gone. Moving
+    /// between the chooser and the route-group form leaves the other host
+    /// mounted for a frame, so an unguarded host would close the dialog that was
+    /// just opened — which reads as the window closing on a click.
+    #[test]
+    fn neither_dialog_host_closes_the_others_overlay() {
+        let source = include_str!("management.rs");
+        let provider = source
+            .split_once("impl Render for ManagementProfileDialog {")
+            .and_then(|(_, tail)| tail.split_once("impl Render for ManagementRouteGroupDialog"))
+            .map(|(body, _)| body)
+            .expect("the Provider host should remain inspectable");
+        assert!(
+            provider
+                .contains("let group_owns_overlay = self.center.read(cx).route_group_editor_open;")
+        );
+        assert!(provider.contains("if !group_owns_overlay {"));
+
+        let group = source
+            .split_once("impl Render for ManagementRouteGroupDialog {")
+            .and_then(|(_, tail)| tail.split_once("impl Render for ManagementCenter"))
+            .map(|(body, _)| body)
+            .expect("the group host should remain inspectable");
+        assert!(group.contains("center.profile_editor_open && center.provider_preset_picker"));
+        assert!(group.contains("if !provider_owns_overlay {"));
+    }
+
     /// The Provider controls toolbar draws, and its menus keep the list's
     /// current filter and sort.
     ///
@@ -46500,6 +46685,74 @@ mod gateway_surface_tests {
         assert!(presenter.contains("\"Add configuration\", \"添加配置\", \"新增配置\""));
     }
 
+    /// The chooser's list region must own the leftover height.
+    ///
+    /// The tab bar, the hint, and the search are fixed chrome. When the list was
+    /// wrapped in a column without `flex_1`, it resolved against a content height
+    /// of zero and both halves looked empty even though the records were there.
+    #[test]
+    fn the_chooser_body_takes_the_leftover_height() {
+        let source = include_str!("management.rs");
+        let picker = source
+            .split_once("    fn render_provider_picker_step(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives this Agent an existing shared Provider.")
+            })
+            .map(|(body, _)| body)
+            .expect("the picker step should remain inspectable");
+        assert!(
+            picker.contains("let mut body = v_flex().w_full().min_w_0().min_h_0().flex_1()"),
+            "the list body must claim the height the chrome leaves"
+        );
+        // The chrome above it must not compete for that height.
+        assert!(
+            picker
+                .contains("div().w_full().flex_none().child(self.render_provider_picker_tabs(cx))")
+        );
+        assert!(
+            picker.contains(
+                ".children(search.map(|search| div().w_full().flex_none().child(search)))"
+            )
+        );
+        // Each half's scroll region is the only thing that scrolls.
+        assert!(picker.contains(".id(\"provider-picker-list\")"));
+        assert!(picker.contains(".id(\"provider-picker-groups\")"));
+    }
+
+    /// "Custom provider" changes the step, it does not open a second dialog.
+    ///
+    /// The chooser already owns the overlay; re-entering the creator pushed
+    /// another dialog onto the stack, and the form's close then uncovered the
+    /// chooser underneath, which read as the window closing on a click.
+    #[test]
+    fn choosing_the_custom_form_swaps_the_step_in_place() {
+        let source = include_str!("management.rs");
+        let custom = source
+            .split_once("    fn choose_custom_provider(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Fills the draft from a built-in preset.")
+            })
+            .map(|(body, _)| body)
+            .expect("the custom chooser should remain inspectable");
+        assert!(
+            !custom.contains("open_profile_creator"),
+            "the chooser must not open a second dialog over itself"
+        );
+        assert!(custom.contains("self.provider_preset_picker = false;"));
+        assert!(custom.contains("self.provider_form_from_picker = true;"));
+        // The abandoned preset's addresses go with the step.
+        assert!(custom.contains("self.reset_profile_draft_fields(window, cx);"));
+
+        let reset = source
+            .split_once("    fn reset_profile_draft_fields(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reset_profile_editor_state("))
+            .map(|(body, _)| body)
+            .expect("the draft reset should remain inspectable");
+        assert!(reset.contains("self.profile_base_url"));
+        assert!(reset.contains("self.profile_api_key.update("));
+        assert!(reset.contains("self.profile_configured_models.clear();"));
+    }
+
     /// Creating a Provider starts on the picker, and the manual path leaves it.
     ///
     /// The step is the feature: an empty form used to be what "add a provider"
@@ -46609,7 +46862,7 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the custom chooser should remain inspectable");
         assert!(
-            custom.contains("self.open_profile_creator_from(window, origin, cx);"),
+            custom.contains("self.reset_profile_draft_fields(window, cx);"),
             "an abandoned preset must not leave its addresses in the empty form"
         );
         assert!(custom.contains("self.provider_preset_picker = false;"));
