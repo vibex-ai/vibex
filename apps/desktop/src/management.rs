@@ -36,7 +36,7 @@ use gpui_component::{
     },
     form::{Field, Form},
     h_flex,
-    input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::NotificationType,
     pagination::Pagination,
@@ -126,6 +126,14 @@ const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
+/// What the Prompt editor's chrome takes above and below its Markdown body.
+///
+/// The card's heading and padding, the selected record's meta row, the name
+/// field and its label, the action row, and the section's own heading and
+/// insets. Subtracted from the window so the body grows with the pane.
+const MANAGEMENT_PROMPT_BODY_RESERVED_HEIGHT: f32 = 330.0;
+const MANAGEMENT_PROMPT_BODY_MIN_HEIGHT: f32 = 160.0;
+const MANAGEMENT_PROMPT_BODY_MAX_HEIGHT: f32 = 640.0;
 /// The height of the controls in a resource sidebar.
 ///
 /// One band for the commands, the market entry and the search field. The kit's
@@ -1781,7 +1789,8 @@ pub struct ManagementCenter {
     automation_title: Entity<InputState>,
     automation_description: Entity<InputState>,
     prompt_name: Entity<InputState>,
-    prompt_body: Entity<TextareaState>,
+    /// The Prompt body, edited with the Markdown grammar.
+    prompt_body: Entity<EditorState>,
     prompt_search: Entity<InputState>,
     /// The Prompt the editor holds, or `None` while it is creating one.
     ///
@@ -2294,12 +2303,22 @@ impl ManagementCenter {
                 "例如 檢查命令",
             ))
         });
+        // A Prompt body is Markdown, so it is written in the component's
+        // source editor with the Markdown grammar rather than a plain
+        // textarea: the headings, lists, fenced blocks and emphasis the
+        // composer inserts are already marked up in the source being written.
         let prompt_body = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder(management_locale_text(
-                "e.g. Review this workspace",
-                "例如 检查此工作区",
-                "例如 檢查此工作區",
-            ))
+            EditorState::new(window, cx)
+                .language("markdown")
+                .line_number(false)
+                .folding(false)
+                .indent_guides(false)
+                .soft_wrap(true)
+                .placeholder(management_locale_text(
+                    "e.g. Review this workspace",
+                    "例如 检查此工作区",
+                    "例如 檢查此工作區",
+                ))
         });
         let hook_name = cx.new(|cx| {
             InputState::new(window, cx)
@@ -3226,7 +3245,7 @@ impl ManagementCenter {
                 input.set_placeholder(locale::text(en, zh_cn, zh_tw), window, cx)
             });
         }
-        // The Prompt body is a multi-line textarea, so it cannot share the
+        // The Prompt body is the Markdown editor, so it cannot share the
         // single-line placeholder array above.
         self.prompt_body.update(cx, |input, cx| {
             input.set_placeholder(
@@ -18651,7 +18670,7 @@ impl ManagementCenter {
             }
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
-            ManagementSection::PromptsHooks => self.render_prompts(cx),
+            ManagementSection::PromptsHooks => self.render_prompts(window, cx),
             ManagementSection::Advanced => self.render_advanced(window, cx),
             ManagementSection::Scheduled => self.render_scheduled(window, cx),
             ManagementSection::Automation => self.render_automation(cx),
@@ -29644,13 +29663,16 @@ impl ManagementCenter {
     ///
     /// The sidebar owns the list and the selection; this card is the one place
     /// a Prompt is written, so creating one and editing one share the same
-    /// fields, labels, and commit button.
-    fn render_prompts(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// fields, labels, and commit button. The body is Markdown and is sized
+    /// from the window, so a long Prompt is read in the same surface that
+    /// writes it rather than in a 96px box.
+    fn render_prompts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let editing = self.selected_prompt_id.is_some();
         let selected = self.selected_prompt().cloned();
+        let body_height = management_prompt_body_height(f32::from(window.viewport_size().height));
 
-        let mut form = v_flex().w_full().gap_3();
+        let mut form = v_flex().w_full().min_w_0().gap_3();
         if let Some(prompt) = &selected {
             form = form.child(
                 h_flex()
@@ -29685,9 +29707,10 @@ impl ManagementCenter {
                 false,
                 cx,
             ))
-            .child(management_textarea_field(
+            .child(management_markdown_body_field(
                 management_locale_text("Prompt body", "提示词内容", "提示詞內容"),
                 &self.prompt_body,
+                body_height,
                 cx,
             ));
 
@@ -33388,6 +33411,43 @@ fn management_textarea_field(
                 .child(Textarea::new(state).h(px(96.0)).w_full()),
         )
         .into_any_element()
+}
+
+/// A labeled Markdown body sized from the window rather than by its content.
+///
+/// The label repeats `Field`'s label typography, but the control is not put
+/// inside a `Field`: a Field sizes its control to its content, which would
+/// leave the editor's own height undecided. The body is given a definite
+/// height, so the card's spare space belongs to the text being written and the
+/// form stays inside the pane's scroll.
+fn management_markdown_body_field(
+    label: impl Into<SharedString>,
+    state: &Entity<EditorState>,
+    height: f32,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let _ = cx;
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(div().text_sm().font_medium().child(label.into()))
+        .child(Editor::new(state).w_full().h(px(height)))
+        .into_any_element()
+}
+
+/// The height the Prompt body gets from the window.
+///
+/// The card sits under the section heading, the selected record's meta row,
+/// the name field and the action row; what is left at the bottom of the pane
+/// is what the body may use. The bounds keep a short window from squeezing the
+/// editor to nothing and a tall one from turning the card into a full-page
+/// text area with no visible actions.
+fn management_prompt_body_height(viewport_height: f32) -> f32 {
+    (viewport_height - MANAGEMENT_PROMPT_BODY_RESERVED_HEIGHT).clamp(
+        MANAGEMENT_PROMPT_BODY_MIN_HEIGHT,
+        MANAGEMENT_PROMPT_BODY_MAX_HEIGHT,
+    )
 }
 
 /// Sources a native export can name.
@@ -41036,7 +41096,9 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_context_sidebar("))
             .map(|(body, _)| body)
             .expect("management content router should remain inspectable");
-        assert!(content.contains("ManagementSection::PromptsHooks => self.render_prompts(cx)"));
+        assert!(
+            content.contains("ManagementSection::PromptsHooks => self.render_prompts(window, cx)")
+        );
 
         let advanced = production
             .split_once("    fn render_advanced(")
@@ -41071,9 +41133,13 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the prompt editor should remain inspectable");
         assert!(editor.contains("this.save_prompt(cx)"));
-        // A Prompt body is prose, so it is written in the kit's multi-line
-        // textarea rather than the single-line input the name field uses.
-        assert!(editor.contains("management_textarea_field("));
+        // A Prompt body is Markdown, so it is written in the component's
+        // Markdown editor rather than the single-line input the name field
+        // uses, and the editor's height comes from the window so a long
+        // Prompt fills the pane instead of a 96px box.
+        assert!(editor.contains("management_markdown_body_field("));
+        assert!(editor.contains("management_prompt_body_height("));
+        assert!(!editor.contains("management_textarea_field("));
         // The sidebar owns the list, so the body must not draw a second copy.
         assert!(!editor.contains("management_resource_row("));
     }
@@ -41269,6 +41335,21 @@ mod tests {
         let (minimum, maximum) = management_compact_sidebar_height_limits(400.0);
         assert_eq!(minimum, 192.0);
         assert_eq!(maximum, 192.0);
+    }
+
+    /// A Prompt body grows with the window but never collapses or takes the
+    /// whole card, so the name field and the save row stay reachable.
+    #[test]
+    fn the_prompt_body_grows_with_the_window_within_bounds() {
+        assert_eq!(
+            management_prompt_body_height(1_080.0),
+            MANAGEMENT_PROMPT_BODY_MAX_HEIGHT
+        );
+        assert_eq!(management_prompt_body_height(780.0), 450.0);
+        assert_eq!(
+            management_prompt_body_height(400.0),
+            MANAGEMENT_PROMPT_BODY_MIN_HEIGHT
+        );
     }
 
     #[test]
