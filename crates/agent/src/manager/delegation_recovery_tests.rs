@@ -39,6 +39,7 @@ impl DelegationFixture {
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Delegation parent".into()),
                 safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: Default::default(),
             })
             .await
             .unwrap();
@@ -708,6 +709,7 @@ async fn cascade_cancels_taskless_external_work_while_single_task_cancellation_p
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Independent external session".into()),
                 safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: Default::default(),
             })
             .await
             .unwrap();

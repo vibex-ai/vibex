@@ -3840,6 +3840,7 @@ mod tests {
             last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         }
     }
 
@@ -4733,6 +4734,7 @@ mod tests {
                 last_message_at_ms: index,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");
@@ -4797,6 +4799,7 @@ mod tests {
                 last_message_at_ms: index,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");
@@ -4871,6 +4874,7 @@ mod tests {
                 last_message_at_ms: index,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             })
             .collect::<Vec<_>>();
         app.agent
@@ -5044,6 +5048,7 @@ mod tests {
                 last_message_at_ms: index,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");
@@ -5138,6 +5143,7 @@ mod tests {
                 last_message_at_ms: 1,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             }]))
             .expect("apply");
         app.navigate_to(Page::Sessions);
@@ -5271,6 +5277,7 @@ mod tests {
                 last_message_at_ms: 1,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             }]))
             .expect("apply");
         app.navigate_to(Page::Sessions);
@@ -5339,6 +5346,7 @@ mod tests {
                 last_message_at_ms: index,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");

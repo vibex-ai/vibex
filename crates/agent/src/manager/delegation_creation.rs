@@ -323,6 +323,9 @@ impl AgentManager {
                     workspace_mode: parent.workspace_mode,
                     title: Some(delegation.title.clone()),
                     safety: Some(parent.safety.clone()),
+                    // A delegated child is the same work in another process,
+                    // so it runs with the parent session's capability answer.
+                    tools: parent.tools.clone(),
                 },
                 child_session_id.clone(),
             )

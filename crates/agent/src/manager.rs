@@ -999,6 +999,11 @@ impl AgentManager {
         // configuration, and reading them at different moments could hand a
         // session the browser of one edit and the computer tool of the next.
         let tool_preferences = self.agent_tool_preferences();
+        // The Config Center records the default, the session records the
+        // answer. Reading them together is what keeps a session created with
+        // the browser off from picking it back up when the card is edited.
+        let session_tools = self.session_tool_settings(session_id)?;
+        let enabled_tools = session_tools.resolve(&tool_preferences, agent_id.as_str());
         if provider_kind == ProviderKind::Acp
             && let Some(tool) = self.delegation_tool.get()
         {
@@ -1041,7 +1046,7 @@ impl AgentManager {
             });
         }
         if provider_kind == ProviderKind::Acp
-            && tool_preferences.enabled(agent_id.as_str(), vibex_core::AgentBuiltinTool::Browser)
+            && enabled_tools.contains(&vibex_core::AgentBuiltinTool::Browser)
             && let Some(tool) = self.browser_mcp_tool.get()
         {
             resources
@@ -1052,7 +1057,7 @@ impl AgentManager {
         // browser one: an Agent that cannot use it simply never lists the
         // tools, and the runtime withholds nothing from the browser path.
         if provider_kind == ProviderKind::Acp
-            && tool_preferences.enabled(agent_id.as_str(), vibex_core::AgentBuiltinTool::Computer)
+            && enabled_tools.contains(&vibex_core::AgentBuiltinTool::Computer)
             && let Some(tool) = self.computer_mcp_tool()
         {
             resources
@@ -1082,6 +1087,36 @@ impl AgentManager {
             }
         }
         Ok(resources)
+    }
+
+    /// The built-in tool answers one session recorded when it was created.
+    ///
+    /// A session that no longer has a row — a probe, a switch in progress —
+    /// reports the empty map, which resolves to the Agent default exactly as
+    /// every session did before the field existed.
+    fn session_tool_settings(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<vibex_core::SessionToolSettings> {
+        let conn = self.open_migrated()?;
+        let mut tools =
+            vibex_db::SessionRepository::tool_settings(&conn, session_id)?.unwrap_or_default();
+        tools.normalize();
+        Ok(tools)
+    }
+
+    /// Replaces one session's built-in tool answers.
+    ///
+    /// The creation path records the request's map, and `fork_session` copies
+    /// the source's. Nothing else writes it: editing an Agent default must not
+    /// rewrite the answer of a session that already exists.
+    pub fn set_session_tool_settings(
+        &self,
+        session_id: &VibexSessionId,
+        tools: vibex_core::SessionToolSettings,
+    ) -> VibexResult<()> {
+        let conn = self.open_migrated()?;
+        vibex_db::SessionRepository::set_tool_settings(&conn, session_id, &tools)
     }
 
     pub(crate) fn resolve_initial_runtime_selection(
@@ -1465,6 +1500,7 @@ impl AgentManager {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: request.tools.clone(),
         };
         let copied_items = TimelineRepository::insert_session_and_append_many(
             &mut conn,
@@ -1680,6 +1716,9 @@ impl AgentManager {
                 workspace_mode: source.workspace_mode,
                 title: Some(source.title),
                 safety: Some(source.safety),
+                // A fork is the same conversation continued, so it keeps the
+                // source's capability answer instead of re-reading the card.
+                tools: source.tools.clone(),
             },
             fork_timeline_appends(&source_items),
             on_created,
@@ -10099,6 +10138,7 @@ mod tests {
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Creation broadcast".to_string()),
                 safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: Default::default(),
             })
             .await
             .unwrap();
@@ -10124,6 +10164,7 @@ mod tests {
                     workspace_mode: WorkspaceMode::CurrentCheckout,
                     title: Some("Owned session".to_string()),
                     safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                    tools: Default::default(),
                 },
                 owned_id.clone(),
             )
@@ -10167,6 +10208,7 @@ mod tests {
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Turn boundary snapshots".to_string()),
                 safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: Default::default(),
             })
             .await
             .unwrap();
@@ -11103,6 +11145,120 @@ mod tests {
     }
 
     #[test]
+    fn a_session_answer_beats_the_agent_default_and_survives_card_edits() {
+        use vibex_core::{AgentBuiltinTool, SessionToolChoice};
+
+        let db_path = temp_db_path("session-tool-answer");
+        let manager = AgentManager::new(&db_path).unwrap();
+        manager
+            .install_browser_mcp_tool(BrowserMcpToolConfig {
+                command: PathBuf::from("/tmp/vibex-desktop"),
+                endpoint: "http://127.0.0.1:43213/mcp".to_string(),
+                capability_token: "cap_session_tool_answer_secret".to_string(),
+            })
+            .unwrap();
+        manager
+            .install_computer_mcp_tool(ComputerMcpToolConfig {
+                command: PathBuf::from("/tmp/vibex-desktop"),
+                endpoint: "http://127.0.0.1:43214/mcp".to_string(),
+                capability_token: "cap_session_tool_answer_secret".to_string(),
+            })
+            .unwrap();
+        let conn = manager.open_migrated().unwrap();
+        let workspace_root = temp_workspace_path("session-tool-answer");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        let mut session = insert_session(
+            &conn,
+            "session tool answer",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            claude.clone(),
+            AgentSessionState::Idle,
+        );
+        drop(conn);
+
+        let browser = |resources: &crate::ProviderRuntimeResources| {
+            resources
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == vibex_core::BROWSER_MCP_SERVER_ID)
+        };
+        let computer = |resources: &crate::ProviderRuntimeResources| {
+            resources
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == vibex_core::COMPUTER_MCP_SERVER_ID)
+        };
+
+        // An untouched session follows the Agent, exactly as before the field
+        // existed.
+        let resources = manager
+            .runtime_resources_for_session(&session.id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(browser(&resources) && computer(&resources));
+
+        // The session records "browser off", which beats the enabled Agent
+        // default without rewriting it.
+        session
+            .tools
+            .set(AgentBuiltinTool::Browser, SessionToolChoice::Off);
+        manager
+            .set_session_tool_settings(&session.id, session.tools.clone())
+            .unwrap();
+        assert!(manager.agent_tool_enabled("claude", AgentBuiltinTool::Browser));
+        let resources = manager
+            .runtime_resources_for_session(&session.id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(!browser(&resources), "the session's own answer must win");
+        assert!(computer(&resources), "the other panel is gated separately");
+
+        // Editing the Agent card later does not rewrite the session's answer,
+        // and a session that never overrode the card does follow the edit.
+        manager.set_agent_tool_enabled("claude", AgentBuiltinTool::Computer, false);
+        let resources = manager
+            .runtime_resources_for_session(&session.id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(!browser(&resources));
+        assert!(!computer(&resources));
+
+        let following = insert_session(
+            &manager.open_migrated().unwrap(),
+            "following the card",
+            &session.project_id,
+            &session.workspace_id,
+            &session.workspace_root,
+            claude.clone(),
+            AgentSessionState::Idle,
+        );
+        let resources = manager
+            .runtime_resources_for_session(&following.id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(browser(&resources));
+        assert!(
+            !computer(&resources),
+            "a session that never answered follows the edited card"
+        );
+
+        // Clearing the override returns the session to the card.
+        session.tools = Default::default();
+        manager
+            .set_session_tool_settings(&session.id, session.tools.clone())
+            .unwrap();
+        let resources = manager
+            .runtime_resources_for_session(&session.id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(browser(&resources));
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
     fn the_computer_cli_environment_reaches_only_the_agents_that_need_it() {
         let db_path = temp_db_path("computer-cli-env");
         let manager = AgentManager::new(&db_path).unwrap();
@@ -11571,6 +11727,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(conn, &session).unwrap();
         session

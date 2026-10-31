@@ -241,6 +241,7 @@ fn create_e2e_durable_session(
         last_message_at_ms: now,
         archived_at_ms: None,
         deleted_at_ms: None,
+        tools: Default::default(),
     };
     SessionRepository::insert(&conn, &session)?;
     let selection =

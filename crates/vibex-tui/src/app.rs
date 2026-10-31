@@ -10624,6 +10624,7 @@ mod tests {
             last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         let at_ms = vibex_core::unix_timestamp_ms() + 60_000;
         app.enqueue_scheduled(
@@ -10788,6 +10789,7 @@ mod tests {
             last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         }
     }
 

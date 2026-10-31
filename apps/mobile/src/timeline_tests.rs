@@ -93,6 +93,7 @@ fn open_timeline<'a>(
                 last_message_at_ms: 1,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             });
             let items: Vec<_> = std::iter::once(TimelinePayload::UserMessage(UserMessagePayload {
                 text: "Review the implementation".into(),

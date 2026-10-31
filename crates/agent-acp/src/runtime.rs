@@ -29285,6 +29285,7 @@ for line in sys.stdin:
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("group session".to_string()),
                 safety: None,
+                tools: Default::default(),
             })
             .await
             .expect("a group session must be creatable");
@@ -29694,6 +29695,7 @@ for line in sys.stdin:
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("runtime switch fixture".to_string()),
                 safety: None,
+                tools: Default::default(),
             })
             .await
             .unwrap();
@@ -40169,6 +40171,7 @@ for line in sys.stdin:
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("mock acp".to_string()),
                 safety: None,
+                tools: Default::default(),
             })
             .await
             .unwrap();

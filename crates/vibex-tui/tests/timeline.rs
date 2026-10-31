@@ -45,6 +45,7 @@ fn app(payloads: Vec<TimelinePayload>, state: AgentSessionState) -> App {
         last_message_at_ms: 1,
         archived_at_ms: None,
         deleted_at_ms: None,
+        tools: Default::default(),
     };
     let id = session.id.clone();
     app.agent.state.selected_session_id = Some(id.clone());

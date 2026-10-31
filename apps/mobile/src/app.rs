@@ -7755,6 +7755,7 @@ impl MobileApp {
             last_message_at_ms: optimistic_submitted_at_ms,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         let optimistic_message = (armed_command.is_none()
             && (!prompt.is_empty() || !attachments.is_empty()))
@@ -7839,6 +7840,7 @@ impl MobileApp {
                 workspace_mode,
                 title: create_title,
                 safety: None,
+                tools: Default::default(),
             });
             backend.create_session(request).await
         });
@@ -38501,6 +38503,7 @@ mod tests {
                 last_message_at_ms: 0,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             });
             app.controller = Some(controller);
             app
@@ -38616,6 +38619,7 @@ mod tests {
                 last_message_at_ms: 0,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             });
             app.controller = Some(controller);
             app.sidebar_view
@@ -43676,6 +43680,7 @@ fn session_opened(cx: &mut Context<Self>) {
                 last_message_at_ms: 0,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             }
         }
 
@@ -43754,6 +43759,7 @@ fn session_opened(cx: &mut Context<Self>) {
                 last_message_at_ms: 0,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             }
         }
 
@@ -43831,6 +43837,7 @@ fn session_opened(cx: &mut Context<Self>) {
                 last_message_at_ms: 0,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             }
         }
         fn send(
@@ -44512,6 +44519,7 @@ fn agent_icon_path(",
                     last_message_at_ms: 1,
                     archived_at_ms: None,
                     deleted_at_ms: None,
+                    tools: Default::default(),
                 },
                 runtime.clone(),
                 Some(PendingMobileUserMessage {

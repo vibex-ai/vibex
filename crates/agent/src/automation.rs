@@ -412,6 +412,7 @@ impl<'a> AutomationGraphRunner<'a> {
                     .safety
                     .clone()
                     .or_else(|| Some(AgentSessionSafety::workspace_write_ask_on_risk())),
+                tools: Default::default(),
             })
             .await
         {
@@ -508,6 +509,7 @@ impl<'a> AutomationGraphRunner<'a> {
                     graph.title, node.title
                 )),
                 safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: Default::default(),
             })
             .await?;
         let step = self.update_step_session(step, Some(session.id.clone()))?;

@@ -97,7 +97,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 84;
+pub const CURRENT_SCHEMA_VERSION: i64 = 86;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -2671,9 +2671,9 @@ impl SessionRepository {
                 workspace_mode, state,
                 permission_mode, ask_on_risk, bypass_all_permissions,
                 created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
-                current_agent_id
+                current_agent_id, tools_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ",
             params![
                 session.id.as_str(),
@@ -2690,13 +2690,72 @@ impl SessionRepository {
                 session.updated_at_ms,
                 session.archived_at_ms,
                 session.deleted_at_ms,
-                session.agent_id.as_str()
+                session.agent_id.as_str(),
+                json_to_db(&session.tools)?
             ],
         )
         .map_err(storage_err(
             "session_insert_failed",
             "failed to insert session",
         ))?;
+        Ok(())
+    }
+
+    /// The built-in tool answers one session recorded, without decoding the
+    /// whole row.
+    ///
+    /// The runtime asks this every time it assembles a session's resources, so
+    /// it stays a single-column primary-key read. A missing session reports
+    /// `None`; the caller resolves that to the Agent default.
+    pub fn tool_settings(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<vibex_core::SessionToolSettings>> {
+        let raw = conn
+            .query_row(
+                "SELECT tools_json FROM agent_sessions WHERE session_id = ?1",
+                params![session_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "session_tool_settings_lookup_failed",
+                "failed to read Agent session tool settings",
+            ))?;
+        raw.map(json_from_db).transpose().map_err(|error| {
+            VibexError::storage(
+                "session_tool_settings_decode_failed",
+                "failed to decode Agent session tool settings",
+            )
+            .with_diagnostic("error", error.to_string())
+        })
+    }
+
+    /// Replaces one session's built-in tool answers.
+    pub fn set_tool_settings(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        tools: &vibex_core::SessionToolSettings,
+    ) -> VibexResult<()> {
+        let updated = conn
+            .execute(
+                "UPDATE agent_sessions SET tools_json = ?2, updated_at_ms = ?3 WHERE session_id = ?1",
+                params![
+                    session_id.as_str(),
+                    json_to_db(tools)?,
+                    unix_timestamp_ms()
+                ],
+            )
+            .map_err(storage_err(
+                "session_tool_settings_update_failed",
+                "failed to store Agent session tool settings",
+            ))?;
+        if updated == 0 {
+            return Err(VibexError::validation(
+                "session_not_found",
+                "Agent session was not found",
+            ));
+        }
         Ok(())
     }
 
@@ -2716,7 +2775,7 @@ impl SessionRepository {
                          WHERE agent_timeline_items.session_id = agent_sessions.session_id),
                         created_at_ms
                     ) AS last_message_at_ms,
-                    archived_at_ms, deleted_at_ms, current_agent_id
+                    archived_at_ms, deleted_at_ms, current_agent_id, tools_json
                 FROM agent_sessions
                 WHERE session_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -2791,7 +2850,7 @@ impl SessionRepository {
                      WHERE agent_timeline_items.session_id = agent_sessions.session_id),
                     created_at_ms
                 ) AS last_message_at_ms,
-                archived_at_ms, deleted_at_ms, current_agent_id
+                archived_at_ms, deleted_at_ms, current_agent_id, tools_json
             FROM agent_sessions
             WHERE deleted_at_ms IS NULL
             {}
@@ -3027,7 +3086,7 @@ impl SessionRepository {
                          WHERE agent_timeline_items.session_id = agent_sessions.session_id),
                         created_at_ms
                     ) AS last_message_at_ms,
-                    archived_at_ms, deleted_at_ms, current_agent_id
+                    archived_at_ms, deleted_at_ms, current_agent_id, tools_json
                 FROM agent_sessions
                 WHERE deleted_at_ms IS NULL
                     AND archived_at_ms IS NOT NULL
@@ -12505,7 +12564,6 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_gateway_profile_kind_repair(conn, &mut applied)?;
     model_gateway::migrate_endpoint_protocol(conn, &mut applied)?;
     apply_route_failover(conn, &mut applied)?;
-    apply_agent_discovery_latest_only(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
@@ -12529,6 +12587,11 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // schema is safe to re-run.
     apply_model_group_routing(conn, &mut applied)?;
     apply_retire_provider_groups(conn, &mut applied)?;
+    // Recorded after the older tail so a migrated database reports an
+    // ascending version list; the discovery index has no dependency on the
+    // Provider work above it.
+    apply_agent_discovery_latest_only(conn, &mut applied)?;
+    apply_session_tool_settings(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -14893,6 +14956,57 @@ fn apply_drop_duplicate_timeline_index(
     Ok(())
 }
 
+/// Adds the built-in tool panels one session runs with.
+///
+/// The Config Center's Agent switches are the default, not the fact: before
+/// this column existed every session silently inherited whatever the Agent
+/// card said at launch, and editing that card rewrote history. The column
+/// records only the sessions that deliberately deviate, so the existing rows
+/// keep following their Agent exactly as they did before the upgrade.
+fn apply_session_tool_settings(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 86;
+    const NAME: &str = "agent_session_tool_settings";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    // A database restored from a newer snapshot can already carry the column
+    // while its recorded version is older; adding it again would abort here and
+    // strand every later migration. Column-by-column, so this is safe to skip.
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name = 'tools_json'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to inspect Agent session columns",
+        ))?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE agent_sessions ADD COLUMN tools_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to add Agent session tool settings",
+        ))?;
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Agent session tool settings migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 fn apply_session_title_lock(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
     const VERSION: i64 = 53;
     const NAME: &str = "agent_session_title_lock";
@@ -17199,6 +17313,7 @@ fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> 
         archived_at_ms: row.get(13)?,
         deleted_at_ms: row.get(14)?,
         agent_id: parse_id_sql(row.get(15)?, AgentId::parse)?,
+        tools: json_from_db_sql(row.get(16)?)?,
     })
 }
 
@@ -18765,6 +18880,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &parent).unwrap();
         let delegation = AgentDelegation::single_turn_legacy(
@@ -18803,6 +18919,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &child).unwrap();
         let attached = AgentDelegationRepository::attach_claimed_child_session(
@@ -18913,6 +19030,7 @@ mod tests {
                 last_message_at_ms: now,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             };
             SessionRepository::insert(conn, &session).unwrap();
             session
@@ -19096,6 +19214,10 @@ mod tests {
         apply_runtime_auth_source_table_rebuild(&mut conn, &mut applied).unwrap();
         assert_eq!(applied, ["46:runtime_auth_source_nullable_legacy_columns"]);
         assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        // The repository always writes the tool map now. A database frozen at
+        // v46 gains that column from every later migration, so the fixture
+        // needs it before the insert above can run.
+        ensure_session_tools_column(&conn).unwrap();
 
         let workspace_root = std::env::temp_dir().join(format!(
             "vibex-schema-v47-agent-default-usage-{}",
@@ -19121,6 +19243,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let auth_context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
@@ -19252,6 +19375,8 @@ mod tests {
                 "82:model_provider_metadata",
                 "83:model_group_routing",
                 "84:retire_provider_groups",
+                "85:agent_discovery_latest_only",
+                "86:agent_session_tool_settings",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19420,6 +19545,8 @@ mod tests {
                 "82:model_provider_metadata",
                 "83:model_group_routing",
                 "84:retire_provider_groups",
+                "85:agent_discovery_latest_only",
+                "86:agent_session_tool_settings",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19472,6 +19599,7 @@ mod tests {
             tx.commit().unwrap();
         }
         assert_eq!(current_schema_version(&conn).unwrap(), 31);
+        ensure_session_tools_column(&conn).unwrap();
 
         let workspace_root = std::env::temp_dir().join(format!(
             "vibex-schema-v32-upgrade-{}",
@@ -19496,6 +19624,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         conn.execute(
@@ -19569,6 +19698,8 @@ mod tests {
                 "82:model_provider_metadata",
                 "83:model_group_routing",
                 "84:retire_provider_groups",
+                "85:agent_discovery_latest_only",
+                "86:agent_session_tool_settings",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19756,6 +19887,8 @@ mod tests {
                 "82:model_provider_metadata",
                 "83:model_group_routing",
                 "84:retire_provider_groups",
+                "85:agent_discovery_latest_only",
+                "86:agent_session_tool_settings",
             ]
         );
         assert_eq!(
@@ -19881,6 +20014,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let selection = SessionRuntimeSelection {
@@ -20420,6 +20554,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -20476,6 +20611,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -21203,6 +21339,8 @@ mod tests {
                 "82:model_provider_metadata",
                 "83:model_group_routing",
                 "84:retire_provider_groups",
+                "85:agent_discovery_latest_only",
+                "86:agent_session_tool_settings",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -22905,6 +23043,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -23038,6 +23177,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -23124,6 +23264,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -23300,6 +23441,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -23448,6 +23590,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, state).unwrap();
@@ -23955,6 +24098,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Running).unwrap();
@@ -24260,6 +24404,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(conn, &session).unwrap();
         SessionRepository::update_state(conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -24534,6 +24679,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -24750,6 +24896,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -25011,6 +25158,7 @@ mod tests {
             last_message_at_ms: 200,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         let appended = TimelineRepository::insert_session_and_append_many(
             &mut conn,
@@ -25087,6 +25235,7 @@ mod tests {
             last_message_at_ms: 100,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -25151,6 +25300,7 @@ mod tests {
             last_message_at_ms: 100,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         TimelineRepository::insert_session_and_append_many(
             &mut conn,
@@ -25207,6 +25357,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -25315,6 +25466,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         for index in 1..=25 {
@@ -25423,6 +25575,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         for index in 1..=12 {
@@ -25574,6 +25727,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let mut starts = Vec::new();
@@ -26263,6 +26417,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -26895,6 +27050,32 @@ mod tests {
 
         drop(conn);
         cleanup_db(temp);
+    }
+
+    /// Adds the tool map column a frozen-schema fixture needs before the
+    /// current repository can insert a session into it.
+    fn ensure_session_tools_column(conn: &Connection) -> VibexResult<()> {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name = 'tools_json'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to inspect Agent session columns",
+            ))?;
+        if present == 0 {
+            conn.execute(
+                "ALTER TABLE agent_sessions ADD COLUMN tools_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to add Agent session tool settings",
+            ))?;
+        }
+        Ok(())
     }
 
     fn temp_db_path(label: &str) -> PathBuf {

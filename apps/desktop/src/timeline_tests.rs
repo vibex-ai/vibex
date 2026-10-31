@@ -3229,6 +3229,7 @@ fn an_answer_that_lands_on_screen_stays_open(cx: &mut TestAppContext) {
                     last_message_at_ms: 1,
                     archived_at_ms: None,
                     deleted_at_ms: None,
+                    tools: Default::default(),
                 });
                 workbench.conversation_turns_cache_key = None;
                 workbench.rebuild_timeline_sizes();

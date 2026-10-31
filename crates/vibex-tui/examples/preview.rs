@@ -709,6 +709,7 @@ fn showcase_sessions(locale: Locale) -> Vec<vibex_core::AgentSession> {
             last_message_at_ms: now - age_ms,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         });
     }
     rows

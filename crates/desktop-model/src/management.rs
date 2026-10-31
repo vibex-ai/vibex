@@ -1100,6 +1100,7 @@ mod shared_projection_tests {
                 .collect(),
             default_model_id: Some("model-0".to_string()),
             headers: Vec::new(),
+            metadata: Default::default(),
             status,
             revision: 1,
             created_at_ms: 1,

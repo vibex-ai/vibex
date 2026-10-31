@@ -5703,6 +5703,7 @@ mod tests {
                         workspace_mode: WorkspaceMode::CurrentCheckout,
                         title: Some("Mobile session".to_string()),
                         safety: None,
+                        tools: Default::default(),
                     },
                 }),
                 RemoteAgentOperationKind::CreateSession,

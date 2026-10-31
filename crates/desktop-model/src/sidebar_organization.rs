@@ -2059,6 +2059,7 @@ mod tests {
             last_message_at_ms,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         }
     }
 

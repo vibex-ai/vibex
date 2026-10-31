@@ -1558,6 +1558,7 @@ mod tests {
             last_message_at_ms: 1_000,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(conn, &session).unwrap();
         let provider_profile_id = ProviderProfileId::new();

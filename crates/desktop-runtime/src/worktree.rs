@@ -5839,6 +5839,7 @@ mod tests {
             last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         let connection = open_database(&fixture.coordinator.db_path).unwrap();
         SessionRepository::insert(&connection, &assistance_session).unwrap();
@@ -6539,6 +6540,7 @@ mod tests {
                 last_message_at_ms: index as i64 + 1,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             },
         )
         .collect::<Vec<_>>();

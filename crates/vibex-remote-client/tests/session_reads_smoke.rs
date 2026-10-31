@@ -62,6 +62,7 @@ async fn session_reads_do_not_bundle_every_timeline(pinned_lan: bool) {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         TimelineRepository::append(

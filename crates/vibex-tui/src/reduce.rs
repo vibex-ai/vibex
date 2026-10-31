@@ -8349,6 +8349,7 @@ pub mod payloads {
             safety: None,
             session_id: None,
             defer_runtime_materialization: false,
+            tools: Default::default(),
         })
     }
 
@@ -8798,6 +8799,7 @@ mod tests {
             last_message_at_ms: 1_759_251_200_000,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         }
     }
 

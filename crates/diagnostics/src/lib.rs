@@ -987,6 +987,7 @@ fn baseline_timeline(root: &Path) -> VibexResult<PerformanceBaselineCheck> {
         last_message_at_ms: now,
         archived_at_ms: None,
         deleted_at_ms: None,
+        tools: Default::default(),
     };
     SessionRepository::insert(&conn, &session)?;
 

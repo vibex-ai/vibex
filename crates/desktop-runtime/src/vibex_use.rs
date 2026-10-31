@@ -1365,6 +1365,7 @@ impl VibexUseService {
                         workspace_mode: workspace.mode,
                         title: Some(title.unwrap_or_else(|| "New Agent session".to_string())),
                         safety: Some(parent_safety),
+                        tools: Default::default(),
                     },
                     session_id.clone(),
                 )

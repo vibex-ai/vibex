@@ -435,6 +435,7 @@ async fn fixture_setup(State(state): State<Arc<HarnessState>>) -> Json<Value> {
                 workspace_mode: workspace.mode,
                 title: Some("E2E fixture session".to_string()),
                 safety: Some(vibex_core::AgentSessionSafety::workspace_write_ask_on_risk()),
+                tools: Default::default(),
             })
             .await
             .expect("create fixture session");

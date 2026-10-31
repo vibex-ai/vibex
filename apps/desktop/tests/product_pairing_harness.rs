@@ -552,6 +552,7 @@ async fn prepare_workspace_fixture(state: &HarnessState) -> ApiResult<()> {
             workspace_mode: workspace.mode,
             title: Some("E2E fixture session".to_string()),
             safety: Some(vibex_core::AgentSessionSafety::workspace_write_ask_on_risk()),
+            tools: Default::default(),
         })
         .await
         .map_err(|_| ApiError::internal("fixture_session_create_failed"))?;

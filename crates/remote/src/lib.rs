@@ -9881,6 +9881,7 @@ mod tests {
                 workspace_mode: rename_target.workspace_mode,
                 title: Some("Created remotely".to_string()),
                 safety: None,
+                tools: Default::default(),
             },
         )
         .unwrap();
@@ -9898,6 +9899,7 @@ mod tests {
                     workspace_mode: WorkspaceMode::CurrentCheckout,
                     title: Some("private create title sentinel".to_string()),
                     safety: None,
+                    tools: Default::default(),
                 },
             }),
         )
@@ -9980,6 +9982,7 @@ mod tests {
                 workspace_mode: session.workspace_mode,
                 title: Some("Missing root".to_string()),
                 safety: None,
+                tools: Default::default(),
             },
         )
         .unwrap_err();
@@ -10010,6 +10013,7 @@ mod tests {
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Unpublished root".to_string()),
                 safety: None,
+                tools: Default::default(),
             },
         )
         .unwrap_err();
@@ -10036,6 +10040,7 @@ mod tests {
                 workspace_mode: WorkspaceMode::VibexWorktree,
                 title: Some("Mode mismatch".to_string()),
                 safety: None,
+                tools: Default::default(),
             },
         )
         .unwrap_err();
@@ -10126,6 +10131,7 @@ mod tests {
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Temporary session".to_string()),
                 safety: None,
+                tools: Default::default(),
             },
         )
         .unwrap();
@@ -12016,6 +12022,7 @@ mod tests {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&conn, &session).unwrap();
         session

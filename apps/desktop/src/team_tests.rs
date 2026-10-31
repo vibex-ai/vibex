@@ -166,6 +166,7 @@ fn session(index: usize) -> AgentSession {
         last_message_at_ms: index as i64,
         archived_at_ms: None,
         deleted_at_ms: None,
+        tools: Default::default(),
     }
 }
 

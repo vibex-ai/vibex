@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ pub fn normalize_agent_session_title(value: &str) -> Option<String> {
 /// part of the workbench, computer use because its own runtime-wide switch and
 /// driver are what gate it. Per-Agent preferences therefore record the
 /// deviations from "on", not the grants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentBuiltinTool {
     /// The embedded browser's MCP tools.
@@ -84,6 +84,105 @@ pub struct AgentToolPreferences {
     browser_disabled: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     computer_disabled: BTreeSet<String>,
+}
+
+/// One session's answer for one built-in tool panel.
+///
+/// Three values rather than a boolean, because "the user never touched this
+/// session" has to stay distinguishable from "the user explicitly turned it
+/// on". Only that distinction lets a later change to the Agent default reach
+/// the sessions that never overrode it while leaving the explicit answers
+/// alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionToolChoice {
+    /// Take whatever the Agent preference says, now and later.
+    #[default]
+    Inherit,
+    On,
+    Off,
+}
+
+impl SessionToolChoice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// The built-in tool panels one logical session runs with.
+///
+/// Empty means every panel follows the Agent preference, which is what an
+/// untouched session and every session created before this field existed
+/// carries. A non-empty entry is a durable override: it survives restarts,
+/// forks and later edits to the Agent card.
+///
+/// Keys are [`AgentBuiltinTool::as_str`] rather than the enum itself so the
+/// shape stays readable to every client that speaks this protocol without
+/// sharing the Rust enum's serde representation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionToolSettings {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choices: BTreeMap<String, SessionToolChoice>,
+}
+
+impl SessionToolSettings {
+    /// The answer this session records for one panel, before defaults.
+    pub fn choice(&self, tool: AgentBuiltinTool) -> SessionToolChoice {
+        self.choices.get(tool.as_str()).copied().unwrap_or_default()
+    }
+
+    /// Records one panel's answer. `Inherit` removes the entry instead of
+    /// storing a third value, so "reset to default" restores the empty map.
+    pub fn set(&mut self, tool: AgentBuiltinTool, choice: SessionToolChoice) {
+        match choice {
+            SessionToolChoice::Inherit => {
+                self.choices.remove(tool.as_str());
+            }
+            SessionToolChoice::On | SessionToolChoice::Off => {
+                self.choices.insert(tool.as_str().to_string(), choice);
+            }
+        }
+    }
+
+    /// Whether every panel follows the Agent preference.
+    pub fn is_inherit(&self) -> bool {
+        self.choices.is_empty()
+    }
+
+    /// Drops entries this build does not know, so a newer client writing a
+    /// panel this one has never heard of cannot make the map unbounded.
+    pub fn normalize(&mut self) {
+        self.choices.retain(|key, _| {
+            AgentBuiltinTool::ALL
+                .iter()
+                .any(|tool| tool.as_str() == key)
+        });
+    }
+
+    /// Resolves this session's answer against the Agent preference.
+    ///
+    /// This is the one place the two layers meet. The runtime asks it before
+    /// injecting a panel, and the UI asks it before drawing a state, so a
+    /// session can never claim a capability the runtime did not deliver.
+    pub fn resolve(
+        &self,
+        defaults: &AgentToolPreferences,
+        agent_id: &str,
+    ) -> BTreeSet<AgentBuiltinTool> {
+        AgentBuiltinTool::ALL
+            .into_iter()
+            .filter(|tool| match self.choice(*tool) {
+                SessionToolChoice::Inherit => defaults.enabled(agent_id, *tool),
+                SessionToolChoice::On => true,
+                SessionToolChoice::Off => false,
+            })
+            .collect()
+    }
 }
 
 /// One Agent's answer for one built-in tool panel, as a client records it.
@@ -330,6 +429,13 @@ pub struct AgentSession {
     pub last_message_at_ms: i64,
     pub archived_at_ms: Option<i64>,
     pub deleted_at_ms: Option<i64>,
+    /// Which built-in tool panels this session runs with.
+    ///
+    /// Recorded once when the session is created and never rewritten by an
+    /// edit to the Agent card: the card is the default, this is the fact.
+    /// Empty follows the Agent preference.
+    #[serde(default, skip_serializing_if = "SessionToolSettings::is_inherit")]
+    pub tools: SessionToolSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +456,13 @@ pub struct CreateAgentSessionRequest {
     /// rely on the durable message queue, which waits for the runtime selection.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub defer_runtime_materialization: bool,
+    /// Built-in tool panels this session should run with.
+    ///
+    /// The new-session page is the only writer. An absent map follows the
+    /// Agent's Config Center switches, which is what every client that does
+    /// not offer the choice leaves it as.
+    #[serde(default, skip_serializing_if = "SessionToolSettings::is_inherit")]
+    pub tools: SessionToolSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -974,6 +1087,69 @@ pub struct AgentCommandExecuteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_tool_settings_inherit_follows_the_agent_and_overrides_win() {
+        let mut defaults = AgentToolPreferences::default();
+        defaults.set_enabled("claude", AgentBuiltinTool::Computer, false);
+        let mut session = SessionToolSettings::default();
+        assert!(session.is_inherit());
+        assert_eq!(
+            session.resolve(&defaults, "claude"),
+            [AgentBuiltinTool::Browser].into_iter().collect()
+        );
+
+        // An explicit "on" beats a disabled Agent default, and an explicit
+        // "off" beats an enabled one. Neither is written back to the Agent.
+        session.set(AgentBuiltinTool::Computer, SessionToolChoice::On);
+        session.set(AgentBuiltinTool::Browser, SessionToolChoice::Off);
+        assert!(!session.is_inherit());
+        assert_eq!(
+            session.resolve(&defaults, "claude"),
+            [AgentBuiltinTool::Computer].into_iter().collect()
+        );
+        assert!(!defaults.enabled("claude", AgentBuiltinTool::Computer));
+
+        // Recording "inherit" removes the entry rather than storing a third
+        // value, so a reset is byte-identical to an untouched session.
+        session.set(AgentBuiltinTool::Browser, SessionToolChoice::Inherit);
+        session.set(AgentBuiltinTool::Computer, SessionToolChoice::Inherit);
+        assert!(session.is_inherit());
+        assert_eq!(session.choices, BTreeMap::new());
+        assert_eq!(
+            session.resolve(&defaults, "claude"),
+            [AgentBuiltinTool::Browser].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn session_tool_settings_round_trip_and_ignore_unknown_panels() {
+        let mut session = SessionToolSettings::default();
+        session.set(AgentBuiltinTool::Browser, SessionToolChoice::Off);
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            serde_json::json!({ "choices": { "browser": "off" } })
+        );
+        let decoded: SessionToolSettings =
+            serde_json::from_value(serde_json::json!({ "choices": { "browser": "off" } })).unwrap();
+        assert_eq!(decoded, session);
+        assert_eq!(SessionToolSettings::default().choices, BTreeMap::new());
+        // A session written before this field existed decodes as "follow the
+        // Agent", never as "everything off".
+        let legacy: SessionToolSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(legacy.is_inherit());
+
+        let mut hand_edited: SessionToolSettings = serde_json::from_value(serde_json::json!({
+            "choices": { "browser": "on", "terminal": "off" },
+        }))
+        .unwrap();
+        hand_edited.normalize();
+        assert_eq!(hand_edited.choices.len(), 1);
+        assert_eq!(
+            hand_edited.choice(AgentBuiltinTool::Browser),
+            SessionToolChoice::On
+        );
+    }
 
     #[test]
     fn builtin_tool_preferences_default_on_and_record_only_deviations() {

@@ -137,6 +137,7 @@ fn a_waiting_schedule_names_its_session_after_the_message() {
         last_message_at_ms: 1,
         archived_at_ms: None,
         deleted_at_ms: None,
+        tools: Default::default(),
     };
     let session_id = VibexSessionId::new();
     let placeholder = session(&session_id, "deepseek-harness session");

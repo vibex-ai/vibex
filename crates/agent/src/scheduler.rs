@@ -195,6 +195,7 @@ impl<'a> ScheduledTaskRunner<'a> {
                 workspace_mode: task.workspace_mode,
                 title: Some(format!("Scheduled: {}", task.title)),
                 safety: Some(task.safety.clone()),
+                tools: Default::default(),
             })
             .await
         {

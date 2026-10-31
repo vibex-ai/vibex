@@ -5711,6 +5711,9 @@ pub fn session_shell_for_materialized(
         last_message_at_ms: materialized.summary.updated_at_ms.unwrap_or(now_ms),
         archived_at_ms: None,
         deleted_at_ms: None,
+        // An imported history has no recorded answer; it follows the Agent
+        // like every session that predates the field.
+        tools: Default::default(),
     }
 }
 

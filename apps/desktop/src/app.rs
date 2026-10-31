@@ -140,14 +140,15 @@ use vibex_core::{
     RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
     SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
     SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SessionTreeNode, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
-    SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
-    TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelineRedactionState, TimelineSource, TimelineTurnStart,
-    UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS, VibexSessionId,
-    VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
-    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
+    SessionToolChoice, SessionToolSettings, SessionTreeNode, SetDesiredAgentSessionRuntimeRequest,
+    SteerAgentMessageRequest, SteerMessageOutcome, TerminalCreateRequest, TerminalId,
+    TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
+    TimelineTurnStart, UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS,
+    VibexSessionId, VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason,
+    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -445,6 +446,10 @@ const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
 const TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH: f32 = 36.0;
 const TITLE_BAR_WIDE_WINDOW_CONTROL_WIDTH: f32 = 44.0;
 const TITLE_BAR_SESSION_TITLE_MAX_WIDTH: f32 = 320.0;
+/// The capability pill and the actions button sit beside the title inside the
+/// heading's budget, so the heading allows for both rather than letting the
+/// pill squeeze a long title to nothing.
+const TITLE_BAR_SESSION_HEADING_EXTRA_WIDTH: f32 = 32.0 + 62.0 + 24.0;
 const TITLE_BAR_SESSION_MENU_WIDTH: f32 = 220.0;
 /// The runtime manager rides one floating panel whose body swaps between the
 /// list and the detail stage, so management never stacks overlays.
@@ -629,6 +634,8 @@ const NEW_SESSION_AGENT_MARK_SIZE: f32 = NEW_SESSION_SLOGAN_SIZE * 1.3;
 /// face half-visible in the corner while the new one lands on top of it.
 const NEW_SESSION_LOGO_SWAP_TRAVEL: f32 = NEW_SESSION_AGENT_MARK_SIZE;
 const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
+/// Width of the read-only panel behind a session's capability pill.
+const SESSION_CAPABILITIES_PANEL_WIDTH: f32 = 352.0;
 const AGENT_TIMELINE_FETCH_PAGE_LIMIT: u32 = 500;
 const CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT: usize = 6;
 const CHILD_AGENT_TIMELINE_MAX_NESTING: u8 = 3;
@@ -1794,6 +1801,14 @@ struct RuntimeAuthenticationMenuState {
 enum RuntimeFeatureTarget {
     NewSession,
     ActiveSession,
+}
+
+/// Whether the new-session page can offer one built-in panel for the Agent in
+/// the draft, and the sentence to show when it cannot.
+#[derive(Debug, Clone, Copy)]
+enum SessionToolAvailability {
+    Available,
+    Unavailable(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -9475,6 +9490,16 @@ pub struct VibexWorkbench {
     wsl_profiles: Vec<crate::ssh_connection::wsl_profile::WslConnectionProfile>,
     wsl_runtime_labels: BTreeMap<String, String>,
     runtime_manager_open: bool,
+    /// Whether a session's capability panel is up.
+    ///
+    /// `Popover` keeps its child built and only paints it while this is true,
+    /// so closing needs no second "still mounted" flag.
+    session_capabilities_open: bool,
+    /// The session whose capabilities the panel describes.
+    ///
+    /// Kept rather than read from the selection: the title bar can render
+    /// another session's heading while a group pane holds the keyboard.
+    session_capabilities_session: Option<VibexSessionId>,
     runtime_manager_stage: RuntimeManagerStage,
     /// The runtime whose detail stage is showing, or whose rename is running.
     runtime_manager_target: Option<String>,
@@ -9843,6 +9868,12 @@ pub struct VibexWorkbench {
     /// this records rather than from what `new_session_agent_id` already says.
     new_session_logo_swap: Option<NewSessionLogoSwap>,
     new_session_runtime_selection: Option<SessionRuntimeSelection>,
+    /// Which built-in tool panels this draft asks for.
+    ///
+    /// Empty follows whichever Agent is selected, which is what the row shows
+    /// until the reader touches a switch. It is draft state, not persisted UI
+    /// state: a new session always opens on the Agent's defaults.
+    new_session_tools: SessionToolSettings,
     new_session_runtime_menu_open: bool,
     new_session_runtime_menu_view: ComposerRuntimeMenuView,
     new_session_runtime_menu_auth_source: Option<RuntimeAuthSource>,
@@ -11377,6 +11408,8 @@ impl VibexWorkbench {
             wsl_profiles,
             wsl_runtime_labels,
             runtime_manager_open: false,
+            session_capabilities_open: false,
+            session_capabilities_session: None,
             runtime_manager_stage: RuntimeManagerStage::List,
             runtime_manager_target: None,
             runtime_manager_list_scroll: ScrollHandle::new(),
@@ -11550,6 +11583,7 @@ impl VibexWorkbench {
             new_session_agent_id: None,
             new_session_logo_swap: None,
             new_session_runtime_selection: None,
+            new_session_tools: SessionToolSettings::default(),
             new_session_runtime_menu_open: false,
             new_session_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
             new_session_runtime_menu_auth_source: None,
@@ -14129,6 +14163,32 @@ impl VibexWorkbench {
             self.runtime_note = None;
             cx.notify();
         }
+    }
+
+    /// Opens the capability panel for one session.
+    ///
+    /// The panel is read-only, so opening only has to record which session it
+    /// describes and mount its body.
+    fn open_session_capabilities(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if self.session_capabilities_session.as_ref() != Some(&session_id) {
+            self.session_capabilities_session = Some(session_id);
+        }
+        self.session_capabilities_open = true;
+        cx.notify();
+    }
+
+    /// Closes the capability panel and forgets which session it described.
+    ///
+    /// `Popover` keeps its child built and only paints it while open, so there
+    /// is no closing frame to keep alive; the session id is dropped with the
+    /// panel so a later reopen never borrows a stale answer.
+    fn close_session_capabilities(&mut self, cx: &mut Context<Self>) {
+        if !self.session_capabilities_open {
+            return;
+        }
+        self.session_capabilities_open = false;
+        self.session_capabilities_session = None;
+        cx.notify();
     }
 
     /// Closes the panel and drops every transient stage it owns, so reopening
@@ -22891,6 +22951,7 @@ impl VibexWorkbench {
                                     workspace_mode: target_mode,
                                     title: Some(title.clone()),
                                     safety: None,
+                                    tools: Default::default(),
                                 })
                                 .with_idempotency_key(format!(
                                     "worktree-assistance-session:{}",
@@ -22918,6 +22979,7 @@ impl VibexWorkbench {
                             workspace_mode: target_mode,
                             title: Some(title),
                             safety: None,
+                            tools: Default::default(),
                         })
                         .with_idempotency_key(format!(
                             "worktree-assistance-session:{}",
@@ -37290,6 +37352,9 @@ impl VibexWorkbench {
         self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
         self.new_session_runtime_menu_auth_source = None;
         self.new_session_error = None;
+        // A new session starts on the Agent's defaults; the override map is
+        // draft state and never survives into the next draft.
+        self.new_session_tools = SessionToolSettings::default();
         self.clear_suggestions();
         let explicit_target = target.is_some();
         if initialize_draft {
@@ -38375,6 +38440,10 @@ impl VibexWorkbench {
         let title = session_title_from_first_message(&text, &attachments);
         let has_initial_message =
             scheduled_at_ms.is_none() && (!text.trim().is_empty() || !attachments.is_empty());
+        // Read once, before any mutation: the page may repaint between now and
+        // the authoritative answer, and the request has to describe the
+        // switches the reader saw when they pressed send.
+        let session_tools = self.new_session_tools.clone();
         let deferred_creation = scheduled_at_ms.is_some() || command_invocation.is_none();
         let optimistic_submitted_at_ms = unix_timestamp_ms();
         let optimistic_session_id = VibexSessionId::new();
@@ -38418,6 +38487,7 @@ impl VibexWorkbench {
             last_message_at_ms: optimistic_submitted_at_ms,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: session_tools.clone(),
         };
         if optimistic_session.title != agent_session_fallback_title(&selection.agent_id) {
             self.pending_new_session_titles.insert(
@@ -38507,6 +38577,7 @@ impl VibexWorkbench {
                 // the first user message, so a later ACP title can replace it.
                 title: None,
                 safety: None,
+                tools: session_tools.clone(),
             };
             let recovery_session_id = optimistic_session_id.clone();
             let creation =
@@ -43621,8 +43692,9 @@ impl VibexWorkbench {
         }
         self.ui_state.right_rail.selected_activity_id =
             Some(right_rail_activity_id(RightRailMode::Files).to_string());
-        self.code_right_rail
-            .update(cx, |right_rail, cx| right_rail.set_mode(RightRailMode::Files, cx));
+        self.code_right_rail.update(cx, |right_rail, cx| {
+            right_rail.set_mode(RightRailMode::Files, cx)
+        });
         self.queue_ui_state();
         cx.notify();
     }
@@ -45107,6 +45179,330 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    // ------------------------------------------------- session tool draft
+
+    /// What one built-in panel resolves to for the draft's Agent right now.
+    ///
+    /// The switches always show the resolved answer rather than "unset", so
+    /// the state on screen is the state the session will be created with. The
+    /// header text — not the switch — is what says whether the answer is
+    /// inherited or overridden.
+    fn new_session_tool_enabled(&self, tool: AgentBuiltinTool) -> bool {
+        let agent_id = self
+            .new_session_agent_id
+            .as_ref()
+            .map(|agent_id| agent_id.as_str().to_string())
+            .unwrap_or_default();
+        self.new_session_tools
+            .resolve(&self.ui_state.agent_tools, &agent_id)
+            .contains(&tool)
+    }
+
+    /// Records one panel's answer for this draft.
+    ///
+    /// A switch turned back to the Agent's current value is still an explicit
+    /// answer: the reader said "on", and a later edit to the card must not
+    /// silently flip it. Only [`Self::reset_new_session_tools`] returns to
+    /// following the card.
+    fn set_new_session_tool(
+        &mut self,
+        tool: AgentBuiltinTool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_action_pending {
+            return;
+        }
+        self.new_session_tools.set(
+            tool,
+            if enabled {
+                SessionToolChoice::On
+            } else {
+                SessionToolChoice::Off
+            },
+        );
+        cx.notify();
+    }
+
+    /// Returns both panels to following the Agent again.
+    fn reset_new_session_tools(&mut self, cx: &mut Context<Self>) {
+        if self.agent_action_pending || self.new_session_tools.is_inherit() {
+            return;
+        }
+        self.new_session_tools = SessionToolSettings::default();
+        cx.notify();
+    }
+
+    /// What a panel's switch can do for the selected Agent, and why not.
+    ///
+    /// The delivery tables answer "can this Agent receive the panel at all";
+    /// computer use additionally needs the runtime-side driver, exactly as the
+    /// Config Center's glyph does. An Agent that carries its own feature is
+    /// reported as unavailable here because Vibex will not write its key.
+    fn new_session_tool_availability(&self, tool: AgentBuiltinTool) -> SessionToolAvailability {
+        let Some(agent_id) = self.new_session_agent_id.as_ref() else {
+            return SessionToolAvailability::Unavailable(locale::text(
+                "Choose an Agent first",
+                "请先选择 Agent",
+                "請先選擇 Agent",
+            ));
+        };
+        let agent_id = agent_id.as_str();
+        match tool {
+            AgentBuiltinTool::Browser => {
+                if vibex_desktop_runtime::BrowserRuntime::delivery_for(agent_id)
+                    == vibex_core::BrowserToolDelivery::Unavailable
+                {
+                    SessionToolAvailability::Unavailable(locale::text(
+                        "This Agent cannot receive browser tools",
+                        "该 Agent 无法接收浏览器工具",
+                        "該 Agent 無法接收瀏覽器工具",
+                    ))
+                } else {
+                    SessionToolAvailability::Available
+                }
+            }
+            AgentBuiltinTool::Computer => {
+                match vibex_desktop_runtime::ComputerRuntime::use_delivery_for(agent_id) {
+                    vibex_core::ComputerUseDelivery::NativeAgentFeature => {
+                        SessionToolAvailability::Unavailable(locale::text(
+                            "This Agent has its own computer use; Vibex does not control it",
+                            "该 Agent 自带电脑操作，Vibex 不会改写它的配置",
+                            "該 Agent 自帶電腦操作，Vibex 不會改寫它的設定",
+                        ))
+                    }
+                    vibex_core::ComputerUseDelivery::Unavailable => {
+                        SessionToolAvailability::Unavailable(locale::text(
+                            "This Agent cannot receive computer use",
+                            "该 Agent 无法接收电脑操作",
+                            "該 Agent 無法接收電腦操作",
+                        ))
+                    }
+                    vibex_core::ComputerUseDelivery::McpTool
+                    | vibex_core::ComputerUseDelivery::CliSkill => {
+                        if self.computer_tools_ready() {
+                            SessionToolAvailability::Available
+                        } else {
+                            SessionToolAvailability::Unavailable(locale::text(
+                                "Computer use is not set up. Enable it in Settings first",
+                                "电脑操作尚未启用，请先在设置中启用",
+                                "電腦操作尚未啟用，請先在設定中啟用",
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One capability chip: icon, label, and a switch, or an inert reason.
+    ///
+    /// The chip carries a dot when the draft overrides the Agent, which is the
+    /// same "this is not the default" marker the row's reset button explains.
+    fn render_session_tool_chip(
+        &self,
+        tool: AgentBuiltinTool,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let unavailable = self.new_session_tool_availability(tool);
+        let enabled = self.new_session_tool_enabled(tool);
+        let overridden = !matches!(
+            self.new_session_tools.choice(tool),
+            SessionToolChoice::Inherit
+        );
+        let (icon, label) = match tool {
+            AgentBuiltinTool::Browser => (
+                "icons/vibex/globe.svg",
+                locale::text("Browser tools", "浏览器工具", "瀏覽器工具"),
+            ),
+            AgentBuiltinTool::Computer => (
+                "icons/vibex/monitor.svg",
+                locale::text("Computer use", "电脑操作", "電腦操作"),
+            ),
+        };
+        let (glyph, text_color) = match (&unavailable, enabled) {
+            (SessionToolAvailability::Unavailable(_), _) => (
+                cx.theme().muted_foreground.opacity(0.55),
+                cx.theme().muted_foreground.opacity(0.70),
+            ),
+            (SessionToolAvailability::Available, true) => {
+                (cx.theme().success, cx.theme().foreground)
+            }
+            (SessionToolAvailability::Available, false) => {
+                (cx.theme().muted_foreground, cx.theme().muted_foreground)
+            }
+        };
+        let tooltip = match &unavailable {
+            SessionToolAvailability::Unavailable(reason) => (*reason).to_string(),
+            SessionToolAvailability::Available => {
+                if enabled {
+                    locale::text(
+                        "On for this session. Click to turn it off.",
+                        "本次会话启用，点击可关闭。",
+                        "本次會話啟用，點擊可關閉。",
+                    )
+                    .to_string()
+                } else {
+                    locale::text(
+                        "Off for this session. Click to turn it on.",
+                        "本次会话未启用，点击可启用。",
+                        "本次會話未啟用，點擊可啟用。",
+                    )
+                    .to_string()
+                }
+            }
+        };
+        let chip = h_flex()
+            .id(SharedString::from(format!(
+                "new-session-tool-{}",
+                tool.as_str()
+            )))
+            .relative()
+            .flex_none()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(30.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(
+                if matches!(unavailable, SessionToolAvailability::Unavailable(_)) {
+                    cx.theme().border.opacity(0.45)
+                } else if enabled {
+                    cx.theme().success.opacity(0.34)
+                } else {
+                    cx.theme().border
+                },
+            )
+            .bg(
+                if enabled && matches!(unavailable, SessionToolAvailability::Available) {
+                    cx.theme().success.opacity(0.10)
+                } else {
+                    cx.theme().transparent
+                },
+            )
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .child(Icon::default().path(icon).size(px(14.0)).text_color(glyph))
+            .when(!compact, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(text_color)
+                        .child(label),
+                )
+            });
+        let chip = match unavailable {
+            SessionToolAvailability::Unavailable(_) => chip.child(
+                Icon::default()
+                    .path("icons/vibex/circle-slash.svg")
+                    .size(px(13.0))
+                    .text_color(cx.theme().muted_foreground.opacity(0.55)),
+            ),
+            SessionToolAvailability::Available => chip.child(
+                Switch::new(SharedString::from(format!(
+                    "new-session-tool-switch-{}",
+                    tool.as_str()
+                )))
+                .small()
+                .checked(enabled)
+                .disabled(self.agent_action_pending)
+                .on_click(cx.listener(move |this, enabled: &bool, _, cx| {
+                    this.set_new_session_tool(tool, *enabled, cx)
+                })),
+            ),
+        };
+        chip.when(overridden, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .top(px(3.0))
+                    .right(px(3.0))
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(cx.theme().success),
+            )
+        })
+        .into_any_element()
+    }
+
+    /// The "this session" row under the new-session prompt.
+    fn render_new_session_tool_row(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        let overridden = !self.new_session_tools.is_inherit();
+        let status = if overridden {
+            locale::text(
+                "Overrides the Agent default",
+                "已覆盖 Agent 默认",
+                "已覆寫 Agent 預設",
+            )
+        } else {
+            locale::text(
+                "Follows the Agent settings",
+                "跟随 Agent 配置",
+                "跟隨 Agent 設定",
+            )
+        };
+        h_flex()
+            .id("new-session-tool-row")
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text("This session", "本次会话", "本次會話")),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .child(self.render_session_tool_chip(AgentBuiltinTool::Browser, compact, cx))
+                    .child(self.render_session_tool_chip(AgentBuiltinTool::Computer, compact, cx)),
+            )
+            .when(overridden, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                )
+                .child(
+                    Button::new("new-session-tools-reset")
+                        .xsmall()
+                        .ghost()
+                        .h(px(24.0))
+                        .label(locale::text("Reset", "恢复默认", "還原預設"))
+                        .tooltip(locale::text(
+                            "Follow the Agent settings again",
+                            "两项都恢复为跟随 Agent 配置",
+                            "兩項都還原為跟隨 Agent 設定",
+                        ))
+                        .disabled(self.agent_action_pending)
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_new_session_tools(cx))),
+                )
+            })
+            .when(!overridden, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground.opacity(0.80))
+                        .child(status),
+                )
+            })
+            .into_any_element()
+    }
+
     /// Applies every persisted per-Agent tool answer to the local runtime.
     ///
     /// Called when an authority is installed, so a restart keeps the answers
@@ -46098,6 +46494,335 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The panels one existing session runs with, as the title bar shows them.
+    ///
+    /// The session's own answer wins over the Agent card, which is the same
+    /// resolution the runtime performed when it assembled this session. The
+    /// card is only consulted for panels the session left alone, so editing a
+    /// default is visible here exactly when it also reaches the session.
+    fn session_tool_states(&self, session: &AgentSession) -> Vec<(AgentBuiltinTool, bool)> {
+        let enabled = session
+            .tools
+            .resolve(&self.ui_state.agent_tools, session.agent_id.as_str());
+        AgentBuiltinTool::ALL
+            .into_iter()
+            .map(|tool| (tool, enabled.contains(&tool)))
+            .collect()
+    }
+
+    /// The pill beside a session title: both panels, then a chevron.
+    ///
+    /// It is an entry point, not a switch. A session's tools are fixed when
+    /// its runtime resources are assembled, so the panel behind it reports
+    /// state and says where a change can be made.
+    fn render_session_capability_pill(
+        &mut self,
+        session: &AgentSession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let states = self.session_tool_states(session);
+        let open = self.session_capabilities_open
+            && self.session_capabilities_session.as_ref() == Some(&session.id);
+        let session_id = session.id.clone();
+        let trigger_session_id = session_id.clone();
+        let enabled_count = states.iter().filter(|(_, enabled)| *enabled).count();
+        let summary = match enabled_count {
+            0 => locale::text("No session tools", "未启用会话能力", "未啟用會話能力").to_string(),
+            2 => locale::text(
+                "Browser and computer use",
+                "浏览器与电脑操作",
+                "瀏覽器與電腦操作",
+            )
+            .to_string(),
+            _ => {
+                let name = states
+                    .iter()
+                    .find(|(_, enabled)| *enabled)
+                    .map(|(tool, _)| match tool {
+                        AgentBuiltinTool::Browser => {
+                            locale::text("Browser tools", "浏览器工具", "瀏覽器工具")
+                        }
+                        AgentBuiltinTool::Computer => {
+                            locale::text("Computer use", "电脑操作", "電腦操作")
+                        }
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{}: {name}",
+                    locale::text("Session tools", "会话能力", "會話能力")
+                )
+            }
+        };
+        let glyphs = states
+            .into_iter()
+            .map(|(tool, enabled)| {
+                let (icon, available) = match tool {
+                    AgentBuiltinTool::Browser => (
+                        "icons/vibex/globe.svg",
+                        vibex_desktop_runtime::BrowserRuntime::delivery_for(
+                            session.agent_id.as_str(),
+                        ) != vibex_core::BrowserToolDelivery::Unavailable,
+                    ),
+                    AgentBuiltinTool::Computer => (
+                        "icons/vibex/monitor.svg",
+                        !matches!(
+                            vibex_desktop_runtime::ComputerRuntime::use_delivery_for(
+                                session.agent_id.as_str()
+                            ),
+                            vibex_core::ComputerUseDelivery::Unavailable
+                        ),
+                    ),
+                };
+                let color = if !available {
+                    cx.theme().muted_foreground.opacity(0.45)
+                } else if enabled {
+                    cx.theme().success
+                } else {
+                    cx.theme().muted_foreground
+                };
+                Icon::default().path(icon).size(px(14.0)).text_color(color)
+            })
+            .collect::<Vec<_>>();
+        // No `on_click`: `Popover` owns the toggle and applies its own pressed
+        // state, so a second handler would close the panel on mouse-up.
+        let trigger = Button::new("session-capabilities")
+            .small()
+            .ghost()
+            .compact()
+            .h(px(24.0))
+            .px(px(6.0))
+            .rounded(px(6.0))
+            .selected(open)
+            .tooltip(summary.clone())
+            .child(
+                h_flex().items_center().gap(px(5.0)).children(glyphs).child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(12.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+            );
+        div()
+            .flex_none()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Popover::new("session-capabilities-popover")
+                    .appearance(false)
+                    .anchor(Anchor::TopLeft)
+                    .open(self.session_capabilities_open)
+                    .on_open_change({
+                        let open_session_id = trigger_session_id.clone();
+                        cx.listener(move |this, open: &bool, _window, cx| {
+                            if *open {
+                                this.open_session_capabilities(open_session_id.clone(), cx);
+                            } else {
+                                this.close_session_capabilities(cx);
+                            }
+                        })
+                    })
+                    .trigger(trigger)
+                    .child(
+                        self.render_session_capabilities_panel(
+                            self.session_capabilities_session
+                                .clone()
+                                .unwrap_or_else(|| session_id.clone()),
+                            cx,
+                        ),
+                    )
+                    .offset(px(6.0)),
+            )
+            .into_any_element()
+    }
+
+    /// The read-only panel behind a session's capability pill.
+    ///
+    /// Every row answers three questions in order: is it on, where did that
+    /// answer come from, and what would the reader do to change it. There is no
+    /// switch here on purpose — see [`Self::session_tool_states`].
+    fn render_session_capabilities_panel(
+        &mut self,
+        session_id: VibexSessionId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(session) = self.registered_session(session_id.as_str()).cloned() else {
+            return div().into_any_element();
+        };
+        let success = cx.theme().success;
+        let states = self.session_tool_states(&session);
+        let rows = states
+            .into_iter()
+            .map(|(tool, enabled)| {
+                let (icon, label, description) = match tool {
+                    AgentBuiltinTool::Browser => (
+                        "icons/vibex/globe.svg",
+                        locale::text("Browser tools", "浏览器工具", "瀏覽器工具"),
+                        locale::text(
+                            "Page actions, screenshots and origin approvals.",
+                            "页面操作、截图与来源授权。",
+                            "頁面操作、截圖與來源授權。",
+                        ),
+                    ),
+                    AgentBuiltinTool::Computer => (
+                        "icons/vibex/monitor.svg",
+                        locale::text("Computer use", "电脑操作", "電腦操作"),
+                        locale::text(
+                            "Screen and input control, approved each time.",
+                            "屏幕与输入控制，逐次审批。",
+                            "螢幕與輸入控制，逐次審批。",
+                        ),
+                    ),
+                };
+                let inherited = matches!(session.tools.choice(tool), SessionToolChoice::Inherit);
+                let source = if inherited {
+                    locale::text("Agent default", "跟随 Agent 默认", "跟隨 Agent 預設")
+                } else {
+                    locale::text("This session", "本会话设置", "本次會話設定")
+                };
+                let source = format!("{}: {source}", locale::text("Source", "来源", "來源"));
+                let dot = if enabled {
+                    success
+                } else {
+                    cx.theme().muted_foreground.opacity(0.55)
+                };
+                let state_label = if enabled {
+                    locale::text("On", "已启用", "已啟用")
+                } else {
+                    locale::text("Off", "未启用", "未啟用")
+                };
+                let state_color = if enabled {
+                    success
+                } else {
+                    cx.theme().muted_foreground
+                };
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .py_2()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::default().path(icon).size(px(15.0)).text_color(
+                                if enabled {
+                                    success
+                                } else {
+                                    cx.theme().muted_foreground
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().popover_foreground)
+                                    .child(label),
+                            )
+                            .child(div().flex_none().size(px(6.0)).rounded_full().bg(dot))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(state_color)
+                                    .child(state_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pl(px(23.0))
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(description),
+                    )
+                    .child(
+                        div()
+                            .pl(px(23.0))
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.75))
+                            .child(source),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .id("session-capabilities-panel")
+            .w(px(SESSION_CAPABILITIES_PANEL_WIDTH))
+            .min_w_0()
+            .gap_1()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .p_3()
+            .shadow_lg()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(locale::text("Session tools", "会话能力", "會話能力")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "Fixed at creation",
+                                "创建时固定",
+                                "建立時固定",
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .my_1()
+                    .h(px(1.0))
+                    .w_full()
+                    .bg(cx.theme().border.opacity(0.60)),
+            )
+            .children(rows)
+            .child(
+                div()
+                    .my_1()
+                    .h(px(1.0))
+                    .w_full()
+                    .bg(cx.theme().border.opacity(0.60)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Info)
+                            .size(px(13.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "These tools are fixed when the session starts and do not change mid-run. Change the Agent default in Agent settings, or start a new session to choose differently.",
+                                "这些能力在会话启动时确定，运行中不会变更。可到 Agent 设置修改默认值，或新建会话重新选择。",
+                                "這些能力在會話啟動時確定，執行中不會變更。可到 Agent 設定修改預設值，或新增會話重新選擇。",
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_title_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let strings = self.strings();
         let selected_session = self.selected_session().cloned();
@@ -46123,6 +46848,7 @@ impl VibexWorkbench {
                 let session_id = session.id.clone();
                 let session_title = truncate_title_bar_session_menu_title(&session.title);
                 let pinned = self.sidebar_state.pinned_ids.contains(session.id.as_str());
+                let tool_states = self.session_tool_states(session);
                 let deletion_pending = self
                     .pending_session_deletion_ids
                     .contains(session.id.as_str());
@@ -46149,6 +46875,7 @@ impl VibexWorkbench {
                                     pinned,
                                     deletion_pending,
                                     archive_pending,
+                                    tool_states.clone(),
                                     strings,
                                     entity.clone(),
                                     window,
@@ -46159,6 +46886,14 @@ impl VibexWorkbench {
                     )
                     .into_any_element()
             });
+        // The capability pill names what this session runs with. It sits with
+        // the title rather than in the composer because the answer is part of
+        // the session's identity, and it is read-only: a running attachment
+        // does not re-register tools.
+        let title_session_capabilities = selected_session
+            .as_ref()
+            .filter(|_| show_session_context)
+            .map(|session| self.render_session_capability_pill(session, cx));
         let sidebar_selected = if self.last_visibility.sidebar_docked {
             self.ui_state.workbench.sidebar_visible
         } else {
@@ -46493,7 +47228,8 @@ impl VibexWorkbench {
                                     h_flex()
                                         .id("title-session-heading")
                                         .w_auto()
-                                        .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH + 32.0))
+                                        .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH
+                                            + TITLE_BAR_SESSION_HEADING_EXTRA_WIDTH))
                                         .flex_none()
                                         .items_center()
                                         .gap(px(1.0))
@@ -46507,6 +47243,9 @@ impl VibexWorkbench {
                                                 .font_medium()
                                                 .child(session_title),
                                         )
+                                        .when_some(title_session_capabilities, |this, pill| {
+                                            this.child(pill)
+                                        })
                                         .when_some(title_session_menu, |this, menu| {
                                             this.child(menu)
                                         }),
@@ -46607,12 +47346,13 @@ impl VibexWorkbench {
 
     #[allow(clippy::too_many_arguments)]
     fn build_title_session_menu(
-        menu: PopupMenu,
+        mut menu: PopupMenu,
         session_id: VibexSessionId,
         session_title: String,
         pinned: bool,
         deletion_pending: bool,
         archive_pending: bool,
+        tool_states: Vec<(AgentBuiltinTool, bool)>,
         strings: &'static Strings,
         entity: WeakEntity<Self>,
         window: &mut Window,
@@ -46636,7 +47376,8 @@ impl VibexWorkbench {
             strings.sidebar_pin
         };
 
-        menu.min_w(px(TITLE_BAR_SESSION_MENU_WIDTH))
+        menu = menu
+            .min_w(px(TITLE_BAR_SESSION_MENU_WIDTH))
             .max_w(px(TITLE_BAR_SESSION_MENU_WIDTH))
             .item(PopupMenuItem::label(session_title))
             .separator()
@@ -46657,6 +47398,33 @@ impl VibexWorkbench {
                             pin_entity.update(cx, |this, cx| this.toggle_session_pin(&pin_id, cx));
                     }),
             )
+            .separator()
+            // A read-only group, not a command: these are the session's
+            // answers, and the session cannot change them while it runs.
+            .item(
+                PopupMenuItem::label(locale::text("Session tools", "会话能力", "會話能力"))
+                    .disabled(true),
+            );
+        for (tool, enabled) in tool_states {
+            let (icon, label) = match tool {
+                AgentBuiltinTool::Browser => (
+                    sidebar_icon("icons/vibex/globe.svg"),
+                    locale::text("Browser tools", "浏览器工具", "瀏覽器工具"),
+                ),
+                AgentBuiltinTool::Computer => (
+                    sidebar_icon("icons/vibex/monitor.svg"),
+                    locale::text("Computer use", "电脑操作", "電腦操作"),
+                ),
+            };
+            let state = if enabled {
+                locale::text("On", "已启用", "已啟用")
+            } else {
+                locale::text("Off", "未启用", "未啟用")
+            };
+            menu = menu.item(PopupMenuItem::new(format!("{label} · {state}")).icon(icon));
+        }
+        menu = menu
+            .separator()
             .item(
                 PopupMenuItem::new(locale::text("Archive", "归档", "封存"))
                     .icon(sidebar_icon("icons/vibex/package.svg"))
@@ -46675,7 +47443,8 @@ impl VibexWorkbench {
                             this.confirm_delete_session(delete_id.clone(), window, cx)
                         });
                     }),
-            )
+            );
+        menu
     }
 
     fn render_agent_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -52624,6 +53393,40 @@ impl VibexWorkbench {
             pinned,
             group_id: group_id.map(str::to_string),
         };
+        // A row earns a capability mark only when the session departs from the
+        // Agent's defaults. Marking every row that follows the default would
+        // turn the list into a wall of icons that says nothing.
+        let sidebar_tool_mark = {
+            let enabled = session
+                .tools
+                .resolve(&self.ui_state.agent_tools, session.agent_id.as_str());
+            let deviates = AgentBuiltinTool::ALL.iter().any(|tool| {
+                let session_wants = enabled.contains(tool);
+                let inherited = matches!(session.tools.choice(*tool), SessionToolChoice::Inherit);
+                !inherited
+                    && session_wants
+                        != self
+                            .ui_state
+                            .agent_tools
+                            .enabled(session.agent_id.as_str(), *tool)
+            });
+            deviates.then(|| {
+                AgentBuiltinTool::ALL
+                    .into_iter()
+                    .filter(|tool| enabled.contains(tool))
+                    .map(|tool| {
+                        let icon = match tool {
+                            AgentBuiltinTool::Browser => "icons/vibex/globe.svg",
+                            AgentBuiltinTool::Computer => "icons/vibex/monitor.svg",
+                        };
+                        Icon::default()
+                            .path(icon)
+                            .size(px(12.0))
+                            .text_color(cx.theme().success)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
         // The running cue reaches the title itself: while the Agent generates,
         // the label runs the same sweep the timeline's thinking row does, at the
         // shared pace and spread, and the light in the status column and the
@@ -53265,15 +54068,48 @@ impl VibexWorkbench {
                                     .flex_1()
                                     .min_w_0()
                                     .child(
-                                        div()
+                                        h_flex()
                                             .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .when(selected, |this| this.font_semibold())
-                                            .group_hover(&hover_group, |style| {
-                                                style.text_color(cx.theme().sidebar_foreground)
-                                            })
-                                            .child(row_title),
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_sm()
+                                                    .when(selected, |this| this.font_semibold())
+                                                    .group_hover(&hover_group, |style| {
+                                                        style.text_color(cx.theme().sidebar_foreground)
+                                                    })
+                                                    .child(row_title),
+                                            )
+                                            .when_some(
+                                                sidebar_tool_mark.clone(),
+                                                |this, marks| {
+                                                    this.child(
+                                                        h_flex()
+                                                            .id(format!(
+                                                                "sidebar-session-tools-{session_id_string}"
+                                                            ))
+                                                            .flex_none()
+                                                            .items_center()
+                                                            .gap(px(3.0))
+                                                            .tooltip({
+                                                                let tip = locale::text(
+                                                                    "This session overrides the Agent's tool defaults",
+                                                                    "本会话覆盖了 Agent 的工具默认值",
+                                                                    "本次會話覆寫了 Agent 的工具預設值",
+                                                                )
+                                                                .to_string();
+                                                                move |window, cx| {
+                                                                    Tooltip::new(tip.clone())
+                                                                        .build(window, cx)
+                                                                }
+                                                            })
+                                                            .children(marks),
+                                                    )
+                                                },
+                                            ),
                                     )
                                     // The branch reports itself on the title
                                     // column's second row, the way a child row
@@ -56636,6 +57472,26 @@ impl VibexWorkbench {
                                     )
                             .when_some(self.new_session_schedule, |this, schedule| {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
+                            })
+                            // Built-in panels are chosen here, beside the
+                            // model and permission controls, because they
+                            // answer the same question: how this one session
+                            // runs. An Agent with no choices has no runtime to
+                            // launch, so the row would only be noise.
+                            .when(has_agent_choices, |this| {
+                                let compact_tools = composer_runtime_controls_are_compact(
+                                    self.last_visibility.layout.viewport_width,
+                                );
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .px_2()
+                                        .pb_1()
+                                        .border_b_1()
+                                        .border_color(cx.theme().border.opacity(0.60))
+                                        .child(self.render_new_session_tool_row(compact_tools, cx)),
+                                )
                             })
                             .child(
                                 v_flex()
@@ -98387,6 +99243,7 @@ mod tests {
             last_message_at_ms: 2,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         }
     }
 
@@ -99496,6 +100353,7 @@ mod tests {
             last_message_at_ms: 2,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         let mut timestamp_only_update = session.clone();
         timestamp_only_update.updated_at_ms = 3;
@@ -101820,6 +102678,7 @@ mod tests {
                 last_message_at_ms: 2,
                 archived_at_ms: None,
                 deleted_at_ms: None,
+                tools: Default::default(),
             }
         }
 
@@ -104161,6 +105020,7 @@ mod tests {
             last_message_at_ms: 2,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         let session_id = VibexSessionId::parse("session_elicitation_form_a").expect("session id");
         let other_session_id =
@@ -105341,6 +106201,99 @@ mod tests {
             mounted_hint_count(cx),
             0,
             "Escape dismisses the hint the keyboard is on"
+        );
+    }
+
+    /// The new-session row offers both panels, and its switches show the
+    /// resolved answer rather than "unset".
+    #[test]
+    fn the_new_session_row_shows_resolved_tool_answers() {
+        let source = include_str!("app.rs");
+        let row = source
+            .split_once("    fn render_new_session_tool_row(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The read-only panel behind a session's capability pill.")
+            })
+            .map(|(body, _)| body)
+            .expect("the new-session tool row should remain inspectable");
+        assert!(row.contains("AgentBuiltinTool::Browser"));
+        assert!(row.contains("AgentBuiltinTool::Computer"));
+        assert!(row.contains("new-session-tools-reset"));
+        assert!(
+            row.contains("self.new_session_tools.is_inherit()"),
+            "the row must say whether the draft follows the Agent or overrides it"
+        );
+
+        let resolved = source
+            .split_once("    fn new_session_tool_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_new_session_tool("))
+            .map(|(body, _)| body)
+            .expect("the resolved-answer helper should remain inspectable");
+        assert!(
+            resolved.contains(
+                "self.new_session_tools\n            .resolve(&self.ui_state.agent_tools"
+            ),
+            "the switch has to show the answer the session would be created with, not an unset value"
+        );
+
+        // Turning a switch never mutates the Agent's defaults; only the reset
+        // button clears the draft's overrides.
+        let setter = source
+            .split_once("    fn set_new_session_tool(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reset_new_session_tools("))
+            .map(|(body, _)| body)
+            .expect("the draft setter should remain inspectable");
+        assert!(!setter.contains("agent_tools"));
+        assert!(!setter.contains("queue_ui_state"));
+    }
+
+    /// An existing session reports its tools and refuses to pretend they can
+    /// be flipped while it runs.
+    #[test]
+    fn a_session_capability_panel_reports_state_without_switches() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_session_capabilities_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_title_bar("))
+            .map(|(body, _)| body)
+            .expect("the session capability panel should remain inspectable");
+        assert!(panel.contains("SessionToolChoice::Inherit"));
+        assert!(panel.contains("localize") || panel.contains("locale::text"));
+        assert!(
+            !panel.contains("Switch::new"),
+            "a running session cannot re-register tools, so the panel must not offer a switch"
+        );
+        assert!(panel.contains("do not change mid-run") || panel.contains("运行中不会变更"));
+        // The source line that identifies each row's provenance.
+        assert!(panel.contains("Agent default") && panel.contains("This session"));
+
+        let states = source
+            .split_once("    fn session_tool_states(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The pill beside a session title"))
+            .map(|(body, _)| body)
+            .expect("the session tool resolver should remain inspectable");
+        assert!(
+            states.contains(
+                "session\n            .tools\n            .resolve(&self.ui_state.agent_tools"
+            ),
+            "the session's recorded answer must win over the Agent card"
+        );
+    }
+
+    /// The sidebar only marks rows that depart from the Agent's defaults.
+    #[test]
+    fn the_sidebar_marks_only_sessions_that_override_the_defaults() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_panel("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        assert!(sidebar.contains("sidebar_tool_mark"));
+        assert!(sidebar.contains("SessionToolChoice::Inherit"));
+        assert!(
+            sidebar.contains("deviates.then("),
+            "a row that follows the Agent must not paint a mark"
         );
     }
 

@@ -917,6 +917,7 @@ mod tests {
             last_message_at_ms: 1_000,
             archived_at_ms: None,
             deleted_at_ms: None,
+            tools: Default::default(),
         };
         SessionRepository::insert(&connection, &session).unwrap();
         let migration_applied_at_ms = connection
