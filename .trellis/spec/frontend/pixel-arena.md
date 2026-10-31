@@ -114,6 +114,13 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   across the entire area and reserves no layout space. Enabling it must leave
   introduction and composer bounds unchanged. Foreground controls occlude the
   guardian's pointer target where they cover it.
+- Only controls may occlude. The heading band above the guardian — wordmark,
+  sentence and description — is copy, and it spans the full content width over
+  a wide strip of the guardian's travel, so marking it `occlude` gives the page
+  text an invisible hitbox that takes every press aimed at the boss behind it.
+  The band therefore stays transparent to the pointer; the Agent's mark inside
+  the sentence keeps its own hit target as a child, and the composer block below
+  still occludes because it really is a control surface.
 - Supported Agent selection determines the guardian. Switching Agent resets the
   completed flag; catalog refreshes or reselecting the same Agent do not.
   Unsupported Agents have no substitute guardian.
@@ -128,9 +135,13 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   composer. Dialogs freeze preview, and inactive windows follow the
   existing ambient-animation appearance preference.
 - `scene::Entry` measures the current raster and positions a native ghost
-  `Button` around the visible model, excluding its shadow. The Button owns
-  pointer/keyboard activation, accessibility, hover, focus, and tooltip. Empty
-  home space is not a game entry. Do not replace it with a clickable canvas.
+  `Button` around the visible model, excluding its shadow. The target is that
+  fitted art grown by `ENTRY_SLOP` on every side, clamped to the scene: the
+  silhouette is re-fitted every frame as the model hops, rolls and turns, so a
+  tight rectangle moves under the pointer and a wing tip or the notch beside a
+  limb misses. The slop must stay small — empty home space is not a game entry.
+  The Button owns pointer/keyboard activation, accessibility, hover, focus, and
+  tooltip. Do not replace it with a clickable canvas.
 - Prepaint records pose, visual time, bounds, and exact projection. Activation
   copies that sample into `Arena::from_preview`; it never resets the pose or
   re-samples a different animation time. Hover may redraw between pointer down
