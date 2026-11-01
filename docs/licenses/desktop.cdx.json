@@ -39226,7 +39226,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-reviewed-icons:b1ebdd70113b62c4",
+      "bom-ref": "asset:vibex-desktop-reviewed-icons:7fbeb414ea2308cb",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
       "version": "0.1.0-rc.8",
       "licenses": [
@@ -39237,7 +39237,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "b1ebdd70113b62c446050758f3db994a276d5c9ce2c8ff309948ce457ef6d881"
+          "content": "7fbeb414ea2308cbe8892203c801de38ef63751bb0f46f3e8730e47eeb06a905"
         }
       ],
       "externalReferences": [
@@ -39817,7 +39817,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-reviewed-icons:b1ebdd70113b62c4",
+      "ref": "asset:vibex-desktop-reviewed-icons:7fbeb414ea2308cb",
       "dependsOn": []
     },
     {
@@ -47293,7 +47293,7 @@
       "ref": "cargo:vibex-desktop@0.1.0-rc.8:8be20e5fa4f9b6f0",
       "dependsOn": [
         "asset:vibex-desktop-application-icons:6d723c8f201e9676",
-        "asset:vibex-desktop-reviewed-icons:b1ebdd70113b62c4",
+        "asset:vibex-desktop-reviewed-icons:7fbeb414ea2308cb",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",

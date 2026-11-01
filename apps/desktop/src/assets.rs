@@ -1021,7 +1021,7 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     ),
     (
         "moonshotai",
-        colored_model_asset("icons/vibex/model-providers/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "morph",
@@ -1209,11 +1209,11 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     ),
     (
         "moonshot-ai",
-        colored_model_asset("icons/vibex/model-providers/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "moonshotai-cn",
-        colored_model_asset("icons/vibex/model-providers/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "z-ai",
@@ -1245,15 +1245,15 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     ),
     (
         "moonshotai-cn",
-        colored_model_asset("icons/vibex/model-providers/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "kimi-code-plan-cn",
-        colored_model_asset("icons/vibex/model-providers/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "kimi-code-plan-global",
-        colored_model_asset("icons/vibex/model-providers/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "zhipuai-coding-plan",
@@ -3244,6 +3244,90 @@ mod tests {
                     "{provider} is drawn with the theme but its file has no mask"
                 );
             }
+        }
+    }
+
+    /// A mark must be visible on both surfaces, not merely painted.
+    ///
+    /// The renderer test above proves a file is drawn the way its colours
+    /// require. This one proves the result reads: a white glyph on a black
+    /// plate has its own contrast on a dark surface and none on a light one, so
+    /// a plate that is nearly black must not rely on a near-white glyph being
+    /// visible. A mark like that has to be a bare silhouette painted with the
+    /// theme instead.
+    #[test]
+    fn no_provider_mark_relies_on_a_white_glyph_over_its_own_dark_plate() {
+        fn luminance(hex: &str) -> Option<f32> {
+            let hex = hex.trim_start_matches('#');
+            let expanded = match hex.len() {
+                3 => hex.chars().flat_map(|c| [c, c]).collect::<String>(),
+                6 => hex.to_string(),
+                _ => return None,
+            };
+            let channel = |i: usize| {
+                u8::from_str_radix(&expanded[i..i + 2], 16)
+                    .ok()
+                    .map(|v| v as f32 / 255.0)
+            };
+            let (r, g, b) = (channel(0)?, channel(2)?, channel(4)?);
+            let linear = |c: f32| {
+                if c <= 0.03928 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            Some(0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b))
+        }
+
+        for (provider, asset) in OPENROUTER_PROVIDER_BRANDS {
+            if asset.uses_current_color {
+                continue;
+            }
+            let source = BUNDLED_GPUI_FONT_ASSETS
+                .iter()
+                .chain(VIBEX_ASSETS.iter())
+                .chain(PROJECT_LOGO_ASSETS.iter())
+                .chain(FILE_INTEGRATION_ASSETS.iter())
+                .chain(AGENT_BRAND_ASSETS.iter())
+                .chain(MODEL_PROVIDER_ASSETS.iter())
+                .find(|(path, _)| *path == asset.path)
+                .map(|(_, bytes)| *bytes)
+                .expect("a provider mark is registered");
+            let source = std::str::from_utf8(source).expect("a provider mark is UTF-8");
+
+            // Every colour the file paints, wherever it is declared: a plate
+            // may carry its fill on the shape itself rather than on a (rect).
+            let shades = source
+                .split("fill=\"#")
+                .skip(1)
+                .filter_map(|tail| tail.split('"').next())
+                .filter_map(luminance)
+                .collect::<Vec<_>>();
+            if shades.is_empty() {
+                continue;
+            }
+            let darkest = shades.iter().copied().reduce(f32::min).unwrap_or(1.0);
+            let lightest = shades.iter().copied().fold(0.0_f32, f32::max);
+            // What makes a mark vanish on a light surface is a filled plate:
+            // a shape that covers the whole viewBox. A dark drawing with light
+            // highlights (`aion-labs`' statue) is a picture, and its dark parts
+            // are the subject rather than a background, so it reads.
+            let plate = source.split("<rect").skip(1).any(|rect| {
+                rect.split('>').next().is_some_and(|attrs| {
+                    attrs.contains("fill=\"#")
+                        && !attrs.contains("x=")
+                        && !attrs.contains("y=")
+                        // A plate may omit its own size and let the viewBox
+                        // size it, so a fixed width is not required.
+                        && !attrs.contains("width=\"2")
+                })
+            });
+            assert!(
+                !(plate && darkest < 0.03 && lightest > 0.85),
+                "{provider} paints a light glyph on its own dark plate, so it vanishes on a \
+                 light surface; draw it as a theme silhouette instead"
+            );
         }
     }
 

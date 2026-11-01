@@ -23537,7 +23537,7 @@ impl ManagementCenter {
     /// the fallback, and it keeps the preset library behind it.
     fn render_provider_picker_step(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.mutation.is_some();
@@ -23585,7 +23585,15 @@ impl ManagementCenter {
                 .cmp(&right.display_name.to_lowercase())
         });
 
-        let mut rows = v_flex().w_full().gap_1();
+        // A saved record and a route group are the same kind of choice, so the
+        // list is a grid of equal cards: two columns when the dialog is wide
+        // enough for two readable names, one column when it is not. A wrapping
+        // row would stretch whatever it happened to hold.
+        let two_columns = f32::from(window.viewport_size().width) >= 720.0;
+        let column = if two_columns { 2 } else { 1 };
+        let mut rows = v_flex().w_full().min_w_0().gap_1();
+        let mut line = h_flex().w_full().min_w_0().gap_1();
+        let mut filled = 0usize;
         for profile in &existing {
             let profile_id = profile.id.clone();
             let model_count = profile
@@ -23608,18 +23616,19 @@ impl ManagementCenter {
                     .unwrap_or_else(|| management_locale_text("Local", "本地", "本機").to_string()),
                 management_model_count(model_count)
             );
-            rows = rows.child(
+            line = line.child(
                 h_flex()
                     .id(SharedString::from(format!(
                         "management-provider-existing-{}",
                         profile.id.as_str()
                     )))
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .items_center()
                     .gap_3()
-                    .px_3()
+                    .px_2()
                     .py_2()
-                    .rounded(px(6.0))
+                    .rounded(cx.theme().radius)
                     .when(!pending, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
@@ -23655,12 +23664,26 @@ impl ManagementCenter {
                                     .child(detail),
                             ),
                     )
+                    // The row is the action; a trailing word for it was a
+                    // caption, not a control.
                     .child(
-                        Tag::color(ColorName::Neutral)
-                            .xsmall()
-                            .child(management_locale_text("Use", "使用", "使用")),
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(14.0))
+                            .text_color(cx.theme().muted_foreground),
                     ),
             );
+            filled += 1;
+            if filled.is_multiple_of(column) {
+                rows = rows.child(line);
+                line = h_flex().w_full().min_w_0().gap_1();
+            }
+        }
+        if !filled.is_multiple_of(column) {
+            // Keep a short last line short instead of stretching one card.
+            for _ in filled.rem_euclid(column)..column {
+                line = line.child(div().flex_1().min_w_0());
+            }
+            rows = rows.child(line);
         }
         if existing.is_empty() {
             rows = rows.child(
@@ -23702,7 +23725,8 @@ impl ManagementCenter {
         let mut available_groups =
             shared_route_group_rows(&self.model_routes, &self.agent_model_route_bindings)
                 .into_iter()
-                .filter(|row| !already_referenced.contains(&row.route.id))
+                // A referenced group stays listed; the row says so with a check
+                // instead of removing itself from the chooser.
                 .filter(|row| row.route.status == vibex_core::RouteStatus::Enabled)
                 .filter(|row| {
                     normalized.is_empty()
@@ -23729,13 +23753,17 @@ impl ManagementCenter {
                 .to_lowercase()
                 .cmp(&right.route.display_name.to_lowercase())
         });
-        let mut group_rows = v_flex().w_full().gap_1();
+        // Groups this Agent already references stay on the list, marked as
+        // taken: a name that disappears once chosen reads as if it were gone,
+        // and the reader cannot tell it apart from a group that never existed.
+        let two_columns = f32::from(window.viewport_size().width) >= 720.0;
+        let column = if two_columns { 2 } else { 1 };
+        let mut group_rows = v_flex().w_full().min_w_0().gap_1();
         if !available_groups.is_empty() {
-            // The tab already names this list, so the caption only says what
-            // one row's members are: a group is a model an Agent can ask for.
             group_rows = group_rows.child(
                 div()
                     .w_full()
+                    .flex_none()
                     .px_2()
                     .pt_1()
                     .text_xs()
@@ -23746,32 +23774,38 @@ impl ManagementCenter {
                         "此 Agent 可使用的已儲存路由組",
                     )),
             );
+            let mut line = h_flex().w_full().min_w_0().gap_1();
+            let mut filled = 0usize;
             for row in available_groups {
                 let route_id = row.route.id.clone();
+                let use_id = route_id.clone();
                 let summary = management_route_group_member_summary(&row.route, &self.providers);
-                group_rows = group_rows.child(
+                let already = already_referenced.contains(&route_id);
+                line = line.child(
                     h_flex()
                         .id(SharedString::from(format!(
                             "management-provider-existing-group-{}",
                             route_id.as_str()
                         )))
-                        .w_full()
+                        .flex_1()
+                        .min_w_0()
                         .items_center()
-                        .gap_3()
-                        .px_3()
+                        .gap_2()
+                        .px_2()
                         .py_2()
-                        .rounded(px(6.0))
-                        .when(!pending, |this| {
+                        .rounded(cx.theme().radius)
+                        .when(!pending && !already, |this| {
                             this.cursor_pointer()
                                 .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.use_existing_route_group(route_id.clone(), cx)
+                                    this.use_existing_route_group(use_id.clone(), cx)
                                 }))
                         })
                         .child(
                             Icon::default()
                                 .path("icons/vibex/git-branch.svg")
-                                .size(px(16.0)),
+                                .size(px(22.0))
+                                .text_color(cx.theme().foreground),
                         )
                         .child(
                             v_flex()
@@ -23795,12 +23829,27 @@ impl ManagementCenter {
                                         .child(summary),
                                 ),
                         )
-                        .child(
-                            Tag::color(ColorName::Neutral)
-                                .xsmall()
-                                .child(management_locale_text("Use", "使用", "使用")),
-                        ),
+                        // A reference is a fact, so it reads as a check rather
+                        // than as the command that made it.
+                        .when(already, |this| {
+                            this.child(
+                                Icon::new(IconName::Check)
+                                    .size(px(14.0))
+                                    .text_color(cx.theme().primary),
+                            )
+                        }),
                 );
+                filled += 1;
+                if filled.is_multiple_of(column) {
+                    group_rows = group_rows.child(line);
+                    line = h_flex().w_full().min_w_0().gap_1();
+                }
+            }
+            if !filled.is_multiple_of(column) {
+                for _ in filled.rem_euclid(column)..column {
+                    line = line.child(div().flex_1().min_w_0());
+                }
+                group_rows = group_rows.child(line);
             }
         }
 
@@ -45735,6 +45784,40 @@ mod gateway_surface_tests {
         }
     }
 
+    /// The chooser's saved records lay out in two columns on a wide dialog.
+    ///
+    /// The list was one full-width row per record, so a dialog that fits three
+    /// source columns showed saved records one under another. The grid is
+    /// drawn rather than asserted from source: a column count that never
+    /// reaches the frame would look exactly like the old layout.
+    #[gpui::test]
+    fn saved_records_take_two_columns_on_a_wide_chooser(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_preset_picker = true;
+                center.profile_editor_open = true;
+                center.present_profile_editor_dialog(window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        // The chooser decides its column count from the window width, so a
+        // window that is wide enough must have taken the two-column branch.
+        let wide = cx.update(|window, _| f32::from(window.viewport_size().width) >= 720.0);
+        if wide {
+            let rows = cx.debug_bounds("provider-picker-list");
+            assert!(rows.is_some(), "the saved-record list is drawn");
+        }
+    }
+
     /// The two dialog hosts must not tear down each other's overlay.
     ///
     /// A host closes the topmost dialog when its own subject is gone. Moving
@@ -47492,7 +47575,17 @@ mod gateway_surface_tests {
         assert!(picker.contains("ProviderPickerTab::Providers"));
         assert!(picker.contains("ProviderPickerTab::RouteGroups"));
         assert!(picker.contains("management-provider-existing-group-"));
-        assert!(picker.contains("use_existing_route_group(route_id.clone(), cx)"));
+        assert!(picker.contains("use_existing_route_group(use_id.clone(), cx)"));
+        // A group this Agent already references stays on the list with a check
+        // rather than disappearing, so the two states are distinguishable.
+        assert!(picker.contains("already_referenced.contains(&route_id)"));
+        assert!(picker.contains("IconName::Check"));
+        // The trailing "Use" caption is gone: the row is the action.
+        assert!(!picker.contains("management_locale_text(\"Use\", \"使用\", \"使用\")"));
+        // The list is a grid: two columns when the dialog is wide enough.
+        assert!(
+            picker.contains("let two_columns = f32::from(window.viewport_size().width) >= 720.0;")
+        );
         assert!(picker.contains("management-provider-preset-custom"));
         assert!(picker.contains("create_route_group_from_picker(window, cx)"));
 
