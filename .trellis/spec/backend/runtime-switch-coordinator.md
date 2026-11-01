@@ -435,6 +435,7 @@ agent://runtime-selection-event
 | Initial request revision/selection/config is not the exact empty-session projection | `runtime_selection_initial_request_invalid`; zero side effects. |
 | Session already has current/desired/effective/pending state | `runtime_selection_initial_enqueue_conflict`; preserve existing state. |
 | Same initial idempotency key has another target | `runtime_selection_idempotency_payload_conflict`; preserve first intent. |
+| Desired selection written while the initial switch is still Requested/Preparing | Accept it as the next durable intent; `effective` may be null until the first commit, and reads project the current switch target. `session_runtime_selection_uninitialized` is reserved for a session with no durable desired selection or status. |
 | Runtime selection service missing during create | `runtime_selection_service_unavailable`; no direct create fallback. |
 | Initial switch terminates without Commit | Preserve desired, null effective/current binding, and the original actionable switch error; synchronous initialization may return `runtime_selection_initialization_failed` and the session becomes recoverable `error`. |
 | Current ACP attachment missing/uncommitted | `runtime_selection_current_attachment_missing` / `_uncommitted`. |
@@ -468,6 +469,13 @@ agent://runtime-selection-event
   Ready without spawning a process or creating a native session.
 - Base: retrying that same selection from `FailedUsingPrevious` revalidates the
   current attachment (or restores it) before returning Ready.
+- Base: changing the runtime while the initial switch is still preparing is
+  accepted, supersedes the first target, and becomes Ready from the newer
+  intent; the null effective selection of that window is projected, not
+  reported as `session_runtime_selection_uninitialized`.
+- Bad: treating a null `effective_runtime_selection` as an uninitialized
+  session while the initial switch is preparing. A new-session startup then
+  surfaces a selection error even though the session becomes Ready.
 - Bad: manager calls `session/new`, then tries to backfill desired/effective
   selection and the switch journal from the returned attachment.
 - Bad: terminal creation permission completes but active-work probe ignores the

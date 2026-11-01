@@ -26222,6 +26222,19 @@ impl VibexWorkbench {
         state: &AgentSessionRuntimeSelectionState,
         cx: &mut Context<Self>,
     ) {
+        // The new-session page seeds the draft's selection so the composer can
+        // render while the authority creates the row. That entry is display
+        // state, not a change request: turning it into a desired-selection
+        // write races the initial runtime switch, which has not committed an
+        // effective selection yet. The creation's own projection answers the
+        // display once the session acknowledges it.
+        if self
+            .pending_new_session
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == *session_id)
+        {
+            return;
+        }
         let Some(desired) = self
             .optimistic_runtime_selections
             .get(session_id.as_str())
@@ -26306,6 +26319,17 @@ impl VibexWorkbench {
                         Ok((outcome, observed)) => match outcome {
                             Ok(state) => {
                                 let persisted = state.desired.clone();
+                                // The authority may resolve the requested
+                                // selection to a normalized one (a dropped
+                                // reasoning effort, a normalized model id).
+                                // Comparing that answer with the raw request
+                                // again would fire the same switch forever, so
+                                // the normalized selection replaces the
+                                // optimistic one.
+                                if persisted != requested_desired {
+                                    this.optimistic_runtime_selections
+                                        .remove(requested_session_id.as_str());
+                                }
                                 this.apply_runtime_selection_state(
                                     &requested_session_id,
                                     state,
@@ -108155,6 +108179,42 @@ mod tests {
         assert!(!runtime_switch.contains("agent_turn_pending"));
         assert!(runtime_switch.contains("self.optimistic_runtime_selections"));
         assert!(runtime_switch.contains("request_pending_runtime_selection"));
+
+        // A new session's draft selection is display state until creation
+        // acknowledges it; reconciling it during creation would write a desired
+        // runtime into a session whose first switch has not committed yet.
+        let reconcile = source
+            .split_once("    fn reconcile_optimistic_runtime_selection(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn request_pending_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("optimistic runtime reconciliation should remain inspectable");
+        let pending_guard = reconcile
+            .find("self\n            .pending_new_session")
+            .or_else(|| reconcile.find("pending_new_session"))
+            .expect("creation must gate the optimistic reconciliation");
+        let optimistic_lookup = reconcile
+            .find("self\n            .optimistic_runtime_selections")
+            .or_else(|| reconcile.find("optimistic_runtime_selections"))
+            .expect("the reconciliation must read the optimistic selection");
+        assert!(
+            pending_guard < optimistic_lookup,
+            "the pending-creation guard must run before the optimistic selection is reconciled"
+        );
+        let request = source
+            .split_once("    fn request_pending_runtime_selection(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn selected_agent_session_state("))
+            .map(|(body, _)| body)
+            .expect("runtime selection writes should remain inspectable");
+        let normalized = request
+            .find("if persisted != requested_desired")
+            .expect("a normalized answer must replace the optimistic selection");
+        let apply = request
+            .find("this.apply_runtime_selection_state(")
+            .expect("the accepted state must be applied");
+        assert!(
+            normalized < apply,
+            "the normalized selection must be adopted before the state is reconciled again"
+        );
     }
 
     #[test]

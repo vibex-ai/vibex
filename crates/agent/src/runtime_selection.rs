@@ -604,9 +604,13 @@ impl RuntimeSelectionService {
             state.selection_revision,
             false,
         )?;
+        // A session that has no current binding exposes its initial target
+        // while the first switch is still preparing. That target can live at a
+        // selection revision past 1: changing the runtime during startup
+        // supersedes the first intent with a new one, and neither has committed
+        // a binding yet.
         let projects_initial_target = state.current_binding_id.is_none()
             && state.effective_runtime_selection.is_none()
-            && state.selection_revision == 1
             && matches!(
                 state.runtime_selection_status,
                 Some(
@@ -1774,6 +1778,68 @@ mod tests {
                 .state,
             AgentSessionState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn a_desired_change_during_initial_preparation_is_accepted() {
+        let env = TestEnvironment::new("initial-preparing-change", 500);
+        let conn = open_database(&env.db_path).unwrap();
+        let template = SessionRepository::get(&conn, &env.session_id)
+            .unwrap()
+            .unwrap();
+        let session_id = VibexSessionId::new();
+        let mut session = template;
+        session.id = session_id.clone();
+        session.title = "initial preparing change".to_string();
+        session.state = AgentSessionState::Initializing;
+        SessionRepository::insert(&conn, &session).unwrap();
+        drop(conn);
+
+        // Enqueue the initial intent without starting its watcher, so the
+        // session stays in the window this test is about: desired and status
+        // are durable, but no binding and no effective selection exist yet.
+        env.service
+            .enqueue_initial_runtime_switch(&session_id, env.effective.clone(), None, None)
+            .await
+            .unwrap();
+        let preparing = env.service.get_selection_state(&session_id).unwrap();
+        assert_eq!(preparing.status, SessionRuntimeSelectionStatus::Preparing);
+        assert!(preparing.current_binding_id.is_none());
+        assert_eq!(preparing.effective, env.effective);
+
+        let desired = SessionRuntimeSelection {
+            model: vibex_core::RuntimeModelSelection::explicit("model-after-initial"),
+            ..env.effective.clone()
+        };
+        let accepted = env
+            .service
+            .set_desired_runtime(SetDesiredAgentSessionRuntimeRequest {
+                session_id: session_id.clone(),
+                idempotency_key: "during-initial-preparation".to_string(),
+                expected_revision: preparing.session_revision,
+                expected_selection_revision: preparing.selection_revision,
+                desired: desired.clone(),
+                interaction: RuntimeSelectionInteraction::Seamless,
+            })
+            .await
+            .expect("a runtime change during initial preparation must be accepted");
+        assert_eq!(accepted.selection_revision, 2);
+        assert_eq!(accepted.desired, desired);
+        assert_eq!(
+            accepted.effective, desired,
+            "a preparing initial target is projected until the first commit"
+        );
+        assert!(accepted.current_binding_id.is_none());
+
+        let ready = wait_for_status(
+            &env.service,
+            &session_id,
+            SessionRuntimeSelectionStatus::Ready,
+        )
+        .await;
+        assert_eq!(ready.desired, desired);
+        assert_eq!(ready.effective, desired);
+        assert!(ready.current_binding_id.is_some());
     }
 
     #[tokio::test]

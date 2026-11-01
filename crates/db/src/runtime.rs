@@ -5960,10 +5960,16 @@ impl AgentSessionRuntimeRepository {
                 "session selection revision does not match expected revision",
             ));
         }
-        if state.desired_runtime_selection.is_none()
-            || state.effective_runtime_selection.is_none()
-            || state.runtime_selection_status.is_none()
-        {
+        // The initial switch records the desired selection before it can
+        // materialize the first runtime, so `effective` is legitimately null
+        // while that switch is Requested or Preparing. Requiring it here made
+        // a selection written during a new session's startup look like an
+        // uninitialized session: the write failed, the client surfaced
+        // `session_runtime_selection_uninitialized`, and the session then went
+        // on to become Ready. Only a session with no durable desired selection
+        // or status is uninitialized; the effective field is projected from the
+        // initial target until the first commit fills it in.
+        if state.desired_runtime_selection.is_none() || state.runtime_selection_status.is_none() {
             return Err(VibexError::conflict(
                 "session_runtime_selection_uninitialized",
                 "Agent session runtime selection state is not initialized",
@@ -7403,6 +7409,74 @@ mod tests {
             Some(SessionRuntimeSelectionStatus::Preparing)
         );
         assert_eq!(state.selection_revision, 1);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn desired_switch_enqueue_accepts_a_session_preparing_its_first_runtime() {
+        let temp = temp_db_path("desired-during-initial-preparing");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "desired-during-initial-preparing");
+        let initial = desired_enqueue_request(&session_id, "initial-intent", 0, sample_selection());
+        AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &initial,
+        )
+        .unwrap();
+        let preparing = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preparing.runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::Preparing)
+        );
+        assert!(preparing.effective_runtime_selection.is_none());
+
+        // A new session has no effective selection until its first switch
+        // commits. A change made while that switch is still preparing is a
+        // real request, not an uninitialized session.
+        let desired = selection_with_model("claude-opus-4-1");
+        let request = desired_enqueue_request(&session_id, "during-preparing", 1, desired.clone());
+        let result = AgentSessionRuntimeRepository::enqueue_desired_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &request,
+        )
+        .unwrap();
+        let DesiredRuntimeSwitchEnqueueResult::Enqueued(record) = result else {
+            panic!("a selection change during initial preparation must enqueue a switch");
+        };
+        assert_eq!(record.desired_selection_revision, 2);
+        assert!(
+            record.source_binding_id.is_none(),
+            "the session still has no committed binding to switch away from"
+        );
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.desired_runtime_selection, Some(desired));
+        assert!(state.effective_runtime_selection.is_none());
+        assert_eq!(state.selection_revision, 2);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn desired_switch_enqueue_rejects_a_session_without_any_selection_state() {
+        let temp = temp_db_path("desired-uninitialized-session");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "desired-uninitialized-session");
+        let request = desired_enqueue_request(&session_id, "uninitialized", 0, sample_selection());
+
+        let error = AgentSessionRuntimeRepository::enqueue_desired_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "session_runtime_selection_uninitialized");
         cleanup_db(temp);
     }
 
