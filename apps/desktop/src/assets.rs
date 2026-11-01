@@ -869,56 +869,59 @@ struct ModelBrandRule {
 const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     (
         "aion-labs",
-        colored_model_asset("icons/vibex/model-providers/aion-labs.svg"),
+        themed_model_asset("icons/vibex/model-providers/aion-labs.svg"),
     ),
     (
         "alibaba",
-        colored_model_asset("icons/vibex/model-providers/alibaba.svg"),
+        themed_model_asset("icons/vibex/model-providers/alibaba.svg"),
     ),
     (
         "amazon",
-        colored_model_asset("icons/vibex/model-providers/amazon.svg"),
+        themed_model_asset("icons/vibex/model-providers/amazon.svg"),
     ),
     (
         "anthracite-org",
-        colored_model_asset("icons/vibex/model-providers/anthracite-org.svg"),
+        themed_model_asset("icons/vibex/model-providers/anthracite-org.svg"),
     ),
-    ("anthropic", colored_model_asset("icons/vibex/claude.svg")),
+    (
+        "anthropic",
+        themed_model_asset("icons/vibex/model-providers/anthropic.svg"),
+    ),
     (
         "arcee-ai",
-        colored_model_asset("icons/vibex/model-providers/arcee-ai.svg"),
+        themed_model_asset("icons/vibex/model-providers/arcee-ai.svg"),
     ),
     (
         "baai",
-        colored_model_asset("icons/vibex/model-providers/baai.svg"),
+        themed_model_asset("icons/vibex/model-providers/baai.svg"),
     ),
     (
         "baidu",
-        colored_model_asset("icons/vibex/model-providers/baidu.svg"),
+        themed_model_asset("icons/vibex/model-providers/baidu.svg"),
     ),
     (
         "black-forest-labs",
-        colored_model_asset("icons/vibex/model-providers/black-forest-labs.svg"),
+        themed_model_asset("icons/vibex/model-providers/black-forest-labs.svg"),
     ),
     (
         "bytedance",
-        colored_model_asset("icons/vibex/model-providers/bytedance.svg"),
+        themed_model_asset("icons/vibex/model-providers/bytedance.svg"),
     ),
     (
         "bytedance-seed",
-        colored_model_asset("icons/vibex/model-providers/bytedance-seed.svg"),
+        themed_model_asset("icons/vibex/model-providers/bytedance-seed.svg"),
     ),
     (
         "canopylabs",
-        colored_model_asset("icons/vibex/model-providers/canopylabs.svg"),
+        themed_model_asset("icons/vibex/model-providers/canopylabs.svg"),
     ),
     (
         "cognitivecomputations",
-        colored_model_asset("icons/vibex/model-providers/cognitivecomputations.svg"),
+        themed_model_asset("icons/vibex/model-providers/cognitivecomputations.svg"),
     ),
     (
         "cohere",
-        colored_model_asset("icons/vibex/model-providers/cohere.svg"),
+        themed_model_asset("icons/vibex/model-providers/cohere.svg"),
     ),
     (
         "deepgram",
@@ -926,32 +929,35 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     ),
     (
         "deepseek",
-        colored_model_asset("icons/vibex/agents/deepseek-harness.svg"),
+        themed_model_asset("icons/vibex/model-providers/deepseek.svg"),
     ),
     (
         "deepseek-ai",
-        colored_model_asset("icons/vibex/agents/deepseek-harness.svg"),
+        themed_model_asset("icons/vibex/model-providers/deepseek.svg"),
     ),
     (
         "dots-studio",
-        colored_model_asset("icons/vibex/model-providers/dots-studio.svg"),
+        themed_model_asset("icons/vibex/model-providers/dots-studio.svg"),
     ),
     (
         "fish-audio",
-        colored_model_asset("icons/vibex/model-providers/fish-audio.svg"),
+        themed_model_asset("icons/vibex/model-providers/fish-audio.svg"),
     ),
-    ("google", colored_model_asset("icons/vibex/gemini.svg")),
+    (
+        "google",
+        themed_model_asset("icons/vibex/model-providers/google.svg"),
+    ),
     (
         "gryphe",
-        colored_model_asset("icons/vibex/model-providers/gryphe.svg"),
+        themed_model_asset("icons/vibex/model-providers/gryphe.svg"),
     ),
     (
         "hexgrad",
-        colored_model_asset("icons/vibex/model-providers/hexgrad.svg"),
+        themed_model_asset("icons/vibex/model-providers/hexgrad.svg"),
     ),
     (
         "heygen",
-        colored_model_asset("icons/vibex/model-providers/heygen.svg"),
+        themed_model_asset("icons/vibex/model-providers/heygen.svg"),
     ),
     (
         "ibm-granite",
@@ -963,63 +969,63 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     ),
     (
         "inclusionai",
-        colored_model_asset("icons/vibex/model-providers/inclusionai.svg"),
+        themed_model_asset("icons/vibex/model-providers/inclusionai.svg"),
     ),
     (
         "intfloat",
-        colored_model_asset("icons/vibex/model-providers/intfloat.svg"),
+        themed_model_asset("icons/vibex/model-providers/intfloat.svg"),
     ),
     (
         "krea",
-        colored_model_asset("icons/vibex/model-providers/krea.svg"),
+        themed_model_asset("icons/vibex/model-providers/krea.svg"),
     ),
     (
         "kwaipilot",
-        colored_model_asset("icons/vibex/model-providers/kwaipilot.svg"),
+        themed_model_asset("icons/vibex/model-providers/kwaipilot.svg"),
     ),
     (
         "kwaivgi",
-        colored_model_asset("icons/vibex/model-providers/kwaivgi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kwaivgi.svg"),
     ),
     (
         "liquid",
-        colored_model_asset("icons/vibex/model-providers/liquid.svg"),
+        themed_model_asset("icons/vibex/model-providers/liquid.svg"),
     ),
     (
         "mancer",
-        colored_model_asset("icons/vibex/model-providers/mancer.svg"),
+        themed_model_asset("icons/vibex/model-providers/mancer.svg"),
     ),
     (
         "meituan",
-        colored_model_asset("icons/vibex/model-providers/meituan.svg"),
+        themed_model_asset("icons/vibex/model-providers/meituan.svg"),
     ),
     (
         "meta",
-        colored_model_asset("icons/vibex/model-providers/meta.svg"),
+        themed_model_asset("icons/vibex/model-providers/meta.svg"),
     ),
     (
         "meta-llama",
-        colored_model_asset("icons/vibex/model-providers/meta-llama.svg"),
+        themed_model_asset("icons/vibex/model-providers/meta-llama.svg"),
     ),
     (
         "microsoft",
-        colored_model_asset("icons/vibex/model-providers/microsoft.svg"),
+        themed_model_asset("icons/vibex/model-providers/microsoft.svg"),
     ),
     (
         "minimax",
-        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+        themed_model_asset("icons/vibex/model-providers/minimax.svg"),
     ),
     (
         "mistralai",
-        colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        themed_model_asset("icons/vibex/model-providers/mistral.svg"),
     ),
     (
         "moonshotai",
-        colored_model_asset("icons/vibex/agents/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "morph",
-        colored_model_asset("icons/vibex/model-providers/morph.svg"),
+        themed_model_asset("icons/vibex/model-providers/morph.svg"),
     ),
     (
         "nex-agi",
@@ -1031,316 +1037,355 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
     ),
     (
         "nvidia",
-        colored_model_asset("icons/vibex/model-providers/nvidia.svg"),
+        themed_model_asset("icons/vibex/model-providers/nvidia.svg"),
     ),
-    ("openai", themed_model_asset("icons/vibex/openai.svg")),
+    (
+        "openai",
+        themed_model_asset("icons/vibex/model-providers/openai.svg"),
+    ),
     (
         "openrouter",
-        colored_model_asset("icons/vibex/model-providers/openrouter.svg"),
+        themed_model_asset("icons/vibex/model-providers/openrouter.svg"),
     ),
     (
         "perceptron",
-        colored_model_asset("icons/vibex/model-providers/perceptron.svg"),
+        themed_model_asset("icons/vibex/model-providers/perceptron.svg"),
     ),
     (
         "perplexity",
-        colored_model_asset("icons/vibex/model-providers/perplexity.svg"),
+        themed_model_asset("icons/vibex/model-providers/perplexity.svg"),
     ),
     (
         "poolside",
         themed_model_asset("icons/vibex/agents/poolside.svg"),
     ),
-    ("qwen", colored_model_asset("icons/vibex/qwen.svg")),
+    (
+        "qwen",
+        themed_model_asset("icons/vibex/model-providers/qwen.svg"),
+    ),
     (
         "recraft",
         themed_model_asset("icons/vibex/model-providers/recraft.svg"),
     ),
     (
         "rekaai",
-        colored_model_asset("icons/vibex/model-providers/rekaai.svg"),
+        themed_model_asset("icons/vibex/model-providers/rekaai.svg"),
     ),
     (
         "relace",
-        colored_model_asset("icons/vibex/model-providers/relace.svg"),
+        themed_model_asset("icons/vibex/model-providers/relace.svg"),
     ),
     (
         "runway",
-        colored_model_asset("icons/vibex/model-providers/runway.svg"),
+        themed_model_asset("icons/vibex/model-providers/runway.svg"),
     ),
     (
         "sakana",
-        colored_model_asset("icons/vibex/model-providers/sakana.svg"),
+        themed_model_asset("icons/vibex/model-providers/sakana.svg"),
     ),
     (
         "sao10k",
-        colored_model_asset("icons/vibex/model-providers/sao10k.svg"),
+        themed_model_asset("icons/vibex/model-providers/sao10k.svg"),
     ),
     (
         "sentence-transformers",
-        colored_model_asset("icons/vibex/model-providers/sentence-transformers.svg"),
+        themed_model_asset("icons/vibex/model-providers/sentence-transformers.svg"),
     ),
     (
         "sesame",
-        colored_model_asset("icons/vibex/model-providers/sesame.svg"),
+        themed_model_asset("icons/vibex/model-providers/sesame.svg"),
     ),
     (
         "sourceful",
-        colored_model_asset("icons/vibex/model-providers/sourceful.svg"),
+        themed_model_asset("icons/vibex/model-providers/sourceful.svg"),
     ),
     (
         "stepfun",
-        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+        themed_model_asset("icons/vibex/model-providers/stepfun.svg"),
     ),
     (
         "tencent",
-        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+        themed_model_asset("icons/vibex/model-providers/tencent.svg"),
     ),
     (
         "thedrummer",
-        colored_model_asset("icons/vibex/model-providers/thedrummer.svg"),
+        themed_model_asset("icons/vibex/model-providers/thedrummer.svg"),
     ),
     (
         "thenlper",
-        colored_model_asset("icons/vibex/model-providers/thenlper.svg"),
+        themed_model_asset("icons/vibex/model-providers/thenlper.svg"),
     ),
     (
         "thinkingmachines",
-        colored_model_asset("icons/vibex/model-providers/thinkingmachines.svg"),
+        themed_model_asset("icons/vibex/model-providers/thinkingmachines.svg"),
     ),
     (
         "undi95",
-        colored_model_asset("icons/vibex/model-providers/undi95.svg"),
+        themed_model_asset("icons/vibex/model-providers/undi95.svg"),
     ),
     (
         "upstage",
-        colored_model_asset("icons/vibex/model-providers/upstage.svg"),
+        themed_model_asset("icons/vibex/model-providers/upstage.svg"),
     ),
     (
         "voyageai",
-        colored_model_asset("icons/vibex/model-providers/voyageai.svg"),
+        themed_model_asset("icons/vibex/model-providers/voyageai.svg"),
     ),
     (
         "writer",
-        colored_model_asset("icons/vibex/model-providers/writer.svg"),
+        themed_model_asset("icons/vibex/model-providers/writer.svg"),
     ),
-    ("x-ai", themed_model_asset("icons/vibex/agents/grok.svg")),
+    (
+        "x-ai",
+        themed_model_asset("icons/vibex/model-providers/xai.svg"),
+    ),
     (
         "xiaomi",
-        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+        themed_model_asset("icons/vibex/model-providers/xiaomi.svg"),
     ),
     (
         "z-ai",
-        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+        themed_model_asset("icons/vibex/model-providers/zhipu.svg"),
     ),
     (
         "groq",
-        colored_model_asset("icons/vibex/model-providers/groq.svg"),
+        themed_model_asset("icons/vibex/model-providers/groq.svg"),
     ),
     (
         "nebius",
-        colored_model_asset("icons/vibex/model-providers/nebius.svg"),
+        themed_model_asset("icons/vibex/model-providers/nebius.svg"),
     ),
     (
         "sambanova",
-        colored_model_asset("icons/vibex/model-providers/sambanova.svg"),
+        themed_model_asset("icons/vibex/model-providers/sambanova.svg"),
     ),
     (
         "novita",
-        colored_model_asset("icons/vibex/model-providers/novita.svg"),
+        themed_model_asset("icons/vibex/model-providers/novita.svg"),
     ),
     (
         "deepinfra",
-        colored_model_asset("icons/vibex/model-providers/deepinfra.svg"),
+        themed_model_asset("icons/vibex/model-providers/deepinfra.svg"),
     ),
     (
         "hyperbolic",
-        colored_model_asset("icons/vibex/model-providers/hyperbolic.svg"),
+        themed_model_asset("icons/vibex/model-providers/hyperbolic.svg"),
     ),
     (
         "cerebras",
-        colored_model_asset("icons/vibex/model-providers/cerebras.svg"),
+        themed_model_asset("icons/vibex/model-providers/cerebras.svg"),
     ),
     (
         "ai21",
-        colored_model_asset("icons/vibex/model-providers/ai21.svg"),
+        themed_model_asset("icons/vibex/model-providers/ai21.svg"),
     ),
     (
         "baichuan",
-        colored_model_asset("icons/vibex/model-providers/baichuan.svg"),
+        themed_model_asset("icons/vibex/model-providers/baichuan.svg"),
     ),
     (
         "yi",
-        colored_model_asset("icons/vibex/model-providers/yi.svg"),
+        themed_model_asset("icons/vibex/model-providers/yi.svg"),
     ),
     (
         "iflytek",
-        colored_model_asset("icons/vibex/model-providers/iflytek.svg"),
+        themed_model_asset("icons/vibex/model-providers/iflytek.svg"),
     ),
     (
         "modelscope",
-        colored_model_asset("icons/vibex/model-providers/modelscope.svg"),
+        themed_model_asset("icons/vibex/model-providers/modelscope.svg"),
     ),
     (
         "volcengine",
-        colored_model_asset("icons/vibex/model-providers/volcengine.svg"),
+        themed_model_asset("icons/vibex/model-providers/volcengine.svg"),
     ),
     (
         "aihubmix",
-        colored_model_asset("icons/vibex/model-providers/aihubmix.svg"),
+        themed_model_asset("icons/vibex/model-providers/aihubmix.svg"),
     ),
     (
         "vercel",
-        colored_model_asset("icons/vibex/model-providers/vercel.svg"),
+        themed_model_asset("icons/vibex/model-providers/vercel.svg"),
     ),
     (
         "moonshot-ai",
-        themed_model_asset("icons/vibex/agents/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "moonshotai-cn",
-        themed_model_asset("icons/vibex/agents/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "z-ai",
-        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+        themed_model_asset("icons/vibex/model-providers/zhipu.svg"),
     ),
     (
         "zai",
-        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+        themed_model_asset("icons/vibex/model-providers/zhipu.svg"),
     ),
     (
         "zhipuai",
-        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+        themed_model_asset("icons/vibex/model-providers/zhipu.svg"),
     ),
-    ("xai", themed_model_asset("icons/vibex/agents/grok.svg")),
-    ("x-ai", themed_model_asset("icons/vibex/agents/grok.svg")),
+    (
+        "xai",
+        themed_model_asset("icons/vibex/model-providers/xai.svg"),
+    ),
+    (
+        "x-ai",
+        themed_model_asset("icons/vibex/model-providers/xai.svg"),
+    ),
     (
         "mistral",
-        themed_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        themed_model_asset("icons/vibex/model-providers/mistral.svg"),
     ),
     (
         "mistralai",
-        themed_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        themed_model_asset("icons/vibex/model-providers/mistral.svg"),
     ),
     (
         "moonshotai-cn",
-        themed_model_asset("icons/vibex/agents/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "kimi-code-plan-cn",
-        themed_model_asset("icons/vibex/agents/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "kimi-code-plan-global",
-        themed_model_asset("icons/vibex/agents/kimi.svg"),
+        themed_model_asset("icons/vibex/model-providers/kimi.svg"),
     ),
     (
         "zhipuai-coding-plan",
-        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+        themed_model_asset("icons/vibex/model-providers/zhipu.svg"),
     ),
     (
         "minimax-cn",
-        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+        themed_model_asset("icons/vibex/model-providers/minimax.svg"),
     ),
     (
         "minimax-coding-plan",
-        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+        themed_model_asset("icons/vibex/model-providers/minimax.svg"),
     ),
     (
         "minimax-cn-coding-plan",
-        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+        themed_model_asset("icons/vibex/model-providers/minimax.svg"),
     ),
     (
         "stepfun-ai",
-        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+        themed_model_asset("icons/vibex/model-providers/stepfun.svg"),
     ),
     (
         "stepfun-ai-step-plan",
-        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+        themed_model_asset("icons/vibex/model-providers/stepfun.svg"),
     ),
     (
         "stepfun-step-plan",
-        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+        themed_model_asset("icons/vibex/model-providers/stepfun.svg"),
     ),
     (
         "xiaomi-token-plan-cn",
-        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+        themed_model_asset("icons/vibex/model-providers/xiaomi.svg"),
     ),
     (
         "xiaomi-token-plan-ams",
-        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+        themed_model_asset("icons/vibex/model-providers/xiaomi.svg"),
     ),
     (
         "xiaomi-token-plan-sgp",
-        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+        themed_model_asset("icons/vibex/model-providers/xiaomi.svg"),
     ),
     (
         "tencent-tokenhub",
-        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+        themed_model_asset("icons/vibex/model-providers/tencent.svg"),
     ),
     (
         "tencent-token-plan",
-        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+        themed_model_asset("icons/vibex/model-providers/tencent.svg"),
     ),
     (
         "tencent-coding-plan",
-        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+        themed_model_asset("icons/vibex/model-providers/tencent.svg"),
     ),
     (
         "volcengine-coding-plan",
-        colored_model_asset("icons/vibex/model-providers/bytedance.svg"),
+        themed_model_asset("icons/vibex/model-providers/bytedance.svg"),
     ),
     (
         "alibaba-coding-plan-cn",
-        colored_model_asset("icons/vibex/model-providers/alibaba.svg"),
+        themed_model_asset("icons/vibex/model-providers/alibaba.svg"),
     ),
     (
         "siliconflow-cn",
-        colored_model_asset("icons/vibex/model-providers/siliconflow.svg"),
+        themed_model_asset("icons/vibex/model-providers/siliconflow.svg"),
     ),
     (
         "siliconflow",
-        colored_model_asset("icons/vibex/model-providers/siliconflow.svg"),
+        themed_model_asset("icons/vibex/model-providers/siliconflow.svg"),
     ),
     (
         "togetherai",
-        colored_model_asset("icons/vibex/model-providers/together.svg"),
+        themed_model_asset("icons/vibex/model-providers/together.svg"),
     ),
     (
         "fireworks-ai",
-        colored_model_asset("icons/vibex/model-providers/fireworks.svg"),
+        themed_model_asset("icons/vibex/model-providers/fireworks.svg"),
     ),
     (
         "github",
-        colored_model_asset("icons/vibex/model-providers/github.svg"),
+        themed_model_asset("icons/vibex/model-providers/github.svg"),
     ),
     (
         "opencode",
-        colored_model_asset("icons/vibex/model-providers/opencode.svg"),
+        themed_model_asset("icons/vibex/model-providers/opencode.svg"),
     ),
     (
         "opencode-go",
-        colored_model_asset("icons/vibex/model-providers/opencode.svg"),
+        themed_model_asset("icons/vibex/model-providers/opencode.svg"),
     ),
     (
         "opencode-zen",
-        colored_model_asset("icons/vibex/model-providers/opencode.svg"),
+        themed_model_asset("icons/vibex/model-providers/opencode.svg"),
     ),
     (
         "clinepass",
-        colored_model_asset("icons/vibex/model-providers/cline.svg"),
+        themed_model_asset("icons/vibex/model-providers/cline.svg"),
     ),
     (
         "commandcode",
-        colored_model_asset("icons/vibex/model-providers/cline.svg"),
+        themed_model_asset("icons/vibex/model-providers/cline.svg"),
     ),
     (
         "novita-ai",
-        colored_model_asset("icons/vibex/model-providers/novita.svg"),
+        themed_model_asset("icons/vibex/model-providers/novita.svg"),
     ),
     (
         "reka",
-        colored_model_asset("icons/vibex/model-providers/rekaai.svg"),
+        themed_model_asset("icons/vibex/model-providers/rekaai.svg"),
+    ),
+    (
+        "anyrouter",
+        themed_model_asset("icons/vibex/model-providers/anyrouter.svg"),
+    ),
+    (
+        "opendesign",
+        themed_model_asset("icons/vibex/model-providers/opendesign.svg"),
+    ),
+    (
+        "open-design",
+        themed_model_asset("icons/vibex/model-providers/opendesign.svg"),
+    ),
+    (
+        "ollama",
+        themed_model_asset("icons/vibex/model-providers/ollama.svg"),
+    ),
+    (
+        "lmstudio",
+        themed_model_asset("icons/vibex/model-providers/lmstudio.svg"),
+    ),
+    (
+        "lm-studio",
+        themed_model_asset("icons/vibex/model-providers/lmstudio.svg"),
     ),
 ];
 
@@ -1927,6 +1972,17 @@ const MODEL_PROVIDER_ASSETS: &[(&str, &[u8])] = &[
     bundled_model_provider_asset!("gryphe.svg"),
     bundled_model_provider_asset!("aihubmix.svg"),
     bundled_model_provider_asset!("ai21.svg"),
+    bundled_model_provider_asset!("anthropic.svg"),
+    bundled_model_provider_asset!("anyrouter.svg"),
+    bundled_model_provider_asset!("opendesign.svg"),
+    bundled_model_provider_asset!("openai.svg"),
+    bundled_model_provider_asset!("google.svg"),
+    bundled_model_provider_asset!("qwen.svg"),
+    bundled_model_provider_asset!("kimi.svg"),
+    bundled_model_provider_asset!("zhipu.svg"),
+    bundled_model_provider_asset!("xai.svg"),
+    bundled_model_provider_asset!("mistral.svg"),
+    bundled_model_provider_asset!("deepseek.svg"),
     bundled_model_provider_asset!("cline.svg"),
     bundled_model_provider_asset!("fireworks.svg"),
     bundled_model_provider_asset!("github.svg"),
@@ -3151,6 +3207,46 @@ mod tests {
         }
     }
 
+    /// Every provider mark paints the interface's foreground, so it reads in
+    /// both themes.
+    ///
+    /// A brand colour that is nearly black disappeared on the dark theme, and
+    /// a white one disappeared on the light theme. A silhouette is the only
+    /// form that works in both without shipping two files per vendor.
+    #[test]
+    fn every_provider_mark_is_a_theme_paintable_silhouette() {
+        for (provider, asset) in OPENROUTER_PROVIDER_BRANDS {
+            assert!(
+                asset.uses_current_color,
+                "{provider} must paint with the theme's foreground, not a fixed colour"
+            );
+            // A mark may be reused from the agent bundle (`hermes.svg` is the
+            // Nous mark), so the whole asset inventory is searched rather than
+            // the provider bundle alone.
+            let source = BUNDLED_GPUI_FONT_ASSETS
+                .iter()
+                .chain(VIBEX_ASSETS.iter())
+                .chain(PROJECT_LOGO_ASSETS.iter())
+                .chain(FILE_INTEGRATION_ASSETS.iter())
+                .chain(AGENT_BRAND_ASSETS.iter())
+                .chain(MODEL_PROVIDER_ASSETS.iter())
+                .find(|(path, _)| *path == asset.path)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or_else(|| {
+                    panic!("{provider} points at an unregistered asset {}", asset.path)
+                });
+            let source = std::str::from_utf8(source).expect("a provider mark is UTF-8");
+            assert!(
+                source.contains("currentColor"),
+                "{provider} must expose a theme-paintable SVG mask"
+            );
+            assert!(
+                !source.contains("fill=\"#"),
+                "{provider} must not carry a fixed fill"
+            );
+        }
+    }
+
     /// A keyword matches a whole segment, so one entry cannot claim another's
     /// name by accident.
     #[test]
@@ -3169,7 +3265,7 @@ mod tests {
         // A count, not a claim about which marks exist: the table grows as a
         // vendor's logo is added, and this test's subject is that every entry
         // is a rasterizable vector rather than a count.
-        assert_eq!(MODEL_PROVIDER_ASSETS.len(), 83);
+        assert_eq!(MODEL_PROVIDER_ASSETS.len(), 94);
         for (path, bytes) in MODEL_PROVIDER_ASSETS {
             let source = std::str::from_utf8(bytes).expect("provider SVG should be UTF-8");
             assert!(source.contains("<svg"), "{path} should be an SVG");

@@ -150,11 +150,11 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 220,
-      "treeSha256": "495d53e5218972172e4f52fd2f4bf090fc35541f3df281c94ea5b8e95c62243e",
+      "expectedFileCount": 231,
+      "treeSha256": "09c7ca163711987ea7408fc41737b7b6ee2c3e532fe641065b65f165638d5694",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "81 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks; 24 provider marks from the LobeHub static icon set (MIT), redistributed as monochrome vectors. All vendor brand marks are third-party marks: brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "81 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks; 24 provider marks from the LobeHub static icon set (MIT), redistributed as monochrome vectors; several monochrome provider marks redrawn from the same vendors' public logos for theme-paintable use. All vendor brand marks are third-party marks: brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",

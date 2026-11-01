@@ -289,6 +289,8 @@ pub const PROVIDER_PRESET_TENCENT_TOKEN_PLAN: &str = "tencent-token-plan";
 pub const PROVIDER_PRESET_TENCENT_CODING_PLAN: &str = "tencent-coding-plan";
 pub const PROVIDER_PRESET_VOLCENGINE_CODING_PLAN: &str = "volcengine-coding-plan";
 pub const PROVIDER_PRESET_ALIBABA_CODING_PLAN: &str = "alibaba-coding-plan";
+pub const PROVIDER_PRESET_ANYROUTER: &str = "anyrouter";
+pub const PROVIDER_PRESET_OPEN_DESIGN: &str = "opendesign";
 
 fn endpoints(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -786,28 +788,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
-            catalog_id: Some("requesty".to_string()),
-            website: Some("https://requesty.ai".to_string()),
-            keys_url: Some("https://app.requesty.ai/api-keys".to_string()),
-            ..preset(
-                "requesty",
-                "Requesty",
-                &[(chat, "https://router.requesty.ai/v1")],
-                &["openai/gpt-4.1", "anthropic/claude-sonnet-4"],
-            )
-        },
-        ProviderPreset {
-            catalog_id: Some("portkey".to_string()),
-            website: Some("https://portkey.ai".to_string()),
-            keys_url: Some("https://app.portkey.ai/api-keys".to_string()),
-            ..preset(
-                "portkey",
-                "Portkey",
-                &[(chat, "https://api.portkey.ai/v1")],
-                &["gpt-4.1", "claude-sonnet-4"],
-            )
-        },
-        ProviderPreset {
             catalog_id: Some("aihubmix".to_string()),
             website: Some("https://aihubmix.com".to_string()),
             keys_url: Some("https://aihubmix.com/token".to_string()),
@@ -830,17 +810,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
-            catalog_id: Some("helicone".to_string()),
-            website: Some("https://www.helicone.ai".to_string()),
-            keys_url: Some("https://us.helicone.ai/settings/api-keys".to_string()),
-            ..preset(
-                "helicone",
-                "Helicone",
-                &[(chat, "https://oai.helicone.ai/v1")],
-                &["gpt-4.1-mini", "claude-sonnet-4"],
-            )
-        },
-        ProviderPreset {
             website: Some("https://lmstudio.ai".to_string()),
             no_key: true,
             no_list: false,
@@ -853,66 +822,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 &[],
             )
         },
-        ProviderPreset {
-            website: Some("https://docs.vllm.ai".to_string()),
-            no_key: true,
-            no_list: false,
-            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["local-model".to_string()],
-            ..preset("vllm", "vLLM", &[(chat, "http://127.0.0.1:8000/v1")], &[])
-        },
-        ProviderPreset {
-            website: Some("https://github.com/ggml-org/llama.cpp".to_string()),
-            no_key: true,
-            no_list: false,
-            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["local-model".to_string()],
-            ..preset(
-                "llamacpp",
-                "llama.cpp",
-                &[(chat, "http://127.0.0.1:8080/v1")],
-                &[],
-            )
-        },
-        ProviderPreset {
-            website: Some("https://localai.io".to_string()),
-            no_key: true,
-            no_list: false,
-            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["local-model".to_string()],
-            ..preset(
-                "localai",
-                "LocalAI",
-                &[(chat, "http://127.0.0.1:8080/v1")],
-                &[],
-            )
-        },
-        ProviderPreset {
-            website: Some("https://jan.ai".to_string()),
-            no_key: true,
-            no_list: false,
-            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["local-model".to_string()],
-            ..preset("jan", "Jan", &[(chat, "http://127.0.0.1:1337/v1")], &[])
-        },
-        ProviderPreset {
-            website: Some("https://github.com/oobabooga/text-generation-webui".to_string()),
-            no_key: true,
-            no_list: false,
-            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["local-model".to_string()],
-            ..preset(
-                "textgenwebui",
-                "Text Generation WebUI",
-                &[(chat, "http://127.0.0.1:5000/v1")],
-                &[],
-            )
-        },
-        // Plans that resell open coding models rather than serving their own.
-        // They are last because they are the exception: everything above is a
-        // vendor's own API. A plan's limits are part of the preset, because
-        // they decide whether the model list can be trusted at all — the one
-        // thing an address and a protocol cannot express.
         ProviderPreset {
             catalog_id: Some("opencode-go".to_string()),
             plan_note: Some("$10/month".to_string()),
@@ -1325,6 +1234,34 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 &["qwen3.5-plus", "qwen3-coder-plus", "kimi-k2.5", "glm-5"],
             )
         },
+        // A relay: one key answers for several vendors' models, over both the
+        // OpenAI and the Anthropic protocols.
+        ProviderPreset {
+            website: Some("https://anyrouter.top".to_string()),
+            keys_url: Some("https://anyrouter.top".to_string()),
+            ..preset(
+                PROVIDER_PRESET_ANYROUTER,
+                "AnyRouter",
+                &[
+                    (chat, "https://anyrouter.top/v1"),
+                    (messages, "https://anyrouter.top/v1"),
+                ],
+                &[],
+            )
+        },
+        ProviderPreset {
+            website: Some("https://open-design.ai".to_string()),
+            keys_url: Some("https://amr-link.open-design.ai".to_string()),
+            ..preset(
+                PROVIDER_PRESET_OPEN_DESIGN,
+                "OpenDesign",
+                &[
+                    (chat, "https://amr-link.open-design.ai/v1"),
+                    (messages, "https://amr-link.open-design.ai/v1"),
+                ],
+                &[],
+            )
+        },
         ProviderPreset {
             catalog_id: Some("commandcode".to_string()),
             website: Some("https://commandcode.ai/docs/provider".to_string()),
@@ -1439,7 +1376,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// Every vendor the catalogue lists under a second region or a second
     /// plan ships as its own preset.
     ///

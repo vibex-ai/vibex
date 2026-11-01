@@ -35876,7 +35876,13 @@ fn provider_logo_tile(
     ]
     .into_iter()
     .flatten()
-    .find_map(|candidate| model_brand_icon(candidate, icon_size, None));
+    .find_map(|candidate| {
+        model_brand_icon(
+            candidate,
+            icon_size,
+            Some(cx.theme().foreground.opacity(0.88)),
+        )
+    });
     let plate = div()
         .flex_none()
         .size(size)
@@ -38553,6 +38559,8 @@ fn provider_preset_category(preset: &vibex_core::ProviderPreset) -> ProviderPres
             | "vercel-gateway"
             | "helicone"
             | "modelscope"
+            | "anyrouter"
+            | "opendesign"
             | "tencent-coding-plan"
             | "volcengine-coding-plan"
             | "alibaba-coding-plan"
@@ -38723,7 +38731,16 @@ fn provider_source_logo(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &
     ]
     .into_iter()
     .flatten()
-    .find_map(|candidate| model_brand_icon(candidate, size * 0.8, None));
+    .find_map(|candidate| {
+        // A silhouette in the interface's own foreground: brand colours that
+        // are nearly black vanished on the dark theme, and the light ones
+        // vanished on the light theme.
+        model_brand_icon(
+            candidate,
+            size * 0.8,
+            Some(cx.theme().foreground.opacity(0.88)),
+        )
+    });
     match logo {
         Some(logo) => div()
             .flex_none()
