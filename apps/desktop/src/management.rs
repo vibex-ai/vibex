@@ -38535,10 +38535,16 @@ fn provider_preset_category(preset: &vibex_core::ProviderPreset) -> ProviderPres
     if local {
         return ProviderPresetCategory::Local;
     }
+    // A relay answers one key with several vendors' models. That is true of the
+    // aggregators, and equally of the coding plans that resell another vendor's
+    // models beside their own (`tencent-coding-plan` serves GLM, Kimi and
+    // MiniMax under a Tencent key). A plan limited to its own vendor's models
+    // is a vendor, not a relay.
     if matches!(
         preset.id.as_str(),
         "openrouter"
             | "opencode-go"
+            | "opencode-zen"
             | "clinepass"
             | "commandcode"
             | "requesty"
@@ -38546,6 +38552,10 @@ fn provider_preset_category(preset: &vibex_core::ProviderPreset) -> ProviderPres
             | "aihubmix"
             | "vercel-gateway"
             | "helicone"
+            | "modelscope"
+            | "tencent-coding-plan"
+            | "volcengine-coding-plan"
+            | "alibaba-coding-plan"
     ) {
         return ProviderPresetCategory::Relay;
     }
@@ -46614,6 +46624,18 @@ mod gateway_surface_tests {
         assert_eq!(
             provider_preset_category(ollama),
             ProviderPresetCategory::Local
+        );
+        // A plan that resells other vendors' models is a relay; one limited to
+        // its own vendor's models stays a vendor.
+        let coding_plan = vibex_core::provider_preset("tencent-coding-plan").expect("ships");
+        assert_eq!(
+            provider_preset_category(&coding_plan),
+            ProviderPresetCategory::Relay
+        );
+        let zhipu_plan = vibex_core::provider_preset("zhipu-coding-plan").expect("ships");
+        assert_eq!(
+            provider_preset_category(&zhipu_plan),
+            ProviderPresetCategory::Vendor
         );
         assert!(
             provider_preset_tiles(presets, "ollama")

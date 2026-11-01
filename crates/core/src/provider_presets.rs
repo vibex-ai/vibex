@@ -264,6 +264,31 @@ pub const PROVIDER_PRESET_OLLAMA: &str = "ollama";
 pub const PROVIDER_PRESET_OPENCODE_GO: &str = "opencode-go";
 pub const PROVIDER_PRESET_CLINEPASS: &str = "clinepass";
 pub const PROVIDER_PRESET_COMMANDCODE: &str = "commandcode";
+/// A vendor's second region, or a subscription sold beside its metered API.
+///
+/// These carry their own id because they answer at a different address with a
+/// different key: a plan's key is refused at the pay-as-you-go host, and a
+/// China host is refused an international key.
+pub const PROVIDER_PRESET_MOONSHOT_KIMI_CN: &str = "moonshot-kimi-cn";
+pub const PROVIDER_PRESET_KIMI_CODE_CN: &str = "kimi-code-cn";
+pub const PROVIDER_PRESET_ZAI: &str = "zai";
+pub const PROVIDER_PRESET_ZHIPU_CODING_PLAN: &str = "zhipu-coding-plan";
+pub const PROVIDER_PRESET_MINIMAX_CN: &str = "minimax-cn";
+pub const PROVIDER_PRESET_MINIMAX_CODING_PLAN: &str = "minimax-coding-plan";
+pub const PROVIDER_PRESET_STEPFUN_GLOBAL: &str = "stepfun-global";
+pub const PROVIDER_PRESET_STEPFUN_STEP_PLAN: &str = "stepfun-step-plan";
+pub const PROVIDER_PRESET_STEPFUN_STEP_PLAN_CN: &str = "stepfun-step-plan-cn";
+pub const PROVIDER_PRESET_MODELSCOPE: &str = "modelscope";
+pub const PROVIDER_PRESET_OPENCODE_ZEN: &str = "opencode-zen";
+pub const PROVIDER_PRESET_XIAOMI: &str = "xiaomi";
+pub const PROVIDER_PRESET_XIAOMI_TOKEN_PLAN: &str = "xiaomi-token-plan";
+pub const PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_AMS: &str = "xiaomi-token-plan-ams";
+pub const PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_SGP: &str = "xiaomi-token-plan-sgp";
+pub const PROVIDER_PRESET_TENCENT_TOKENHUB: &str = "tencent-tokenhub";
+pub const PROVIDER_PRESET_TENCENT_TOKEN_PLAN: &str = "tencent-token-plan";
+pub const PROVIDER_PRESET_TENCENT_CODING_PLAN: &str = "tencent-coding-plan";
+pub const PROVIDER_PRESET_VOLCENGINE_CODING_PLAN: &str = "volcengine-coding-plan";
+pub const PROVIDER_PRESET_ALIBABA_CODING_PLAN: &str = "alibaba-coding-plan";
 
 fn endpoints(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -935,6 +960,371 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 ],
             )
         },
+        // The second region of a vendor whose two hosts take different keys.
+        ProviderPreset {
+            catalog_id: Some("moonshotai-cn".to_string()),
+            website: Some("https://platform.moonshot.cn".to_string()),
+            keys_url: Some("https://platform.moonshot.cn/console/api-keys".to_string()),
+            ..preset(
+                PROVIDER_PRESET_MOONSHOT_KIMI_CN,
+                "Moonshot Kimi (China)",
+                &[
+                    (chat, "https://api.moonshot.cn/v1"),
+                    (messages, "https://api.moonshot.cn/anthropic"),
+                ],
+                &["kimi-k2.6", "kimi-k2.7-code", "kimi-k3"],
+            )
+        },
+        // A membership's own endpoint: it serves the coding models alone and
+        // refuses a metered key, so it is its own record rather than a region
+        // of the API preset above it.
+        ProviderPreset {
+            catalog_id: Some("kimi-code-plan-cn".to_string()),
+            website: Some("https://www.kimi.com/code".to_string()),
+            keys_url: Some("https://www.kimi.com/code/console".to_string()),
+            plan_note: Some("Membership".to_string()),
+            ..preset(
+                PROVIDER_PRESET_KIMI_CODE_CN,
+                "Kimi Code (China)",
+                &[
+                    (chat, "https://api.kimi.com/coding/v1"),
+                    (messages, "https://api.kimi.com/coding"),
+                ],
+                &["k3", "k3.1-pro", "kimi-for-coding"],
+            )
+        },
+        // The same vendor's international host. The catalogue names it apart
+        // from the China one because its key and its model line differ.
+        ProviderPreset {
+            catalog_id: Some("zai".to_string()),
+            website: Some("https://z.ai".to_string()),
+            keys_url: Some("https://z.ai/manage-apikey/apikey-list".to_string()),
+            ..preset(
+                PROVIDER_PRESET_ZAI,
+                "Z.ai",
+                &[
+                    (chat, "https://api.z.ai/api/paas/v4"),
+                    (messages, "https://api.z.ai/api/anthropic"),
+                ],
+                &["glm-4.7", "glm-4.6", "glm-4.5-air"],
+            )
+        },
+        // A subscription served at its own path: its key is refused at the
+        // pay-as-you-go address, and the vendor's model list answers with the
+        // metered models only, so the plan's ids are written here.
+        ProviderPreset {
+            catalog_id: Some("zhipuai-coding-plan".to_string()),
+            website: Some("https://docs.bigmodel.cn/cn/coding-plan/overview".to_string()),
+            keys_url: Some("https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys".to_string()),
+            plan_note: Some("Coding Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_ZHIPU_CODING_PLAN,
+                "Zhipu GLM Coding Plan",
+                &[
+                    (chat, "https://open.bigmodel.cn/api/coding/paas/v4"),
+                    (responses, "https://open.bigmodel.cn/api/v1"),
+                    (messages, "https://open.bigmodel.cn/api/anthropic"),
+                ],
+                &["glm-5.3", "glm-5.3-flash", "glm-5.3-highspeed", "glm-4.6v"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("minimax-cn".to_string()),
+            website: Some("https://platform.minimaxi.com".to_string()),
+            keys_url: Some(
+                "https://platform.minimaxi.com/user-center/basic-information/interface-key"
+                    .to_string(),
+            ),
+            ..preset(
+                PROVIDER_PRESET_MINIMAX_CN,
+                "MiniMax (China)",
+                &[
+                    (chat, "https://api.minimaxi.com/v1"),
+                    (messages, "https://api.minimaxi.com/anthropic"),
+                ],
+                &["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("minimax-coding-plan".to_string()),
+            website: Some("https://platform.minimax.io/docs/token-plan/intro".to_string()),
+            keys_url: Some(
+                "https://platform.minimax.io/user-center/basic-information/interface-key"
+                    .to_string(),
+            ),
+            plan_note: Some("Token Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_MINIMAX_CODING_PLAN,
+                "MiniMax Token Plan",
+                &[
+                    (chat, "https://api.minimax.io/v1"),
+                    (messages, "https://api.minimax.io/anthropic"),
+                ],
+                &["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7"],
+            )
+        },
+        // StepFun's two hosts and its subscription. The plan's key is refused
+        // at the pay-as-you-go addresses and the other way round, so the plan
+        // is a preset of its own rather than a second address on one record.
+        ProviderPreset {
+            catalog_id: Some("stepfun-ai".to_string()),
+            website: Some("https://platform.stepfun.ai".to_string()),
+            keys_url: Some("https://platform.stepfun.ai/interface-key".to_string()),
+            ..preset(
+                PROVIDER_PRESET_STEPFUN_GLOBAL,
+                "StepFun (Global)",
+                &[
+                    (chat, "https://api.stepfun.ai/v1"),
+                    (messages, "https://api.stepfun.ai"),
+                ],
+                &["step-3.7-flash", "step-3.5-flash", "step-5-preview"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("stepfun-ai-step-plan".to_string()),
+            website: Some(
+                "https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api"
+                    .to_string(),
+            ),
+            keys_url: Some("https://platform.stepfun.ai/interface-key".to_string()),
+            plan_note: Some("Step Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_STEPFUN_STEP_PLAN,
+                "StepFun Step Plan (Global)",
+                &[
+                    (chat, "https://api.stepfun.ai/step_plan/v1"),
+                    (messages, "https://api.stepfun.ai/step_plan"),
+                ],
+                &["step-3.7-flash", "step-3.5-flash", "step-5-preview"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("stepfun-step-plan".to_string()),
+            website: Some(
+                "https://platform.stepfun.com/docs/zh/step-plan/integrations/reasoning-api"
+                    .to_string(),
+            ),
+            keys_url: Some("https://platform.stepfun.com/interface-key".to_string()),
+            plan_note: Some("Step Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_STEPFUN_STEP_PLAN_CN,
+                "StepFun Step Plan (China)",
+                &[
+                    (chat, "https://api.stepfun.com/step_plan/v1"),
+                    (messages, "https://api.stepfun.com/step_plan"),
+                ],
+                &["step-3.7-flash", "step-3.5-flash", "step-router-v1"],
+            )
+        },
+        // An inference aggregator: one token reaches many vendors' open
+        // weights, and its ids keep the vendor as a path prefix.
+        ProviderPreset {
+            catalog_id: Some("modelscope".to_string()),
+            website: Some("https://modelscope.cn".to_string()),
+            keys_url: Some("https://modelscope.cn/my/myaccesstoken".to_string()),
+            ..preset(
+                PROVIDER_PRESET_MODELSCOPE,
+                "ModelScope",
+                &[
+                    (chat, "https://api-inference.modelscope.cn/v1"),
+                    (responses, "https://api-inference.modelscope.cn/v1"),
+                ],
+                &[
+                    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+                    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                    "ZhipuAI/GLM-4.6",
+                ],
+            )
+        },
+        // The same relay's open-model console, which serves a keyless tier:
+        // its free models answer without one, and a key adds the paid ones.
+        ProviderPreset {
+            catalog_id: Some("opencode".to_string()),
+            website: Some("https://opencode.ai/docs/zen".to_string()),
+            keys_url: Some("https://opencode.ai/auth".to_string()),
+            key_hint: Some("optional: free models need no key".to_string()),
+            ..preset(
+                PROVIDER_PRESET_OPENCODE_ZEN,
+                "OpenCode Zen",
+                &[
+                    (chat, "https://opencode.ai/zen/v1"),
+                    (responses, "https://opencode.ai/zen/v1"),
+                    (messages, "https://opencode.ai/zen"),
+                ],
+                &[],
+            )
+        },
+        // Xiaomi sells a metered API and a regional subscription, each on its
+        // own host: a plan key is spent at the plan's host alone.
+        ProviderPreset {
+            catalog_id: Some("xiaomi".to_string()),
+            website: Some("https://platform.xiaomimimo.com".to_string()),
+            keys_url: Some("https://platform.xiaomimimo.com/#/console/api-keys".to_string()),
+            ..preset(
+                PROVIDER_PRESET_XIAOMI,
+                "Xiaomi MiMo",
+                &[
+                    (chat, "https://api.xiaomimimo.com/v1"),
+                    (responses, "https://api.xiaomimimo.com/v1"),
+                ],
+                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("xiaomi-token-plan-cn".to_string()),
+            website: Some("https://platform.xiaomimimo.com".to_string()),
+            keys_url: Some("https://platform.xiaomimimo.com/token-plan".to_string()),
+            plan_note: Some("Token Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_XIAOMI_TOKEN_PLAN,
+                "Xiaomi Token Plan (China)",
+                &[
+                    (chat, "https://token-plan-cn.xiaomimimo.com/v1"),
+                    (responses, "https://token-plan-cn.xiaomimimo.com/v1"),
+                    (messages, "https://token-plan-cn.xiaomimimo.com/anthropic"),
+                ],
+                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("xiaomi-token-plan-ams".to_string()),
+            website: Some("https://platform.xiaomimimo.com".to_string()),
+            keys_url: Some("https://platform.xiaomimimo.com/token-plan".to_string()),
+            plan_note: Some("Token Plan".to_string()),
+            ..preset(
+                PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_AMS,
+                "Xiaomi Token Plan (Europe)",
+                &[
+                    (chat, "https://token-plan-ams.xiaomimimo.com/v1"),
+                    (responses, "https://token-plan-ams.xiaomimimo.com/v1"),
+                    (messages, "https://token-plan-ams.xiaomimimo.com/anthropic"),
+                ],
+                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("xiaomi-token-plan-sgp".to_string()),
+            website: Some("https://platform.xiaomimimo.com".to_string()),
+            keys_url: Some("https://platform.xiaomimimo.com/token-plan".to_string()),
+            plan_note: Some("Token Plan".to_string()),
+            ..preset(
+                PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_SGP,
+                "Xiaomi Token Plan (Singapore)",
+                &[
+                    (chat, "https://token-plan-sgp.xiaomimimo.com/v1"),
+                    (responses, "https://token-plan-sgp.xiaomimimo.com/v1"),
+                    (messages, "https://token-plan-sgp.xiaomimimo.com/anthropic"),
+                ],
+                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
+            )
+        },
+        // Tencent's three answers. TokenHub is the metered gateway; the two
+        // plans are served at paths of their own and refuse a TokenHub key.
+        ProviderPreset {
+            catalog_id: Some("tencent-tokenhub".to_string()),
+            website: Some("https://cloud.tencent.com/document/product/1823/130050".to_string()),
+            keys_url: Some("https://console.cloud.tencent.com/tokenhub/apikey".to_string()),
+            ..preset(
+                PROVIDER_PRESET_TENCENT_TOKENHUB,
+                "Tencent TokenHub",
+                &[
+                    (chat, "https://tokenhub.tencentmaas.com/v1"),
+                    (responses, "https://tokenhub.tencentmaas.com/v1"),
+                    (messages, "https://tokenhub.tencentmaas.com"),
+                ],
+                &["hy3", "hy4-preview", "hy3-preview"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("tencent-token-plan".to_string()),
+            website: Some("https://cloud.tencent.com/document/product/1823/130060".to_string()),
+            keys_url: Some("https://console.cloud.tencent.com/tokenhub/tokenplan".to_string()),
+            plan_note: Some("Token Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_TENCENT_TOKEN_PLAN,
+                "Tencent Token Plan",
+                &[
+                    (chat, "https://api.lkeap.cloud.tencent.com/plan/v3"),
+                    (
+                        messages,
+                        "https://api.lkeap.cloud.tencent.com/plan/anthropic",
+                    ),
+                ],
+                &["hy3", "hy4-preview"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("tencent-coding-plan".to_string()),
+            website: Some("https://cloud.tencent.com/document/product/1772/128947".to_string()),
+            keys_url: Some("https://console.cloud.tencent.com/tokenhub/codingplan".to_string()),
+            plan_note: Some("Coding Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_TENCENT_CODING_PLAN,
+                "Tencent Coding Plan",
+                &[
+                    (chat, "https://api.lkeap.cloud.tencent.com/coding/v3"),
+                    (
+                        messages,
+                        "https://api.lkeap.cloud.tencent.com/coding/anthropic",
+                    ),
+                ],
+                &["hunyuan-2.0-instruct", "glm-5", "kimi-k2.5", "minimax-m2.5"],
+            )
+        },
+        // The Ark Coding Plan's quota is spent at /api/coding/v3 alone: a key
+        // sent to the metered /api/v3 is billed separately and never draws on
+        // the plan, so the two must not share a record.
+        ProviderPreset {
+            catalog_id: Some("volcengine-coding-plan".to_string()),
+            website: Some("https://www.volcengine.com/docs/82379/1928261".to_string()),
+            keys_url: Some("https://ark.volcengine.com/region:cn-beijing/apikey".to_string()),
+            plan_note: Some("Coding Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_VOLCENGINE_CODING_PLAN,
+                "Volcengine Ark Coding Plan",
+                &[
+                    (chat, "https://ark.cn-beijing.volces.com/api/coding/v3"),
+                    (responses, "https://ark.cn-beijing.volces.com/api/coding/v3"),
+                    (messages, "https://ark.cn-beijing.volces.com/api/coding"),
+                ],
+                &[
+                    "doubao-seed-2.1-turbo",
+                    "deepseek-v4-pro",
+                    "glm-5.3",
+                    "kimi-k2.7-code",
+                ],
+            )
+        },
+        // Alibaba's coding plan: its own host and its own key, which the
+        // DashScope endpoint the Qwen preset uses will not accept.
+        ProviderPreset {
+            catalog_id: Some("alibaba-coding-plan-cn".to_string()),
+            website: Some("https://help.aliyun.com/zh/model-studio/coding-plan".to_string()),
+            keys_url: Some("https://bailian.console.aliyun.com".to_string()),
+            plan_note: Some("Coding Plan".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_ALIBABA_CODING_PLAN,
+                "Alibaba Coding Plan (China)",
+                &[
+                    (chat, "https://coding.dashscope.aliyuncs.com/v1"),
+                    (responses, "https://coding.dashscope.aliyuncs.com/v1"),
+                    (
+                        messages,
+                        "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+                    ),
+                ],
+                &["qwen3.5-plus", "qwen3-coder-plus", "kimi-k2.5", "glm-5"],
+            )
+        },
         ProviderPreset {
             catalog_id: Some("commandcode".to_string()),
             website: Some("https://commandcode.ai/docs/provider".to_string()),
@@ -978,9 +1368,13 @@ mod tests {
     #[test]
     fn first_batch_is_complete_and_unique() {
         let presets = provider_presets();
+        // A range rather than one number: the table grows as vendors appear and
+        // shrinks when one folds. What must hold is that it stays a curated
+        // library — neither accidentally empty nor a dump of every catalogue
+        // entry — and that every entry below is addressable and unique.
         assert!(
-            (40..=60).contains(&presets.len()),
-            "the curated picker ships 40-60 presets, got {}",
+            (60..=120).contains(&presets.len()),
+            "the curated picker stays a curated library, got {}",
             presets.len()
         );
         let mut ids = presets
@@ -1041,6 +1435,95 @@ mod tests {
             assert!(
                 provider_preset(id).is_some(),
                 "the curated picker must include {id}"
+            );
+        }
+    }
+
+    #[test]
+    /// Every vendor the catalogue lists under a second region or a second
+    /// plan ships as its own preset.
+    ///
+    /// These are not aliases of the first preset: a China host refuses an
+    /// international key, and a plan's key is refused at the metered address.
+    /// The catalogue therefore names each one, and a preset that pointed all of
+    /// them at the first host would fail at the first request rather than at
+    /// the picker.
+    #[test]
+    fn every_secondary_region_and_plan_has_its_own_preset() {
+        for (preset_id, catalog_id) in [
+            (PROVIDER_PRESET_MOONSHOT_KIMI_CN, "moonshotai-cn"),
+            (PROVIDER_PRESET_KIMI_CODE_CN, "kimi-code-plan-cn"),
+            (PROVIDER_PRESET_ZAI, "zai"),
+            (PROVIDER_PRESET_ZHIPU_CODING_PLAN, "zhipuai-coding-plan"),
+            (PROVIDER_PRESET_MINIMAX_CN, "minimax-cn"),
+            (PROVIDER_PRESET_MINIMAX_CODING_PLAN, "minimax-coding-plan"),
+            (PROVIDER_PRESET_STEPFUN_GLOBAL, "stepfun-ai"),
+            (PROVIDER_PRESET_STEPFUN_STEP_PLAN, "stepfun-ai-step-plan"),
+            (PROVIDER_PRESET_STEPFUN_STEP_PLAN_CN, "stepfun-step-plan"),
+            (PROVIDER_PRESET_MODELSCOPE, "modelscope"),
+            (PROVIDER_PRESET_OPENCODE_ZEN, "opencode"),
+            (PROVIDER_PRESET_XIAOMI, "xiaomi"),
+            (PROVIDER_PRESET_XIAOMI_TOKEN_PLAN, "xiaomi-token-plan-cn"),
+            (
+                PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_AMS,
+                "xiaomi-token-plan-ams",
+            ),
+            (
+                PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_SGP,
+                "xiaomi-token-plan-sgp",
+            ),
+            (PROVIDER_PRESET_TENCENT_TOKENHUB, "tencent-tokenhub"),
+            (PROVIDER_PRESET_TENCENT_TOKEN_PLAN, "tencent-token-plan"),
+            (PROVIDER_PRESET_TENCENT_CODING_PLAN, "tencent-coding-plan"),
+            (
+                PROVIDER_PRESET_VOLCENGINE_CODING_PLAN,
+                "volcengine-coding-plan",
+            ),
+            (
+                PROVIDER_PRESET_ALIBABA_CODING_PLAN,
+                "alibaba-coding-plan-cn",
+            ),
+        ] {
+            let preset = provider_preset(preset_id)
+                .unwrap_or_else(|| panic!("{preset_id} must ship as its own preset"));
+            assert_eq!(
+                preset.catalog_id.as_deref(),
+                Some(catalog_id),
+                "{preset_id} must point at the catalogue entry it answers for"
+            );
+            assert!(
+                preset.default_wire_api().is_some(),
+                "{preset_id} must carry a usable endpoint"
+            );
+        }
+    }
+
+    /// A plan's record says what its vendor's list cannot.
+    ///
+    /// The plans here are served at their own paths and list the metered
+    /// models, not the covered ones, so the ids are written in and the caveat
+    /// says why. A plan without its own models would present an empty picker.
+    #[test]
+    fn every_plan_preset_carries_its_own_models() {
+        for preset_id in [
+            PROVIDER_PRESET_ZHIPU_CODING_PLAN,
+            PROVIDER_PRESET_MINIMAX_CODING_PLAN,
+            PROVIDER_PRESET_STEPFUN_STEP_PLAN,
+            PROVIDER_PRESET_STEPFUN_STEP_PLAN_CN,
+            PROVIDER_PRESET_XIAOMI_TOKEN_PLAN,
+            PROVIDER_PRESET_TENCENT_TOKEN_PLAN,
+            PROVIDER_PRESET_TENCENT_CODING_PLAN,
+            PROVIDER_PRESET_VOLCENGINE_CODING_PLAN,
+            PROVIDER_PRESET_ALIBABA_CODING_PLAN,
+        ] {
+            let preset = provider_preset(preset_id).expect("the plan ships");
+            assert!(
+                !preset.models.is_empty(),
+                "{preset_id} must carry the plan's own model ids"
+            );
+            assert!(
+                !preset.caveats.is_empty(),
+                "{preset_id} must say why its list is written rather than fetched"
             );
         }
     }
