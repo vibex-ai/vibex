@@ -204,6 +204,10 @@ pub struct TerminalSurface {
     /// area the cells start at — used to turn pointer positions into grid points.
     grid_bounds: Option<Bounds<Pixels>>,
     last_grid_bounds: Option<(String, u32, u32)>,
+    /// The grid box the terminal should be sized to right now. It follows every
+    /// prepaint, including when the debounced request for that box is already
+    /// pending, so a resize response can be checked against what is on screen.
+    desired_grid_size: Option<(String, f32, f32)>,
     poll_task: Option<Task<()>>,
     blink_task: Option<Task<()>>,
     foreground_active: bool,
@@ -486,6 +490,7 @@ impl TerminalSurface {
             resize_task: None,
             grid_bounds: None,
             last_grid_bounds: None,
+            desired_grid_size: None,
             poll_task: None,
             blink_task: None,
             foreground_active: mode == TerminalSurfaceMode::Standalone,
@@ -819,6 +824,10 @@ impl TerminalSurface {
             self.resize_task = None;
             self.last_grid_bounds = None;
         }
+        // Remember the box even when the scheduler below has already recorded
+        // it: a response to an older request must be able to tell that the
+        // grid has moved on and ask for this one instead.
+        self.desired_grid_size = Some((terminal_id.as_str().to_string(), width, height));
         let bounds = (
             terminal_id.as_str().to_string(),
             width.round().max(1.0) as u32,
@@ -879,6 +888,12 @@ impl TerminalSurface {
                         }
                         this.note = format!("{} rows x {} columns", request.rows, request.cols);
                         this.last_error_code = None;
+                        this.reconcile_resize_after_response(
+                            &terminal_id,
+                            request.rows,
+                            request.cols,
+                            cx,
+                        );
                     }
                     Err(error) => {
                         this.note = format!("Resize failed: {}", error.message);
@@ -889,6 +904,50 @@ impl TerminalSurface {
             },
             cx,
         );
+    }
+
+    /// Re-checks the terminal against the grid after a resize response.
+    ///
+    /// A response can describe a size the surface has already left behind: the
+    /// terminal panel animates through small heights while it closes, and a
+    /// request sent during that transit can be answered after the panel has
+    /// opened again. Applying that response leaves the PTY one row tall while
+    /// the grid is full, and the debounced scheduler will not send the current
+    /// size because it already scheduled that box. Ask for the box on screen
+    /// instead.
+    fn reconcile_resize_after_response(
+        &mut self,
+        terminal_id: &TerminalId,
+        rows: u16,
+        cols: u16,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((desired_terminal, width, height)) = self.desired_grid_size.clone() else {
+            return;
+        };
+        if desired_terminal != terminal_id.as_str() {
+            return;
+        }
+        let Ok((desired_rows, desired_cols)) = self.cell_metrics.dimensions(width, height) else {
+            return;
+        };
+        if (desired_rows, desired_cols) == (rows, cols) {
+            return;
+        }
+        // The coordinator recorded the stale request as the last one sent, so
+        // a plain commit would be suppressed as a duplicate. Start it over and
+        // take both observations a resize needs in one step. The pending
+        // debounce belongs to whichever box was current when it was scheduled,
+        // so it is obsolete once this request goes out.
+        self.resize_task = None;
+        self.last_grid_bounds = Some((
+            desired_terminal,
+            width.round().max(1.0) as u32,
+            height.round().max(1.0) as u32,
+        ));
+        self.resize = TerminalResizeCoordinator::new(self.cell_metrics);
+        let _ = self.resize.observe(terminal_id.clone(), width, height);
+        self.commit_resize(terminal_id.clone(), width, height, cx);
     }
 
     fn active_runtime(&self) -> Option<(TerminalId, SharedTerminalBackend)> {
@@ -2856,6 +2915,55 @@ mod tests {
             ),
         );
         assert_eq!(anchor(&cx), None);
+    }
+
+    #[gpui::test]
+    fn a_stale_resize_response_is_reconciled_with_the_visible_grid(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(bind_terminal_keys);
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| TerminalSurface::new(false, window, cx))
+            })
+            .expect("terminal test window should open")
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let surface = window
+            .root(&mut cx)
+            .expect("terminal test surface should exist");
+
+        let (terminal_id, expected) = surface.read_with(&cx, |surface, _| {
+            (
+                surface
+                    .tabs
+                    .first()
+                    .expect("terminal tab")
+                    .session
+                    .id
+                    .clone(),
+                surface
+                    .cell_metrics
+                    .dimensions(816.0, 416.0)
+                    .expect("grid dimensions"),
+            )
+        });
+
+        // The panel is open at its full height, but the response still
+        // describes the one row the closing transition asked for.
+        surface.update(&mut cx, |surface, cx| {
+            surface.desired_grid_size = Some((terminal_id.as_str().to_string(), 816.0, 416.0));
+            surface.reconcile_resize_after_response(&terminal_id, 1, 20, cx);
+        });
+        cx.run_until_parked();
+
+        let session = surface.read_with(&cx, |surface, _| {
+            surface.tabs.first().expect("terminal tab").session.clone()
+        });
+        assert_eq!(
+            (session.rows, session.cols),
+            expected,
+            "the terminal should be resized back to the grid, not left at the stale response"
+        );
     }
 
     #[test]

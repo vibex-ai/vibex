@@ -59445,6 +59445,14 @@ impl VibexWorkbench {
                 v_flex()
                     .w_full()
                     .h(px(terminal_height))
+                    // The open/close transition animates the panel's own
+                    // height. This box keeps the height the terminal was
+                    // sized for, so the grid is not laid out through a
+                    // shrinking box: an intermediate height used to be
+                    // committed as the PTY size, leaving a reopened terminal
+                    // one row tall. The panel's overflow clips the box while
+                    // it travels.
+                    .flex_none()
                     .min_w_0()
                     .overflow_hidden()
                     .child(card),
@@ -98746,6 +98754,19 @@ mod tests {
         // whole workbench instead of one per conversation pane.
         assert!(panel.contains(".w_full()"));
         assert!(!panel.contains("content_max_width"));
+        // The animated panel height must not become the terminal's layout
+        // height: a shrinking box used to resize the PTY to one row while the
+        // panel closed. The fixed-height terminal box keeps its own size.
+        let terminal_box = panel
+            .split_once(".h(px(terminal_height))")
+            .expect("the panel should size its terminal box")
+            .1;
+        assert!(
+            terminal_box
+                .split_once(".child(card)")
+                .is_some_and(|(box_style, _)| box_style.contains(".flex_none()")),
+            "the terminal box must not shrink inside the panel transition"
+        );
 
         let shell = source
             .split_once("    fn render_shell(")
