@@ -2079,6 +2079,7 @@ impl ModelGatewayService {
             passthrough,
             endpoint,
             metadata: upstream.metadata.clone(),
+            extra_body: vibex_core::ModelProviderExtraBody::for_request(&upstream.metadata),
             body,
             alternates,
             keys,
@@ -2577,18 +2578,10 @@ impl ModelGatewayService {
                     prepared.stream,
                 )?;
                 let mut body = call.body.clone();
-                if let Some(extra) = member
-                    .metadata
-                    .extra_body_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-                    .and_then(|value| value.as_object().cloned())
-                    && let Some(target) = body.as_object_mut()
-                {
-                    for (key, value) in extra {
-                        target.insert(key, value);
-                    }
-                }
+                // The Provider's declared fields are the last word on the body
+                // it sends. A field the gateway owns is skipped, so a record
+                // written by hand cannot replace routing with a request.
+                member.extra_body.apply_to(&mut body);
                 if send_model != member.model
                     && let Some(target) = body.as_object_mut()
                 {
@@ -3170,6 +3163,9 @@ pub struct PreparedMember {
     pub passthrough: bool,
     pub endpoint: ModelProviderEndpoint,
     pub metadata: vibex_core::ModelProviderMetadata,
+    /// The body fields the Provider declares, read once here so every Key
+    /// attempt and every protocol alternative carries the same ones.
+    pub extra_body: vibex_core::ModelProviderExtraBody,
     pub body: Value,
     /// Ordered attempts: the candidate and the credential record it uses.
     pub keys: Vec<(CandidateKey, ModelProviderCredentialReference)>,

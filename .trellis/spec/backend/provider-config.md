@@ -6710,16 +6710,46 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 ### Advanced override metadata (v2)
 
 - Advanced overrides live in `ModelProviderMetadata`, never in the launch
-  contract: auth header mode, extra body JSON, User-Agent mode, TLS acceptance,
-  connect/request/stream-idle timeouts, auto-refresh, and model aliases.
+  contract: auth header mode, request body fields, User-Agent mode, TLS
+  acceptance, connect/request/stream-idle timeouts, auto-refresh, and model
+  aliases.
 - The shared Advanced tab edits them as a JSON object. The object is validated
   before the v2 update; invalid JSON or an unknown auth/UA mode leaves the draft
   open and reports the error.
 - `tlsAcceptInvalid` is refused for a catalogued vendor Provider; it is only for
   a custom or local record.
-- `extraBody` must be a JSON object. `modelAliases` is an object of local id to
-  upstream id.
+- `modelAliases` is an object of local id to upstream id.
 - None of these fields may carry a price, cost, quota, or balance value.
+
+### Provider request body fields
+
+- A Provider's body fields are one stored object,
+  `ModelProviderMetadata::extra_body_json`, and one typed contract,
+  `ModelProviderExtraBody`. The editor, the save path, and the gateway read that
+  single contract; no second writer may exist for the same object.
+- The Provider page edits them as name/value rows, not as raw JSON. A value is
+  JSON as typed, so a nested object or array survives the form. A row with
+  neither a name nor a value is an abandoned row and is dropped; any other
+  incomplete row names itself and keeps the editor open.
+- `MODEL_PROVIDER_EXTRA_BODY_RESERVED` refuses the fields the gateway decides:
+  `model`, `stream`, the conversation itself (`messages`, `input`, `contents`,
+  `system`, `systemInstruction`, `system_instruction`, `instructions`), and
+  `tools`. A save that names one is rejected with
+  `model_provider_extra_body_field_reserved`.
+- Reading for a request is lenient on purpose
+  (`ModelProviderExtraBody::for_request`): a hand-edited record whose object
+  carries a reserved field, a duplicate, or an unusable name still sends the
+  fields it may carry, instead of failing the call. The editor is the strict
+  direction (`parse`, `from_fields`).
+- The gateway applies the fields after the body is built and after protocol
+  translation, so one declaration shapes every protocol the Provider speaks.
+  The model id the gateway routed to is written last and cannot be replaced.
+- These fields reach a request only through the gateway, which means a route
+  group. An Agent that calls the Provider directly builds its own body, and the
+  section says so; it must not imply the fields shape a direct call.
+- The metadata JSON editor does not offer `extraBody`. Two writers for one
+  object would let a save of the other overrides undo a field the row editor
+  had just added.
 
 ### Pre-save connection test
 
@@ -6851,8 +6881,9 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   order passing probes by latency, and `Use fastest` moves the fastest API
   endpoint to the front of the profile before a v2 update.
 - Advanced exposes auth-header, User-Agent, TLS, and auto-refresh as direct
-  controls; timeouts, extra body, and aliases remain in the JSON editor. TLS is
-  disabled for catalogued non-local Providers.
+  controls; timeouts and aliases remain in the JSON editor, and request body
+  fields have their own row editor above it. TLS is disabled for catalogued
+  non-local Providers.
 - Provider, Model, and Gateway Request rows are focusable; Enter opens the same
   detail the click opens, while the default star stops propagation.
 
@@ -6864,8 +6895,8 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - `autoRefreshModels` remains UI metadata; model refresh is still an explicit
   action.
 - Auth modes override the protocol default; Anthropic keeps its version header.
-- Extra body is a shallow top-level object merge; it cannot replace the model
-  field except through an alias map.
+- Extra body is a shallow top-level object merge applied after translation; a
+  field the gateway owns is skipped, and the routed model id is written last.
 - The gateway request ledger renders through `v_virtual_list` with a fixed
   collapsed row height and a larger expanded trace height; filtering happens
   before the list, and the clear action still clears the whole ledger.

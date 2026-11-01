@@ -1425,6 +1425,7 @@ impl ManagementCenter {
         ws_stack(vec![
             form,
             self.render_workspace_provider_behaviour(&profile, cx),
+            self.render_workspace_provider_extra_body(&profile, cx),
             self.render_shared_provider_endpoint_probes(&profile, cx),
             self.render_shared_provider_advanced_editor(&profile, window, cx),
             self.render_workspace_provider_danger(row, cx),
@@ -1623,6 +1624,233 @@ impl ManagementCenter {
             management_settings_list(rows, cx),
             cx,
         )
+    }
+
+    /// The request-body fields one Provider declares.
+    ///
+    /// A field is a name and a JSON value, so a nested object or an array is
+    /// written as JSON rather than flattened into a string. The section is
+    /// always present, and it says that only a route group's forwarded request
+    /// carries the fields: hiding it would leave a reader whose Agent calls the
+    /// Provider directly to guess why nothing they typed took effect.
+    fn render_workspace_provider_extra_body(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let active = self.provider_extra_body_target.as_ref() == Some(&profile.id);
+        let declared = vibex_core::ModelProviderExtraBody::for_request(&profile.metadata);
+        let summary = if declared.is_empty() {
+            management_locale_text("No fields", "未设置", "未設定").to_string()
+        } else {
+            format!(
+                "{} {}",
+                declared.len(),
+                management_locale_text("fields", "个字段", "個欄位")
+            )
+        };
+        if !active {
+            return ws_section(
+                management_locale_text("Request body", "请求体", "請求體"),
+                Some(management_locale_text(
+                    "JSON fields added to every request the gateway forwards to this Provider through a route group. An Agent that calls the Provider directly builds its own body, so these fields do not reach it. A field the body already has is replaced.",
+                    "经路由组由网关转发到该供应商的每个请求都会附加的 JSON 字段；Agent 直连时请求体由它自己构建，这些字段不会生效。请求体已有的同名字段会被替换。",
+                    "經路由組由閘道轉發到該供應商的每個請求都會附加的 JSON 欄位；Agent 直連時請求體由它自己建構，這些欄位不會生效。請求體已有的同名字段會被取代。",
+                )),
+                Some(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(summary)
+                        .into_any_element(),
+                ),
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-extra-body-edit-{}",
+                            profile.id.as_str()
+                        )))
+                        .xsmall()
+                        .outline()
+                        .icon(Icon::default().path("icons/vibex/settings.svg"))
+                        .label(management_locale_text(
+                            "Edit request body",
+                            "编辑请求体",
+                            "編輯請求體",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile = profile.clone();
+                            move |this, _, window, cx| {
+                                this.open_shared_provider_extra_body_editor(&profile, window, cx)
+                            }
+                        })),
+                    )
+                    .into_any_element(),
+                cx,
+            );
+        }
+        let mut body = v_flex().w_full().min_w_0().gap_2();
+        if self.provider_extra_body_rows.is_empty() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Every request goes out as the Agent built it.",
+                        "所有请求都按 Agent 构建的原样发出。",
+                        "所有請求都按 Agent 建構的原樣發出。",
+                    )),
+            );
+        }
+        for index in 0..self.provider_extra_body_rows.len() {
+            body = body.child(self.render_provider_extra_body_row(index, cx));
+        }
+        let error = self.provider_extra_body_error.clone();
+        let profile_id = profile.id.clone();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .px_4()
+            .py_3()
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text("Request body", "请求体", "請求體")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "JSON fields added to every request the gateway forwards to this Provider through a route group. An Agent that calls the Provider directly builds its own body, so these fields do not reach it. A field the body already has is replaced.",
+                                "经路由组由网关转发到该供应商的每个请求都会附加的 JSON 字段；Agent 直连时请求体由它自己构建，这些字段不会生效。请求体已有的同名字段会被替换。",
+                                "經路由組由閘道轉發到該供應商的每個請求都會附加的 JSON 欄位；Agent 直連時請求體由它自己建構，這些欄位不會生效。請求體已有的同名字段會被取代。",
+                            )),
+                    ),
+            )
+            .child(body)
+            .child(
+                Button::new("management-provider-extra-body-add")
+                    .xsmall()
+                    .outline()
+                    .icon(IconName::Plus)
+                    .label(management_locale_text(
+                        "Add field",
+                        "添加字段",
+                        "新增欄位",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_provider_extra_body_row(window, cx)
+                    })),
+            )
+            .children(error.map(|message| {
+                div().text_xs().text_color(cx.theme().danger).child(message)
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-extra-body-cancel-{}",
+                            profile_id.as_str()
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.provider_extra_body_target = None;
+                            this.provider_extra_body_error = None;
+                            this.provider_extra_body_rows.clear();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-extra-body-save-{}",
+                            profile_id.as_str()
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text(
+                            "Save fields",
+                            "保存字段",
+                            "儲存欄位",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_shared_provider_extra_body_editor(profile_id.clone(), cx)
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One request-body field: name, JSON value, and a remove action.
+    ///
+    /// The remove control is named by index, so it denotes the row at that
+    /// position rather than a record that can move under it; a stable id per
+    /// row would outlive the row it names when one above it is deleted.
+    fn render_provider_extra_body_row(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(draft) = self.provider_extra_body_rows.get(index) else {
+            return div().into_any_element();
+        };
+        let name_input = draft.name.clone();
+        let value_input = draft.value.clone();
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(Input::new(&name_input).small().w_full()),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(Input::new(&value_input).small().w_full()),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "management-provider-extra-body-remove-{index}"
+                )))
+                .xsmall()
+                .ghost()
+                .icon(IconName::Close)
+                .tooltip(management_locale_text(
+                    "Remove field",
+                    "删除字段",
+                    "刪除欄位",
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_provider_extra_body_row(index, cx);
+                })),
+            )
+            .into_any_element()
     }
 
     fn render_workspace_provider_danger(

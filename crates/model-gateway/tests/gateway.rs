@@ -4206,3 +4206,87 @@ async fn a_cooldown_override_shortens_the_key_rest() {
     service.shutdown().await;
     cleanup(path);
 }
+
+/// A Provider's declared request-body fields ride every forwarded call, and a
+/// field the gateway owns is never replaced by one.
+///
+/// The record is written by hand here because that is the shape a stored
+/// record reaches the gateway in: the editor validates too, but the gateway
+/// must not trust it to.
+#[tokio::test]
+async fn declared_body_fields_reach_the_upstream_and_never_replace_the_model() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_upstream(
+        200,
+        chat_stream(),
+        Some(json!({
+            "id": "c1",
+            "object": "chat.completion",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }]
+        })),
+    )
+    .await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let mut profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        profile.metadata.extra_body_json = Some(
+            json!({
+                "prompt_cache_key": "cache-1",
+                "top_k": 3,
+                "model": "hijacked",
+                "stream": true
+            })
+            .to_string(),
+        );
+        let revision = profile.revision;
+        profile.revision = revision + 1;
+        vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
+    }
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "deepseek-chat"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let recorded = recorder.lock().await;
+    let body = recorded.body.as_ref().expect("the upstream saw a body");
+    assert_eq!(body["prompt_cache_key"], "cache-1");
+    assert_eq!(body["top_k"], 3);
+    // The address the router chose is what the request names, whatever the
+    // record says; the same holds for the client's own response shape.
+    assert_eq!(body["model"], "deepseek-chat");
+    assert_eq!(body["stream"], false);
+
+    drop(recorded);
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}

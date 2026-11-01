@@ -204,6 +204,188 @@ impl ModelProviderHeaderReference {
     }
 }
 
+/// The body fields the gateway decides for every request, so an extra-body
+/// field may not set them.
+///
+/// A save that names one is refused here, and a hand-edited record that
+/// carries one is skipped on the way out: writing `model` or `stream` would
+/// break routing instead of shaping a request.
+pub const MODEL_PROVIDER_EXTRA_BODY_RESERVED: &[&str] = &[
+    "model",
+    "stream",
+    "messages",
+    "input",
+    "contents",
+    "system",
+    "systemInstruction",
+    "system_instruction",
+    "instructions",
+    "tools",
+];
+
+const MAX_EXTRA_BODY_FIELDS: usize = 64;
+const MAX_EXTRA_BODY_FIELD_NAME_LEN: usize = 128;
+
+/// The JSON fields a Provider adds to the body of every request the gateway
+/// forwards to it.
+///
+/// The editor, the save path and the gateway all read the same object, so a
+/// field the user can type is exactly a field a request can carry. Stored as
+/// `ModelProviderMetadata::extra_body_json`; this type is the contract around
+/// it, not a second copy of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelProviderExtraBody {
+    fields: BTreeMap<String, serde_json::Value>,
+}
+
+impl ModelProviderExtraBody {
+    /// Builds the object from fields the editor has already read.
+    pub fn from_fields(
+        fields: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> VibexResult<Self> {
+        let mut collected = BTreeMap::new();
+        for (name, value) in fields {
+            let name = name.trim().to_string();
+            if name.is_empty() || name.len() > MAX_EXTRA_BODY_FIELD_NAME_LEN {
+                return Err(VibexError::validation(
+                    "model_provider_extra_body_field_invalid",
+                    "a request body field needs a bounded, non-empty name",
+                )
+                .with_diagnostic("fieldName", name));
+            }
+            if MODEL_PROVIDER_EXTRA_BODY_RESERVED.contains(&name.as_str()) {
+                return Err(VibexError::validation(
+                    "model_provider_extra_body_field_reserved",
+                    "the gateway sets this request body field itself",
+                )
+                .with_diagnostic("fieldName", name));
+            }
+            if collected.insert(name.clone(), value).is_some() {
+                return Err(VibexError::validation(
+                    "model_provider_extra_body_field_duplicate",
+                    "a request body field is declared twice",
+                )
+                .with_diagnostic("fieldName", name));
+            }
+        }
+        if collected.len() > MAX_EXTRA_BODY_FIELDS {
+            return Err(VibexError::validation(
+                "model_provider_extra_body_limit_exceeded",
+                "request body declares too many fields",
+            ));
+        }
+        Ok(Self { fields: collected })
+    }
+
+    /// Reads the stored object, rejecting anything a request could not carry.
+    pub fn parse(raw: &str) -> VibexResult<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(Self::default());
+        }
+        let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+            VibexError::validation(
+                "model_provider_extra_body_invalid",
+                "request body fields must be a JSON object",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        let Some(object) = value.as_object() else {
+            return Err(VibexError::validation(
+                "model_provider_extra_body_invalid",
+                "request body fields must be a JSON object",
+            ));
+        };
+        Self::from_fields(
+            object
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        )
+    }
+
+    /// Reads the object a Provider's metadata carries, if any.
+    pub fn from_metadata(metadata: &ModelProviderMetadata) -> VibexResult<Self> {
+        match metadata.extra_body_json.as_deref() {
+            Some(raw) => Self::parse(raw),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Reads the object for a request that is about to leave.
+    ///
+    /// This is the lenient direction, and it is deliberately different from
+    /// [`Self::parse`]: the editor refuses a bad object so the user fixes it,
+    /// while a request must go out with whatever the record can legally carry.
+    /// A field the gateway owns, a duplicate, or a field with no usable name is
+    /// dropped here instead of failing the call.
+    pub fn for_request(metadata: &ModelProviderMetadata) -> Self {
+        let Some(raw) = metadata.extra_body_json.as_deref() else {
+            return Self::default();
+        };
+        let Some(object) = serde_json::from_str::<serde_json::Value>(raw.trim())
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return Self::default();
+        };
+        let mut fields = BTreeMap::new();
+        for (name, value) in object.into_iter().take(MAX_EXTRA_BODY_FIELDS) {
+            let name = name.trim().to_string();
+            if name.is_empty()
+                || name.len() > MAX_EXTRA_BODY_FIELD_NAME_LEN
+                || MODEL_PROVIDER_EXTRA_BODY_RESERVED.contains(&name.as_str())
+            {
+                continue;
+            }
+            fields.insert(name, value);
+        }
+        Self { fields }
+    }
+
+    /// The object as it is stored, or `None` when nothing is declared.
+    pub fn to_json(&self) -> Option<String> {
+        if self.fields.is_empty() {
+            return None;
+        }
+        let object = self
+            .fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::to_string(&serde_json::Value::Object(object)).ok()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+    }
+
+    /// Writes the declared fields on top of an outbound body.
+    ///
+    /// A field the gateway owns is skipped even when a hand-edited record
+    /// carries one, so a bad record cannot take routing down with it.
+    pub fn apply_to(&self, body: &mut serde_json::Value) {
+        let Some(target) = body.as_object_mut() else {
+            return;
+        };
+        for (name, value) in &self.fields {
+            if MODEL_PROVIDER_EXTRA_BODY_RESERVED.contains(&name.as_str()) {
+                continue;
+            }
+            target.insert(name.clone(), value.clone());
+        }
+    }
+}
+
 /// Provider-side model metadata. Wire protocol and SDK adapter deliberately
 /// live on `AgentConfiguredModelBinding`, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3108,6 +3290,112 @@ mod advanced_metadata_tests {
         assert!(!encoded.contains("quota"));
         let decoded: ModelProviderMetadata = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, metadata);
+    }
+
+    /// The typed extra body is the one object the editor, the save and the
+    /// gateway read, so its rejections have to be the ones a request cannot
+    /// carry: a field that is not an object member, a field the gateway owns,
+    /// and a duplicate.
+    #[test]
+    fn extra_body_reads_an_object_and_refuses_the_fields_it_may_not_set() {
+        let declared = ModelProviderExtraBody::parse(
+            r#"{"prompt_cache_key":"${sessionId}","reasoning":{"effort":"high"}}"#,
+        )
+        .unwrap();
+        assert_eq!(declared.len(), 2);
+        assert_eq!(
+            declared.fields().map(|(name, _)| name).collect::<Vec<_>>(),
+            vec!["prompt_cache_key", "reasoning"]
+        );
+
+        assert!(ModelProviderExtraBody::parse("").unwrap().is_empty());
+        assert!(ModelProviderExtraBody::parse("   ").unwrap().is_empty());
+        assert_eq!(
+            ModelProviderExtraBody::parse("[1]").unwrap_err().code,
+            "model_provider_extra_body_invalid"
+        );
+        assert_eq!(
+            ModelProviderExtraBody::parse("not json").unwrap_err().code,
+            "model_provider_extra_body_invalid"
+        );
+        for reserved in ["model", "stream", "tools", "instructions"] {
+            let error =
+                ModelProviderExtraBody::parse(&format!(r#"{{"{reserved}":1}}"#)).unwrap_err();
+            assert_eq!(error.code, "model_provider_extra_body_field_reserved");
+        }
+        assert_eq!(
+            ModelProviderExtraBody::from_fields(vec![
+                ("x".to_string(), serde_json::json!(1)),
+                ("x".to_string(), serde_json::json!(2)),
+            ])
+            .unwrap_err()
+            .code,
+            "model_provider_extra_body_field_duplicate"
+        );
+    }
+
+    /// The stored form is the editor's, so a round trip through the metadata
+    /// string keeps field order and value shape.
+    #[test]
+    fn extra_body_round_trips_through_its_stored_form() {
+        let declared = ModelProviderExtraBody::parse(
+            r#"{"prompt_cache_key":"${sessionId}","top_k":7,"nested":{"a":[1,2]}}"#,
+        )
+        .unwrap();
+        let stored = declared.to_json().unwrap();
+        let reparsed = ModelProviderExtraBody::parse(&stored).unwrap();
+        assert_eq!(reparsed, declared);
+        assert_eq!(
+            stored,
+            r#"{"nested":{"a":[1,2]},"prompt_cache_key":"${sessionId}","top_k":7}"#
+        );
+        assert!(ModelProviderExtraBody::default().to_json().is_none());
+    }
+
+    /// Applying is last-word: the declared fields land on the body as it goes
+    /// out, and a field the gateway owns is skipped even from a record written
+    /// by hand.
+    #[test]
+    fn extra_body_applies_on_top_of_a_body_and_skips_reserved_fields() {
+        let declared = ModelProviderExtraBody::from_fields(vec![
+            ("prompt_cache_key".to_string(), serde_json::json!("k")),
+            ("stream".to_string(), serde_json::json!(true)),
+        ])
+        .unwrap_err();
+        assert_eq!(declared.code, "model_provider_extra_body_field_reserved");
+
+        let declared = ModelProviderExtraBody::parse(r#"{"prompt_cache_key":"k"}"#).unwrap();
+        let mut body = serde_json::json!({
+            "model": "m",
+            "stream": false,
+            "prompt_cache_key": "agent-chosen"
+        });
+        declared.apply_to(&mut body);
+        assert_eq!(body["prompt_cache_key"], "k");
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["stream"], false);
+    }
+
+    /// A record written before the field existed reads as no fields, not as a
+    /// save failure.
+    #[test]
+    fn extra_body_from_absent_metadata_is_empty() {
+        let metadata = ModelProviderMetadata::default();
+        assert!(
+            ModelProviderExtraBody::from_metadata(&metadata)
+                .unwrap()
+                .is_empty()
+        );
+        let metadata = ModelProviderMetadata {
+            extra_body_json: Some(r#"{"top_k":3}"#.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ModelProviderExtraBody::from_metadata(&metadata)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
 

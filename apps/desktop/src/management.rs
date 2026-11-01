@@ -408,6 +408,15 @@ struct ProfileHeaderDraft {
     variable: Option<vibex_core::ModelProviderHeaderVariable>,
 }
 
+/// One request-body field in the Provider editor.
+///
+/// The value is the JSON the user typed, so a nested object or an array
+/// survives the form without being flattened into a string.
+struct ProviderExtraBodyDraft {
+    name: Entity<InputState>,
+    value: Entity<InputState>,
+}
+
 /// Why the MCP market is asking the runtime for a window of the registry.
 ///
 /// The runtime indexes the registry in the background, so most asks are just
@@ -1454,6 +1463,14 @@ pub struct ManagementCenter {
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_input: Option<Entity<TextareaState>>,
     shared_provider_advanced_error: Option<String>,
+    /// The Provider whose request-body fields are open, and the rows it holds.
+    ///
+    /// The target is separate from the metadata editor's because the two are
+    /// independent disclosures: opening one must not close the other, and a
+    /// save from either must not pick up the other's half-typed draft.
+    provider_extra_body_target: Option<vibex_core::ModelProviderProfileId>,
+    provider_extra_body_rows: Vec<ProviderExtraBodyDraft>,
+    provider_extra_body_error: Option<String>,
     /// The picker's filter. It matches id, name, and address, because those
     /// are the three things a user remembers about a vendor.
     provider_preset_query: Entity<InputState>,
@@ -3045,6 +3062,9 @@ impl ManagementCenter {
             shared_provider_advanced_target: None,
             shared_provider_advanced_input: None,
             shared_provider_advanced_error: None,
+            provider_extra_body_target: None,
+            provider_extra_body_rows: Vec::new(),
+            provider_extra_body_error: None,
             provider_editor_bind_agent: false,
             provider_preset_query,
             route_group_editor_open: false,
@@ -6809,6 +6829,170 @@ impl ManagementCenter {
         self.projection_editor.mark_draft_changed();
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
+    }
+
+    /// Fills the request-body rows from the record's stored object.
+    ///
+    /// A record whose stored object the contract refuses still opens: each
+    /// value is shown as it was written, so the reader can fix or delete the
+    /// row instead of losing what a hand edit put there.
+    fn load_provider_extra_body(
+        &mut self,
+        metadata: &vibex_core::ModelProviderMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_provider_extra_body();
+        let Some(raw) = metadata.extra_body_json.as_deref() else {
+            return;
+        };
+        let Some(object) = serde_json::from_str::<serde_json::Value>(raw.trim())
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return;
+        };
+        for (name, value) in object {
+            self.push_provider_extra_body_row(
+                name,
+                serde_json::to_string_pretty(&value).unwrap_or_default(),
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Empties the request-body editor and every answer about it.
+    fn clear_provider_extra_body(&mut self) {
+        self.provider_extra_body_rows.clear();
+        self.provider_extra_body_error = None;
+    }
+
+    /// Appends one request-body row and subscribes to its inputs.
+    fn push_provider_extra_body_row(
+        &mut self,
+        name: String,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(name)
+                .placeholder(management_locale_text(
+                    "Body field",
+                    "请求体字段",
+                    "請求體欄位",
+                ))
+        });
+        let value_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(value)
+                .placeholder("true")
+        });
+        for input in [&name_input, &value_input] {
+            self._subscriptions
+                .push(cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.provider_extra_body_error = None;
+                    cx.notify();
+                }));
+        }
+        self.provider_extra_body_rows.push(ProviderExtraBodyDraft {
+            name: name_input,
+            value: value_input,
+        });
+    }
+
+    fn add_provider_extra_body_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_provider_extra_body_row(String::new(), String::new(), window, cx);
+        cx.notify();
+    }
+
+    fn remove_provider_extra_body_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.provider_extra_body_rows.len() {
+            self.provider_extra_body_rows.remove(index);
+        }
+        self.provider_extra_body_error = None;
+        cx.notify();
+    }
+
+    /// Reads the rows into the object the record stores.
+    ///
+    /// A row with no name and no value is an abandoned new row, not a field.
+    /// Every other row is validated here, so a rejected save can name the row
+    /// the reader is looking at instead of reporting a JSON position.
+    fn provider_extra_body_object(
+        &self,
+        cx: &Context<Self>,
+    ) -> Result<vibex_core::ModelProviderExtraBody, String> {
+        let mut fields = Vec::new();
+        for draft in &self.provider_extra_body_rows {
+            let name = draft.name.read(cx).value().trim().to_string();
+            let raw_value = draft.value.read(cx).value().trim().to_string();
+            if name.is_empty() && raw_value.is_empty() {
+                continue;
+            }
+            if name.is_empty() {
+                return Err(management_locale_text(
+                    "A request body field needs a name",
+                    "请求体字段需要填写名称",
+                    "請求體欄位需要填寫名稱",
+                )
+                .to_string());
+            }
+            if raw_value.is_empty() {
+                return Err(format!(
+                    "{}{name}",
+                    management_locale_text(
+                        "A request body field needs a value: ",
+                        "请求体字段需要填写值：",
+                        "請求體欄位需要填寫值：",
+                    )
+                ));
+            }
+            let value = serde_json::from_str::<serde_json::Value>(&raw_value).map_err(|error| {
+                format!(
+                    "{} {name}: {error}",
+                    management_locale_text(
+                        "Request body value is not JSON:",
+                        "请求体的值不是有效 JSON：",
+                        "請求體的值不是有效 JSON：",
+                    )
+                )
+            })?;
+            fields.push((name, value));
+        }
+        let extra = vibex_core::ModelProviderExtraBody::from_fields(fields).map_err(|error| {
+            let field = error
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.key == "fieldName")
+                .map(|diagnostic| diagnostic.value.clone())
+                .unwrap_or_default();
+            match error.code.as_str() {
+                "model_provider_extra_body_field_reserved" => format!(
+                    "{}{field}",
+                    management_locale_text(
+                        "The gateway sets this field itself, so it cannot be declared: ",
+                        "该字段由网关自己决定，不能在此声明：",
+                        "該欄位由閘道自己決定，不能在此宣告：",
+                    )
+                ),
+                "model_provider_extra_body_field_duplicate" => format!(
+                    "{}{field}",
+                    management_locale_text(
+                        "Duplicate request body field: ",
+                        "请求体字段重复：",
+                        "請求體欄位重複：",
+                    )
+                ),
+                _ => format!("{}{field}", error.message),
+            }
+        })?;
+        Ok(extra)
     }
 
     fn present_profile_editor_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -16109,11 +16293,6 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         let metadata = &profile.metadata;
-        let extra_body = metadata
-            .extra_body_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            .unwrap_or(serde_json::Value::Null);
         let aliases = metadata
             .model_aliases
             .iter()
@@ -16124,9 +16303,11 @@ impl ManagementCenter {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        // Body fields have their own editor, so they are not repeated here.
+        // Leaving them in this object would give the same record two writers,
+        // and whichever was saved last would silently undo the other.
         let value = serde_json::json!({
             "authHeaderMode": metadata.auth_header_mode,
-            "extraBody": extra_body,
             "userAgentMode": metadata.user_agent_mode,
             "tlsAcceptInvalid": metadata.tls_accept_invalid,
             "connectTimeoutMs": metadata.connect_timeout_ms,
@@ -16255,29 +16436,6 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        let extra_body_json = object
-            .get("extraBody")
-            .filter(|value| !value.is_null())
-            .map(|value| {
-                if value.is_object() {
-                    Ok(value.to_string())
-                } else {
-                    Err(management_locale_text(
-                        "Extra body must be a JSON object",
-                        "Extra body 必须是 JSON 对象",
-                        "Extra body 必須是 JSON 物件",
-                    ))
-                }
-            })
-            .transpose();
-        let extra_body_json = match extra_body_json {
-            Ok(value) => value,
-            Err(message) => {
-                self.shared_provider_advanced_error = Some(message.to_string());
-                cx.notify();
-                return;
-            }
-        };
         let model_aliases = object
             .get("modelAliases")
             .and_then(serde_json::Value::as_object)
@@ -16296,7 +16454,6 @@ impl ManagementCenter {
             })
             .unwrap_or_default();
         profile.metadata.auth_header_mode = auth_header_mode;
-        profile.metadata.extra_body_json = extra_body_json;
         profile.metadata.user_agent_mode = user_agent_mode;
         profile.metadata.tls_accept_invalid = tls_accept_invalid;
         profile.metadata.connect_timeout_ms = number("connectTimeoutMs");
@@ -16315,6 +16472,60 @@ impl ManagementCenter {
                 "Advanced settings updated",
                 "高级设置已更新",
                 "進階設定已更新",
+            ),
+            cx,
+        );
+    }
+
+    /// Opens the request-body field editor for one Provider.
+    ///
+    /// The rows are read from the record every time it opens, so what is on
+    /// screen is what a save would send: a draft that was abandoned when the
+    /// reader navigated away never becomes a field they never typed.
+    fn open_shared_provider_extra_body_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.provider_extra_body_target = Some(profile.id.clone());
+        self.provider_extra_body_error = None;
+        self.load_provider_extra_body(&profile.metadata, window, cx);
+        cx.notify();
+    }
+
+    /// Writes the rows back into the record's metadata, or keeps the editor
+    /// open with the row that is wrong.
+    fn save_shared_provider_extra_body_editor(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let extra = match self.provider_extra_body_object(cx) {
+            Ok(extra) => extra,
+            Err(message) => {
+                self.provider_extra_body_error = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        profile.metadata.extra_body_json = extra.to_json();
+        self.provider_extra_body_error = None;
+        self.provider_extra_body_target = None;
+        self.update_shared_provider(
+            profile,
+            management_locale_text(
+                "Request body fields updated",
+                "请求体字段已更新",
+                "請求體欄位已更新",
             ),
             cx,
         );
@@ -46875,7 +47086,6 @@ mod gateway_surface_tests {
             "management-shared-provider-advanced-save-",
             "render_shared_provider_advanced_editor",
             "authHeaderMode",
-            "extraBody",
             "tlsAcceptInvalid",
             "streamIdleTimeoutMs",
             "modelAliases",
@@ -46885,6 +47095,48 @@ mod gateway_surface_tests {
                 "advanced overrides must keep {marker}"
             );
         }
+    }
+
+    /// The request-body fields are their own editor, and the metadata JSON
+    /// editor no longer carries them.
+    ///
+    /// Two writers for one stored object is the failure this pins down: the
+    /// JSON editor wrote `extraBody` back wholesale, so saving the other
+    /// overrides would undo a field the row editor had just added.
+    #[test]
+    fn request_body_fields_have_their_own_editor() {
+        let source = include_str!("management.rs");
+        let workspace = include_str!("management/provider_workspace/provider.rs");
+        for marker in [
+            "management-provider-extra-body-edit-",
+            "management-provider-extra-body-save-",
+            "render_workspace_provider_extra_body",
+            "open_shared_provider_extra_body_editor",
+            "save_shared_provider_extra_body_editor",
+            "provider_extra_body_object(",
+        ] {
+            assert!(
+                source.contains(marker) || workspace.contains(marker),
+                "the request body editor must keep {marker}"
+            );
+        }
+        // The metadata editor must not read or write the same field, or the
+        // two would overwrite each other's saves.
+        let advanced = source
+            .split_once("    fn open_shared_provider_advanced_editor(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn open_shared_provider_extra_body_editor(")
+            })
+            .map(|(body, _)| body)
+            .expect("the advanced editor should remain inspectable");
+        assert!(
+            !advanced.contains("extra_body_json"),
+            "body fields moved out of the advanced JSON editor"
+        );
+        assert!(
+            !advanced.contains("\"extraBody\""),
+            "the advanced JSON object must not offer a second body-field writer"
+        );
     }
 
     #[test]
