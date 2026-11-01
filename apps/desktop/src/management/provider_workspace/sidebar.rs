@@ -608,12 +608,12 @@ impl ManagementCenter {
             SharedString::from("management-global-provider-row-gateway"),
             selected,
             None,
-            ws_icon_tile(
+            workspace_card_mark(ws_icon_mark(
                 "icons/vibex/server.svg",
-                px(30.0),
+                px(22.0),
                 Some(cx.theme().primary),
                 cx,
-            ),
+            )),
             gateway_display_name(&gateway.settings),
             Some(
                 div()
@@ -694,7 +694,11 @@ impl ManagementCenter {
             checked,
             div()
                 .when(!enabled, |mark| mark.opacity(0.55))
-                .child(provider_logo_tile(&row.profile, px(30.0), cx))
+                .child(workspace_card_mark(provider_logo_mark(
+                    &row.profile,
+                    px(22.0),
+                    cx,
+                )))
                 .into_any_element(),
             row.profile.display_name.clone(),
             subtitle,
@@ -734,7 +738,12 @@ impl ManagementCenter {
             SharedString::from(format!("management-global-route-row-{id}")),
             selected,
             checked,
-            ws_icon_tile("icons/vibex/git-branch.svg", px(30.0), None, cx),
+            workspace_card_mark(ws_icon_mark(
+                "icons/vibex/git-branch.svg",
+                px(22.0),
+                None,
+                cx,
+            )),
             row.route.display_name.clone(),
             None,
             (!enabled).then(|| {
@@ -788,6 +797,23 @@ pub(super) fn workspace_gateway_state(
             cx.theme().warning,
         ),
     }
+}
+
+/// The leading slot of a card in the left column.
+///
+/// The slot keeps its width and height whether the mark is a filled brand logo
+/// or a line icon, so names and card heights line up down the column. The mark
+/// sits in it bare: the rounded plate belongs to an identity header, where it
+/// anchors one page rather than outlining every row.
+fn workspace_card_mark(mark: AnyElement) -> AnyElement {
+    div()
+        .flex_none()
+        .size(px(30.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(mark)
+        .into_any_element()
 }
 
 /// One card of the left column.

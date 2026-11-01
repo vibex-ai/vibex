@@ -257,8 +257,30 @@ fn ws_tile_row(tiles: Vec<AnyElement>) -> AnyElement {
         .into_any_element()
 }
 
-/// A square plate behind a monochrome icon: the leading mark of a record that
-/// has no logo of its own (the gateway, a route group).
+/// A monochrome icon at the size a card's leading mark takes, with no plate of
+/// its own. The glyph is drawn a little inside its slot so a line icon reads at
+/// the same weight as the filled brand marks it lines up with; the rounded
+/// plate stays reserved for an identity header, where it anchors the page
+/// instead of outlining every row.
+fn ws_icon_mark(path: &'static str, size: Pixels, tone: Option<Hsla>, cx: &App) -> AnyElement {
+    let tone = tone.unwrap_or(cx.theme().muted_foreground);
+    div()
+        .flex_none()
+        .size(size)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::default()
+                .path(path)
+                .size(size * 0.82)
+                .text_color(tone),
+        )
+        .into_any_element()
+}
+
+/// A square plate behind a monochrome icon: the leading mark of an identity
+/// header that has no logo of its own (the gateway, a route group).
 fn ws_icon_tile(path: &'static str, size: Pixels, tone: Option<Hsla>, cx: &App) -> AnyElement {
     let tone = tone.unwrap_or(cx.theme().muted_foreground);
     div()
@@ -958,6 +980,47 @@ mod tests {
             !row.contains(".children(footer"),
             "the card has no line under the name: the logos trail it instead"
         );
+    }
+
+    /// A card leads with the bare mark, not a rounded plate around it.
+    ///
+    /// The plate drew a second outline inside every card and made a list of
+    /// records read as a column of buttons. It stays on an identity header,
+    /// where it anchors one page instead of repeating on every row.
+    #[test]
+    fn card_marks_are_shown_without_a_plate() {
+        let kit = include_str!("mod.rs");
+        let mark = kit
+            .split_once("fn ws_icon_mark(")
+            .and_then(|(_, tail)| tail.split_once("fn ws_icon_tile("))
+            .map(|(body, _)| body)
+            .expect("the card's bare mark should remain inspectable");
+        assert!(!mark.contains(".rounded("));
+        assert!(!mark.contains(".bg("));
+        assert!(mark.contains("Icon::default()"));
+
+        let slot = SIDEBAR
+            .split_once("fn workspace_card_mark(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the card's leading slot should remain inspectable");
+        assert!(!slot.contains(".rounded("));
+        assert!(!slot.contains(".bg("));
+
+        // Each of the column's three cards leads with that bare mark; a
+        // Provider row uses the brand mark itself, not its plated variant.
+        let gateway = SIDEBAR.find("fn render_workspace_gateway_row(").unwrap();
+        let provider = SIDEBAR.find("fn render_workspace_provider_row(").unwrap();
+        let route = SIDEBAR.find("fn render_workspace_route_row(").unwrap();
+        let rows = &SIDEBAR[gateway..route];
+        assert!(rows.contains("ws_icon_mark("));
+        assert!(rows.contains("provider_logo_mark("));
+        assert!(!rows.contains("ws_icon_tile("));
+        assert!(!rows.contains("provider_logo_tile("));
+        let route_body = &SIDEBAR[route..SIDEBAR.find("fn workspace_card_mark(").unwrap()];
+        assert!(route_body.contains("ws_icon_mark("));
+        assert!(!route_body.contains("ws_icon_tile("));
+        assert!(provider < route, "the cards stay in the documented order");
     }
 
     /// Every detail view opens with the same identity header and underline
