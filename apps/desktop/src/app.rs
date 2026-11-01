@@ -89601,11 +89601,18 @@ impl FoundationSettings {
             option_env!("RUSTC_VERSION").unwrap_or("1.97.0")
         );
         let copy_summary = summary.clone();
-        // The brand lockup is this page's heading: the settings navigation
-        // already names the page, and a second "About" title under the wordmark
-        // would repeat the version line that follows it.
+        // The title stays at the page's left edge like every other settings
+        // page, so the navigation and the page agree on where a reader is. The
+        // brand lockup and the installed version sit centered beneath it,
+        // because that is what this page is about.
         settings_page_with_heading(
-            about_brand_wordmark(cx),
+            locale::text("About", "关于", "關於"),
+            Some(locale::text(
+                "Version, build and project information.",
+                "版本、构建和项目信息。",
+                "版本、建置與專案資訊。",
+            )),
+            Some(about_brand_wordmark(cx)),
             vec![
                 SettingsGroup::with_leading(
                     locale::text("Software update", "软件更新", "軟體更新"),
@@ -91817,14 +91824,14 @@ impl SettingsGroup {
     }
 }
 
-/// The About page's brand block: the Vibex lockup centered at the top of the
-/// page, with the installed version set underneath it.
+/// The About page's brand block: the Vibex lockup centered in the page, with
+/// the installed version set underneath it.
 ///
-/// The mark is the same one the new-session page leads with, drawn here as a
-/// picture rather than as the page's title so the settings navigation still
-/// names the page it opened. The version is the label the reader came for, so
-/// it sits directly under the lockup instead of only in the version chips
-/// further down.
+/// The mark is the same one the new-session page leads with, so the two
+/// surfaces that introduce the product wear the same lockup. The version is the
+/// label the reader came for, so it sits directly under the mark instead of only
+/// in the version chips further down. The page's own title stays above this
+/// block at the page's left edge, where every other settings page puts it.
 fn about_brand_wordmark(cx: &App) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
@@ -91834,6 +91841,9 @@ fn about_brand_wordmark(cx: &App) -> AnyElement {
         .w_full()
         .min_w_0()
         .items_center()
+        // The title sits a line above, so the lockup takes its own air rather
+        // than crowding the header it now follows.
+        .mt_6()
         // The lockup is the one the new-session page leads with, so the two
         // surfaces that introduce the product wear the same mark.
         .child(startup_loading_wordmark(false, cx))
@@ -91857,34 +91867,18 @@ fn settings_page(
     groups: Vec<SettingsGroup>,
     cx: &App,
 ) -> AnyElement {
-    let is_dark = cx.theme().is_dark();
-    let foreground = theme::semantic_color("foreground", is_dark);
-    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-
-    settings_page_with_heading(
-        v_flex()
-            .gap_1()
-            .text_color(foreground)
-            .child(div().text_lg().font_semibold().child(title))
-            .child(
-                div()
-                    .text_xs()
-                    .whitespace_normal()
-                    .text_color(muted_foreground)
-                    .child(description),
-            )
-            .into_any_element(),
-        groups,
-        cx,
-    )
+    settings_page_with_heading(title, Some(description), None, groups, cx)
 }
 
-/// A settings page whose leading block is supplied by the caller.
+/// A settings page whose header may carry more than a title and description.
 ///
-/// The About page replaces the usual title line with its brand lockup; every
-/// other page keeps the title and description [`settings_page`] builds.
+/// Every page opens with its title at the left edge of the page. The About page
+/// adds its brand lockup centered under that title; every other page passes no
+/// leading block and keeps the plain title-and-description header.
 fn settings_page_with_heading(
-    heading: AnyElement,
+    title: &'static str,
+    description: Option<&'static str>,
+    leading: Option<AnyElement>,
     groups: Vec<SettingsGroup>,
     cx: &App,
 ) -> AnyElement {
@@ -91906,7 +91900,23 @@ fn settings_page_with_heading(
         .text_color(foreground)
         .px(px(SETTINGS_PAGE_PADDING_X))
         .py_8()
-        .child(heading)
+        .child(
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_lg().font_semibold().child(title))
+                .when_some(description, |this, description| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(muted_foreground)
+                            .child(description),
+                    )
+                })
+                .when_some(leading, |this, leading| this.child(leading)),
+        )
         .children(
             groups
                 .into_iter()
@@ -113271,9 +113281,11 @@ mod tests {
         // With nothing newer available the card falls back to the notes of the
         // installed version.
         assert!(about.contains("update_snapshot.current_notes.as_deref()"));
-        // The page leads with the product lockup and the installed version set
-        // under it, rather than with a second title line.
+        // The page keeps the title every other settings page opens with, at the
+        // page's left edge, and centers the product lockup with the installed
+        // version under it.
         assert!(about.contains("about_brand_wordmark(cx)"));
+        assert!(about.contains("locale::text(\"About\", \"关于\", \"關於\")"));
         assert!(about.contains("settings_page_with_heading("));
 
         let brand = source
