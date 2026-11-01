@@ -19,7 +19,32 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ProviderModelWireApi;
+use crate::{ModelProviderHeaderVariable, ProviderModelWireApi};
+
+/// The Provider option that carries a Profile's request headers.
+const HEADER_OVERRIDE_OPTION_KEY: &str = "headerOverrideJson";
+
+/// One request header a Provider created from a preset declares up front.
+///
+/// Most presets declare none. A header belongs here only when the vendor's
+/// gateway refuses a request without it, so creating the Provider from the
+/// preset is enough to make it work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPresetHeader {
+    pub name: String,
+    pub value: ProviderPresetHeaderValue,
+}
+
+/// What a preset's request header carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum ProviderPresetHeaderValue {
+    /// A fixed value the vendor documents.
+    Literal(String),
+    /// A value the runtime fills from the session it serves.
+    Variable(ModelProviderHeaderVariable),
+}
 
 /// One regional spelling of a Provider's endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +133,12 @@ pub struct ProviderPreset {
     /// metered API. This is vendor copy, not a computed amount.
     pub plan_note: Option<String>,
     pub caveats: Vec<ProviderPresetCaveat>,
+    /// Request headers a Provider created from this preset declares.
+    ///
+    /// Declared in preset order so the editor shows the vendor's own ordering;
+    /// an empty list leaves the header editor untouched.
+    #[serde(default)]
+    pub headers: Vec<ProviderPresetHeader>,
 }
 
 impl ProviderPreset {
@@ -177,6 +208,32 @@ impl ProviderPreset {
         }
         models
     }
+
+    /// The `headerOverrideJson` value a Provider created from this preset
+    /// starts with.
+    ///
+    /// The shape is the same one the Provider editors read and write: a JSON
+    /// object keyed by header name, whose value is a literal string or a
+    /// `{"variable": ...}` object. `None` means the preset declares no header,
+    /// so the editor leaves the user's own rows alone.
+    pub fn header_override(&self) -> Option<String> {
+        if self.headers.is_empty() {
+            return None;
+        }
+        let mut object = serde_json::Map::new();
+        for header in &self.headers {
+            let value = match &header.value {
+                ProviderPresetHeaderValue::Literal(value) => {
+                    serde_json::Value::String(value.clone())
+                }
+                ProviderPresetHeaderValue::Variable(variable) => {
+                    serde_json::json!({ "variable": variable.id() })
+                }
+            };
+            object.insert(header.name.clone(), value);
+        }
+        Some(serde_json::Value::Object(object).to_string())
+    }
 }
 
 impl ProviderPreset {
@@ -239,6 +296,12 @@ impl ProviderPreset {
             options.entries.push(crate::ProviderBindingMetadata {
                 key: "websiteUrl".to_string(),
                 value: website.to_string(),
+            });
+        }
+        if let Some(headers) = self.header_override() {
+            options.entries.push(crate::ProviderBindingMetadata {
+                key: HEADER_OVERRIDE_OPTION_KEY.to_string(),
+                value: headers,
             });
         }
         profile.provider_options = options;
@@ -321,7 +384,19 @@ fn preset(
         only: None,
         plan_note: None,
         caveats: Vec::new(),
+        headers: Vec::new(),
     }
+}
+
+/// The header OpenCode's gateways route a request by.
+///
+/// The session id is filled by the runtime, not typed by the user, so a preset
+/// that points at either OpenCode gateway ships the row already bound.
+fn opencode_session_headers() -> Vec<ProviderPresetHeader> {
+    vec![ProviderPresetHeader {
+        name: "x-opencode-session".to_string(),
+        value: ProviderPresetHeaderValue::Variable(ModelProviderHeaderVariable::SessionId),
+    }]
 }
 
 /// Every preset the build ships, in display order.
@@ -827,6 +902,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             plan_note: Some("$10/month".to_string()),
             website: Some("https://opencode.ai/docs/go".to_string()),
             keys_url: Some("https://opencode.ai/auth".to_string()),
+            headers: opencode_session_headers(),
             ..preset(
                 PROVIDER_PRESET_OPENCODE_GO,
                 "OpenCode Go",
@@ -1056,6 +1132,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             website: Some("https://opencode.ai/docs/zen".to_string()),
             keys_url: Some("https://opencode.ai/auth".to_string()),
             key_hint: Some("optional: free models need no key".to_string()),
+            headers: opencode_session_headers(),
             ..preset(
                 PROVIDER_PRESET_OPENCODE_ZEN,
                 "OpenCode Zen",
@@ -1600,6 +1677,53 @@ mod tests {
                 .iter()
                 .any(|entry| entry.key == "catalogId"),
             "a preset without a catalogue id writes no option"
+        );
+    }
+
+    /// Creating an OpenCode Provider from its preset already carries the
+    /// header its gateway routes by, in the shape the editors persist.
+    #[test]
+    fn opencode_presets_preset_the_session_header() {
+        let agent_id = crate::AgentId::parse("opencode").unwrap();
+        for preset_id in [PROVIDER_PRESET_OPENCODE_GO, PROVIDER_PRESET_OPENCODE_ZEN] {
+            let preset = provider_preset(preset_id).expect("the OpenCode preset ships");
+            assert_eq!(
+                preset.headers,
+                opencode_session_headers(),
+                "{preset_id} must declare the session header"
+            );
+
+            let raw = preset
+                .header_override()
+                .unwrap_or_else(|| panic!("{preset_id} must write a header override"));
+            let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
+
+            // The draft is the profile a preset-driven creation starts from,
+            // so the header has to ride in its options rather than only in the
+            // preset's own field.
+            let draft = preset.draft_profile(&agent_id);
+            let option = draft
+                .provider_options
+                .entries
+                .iter()
+                .find(|entry| entry.key == "headerOverrideJson")
+                .unwrap_or_else(|| panic!("{preset_id} draft carries no header option"));
+            let stored: serde_json::Value = serde_json::from_str(&option.value).unwrap();
+            assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
+        }
+
+        // Every other preset stays out of the user's header rows.
+        let deepseek = provider_preset(PROVIDER_PRESET_DEEPSEEK).unwrap();
+        assert!(deepseek.headers.is_empty());
+        assert!(deepseek.header_override().is_none());
+        assert!(
+            !deepseek
+                .draft_profile(&agent_id)
+                .provider_options
+                .entries
+                .iter()
+                .any(|entry| entry.key == "headerOverrideJson")
         );
     }
 

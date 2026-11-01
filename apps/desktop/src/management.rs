@@ -6406,6 +6406,9 @@ impl ManagementCenter {
         self.profile_detached_models.clear();
         self.profile_model_selection = None;
         self.profile_name_error = None;
+        // A preset may have written header rows; none of them belongs to the
+        // empty form this call produces.
+        self.clear_profile_headers(window, cx);
     }
 
     fn reset_profile_editor_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -13969,9 +13972,10 @@ impl ManagementCenter {
     /// Fills the page draft from one built-in preset.
     ///
     /// Only the starting values move: the name, the default protocol's
-    /// address, its model ids, and the catalogue id the record keeps as
-    /// advisory metadata. A preset declares no default model and no key, so
-    /// those are cleared rather than inherited from the previous choice.
+    /// address, its model ids, the headers its gateway requires, and the
+    /// catalogue id the record keeps as advisory metadata. A preset declares
+    /// no default model and no key, so those are cleared rather than inherited
+    /// from the previous choice.
     fn apply_provider_create_preset(
         &mut self,
         preset_id: &str,
@@ -13997,6 +14001,12 @@ impl ManagementCenter {
         });
         self.provider_create_models
             .update(cx, |state, cx| state.set_value(models, window, cx));
+        // The header editor speaks the same override shape the record stores,
+        // so a preset's rows can be written before the Provider exists.
+        let headers = preset.header_override().unwrap_or_default();
+        self.provider_create_headers
+            .update(cx, |state, cx| state.set_value(headers, window, cx));
+        self.provider_create_headers_open = !preset.headers.is_empty();
         for input in [
             &self.provider_create_default_model,
             &self.provider_create_models_url,
@@ -14016,8 +14026,7 @@ impl ManagementCenter {
     /// Drops the applied preset and starts the same form from empty again.
     ///
     /// The fields a preset filled are cleared with it, because the menu says
-    /// "empty form"; the Key, headers and proxy stay, since a preset never
-    /// writes them.
+    /// "empty form"; the Key and proxy stay, since a preset never writes them.
     fn clear_provider_create_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_create_preset = None;
         self.provider_create_preset_region = None;
@@ -14034,6 +14043,9 @@ impl ManagementCenter {
         ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
+        self.provider_create_headers
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.provider_create_headers_open = false;
         cx.notify();
     }
 
@@ -24858,6 +24870,7 @@ impl ManagementCenter {
             });
         }
         self.apply_preset_endpoints(&preset, window, cx);
+        self.apply_preset_headers(&preset, window, cx);
         // The preset's models are added as declared entries, which is what a
         // manual add produces too: their capabilities stay empty rather than
         // being guessed from the id.
@@ -24954,6 +24967,37 @@ impl ManagementCenter {
         }
         self.profile_provider_options = options;
         self.rebuild_profile_protocol_base_urls(window, cx);
+    }
+
+    /// Writes a preset's request headers into the editor's rows.
+    ///
+    /// A preset starts the header section from its own rows: a header left
+    /// over from the previous choice is not part of this Provider. A preset
+    /// that declares none leaves an empty section, and the address rule in
+    /// [`Self::sync_opencode_session_header`] can still offer the gateway's
+    /// header once the user types an address that names it.
+    fn apply_preset_headers(
+        &mut self,
+        preset: &vibex_core::ProviderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_profile_headers(window, cx);
+        for header in &preset.headers {
+            let (literal, variable) = match &header.value {
+                vibex_core::ProviderPresetHeaderValue::Literal(value) => (value.clone(), None),
+                vibex_core::ProviderPresetHeaderValue::Variable(variable) => {
+                    (String::new(), Some(*variable))
+                }
+            };
+            self.push_profile_header(header.name.clone(), literal, variable, window, cx);
+        }
+        if !preset.headers.is_empty() {
+            // The rows are what the user came for, and the preset has already
+            // answered for the gateway the address names.
+            self.profile_headers_open = true;
+            self.profile_opencode_session_header_offered = true;
+        }
     }
 
     /// Switches the draft to one of the preset's regional endpoints.
@@ -42280,6 +42324,80 @@ mod tests {
                 1,
                 "a gateway already answered for is not announced twice"
             );
+        });
+    }
+
+    /// Choosing an OpenCode preset writes its session header straight into the
+    /// draft, on both Provider surfaces and without waiting for an address edit.
+    #[gpui::test]
+    fn opencode_presets_start_with_the_session_header(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
+        // The editor queues notices on the hint layer its window's Root owns,
+        // so the test window carries one the way the real window does.
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        let handle = cx.windows().pop().expect("test window");
+
+        for preset_id in [
+            vibex_core::PROVIDER_PRESET_OPENCODE_GO,
+            vibex_core::PROVIDER_PRESET_OPENCODE_ZEN,
+        ] {
+            let _ = cx.update_window(handle, |_, window, cx| {
+                center.update(cx, |center, cx| {
+                    center.apply_provider_preset(preset_id, window, cx);
+                });
+            });
+            center.read_with(cx, |center, cx| {
+                assert_eq!(center.profile_headers.len(), 1, "{preset_id}");
+                assert_eq!(
+                    center.profile_headers[0].name.read(cx).value().trim(),
+                    OPENCODE_ZEN_SESSION_HEADER,
+                    "{preset_id}"
+                );
+                assert_eq!(
+                    center.profile_headers[0].variable,
+                    Some(vibex_core::ModelProviderHeaderVariable::SessionId),
+                    "{preset_id}"
+                );
+                assert!(center.profile_headers_open, "{preset_id}");
+            });
+        }
+
+        // A preset that declares no header starts an empty section rather than
+        // keeping the previous choice's rows.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.apply_provider_preset(vibex_core::PROVIDER_PRESET_DEEPSEEK, window, cx);
+            });
+        });
+        center.read_with(cx, |center, _| {
+            assert!(center.profile_headers.is_empty());
+            assert!(!center.profile_headers_open);
+        });
+
+        // The global Providers page writes the same override into the JSON
+        // editor the record is created from.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(
+                    Some(vibex_core::PROVIDER_PRESET_OPENCODE_GO),
+                    window,
+                    cx,
+                );
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            let raw = center.provider_create_headers.read(cx).value().to_string();
+            let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
+            assert!(center.provider_create_headers_open);
         });
     }
 

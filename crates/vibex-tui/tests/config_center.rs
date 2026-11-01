@@ -1623,6 +1623,44 @@ fn a_provider_profile_can_be_made_from_nothing() {
     assert!(outcome.effects.is_empty(), "a nameless profile was written");
 }
 
+/// Creating an OpenCode Provider from its preset already carries the session
+/// header its gateway routes by.
+#[test]
+fn an_opencode_preset_creates_a_provider_with_the_session_header() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    let (index, _) = vibex_core::provider_presets()
+        .into_iter()
+        .enumerate()
+        .find(|(_, preset)| preset.id == vibex_core::PROVIDER_PRESET_OPENCODE_GO)
+        .expect("the OpenCode Go preset ships");
+    app.overlay = Some(Overlay::ProviderPresetPicker {
+        selected: index,
+        agent_id: "opencode".to_string(),
+    });
+    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::CreateProviderProfile(request) = mutation else {
+                panic!("the save was not a creation: {mutation:?}");
+            };
+            let options = request.provider_options.as_ref().expect("preset options");
+            let raw = options
+                .entries
+                .iter()
+                .find(|entry| entry.key == "headerOverrideJson")
+                .map(|entry| entry.value.as_str())
+                .expect("the preset wrote no header override");
+            let stored: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
+        }
+        other => panic!("the save produced {other:?}"),
+    }
+}
+
 /// One profile as the authority holds it, which is what an editor needs.
 fn provider_profile_detail() -> vibex_core::ProviderProfile {
     serde_json::from_value(serde_json::json!({
