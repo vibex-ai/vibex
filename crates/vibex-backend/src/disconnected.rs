@@ -36,7 +36,7 @@ use vibex_core::{
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
     GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
+    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpMarketIcon,
     McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
@@ -1685,6 +1685,10 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: McpMarketSearchRequest,
     ) -> BackendFuture<'_, McpMarketSearchResponse> {
+        disconnected_future!()
+    }
+
+    fn mcp_market_icon(&self, _entry_id: String) -> BackendFuture<'_, McpMarketIcon> {
         disconnected_future!()
     }
 

@@ -871,7 +871,7 @@ strings! {
     config_registry_shown => { "showing", "已显示", "已顯示" },
     config_registry_of => { "of", "/", "/" },
     config_registry_entries => { "registry entries", "条注册表条目", "條註冊表條目" },
-    config_registry_indexing => { "still indexing", "仍在索引", "仍在索引" },
+    config_registry_indexing => { "more on the registry", "注册表还有更多", "登錄表還有更多" },
     // The registry's own controls, drawn above the page they act on. The
     // transport names are the reader's vocabulary rather than the wire's:
     // http and sse are one decision from this side of the screen.
@@ -962,7 +962,7 @@ strings! {
     config_preview_body => { "Instructions", "指令正文", "指令正文" },
     config_preview_empty => { "The preview carried nothing.", "预览内容为空。", "預覽內容為空。" },
     config_registry_more => { "{count} more loaded", "又载入 {count} 条", "又載入 {count} 條" },
-    config_registry_load_more => { "more available on the next page", "下一页还有更多", "下一頁還有更多" },
+    config_registry_load_more => { "more available", "还有更多", "還有更多" },
     config_registry_failed => { "The registry could not be read", "无法读取注册表", "無法讀取登錄表" },
     config_discard_title => { "Discard unsaved changes?", "放弃未保存的修改？", "放棄未儲存的修改？" },
     config_discard_body => { "This form has edits that have not been saved. Discarding them cannot be undone.", "此表单有未保存的修改，放弃后无法恢复。", "此表單有未儲存的修改，放棄後無法復原。" },

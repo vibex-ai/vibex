@@ -50,7 +50,7 @@ use crate::ids::{
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::market::{
-    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
     SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
     SkillMarketSearchResponse,
@@ -2371,6 +2371,7 @@ pub enum RemoteProviderOperationKind {
     SkillImport,
     SkillValidate,
     McpMarketSearch,
+    McpMarketIcon,
     McpMarketInstall,
     SkillMarketSearch,
     SkillMarketDocument,
@@ -3218,6 +3219,19 @@ pub struct RemoteProviderMcpMarketSearchResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketIconRequest {
+    pub auth: RemoteAuthProof,
+    pub entry_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketIconResponse {
+    pub result: McpMarketIcon,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteProviderMcpMarketInstallRequest {
     pub auth: RemoteAuthProof,
     pub request: McpMarketInstallRequest,
@@ -4001,6 +4015,7 @@ pub enum RemoteProviderRequest {
     SkillImport(RemoteProviderSkillImportRequest),
     SkillValidate(RemoteProviderSkillValidateRequest),
     McpMarketSearch(RemoteProviderMcpMarketSearchRequest),
+    McpMarketIcon(RemoteProviderMcpMarketIconRequest),
     McpMarketInstall(RemoteProviderMcpMarketInstallRequest),
     SkillMarketSearch(RemoteProviderSkillMarketSearchRequest),
     SkillMarketDocument(RemoteProviderSkillMarketDocumentRequest),
@@ -4248,6 +4263,7 @@ impl RemoteProviderRequest {
             Self::SkillImport(_) => RemoteProviderOperationKind::SkillImport,
             Self::SkillValidate(_) => RemoteProviderOperationKind::SkillValidate,
             Self::McpMarketSearch(_) => RemoteProviderOperationKind::McpMarketSearch,
+            Self::McpMarketIcon(_) => RemoteProviderOperationKind::McpMarketIcon,
             Self::McpMarketInstall(_) => RemoteProviderOperationKind::McpMarketInstall,
             Self::SkillMarketSearch(_) => RemoteProviderOperationKind::SkillMarketSearch,
             Self::SkillMarketDocument(_) => RemoteProviderOperationKind::SkillMarketDocument,

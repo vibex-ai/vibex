@@ -28,7 +28,7 @@ use vibex_core::{
     DiagnosticExportPayload, GatewayAgentUpdateRequest, GatewayCapabilitySuggestion,
     GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, McpMarketInstallRequest, McpMarketInstallResult,
+    ManagementSnapshotPayload, McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult,
     McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
     McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
     McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
@@ -713,6 +713,12 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: McpMarketSearchRequest,
     ) -> BackendFuture<'_, McpMarketSearchResponse>;
+
+    /// Loads the picture one market entry published.
+    ///
+    /// The bytes come from the authority, so a paired client shows the same
+    /// picture without a network client of its own.
+    fn mcp_market_icon(&self, entry_id: String) -> BackendFuture<'_, McpMarketIcon>;
 
     fn install_mcp_market_entry(
         &self,

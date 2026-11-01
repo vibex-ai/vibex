@@ -524,7 +524,7 @@ impl Dispatch {
     ///
     /// The two registries page differently and the request follows each: MCP is
     /// addressed by offset and asked for exactly the page the reader is on,
-    /// while the Skill index answers a cursor it hands back and reports no
+    /// while the Skill registry answers a cursor it hands back and reports no
     /// total, so one window is fetched and the client cuts the pages out of it.
     async fn search_registry(
         &mut self,
@@ -540,21 +540,21 @@ impl Dispatch {
                     query: (!query.trim().is_empty()).then_some(query),
                     limit: Some(MARKET_PAGE_SIZE as u32),
                     offset: Some(offset as u32),
+                    // The registry pages by an opaque cursor, but the table
+                    // counts pages, so the runtime walks the cursor until the
+                    // offset is covered and cuts the window from what it read.
+                    cursor: None,
                     transport: registry.transport_filter(),
-                    // Past the first page the index has to be walked further
-                    // before it can answer, or the page would be cut out of a
-                    // window that is known to be too small for it.
-                    extend: Some(registry.page > 0),
                 };
                 match self.facade.management().search_mcp_market(request).await {
                     Ok(response) => AppMessage::Registry {
                         module,
                         note: Some(crate::app::MarketNote {
                             matched: Some(response.total_matches),
-                            exhausted: response.catalog_exhausted,
-                            // The MCP market pages by offset, so there is no
-                            // cursor to carry: the client names the page it
-                            // wants rather than the one it was given.
+                            exhausted: !response.has_more,
+                            // The MCP market pages by offset: the runtime
+                            // walks the registry's cursor on the reader's
+                            // behalf, so the table names the page it wants.
                             cursor: None,
                             error: None,
                         }),
@@ -585,9 +585,9 @@ impl Dispatch {
                     Ok(response) => AppMessage::Registry {
                         module,
                         note: Some(crate::app::MarketNote {
-                            // The window is the denominator: the index reports
-                            // no total, so the line counts what was handed over
-                            // rather than inventing one.
+                            // The window is the denominator: the registry
+                            // reports no total, so the line counts what was
+                            // handed over rather than inventing one.
                             matched: Some(response.entries.len()),
                             exhausted: !response.has_more,
                             cursor: response.next_cursor.clone(),

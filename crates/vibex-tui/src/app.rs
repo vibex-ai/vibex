@@ -815,7 +815,7 @@ fn read_key(
 /// How much of a registry one page of it covers.
 ///
 /// A page is not a catalog, and a reader who is shown forty rows has no way to
-/// tell "that is all there is" from "the index has not walked any further yet".
+/// tell "that is all there is" from "the registry has more behind this page".
 /// The numbers travel together so the line under the table can say which of the
 /// two it is, instead of leaving the reader to guess whether to press search
 /// again.
@@ -825,8 +825,8 @@ pub struct MarketNote {
     /// is on screen is counted from the rows themselves, so a page the client
     /// cut is described by what it cut rather than by what it fetched.
     pub matched: Option<usize>,
-    /// Whether the runtime had walked the registry to its last page. `false`
-    /// means the list is a window that is still widening.
+    /// Whether this is the last page the registry has. `false` means it
+    /// answered with a cursor, so there are more entries behind this one.
     pub exhausted: bool,
     /// The cursor for the page after this one, when the registry named one.
     ///
@@ -5835,23 +5835,6 @@ impl App {
             {
                 effects.push(Effect::PairingPublications);
             }
-        }
-        // An MCP page whose index is still being walked is asked again on a slow
-        // clock, for the same reason the pairing window is: the fact changes on
-        // the runtime's own time and nothing arrives to say so. The Skill index
-        // is not polled — its cursor says whether another page exists, not
-        // whether the one on screen is still growing.
-        let widening = self.page.is_configuration_centre()
-            && self.config_center.module == crate::config_center::ConfigModule::Mcp
-            && self.config_center.section == crate::config_center::ConfigSection::Catalog
-            && self
-                .management_data
-                .market_note
-                .as_ref()
-                .is_some_and(|note| !note.exhausted);
-        if self.config_center.poll_registry(widening) {
-            effects.extend(self.config_section_effects());
-            dirty = true;
         }
         // An install is watched rather than awaited: the authority answers the
         // request with nothing and changes the record when it is done, so the

@@ -6183,13 +6183,12 @@ fn registry_note(app: &App, shown: usize, strings: Strings) -> Option<String> {
             strings.config_registry_entries()
         ),
     };
+    // A page the registry has more of says so once: the next page is reached
+    // with the table's own pager, so repeating that here would name two ways to
+    // read the same answer.
     if !note.exhausted {
         line.push_str(" · ");
         line.push_str(strings.config_registry_indexing());
-    }
-    if note.cursor.is_some() {
-        line.push_str(" · ");
-        line.push_str(strings.config_registry_load_more());
     }
     Some(line)
 }

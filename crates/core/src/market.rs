@@ -26,6 +26,13 @@ use crate::provider::{
 #[serde(rename_all = "camelCase")]
 pub struct MarketEnvRequirement {
     pub name: String,
+    /// What the value is, for a form that has to say where it goes.
+    ///
+    /// The registry publishes a header with a remote entry and an environment
+    /// variable with a package; both become inputs, and the saved server needs
+    /// the difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<MarketEnvTarget>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -36,6 +43,16 @@ pub struct MarketEnvRequirement {
     pub default_value: Option<String>,
     #[serde(default)]
     pub placeholder: Option<String>,
+}
+
+/// Where a market input's value is written on the saved server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketEnvTarget {
+    /// An environment variable of a server Vibex starts.
+    Env,
+    /// A header sent to a remote server.
+    Header,
 }
 
 /// One installable MCP server as the market lists it.
@@ -79,6 +96,13 @@ pub struct McpMarketEntry {
     /// RFC3339 timestamp of the registry's last update to this version.
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// Picture the registry published for this entry, when it published one.
+    ///
+    /// It is the publisher's own address, not a copy: the market loads it
+    /// through the runtime so a paired client shows the same picture without
+    /// reaching the publisher itself.
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 /// One installable Skill as the registry lists it.
@@ -210,25 +234,22 @@ pub struct McpMarketSearchRequest {
     pub query: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Entries to skip before the window starts.
+    ///
+    /// The registry pages by an opaque cursor, but a pager counts pages, so the
+    /// runtime walks the cursor until the offset is covered and cuts the window
+    /// from what it read.
     #[serde(default)]
     pub offset: Option<u32>,
-    /// Narrow the answer to one transport family, before the page is cut.
+    /// Cursor the previous answer ended on, echoed back to reach the next one.
     ///
-    /// The filter is applied by the index rather than by the caller because the
-    /// caller only ever holds one page: filtering a page after it was cut would
-    /// leave holes in the list and a count that does not match what is on
-    /// screen.
+    /// When it is present the runtime starts there instead of walking from the
+    /// first page, which is what keeps deep paging cheap.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Narrow the answer to one transport family, before the window is cut.
     #[serde(default)]
     pub transport: Option<McpMarketTransportFilter>,
-    /// Ask the runtime to walk further into the registry before answering.
-    ///
-    /// The registry is browsed one cursor page at a time and the pages are
-    /// cached, so a browse view can answer from what is already indexed. A
-    /// search — and a caller that pressed "load more" — sets this so the
-    /// request waits for the cache to grow instead of answering from a window
-    /// that is known to be too small.
-    #[serde(default)]
-    pub extend: Option<bool>,
 }
 
 /// Which transport family a market search is narrowed to.
@@ -258,19 +279,28 @@ impl McpMarketTransportFilter {
 #[serde(rename_all = "camelCase")]
 pub struct McpMarketSearchResponse {
     pub entries: Vec<McpMarketEntry>,
-    /// True when the registry reported another page beyond what is indexed.
+    /// True when the registry has more entries after this window.
     pub has_more: bool,
-    /// Registry entries the runtime currently holds, across every page it has
-    /// walked. Reported so the UI can say how much of the registry a search
-    /// actually covered instead of implying the list is the whole catalog.
+    /// Cursor the next window starts at, absent when nothing follows.
+    ///
+    /// An opaque registry value the caller echoes back untouched; reading
+    /// further is a request to the registry rather than a page the client cut
+    /// for itself.
     #[serde(default)]
-    pub catalog_size: usize,
-    /// True once the runtime has walked the registry to its last page.
-    #[serde(default)]
-    pub catalog_exhausted: bool,
-    /// How many indexed entries matched the query, before the page limit.
+    pub next_cursor: Option<String>,
+    /// Entries the registry matched for this question, across the window read.
+    ///
+    /// A search counts what the registry returned rather than what fits on one
+    /// page, which is what lets the pager show a real number of pages instead
+    /// of a total that grows under the reader.
     #[serde(default)]
     pub total_matches: usize,
+    /// Whether `total_matches` is the registry's own count.
+    ///
+    /// A ranked search can report it; a browse pages by name and the runtime
+    /// stops after a bounded walk, so the count there is what was read.
+    #[serde(default)]
+    pub total_is_exact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -405,3 +435,31 @@ pub const MAX_MARKET_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 /// per-bundle limits above, which is what makes a decompression bomb a refused
 /// file rather than an exhausted process.
 pub const MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Largest picture the market will download for an entry.
+///
+/// Icons are avatars and product marks at display size, so a picture larger
+/// than this is not one the market asked for; refusing it also keeps a hostile
+/// publisher from turning a card into a download.
+pub const MAX_MARKET_ICON_BYTES: u64 = 1024 * 1024;
+
+/// One entry's picture as the runtime loaded it.
+///
+/// The bytes travel with the media type rather than being written to disk: the
+/// market shows a picture, it does not hand out files, so a `data:` URL is all
+/// the card needs and a paired client needs no second request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpMarketIcon {
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub bytes: Vec<u8>,
+}
+
+impl McpMarketIcon {
+    /// Whether the runtime actually loaded a picture.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}

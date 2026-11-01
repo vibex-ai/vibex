@@ -722,6 +722,11 @@ impl ProviderManagementFacade {
         self.service.search_mcp_market(request)
     }
 
+    /// Loads the picture one market entry published.
+    pub fn mcp_market_icon(&self, entry_id: &str) -> VibexResult<vibex_core::McpMarketIcon> {
+        self.service.mcp_market_icon(entry_id)
+    }
+
     pub fn install_mcp_market_entry(
         &self,
         request: vibex_core::McpMarketInstallRequest,

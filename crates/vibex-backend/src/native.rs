@@ -47,7 +47,7 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, McpMarketInstallRequest, McpMarketInstallResult,
+    ManagementSnapshotPayload, McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult,
     McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
     McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
     McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
@@ -4115,6 +4115,23 @@ impl ManagementBackend for NativeBackend {
                     BackendError::failed(
                         "market_search_task_failed",
                         "the market search task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn mcp_market_icon(&self, entry_id: String) -> BackendFuture<'_, McpMarketIcon> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || service.mcp_market_icon(&entry_id))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_icon_task_failed",
+                        "the market icon task did not complete",
                     )
                 })?
                 .map_err(Into::into)

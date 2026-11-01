@@ -419,34 +419,23 @@ struct ProviderExtraBodyDraft {
 
 /// Why the MCP market is asking the runtime for a window of the registry.
 ///
-/// The runtime indexes the registry in the background, so most asks are just
-/// "what do you have now" — only a search the user actually pressed is worth
-/// waiting on, and only a fresh result set may move the page.
+/// Every ask is a read from the registry's own search, so the only difference
+/// between them is what the view does with the answer: a fresh question resets
+/// the pager, while a page or a filter keeps the reader where they are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpMarketRequest {
-    /// First paint: a fresh result set, answered from whatever is indexed.
-    Open,
-    /// The user pressed Search or Enter: a fresh result set, and the runtime
-    /// is asked to widen its index before answering.
+    /// First paint or a new question: a fresh result set.
     Search,
-    /// The user picked another page. The result set is the same one, so the
-    /// page stays where the user put it and the Search button keeps its rest
-    /// state rather than flashing for a request nobody typed.
+    /// The reader picked another page of the same result set.
     Page,
-    /// A poll that picks up entries the index gained since the last reply. The
-    /// result set is the same one, so the page in view must not move.
-    Poll,
+    /// The reader narrowed the same result set to one transport family.
+    Filter,
 }
 
 impl McpMarketRequest {
-    /// Whether the runtime should widen its index before answering.
-    fn waits_for_a_wider_index(self) -> bool {
-        matches!(self, McpMarketRequest::Search)
-    }
-
     /// Whether this starts a new result set, which is what resets the page.
     fn starts_a_new_result_set(self) -> bool {
-        matches!(self, McpMarketRequest::Open | McpMarketRequest::Search)
+        matches!(self, McpMarketRequest::Search)
     }
 }
 
@@ -1698,12 +1687,24 @@ pub struct ManagementCenter {
     mcp_market_page: usize,
     /// Transport the grid is filtered to; `None` shows every kind.
     mcp_market_transport: Option<MarketTransportFilter>,
-    /// True when the registry holds entries beyond what is indexed.
+    /// True when the registry holds entries beyond the window on screen.
     mcp_market_has_more: bool,
-    /// How many entries the index matched for the current query and filter,
-    /// across every page. The grid pages through this number rather than
-    /// through whatever one request happened to return.
+    /// Cursor the next window of this question starts at.
+    ///
+    /// An opaque registry value, kept exactly as it arrived: paging is a
+    /// request to the registry rather than a window this view widened itself.
+    mcp_market_next_cursor: Option<String>,
+    /// How many entries the registry matched for the current query and filter.
+    /// The grid pages through this number rather than through whatever one
+    /// request happened to return.
     mcp_market_total: usize,
+    /// Pictures already loaded, by entry id.
+    ///
+    /// A card is re-rendered on every scroll and every keystroke elsewhere in
+    /// the pane, so a picture fetched once must not be fetched again.
+    mcp_market_icons: BTreeMap<String, Arc<gpui::Image>>,
+    /// Entries whose picture is being fetched, so one card asks once.
+    mcp_market_icon_pending: BTreeSet<String>,
     /// The MCP grid's scroll offset, so a page change can return to the top
     /// instead of dropping the reader into the middle of the new page.
     mcp_market_scroll: ScrollHandle,
@@ -1712,9 +1713,6 @@ pub struct ManagementCenter {
     /// Bumped for every market request, so a reply that lost the race cannot
     /// overwrite a newer one, and so the indexing poll stops with the view.
     mcp_market_generation: u64,
-    /// The pending re-query that picks up entries the index gained since the
-    /// last reply.
-    mcp_market_index_task: Option<Task<()>>,
     /// Entry the install form is configuring; `None` while browsing.
     mcp_market_install_target: Option<vibex_core::McpMarketEntry>,
     mcp_market_install_agents: BTreeSet<String>,
@@ -2891,12 +2889,14 @@ impl ManagementCenter {
             mcp_market_page: 1,
             mcp_market_transport: None,
             mcp_market_has_more: false,
+            mcp_market_next_cursor: None,
             mcp_market_total: 0,
+            mcp_market_icons: BTreeMap::new(),
+            mcp_market_icon_pending: BTreeSet::new(),
             mcp_market_scroll: ScrollHandle::new(),
             mcp_market_loading: false,
             mcp_market_error: None,
             mcp_market_generation: 0,
-            mcp_market_index_task: None,
             mcp_market_install_target: None,
             mcp_market_install_agents: BTreeSet::new(),
             mcp_market_install_env: BTreeMap::new(),
@@ -11242,26 +11242,23 @@ impl ManagementCenter {
         self.mcp_market_install_target = None;
         self.mcp_market_install_env.clear();
         self.mcp_market_install_agents = self.market_default_agents();
-        // The index lives in the runtime and outlives this view, so what is
-        // shown here is whatever it has already walked; the window is cleared
-        // only so the first reply is what fills it in.
+        // Every open is a fresh question: the registry is asked again rather
+        // than answered from a walk that may be hours old.
         self.mcp_market_entries.clear();
         self.mcp_market_total = 0;
         self.mcp_market_page = 1;
         self.mcp_market_transport = None;
-        // Opening the view must not wait on the registry: whatever the runtime
-        // has already indexed is enough to paint, and the poll fills the rest.
-        self.request_mcp_market(McpMarketRequest::Open, cx);
+        self.mcp_market_next_cursor = None;
+        self.mcp_market_icon_pending.clear();
+        self.request_mcp_market(McpMarketRequest::Search, cx);
     }
 
-    /// Load one window of the registry for the current query.
+    /// Ask the registry the current question.
     ///
-    /// The runtime indexes the registry a page at a time rather than asking the
-    /// registry to search, because the registry's own search takes tens of
-    /// seconds. So a reply describes how much of the catalog it covered, and
-    /// this keeps asking while that is still growing — which is what makes
-    /// results appear as the index fills instead of stopping at whatever the
-    /// first page happened to hold.
+    /// A page is addressed by offset because a pager counts pages, and the
+    /// runtime walks the registry's cursor until that offset is covered. The
+    /// cursor of the answer is kept so the next page starts where this one
+    /// ended instead of walking from the first result again.
     fn search_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.request_mcp_market(McpMarketRequest::Search, cx);
     }
@@ -11271,23 +11268,25 @@ impl ManagementCenter {
             return;
         };
         let query = self.mcp_market_query.read(cx).value().trim().to_string();
-        // A poll is not something the user did, so it must not put the Search
-        // button into a spinner every few seconds.
         if request.starts_a_new_result_set() {
             self.mcp_market_loading = true;
             self.mcp_market_page = 1;
+            self.mcp_market_next_cursor = None;
         }
         self.mcp_market_error = None;
         self.mcp_market_generation = self.mcp_market_generation.wrapping_add(1);
         let generation = self.mcp_market_generation;
-        let extend = request.waits_for_a_wider_index();
-        // The index holds the whole registry, so the view asks for the page it
-        // is on rather than for a window it then has to page through itself.
         let page = self.mcp_market_page.max(1);
         let offset = page.saturating_sub(1).saturating_mul(MARKET_PAGE_SIZE);
         let transport = self
             .mcp_market_transport
             .map(MarketTransportFilter::request_filter);
+        // Only the page this view already walked past needs a cursor: a first
+        // page is faster from the registry's own beginning, and asking with a
+        // stale cursor would read a result set that has since changed.
+        let cursor = (offset > 0)
+            .then(|| self.mcp_market_next_cursor.clone())
+            .flatten();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
@@ -11296,8 +11295,8 @@ impl ManagementCenter {
                     query: (!query.is_empty()).then_some(query),
                     limit: Some(MARKET_PAGE_SIZE as u32),
                     offset: Some(offset.min(u32::MAX as usize) as u32),
+                    cursor,
                     transport,
-                    extend: Some(extend),
                 })
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -11328,7 +11327,8 @@ impl ManagementCenter {
                         this.mcp_market_entries = response.entries;
                         this.mcp_market_total = response.total_matches;
                         this.mcp_market_has_more = response.has_more;
-                        this.schedule_mcp_market_index_poll(cx);
+                        this.mcp_market_next_cursor = response.next_cursor;
+                        this.load_mcp_market_icons(cx);
                     }
                     Ok(Err(error)) => {
                         this.mcp_market_error =
@@ -11341,33 +11341,57 @@ impl ManagementCenter {
         }));
     }
 
-    /// Re-query once the index has had time to gain another page.
+    /// Load the picture of every entry on screen that has one.
     ///
-    /// The delay is longer than a page takes to land, so this settles into a
-    /// poll that refreshes the count every few seconds rather than one that
-    /// spins. It stops once the registry has been walked to its end: the page
-    /// in view does not grow, but the number of pages behind it does.
-    fn schedule_mcp_market_index_poll(&mut self, cx: &mut Context<Self>) {
-        if !self.mcp_market_has_more || !self.mcp_market_open {
-            self.mcp_market_index_task = None;
+    /// The bytes come from the runtime, so this is one request per card rather
+    /// than one per frame, and a picture already in hand is not asked for
+    /// again. A failure is simply no picture: the card keeps its transport
+    /// glyph, which is what it shows for an entry that published none.
+    fn load_mcp_market_icons(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
             return;
-        }
-        let generation = self.mcp_market_generation;
-        self.mcp_market_index_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                cx.background_executor()
-                    .timer(MCP_MARKET_INDEX_POLL_INTERVAL)
-                    .await;
+        };
+        let wanted = self
+            .mcp_market_entries
+            .iter()
+            .filter(|entry| entry.icon_url.is_some())
+            .map(|entry| entry.id.clone())
+            .filter(|id| {
+                !self.mcp_market_icons.contains_key(id)
+                    && !self.mcp_market_icon_pending.contains(id)
+            })
+            .collect::<Vec<_>>();
+        for entry_id in wanted {
+            self.mcp_market_icon_pending.insert(entry_id.clone());
+            let entity = cx.weak_entity();
+            let backend = backend.clone();
+            let request_id = entry_id.clone();
+            cx.spawn(async move |_, cx| {
+                let loaded = backend.management().mcp_market_icon(request_id).await;
                 let _ = entity.update(cx, |this, cx| {
-                    // The view may have closed, or the user may have searched
-                    // again, while this was waiting.
-                    if this.mcp_market_generation != generation || !this.mcp_market_open {
+                    this.mcp_market_icon_pending.remove(&entry_id);
+                    let Ok(icon) = loaded else {
+                        return;
+                    };
+                    let Some(format) = icon
+                        .mime
+                        .as_deref()
+                        .and_then(gpui::ImageFormat::from_mime_type)
+                    else {
+                        return;
+                    };
+                    if icon.bytes.is_empty() {
                         return;
                     }
-                    this.request_mcp_market(McpMarketRequest::Poll, cx);
+                    this.mcp_market_icons.insert(
+                        entry_id,
+                        Arc::new(gpui::Image::from_bytes(format, icon.bytes)),
+                    );
+                    cx.notify();
                 });
-            },
-        ));
+            })
+            .detach();
+        }
     }
 
     /// Open an entry's own page in the browser.
@@ -20574,11 +20598,18 @@ impl ManagementCenter {
             return self.render_mcp_market_install_form(&target, pending, cx);
         }
 
-        // The runtime already cut the page and counted the matches: it holds
-        // the whole index, so the query and the transport filter are its job
-        // rather than something this view does to a window it fetched.
+        // The runtime cut the page and counted what it read, so the query and
+        // the transport filter are its job rather than something this view does
+        // to a window it fetched. A registry that answered with a cursor has
+        // more behind this page, so the pager offers one page past what was
+        // read and asking for it is what walks the cursor further.
         let total = self.mcp_market_total;
-        let page = market_page(self.mcp_market_page, total);
+        let page_total = if self.mcp_market_has_more {
+            total.saturating_add(MARKET_PAGE_SIZE)
+        } else {
+            total
+        };
+        let page = market_page(self.mcp_market_page, page_total);
         let shown = entries;
         let shown_count = shown.len();
         let filtered = transport_filter.is_some();
@@ -20619,8 +20650,7 @@ impl ManagementCenter {
             );
         // The Search button owns the only busy indicator on this pane. The
         // title used to grow a second one whenever the view was loading, which
-        // put two spinners on screen for one request; what the title has to say
-        // about a still-filling index is said by the count line below.
+        // put two spinners on screen for one request.
         content = content.child(heading);
 
         content = content.child(management_market_toolbar(
@@ -20641,7 +20671,8 @@ impl ManagementCenter {
                     // Narrowing the grid is a new reading position, so the
                     // pager starts over instead of opening mid-list.
                     this.mcp_market_page = 1;
-                    this.request_mcp_market(McpMarketRequest::Page, cx);
+                    this.mcp_market_next_cursor = None;
+                    this.request_mcp_market(McpMarketRequest::Filter, cx);
                 }),
                 cx,
             )),
@@ -20680,18 +20711,18 @@ impl ManagementCenter {
                             .child(management_market_result_count(shown_count, total)),
                     )
                     .when(self.mcp_market_has_more, |row| {
-                        // The registry indexes in the background, so the count
-                        // keeps growing under the grid; saying so is friendlier
-                        // than a number that silently changes.
+                        // The registry answered with a cursor, so more results
+                        // exist than this page shows. Saying which is more
+                        // honest than a total that would silently change.
                         row.child(
                             div()
                                 .flex_none()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(management_locale_text(
-                                    "Still indexing the registry…",
-                                    "仍在索引注册表…",
-                                    "仍在索引登錄表…",
+                                    "More results on the registry",
+                                    "注册表还有更多结果",
+                                    "登錄表還有更多結果",
                                 )),
                         )
                     }),
@@ -20714,7 +20745,8 @@ impl ManagementCenter {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.mcp_market_transport = None;
                         this.mcp_market_page = 1;
-                        this.request_mcp_market(McpMarketRequest::Page, cx);
+                        this.mcp_market_next_cursor = None;
+                        this.request_mcp_market(McpMarketRequest::Filter, cx);
                     }))
                     .into_any_element()
             });
@@ -20726,9 +20758,9 @@ impl ManagementCenter {
                 ),
                 if filtered {
                     management_locale_text(
-                        "Nothing indexed so far uses this transport. Clear the filter to see the rest.",
-                        "已索引的服务中还没有使用该连接方式的服务，清除筛选即可查看其余条目。",
-                        "已索引的服務中還沒有使用該連線方式的服務，清除篩選即可查看其餘條目。",
+                        "Nothing the registry returned uses this transport. Clear the filter to see the rest.",
+                        "注册表返回的结果中还没有使用该连接方式的服务，清除筛选即可查看其余条目。",
+                        "登錄表傳回的結果中還沒有使用該連線方式的服務，清除篩選即可查看其餘條目。",
                     )
                 } else {
                     management_locale_text(
@@ -20762,6 +20794,9 @@ impl ManagementCenter {
             let entry_id = entry.id.clone();
             let install_entry = entry.clone();
             let install_id = entry.id.clone();
+            // A picture the registry published is the entry's own mark; an
+            // entry without one keeps the glyph for what it is.
+            let icon = self.mcp_market_icons.get(&entry.id).cloned();
 
             let link_element = link.clone().map(|url| {
                 let open_link = url.clone();
@@ -20784,7 +20819,10 @@ impl ManagementCenter {
 
             grid = grid.child(management_market_card(
                 entry_id,
-                market_transport_icon_path(entry.transport),
+                MarketCardMark {
+                    glyph_path: market_transport_icon_path(entry.transport),
+                    icon,
+                },
                 name,
                 state,
                 meta,
@@ -20830,12 +20868,12 @@ impl ManagementCenter {
                 .vertical_scrollbar(&self.mcp_market_scroll),
         );
 
-        if !first_load && total > 0 {
+        if !first_load && page_total > 0 {
             let entity = cx.weak_entity();
             content = content.child(management_market_pager(
                 "management-mcp-market-pager",
                 page,
-                total,
+                page_total,
                 move |page, _, cx| {
                     let page = *page;
                     let _ = entity.update(cx, |this, cx| {
@@ -20927,7 +20965,20 @@ impl ManagementCenter {
             .gap_4()
             .child(heading)
             .child(management_market_detail_header(
-                management_market_glyph(market_transport_icon_path(target.transport), cx),
+                // The entry keeps its own mark on the form it was opened from,
+                // so the page answers "which one am I installing" at a glance.
+                match self.mcp_market_icons.get(&target.id).cloned() {
+                    Some(icon) => management_market_plate(
+                        gpui::img(icon)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .into_any_element(),
+                        cx,
+                    ),
+                    None => {
+                        management_market_glyph(market_transport_icon_path(target.transport), cx)
+                    }
+                },
                 target.name.clone(),
                 state,
                 market_entry_publisher_line(target),
@@ -20988,6 +21039,17 @@ impl ManagementCenter {
                                 .text_xs()
                                 .text_color(cx.theme().danger)
                                 .child(management_locale_text("Required", "必填", "必填")),
+                        );
+                    }
+                    // A header is sent on the connection; saying so keeps it
+                    // from being mistaken for an environment variable.
+                    if requirement.target == Some(vibex_core::MarketEnvTarget::Header) {
+                        label = label.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text("Header", "请求头", "請求標頭")),
                         );
                     }
                     env_rows = env_rows.child(
@@ -21273,7 +21335,10 @@ impl ManagementCenter {
                 .or_else(|| (entry.stars > 0).then(|| format!("{} ★", entry.stars)));
             grid = grid.child(management_market_card(
                 entry_id,
-                "icons/vibex/book-open.svg",
+                MarketCardMark {
+                    glyph_path: "icons/vibex/book-open.svg",
+                    icon: None,
+                },
                 entry.name.clone(),
                 installed.then_some(MarketEntryState::Installed),
                 // The publisher is what tells two Skills of one slug apart,
@@ -37596,6 +37661,7 @@ fn market_entry_to_candidate(
     env_values: &[vibex_core::McpServerEnvEntry],
 ) -> vibex_core::McpServerCreateRequest {
     let mut env = Vec::new();
+    let mut headers = Vec::new();
     for requirement in &entry.env {
         let supplied = env_values
             .iter()
@@ -37603,11 +37669,23 @@ fn market_entry_to_candidate(
             .map(|value| value.value.clone())
             .filter(|value| !value.trim().is_empty());
         let resolved = supplied.or_else(|| requirement.default_value.clone());
-        if let Some(value) = resolved {
-            env.push(vibex_core::McpServerEnvEntry {
+        let Some(value) = resolved else {
+            continue;
+        };
+        // The registry publishes a header with a remote entry and a variable
+        // with a package; the saved server has to carry it where it belongs,
+        // or a remote install answers 401 with the value in the wrong place.
+        match requirement.target {
+            Some(vibex_core::MarketEnvTarget::Header) => {
+                headers.push(vibex_core::McpServerHeaderEntry {
+                    name: requirement.name.clone(),
+                    value,
+                })
+            }
+            _ => env.push(vibex_core::McpServerEnvEntry {
                 name: requirement.name.clone(),
                 value,
-            });
+            }),
         }
     }
     // Values for names the catalog did not declare are still carried: an entry
@@ -37631,7 +37709,7 @@ fn market_entry_to_candidate(
         args: entry.args.clone(),
         env,
         url: entry.url.clone(),
-        headers: Vec::new(),
+        headers,
         description: entry.description.clone(),
         tags: vec!["market".to_string()],
         secret_references: Vec::new(),
@@ -37640,6 +37718,22 @@ fn market_entry_to_candidate(
 }
 
 /// The rounded plate an entry's transport glyph sits on.
+/// The plate a market icon sits on, at the size the detail header uses.
+fn management_market_plate(content: AnyElement, cx: &App) -> AnyElement {
+    h_flex()
+        .size(px(34.0))
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.60))
+        .bg(cx.theme().background)
+        .child(content)
+        .into_any_element()
+}
+
 fn management_market_glyph(icon_path: &str, cx: &App) -> AnyElement {
     h_flex()
         .size(px(34.0))
@@ -37712,10 +37806,22 @@ struct MarketCardEndpoint {
 /// baseline: the description and metadata take the slack, and the footer is
 /// pinned to the bottom, so a short entry does not leave its Install button
 /// floating halfway up the row.
+/// The mark a market card leads with.
+///
+/// A registry entry can publish its own picture; when it does, that picture is
+/// the card's identity and the transport glyph moves beside the address line.
+/// An entry with none keeps the glyph, so the two kinds of card stay the same
+/// size and the grid does not reflow when one picture arrives.
+#[derive(Clone, Default)]
+struct MarketCardMark {
+    glyph_path: &'static str,
+    icon: Option<Arc<gpui::Image>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn management_market_card(
     id: String,
-    glyph_path: &'static str,
+    mark: MarketCardMark,
     name: String,
     state: Option<MarketEntryState>,
     meta: Option<String>,
@@ -37746,6 +37852,32 @@ fn management_market_card(
         (meta, quiet) => meta.or(quiet),
     };
 
+    // The lead is the entry's own picture when it has one: a 36px plate, the
+    // same footprint the owned-server rows use, so the market reads as a list
+    // of products rather than a list of protocols.
+    let lead = match mark.icon.clone() {
+        Some(icon) => div()
+            .size(px(36.0))
+            .flex_none()
+            .overflow_hidden()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.60))
+            .bg(cx.theme().background)
+            .child(
+                gpui::img(icon)
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Contain),
+            )
+            .into_any_element(),
+        None => Icon::default()
+            .path(mark.glyph_path)
+            .size(px(16.0))
+            .flex_none()
+            .text_color(cx.theme().muted_foreground)
+            .into_any_element(),
+    };
+
     let mut body = v_flex()
         .min_w_0()
         .flex_1()
@@ -37756,13 +37888,7 @@ fn management_market_card(
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(
-                    Icon::default()
-                        .path(glyph_path)
-                        .size(px(16.0))
-                        .flex_none()
-                        .text_color(cx.theme().muted_foreground),
-                )
+                .child(lead)
                 .child(identity)
                 .children(
                     state
@@ -38043,10 +38169,10 @@ fn management_market_empty_row(
 
 /// Entries a market grid shows on one page.
 ///
-/// The MCP market asks the runtime for exactly one page: its index holds the
-/// whole registry, and the reader only ever looks at one screen, so the page is
-/// addressed by offset rather than shipped whole. The Skill index ignores the
-/// offset outright, so that market fetches one window and pages it locally.
+/// The MCP market asks the runtime for exactly one page and the runtime asks
+/// the registry for it, so the page is addressed by offset rather than the
+/// whole catalog being shipped. The Skill registry ignores the offset, so that
+/// market fetches one window and pages it locally.
 const MARKET_PAGE_SIZE: usize = 20;
 
 /// Entries the Skill market fetches in one go.
@@ -38072,14 +38198,6 @@ const MANAGEMENT_MARKET_CARD_MIN_WIDTH: f32 = 260.0;
 /// spacer is what actually pins the footer once a taller neighbour sets the
 /// height.
 const MANAGEMENT_MARKET_CARD_MIN_HEIGHT: f32 = 150.0;
-
-/// How long the MCP market waits before asking again for a wider index.
-///
-/// The runtime indexes the registry a page at a time in the background, and a
-/// page takes a few seconds to land. Polling slower than that keeps the view
-/// filling without spinning, and the poll stops as soon as the registry is
-/// exhausted or the view closes.
-const MCP_MARKET_INDEX_POLL_INTERVAL: Duration = Duration::from_millis(2500);
 
 /// Pages a fetched window divides into.
 ///
@@ -42425,7 +42543,43 @@ mod tests {
             env: Vec::new(),
             version: Some("1.0.0".to_string()),
             package_kind: Some("npm".to_string()),
+            icon_url: Some("https://cdn.example/icon.png".to_string()),
         }
+    }
+
+    /// An entry's own picture is what the card leads with, and a picture that
+    /// has not arrived yet must not reflow the grid.
+    #[test]
+    fn a_market_card_leads_with_the_entrys_own_picture() {
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("fn management_market_card(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_market_error_text("))
+            .map(|(body, _)| body)
+            .expect("the market card renderer should remain inspectable");
+        assert!(
+            card.contains("mark.icon.clone()"),
+            "the card should draw the picture the entry published"
+        );
+        assert!(
+            card.contains("ObjectFit::Contain"),
+            "a product mark must not be cropped to fill the plate"
+        );
+        // The fallback is the same glyph the card had before pictures existed,
+        // so an entry without one keeps its transport mark.
+        assert!(
+            card.contains("mark.glyph_path"),
+            "an entry without a picture should keep its glyph"
+        );
+        let market = source
+            .split_once("    fn render_mcp_market(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_market_install_form("))
+            .map(|(body, _)| body)
+            .expect("the MCP market should remain inspectable");
+        assert!(
+            market.contains("self.mcp_market_icons.get(&entry.id)"),
+            "the grid should hand the card the picture it already loaded"
+        );
     }
 
     /// The registry publishes a full RFC3339 instant; a card only wants the day.
@@ -42457,6 +42611,7 @@ mod tests {
         entry.env = vec![
             vibex_core::MarketEnvRequirement {
                 name: "API_KEY".to_string(),
+                target: Some(vibex_core::MarketEnvTarget::Env),
                 description: None,
                 required: true,
                 secret: true,
@@ -42465,6 +42620,7 @@ mod tests {
             },
             vibex_core::MarketEnvRequirement {
                 name: "REGION".to_string(),
+                target: Some(vibex_core::MarketEnvTarget::Env),
                 description: None,
                 required: false,
                 secret: false,
@@ -42587,20 +42743,20 @@ mod tests {
             "\n    /// The native-import view",
         );
 
-        // The MCP index holds the whole registry, so the view asks for one page
-        // at a time and never cuts a page out of a window it fetched: the count
-        // it pages through is the index's own match count.
+        // The registry is asked for one page at a time, so the view never cuts
+        // a page out of a window it fetched: the count it pages through is the
+        // registry's own match count.
         assert!(
             mcp.contains("self.mcp_market_total"),
-            "the MCP pager should count what the index matched"
+            "the MCP pager should count what the registry matched"
         );
         assert!(
             !mcp.contains("market_page_slice("),
-            "the MCP market should not slice a fetched window: it pages the index"
+            "the MCP market should not slice a fetched window: it pages the registry"
         );
         let request = renderer(
             "    fn request_mcp_market(",
-            "\n    /// Re-query once the index",
+            "\n    /// Load the picture of every entry",
         );
         assert!(
             request.contains("offset: Some("),
@@ -42611,12 +42767,16 @@ mod tests {
             "the MCP request should ask for exactly one page"
         );
         assert!(
+            request.contains("cursor,"),
+            "a page past the first should carry the registry's cursor"
+        );
+        assert!(
             request.contains("MarketTransportFilter::request_filter"),
-            "the transport filter belongs to the index, or paging under it would leave holes"
+            "the transport filter belongs to the request, or paging under it would leave holes"
         );
 
-        // The Skill index ignores the offset outright, so that market fetches
-        // one window and pages through it locally.
+        // The Skill registry ignores the offset, so that market fetches one
+        // window and pages through it locally.
         assert!(
             skills.contains("market_page_slice("),
             "the Skill market should page the window it fetched"

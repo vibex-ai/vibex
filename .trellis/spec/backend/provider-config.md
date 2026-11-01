@@ -1092,6 +1092,87 @@ Native export therefore follows the same preview → diff → backup → atomic 
   diagnostic naming only its lookup key, never an empty placeholder that would
   look configured. Provider-profile export still writes public settings only.
 
+## Scenario: Market Catalogs Are Searched Upstream
+
+### 1. Scope / Trigger
+
+- Trigger: the Config Center's **Browse MCP market** and **Skill market** read
+  their catalogs from `crates/config-switch/src/market.rs`.
+- Cross-layer: the runtime fetches and maps, `crates/core/src/market.rs` owns
+  the wire vocabulary, `crates/vibex-backend` exposes it on the typed facade,
+  and `apps/desktop` / `crates/vibex-tui` render it.
+
+### 2. Signatures
+
+```text
+ProviderConfigService::search_mcp_market(McpMarketSearchRequest)
+  -> McpMarketSearchResponse
+ProviderConfigService::mcp_market_icon(entry_id) -> McpMarketIcon
+ProviderConfigService::search_skill_market(SkillMarketSearchRequest)
+  -> SkillMarketSearchResponse
+```
+
+`McpMarketSearchRequest` carries `query`, `limit`, `offset`, `cursor`, and
+`transport`; the response carries `entries`, `has_more`, `next_cursor`,
+`total_matches`, `total_is_exact`, `catalog_size`, `catalog_exhausted`.
+
+### 3. Contract
+
+- **One upstream per market, asked the reader's own question.** MCP sends
+  `GET https://registry.modelcontextprotocol.io/v0.1/servers?version=latest`
+  with `search` (when the query is at least three characters) and `limit` at
+  most 100. Nothing is pre-indexed: a catalog walked into memory cannot be
+  complete within an interactive wait, and the registry's search answers a
+  single query in about a second.
+- **A browse is the same endpoint without `search`.** The registry rejects a
+  query shorter than three characters with a 422, so a shorter query is a
+  browse rather than a failure; `total_is_exact` is `false` there because the
+  runtime stops walking after a bounded number of cursor pages.
+- **The transport filter narrows the window, never the upstream request.**
+  Filtering before paging would make a page of twenty depend on how many of a
+  hundred happened to match, which skips entries and breaks the pager.
+- **Paging walks the registry's cursor.** `offset` is what the pager counts;
+  the runtime reads cursor pages until the offset is covered and cuts the window
+  from what it read, keeping the result set per question so paging back is a
+  redraw rather than a second walk.
+- **Only installable forms are listed.** An entry becomes a market row only if
+  it has an `npm` or `pypi` package or a public `streamable-http` remote.
+  `oci` and `mcpb` forms are not offered because no host can start them, and a
+  withdrawn (`deleted`, `deprecated`) record is not offered at all.
+- **Remote headers are inputs, not decoration.** The registry publishes a
+  remote's headers as variables; a header that is a placeholder, required, or
+  secret becomes a `MarketEnvRequirement` with
+  `target: MarketEnvTarget::Header`, and the install writes it into
+  `McpServerCreateRequest::headers` rather than `env`.
+- **An entry's picture is the publisher's URL, loaded by the authority.**
+  `McpMarketEntry::icon_url` is the first `icons[].src` that passes the market's
+  public-`https` policy. `mcp_market_icon` fetches it through the same redirect
+  and size policy (1 MiB cap), decides the media type from the bytes rather than
+  the address, and caches by entry id. A client renders the returned bytes; it
+  never fetches a publisher URL itself, which is what makes the picture work on
+  a paired device.
+- **The Skill market keeps ClawHub** (`https://clawhub.ai/api/v1/...`) with its
+  own rankings, cursors, and zip bundles; its searches are not the MCP path.
+
+### 4. Failure handling
+
+- A registry refusal is `SearchError`-shaped: `market_rejected` carries the
+  status, and a malformed body is `market_malformed` with the host. A read that
+  answered nothing is an outage; a read that answered an empty list is a search
+  that found nothing, and the two are reported differently.
+- An entry whose picture fails to load keeps the transport glyph. A market
+  never invents a picture, just as it never invents an entry.
+
+### 5. Tests
+
+```text
+cargo test -p vibex-config-switch market
+cargo test -p vibex-config-switch -- --ignored live_registry_search
+cargo test -p vibex-config-switch -- --ignored live_registry_entry_icon
+cargo test -p vibex-desktop --lib market
+cargo test -p vibex-tui --test config_center
+```
+
 ## Scenario: Skills Prompts Hooks Resource Management Baseline
 
 ### 1. Scope / Trigger

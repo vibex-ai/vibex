@@ -5530,6 +5530,28 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn mcp_market_icon(&self, entry_id: String) -> BackendFuture<'_, vibex_core::McpMarketIcon> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::McpMarketIcon(
+                vibex_core::RemoteProviderMcpMarketIconRequest {
+                    auth: this.auth(),
+                    entry_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpMarketIconResponse>(value)?.result)
+        })
+    }
+
     fn install_mcp_market_entry(
         &self,
         request: MutationRequest<vibex_core::McpMarketInstallRequest>,

@@ -2088,6 +2088,13 @@ mod tests {
             error_future()
         }
 
+        fn mcp_market_icon(
+            &self,
+            _entry_id: String,
+        ) -> BackendFuture<'_, vibex_core::McpMarketIcon> {
+            error_future()
+        }
+
         fn install_mcp_market_entry(
             &self,
             _request: MutationRequest<vibex_core::McpMarketInstallRequest>,

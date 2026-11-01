@@ -3656,6 +3656,19 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderMcpMarketSearchResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::McpMarketIcon(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let entry_id = request.entry_id;
+            let result = run_market_blocking(move || service.mcp_market_icon(&entry_id))?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMarketIconResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::McpMarketInstall(request) => {
             let auth = authorize_provider_action(
                 runtime,

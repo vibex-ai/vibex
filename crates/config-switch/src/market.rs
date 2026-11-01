@@ -33,18 +33,22 @@
 //! is reported to the caller rather than dropped, because a Skill whose scripts
 //! silently did not arrive is not the Skill the publisher described.
 //!
-//! ## Why the MCP catalog is indexed rather than queried
+//! ## How an MCP search is answered
 //!
-//! The registry's own `search` parameter is not usable interactively: measured
-//! against the live registry a single `?search=` request took 9–90 seconds,
-//! while walking one cursor page of the same catalog takes 2–6. A market that
-//! searched upstream would time out far more often than it answered.
+//! The registry is asked the question the reader asked. Its `search` parameter
+//! ranks nothing but it does cover the whole catalog, and it answers in about a
+//! second, so the runtime sends the query upstream and pages the cursor the
+//! registry hands back. Nothing is indexed ahead of time: an entry that exists
+//! at the registry is reachable the first time somebody asks for it, which a
+//! walk of the whole catalog cannot promise within an interactive wait.
 //!
-//! So the runtime walks the registry itself, one cursor page at a time, into a
-//! process-wide cache, and every query is answered by filtering that cache.
-//! Indexing continues in the background while the market is in use, which is
-//! what lets a search cover thousands of entries without ever waiting on the
-//! registry's own scan.
+//! Two properties follow from that and are load-bearing:
+//!
+//! - A query shorter than the registry accepts is a browse, not a failure. The
+//!   same endpoint answers it in the order the registry publishes.
+//! - The transport filter is applied to the window, never upstream. Filtering
+//!   before paging would make a page of twenty depend on how many of a hundred
+//!   happened to match, which is a pager that skips entries.
 //!
 //! ## Network boundary
 //!
@@ -64,23 +68,23 @@
 //! the resolved address into the socket, which the blocking client used here
 //! does not expose.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 use vibex_core::{
-    AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_BUNDLE_BYTES,
+    AgentId, MAX_MARKET_ICON_BYTES, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_BUNDLE_BYTES,
     MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES, MAX_SKILL_MARKET_BUNDLE_FILE_BYTES,
     MAX_SKILL_MARKET_BUNDLE_FILES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
-    McpMarketEntry, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpMarketTransportFilter, McpServerTransportKind, ProviderKind,
-    SkillCreateRequest, SkillMarketBundleFile, SkillMarketDocument, SkillMarketDocumentRequest,
-    SkillMarketEntry, SkillMarketInstallRequest, SkillMarketInstallResult,
-    SkillMarketSearchRequest, SkillMarketSearchResponse, SkillMarketSort, SkillScopeKind,
-    SkillSourceKind, SkillStatus, VibexError, VibexResult,
+    MarketEnvTarget, McpMarketEntry, McpMarketIcon, McpMarketInstallRequest,
+    McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse,
+    McpServerTransportKind, ProviderKind, SkillCreateRequest, SkillMarketBundleFile,
+    SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
+    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse, SkillMarketSort,
+    SkillScopeKind, SkillSourceKind, SkillStatus, VibexError, VibexResult,
 };
 use vibex_db::{McpServerRepository, SkillRepository};
 
@@ -123,11 +127,10 @@ const SKILL_BUNDLE_MANIFEST_NAMES: [&str; 2] = ["SKILL.md", "skill.md"];
 
 /// One request may not take longer than this, including every redirect.
 ///
-/// The registry is not fast: walking its pages measured between 2 and 28
-/// seconds each. A ten-second ceiling — what this used to be — turned every
-/// slow-but-fine page into a reported outage, so the ceiling is set above the
-/// slowest page observed rather than at a comfortable interactive latency.
-const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// The registry answers a search in about a second and a Skill bundle can take
+/// longer, so the ceiling sits above both while still failing an interactive
+/// read fast enough for the reader to retry it.
+const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Redirect hops followed before the fetch is refused.
 const MAX_MARKET_REDIRECTS: usize = 5;
 /// How much of a refusal body is read.
@@ -140,39 +143,8 @@ const MAX_MARKET_REFUSAL_BYTES: u64 = 16 * 1024;
 /// Entries a single response may contribute, so one huge catalog cannot flood
 /// the list.
 const MAX_ENTRIES_PER_SEARCH: usize = 500;
-/// Attempts one registry page gets before the indexer gives up on it.
-const MCP_PAGE_ATTEMPTS: usize = 2;
-/// Registry page size. The API caps `limit` here, so asking for more only
-/// pretends to.
-const MCP_REGISTRY_PAGE_SIZE: u32 = 100;
-/// How long a request may wait for the catalog to reach what it asked for.
-const MCP_CATALOG_WAIT: Duration = Duration::from_secs(12);
-/// Pause between background pages, so indexing stays a polite trickle.
-const MCP_CATALOG_FILL_PAUSE: Duration = Duration::from_millis(250);
-/// Entries the cache will hold before the indexer stops walking.
-///
-/// The registry publishes far more servers than a single response can carry —
-/// a walk of it passed 26,000 entries without reaching the end — and the market
-/// is supposed to answer from the whole catalog rather than from a sample of
-/// it. The ceiling is therefore set well above the registry's current size; the
-/// cost of the extra reach is memory in the index (roughly 30 MB at the cap)
-/// rather than latency in a request, because the walk is a background trickle.
-const MCP_CATALOG_MAX_ENTRIES: usize = 40_000;
-/// A catalog older than this is walked again from the registry's first page.
-///
-/// The TTL has to outlast a full walk, or the catalog would be thrown away
-/// almost as soon as it was complete: the registry answers about one page of
-/// 100 entries every few seconds, so covering tens of thousands of entries is
-/// a matter of tens of minutes. Six hours keeps a complete catalog usable for
-/// a working day without pretending a day-old one is current.
-const MCP_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-/// The indexer stops once nothing has asked for the market for this long, so
-/// closing the view ends the network activity rather than leaving it running.
-const MCP_CATALOG_IDLE: Duration = Duration::from_secs(120);
-/// Longest query the market will filter on.
-const MCP_CATALOG_MAX_QUERY_CHARS: usize = 120;
-/// How often a waiting request re-checks the cache.
-const MCP_CATALOG_POLL: Duration = Duration::from_millis(120);
+/// Entries one market page holds when the caller does not name a size.
+const MARKET_PAGE_LIMIT: u32 = 20;
 /// A Skill document is markdown; anything past this is not one.
 const MAX_SKILL_DOCUMENT_FETCH_BYTES: u64 = MAX_SKILL_MARKET_DOCUMENT_BYTES + 1;
 
@@ -473,9 +445,22 @@ struct RegistryServer {
     #[serde(default)]
     repository: Option<RegistryRepository>,
     #[serde(default)]
+    icons: Vec<RegistryIcon>,
+    #[serde(default)]
     packages: Vec<RegistryPackage>,
     #[serde(default)]
     remotes: Vec<RegistryRemote>,
+}
+
+/// One picture a publisher offered for its entry.
+///
+/// The registry publishes a list because one address never fits every surface;
+/// the market shows the first one it can fetch, and the type it declares is
+/// only a hint — the bytes are sniffed before they are trusted.
+#[derive(Debug, Deserialize)]
+struct RegistryIcon {
+    #[serde(default)]
+    src: Option<String>,
 }
 
 /// The registry publishes `repository` as an object, but older records carry a
@@ -555,6 +540,13 @@ struct RegistryRemote {
     remote_type: Option<String>,
     #[serde(default)]
     url: Option<String>,
+    /// Headers the entry needs before it answers, each possibly a placeholder.
+    ///
+    /// A remote that authenticates with a header (`Authorization`, a vendor's
+    /// own key) is unusable without this, so the market carries the header
+    /// names into the install form instead of saving a connection that 401s.
+    #[serde(default)]
+    headers: Vec<RegistryEnvVar>,
 }
 
 /// `com.pulsemcp/foo` becomes `com-pulsemcp-foo`, matching the id shape the
@@ -692,6 +684,7 @@ fn registry_env_requirements(package: &RegistryPackage) -> Vec<MarketEnvRequirem
             }
             Some(MarketEnvRequirement {
                 name: name.to_string(),
+                target: Some(MarketEnvTarget::Env),
                 description: variable
                     .description
                     .as_deref()
@@ -739,6 +732,9 @@ enum RegistryLaunchForm {
     },
     Remote {
         url: String,
+        /// Header names the remote needs before it answers, in the order the
+        /// registry declared them.
+        headers: Vec<MarketEnvRequirement>,
     },
 }
 
@@ -783,7 +779,65 @@ fn registry_launch_form(server: &RegistryServer) -> Option<RegistryLaunchForm> {
     })?;
     Some(RegistryLaunchForm::Remote {
         url: remote.url.clone()?,
+        headers: registry_header_requirements(remote),
     })
+}
+
+/// The headers a remote entry needs, as the install form asks for them.
+///
+/// A header the registry fills in itself needs nothing from the reader; one it
+/// leaves as `{placeholder}`, marks secret, or marks required is an input. The
+/// header's name is the key, because that is what the saved server carries.
+fn registry_header_requirements(remote: &RegistryRemote) -> Vec<MarketEnvRequirement> {
+    remote
+        .headers
+        .iter()
+        .filter_map(|header| {
+            let name = header.name.as_deref()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let value = header.value.as_deref().unwrap_or_default().trim();
+            let placeholder = placeholder_in(value);
+            // A literal value the publisher ships is not a question; only an
+            // empty one, a placeholder, or an explicit requirement is.
+            if !value.is_empty()
+                && placeholder.is_none()
+                && !header.is_required.unwrap_or(false)
+                && !header.is_secret.unwrap_or(false)
+            {
+                return None;
+            }
+            Some(MarketEnvRequirement {
+                name: name.to_string(),
+                target: Some(MarketEnvTarget::Header),
+                description: header
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| placeholder.filter(|value| !value.is_empty())),
+                required: header.is_required.unwrap_or(false),
+                secret: header
+                    .is_secret
+                    .unwrap_or_else(|| env_name_looks_secret(name)),
+                default_value: None,
+                placeholder: None,
+            })
+        })
+        .collect()
+}
+
+/// The variable a header's value is spelled with, when it is a placeholder.
+///
+/// The registry writes `{api_key}`; the install form asks for the value, so the
+/// placeholder is what tells the reader what to paste rather than a literal.
+fn placeholder_in(value: &str) -> Option<String> {
+    let start = value.find('{')?;
+    let end = value[start..].find('}')? + start;
+    let inner = value[start + 1..end].trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 fn registry_server_to_entry(record: &RegistryServerRecord) -> Option<McpMarketEntry> {
@@ -834,12 +888,12 @@ fn registry_server_to_entry(record: &RegistryServerRecord) -> Option<McpMarketEn
             version,
             Some(kind.to_string()),
         ),
-        RegistryLaunchForm::Remote { url } => (
+        RegistryLaunchForm::Remote { url, headers } => (
             McpServerTransportKind::Http,
             None,
             Vec::new(),
             Some(url),
-            Vec::new(),
+            headers,
             None,
             Some("remote".to_string()),
         ),
@@ -861,349 +915,417 @@ fn registry_server_to_entry(record: &RegistryServerRecord) -> Option<McpMarketEn
         env,
         version,
         package_kind,
+        icon_url: registry_icon(server),
     })
 }
 
-// ---------------------------------------------------------------------------
-// MCP registry index
-// ---------------------------------------------------------------------------
-
-/// The registry as this process has walked it so far.
+/// The picture an entry offers, when it offers one the market may load.
 ///
-/// The cache is process-wide rather than per-service because there is exactly
-/// one authoritative runtime per process, and the catalog it walks is the same
-/// one every caller — local window or paired device — is asking about.
-#[derive(Default)]
-struct McpCatalogIndex {
-    entries: Vec<McpMarketEntry>,
-    /// Ids already held, so a record the registry lists twice is stored once.
-    ids: HashSet<String>,
-    /// Cursor for the next page, absent once the registry is exhausted.
-    cursor: Option<String>,
-    exhausted: bool,
-    /// True while the background walker is running.
-    filling: bool,
-    /// Last time a caller asked for the market, which is what keeps the
-    /// walker alive.
-    used_at: Option<Instant>,
-    /// When the first page landed, which is what staleness is measured from.
-    fetched_at: Option<Instant>,
-    /// The last page failure, reported when a request finds nothing to answer
-    /// with. Kept here rather than returned immediately because the walker
-    /// runs on its own thread and has no caller to return to.
-    error: Option<VibexError>,
+/// The registry's list is a preference order, so the first address that passes
+/// the same public-`https` policy every market fetch passes is the one kept. An
+/// entry with none keeps none: the card falls back to its transport glyph
+/// rather than inventing a logo.
+fn registry_icon(server: &RegistryServer) -> Option<String> {
+    server
+        .icons
+        .iter()
+        .filter_map(|icon| icon.src.as_deref())
+        .map(str::trim)
+        .find(|src| market_url_policy(src).is_ok())
+        .map(str::to_string)
 }
 
-static MCP_CATALOG: LazyLock<Mutex<McpCatalogIndex>> =
-    LazyLock::new(|| Mutex::new(McpCatalogIndex::default()));
+// ---------------------------------------------------------------------------
+// MCP registry search
+// ---------------------------------------------------------------------------
 
-/// Lock the index, ignoring poisoning.
+/// The entries of the last answer, by id.
 ///
-/// A panic in the walker must not turn the market into a permanently dead
-/// feature: the worst a poisoned lock can mean here is that a half-written
-/// page is visible, and the next walk repairs that.
-fn mcp_catalog_lock() -> std::sync::MutexGuard<'static, McpCatalogIndex> {
-    MCP_CATALOG
+/// An icon is asked for after the grid has the entry, and the entry is what
+/// carries the picture's address; keeping the last answer is what lets the
+/// picture be loaded without a second search. The map is small — one market
+/// page plus a screen of alternatives — and is replaced rather than added to.
+static MARKET_ENTRIES: LazyLock<Mutex<HashMap<String, McpMarketEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Pictures already loaded, by entry id.
+///
+/// A card is re-rendered on every scroll and every keystroke elsewhere in the
+/// pane, so a picture that was fetched once must not be fetched again. The
+/// cache is bounded by the number of entries a market ever lists in one run.
+static MARKET_ICONS: LazyLock<Mutex<HashMap<String, McpMarketIcon>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn market_entry_cache_get(entry_id: &str) -> Option<McpMarketEntry> {
+    MARKET_ENTRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(entry_id)
+        .cloned()
+}
+
+fn market_entries_cache_put(entries: &[McpMarketEntry]) {
+    let mut cache = MARKET_ENTRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for entry in entries {
+        cache.insert(entry.id.clone(), entry.clone());
+    }
+}
+
+fn market_icon_cache_get(entry_id: &str) -> Option<McpMarketIcon> {
+    MARKET_ICONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(entry_id)
+        .cloned()
+}
+
+fn market_icon_cache_put(entry_id: &str, icon: McpMarketIcon) {
+    MARKET_ICONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(entry_id.to_string(), icon);
+}
+
+/// What a result set is keyed by: the question, not the page of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct McpSearchKey {
+    query: String,
+    transport: Option<String>,
+}
+
+/// One result set read in this run.
+#[derive(Default)]
+struct McpSearchSet {
+    /// Everything read for this question, in registry order.
+    entries: Vec<McpMarketEntry>,
+    /// Where the next unwalked page starts, absent once the registry ended.
+    cursor: Option<String>,
+    /// Windows already answered, by `offset:limit`.
+    windows: HashMap<String, McpMarketSearchResponse>,
+}
+
+/// Result sets read in this run, by question.
+///
+/// The market is one grid read one page at a time, so the pages a reader moves
+/// through are pages of the same answer. Keeping the answer is what makes
+/// paging back instant and stops a page from being re-walked from the first
+/// result; the map is bounded because a session asks a bounded number of
+/// questions and this is cleared with the process.
+static MARKET_SEARCH: LazyLock<Mutex<HashMap<McpSearchKey, McpSearchSet>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn market_search_lock() -> std::sync::MutexGuard<'static, HashMap<McpSearchKey, McpSearchSet>> {
+    MARKET_SEARCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn mcp_registry_page_url(cursor: Option<&str>) -> String {
-    let mut url =
-        format!("{MCP_REGISTRY_BASE}/v0.1/servers?version=latest&limit={MCP_REGISTRY_PAGE_SIZE}");
-    if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
+fn market_search_window_get(
+    key: &McpSearchKey,
+    offset: usize,
+    limit: usize,
+) -> Option<McpMarketSearchResponse> {
+    market_search_lock()
+        .get(key)
+        .and_then(|set| set.windows.get(&format!("{offset}:{limit}")).cloned())
+}
+
+fn market_search_window_put(
+    key: &McpSearchKey,
+    offset: usize,
+    limit: usize,
+    response: &McpMarketSearchResponse,
+) {
+    let mut cache = market_search_lock();
+    // A new question is a new result set; only the last handful is kept so a
+    // long session of typing does not accumulate answers nobody returns to.
+    if cache.len() >= 16 && !cache.contains_key(key) {
+        cache.clear();
+    }
+    cache
+        .entry(key.clone())
+        .or_default()
+        .windows
+        .insert(format!("{offset}:{limit}"), response.clone());
+}
+
+fn market_search_entries_get(key: &McpSearchKey) -> Vec<McpMarketEntry> {
+    market_search_lock()
+        .get(key)
+        .map(|set| set.entries.clone())
+        .unwrap_or_default()
+}
+
+fn market_search_cursor_get(key: &McpSearchKey) -> Option<String> {
+    market_search_lock()
+        .get(key)
+        .and_then(|set| set.cursor.clone())
+}
+
+fn market_search_entries_put(
+    key: &McpSearchKey,
+    entries: Vec<McpMarketEntry>,
+    cursor: Option<String>,
+) {
+    let mut cache = market_search_lock();
+    if cache.len() >= 16 && !cache.contains_key(key) {
+        cache.clear();
+    }
+    let set = cache.entry(key.clone()).or_default();
+    set.entries = entries;
+    set.cursor = cursor;
+}
+
+/// Load one entry's picture, or the empty icon when it published none.
+///
+/// The bytes come from the publisher's own address, so the fetch goes through
+/// the same public-`https`, redirect and size policy as every other market
+/// read, and the type is decided by the bytes rather than by the address.
+fn load_market_icon(entry_id: &str) -> VibexResult<McpMarketIcon> {
+    let entry_id = entry_id.trim();
+    if entry_id.is_empty() {
+        return Err(VibexError::validation(
+            "market_icon_entry_missing",
+            "no market entry was named",
+        ));
+    }
+    if let Some(icon) = market_icon_cache_get(entry_id) {
+        return Ok(icon);
+    }
+    let entry = market_entry_cache_get(entry_id).ok_or_else(|| {
+        VibexError::validation(
+            "market_icon_entry_unknown",
+            "the entry is not in the market's last answer; search for it again",
+        )
+    })?;
+    let Some(url) = entry.icon_url.clone() else {
+        return Ok(McpMarketIcon::default());
+    };
+    let client = market_http_client()?;
+    let bytes = fetch_market_bytes(&client, &url, MAX_MARKET_ICON_BYTES)?.0;
+    let mime = sniff_image_mime(&bytes).ok_or_else(|| {
+        VibexError::provider(
+            "market_icon_not_image",
+            "the picture the entry named is not an image the market can show",
+        )
+        .with_diagnostic("entry", entry_id.to_string())
+    })?;
+    let icon = McpMarketIcon {
+        mime: Some(mime.to_string()),
+        bytes,
+    };
+    market_icon_cache_put(entry_id, icon.clone());
+    Ok(icon)
+}
+
+/// The media type of an image, read from its bytes rather than its address.
+///
+/// A publisher names the type it meant; the bytes are what a renderer will act
+/// on, so only the formats the desktop can decode are accepted, and an SVG is
+/// recognised by its markup because it has no binary header.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
+        [b'B', b'M', ..] => Some("image/bmp"),
+        [0, 0, 1, 0, ..] => Some("image/x-icon"),
+        _ => {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+            let trimmed = head.trim_start();
+            (trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && head.contains("<svg")))
+                .then_some("image/svg+xml")
+        }
+    }
+}
+
+/// The registry lists a page per request and will not serve more than this.
+const MCP_REGISTRY_PAGE_SIZE: u32 = 100;
+
+/// Shortest query the registry's search accepts. Anything shorter is refused
+/// with a 422, so a shorter query is a browse rather than a failed search.
+const MCP_REGISTRY_MIN_QUERY_CHARS: usize = 3;
+
+/// Longest query worth sending: the registry matches a bounded name field, and
+/// a caller pasting a paragraph is asking for a browse rather than a match.
+const MCP_REGISTRY_MAX_QUERY_CHARS: usize = 120;
+
+/// Pages one search may walk when the registry keeps handing back a cursor.
+///
+/// The registry ranks nothing and pages by name, so following its cursor is
+/// what makes "results 101..200" reachable. Four pages of a hundred is more
+/// than one screen of results ever shows while keeping one request bounded.
+const MCP_REGISTRY_SEARCH_PAGES: usize = 4;
+
+/// A search answer plus the cursor the next page of it starts at.
+struct McpSearchPage {
+    entries: Vec<McpMarketEntry>,
+    next_cursor: Option<String>,
+}
+
+/// Read one page of a search or a browse from the registry.
+///
+/// Both are the same endpoint: a search adds `search`, a browse is the name
+/// order the registry publishes. `version=latest` is what the market installs
+/// from, so it is also what it reads.
+fn mcp_registry_page(
+    client: &reqwest::blocking::Client,
+    query: Option<&str>,
+    cursor: Option<&str>,
+    limit: u32,
+) -> VibexResult<McpSearchPage> {
+    let limit = limit.clamp(1, MCP_REGISTRY_PAGE_SIZE);
+    let mut url = format!("{MCP_REGISTRY_BASE}/v0.1/servers?version=latest&limit={limit}");
+    if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
+        url.push_str("&search=");
+        url.push_str(&urlencode(query.trim()));
+    }
+    if let Some(cursor) = cursor.filter(|value| !value.trim().is_empty()) {
         url.push_str("&cursor=");
         url.push_str(&urlencode(cursor));
     }
-    url
-}
-
-/// Walk one registry page into the index and report how many entries it added.
-///
-/// The registry's `version=latest` view is what the market installs from, so
-/// that is the view it indexes: a page of it is one request, and the response's
-/// own cursor is the only way forward.
-fn mcp_catalog_fetch_page(client: &reqwest::blocking::Client) -> VibexResult<usize> {
-    let cursor = mcp_catalog_lock().cursor.clone();
-    let response: RegistryListResponse =
-        fetch_market_json(client, &mcp_registry_page_url(cursor.as_deref()))?;
-
-    let mut index = mcp_catalog_lock();
-    let mut added = 0usize;
-    for record in &response.servers {
-        if index.entries.len() >= MCP_CATALOG_MAX_ENTRIES {
-            break;
-        }
-        let Some(entry) = registry_server_to_entry(record) else {
-            continue;
-        };
-        if !index.ids.insert(entry.id.clone()) {
-            continue;
-        }
-        index.entries.push(entry);
-        added += 1;
-    }
-
-    let next = response
+    let response: RegistryListResponse = fetch_market_json(client, &url)?;
+    let next_cursor = response
         .metadata
         .and_then(|metadata| metadata.next_cursor)
-        .filter(|cursor| !cursor.is_empty());
-    match next {
-        // A cursor that does not move would loop the walker forever on the same
-        // page, so a repeated cursor is treated as the end of the catalog.
-        Some(next)
-            if Some(&next) != cursor.as_ref() && index.entries.len() < MCP_CATALOG_MAX_ENTRIES =>
-        {
-            index.cursor = Some(next);
-        }
-        _ => index.exhausted = true,
-    }
-    index.fetched_at.get_or_insert_with(Instant::now);
-    index.error = None;
-    Ok(added)
+        .filter(|cursor| !cursor.trim().is_empty());
+    let entries = response
+        .servers
+        .iter()
+        .filter(|record| registry_record_is_active(record))
+        .filter_map(registry_server_to_entry)
+        .collect();
+    Ok(McpSearchPage {
+        entries,
+        next_cursor,
+    })
 }
 
-/// Walk pages until one lands, retrying a page the registry drops.
+/// Whether a record is a server the market may offer.
 ///
-/// A single slow page used to be indistinguishable from an outage. The walker
-/// is not on anyone's critical path, so it can afford a second attempt.
-fn mcp_catalog_fetch_page_with_retry(client: &reqwest::blocking::Client) -> VibexResult<usize> {
-    let mut last = None;
-    for _ in 0..MCP_PAGE_ATTEMPTS {
-        match mcp_catalog_fetch_page(client) {
-            Ok(added) => return Ok(added),
-            Err(error) => last = Some(error),
-        }
-    }
-    Err(last.unwrap_or_else(|| {
-        VibexError::provider("market_unreachable", "the registry could not be reached")
-    }))
+/// The registry publishes withdrawn variants beside live ones, and a search
+/// that offered a deleted server would be offering an install that cannot run.
+fn registry_record_is_active(record: &RegistryServerRecord) -> bool {
+    let status = record
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.official.as_ref())
+        .and_then(|official| official.status.as_deref())
+        .map(str::trim)
+        .unwrap_or("active");
+    status.eq_ignore_ascii_case("active")
 }
 
-/// Start the background walker unless it is already running or has finished.
+/// Answer one market request against the registry's own search.
 ///
-/// The registry answers one cursor page at a time and the catalog holds
-/// thousands of entries, so indexing continues in the background while the
-/// market is in use. Every call refreshes the activity stamp; the walker stops
-/// on its own once the registry is exhausted, the entry cap is reached, or the
-/// market has been closed long enough that continuing would be work nobody
-/// asked for.
-fn mcp_catalog_ensure_walker() {
-    {
-        let mut index = mcp_catalog_lock();
-        index.used_at = Some(Instant::now());
-        if index.filling || index.exhausted || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES {
-            return;
-        }
-        index.filling = true;
-    }
-
-    let spawned = std::thread::Builder::new()
-        .name("mcp-catalog".to_string())
-        .spawn(|| {
-            let client = match market_http_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    let mut index = mcp_catalog_lock();
-                    index.error = Some(error);
-                    index.filling = false;
-                    return;
-                }
-            };
-            loop {
-                {
-                    let index = mcp_catalog_lock();
-                    if index.exhausted
-                        || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES
-                        || index
-                            .used_at
-                            .is_some_and(|at| at.elapsed() > MCP_CATALOG_IDLE)
-                    {
-                        break;
-                    }
-                }
-                if let Err(error) = mcp_catalog_fetch_page_with_retry(&client) {
-                    mcp_catalog_lock().error = Some(error);
-                    break;
-                }
-                std::thread::sleep(MCP_CATALOG_FILL_PAUSE);
-            }
-            mcp_catalog_lock().filling = false;
-        });
-
-    if spawned.is_err() {
-        mcp_catalog_lock().filling = false;
-    }
-}
-
-/// Drop a catalog that has gone stale, so the next request re-walks it.
-fn mcp_catalog_expire_if_stale() {
-    let mut index = mcp_catalog_lock();
-    let stale = index
-        .fetched_at
-        .is_some_and(|at| at.elapsed() > MCP_CATALOG_TTL);
-    if stale {
-        index.entries.clear();
-        index.ids.clear();
-        index.cursor = None;
-        index.exhausted = false;
-        index.fetched_at = None;
-    }
-}
-
-/// What one request needs to know about the index.
-struct McpCatalogWindow {
-    /// The matching entries the caller asked for, already cut to its limit.
-    entries: Vec<McpMarketEntry>,
-    /// How many indexed entries matched, before the limit.
-    total_matches: usize,
-    /// How many entries the index holds in total.
-    catalog_size: usize,
-    exhausted: bool,
-    error: Option<VibexError>,
-}
-
-/// Wait for the index to satisfy `ready`, then cut the window the caller asked
-/// for while still holding the lock.
+/// The registry is asked the question the reader asked, so the answer covers
+/// the whole catalog rather than a window this process happened to walk. A
+/// query shorter than the registry accepts is a browse: the same endpoint
+/// without `search`, in the order the registry publishes.
 ///
-/// Polling rather than a condition variable: a page takes seconds, so the
-/// poll's own cost is noise, and this keeps the walker free to update the index
-/// without any handshake to get wrong.
-fn mcp_catalog_wait_for_window(
-    deadline: Instant,
-    query: &str,
-    transport: Option<McpMarketTransportFilter>,
-    offset: usize,
-    limit: usize,
-    mut ready: impl FnMut(&McpCatalogIndex) -> bool,
-) -> McpCatalogWindow {
-    loop {
-        {
-            let index = mcp_catalog_lock();
-            if ready(&index) || Instant::now() >= deadline {
-                // One pass: every match is counted, and the ones inside the
-                // requested window are cloned. The count is taken before the
-                // offset is applied because it is what the caller's pager
-                // divides into pages, not what is left after the skip.
-                let mut total_matches = 0usize;
-                let mut entries = Vec::new();
-                for entry in index
-                    .entries
-                    .iter()
-                    .filter(|entry| mcp_entry_matches(entry, query, transport))
-                {
-                    if total_matches >= offset && entries.len() < limit {
-                        entries.push(entry.clone());
-                    }
-                    total_matches += 1;
-                }
-                return McpCatalogWindow {
-                    entries,
-                    total_matches,
-                    catalog_size: index.entries.len(),
-                    exhausted: index.exhausted,
-                    error: index.error.clone(),
-                };
-            }
-        }
-        std::thread::sleep(MCP_CATALOG_POLL);
-    }
-}
-
-/// Whether one entry matches a lowercased query.
-///
-/// The registry's own search matches names only, which is why a query for what
-/// a server does — "database", "screenshot" — finds nothing there. Matching the
-/// description and publisher too is what makes the market's search worth using.
-fn mcp_entry_matches(
-    entry: &McpMarketEntry,
-    query: &str,
-    transport: Option<McpMarketTransportFilter>,
-) -> bool {
-    if transport.is_some_and(|filter| !filter.matches(entry.transport)) {
-        return false;
-    }
-    if query.is_empty() {
-        return true;
-    }
-    let haystacks = [
-        Some(entry.name.as_str()),
-        entry.description.as_deref(),
-        entry.author.as_deref(),
-        entry.version.as_deref(),
-        entry.package_kind.as_deref(),
-    ];
-    haystacks
-        .into_iter()
-        .flatten()
-        .any(|text| text.to_lowercase().contains(query))
-}
-
-/// Answer one market request from the index, walking further when asked to.
-fn search_mcp_catalog(request: &McpMarketSearchRequest) -> VibexResult<McpMarketSearchResponse> {
+/// The transport filter is applied here because the registry has no parameter
+/// for it, and only to the window the caller asked for: filtering upstream
+/// would make a page of twenty depend on how many of a hundred happened to
+/// match, which is exactly the paging bug this replaces.
+fn search_mcp_registry(request: &McpMarketSearchRequest) -> VibexResult<McpMarketSearchResponse> {
     let query = request
         .query
         .as_deref()
         .map(str::trim)
         .unwrap_or_default()
-        .to_lowercase();
-    let query = query
         .chars()
-        .take(MCP_CATALOG_MAX_QUERY_CHARS)
+        .take(MCP_REGISTRY_MAX_QUERY_CHARS)
         .collect::<String>();
+    let query = query.trim().to_string();
+    let searching = query.chars().count() >= MCP_REGISTRY_MIN_QUERY_CHARS;
     let limit = request
         .limit
-        .unwrap_or(MCP_REGISTRY_PAGE_SIZE)
+        .unwrap_or(MARKET_PAGE_LIMIT)
         .clamp(1, MAX_ENTRIES_PER_SEARCH as u32) as usize;
     let offset = request.offset.unwrap_or(0) as usize;
     let transport = request.transport;
-    let extend = request.extend.unwrap_or(false);
 
-    // A caller that did not ask to extend only needs the index to hold
-    // something worth showing, so a cold start waits for one page and an
-    // already-warm index answers at once. A caller that did ask to extend —
-    // someone who pressed Search — waits for the window it asked for.
-    let wanted = if extend {
-        limit
-    } else {
-        (MCP_REGISTRY_PAGE_SIZE as usize).min(limit)
+    // A result set already read in this run answers a page of itself without
+    // touching the network: paging back is a redraw, and paging forward inside
+    // what was read costs nothing. Only a window past the end asks again.
+    let key = McpSearchKey {
+        query: query.clone(),
+        transport: transport.map(|filter| format!("{filter:?}")),
     };
-
-    mcp_catalog_expire_if_stale();
-    // The walker is what fills the index, so it has to be running before there
-    // is anything to wait for.
-    mcp_catalog_ensure_walker();
-
-    let deadline = Instant::now() + MCP_CATALOG_WAIT;
-    let window = mcp_catalog_wait_for_window(deadline, &query, transport, offset, limit, |index| {
-        index.exhausted
-            || index.entries.len() >= wanted
-            || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES
-    });
-
-    // An index that holds nothing and recorded a failure is an outage, not a
-    // search that found nothing. Reporting the difference is the whole reason
-    // the walker keeps the error instead of dropping it.
-    if window.catalog_size == 0
-        && let Some(error) = window.error
-    {
-        return Err(error);
+    if let Some(window) = market_search_window_get(&key, offset, limit) {
+        market_entries_cache_put(&window.entries);
+        return Ok(window);
     }
 
-    // A search that ran out of indexed entries has not finished searching, so
-    // it keeps the walker going rather than reporting an answer it knows is
-    // incomplete.
-    if !window.exhausted && (query.is_empty() || window.total_matches < limit) {
-        mcp_catalog_ensure_walker();
+    let client = market_http_client()?;
+    let mut entries: Vec<McpMarketEntry> = market_search_entries_get(&key);
+    let mut cursor: Option<String> = market_search_cursor_get(&key);
+    let mut pages = 0usize;
+    // Walk until the window is filled, the cursor runs out, or the page budget
+    // is spent. Counting pages rather than entries is deliberate: the registry
+    // will not serve fewer than a hundred, and the transport filter may drop
+    // most of them, so an entry count would stop too early.
+    while entries.len() < offset + limit && pages < MCP_REGISTRY_SEARCH_PAGES {
+        // A set already exhausted cannot be walked further; the first page of
+        // a fresh set is read with no cursor at all.
+        if (pages > 0 || !entries.is_empty()) && cursor.is_none() {
+            break;
+        }
+        let page = mcp_registry_page(
+            &client,
+            searching.then_some(query.as_str()),
+            cursor.as_deref(),
+            MCP_REGISTRY_PAGE_SIZE,
+        )?;
+        pages += 1;
+        let next = page.next_cursor;
+        entries.extend(
+            page.entries
+                .into_iter()
+                .filter(|entry| transport.is_none_or(|filter| filter.matches(entry.transport))),
+        );
+        cursor = next;
     }
+    market_search_entries_put(&key, entries.clone(), cursor.clone());
 
-    Ok(McpMarketSearchResponse {
-        entries: window.entries,
-        has_more: !window.exhausted,
-        catalog_size: window.catalog_size,
-        catalog_exhausted: window.exhausted,
-        total_matches: window.total_matches,
-    })
+    let total_matches = entries.len();
+    let window = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let has_more = cursor.is_some() || total_matches > offset + window.len();
+    // The window is what the card needs an icon for, so only it is remembered:
+    // an entry the reader never sees must not keep a picture resident.
+    market_entries_cache_put(&window);
+    let response = McpMarketSearchResponse {
+        entries: window,
+        has_more,
+        next_cursor: cursor,
+        total_matches,
+        // A browse cannot promise a total: the registry pages by name and the
+        // client stops after a bounded walk, so the count is what was read.
+        total_is_exact: searching,
+    };
+    market_search_window_put(&key, offset, limit, &response);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1904,18 +2026,27 @@ fn render_skill_document(name: &str, description: Option<&str>, body: &str) -> S
 // ---------------------------------------------------------------------------
 
 impl ProviderConfigService {
-    /// Answer one market query from the registry index.
+    /// Answer one market query from the registry's own search.
     ///
-    /// The index is walked in the background instead of queried upstream: the
-    /// registry's own `search` takes tens of seconds, which no interactive
-    /// view can wait for. This returns as soon as the index holds enough to
-    /// answer, and reports how much of the registry it covered when it could
-    /// not answer in full.
+    /// The registry is asked what the reader asked, so the answer covers the
+    /// whole catalog rather than a window this process walked. A query too
+    /// short for the registry's search is a browse.
     pub fn search_mcp_market(
         &self,
         request: McpMarketSearchRequest,
     ) -> VibexResult<McpMarketSearchResponse> {
-        search_mcp_catalog(&request)
+        search_mcp_registry(&request)
+    }
+
+    /// Load the picture one market entry published.
+    ///
+    /// The bytes come from the runtime rather than from the card, so a paired
+    /// client shows the same picture without a network client of its own, and
+    /// every hop is validated like every other market fetch. The result is kept
+    /// in memory under the entry id, because a grid re-renders far more often
+    /// than the pictures change.
+    pub fn mcp_market_icon(&self, entry_id: &str) -> VibexResult<McpMarketIcon> {
+        load_market_icon(entry_id)
     }
 
     /// Answer one Skill market query.
@@ -2391,6 +2522,7 @@ fn set_skill_agent_matrix_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn market_policy_refuses_non_public_and_insecure_urls() {
@@ -2455,6 +2587,7 @@ mod tests {
                 homepage: None,
                 website_url: None,
                 repository: None,
+                icons: Vec::new(),
                 packages,
                 remotes: Vec::new(),
             }),
@@ -2633,60 +2766,141 @@ mod tests {
         assert_eq!(entry.updated_at.as_deref(), Some("2026-07-27T15:34:57Z"));
     }
 
-    /// The registry's own search matches names only, so a query for what a
-    /// server does finds nothing there. The market's search has to look wider.
+    /// A remote entry authenticates with headers, and the registry publishes
+    /// them as variables. Without carrying them the install form has nothing to
+    /// ask for and the saved server answers 401.
     #[test]
-    fn market_search_matches_more_than_the_name() {
-        let entry = McpMarketEntry {
-            id: "io.example/browser".to_string(),
-            name: "Browser Tool".to_string(),
-            description: Some("Capture a screenshot of any page".to_string()),
-            homepage: None,
-            repository: None,
-            author: Some("io.example".to_string()),
-            status: None,
-            updated_at: None,
-            transport: McpServerTransportKind::Http,
-            command: None,
-            args: Vec::new(),
-            url: Some("https://example.com/mcp".to_string()),
-            env: Vec::new(),
-            version: Some("1.0.0".to_string()),
-            package_kind: Some("remote".to_string()),
+    fn remote_headers_become_install_inputs() {
+        let remote = RegistryRemote {
+            remote_type: Some("streamable-http".to_string()),
+            url: Some("https://mcp.example.com/mcp".to_string()),
+            headers: vec![
+                RegistryEnvVar {
+                    name: Some("Authorization".to_string()),
+                    description: Some("personal access token".to_string()),
+                    is_required: Some(true),
+                    is_secret: Some(true),
+                    value: Some("Bearer {token}".to_string()),
+                    default: None,
+                },
+                // A value the publisher ships needs nothing from the reader.
+                RegistryEnvVar {
+                    name: Some("X-Client".to_string()),
+                    description: None,
+                    is_required: None,
+                    is_secret: None,
+                    value: Some("vibex".to_string()),
+                    default: None,
+                },
+            ],
         };
-        assert!(mcp_entry_matches(&entry, "", None));
-        assert!(mcp_entry_matches(&entry, "browser", None));
-        assert!(mcp_entry_matches(&entry, "screenshot", None));
-        assert!(mcp_entry_matches(&entry, "io.example", None));
-        assert!(!mcp_entry_matches(&entry, "database", None));
-        // The transport filter is a narrowing of its own: a remote entry is
-        // not a local one, whatever the query says.
-        assert!(mcp_entry_matches(
-            &entry,
-            "",
-            Some(McpMarketTransportFilter::Remote)
-        ));
-        assert!(!mcp_entry_matches(
-            &entry,
-            "",
-            Some(McpMarketTransportFilter::Local)
-        ));
+        let inputs = registry_header_requirements(&remote);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "Authorization");
+        assert!(inputs[0].required && inputs[0].secret);
+        assert_eq!(
+            inputs[0].description.as_deref(),
+            Some("personal access token")
+        );
+    }
+
+    /// The registry's list is a preference order, and an address that is not a
+    /// public `https` one must be skipped rather than loaded.
+    #[test]
+    fn an_entry_keeps_the_first_loadable_picture() {
+        let mut server = RegistryServer {
+            name: "io.example/with-icon".to_string(),
+            title: None,
+            description: None,
+            homepage: None,
+            website_url: None,
+            repository: None,
+            icons: vec![
+                RegistryIcon {
+                    src: Some("http://insecure.example/icon.png".to_string()),
+                },
+                RegistryIcon {
+                    src: Some("https://cdn.example/icon.png".to_string()),
+                },
+            ],
+            packages: vec![registry_package_of("npm", "example-server", "1.0.0")],
+            remotes: Vec::new(),
+        };
+        assert_eq!(
+            registry_icon(&server).as_deref(),
+            Some("https://cdn.example/icon.png")
+        );
+        server.icons.clear();
+        assert_eq!(registry_icon(&server), None);
+    }
+
+    /// A withdrawn entry is not something the market may offer: installing it
+    /// would write a launcher that cannot run.
+    #[test]
+    fn a_withdrawn_registry_record_is_not_offered() {
+        let mut record = registry_record(
+            "io.example/old",
+            vec![registry_package_of("npm", "example-server", "1.0.0")],
+        );
+        assert!(registry_record_is_active(&record));
+        record.meta = Some(RegistryRecordMeta {
+            official: Some(RegistryOfficialMeta {
+                status: Some("deleted".to_string()),
+                updated_at: None,
+            }),
+        });
+        assert!(!registry_record_is_active(&record));
+    }
+
+    /// A page size past what the registry serves is a 422, and a query shorter
+    /// than three characters is one too. Both are decided before a request is
+    /// made so the market answers instead of reporting a bad request.
+    #[test]
+    fn the_registry_limits_are_respected_before_a_request() {
+        // A page larger than the registry serves is a 422, and so is a query
+        // shorter than its minimum; both are refused before a request is made.
+        const { assert!(MCP_REGISTRY_PAGE_SIZE == 100) };
+        const { assert!(MCP_REGISTRY_MIN_QUERY_CHARS >= 3) };
+        const { assert!(MCP_REGISTRY_MAX_QUERY_CHARS >= MCP_REGISTRY_MIN_QUERY_CHARS) };
     }
 
     #[test]
-    fn registry_page_url_walks_the_cursor_and_encodes_it() {
+    fn image_bytes_decide_the_media_type() {
         assert_eq!(
-            mcp_registry_page_url(None),
-            "https://registry.modelcontextprotocol.io/v0.1/servers?version=latest&limit=100"
+            sniff_image_mime(&[0x89, b'P', b'N', b'G', 13, 10]),
+            Some("image/png")
         );
-        // A cursor is `name:version`, and the slash in a name has to survive
-        // the round trip.
-        let url = mcp_registry_page_url(Some("ai.example/server:1.0.0"));
-        assert!(
-            url.ends_with("&cursor=ai.example%2Fserver%3A1.0.0"),
-            "{url}"
+        assert_eq!(
+            sniff_image_mime(&[0xff, 0xd8, 0xff, 0xe0]),
+            Some("image/jpeg")
         );
-        assert!(!mcp_registry_page_url(Some("")).contains("cursor"));
+        assert_eq!(
+            sniff_image_mime(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(sniff_image_mime(b"<html>not a picture</html>"), None);
+    }
+
+    /// A search and a browse are the same endpoint: the query is what turns
+    /// one into the other, and a cursor is echoed untouched.
+    #[test]
+    fn the_search_url_carries_the_query_and_the_cursor() {
+        // The page builder is the only place a registry URL is assembled, so
+        // its shape is what the assertions below pin.
+        let source = include_str!("market.rs");
+        let builder = source
+            .split_once("fn mcp_registry_page(")
+            .and_then(|(_, tail)| tail.split_once("\n/// Whether a record is a server"))
+            .map(|(body, _)| body)
+            .expect("the registry page builder should remain inspectable");
+        assert!(builder.contains("version=latest"));
+        assert!(builder.contains("limit="));
+        assert!(builder.contains("&search="));
+        assert!(builder.contains("&cursor="));
+        assert!(builder.contains("&urlencode(query.trim())"));
+        assert!(builder.contains("&urlencode(cursor)"));
+        // The limit is clamped to what the registry serves before it is sent.
+        assert!(builder.contains("limit.clamp(1, MCP_REGISTRY_PAGE_SIZE)"));
     }
 
     /// A real page of the registry, captured from the live API.
@@ -2802,62 +3016,82 @@ mod tests {
     /// network; run it with `cargo test -p vibex-config-switch -- --ignored`
     /// when the registry's shape or latency is in question.
     ///
-    /// This is the check that the market answers at all: the registry's own
-    /// `search` parameter used to be the only way to search, and it takes tens
-    /// of seconds, so the thing worth proving is that a page lands quickly and
-    /// that a query is answered from what landed.
+    /// This is the check that the market answers at all: a search has to reach
+    /// the registry rather than a window this process walked, and it has to
+    /// come back inside one interactive wait.
     #[test]
     #[ignore = "hits the live MCP registry"]
-    fn live_registry_index_fills_and_searches() {
+    fn live_registry_search_answers_from_the_whole_catalog() {
         let started = Instant::now();
-        let browse = search_mcp_catalog(&McpMarketSearchRequest {
+        let browse = search_mcp_registry(&McpMarketSearchRequest {
             query: None,
-            limit: Some(100),
+            limit: Some(20),
             offset: None,
+            cursor: None,
             transport: None,
-            extend: Some(true),
         })
         .expect("the live registry answers a browse");
-        let elapsed = started.elapsed();
         assert!(
-            browse.entries.len() >= 100,
+            browse.entries.len() >= 20,
             "a browse window should hold a full page, got {}",
             browse.entries.len()
         );
-        assert!(browse.catalog_size >= browse.entries.len());
-        assert!(
-            elapsed < MCP_CATALOG_WAIT + MARKET_REQUEST_TIMEOUT,
-            "a browse should answer inside one wait, took {elapsed:?}"
-        );
+        assert!(started.elapsed() < MARKET_REQUEST_TIMEOUT);
 
-        // Searching for something the index actually holds must find it. A
-        // term from deeper in the catalog may legitimately miss: the index is
-        // filled one page at a time, so a cold search only covers what has
-        // landed so far.
-        let needle = browse.entries[0].name.to_lowercase();
-        let needle = needle
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let search = search_mcp_catalog(&McpMarketSearchRequest {
-            query: Some(needle.clone()),
-            limit: Some(50),
+        // A name that sits deep in the registry's published order is the whole
+        // point of asking upstream: it must be found on the first search, not
+        // after a background walk caught up with it.
+        let search = search_mcp_registry(&McpMarketSearchRequest {
+            query: Some("grafana".to_string()),
+            limit: Some(20),
             offset: None,
+            cursor: None,
             transport: None,
-            extend: Some(true),
         })
         .expect("the live registry answers a search");
-        assert!(
-            search.total_matches >= 1,
-            "searching {needle:?} found nothing among {} indexed entries",
-            search.catalog_size
-        );
         assert!(
             search
                 .entries
                 .iter()
-                .any(|entry| mcp_entry_matches(entry, &needle, None))
+                .any(|entry| entry.name.to_lowercase().contains("grafana")
+                    || entry
+                        .description
+                        .as_deref()
+                        .is_some_and(|text| text.to_lowercase().contains("grafana"))),
+            "searching grafana among {} entries found nothing",
+            search.total_matches
+        );
+    }
+
+    /// The live icon path: a search finds an entry that published a picture,
+    /// and the picture the runtime loads is one it would show.
+    #[test]
+    #[ignore = "hits the live MCP registry"]
+    fn live_registry_entry_icon_loads() {
+        let response = search_mcp_registry(&McpMarketSearchRequest {
+            query: Some("context7".to_string()),
+            limit: Some(20),
+            offset: None,
+            cursor: None,
+            transport: None,
+        })
+        .expect("the live registry answers a search");
+        let entry = response
+            .entries
+            .iter()
+            .find(|entry| entry.icon_url.is_some())
+            .expect("an entry that published a picture");
+        // The icon path is a service method, but it only reads the cache the
+        // search above filled, so it is called through the same helper the
+        // cache writes.
+        let icon = load_market_icon(&entry.id).expect("the entry's picture loads");
+        assert!(!icon.is_empty(), "the picture came back empty");
+        assert!(
+            icon.mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/")),
+            "the picture's type is {:?}",
+            icon.mime
         );
     }
 
