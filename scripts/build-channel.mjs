@@ -16,6 +16,14 @@ if (targetIndex >= 0 && (!target || target.startsWith("--"))) {
   process.exit(2);
 }
 
+// Identical code folding deletes the duplicate monomorphised bodies that make
+// the GPUI binaries large, but only lld implements `--icf`; the GNU bfd linker
+// rustc reaches through `cc` rejects it. Scope both flags to the Linux x86_64
+// target through target rustflags so macOS and Windows links are untouched and
+// an outer RUSTFLAGS is never overwritten.
+const LINUX_X86_64_LINK_FLAGS =
+  '["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--icf=all"]';
+
 // Both binaries the Packager configs declare must be built here: the desktop
 // GUI, and the standalone `vibex` character-grid client from `vibex-client`.
 // `vibex-desktop` only depends on `vibex-client` as a library, so building the
@@ -31,7 +39,10 @@ const nativeBuildResult = spawnSync(
     "vibex-client",
     "--release",
     "--locked",
-    ...(target ? ["--target", target] : [])
+    ...(target ? ["--target", target] : []),
+    ...(process.platform === "linux"
+      ? ["--config", `target.x86_64-unknown-linux-gnu.rustflags=${LINUX_X86_64_LINK_FLAGS}`]
+      : [])
   ],
   {
     cwd: ROOT,

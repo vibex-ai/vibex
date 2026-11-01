@@ -29,6 +29,27 @@ embeds the other product's assets.
   process cross-architecture binaries, so aarch64 releases ship the `.deb`
   package instead of an AppImage.
 
+## Linux deb Packaging Rules
+
+- cargo-packager writes the deb payload as `control.tar.gz` + `data.tar.gz` and
+  exposes no compression setting, so every packaging command repacks both
+  members into xz with `scripts/compress-deb.mjs`. Only those two tar members
+  change; the installed tree and the control fields stay untouched.
+- The repack uses xz preset 9 and removes more than a third of the published
+  `.deb` (the 0.1.0-rc.8 preview payload drops from 119.8 MB to 69.8 MB).
+- Building a `.deb` requires `xz` on the packaging host; the repacked package
+  must still extract with `dpkg-deb -x`/`-e`.
+
+## Linux Binary Linking Rules
+
+- Linux x86_64 release links run through lld with `--icf=all` from
+  `scripts/build-channel.mjs`: identical code folding removes the duplicate
+  monomorphised bodies, which the GNU bfd linker rustc reaches by default
+  cannot do because it has no ICF implementation.
+- The flags are scoped to the `x86_64-unknown-linux-gnu` target, so macOS and
+  Windows links are unchanged, and the packaging host needs `ld.lld` (the
+  `lld` package on Debian/Ubuntu) before a release build can link.
+
 ## Headless Server Packaging Rules
 
 - Linux server artifacts are linked inside `deploy/server/Dockerfile.build`, a

@@ -133,10 +133,12 @@ function validatePackaging() {
     const command = packageJson.scripts?.[`package:${channel}`] ?? "";
     assert(command.includes(`build-channel.mjs ${channel}`), `${channel} package command drifted`);
     assert(command.includes("--formats deb,appimage"), `${channel} package formats drifted`);
+    assert(command.includes("compress-deb.mjs"), `${channel} package does not xz-compress its deb`);
   }
   const workflow = workflowSource(".github/workflows/release-candidate.yml");
   assert(workflow.includes("ubuntu-24.04"), "candidate workflow lost its Linux host");
   assert(workflow.includes("--formats deb,appimage"), "candidate workflow formats drifted");
+  assert(workflow.includes("compress-deb.mjs"), "candidate workflow does not xz-compress its deb");
   for (const dependency of [
     "libglib2.0-dev",
     "libgtk-3-dev",

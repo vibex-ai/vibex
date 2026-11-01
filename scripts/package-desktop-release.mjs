@@ -12,6 +12,8 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { compressDebPackage } from "./compress-deb.mjs";
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PLATFORMS = new Set(["linux", "macos", "windows"]);
 // Cross-packaged architectures are released as deb (Linux), dmg (macOS), and
@@ -287,6 +289,17 @@ function main() {
       ],
       { env: buildEnvironment }
     );
+    // cargo-packager fixes the deb payload to gzip; xz is what keeps the
+    // published package to a fraction of the installed tree.
+    if (platform === "linux") {
+      for (const entry of readdirSync(packageDirectory)) {
+        if (!entry.endsWith(".deb")) continue;
+        const result = compressDebPackage(join(packageDirectory, entry));
+        if (result) {
+          console.log(`${entry}: ${result.before} -> ${result.after} bytes`);
+        }
+      }
+    }
   } finally {
     if (generatedConfig) rmSync(generatedConfig, { force: true });
   }
