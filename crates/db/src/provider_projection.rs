@@ -15,11 +15,12 @@ use vibex_core::{
     ModelProviderHeaderValue, ModelProviderHeaderVariable, ModelProviderProfile,
     ModelProviderProfileId, ModelProviderProfileStatus, ModelProviderProxyPolicy,
     ProjectionDescriptorMatch, ProjectionEvidenceState, ProjectionSecretReference,
-    ProjectionVerificationState, ProviderConfiguredModel, ProviderModelWireApi, ProviderProfile,
-    ProviderProfileId, ProviderProfileStatus, ProviderSecretKind, ProviderSecretSetupState,
-    TransportKind, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
-    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
-    acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
+    ProjectionVerificationState, ProviderBindingMetadata, ProviderConfiguredModel,
+    ProviderModelWireApi, ProviderProfile, ProviderProfileId, ProviderProfileStatus,
+    ProviderSecretKind, ProviderSecretSetupState, TransportKind, VibexError, VibexResult,
+    WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries, builtin_agent_definitions,
+    unix_timestamp_ms,
 };
 
 use super::{
@@ -3451,6 +3452,119 @@ mod tests {
             WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
         );
     }
+
+    /// A Provider that points at an OpenCode gateway is repaired even when it
+    /// predates the preset declaring the session header.
+    #[test]
+    fn opencode_session_header_backfills_existing_providers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut opencode = ProviderProfile::local_default(ProviderKind::Acp);
+        opencode.id = ProviderProfileId::new();
+        opencode.status = ProviderProfileStatus::Enabled;
+        opencode.base_url = Some("https://opencode.ai/zen/go/v1".to_string());
+        opencode.provider_options = ProviderOptions::empty();
+        ProviderProfileRepository::insert(&conn, &opencode).unwrap();
+
+        let mut other = ProviderProfile::local_default(ProviderKind::Acp);
+        other.id = ProviderProfileId::new();
+        other.status = ProviderProfileStatus::Enabled;
+        other.base_url = Some("https://api.example.invalid/v1".to_string());
+        other.provider_options = ProviderOptions::empty();
+        ProviderProfileRepository::insert(&conn, &other).unwrap();
+
+        let standalone = ModelProviderProfile {
+            id: ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: "Imported OpenCode Go".to_string(),
+            vendor_hint: Some("opencode-go".to_string()),
+            endpoints: vec![ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://opencode.ai/zen/go/v1".to_string(),
+                wire_protocol_id: None,
+            }],
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: vec![ModelProviderCatalogEntry {
+                id: "deepseek-v4.1-flash".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            }],
+            default_model_id: Some("deepseek-v4.1-flash".to_string()),
+            headers: Vec::new(),
+            metadata: Default::default(),
+            status: ModelProviderProfileStatus::Enabled,
+            revision: 1,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            deleted_at_ms: None,
+        };
+        ModelProviderProfileRepository::insert(&conn, &standalone).unwrap();
+
+        // Let the rest of the schema stand and run only the header repair again.
+        conn.execute("DELETE FROM schema_migrations WHERE version = 87", [])
+            .unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let saved = ProviderProfileRepository::get(&conn, &opencode.id)
+            .unwrap()
+            .unwrap();
+        let raw = provider_option(&saved, LEGACY_HEADER_OVERRIDE_OPTION_KEY)
+            .expect("the OpenCode Provider must carry a header override");
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
+
+        let projected = ModelProviderProfileRepository::get_by_legacy_profile(&conn, &saved.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projected
+                .headers
+                .iter()
+                .filter(|header| header.name == OPENCODE_SESSION_HEADER)
+                .count(),
+            1
+        );
+
+        let imported = ModelProviderProfileRepository::get(&conn, &standalone.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            imported
+                .headers
+                .iter()
+                .filter(|header| header.name == OPENCODE_SESSION_HEADER)
+                .count(),
+            1
+        );
+
+        // Another gateway is not given a header.
+        let saved = ProviderProfileRepository::get(&conn, &other.id)
+            .unwrap()
+            .unwrap();
+        assert!(provider_option(&saved, LEGACY_HEADER_OVERRIDE_OPTION_KEY).is_none());
+
+        // Running the repair again does not add a second row.
+        conn.execute("DELETE FROM schema_migrations WHERE version = 87", [])
+            .unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let imported = ModelProviderProfileRepository::get(&conn, &standalone.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            imported
+                .headers
+                .iter()
+                .filter(|header| header.name == OPENCODE_SESSION_HEADER)
+                .count(),
+            1
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3802,6 +3916,158 @@ pub(crate) fn migrate_provider_metadata(
     transaction.commit().map_err(storage_err(
         "model_provider_metadata_commit_failed",
         "failed to commit the Provider metadata migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// The header OpenCode's gateways route a request by.
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether one request address names an OpenCode gateway.
+///
+/// Matched case-insensitively and by containment, the same way the Provider
+/// editor recognises it: both Zen and Go sit under this path.
+fn url_names_opencode_gateway(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().contains("opencode.ai/zen")
+}
+
+fn model_provider_names_opencode_gateway(profile: &ModelProviderProfile) -> bool {
+    profile
+        .endpoints
+        .iter()
+        .any(|endpoint| url_names_opencode_gateway(&endpoint.url))
+}
+
+fn legacy_provider_names_opencode_gateway(profile: &ProviderProfile) -> bool {
+    profile
+        .base_url
+        .as_deref()
+        .is_some_and(url_names_opencode_gateway)
+        || profile.provider_options.entries.iter().any(|entry| {
+            entry.key.starts_with("protocolBaseUrl.") && url_names_opencode_gateway(&entry.value)
+        })
+}
+
+fn opencode_session_header_reference() -> ModelProviderHeaderReference {
+    ModelProviderHeaderReference {
+        name: OPENCODE_SESSION_HEADER.to_string(),
+        value: ModelProviderHeaderValue::DynamicVariable(ModelProviderHeaderVariable::SessionId),
+        redacted_hint: "session variable".to_string(),
+    }
+}
+
+/// Adds the session header to a v2 Provider whose address names a gateway that
+/// requires it. Returns whether the record changed.
+fn add_session_header_to_model_provider(profile: &mut ModelProviderProfile) -> bool {
+    if !model_provider_names_opencode_gateway(profile) {
+        return false;
+    }
+    if profile
+        .headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
+    {
+        return false;
+    }
+    profile.headers.push(opencode_session_header_reference());
+    profile.revision = profile.revision.saturating_add(1);
+    profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
+    true
+}
+
+/// Adds the session header to a legacy Provider's `headerOverrideJson`.
+///
+/// A malformed override is left alone rather than replaced: other rows the
+/// user hand-edited live in that object, and rewriting it would drop them.
+fn add_session_header_to_legacy_provider(profile: &mut ProviderProfile) -> bool {
+    if !legacy_provider_names_opencode_gateway(profile) {
+        return false;
+    }
+    let mut headers = match provider_option(profile, LEGACY_HEADER_OVERRIDE_OPTION_KEY) {
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Object(headers)) => headers,
+            _ => return false,
+        },
+        None => serde_json::Map::new(),
+    };
+    if headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
+    {
+        return false;
+    }
+    headers.insert(
+        OPENCODE_SESSION_HEADER.to_string(),
+        serde_json::json!({ "variable": ModelProviderHeaderVariable::SessionId.id() }),
+    );
+    let value = serde_json::Value::Object(headers).to_string();
+    if let Some(entry) = profile
+        .provider_options
+        .entries
+        .iter_mut()
+        .find(|entry| entry.key == LEGACY_HEADER_OVERRIDE_OPTION_KEY)
+    {
+        entry.value = value;
+    } else {
+        profile
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata {
+                key: LEGACY_HEADER_OVERRIDE_OPTION_KEY.to_string(),
+                value,
+            });
+    }
+    profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
+    true
+}
+
+/// Gives existing OpenCode Providers the session header their gateway needs.
+///
+/// The preset now declares it at creation, but a Provider created before that
+/// rule, imported from another client, or edited into an OpenCode address still
+/// has no row. The gateway refuses those requests with a failure that names
+/// nothing the user configured, so the repair belongs in the record rather than
+/// in one surface's creation path. Both records are repaired: the legacy row
+/// the Agent editor shows and the v2 row every projection reads.
+pub(crate) fn migrate_opencode_session_header(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 87;
+    const NAME: &str = "opencode_session_header";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_err(
+            "opencode_session_header_transaction_failed",
+            "failed to start the OpenCode session header migration",
+        ))?;
+    for mut profile in ModelProviderProfileRepository::list(&transaction)? {
+        let expected_revision = profile.revision;
+        if add_session_header_to_model_provider(&mut profile) {
+            ModelProviderProfileRepository::update(&transaction, &profile, expected_revision)?;
+        }
+    }
+    for mut profile in list_legacy_provider_profiles(&transaction)? {
+        if add_session_header_to_legacy_provider(&mut profile) {
+            ProviderProfileRepository::update(&transaction, &profile)?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![VERSION, NAME, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "migration_record_failed",
+            "failed to record the OpenCode session header migration",
+        ))?;
+    transaction.commit().map_err(storage_err(
+        "opencode_session_header_commit_failed",
+        "failed to commit the OpenCode session header migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())

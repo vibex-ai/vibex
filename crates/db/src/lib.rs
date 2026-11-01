@@ -97,7 +97,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 86;
+pub const CURRENT_SCHEMA_VERSION: i64 = 87;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12573,6 +12573,9 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // through the repository that selects it; add it before the read.
     provider_projection::ensure_provider_metadata_column(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
+    // The preset writes the session header when a Provider is created, but a
+    // record that predates that rule still points at the gateway without one.
+    provider_projection::migrate_opencode_session_header(conn, &mut applied)?;
     // Describes each Agent's direct Provider as a single-member route, so the
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
