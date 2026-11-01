@@ -27836,13 +27836,15 @@ impl ManagementCenter {
             .flex_none()
             .overflow_hidden()
             // The top edge is a lip, not a divider: rounded corners, one
-            // hairline, and the raised fill of a sheet pulled up from the
-            // bottom of the column.
+            // hairline, and the fill of a sheet pulled up from the bottom of
+            // the column. The sheet is a module like any other, so it takes
+            // the same fill the Settings page and the rest of this page's
+            // cards use instead of a plate of its own.
             .rounded_tl(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))
             .rounded_tr(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))
             .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(theme::semantic_color("card", cx.theme().is_dark()))
+            .border_color(theme::module_border(cx.theme().is_dark()))
+            .bg(theme::module_surface(cx.theme().is_dark()))
             .child(self.render_route_group_recommendations_resize_handle(cx))
             .child(
                 h_flex()
