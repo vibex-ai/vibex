@@ -1023,6 +1023,31 @@ mod tests {
         assert!(provider < route, "the cards stay in the documented order");
     }
 
+    /// A Provider card does not carry a health dot.
+    ///
+    /// Every card drew a same-sized dot in the health colour, so the column was
+    /// a strip of coloured points with no word beside them and no difference
+    /// between a healthy Provider and an unchecked one. The verdict belongs on
+    /// the detail header, where it is named; the card keeps only the states
+    /// that change what the row means at a glance.
+    #[test]
+    fn provider_cards_do_not_carry_a_health_dot() {
+        let row = SIDEBAR
+            .split_once("fn render_workspace_provider_row(")
+            .and_then(|(_, tail)| tail.split_once("fn render_workspace_route_row("))
+            .map(|(body, _)| body)
+            .expect("the Provider card should remain inspectable");
+        assert!(!row.contains("management-provider-health-"));
+        assert!(!row.contains("shared_provider_health_label("));
+        assert!(!row.contains(".rounded_full()"));
+        // The states the card still has to call out stay: a disabled record
+        // says so, and a favourite keeps its star.
+        assert!(row.contains("management_locale_text(\"Off\", \"已停用\", \"已停用\")"));
+        assert!(row.contains("IconName::StarFill"));
+        // The detail header still names the verdict it now owns.
+        assert!(PROVIDER.contains("shared_provider_health_label(profile)"));
+    }
+
     /// Every detail view opens with the same identity header and underline
     /// tabs, so the three records read as one page family.
     #[test]

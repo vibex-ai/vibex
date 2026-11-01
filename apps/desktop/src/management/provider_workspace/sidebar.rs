@@ -641,7 +641,6 @@ impl ManagementCenter {
             && !self.provider_create_page_open
             && !self.route_group_page_open;
         let enabled = row.profile.status == vibex_core::ModelProviderProfileStatus::Enabled;
-        let (health, health_status) = self.shared_provider_health_label(&row.profile);
         let favorite = self.provider_favorites.contains(id.as_str());
         // Counts are redundant with the section header and the detail page, but
         // a missing Key is the one state the card still has to call out.
@@ -655,35 +654,24 @@ impl ManagementCenter {
                 ))
                 .into_any_element()
         });
-        let trailing = if !enabled {
-            Tag::color(ColorName::Neutral)
-                .xsmall()
-                .child(management_locale_text("Off", "已停用", "已停用"))
-                .into_any_element()
+        // The card trails only what changes how the record is read at a glance:
+        // an off record says so, a favourite is marked. Health stays on the
+        // detail header, where its verdict has room to be named; a bare dot on
+        // every card was a second colour with no word beside it.
+        let trailing = if enabled {
+            favorite.then(|| {
+                Icon::new(IconName::StarFill)
+                    .size_3()
+                    .text_color(cx.theme().warning)
+                    .into_any_element()
+            })
         } else {
-            h_flex()
-                .items_center()
-                .gap_1()
-                .when(favorite, |mark| {
-                    mark.child(
-                        Icon::new(IconName::StarFill)
-                            .size_3()
-                            .text_color(cx.theme().warning),
-                    )
-                })
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "management-provider-health-{id}"
-                        )))
-                        .size(px(7.0))
-                        .rounded_full()
-                        .bg(management_provider_health_color(health_status, cx))
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(health).build(window, cx)
-                        }),
-                )
-                .into_any_element()
+            Some(
+                Tag::color(ColorName::Neutral)
+                    .xsmall()
+                    .child(management_locale_text("Off", "已停用", "已停用"))
+                    .into_any_element(),
+            )
         };
         let selecting = self.workspace_selecting();
         let checked = selecting.then(|| self.workspace_provider_selected(id.as_str()));
@@ -702,7 +690,7 @@ impl ManagementCenter {
                 .into_any_element(),
             row.profile.display_name.clone(),
             subtitle,
-            Some(trailing),
+            trailing,
             workspace_agent_logos(
                 &format!("management-provider-row-{id}"),
                 &row.agents,
