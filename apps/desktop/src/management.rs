@@ -34709,8 +34709,14 @@ fn management_agent_glyph(identity: &str, label: &str, active: bool, cx: &App) -
 ///
 /// The capsule is a real button for assistive technology: it reports its agent
 /// name and its toggled state, takes focus, and answers Enter/Space as well as a
-/// pointer. Anything that does something else for the same Agent — setting it
-/// as the default model source — is a sibling control, never a nested one.
+/// pointer.
+///
+/// When the surrounding list has a second answer about the same Agent, it rides
+/// inside the capsule's trailing edge as one nested control — the mark a model
+/// source shows when it is the Agent's default. A press on that mark stops at
+/// it, so promoting the default never also toggles the binding.
+type AgentCapsuleAction = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 struct AgentCapsule {
     id: SharedString,
     agent_id: String,
@@ -34718,6 +34724,85 @@ struct AgentCapsule {
     enabled: bool,
     disabled: bool,
     tooltip: SharedString,
+    trailing: Option<AnyElement>,
+}
+
+/// The trailing star of an Agent capsule: this model source is, or could be,
+/// the Agent's default.
+///
+/// A filled star is the answer (this source is the default) and is inert; an
+/// outlined one offers the answer and is a control of its own. It replaces the
+/// plain check the capsule draws elsewhere, because "default" already implies
+/// "enabled" and therefore says more than the check did.
+///
+/// Every star swallows its own press. Even the inert one sits inside a capsule
+/// that toggles the binding on click, so letting the press through would turn
+/// "this is the default" into an accidental unbind.
+fn agent_capsule_star(
+    id: SharedString,
+    is_default: bool,
+    disabled: bool,
+    on_click: Option<AgentCapsuleAction>,
+    cx: &App,
+) -> AnyElement {
+    let tone = if is_default {
+        cx.theme().primary
+    } else {
+        cx.theme().muted_foreground
+    };
+    let label = if is_default {
+        management_locale_text("Default", "默认", "預設")
+    } else {
+        management_set_default_label()
+    };
+    let clickable = on_click.is_some() && !disabled;
+    let keyboard = on_click.clone();
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(18.0))
+        .rounded_full()
+        .when(clickable, |star| {
+            star.cursor_pointer().focusable().tab_index(0)
+        })
+        .when(!disabled, |star| {
+            star.hover(|style| style.bg(cx.theme().primary.opacity(0.16)))
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        })
+        .when(disabled, |star| star.opacity(0.45))
+        .on_click(move |event, window, cx| {
+            // Promoting the default is its own answer: it must not also toggle
+            // the binding the capsule underneath owns.
+            cx.stop_propagation();
+            if let Some(on_click) = on_click.as_ref() {
+                on_click(event, window, cx);
+            }
+        })
+        .when(clickable, |star| {
+            star.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    if let Some(on_click) = keyboard.as_ref() {
+                        on_click(&ClickEvent::default(), window, cx);
+                    }
+                }
+            })
+        })
+        .child(
+            Icon::new(if is_default {
+                IconName::StarFill
+            } else {
+                IconName::Star
+            })
+            .size(px(13.0))
+            .text_color(tone),
+        )
+        .into_any_element()
 }
 
 impl AgentCapsule {
@@ -34735,12 +34820,19 @@ impl AgentCapsule {
             enabled,
             disabled: false,
             tooltip,
+            trailing: None,
         }
     }
 
     /// Dims the capsule while the surrounding list is waiting on a write.
     fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// A second control for this Agent, nested on the capsule's trailing edge.
+    fn trailing(mut self, trailing: Option<AnyElement>) -> Self {
+        self.trailing = trailing;
         self
     }
 }
@@ -34757,6 +34849,7 @@ fn management_agent_capsule(
         enabled,
         disabled,
         tooltip,
+        trailing,
     } = capsule;
     let (background, border, foreground) = if enabled {
         (
@@ -34772,6 +34865,7 @@ fn management_agent_capsule(
         )
     };
     let identity = format!("{agent_id} {label}");
+    let had_trailing = trailing.is_some();
     let hover_background = if enabled {
         cx.theme().primary.opacity(0.18)
     } else {
@@ -34826,7 +34920,13 @@ fn management_agent_capsule(
                 .font_medium()
                 .child(label),
         )
-        .when(enabled, |capsule| {
+        // The model-source default is the capsule's second answer: it rides in
+        // the capsule's own trailing slot so it reads as a qualifier of this
+        // Agent, and its press never reaches the toggle underneath. It stands
+        // where the plain check would, because the star already says "on" and
+        // says which one is the default.
+        .when_some(trailing, |capsule, mark| capsule.child(mark))
+        .when(enabled && !had_trailing, |capsule| {
             capsule.child(
                 Icon::new(IconName::Check)
                     .size(px(12.0))
@@ -42211,6 +42311,26 @@ mod tests {
         assert!(capsule.contains("Role::Button"));
         assert!(capsule.contains("\"enter\" | \"space\""));
         assert!(capsule.contains(".on_click("));
+        // A model source's default is the capsule's own trailing mark. The
+        // star stands where the plain check would, so "on" and "default" read
+        // as one answer instead of two competing glyphs.
+        assert!(capsule.contains("trailing"));
+        assert!(capsule.contains("when_some(trailing"));
+        let star = source
+            .split_once("fn agent_capsule_star(")
+            .and_then(|(_, tail)| tail.split_once("\nimpl AgentCapsule {"))
+            .map(|(body, _)| body)
+            .expect("the capsule's default star should remain inspectable");
+        assert!(star.contains("IconName::StarFill"));
+        assert!(star.contains("IconName::Star"));
+        assert!(
+            star.contains("cx.stop_propagation()"),
+            "promoting the default must not also toggle the binding"
+        );
+        assert!(
+            capsule.contains("enabled && !had_trailing"),
+            "a capsule that carries a star must not also draw the plain check"
+        );
 
         // The three surfaces that ask which Agents a feature reaches all draw
         // the capsule, and none of them still draws a per-Agent switch.

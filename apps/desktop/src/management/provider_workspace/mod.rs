@@ -779,6 +779,33 @@ impl ManagementCenter {
                     state_label
                 }
             );
+            // The star is the capsule's own trailing mark: filled when this
+            // Agent's default model source is here, outlined when the binding
+            // exists but something else is the default. A press on the outline
+            // promotes it without toggling the binding, so it stops at the star.
+            let mark = if row.is_default {
+                Some(agent_capsule_star(
+                    SharedString::from(format!("{id_prefix}-agent-default-mark-{agent_id}")),
+                    true,
+                    true,
+                    None,
+                    cx,
+                ))
+            } else if bound {
+                let default_agent = agent_id.clone();
+                let on_default = on_set_default.clone();
+                Some(agent_capsule_star(
+                    SharedString::from(format!("{id_prefix}-agent-default-{agent_id}")),
+                    false,
+                    pending,
+                    Some(Rc::new(cx.listener(move |this, _, _, cx| {
+                        on_default(this, default_agent.clone(), cx)
+                    }))),
+                    cx,
+                ))
+            } else {
+                None
+            };
             let capsule = management_agent_capsule(
                 AgentCapsule::new(
                     SharedString::from(format!("{id_prefix}-agent-{agent_id}")),
@@ -787,57 +814,14 @@ impl ManagementCenter {
                     bound,
                     SharedString::from(tooltip),
                 )
-                .disabled(pending),
+                .disabled(pending)
+                .trailing(mark),
                 cx.listener(move |this, _, window, cx| {
                     toggle(this, toggle_agent.clone(), !bound, window, cx)
                 }),
                 cx,
             );
-            // The default marker is a sibling of the capsule, not a child: a
-            // control inside a control would hand the same press to two
-            // answers. A bound Agent keeps its marker next to its name, and an
-            // unbound one has no default to mark.
-            let mut entry = h_flex().flex_none().items_center().gap_0p5().child(capsule);
-            if row.is_default {
-                let tip = SharedString::from(management_set_default_label());
-                entry = entry.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "{id_prefix}-agent-default-mark-{agent_id}"
-                        )))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .child(
-                            Icon::new(IconName::StarFill)
-                                .size(px(12.0))
-                                .text_color(cx.theme().primary),
-                        )
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
-                );
-            } else if bound {
-                let default_agent = agent_id.clone();
-                let on_default = on_set_default.clone();
-                entry = entry.child(button_with_aria_label(
-                    Button::new(SharedString::from(format!(
-                        "{id_prefix}-agent-default-{default_agent}"
-                    )))
-                    .ghost()
-                    .compact()
-                    .size(px(20.0))
-                    .icon(
-                        Icon::new(IconName::Star)
-                            .size(px(12.0))
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        on_default(this, default_agent.clone(), cx)
-                    })),
-                    management_set_default_label(),
-                ));
-            }
-            capsules = capsules.child(entry);
+            capsules = capsules.child(capsule);
         }
         capsules.into_any_element()
     }
@@ -1017,6 +1001,14 @@ mod tests {
             "a feature's Agent audience is a row of capsules, not switches"
         );
         assert!(list.contains("toggle(this, toggle_agent.clone(), !bound, window, cx)"));
+        // The model-source default is the capsule's own trailing mark: a star
+        // inside the pill, not a second control standing beside it.
+        assert!(list.contains(".trailing(mark)"));
+        assert!(list.contains("agent_capsule_star("));
+        assert!(
+            !list.contains("entry = entry.child("),
+            "the default star belongs inside the capsule, not next to it"
+        );
         assert!(PROVIDER.contains("try_unbind_model_source("));
         assert!(ROUTE_GROUP.contains("try_unbind_model_source("));
     }
