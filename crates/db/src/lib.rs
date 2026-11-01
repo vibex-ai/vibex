@@ -12595,6 +12595,11 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // Provider work above it.
     apply_agent_discovery_latest_only(conn, &mut applied)?;
     apply_session_tool_settings(conn, &mut applied)?;
+    // The preset writes the session header when a Provider is created, but a
+    // record that predates that rule still points at the gateway without one.
+    // Recorded after the older tail so a migrated database reports an ascending
+    // version list; it needs the v2 Provider rows the backfill above creates.
+    provider_projection::migrate_opencode_session_header(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -19380,6 +19385,7 @@ mod tests {
                 "84:retire_provider_groups",
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
+                "87:opencode_session_header",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19550,6 +19556,7 @@ mod tests {
                 "84:retire_provider_groups",
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
+                "87:opencode_session_header",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19703,6 +19710,7 @@ mod tests {
                 "84:retire_provider_groups",
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
+                "87:opencode_session_header",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19892,6 +19900,7 @@ mod tests {
                 "84:retire_provider_groups",
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
+                "87:opencode_session_header",
             ]
         );
         assert_eq!(
@@ -21344,6 +21353,7 @@ mod tests {
                 "84:retire_provider_groups",
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
+                "87:opencode_session_header",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
