@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::typography::code_font_weight;
+use crate::typography::{code_font_weight, ui_rems};
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
     Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -602,12 +602,14 @@ impl ManagementNativeImportDialog {
 }
 
 impl Render for ManagementNativeImportDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The body owns the loading gap, the empty state, and the list, so it
         // renders on every frame: returning early while the preview is still
         // being read would leave the dialog blank for the whole read.
-        self.center
-            .update(cx, |center, cx| center.render_native_import_picker_body(cx))
+        let viewport_height = f32::from(window.viewport_size().height);
+        self.center.update(cx, |center, cx| {
+            center.render_native_import_picker_body(viewport_height, cx)
+        })
     }
 }
 
@@ -13270,28 +13272,11 @@ impl ManagementCenter {
                 })
                 .w(px(width))
                 .max_w(px(width));
+            // The dialogue's two buttons are the only footer children: the
+            // kit's close and action parts each fill the row, so a third label
+            // there is squeezed to one character per line. The running total
+            // lives on the list's own strip, where it has room to read.
             let footer = gpui_component::dialog::DialogFooter::new()
-                // The running count sits on the leading edge, opposite the
-                // commit: it describes the whole dialog, not the tab on screen.
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(match picked {
-                            0 => management_locale_text(
-                                "Nothing selected yet",
-                                "尚未选择任何配置",
-                                "尚未選擇任何設定",
-                            )
-                            .to_string(),
-                            count => format!(
-                                "{} {count}",
-                                management_locale_text("Selected", "已选", "已選")
-                            ),
-                        }),
-                )
                 .child(gpui_component::dialog::DialogClose::new().child(
                     Button::new("management-native-import-cancel")
                         .outline()
@@ -15262,6 +15247,7 @@ impl ManagementCenter {
     /// like part of the long one and pushed the dialog's own actions away.
     pub(super) fn render_native_import_picker_body(
         &mut self,
+        viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(preview) = self.native_import_picker.clone() else {
@@ -15336,8 +15322,8 @@ impl ManagementCenter {
         };
         self.native_import_active_source = active;
         let picked = self.native_import_picked.clone();
-        let mut header = v_flex().w_full().min_w_0().gap_2();
-        header = header.child(self.render_native_import_source_tabs(&items, active, cx));
+        let mut body = v_flex().w_full().min_w_0().gap_2();
+        body = body.child(self.render_native_import_source_tabs(&items, active, cx));
 
         let mut source_items = items
             .iter()
@@ -15525,24 +15511,51 @@ impl ManagementCenter {
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .flex_1()
+                            .min_w_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground.opacity(0.8))
                             .child(format!("{picked_count}/{}", source_items.len())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(match picked.len() {
+                                0 => management_locale_text(
+                                    "Nothing selected yet",
+                                    "尚未选择任何配置",
+                                    "尚未選擇任何設定",
+                                )
+                                .to_string(),
+                                count => format!(
+                                    "{} {count}",
+                                    management_locale_text("Selected", "已选", "已選")
+                                ),
+                            }),
                     ),
             )
             .child(
+                // The plain overflow, not the kit's scrollbar wrapper. The
+                // wrapper sizes itself to its parent, and this pane is as tall
+                // as its rows, so the pair resolved to zero height and the
+                // dialog showed its tabs over an empty gap. A capped auto
+                // height is what the surface actually needs: a short source
+                // stays short, a long one stops at the cap and scrolls.
                 div()
+                    .id("management-native-import-list")
+                    .debug_selector(|| "management-native-import-list".to_string())
                     .w_full()
                     .min_w_0()
-                    .min_h_0()
-                    .max_h(rems(24.0))
-                    .overflow_y_scrollbar()
+                    .max_h(native_import_list_cap(viewport_height))
+                    .overflow_y_scroll()
                     .scroll_gutter()
                     .child(rows),
             );
 
-        header.child(list).into_any_element()
+        body.child(list).into_any_element()
     }
 
     /// The picker's tabs: one per import source, each naming its own count.
@@ -35370,6 +35383,18 @@ fn native_import_source_label(source: vibex_core::ProviderNativeImportSource) ->
     }
 }
 
+/// How tall the picker's list may grow.
+///
+/// The list is as tall as its rows until it reaches this cap, which keeps a
+/// short source short and a long one scrolling inside the dialog. The cap
+/// follows the window rather than a fixed length: the dialog also has a title,
+/// a paragraph, the source tabs, the strip, and the footer, and on a short
+/// window a fixed cap would put the actions below the bottom edge.
+fn native_import_list_cap(viewport_height: f32) -> Rems {
+    let available = (viewport_height - 260.0).clamp(120.0, 384.0);
+    ui_rems(available)
+}
+
 /// The mark a source wears in the picker's tab bar.
 ///
 /// Codex and Claude have a brand mark; CC Switch has none, and it is a local
@@ -42626,7 +42651,7 @@ mod tests {
         assert!(pager.contains(".w_full()"));
     }
 
-    fn provider_options(entries: &[(&str, &str)]) -> vibex_core::ProviderOptions {
+    pub(super) fn provider_options(entries: &[(&str, &str)]) -> vibex_core::ProviderOptions {
         vibex_core::ProviderOptions {
             schema_version: 1,
             entries: entries
@@ -42639,7 +42664,7 @@ mod tests {
         }
     }
 
-    fn native_import_item(
+    pub(super) fn native_import_item(
         id: &str,
         source: vibex_core::ProviderNativeImportSource,
         agent_id: &AgentId,
@@ -46307,6 +46332,101 @@ mod gateway_surface_tests {
         });
     }
 
+    /// The import picker's list draws at a real height.
+    ///
+    /// The list is a scroller inside a dialog whose content is as tall as its
+    /// children. The kit's scrollbar wrapper fills its parent, so pairing it
+    /// with an auto-height pane collapsed the rows to nothing and the dialog
+    /// showed its tabs and its footer with an empty gap between them. Measure
+    /// the drawn list instead of trusting the element tree.
+    #[gpui::test]
+    fn the_import_picker_list_paints_its_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        let codex = AgentId::parse("codex").expect("valid Agent id");
+        let options = super::tests::provider_options(&[(PROVIDER_OPTION_NATIVE_SOURCE, "codex")]);
+        let preview = vibex_core::ProviderNativeImportPreview {
+            preview_id: vibex_core::RequestId::parse("request_preview").expect("valid preview id"),
+            sources: vec![vibex_core::ProviderNativeImportSource::Codex],
+            files: Vec::new(),
+            items: (0..24)
+                .map(|index| {
+                    let mut item = super::tests::native_import_item(
+                        &format!("request_import_{index}"),
+                        vibex_core::ProviderNativeImportSource::Codex,
+                        &codex,
+                        vibex_core::ProviderNativeImportItemStatus::Importable,
+                        options.clone(),
+                    );
+                    item.base_url = Some("https://relay.example.com/v1".to_string());
+                    item
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+            created_at_ms: 1,
+        };
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.native_import_target = Some(codex.clone());
+                center.native_import_picked = preview
+                    .items
+                    .iter()
+                    .map(|item| item.import_item_id.as_str().to_string())
+                    .collect();
+                center.native_import_picker = Some(preview.clone());
+                center.present_native_import_picker(window, cx);
+            });
+        });
+        // The reported window was barely taller than the dialog, and the rows
+        // were the part that lost the argument: the surface grew past the
+        // window instead of scrolling inside it.
+        cx.simulate_resize(gpui::size(px(704.0), px(317.0)));
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let list = cx
+            .debug_bounds("management-native-import-list")
+            .expect("the picker list should be laid out");
+        assert!(
+            list.size.height >= px(110.0),
+            "the rows must keep a readable viewport, got {:?}",
+            list.size.height
+        );
+        assert!(
+            list.size.width > px(200.0),
+            "the rows must occupy the dialog's width, got {:?}",
+            list.size.width
+        );
+        // The list is capped, not content-sized: the whole point is that the
+        // rows scroll inside the dialog rather than extending it past the
+        // window, which is what made the footer unreachable.
+        assert!(
+            list.size.height <= px(390.0),
+            "the list must stay bounded, got {:?}",
+            list.size.height
+        );
+        // ...and the surface it sits in fits the window it was drawn into.
+        assert!(
+            list.bottom() <= px(317.0) + px(16.0),
+            "the list must stay inside the window, bottom was {:?}",
+            list.bottom()
+        );
+    }
+
     /// The route-group tab is a second view of one page, and it has to render
     /// without an Agent and without a selected group.
     ///
@@ -46931,7 +47051,9 @@ mod gateway_surface_tests {
         assert!(body.contains("item.source == active"));
         assert!(body.contains("toggle_native_import_source("));
         assert!(body.contains("toggle_native_import_picked("));
-        assert!(body.contains("overflow_y_scrollbar()"));
+        // The list is a bounded, auto-height scroller rather than the kit's
+        // fill-the-parent wrapper, so a short source stays short.
+        assert!(body.contains(".overflow_y_scroll()"));
         // The old command wrote every candidate it could find; that path is
         // gone, so nothing can import without the reader seeing the list.
         // Concatenated so this assertion does not match its own source text.
@@ -46963,10 +47085,30 @@ mod gateway_surface_tests {
             .and_then(|(_, tail)| tail.split_once("\n    /// Writes the configurations checked"))
             .map(|(body, _)| body)
             .expect("the import dialog should remain inspectable");
-        assert!(dialog.contains("Nothing selected yet"));
-        assert!(dialog.contains("Selected"));
         // The count is read from the same check state the rows toggle.
         assert!(dialog.contains("confirm_center.read(cx).native_import_picked.len()"));
+        // The footer is the two buttons and nothing else: the kit's close and
+        // action parts each fill the row, so a label added beside them collapses
+        // to one character per line. The running total rides the list strip.
+        let footer = dialog
+            .split_once("gpui_component::dialog::DialogFooter::new()")
+            .map(|(_, tail)| tail)
+            .expect("the footer should remain inspectable");
+        assert!(!footer.contains("Nothing selected yet"));
+
+        let body = source
+            .split_once("pub(super) fn render_native_import_picker_body(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the picker body should remain inspectable");
+        assert!(body.contains("Nothing selected yet"));
+        assert!(body.contains("Selected"));
+        // A bounded auto-height list: the kit's scrollbar wrapper fills its
+        // parent, and this pane is as tall as its rows, so the plain overflow
+        // is what keeps a short source short and a long one scrollable.
+        assert!(body.contains("max_h(native_import_list_cap(viewport_height))"));
+        assert!(body.contains(".overflow_y_scroll()"));
+        assert!(!body.contains(".overflow_y_scrollbar()"));
     }
 
     /// A source the machine has records for is the one the dialog opens on.
