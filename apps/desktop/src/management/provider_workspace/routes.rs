@@ -1563,8 +1563,8 @@ impl ManagementCenter {
             .min_w_0()
             .rounded(cx.theme().radius_lg)
             .border_1()
-            .border_color(cx.theme().border)
-            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+            .border_color(theme::module_border(cx.theme().is_dark()))
+            .bg(theme::module_surface(cx.theme().is_dark()))
             .child(self.render_workspace_route_head(&staged, cx))
             .child(div().w_full().px_3().child(stage))
             .child(self.render_workspace_route_story(&staged, now, cx));

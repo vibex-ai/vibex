@@ -280,6 +280,28 @@ pub fn tab_strip_plate(theme: &Theme) -> Hsla {
         .blend(theme.muted.opacity(TAB_STRIP_PLATE_MIX))
 }
 
+/// The fill a module panel paints behind its rows.
+///
+/// A module is a titled block of rows — a settings group, a Provider section,
+/// a record card — and every one of them takes this same fill so the two
+/// places that show modules, Settings and the configuration center, read as
+/// one surface rather than two near-misses. The tone stays close to the page:
+/// in a dark appearance it is the card color toned down, in a light one the
+/// muted plate, enough to separate the module from the page without turning it
+/// into a second elevated layer.
+pub fn module_surface(is_dark: bool) -> Hsla {
+    if is_dark {
+        semantic_color("card", is_dark).opacity(0.35)
+    } else {
+        semantic_color("muted", is_dark).opacity(0.45)
+    }
+}
+
+/// The hairline around a module panel, paired with [`module_surface`].
+pub fn module_border(is_dark: bool) -> Hsla {
+    semantic_color("border", is_dark).opacity(0.55)
+}
+
 pub fn apply_appearance(
     appearance: &AppearanceUiState,
     backdrop: Backdrop,

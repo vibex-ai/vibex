@@ -89734,10 +89734,7 @@ impl FoundationSettings {
         let (status, description, control) = action;
         let is_dark = cx.theme().is_dark();
         let primary = theme::semantic_color("primary", is_dark);
-        let muted = theme::semantic_color("muted", is_dark);
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-        let border = theme::semantic_color("border", is_dark);
-        let card = theme::semantic_color("card", is_dark);
         let title = locale::text("Software update", "软件更新", "軟體更新");
         let (target_anchor, is_highlighted) = settings_row_anchor(title, cx);
         let notes_scroll = self.about_notes_scroll.clone();
@@ -89829,12 +89826,8 @@ impl FoundationSettings {
                             })
                             .rounded(px(8.0))
                             .border_1()
-                            .border_color(border.opacity(0.5))
-                            .bg(if is_dark {
-                                card.opacity(0.35)
-                            } else {
-                                muted.opacity(0.45)
-                            })
+                            .border_color(theme::module_border(is_dark))
+                            .bg(theme::module_surface(is_dark))
                             .px_3()
                             .py_2()
                             .child(TextView::markdown(
@@ -91803,8 +91796,6 @@ fn settings_page(
     let is_dark = cx.theme().is_dark();
     let foreground = theme::semantic_color("foreground", is_dark);
     let border = theme::semantic_color("border", is_dark);
-    let card = theme::semantic_color("card", is_dark);
-    let muted = theme::semantic_color("muted", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
 
     v_flex()
@@ -91835,7 +91826,7 @@ fn settings_page(
         .children(
             groups
                 .into_iter()
-                .map(|group| settings_group(group, is_dark, border, card, muted, muted_foreground)),
+                .map(|group| settings_group(group, is_dark, border, muted_foreground)),
         )
         .into_any_element()
 }
@@ -91849,8 +91840,6 @@ fn settings_group(
     group: SettingsGroup,
     is_dark: bool,
     border: Hsla,
-    card: Hsla,
-    muted: Hsla,
     muted_foreground: Hsla,
 ) -> AnyElement {
     let mut panel_rows = Vec::with_capacity(group.rows.len().saturating_mul(2));
@@ -91886,12 +91875,8 @@ fn settings_group(
                 v_flex()
                     .rounded(px(10.0))
                     .border_1()
-                    .border_color(border.opacity(0.55))
-                    .bg(if is_dark {
-                        card.opacity(0.35)
-                    } else {
-                        muted.opacity(0.45)
-                    })
+                    .border_color(theme::module_border(is_dark))
+                    .bg(theme::module_surface(is_dark))
                     .px_4()
                     .py_1()
                     .children(panel_rows),
