@@ -46636,28 +46636,21 @@ impl VibexWorkbench {
                     }
                 };
                 let source = format!("{}: {source}", locale::text("Source", "来源", "來源"));
-                let dot = match (&availability, enabled) {
-                    (SessionToolAvailability::Unavailable(_), _) => {
-                        cx.theme().muted_foreground.opacity(0.40)
-                    }
-                    (SessionToolAvailability::Available, true) => success,
-                    (SessionToolAvailability::Available, false) => {
-                        cx.theme().muted_foreground.opacity(0.55)
-                    }
-                };
-                let state_label = match &availability {
-                    SessionToolAvailability::Unavailable(_) => {
-                        locale::text("Unavailable", "不可用", "不可用")
-                    }
+                // One colour answers both "can this run" and "is it on": an
+                // unavailable panel is grey whatever the session recorded,
+                // because the session's answer never reaches the Agent.
+                let (state_color, state_label) = match &availability {
+                    SessionToolAvailability::Unavailable(_) => (
+                        cx.theme().muted_foreground.opacity(0.55),
+                        locale::text("Unavailable", "不可用", "不可用"),
+                    ),
                     SessionToolAvailability::Available if enabled => {
-                        locale::text("On", "已启用", "已啟用")
+                        (success, locale::text("On", "已启用", "已啟用"))
                     }
-                    SessionToolAvailability::Available => locale::text("Off", "未启用", "未啟用"),
-                };
-                let state_color = if enabled {
-                    success
-                } else {
-                    cx.theme().muted_foreground
+                    SessionToolAvailability::Available => (
+                        cx.theme().muted_foreground,
+                        locale::text("Off", "未启用", "未啟用"),
+                    ),
                 };
                 v_flex()
                     .w_full()
@@ -46670,13 +46663,12 @@ impl VibexWorkbench {
                             .min_w_0()
                             .items_center()
                             .gap_2()
-                            .child(Icon::default().path(icon).size(px(15.0)).text_color(
-                                if enabled {
-                                    success
-                                } else {
-                                    cx.theme().muted_foreground
-                                },
-                            ))
+                            .child(
+                                Icon::default()
+                                    .path(icon)
+                                    .size(px(15.0))
+                                    .text_color(state_color),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -46685,7 +46677,13 @@ impl VibexWorkbench {
                                     .text_color(cx.theme().popover_foreground)
                                     .child(label),
                             )
-                            .child(div().flex_none().size(px(6.0)).rounded_full().bg(dot))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .bg(state_color),
+                            )
                             .child(
                                 div()
                                     .flex_none()
@@ -106233,6 +106231,17 @@ mod tests {
         assert!(!panel.contains("IconName::Info"));
         // The source line that identifies each row's provenance stays.
         assert!(panel.contains("Agent default") && panel.contains("This session"));
+        // An unavailable panel is grey whatever the session recorded: the
+        // icon, the dot and the label share one colour so nothing paints a
+        // capability the Agent can never receive as if it were on.
+        assert!(
+            panel.contains("SessionToolAvailability::Unavailable(_) => (\n                        cx.theme().muted_foreground.opacity(0.55),"),
+            "the unavailable row must take one grey for icon, dot and label"
+        );
+        assert!(
+            !panel.contains("let state_color = if enabled {"),
+            "the state colour must come from availability, not the recorded answer alone"
+        );
 
         let states = source
             .split_once("    fn session_tool_states(")
