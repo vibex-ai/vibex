@@ -1132,6 +1132,216 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
         "z-ai",
         themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
     ),
+    (
+        "groq",
+        colored_model_asset("icons/vibex/model-providers/groq.svg"),
+    ),
+    (
+        "nebius",
+        colored_model_asset("icons/vibex/model-providers/nebius.svg"),
+    ),
+    (
+        "sambanova",
+        colored_model_asset("icons/vibex/model-providers/sambanova.svg"),
+    ),
+    (
+        "novita",
+        colored_model_asset("icons/vibex/model-providers/novita.svg"),
+    ),
+    (
+        "deepinfra",
+        colored_model_asset("icons/vibex/model-providers/deepinfra.svg"),
+    ),
+    (
+        "hyperbolic",
+        colored_model_asset("icons/vibex/model-providers/hyperbolic.svg"),
+    ),
+    (
+        "cerebras",
+        colored_model_asset("icons/vibex/model-providers/cerebras.svg"),
+    ),
+    (
+        "ai21",
+        colored_model_asset("icons/vibex/model-providers/ai21.svg"),
+    ),
+    (
+        "baichuan",
+        colored_model_asset("icons/vibex/model-providers/baichuan.svg"),
+    ),
+    (
+        "yi",
+        colored_model_asset("icons/vibex/model-providers/yi.svg"),
+    ),
+    (
+        "iflytek",
+        colored_model_asset("icons/vibex/model-providers/iflytek.svg"),
+    ),
+    (
+        "modelscope",
+        colored_model_asset("icons/vibex/model-providers/modelscope.svg"),
+    ),
+    (
+        "volcengine",
+        colored_model_asset("icons/vibex/model-providers/volcengine.svg"),
+    ),
+    (
+        "aihubmix",
+        colored_model_asset("icons/vibex/model-providers/aihubmix.svg"),
+    ),
+    (
+        "vercel",
+        colored_model_asset("icons/vibex/model-providers/vercel.svg"),
+    ),
+    (
+        "moonshot-ai",
+        themed_model_asset("icons/vibex/agents/kimi.svg"),
+    ),
+    (
+        "moonshotai-cn",
+        themed_model_asset("icons/vibex/agents/kimi.svg"),
+    ),
+    (
+        "z-ai",
+        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+    ),
+    (
+        "zai",
+        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+    ),
+    (
+        "zhipuai",
+        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+    ),
+    ("xai", themed_model_asset("icons/vibex/agents/grok.svg")),
+    ("x-ai", themed_model_asset("icons/vibex/agents/grok.svg")),
+    (
+        "mistral",
+        themed_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+    ),
+    (
+        "mistralai",
+        themed_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+    ),
+    (
+        "moonshotai-cn",
+        themed_model_asset("icons/vibex/agents/kimi.svg"),
+    ),
+    (
+        "kimi-code-plan-cn",
+        themed_model_asset("icons/vibex/agents/kimi.svg"),
+    ),
+    (
+        "kimi-code-plan-global",
+        themed_model_asset("icons/vibex/agents/kimi.svg"),
+    ),
+    (
+        "zhipuai-coding-plan",
+        themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+    ),
+    (
+        "minimax-cn",
+        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+    ),
+    (
+        "minimax-coding-plan",
+        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+    ),
+    (
+        "minimax-cn-coding-plan",
+        colored_model_asset("icons/vibex/model-providers/minimax.svg"),
+    ),
+    (
+        "stepfun-ai",
+        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+    ),
+    (
+        "stepfun-ai-step-plan",
+        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+    ),
+    (
+        "stepfun-step-plan",
+        colored_model_asset("icons/vibex/model-providers/stepfun.svg"),
+    ),
+    (
+        "xiaomi-token-plan-cn",
+        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+    ),
+    (
+        "xiaomi-token-plan-ams",
+        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+    ),
+    (
+        "xiaomi-token-plan-sgp",
+        colored_model_asset("icons/vibex/model-providers/xiaomi.svg"),
+    ),
+    (
+        "tencent-tokenhub",
+        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+    ),
+    (
+        "tencent-token-plan",
+        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+    ),
+    (
+        "tencent-coding-plan",
+        colored_model_asset("icons/vibex/model-providers/tencent.svg"),
+    ),
+    (
+        "volcengine-coding-plan",
+        colored_model_asset("icons/vibex/model-providers/bytedance.svg"),
+    ),
+    (
+        "alibaba-coding-plan-cn",
+        colored_model_asset("icons/vibex/model-providers/alibaba.svg"),
+    ),
+    (
+        "siliconflow-cn",
+        colored_model_asset("icons/vibex/model-providers/siliconflow.svg"),
+    ),
+    (
+        "siliconflow",
+        colored_model_asset("icons/vibex/model-providers/siliconflow.svg"),
+    ),
+    (
+        "togetherai",
+        colored_model_asset("icons/vibex/model-providers/together.svg"),
+    ),
+    (
+        "fireworks-ai",
+        colored_model_asset("icons/vibex/model-providers/fireworks.svg"),
+    ),
+    (
+        "github",
+        colored_model_asset("icons/vibex/model-providers/github.svg"),
+    ),
+    (
+        "opencode",
+        colored_model_asset("icons/vibex/model-providers/opencode.svg"),
+    ),
+    (
+        "opencode-go",
+        colored_model_asset("icons/vibex/model-providers/opencode.svg"),
+    ),
+    (
+        "opencode-zen",
+        colored_model_asset("icons/vibex/model-providers/opencode.svg"),
+    ),
+    (
+        "clinepass",
+        colored_model_asset("icons/vibex/model-providers/cline.svg"),
+    ),
+    (
+        "commandcode",
+        colored_model_asset("icons/vibex/model-providers/cline.svg"),
+    ),
+    (
+        "novita-ai",
+        colored_model_asset("icons/vibex/model-providers/novita.svg"),
+    ),
+    (
+        "reka",
+        colored_model_asset("icons/vibex/model-providers/rekaai.svg"),
+    ),
 ];
 
 // Longer prefixes handle model names whose first keyword is shared by providers.
@@ -1715,6 +1925,30 @@ const MODEL_PROVIDER_ASSETS: &[(&str, &[u8])] = &[
     bundled_model_provider_asset!("dots-studio.svg"),
     bundled_model_provider_asset!("fish-audio.svg"),
     bundled_model_provider_asset!("gryphe.svg"),
+    bundled_model_provider_asset!("aihubmix.svg"),
+    bundled_model_provider_asset!("ai21.svg"),
+    bundled_model_provider_asset!("cline.svg"),
+    bundled_model_provider_asset!("fireworks.svg"),
+    bundled_model_provider_asset!("github.svg"),
+    bundled_model_provider_asset!("lmstudio.svg"),
+    bundled_model_provider_asset!("ollama.svg"),
+    bundled_model_provider_asset!("opencode.svg"),
+    bundled_model_provider_asset!("siliconflow.svg"),
+    bundled_model_provider_asset!("together.svg"),
+    bundled_model_provider_asset!("vllm.svg"),
+    bundled_model_provider_asset!("vercel.svg"),
+    bundled_model_provider_asset!("baichuan.svg"),
+    bundled_model_provider_asset!("cerebras.svg"),
+    bundled_model_provider_asset!("deepinfra.svg"),
+    bundled_model_provider_asset!("groq.svg"),
+    bundled_model_provider_asset!("hyperbolic.svg"),
+    bundled_model_provider_asset!("iflytek.svg"),
+    bundled_model_provider_asset!("modelscope.svg"),
+    bundled_model_provider_asset!("nebius.svg"),
+    bundled_model_provider_asset!("novita.svg"),
+    bundled_model_provider_asset!("sambanova.svg"),
+    bundled_model_provider_asset!("volcengine.svg"),
+    bundled_model_provider_asset!("yi.svg"),
     bundled_model_provider_asset!("hexgrad.svg"),
     bundled_model_provider_asset!("heygen.svg"),
     bundled_model_provider_asset!("ibm-granite.svg"),
@@ -1952,6 +2186,12 @@ pub(crate) fn model_brand_icon(
     model_brand_asset(model).map(|asset| brand_asset_icon(asset, size, current_color))
 }
 
+/// Keyed lookups match a whole segment, never a prefix mid-word.
+///
+/// The brand tables hold catalogue ids (`xai`, `zai`, `meta`), and a record's
+/// fields are whole ids too. Letting `xai` match inside `xai-something`,
+/// `openai` inside `openai-compatible`, or `meta` inside `metaverse` labelled
+/// unrelated records with the wrong mark.
 fn model_keyword_matches(model: &str, keyword: &str) -> bool {
     model.starts_with(keyword)
         && model.as_bytes().get(keyword.len()).is_none_or(|character| {
@@ -2840,12 +3080,96 @@ mod tests {
         }
     }
 
+    /// A vendor the catalogue lists wears its mark, including its regions and
+    /// its plans.
+    ///
+    /// A regional host and a plan are separate catalogue entries, so a lookup
+    /// that only knew the base vendor left the derived ones showing an initial.
+    /// The entry a preset answers for is therefore what decides the mark.
+    #[test]
+    fn catalogue_vendors_resolve_to_their_brand_mark() {
+        for catalog_id in [
+            "anthropic",
+            "openai",
+            "google",
+            "deepseek",
+            "moonshotai",
+            "moonshotai-cn",
+            "kimi-code-plan-cn",
+            "zhipuai",
+            "zai",
+            "zhipuai-coding-plan",
+            "openrouter",
+            "xai",
+            "mistral",
+            "groq",
+            "siliconflow",
+            "cohere",
+            "togetherai",
+            "fireworks-ai",
+            "perplexity",
+            "cerebras",
+            "deepinfra",
+            "hyperbolic",
+            "nebius",
+            "novita-ai",
+            "sambanova",
+            "minimax",
+            "minimax-cn",
+            "minimax-coding-plan",
+            "alibaba",
+            "alibaba-coding-plan-cn",
+            "baidu",
+            "volcengine",
+            "volcengine-coding-plan",
+            "tencent",
+            "tencent-tokenhub",
+            "tencent-coding-plan",
+            "iflytek",
+            "yi",
+            "stepfun",
+            "stepfun-ai",
+            "stepfun-step-plan",
+            "baichuan",
+            "upstage",
+            "reka",
+            "ai21",
+            "nvidia",
+            "github",
+            "aihubmix",
+            "vercel",
+            "opencode",
+            "opencode-go",
+            "modelscope",
+            "xiaomi",
+            "xiaomi-token-plan-cn",
+        ] {
+            assert!(
+                model_brand_icon(catalog_id, gpui::px(16.0), None).is_some(),
+                "{catalog_id} must resolve to a bundled mark"
+            );
+        }
+    }
+
+    /// A keyword matches a whole segment, so one entry cannot claim another's
+    /// name by accident.
+    #[test]
+    fn a_brand_keyword_does_not_match_inside_another_word() {
+        assert!(model_keyword_matches("xai", "xai"));
+        assert!(!model_keyword_matches("xaiver", "xai"));
+        assert!(model_keyword_matches("claude-sonnet-4-5", "claude"));
+        assert!(!model_keyword_matches("metaverse", "meta"));
+    }
+
     #[test]
     fn model_provider_svgs_are_path_based_and_rasterizable() {
         let assets = VibexAssets;
         let renderer = gpui::SvgRenderer::new(Arc::new(VibexAssets));
 
-        assert_eq!(MODEL_PROVIDER_ASSETS.len(), 59);
+        // A count, not a claim about which marks exist: the table grows as a
+        // vendor's logo is added, and this test's subject is that every entry
+        // is a rasterizable vector rather than a count.
+        assert_eq!(MODEL_PROVIDER_ASSETS.len(), 83);
         for (path, bytes) in MODEL_PROVIDER_ASSETS {
             let source = std::str::from_utf8(bytes).expect("provider SVG should be UTF-8");
             assert!(source.contains("<svg"), "{path} should be an SVG");
