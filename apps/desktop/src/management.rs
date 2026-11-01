@@ -23543,26 +23543,19 @@ impl ManagementCenter {
         let pending = self.mutation.is_some();
         let query = self.provider_preset_query.read(cx).value().to_string();
         let normalized = query.trim().to_lowercase();
-        // A shared Provider appears once here however many Agents bind it. It
-        // is hidden only when *this* Agent already launches through it, because
-        // choosing it again would be a no-op dressed up as an action.
-        let already_bound = self
+        // A shared Provider appears once here however many Agents bind it. A
+        // record this Agent already launches through stays listed but is not
+        // selectable, because choosing it again would be a no-op dressed up as
+        // an action.
+        let selected_agent = self
             .selected_agent_id
             .as_deref()
-            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok())
-            .map(|agent_id| agent_bound_profile_ids(&agent_id, &self.provider_bindings))
-            .unwrap_or_default();
+            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok());
         let mut existing = self
             .providers
             .iter()
             .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
             .filter(|profile| !profile.metadata.only_through_route_groups)
-            .filter(|profile| {
-                profile
-                    .legacy_provider_profile_id
-                    .as_ref()
-                    .is_none_or(|legacy| !already_bound.contains(legacy.as_str()))
-            })
             .filter(|profile| {
                 if normalized.is_empty() {
                     return true;
@@ -23596,6 +23589,13 @@ impl ManagementCenter {
         let mut filled = 0usize;
         for profile in &existing {
             let profile_id = profile.id.clone();
+            // A Provider this Agent already uses stays on the list with a check
+            // and no action: hiding it made a used record indistinguishable
+            // from one that was never there, and binding it again was a no-op
+            // dressed up as an action.
+            let in_use = selected_agent.as_ref().is_some_and(|agent_id| {
+                agent_uses_shared_provider(agent_id, profile, &self.provider_bindings)
+            });
             let model_count = profile
                 .configured_models
                 .iter()
@@ -23629,7 +23629,7 @@ impl ManagementCenter {
                     .px_2()
                     .py_2()
                     .rounded(cx.theme().radius)
-                    .when(!pending, |this| {
+                    .when(!pending && !in_use, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -23664,13 +23664,22 @@ impl ManagementCenter {
                                     .child(detail),
                             ),
                     )
-                    // The row is the action; a trailing word for it was a
-                    // caption, not a control.
-                    .child(
-                        Icon::new(IconName::ChevronRight)
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                    // A record in use reads as a fact, not a command: the same
+                    // check a referenced route group carries.
+                    .when(in_use, |this| {
+                        this.child(
+                            Icon::new(IconName::Check)
+                                .size(px(14.0))
+                                .text_color(cx.theme().primary),
+                        )
+                    })
+                    .when(!in_use, |this| {
+                        this.child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                    }),
             );
             filled += 1;
             if filled.is_multiple_of(column) {
@@ -23879,6 +23888,26 @@ impl ManagementCenter {
             // share, and a kind the search emptied is left out entirely.
             // A saved record and a preset are different kinds of answer, so the
             // two lists are divided by a rule rather than by a heading alone.
+            // A vendor already added for this Agent is marked in the library,
+            // so a reader is not sent through the form to discover the
+            // duplicate. The catalogue id is what a record remembers; a preset
+            // with no catalogue entry falls back to its own id.
+            let added_presets = self
+                .providers
+                .iter()
+                .filter(|profile| {
+                    selected_agent.as_ref().is_some_and(|agent_id| {
+                        agent_uses_shared_provider(agent_id, profile, &self.provider_bindings)
+                    })
+                })
+                .filter_map(|profile| {
+                    profile
+                        .metadata
+                        .catalog_id
+                        .clone()
+                        .or_else(|| profile.vendor_hint.clone())
+                })
+                .collect::<BTreeSet<String>>();
             let mut sections = v_flex().w_full().min_w_0().gap_1();
             if !existing.is_empty() {
                 sections = sections.child(provider_source_section(
@@ -23914,7 +23943,7 @@ impl ManagementCenter {
                     )),
                     category.icon(),
                     category.label(),
-                    provider_source_rows(&listed, pending, cx),
+                    provider_source_rows(&listed, pending, &added_presets, cx),
                     cx,
                 ));
             }
@@ -24147,6 +24176,19 @@ impl ManagementCenter {
         let Ok(agent_id) = vibex_core::AgentId::parse(agent_id) else {
             return;
         };
+        // The row is not clickable once taken, and this keeps a second path
+        // (a stale frame, a keyboard action) from re-binding the same record:
+        // the write would be a no-op the reader could not see.
+        let already_using = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == provider_id)
+            .is_some_and(|profile| {
+                agent_uses_shared_provider(&agent_id, profile, &self.provider_bindings)
+            });
+        if already_using {
+            return;
+        }
         let profile_id = self
             .providers
             .iter()
@@ -35533,6 +35575,33 @@ fn agent_bound_profile_ids(
         .collect()
 }
 
+/// Whether this Agent already sends through the shared Provider.
+///
+/// A binding names the shared record as well as the legacy per-Agent profile,
+/// and a Provider created by the current flow has only the shared id: the
+/// legacy profile is minted later, or never. Asking only for the legacy id
+/// therefore missed every record this app created, so an Agent could add the
+/// same Provider again and again.
+fn agent_uses_shared_provider(
+    agent_id: &vibex_core::AgentId,
+    profile: &vibex_core::ModelProviderProfile,
+    bindings: &[vibex_core::AgentModelProviderBinding],
+) -> bool {
+    bindings.iter().any(|binding| {
+        if binding.deleted_at_ms.is_some() || &binding.agent_id != agent_id {
+            return false;
+        }
+        binding.model_provider_profile_id.as_ref() == Some(&profile.id)
+            || match (
+                binding.legacy_provider_profile_id.as_ref(),
+                profile.legacy_provider_profile_id.as_ref(),
+            ) {
+                (Some(bound), Some(own)) => bound == own,
+                _ => false,
+            }
+    })
+}
+
 /// Why a Key did not serve a reply, in words.
 ///
 /// The stored kind is an enum id; a reader gets the human phrase. Nothing here
@@ -38975,13 +39044,19 @@ fn provider_source_section(
 fn provider_source_rows(
     presets: &[vibex_core::ProviderPreset],
     pending: bool,
+    added: &BTreeSet<String>,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let mut rows = v_flex().w_full().min_w_0().gap_0p5();
     for line in presets.chunks(PROVIDER_SOURCE_COLUMNS) {
         let mut row = h_flex().w_full().min_w_0().gap_1();
         for preset in line {
-            row = row.child(provider_source_tile(preset, pending, cx));
+            row = row.child(provider_source_tile(
+                preset,
+                pending,
+                added.contains(&preset.id),
+                cx,
+            ));
         }
         // A partially filled line keeps the empty column widths in place, so a
         // kind's rows line up with the rows above them instead of centring.
@@ -39001,6 +39076,7 @@ fn provider_source_rows(
 fn provider_source_tile(
     preset: &vibex_core::ProviderPreset,
     pending: bool,
+    added: bool,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let preset_id = preset.id.clone();
@@ -39037,6 +39113,15 @@ fn provider_source_tile(
                 .font_medium()
                 .child(preset.display_name.clone()),
         )
+        // A vendor already added is marked here too, so the state is visible
+        // before the form is opened rather than only after a record exists.
+        .when(added, |this| {
+            this.child(
+                Icon::new(IconName::Check)
+                    .size(px(12.0))
+                    .text_color(cx.theme().primary),
+            )
+        })
         .into_any_element()
 }
 
@@ -47048,6 +47133,75 @@ mod gateway_surface_tests {
         assert!(!ids.contains(unbound.as_str()));
     }
 
+    /// A Provider made by the current flow is recognised as in use.
+    ///
+    /// Such a record has only the shared id: the legacy per-Agent profile is
+    /// minted later or never. Asking the binding for that legacy id alone said
+    /// "not in use", so the chooser offered the same Provider again.
+    #[test]
+    fn a_record_with_only_its_shared_id_still_reads_as_in_use() {
+        use vibex_core::{
+            AgentId, AgentModelProviderBinding, AgentModelProviderBindingId, AgentRuntimeProfileId,
+            ModelProviderProfileId,
+        };
+
+        let agent = AgentId::parse("claude").unwrap();
+        let shared = ModelProviderProfileId::new();
+        let profile = vibex_core::ModelProviderProfile {
+            id: shared.clone(),
+            display_name: "anyrouter".to_string(),
+            ..Default::default()
+        };
+        let binding = AgentModelProviderBinding {
+            id: AgentModelProviderBindingId::new(),
+            legacy_provider_profile_id: None,
+            model_provider_profile_id: Some(shared.clone()),
+            agent_id: agent.clone(),
+            runtime_profile_id: AgentRuntimeProfileId::new(),
+            deleted_at_ms: None,
+            ..AgentModelProviderBinding::default()
+        };
+
+        assert!(agent_uses_shared_provider(
+            &agent,
+            &profile,
+            std::slice::from_ref(&binding)
+        ));
+
+        // A removed binding is history, not use.
+        let removed = AgentModelProviderBinding {
+            deleted_at_ms: Some(1),
+            ..binding.clone()
+        };
+        assert!(!agent_uses_shared_provider(&agent, &profile, &[removed]));
+
+        // Another Agent's binding says nothing about this one.
+        let other_agent = AgentModelProviderBinding {
+            agent_id: AgentId::parse("codex").unwrap(),
+            ..binding
+        };
+        assert!(!agent_uses_shared_provider(
+            &agent,
+            &profile,
+            &[other_agent]
+        ));
+
+        // A different Provider is not this one.
+        let unrelated = vibex_core::ModelProviderProfile {
+            id: ModelProviderProfileId::new(),
+            ..profile.clone()
+        };
+        assert!(!agent_uses_shared_provider(
+            &agent,
+            &unrelated,
+            &[AgentModelProviderBinding {
+                agent_id: agent.clone(),
+                model_provider_profile_id: Some(ModelProviderProfileId::new()),
+                ..AgentModelProviderBinding::default()
+            }]
+        ));
+    }
+
     /// The "from preset" marker reads the value, so it cannot outlive an edit.
     #[test]
     fn a_preset_marker_is_a_reading_not_a_record() {
@@ -47585,6 +47739,13 @@ mod gateway_surface_tests {
         // The list is a grid: two columns when the dialog is wide enough.
         assert!(
             picker.contains("let two_columns = f32::from(window.viewport_size().width) >= 720.0;")
+        );
+        // A saved Provider this Agent already uses is drawn with a check and no
+        // click, rather than being filtered out of the list and offered again.
+        assert!(picker.contains("agent_uses_shared_provider("));
+        assert!(
+            !picker.contains(".legacy_provider_profile_id\n                    .as_ref()\n                    .is_none_or"),
+            "a used Provider must stay listed, marked as taken"
         );
         assert!(picker.contains("management-provider-preset-custom"));
         assert!(picker.contains("create_route_group_from_picker(window, cx)"));
