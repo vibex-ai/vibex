@@ -1446,6 +1446,24 @@ pub struct ManagementCenter {
     provider_model_edit_efforts: Option<Entity<InputState>>,
     /// The open model's API protocol; `None` inherits the Provider's.
     provider_model_edit_wire_api: Option<vibex_core::ProviderModelWireApi>,
+    /// The open model's capabilities as the inline editor holds them.
+    ///
+    /// The chips used to write straight to the saved record, which made the
+    /// editor's two halves behave differently: a token limit waited for "Save
+    /// model" while a capability was persisted on the click. They are kept
+    /// here so one Save writes the whole model, and so a catalogue lookup can
+    /// fill them without touching a saved Provider.
+    provider_model_edit_image_input: Option<bool>,
+    provider_model_edit_pdf_input: Option<bool>,
+    provider_model_edit_temperature: Option<bool>,
+    provider_model_edit_reasoning: Option<bool>,
+    /// The catalogue's suggestion for the model the inline editor has open.
+    provider_model_capability_suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
+    /// How many suggestion fields the lookup filled in by itself, so the
+    /// editor can say so instead of leaving the numbers unexplained.
+    provider_model_capability_auto_filled: usize,
+    /// The in-flight catalogue lookup behind the inline editor.
+    provider_model_capability_task: Option<Task<()>>,
     provider_model_edit_error: Option<String>,
     /// The Models tab's "add a model by id" field.
     provider_model_add_input: Entity<InputState>,
@@ -1594,10 +1612,16 @@ pub struct ManagementCenter {
     route_group_member_efforts: BTreeMap<String, String>,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
-    /// It is only ever a suggestion: nothing here is applied until the user
-    /// presses the field's own adopt control, and a failed or missing lookup
-    /// simply leaves this empty.
+    /// The fields it carries that the Model does not declare yet are filled in
+    /// as soon as it arrives; adopted values keep the catalogue as their
+    /// source, and the field's own control can still put a value back after an
+    /// edit. A failed or missing lookup simply leaves this empty.
     model_capability_suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
+    /// The in-flight catalogue lookup behind the Agent dialog's model settings.
+    ///
+    /// Kept apart from the Secret read's task: both may be in flight while the
+    /// dialog opens, and sharing one slot let either answer cancel the other.
+    model_capability_task: Option<Task<()>>,
     /// Catalogue identities for the Models the open model-group draft can
     /// name, keyed by `(catalogue provider id, upstream model id)`.
     ///
@@ -3074,6 +3098,13 @@ impl ManagementCenter {
             provider_model_edit_name: None,
             provider_model_edit_efforts: None,
             provider_model_edit_wire_api: None,
+            provider_model_edit_image_input: None,
+            provider_model_edit_pdf_input: None,
+            provider_model_edit_temperature: None,
+            provider_model_edit_reasoning: None,
+            provider_model_capability_suggestion: None,
+            provider_model_capability_auto_filled: 0,
+            provider_model_capability_task: None,
             provider_model_edit_error: None,
             provider_model_add_input,
             provider_endpoint_probes: None,
@@ -3126,6 +3157,7 @@ impl ManagementCenter {
             route_group_token_limit_window: vibex_core::GatewayTokenWindow::Day,
             route_group_member_efforts: BTreeMap::new(),
             model_capability_suggestion: None,
+            model_capability_task: None,
             model_canonical_ids: BTreeMap::new(),
             selected_global_provider_id: None,
             provider_search,
@@ -6452,6 +6484,8 @@ impl ManagementCenter {
         self.profile_detached_models.clear();
         self.profile_model_selection = None;
         self.profile_model_edit_wire_api = None;
+        self.model_capability_suggestion = None;
+        self.model_capability_task = None;
         self.profile_model_edit_error = None;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
@@ -7386,7 +7420,6 @@ impl ManagementCenter {
         {
             Some(index) => {
                 self.load_profile_model_editor(index, window, cx);
-                self.request_model_capability_suggestion(cx);
             }
             None => {
                 self.clear_profile_model_editor(window, cx);
@@ -7401,7 +7434,7 @@ impl ManagementCenter {
     /// The answer is advisory and may be absent for any reason, so a failure
     /// clears the suggestion instead of surfacing an error: a catalogue that
     /// cannot answer must not look like a broken editor.
-    fn request_model_capability_suggestion(&mut self, cx: &mut Context<Self>) {
+    fn request_model_capability_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -7455,7 +7488,8 @@ impl ManagementCenter {
         };
         self.model_capability_suggestion = None;
         let entity = cx.weak_entity();
-        self.profile_secret_task = Some(cx.spawn(async move |_, cx| {
+        let requested_model = model_id.clone();
+        self.model_capability_task = Some(cx.spawn_in(window, async move |_, cx| {
             let suggestion = backend
                 .management()
                 .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
@@ -7465,11 +7499,103 @@ impl ManagementCenter {
                 .await
                 .ok()
                 .flatten();
-            let _ = entity.update(cx, |this, cx| {
+            let _ = entity.update_in(cx, |this, window, cx| {
+                // A late answer must not describe a Model the pane has already
+                // left, so the selection is the guard rather than a generation
+                // counter: the pane names exactly one Model at a time.
+                if this.profile_model_selection.as_deref() != Some(requested_model.as_str()) {
+                    return;
+                }
                 this.model_capability_suggestion = suggestion;
+                this.auto_fill_profile_model_capabilities(window, cx);
                 cx.notify();
             });
         }));
+    }
+
+    /// Fills the fields the Model does not declare yet from the suggestion.
+    ///
+    /// The catalogue is only a default answer, so it may write where nothing
+    /// is declared and nowhere else: a value the user already declared stays,
+    /// and adopting it remains an explicit click in the suggestion list. The
+    /// fields that were filled are still listed there, because a user who
+    /// edits one may want the catalogue's value back.
+    fn auto_fill_profile_model_capabilities(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(suggestion) = self.model_capability_suggestion.clone() else {
+            return;
+        };
+        let Some(index) = self.selected_profile_model_index() else {
+            return;
+        };
+        let Some(model) = self.profile_configured_models.get(index) else {
+            return;
+        };
+        let mut capabilities = model.capabilities.clone();
+        // The field on screen is the answer the user is looking at, so a limit
+        // only counts as undeclared while its box is empty as well.
+        let context_box_empty = self
+            .profile_model_edit_context_tokens
+            .read(cx)
+            .value()
+            .trim()
+            .is_empty();
+        let output_box_empty = self
+            .profile_model_edit_output_tokens
+            .read(cx)
+            .value()
+            .trim()
+            .is_empty();
+        let mut filled = 0usize;
+        for field in suggestion
+            .fields
+            .iter()
+            .map(|entry| entry.field.as_str())
+            .collect::<Vec<_>>()
+        {
+            let unset = match field {
+                "contextTokens" => context_box_empty && capabilities.context_tokens.is_none(),
+                "outputTokens" => output_box_empty && capabilities.output_tokens.is_none(),
+                "reasoning" => capabilities.reasoning.is_none(),
+                "imageInput" => capabilities.image_input.is_none(),
+                "pdfInput" => capabilities.pdf_input.is_none(),
+                "temperature" => capabilities.temperature.is_none(),
+                _ => false,
+            };
+            if unset && suggestion.adopt(&mut capabilities, field) {
+                filled += 1;
+            }
+        }
+        if filled == 0 {
+            return;
+        }
+        let context_tokens = capabilities.context_tokens;
+        let output_tokens = capabilities.output_tokens;
+        if let Some(model) = self.profile_configured_models.get_mut(index) {
+            model.capabilities = capabilities;
+        }
+        // The visible fields follow the declaration they now hold.
+        if let Some(value) = context_tokens
+            && context_box_empty
+        {
+            self.profile_model_edit_context_tokens
+                .update(cx, |state, cx| {
+                    state.set_value(value.to_string(), window, cx)
+                });
+        }
+        if let Some(value) = output_tokens
+            && output_box_empty
+        {
+            self.profile_model_edit_output_tokens
+                .update(cx, |state, cx| {
+                    state.set_value(value.to_string(), window, cx)
+                });
+        }
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
     }
 
     /// Fills [`Self::model_canonical_ids`] for the draft's current Providers.
@@ -7553,6 +7679,7 @@ impl ManagementCenter {
     /// Empties the settings pane, for a selection the draft no longer holds.
     fn clear_profile_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_capability_suggestion = None;
+        self.model_capability_task = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
         self.profile_model_edit_error = None;
@@ -7616,6 +7743,10 @@ impl ManagementCenter {
         self.profile_model_edit_error = None;
         self.navigation
             .mark_dirty(ManagementSection::Agents, was_dirty);
+        // Every path that shows a Model's settings asks the catalogue, not only
+        // the "add a custom id" one: a row click and a checkbox answer land in
+        // this same pane.
+        self.request_model_capability_suggestion(window, cx);
         cx.notify();
     }
 
@@ -16724,6 +16855,15 @@ impl ManagementCenter {
         }
         self.provider_model_edit_id = Some(model.id.clone());
         self.provider_model_edit_error = None;
+        self.provider_model_edit_image_input = model.capabilities.image_input;
+        self.provider_model_edit_pdf_input = model.capabilities.pdf_input;
+        self.provider_model_edit_temperature = model.capabilities.temperature;
+        self.provider_model_edit_reasoning = model.capabilities.reasoning;
+        // A lookup left over from the previously open Model must not answer for
+        // this one, and its suggestion must not describe this Model either.
+        self.provider_model_capability_task = None;
+        self.provider_model_capability_suggestion = None;
+        self.provider_model_capability_auto_filled = 0;
         let context = model
             .capabilities
             .context_tokens
@@ -16753,7 +16893,12 @@ impl ManagementCenter {
                 .default_value(efforts)
         }));
         self.provider_model_edit_wire_api = shared_model_wire_api(model);
-        let _ = profile;
+        self.request_provider_model_capability_suggestion(
+            profile.clone(),
+            model.id.clone(),
+            window,
+            cx,
+        );
         cx.notify();
     }
 
@@ -16764,8 +16909,194 @@ impl ManagementCenter {
         self.provider_model_edit_name = None;
         self.provider_model_edit_efforts = None;
         self.provider_model_edit_wire_api = None;
+        self.provider_model_edit_image_input = None;
+        self.provider_model_edit_pdf_input = None;
+        self.provider_model_edit_temperature = None;
+        self.provider_model_edit_reasoning = None;
+        self.provider_model_capability_task = None;
+        self.provider_model_capability_suggestion = None;
+        self.provider_model_capability_auto_filled = 0;
         self.provider_model_edit_error = None;
         cx.notify();
+    }
+
+    /// Asks the catalogue what the Model the inline editor has open suggests.
+    ///
+    /// The lookup is best effort and never blocks: a Provider with no
+    /// catalogue id, a missing catalogue, or a failed call simply leaves the
+    /// editor with no suggestions. [`Self::apply_provider_model_capability_suggestion`]
+    /// does the filling once the answer lands.
+    fn request_provider_model_capability_suggestion(
+        &mut self,
+        profile: vibex_core::ModelProviderProfile,
+        model_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(provider_id) = profile
+            .metadata
+            .catalog_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|catalog_id| !catalog_id.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let requested_model = model_id.clone();
+        self.provider_model_capability_task = Some(cx.spawn_in(window, async move |_, cx| {
+            let suggestion = backend
+                .management()
+                .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
+                    provider_id,
+                    model_id,
+                })
+                .await
+                .ok()
+                .flatten();
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.provider_model_edit_id.as_deref() != Some(requested_model.as_str()) {
+                    return;
+                }
+                this.apply_provider_model_capability_suggestion(suggestion, window, cx);
+            });
+        }));
+    }
+
+    /// Stores one Model's suggestion and fills the fields nothing declared.
+    ///
+    /// The fill goes into the editor's own copy, not the saved record: the
+    /// inline editor already waits for "Save model" for the limits, and a
+    /// lookup that wrote on its own would change a Provider merely because its
+    /// Models tab was opened. Only a field still showing its empty state is
+    /// filled, so a value the user typed is never replaced.
+    fn apply_provider_model_capability_suggestion(
+        &mut self,
+        suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.provider_model_capability_suggestion = suggestion;
+        self.provider_model_capability_auto_filled = 0;
+        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
+            cx.notify();
+            return;
+        };
+        let mut filled = 0usize;
+        if let Some(value) = suggestion.number("contextTokens")
+            && self
+                .provider_model_edit_context
+                .as_ref()
+                .is_some_and(|input| input.read(cx).value().trim().is_empty())
+        {
+            self.set_provider_model_limit(
+                &self.provider_model_edit_context.clone(),
+                value,
+                window,
+                cx,
+            );
+            filled += 1;
+        }
+        if let Some(value) = suggestion.number("outputTokens")
+            && self
+                .provider_model_edit_output
+                .as_ref()
+                .is_some_and(|input| input.read(cx).value().trim().is_empty())
+        {
+            self.set_provider_model_limit(
+                &self.provider_model_edit_output.clone(),
+                value,
+                window,
+                cx,
+            );
+            filled += 1;
+        }
+        for (field, slot) in [
+            ("imageInput", &mut self.provider_model_edit_image_input),
+            ("pdfInput", &mut self.provider_model_edit_pdf_input),
+            ("temperature", &mut self.provider_model_edit_temperature),
+            ("reasoning", &mut self.provider_model_edit_reasoning),
+        ] {
+            if slot.is_none()
+                && let Some(value) = suggestion.flag(field)
+            {
+                *slot = Some(value);
+                filled += 1;
+            }
+        }
+        self.provider_model_capability_auto_filled = filled;
+        cx.notify();
+    }
+
+    fn set_provider_model_limit(
+        &mut self,
+        input: &Option<Entity<InputState>>,
+        value: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(input) = input {
+            input.update(cx, |state, cx| {
+                state.set_value(value.to_string(), window, cx);
+            });
+        }
+    }
+
+    /// Writes one suggested field into the inline editor's own copy.
+    fn adopt_provider_model_capability_field(
+        &mut self,
+        field: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
+            return;
+        };
+        match field {
+            "contextTokens" => {
+                if let Some(value) = suggestion.number(field) {
+                    self.set_provider_model_limit(
+                        &self.provider_model_edit_context.clone(),
+                        value,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            "outputTokens" => {
+                if let Some(value) = suggestion.number(field) {
+                    self.set_provider_model_limit(
+                        &self.provider_model_edit_output.clone(),
+                        value,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            "imageInput" => self.provider_model_edit_image_input = suggestion.flag(field),
+            "pdfInput" => self.provider_model_edit_pdf_input = suggestion.flag(field),
+            "temperature" => self.provider_model_edit_temperature = suggestion.flag(field),
+            "reasoning" => self.provider_model_edit_reasoning = suggestion.flag(field),
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    fn adopt_all_provider_model_capability_fields(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
+            return;
+        };
+        for field in suggestion.fields.iter().map(|entry| entry.field.clone()) {
+            self.adopt_provider_model_capability_field(&field, window, cx);
+        }
     }
 
     /// Adds one model by id to a shared Provider, the Models tab's version of
@@ -16972,13 +17303,71 @@ impl ManagementCenter {
         };
         model.capabilities.context_tokens = context;
         model.capabilities.output_tokens = output;
+        model.capabilities.image_input = self.provider_model_edit_image_input;
+        model.capabilities.pdf_input = self.provider_model_edit_pdf_input;
+        model.capabilities.temperature = self.provider_model_edit_temperature;
+        model.capabilities.reasoning = self.provider_model_edit_reasoning;
         model.display_name = (!display_name.is_empty()).then_some(display_name);
-        if model.capabilities.reasoning != Some(false) {
-            model.capabilities.reasoning = match (efforts.is_some(), model.capabilities.reasoning) {
-                (true, _) => Some(true),
-                (false, declared) => declared,
-            };
+        if model.capabilities.reasoning == Some(false) {
+            model.capabilities.reasoning_efforts = None;
+        } else {
+            if efforts.is_some() {
+                model.capabilities.reasoning = Some(true);
+            }
             model.capabilities.reasoning_efforts = efforts;
+        }
+        // A value still equal to the catalogue's is the catalogue's; anything
+        // else is the user's own answer, whether they typed it or picked it
+        // from the chips above. Records saved before any lookup existed keep
+        // whatever provenance they already carried.
+        if let Some(suggestion) = self.provider_model_capability_suggestion.as_ref() {
+            for field in [
+                "imageInput",
+                "pdfInput",
+                "temperature",
+                "reasoning",
+                "contextTokens",
+                "outputTokens",
+            ] {
+                let (suggested, current) = match field {
+                    "contextTokens" => (
+                        suggestion.number(field).map(|value| value.to_string()),
+                        model
+                            .capabilities
+                            .context_tokens
+                            .map(|value| value.to_string()),
+                    ),
+                    "outputTokens" => (
+                        suggestion.number(field).map(|value| value.to_string()),
+                        model
+                            .capabilities
+                            .output_tokens
+                            .map(|value| value.to_string()),
+                    ),
+                    _ => (
+                        suggestion.flag(field).map(|value| value.to_string()),
+                        match field {
+                            "imageInput" => model.capabilities.image_input,
+                            "pdfInput" => model.capabilities.pdf_input,
+                            "temperature" => model.capabilities.temperature,
+                            _ => model.capabilities.reasoning,
+                        }
+                        .map(|value| value.to_string()),
+                    ),
+                };
+                let Some(suggested) = suggested else {
+                    continue;
+                };
+                let adopted = current.as_deref() == Some(suggested.as_str());
+                model.capabilities.set_source(
+                    field,
+                    if adopted {
+                        vibex_core::ModelCapabilitySource::Catalog
+                    } else {
+                        vibex_core::ModelCapabilitySource::Declared
+                    },
+                );
+            }
         }
         model.metadata.retain(|entry| entry.key != "wireApi");
         if let Some(wire_api) = self.provider_model_edit_wire_api {
@@ -16995,50 +17384,166 @@ impl ManagementCenter {
         );
     }
 
-    fn set_shared_provider_model_capability(
+    /// Writes one of the open model's capability choices into the editor.
+    ///
+    /// The saved record is untouched until "Save model", so a catalogue
+    /// lookup or an experimental click cannot change a Provider on its own.
+    fn set_provider_model_edit_capability(
         &mut self,
-        profile_id: vibex_core::ModelProviderProfileId,
-        model_id: String,
         field: &'static str,
         value: Option<bool>,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut profile) = self
-            .providers
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .cloned()
-        else {
-            return;
-        };
-        let Some(model) = profile
-            .configured_models
-            .iter_mut()
-            .find(|model| model.id == model_id)
-        else {
-            return;
-        };
         match field {
-            "image" => model.capabilities.image_input = value,
-            "pdf" => model.capabilities.pdf_input = value,
-            "temperature" => model.capabilities.temperature = value,
-            "reasoning" => {
-                model.capabilities.reasoning = value;
-                if value != Some(true) {
-                    model.capabilities.reasoning_efforts = None;
-                }
-            }
+            "image" => self.provider_model_edit_image_input = value,
+            "pdf" => self.provider_model_edit_pdf_input = value,
+            "temperature" => self.provider_model_edit_temperature = value,
+            "reasoning" => self.provider_model_edit_reasoning = value,
             _ => return,
         }
-        self.update_shared_provider(
-            profile,
+        cx.notify();
+    }
+
+    /// The catalogue's values for the open model, each with its own adopt
+    /// control.
+    ///
+    /// The list stays visible after the automatic fill, because it is also the
+    /// way back: an edited field can be returned to the catalogue's value, and
+    /// "adopt all" restores every one of them.
+    fn render_provider_model_capability_suggestions(
+        &mut self,
+        model: &vibex_core::ModelProviderCatalogEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
+            return div().into_any_element();
+        };
+        if suggestion.fields.is_empty() {
+            return div().into_any_element();
+        }
+        let approximate = suggestion.approximate;
+        let auto_filled = self.provider_model_capability_auto_filled;
+        let note = if auto_filled > 0 {
             management_locale_text(
-                "Model capability updated",
-                "模型能力已更新",
-                "模型能力已更新",
-            ),
-            cx,
-        );
+                "Filled from the catalogue when this model opened. Save model to keep it; apply a value to restore it.",
+                "打开时已按目录自动填入；保存模型后生效，点采用可恢复目录值。",
+                "開啟時已按目錄自動填入；儲存模型後生效，點採用可還原目錄值。",
+            )
+        } else {
+            management_locale_text(
+                "Click apply to copy a catalogue value into the form. Nothing is written until you save.",
+                "点采用即可把目录值写入表单；保存模型前不会写入记录。",
+                "點採用即可把目錄值寫入表單；儲存模型前不會寫入紀錄。",
+            )
+        };
+        let mut block = v_flex()
+            .w_full()
+            .gap_1p5()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.15))
+            .p_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_xs().font_medium().child(management_locale_text(
+                        "Catalogue suggestion",
+                        "目录建议",
+                        "目錄建議",
+                    )))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-model-adopt-all-{}",
+                            model.id
+                        )))
+                        .xsmall()
+                        .outline()
+                        .label(management_locale_text(
+                            "Apply all suggestions",
+                            "采用全部建议",
+                            "採用全部建議",
+                        ))
+                        .disabled(self.mutation.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.adopt_all_provider_model_capability_fields(window, cx)
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(note),
+            );
+        for field in suggestion.fields {
+            let label = match field.field.as_str() {
+                "contextTokens" => {
+                    management_locale_text("Context window", "上下文窗口", "上下文視窗")
+                }
+                "outputTokens" => management_locale_text("Max output", "最大输出", "最大輸出"),
+                "reasoning" => management_locale_text("Reasoning", "推理", "推理"),
+                "imageInput" => management_locale_text("Images", "图片输入", "圖片輸入"),
+                "pdfInput" => management_locale_text("PDF", "PDF 输入", "PDF 輸入"),
+                "temperature" => management_locale_text("Temperature", "温度参数", "溫度參數"),
+                _ => continue,
+            };
+            let shown = match field.field.as_str() {
+                "reasoning" | "imageInput" | "pdfInput" | "temperature" => {
+                    if field.value == "true" {
+                        management_locale_text("supported", "支持", "支援")
+                    } else {
+                        management_locale_text("unsupported", "不支持", "不支援")
+                    }
+                }
+                _ => field.value.as_str(),
+            };
+            let field_key = field.field.clone();
+            block = block.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{label} · {shown}{}",
+                                if approximate {
+                                    management_locale_text(
+                                        " (approximate)",
+                                        "（近似匹配）",
+                                        "（近似比對）",
+                                    )
+                                } else {
+                                    ""
+                                }
+                            )),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-model-adopt-{}-{field_key}",
+                            model.id
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Apply", "采用", "採用"))
+                        .disabled(self.mutation.is_some())
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.adopt_provider_model_capability_field(&field_key, window, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        block.into_any_element()
     }
 
     fn set_shared_provider_default_model(
@@ -18968,22 +19473,22 @@ impl ManagementCenter {
             (
                 "image",
                 management_locale_text("Image input", "图片输入", "圖片輸入"),
-                model.capabilities.image_input,
+                self.provider_model_edit_image_input,
             ),
             (
                 "pdf",
                 management_locale_text("PDF input", "PDF 输入", "PDF 輸入"),
-                model.capabilities.pdf_input,
+                self.provider_model_edit_pdf_input,
             ),
             (
                 "temperature",
                 management_locale_text("Temperature", "温度参数", "溫度參數"),
-                model.capabilities.temperature,
+                self.provider_model_edit_temperature,
             ),
             (
                 "reasoning",
                 management_locale_text("Reasoning", "推理", "推理"),
-                model.capabilities.reasoning,
+                self.provider_model_edit_reasoning,
             ),
         ] {
             let choices = [
@@ -19021,23 +19526,15 @@ impl ManagementCenter {
                         .label(choice_label)
                         .selected(value == choice)
                     }))
-                    .on_click(cx.listener({
-                        let profile_id = profile_id.clone();
-                        let model_id = model_id.clone();
+                    .on_click(cx.listener(
                         move |this, clicks: &Vec<usize>, _, cx| {
                             if let Some((choice, _)) =
                                 clicks.first().and_then(|index| choices.get(*index))
                             {
-                                this.set_shared_provider_model_capability(
-                                    profile_id.clone(),
-                                    model_id.clone(),
-                                    field,
-                                    *choice,
-                                    cx,
-                                );
+                                this.set_provider_model_edit_capability(field, *choice, cx);
                             }
-                        }
-                    })),
+                        },
+                    )),
                 );
             capabilities = capabilities.child(chips);
         }
@@ -19067,6 +19564,9 @@ impl ManagementCenter {
                 cx,
             ));
         }
+        // Rendered before the labelling closure exists: the renderer needs the
+        // entity context mutably, and the closure keeps it borrowed.
+        let suggestions = self.render_provider_model_capability_suggestions(model, cx);
         let labelled = |label: &'static str, control: AnyElement| {
             v_flex()
                 .min_w_0()
@@ -19173,7 +19673,8 @@ impl ManagementCenter {
                     )),
             )
             .child(capabilities)
-            .when(model.capabilities.reasoning != Some(false), |editor| {
+            .child(suggestions)
+            .when(self.provider_model_edit_reasoning != Some(false), |editor| {
                 editor.child(labelled(
                     management_locale_text("Thinking levels", "思考档位", "思考檔位"),
                     v_flex()
@@ -23325,9 +23826,10 @@ impl ManagementCenter {
     /// The catalogue's suggestions, one row per field with its own adopt
     /// control.
     ///
-    /// Nothing here applies by itself: a suggestion is a value the user may
-    /// take, and a field they already declared is shown with a way back to
-    /// their own value rather than being overwritten.
+    /// A field with no declaration is filled as soon as the answer arrives, so
+    /// the editor opens useful instead of blank; the rows stay listed because
+    /// the catalogue's value is what an edited field can be returned to, and
+    /// adopting one is still an explicit click.
     fn render_capability_suggestions(
         &mut self,
         index: usize,
@@ -23438,9 +23940,9 @@ impl ManagementCenter {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "Some values came from the catalogue.",
-                        "部分数值来自模型目录。",
-                        "部分數值來自模型目錄。",
+                        "Values without a declaration were filled from the catalogue and can still be changed.",
+                        "未声明过的数值已按模型目录自动填入，仍可修改。",
+                        "未宣告過的數值已按模型目錄自動填入，仍可修改。",
                     ))
                     .into_any_element(),
             );
@@ -25049,10 +25551,15 @@ impl ManagementCenter {
             })
             .collect();
         self.profile_available_models = self.profile_configured_models.clone();
-        self.profile_model_selection = self
-            .profile_configured_models
-            .first()
-            .map(|model| model.id.clone());
+        // The pane opens on the first model, so the same gesture has to load
+        // it. Naming it alone left the previous draft's fields under the new
+        // model's header and never asked the catalogue.
+        if self.profile_configured_models.is_empty() {
+            self.profile_model_selection = None;
+            self.clear_profile_model_editor(window, cx);
+        } else {
+            self.load_profile_model_editor(0, window, cx);
+        }
         if let Some(hint) = preset.key_hint.as_deref() {
             // The hint is a placeholder, not a value: it tells the user what
             // the vendor's keys look like without typing anything.
@@ -42872,7 +43379,9 @@ mod tests {
         let source = include_str!("management.rs");
         let market = source
             .split_once("    fn render_skills_market(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The preview and confirmation panel for one Skill."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The preview and confirmation panel for one Skill.")
+            })
             .map(|(body, _)| body)
             .expect("the Skill market should remain inspectable");
         for element in [
@@ -42887,10 +43396,7 @@ mod tests {
             "self.skill_market_summaries",
             ".official",
         ] {
-            assert!(
-                market.contains(element),
-                "the Skill card lost {element}"
-            );
+            assert!(market.contains(element), "the Skill card lost {element}");
         }
     }
 
@@ -44185,6 +44691,13 @@ mod tests {
         assert_eq!(models[1].id, "claude-sonnet");
     }
 
+    fn suggestion_field(field: &str, value: &str) -> vibex_core::GatewayCapabilityField {
+        vibex_core::GatewayCapabilityField {
+            field: field.to_string(),
+            value: value.to_string(),
+        }
+    }
+
     fn test_provider_model(
         id: &str,
         display_name: Option<&str>,
@@ -44819,6 +45332,176 @@ mod tests {
                 assert_eq!(center.selected_profile_model_index(), Some(1));
             });
         });
+    }
+
+    /// A catalogue answer fills the settings pane where nothing is declared.
+    ///
+    /// The declared limit is the one thing that must not move: auto-fill is a
+    /// convenience for the empty editor, not a way to overwrite a decision the
+    /// user already made.
+    #[gpui::test]
+    fn a_catalogue_answer_fills_the_settings_pane(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                let mut declared = test_provider_model("declared-model", None);
+                declared.capabilities.context_tokens = Some(64_000);
+                center.profile_configured_models = vec![declared];
+                center.profile_model_selection = Some("declared-model".to_string());
+                center
+                    .profile_model_edit_context_tokens
+                    .update(cx, |state, cx| state.set_value("64000", window, cx));
+                center.model_capability_suggestion =
+                    Some(vibex_core::GatewayCapabilitySuggestion {
+                        approximate: false,
+                        fields: vec![
+                            suggestion_field("contextTokens", "1000000"),
+                            suggestion_field("outputTokens", "128000"),
+                            suggestion_field("imageInput", "true"),
+                            suggestion_field("temperature", "false"),
+                        ],
+                    });
+
+                center.auto_fill_profile_model_capabilities(window, cx);
+
+                let model = &center.profile_configured_models[0];
+                assert_eq!(
+                    model.capabilities.context_tokens,
+                    Some(64_000),
+                    "a declared limit must survive the automatic fill"
+                );
+                assert_eq!(model.capabilities.output_tokens, Some(128_000));
+                assert_eq!(model.capabilities.image_input, Some(true));
+                assert_eq!(model.capabilities.temperature, Some(false));
+                assert_eq!(
+                    center.profile_model_edit_output_tokens.read(cx).value(),
+                    "128000"
+                );
+                assert_eq!(
+                    center.profile_model_edit_context_tokens.read(cx).value(),
+                    "64000"
+                );
+                assert!(
+                    model
+                        .capabilities
+                        .adopted_from_catalog()
+                        .any(|field| field == "outputTokens"),
+                    "a filled field records where it came from"
+                );
+            });
+        });
+    }
+
+    /// The Models tab's inline editor fills its own fields from the catalogue.
+    ///
+    /// Nothing is written to the saved record here: the numbers are only in
+    /// the editor's boxes until "Save model", and a declared capability stays
+    /// where the user put it.
+    #[gpui::test]
+    fn a_catalogue_answer_fills_the_models_tab_editor(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            let context = cx.new(|cx| InputState::new(window, cx));
+            let output = cx.new(|cx| InputState::new(window, cx));
+            center.update(cx, |center, cx| {
+                center.provider_model_edit_id = Some("claude-haiku-5-5".to_string());
+                center.provider_model_edit_context = Some(context);
+                center.provider_model_edit_output = Some(output);
+                center.provider_model_edit_image_input = None;
+                center.provider_model_edit_temperature = Some(false);
+                center.apply_provider_model_capability_suggestion(
+                    Some(vibex_core::GatewayCapabilitySuggestion {
+                        approximate: false,
+                        fields: vec![
+                            suggestion_field("contextTokens", "1000000"),
+                            suggestion_field("outputTokens", "128000"),
+                            suggestion_field("imageInput", "true"),
+                            suggestion_field("temperature", "true"),
+                        ],
+                    }),
+                    window,
+                    cx,
+                );
+
+                assert_eq!(
+                    center
+                        .provider_model_edit_context
+                        .as_ref()
+                        .expect("context input")
+                        .read(cx)
+                        .value(),
+                    "1000000"
+                );
+                assert_eq!(
+                    center
+                        .provider_model_edit_output
+                        .as_ref()
+                        .expect("output input")
+                        .read(cx)
+                        .value(),
+                    "128000"
+                );
+                assert_eq!(center.provider_model_edit_image_input, Some(true));
+                assert_eq!(
+                    center.provider_model_edit_temperature,
+                    Some(false),
+                    "a declared capability must survive the automatic fill"
+                );
+                assert_eq!(center.provider_model_capability_auto_filled, 3);
+            });
+        });
+    }
+
+    /// Both model settings ask the catalogue, and both show its adopt controls.
+    ///
+    /// The Models tab had no lookup at all, and the Agent dialog only asked on
+    /// the hand-typed-id path, so a row click landed on a pane that never
+    /// looked anything up. This pins the two call sites the fix hangs on.
+    #[test]
+    fn both_model_settings_ask_the_catalogue_and_offer_its_values() {
+        let source = include_str!("management.rs");
+        let toggle = source
+            .split_once("    fn toggle_shared_provider_model_editor(")
+            .and_then(|(_, tail)| tail.split_once("    fn close_shared_provider_model_editor("))
+            .map(|(body, _)| body)
+            .expect("shared model editor should remain inspectable");
+        assert!(toggle.contains("request_provider_model_capability_suggestion("));
+        let inline = source
+            .split_once("    fn render_shared_provider_model_inline(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_gateway_key_policy("))
+            .map(|(body, _)| body)
+            .expect("inline model editor should remain inspectable");
+        assert!(inline.contains("render_provider_model_capability_suggestions("));
+        assert!(inline.contains("set_provider_model_edit_capability("));
+        let load = source
+            .split_once("    fn load_profile_model_editor(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Writes the open Model editor's fields")
+            })
+            .map(|(body, _)| body)
+            .expect("Agent model loader should remain inspectable");
+        assert!(
+            load.contains("request_model_capability_suggestion(window, cx)"),
+            "every path that opens the pane must ask, not only the custom-id one"
+        );
+        let request = source
+            .split_once("    fn request_model_capability_suggestion(")
+            .and_then(|(_, tail)| {
+                tail.split_once("    /// Fills the fields the Model does not declare yet")
+            })
+            .map(|(body, _)| body)
+            .expect("suggestion request should remain inspectable");
+        assert!(request.contains("auto_fill_profile_model_capabilities(window, cx)"));
+        // A preset names its first model, so it must load it too: naming it
+        // alone is what left the pane without the catalogue's answer.
+        let preset = source
+            .split_once("    fn apply_provider_preset(")
+            .and_then(|(_, tail)| tail.split_once("    fn apply_provider_preset_region("))
+            .map(|(body, _)| body)
+            .expect("preset application should remain inspectable");
+        assert!(preset.contains("self.load_profile_model_editor(0, window, cx)"));
     }
 
     /// The panes are built from live state, so drawing them is the only check
