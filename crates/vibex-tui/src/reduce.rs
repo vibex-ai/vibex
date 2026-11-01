@@ -3238,9 +3238,8 @@ impl App {
         });
         Outcome::effects(vec![Effect::PreviewSkillMarket {
             entry_id: entry.id.clone(),
+            source: entry.source.clone(),
             slug: entry.slug.clone(),
-            owner_handle: entry.owner_handle.clone(),
-            version: entry.version.clone(),
         }])
     }
 
@@ -4119,9 +4118,8 @@ impl App {
             ))),
             FormPurpose::SkillMarketInstall {
                 entry_id,
+                source,
                 slug,
-                owner_handle,
-                version,
             } => {
                 let agent_ids = form
                     .enabled_agents()
@@ -4143,9 +4141,8 @@ impl App {
                     .cloned();
                 Ok(ConfigMutation::InstallSkillMarketEntry {
                     entry_id: entry_id.clone(),
+                    source: source.clone(),
                     slug: slug.clone(),
-                    owner_handle: owner_handle.clone(),
-                    version: version.clone(),
                     agent_ids,
                     document,
                 })

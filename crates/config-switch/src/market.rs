@@ -9,9 +9,9 @@
 //! fetched once for every client of this runtime.
 //!
 //! **Each market has one upstream.** MCP reads the official registry. The Skill
-//! market reads ClawHub, a public Skill registry that publishes both a catalog
-//! and the skill folders themselves. There is no user-configured source list, so
-//! there is no policy for one.
+//! market reads a public Skill catalog that publishes the ranked list and a
+//! search, and names the repository each Skill lives in. There is no
+//! user-configured source list, so there is no policy for one.
 //!
 //! **A market never invents an entry.** Everything the UI shows came out of an
 //! upstream response; an entry the upstream did not publish cannot be listed.
@@ -19,10 +19,12 @@
 //! ## What a Skill install actually writes
 //!
 //! A published Skill is a folder, not a file: `SKILL.md` plus the references,
-//! scripts and templates its instructions point at. ClawHub serves that folder
-//! as a zip archive, so the market downloads the archive, and unpacks it under
-//! this runtime's own store rather than into any Agent's Skills folder. Each
-//! Agent then receives the folder through the same native Skill export a
+//! scripts and templates its instructions point at. The catalog names the
+//! repository but not the folder inside it, so the market downloads that
+//! repository's archive once and lifts the one folder out of it, finding it by
+//! the `SKILL.md` whose parent is named after the entry. The folder is unpacked
+//! under this runtime's own store rather than into any Agent's Skills folder.
+//! Each Agent then receives it through the same native Skill export a
 //! hand-imported Skill uses, which is what keeps one install path for every
 //! Agent instead of one per agent.
 //!
@@ -72,19 +74,20 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use vibex_core::{
     AgentId, MAX_MARKET_ICON_BYTES, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_BUNDLE_BYTES,
     MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES, MAX_SKILL_MARKET_BUNDLE_FILE_BYTES,
     MAX_SKILL_MARKET_BUNDLE_FILES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
-    MarketEnvTarget, McpMarketEntry, McpMarketIcon, McpMarketInstallRequest,
+    MarketEnvTarget, MarketIcon, McpMarketEntry, McpMarketIcon, McpMarketInstallRequest,
     McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse,
     McpServerTransportKind, ProviderKind, SkillCreateRequest, SkillMarketBundleFile,
     SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
-    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse, SkillMarketSort,
-    SkillScopeKind, SkillSourceKind, SkillStatus, VibexError, VibexResult,
+    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse,
+    SkillMarketSummaryRequest, SkillMarketSummaryResponse, SkillScopeKind, SkillSourceKind,
+    SkillStatus, VibexError, VibexResult,
 };
 use vibex_db::{McpServerRepository, SkillRepository};
 
@@ -99,27 +102,29 @@ use crate::{
 
 /// The official MCP registry. Its `v0.1` API is the only MCP catalog.
 const MCP_REGISTRY_BASE: &str = "https://registry.modelcontextprotocol.io";
-/// The public Skill registry, and the only Skill catalog.
+/// The public Skill catalog, and the only Skill catalog.
 ///
-/// The registry documents this surface: `GET /api/v1/openapi.json` is served by
-/// the registry itself, which is why the paths and the ranking vocabulary below
-/// are pinned to it rather than to a client's guess.
-const CLAWHUB_API_BASE: &str = "https://clawhub.ai";
-/// Lists and pages the catalog. The ranking and the cursor are the registry's.
-const CLAWHUB_SKILLS_PATH: &str = "/api/v1/skills";
-/// Ranks the catalog against a query. `q` is mandatory here.
-const CLAWHUB_SEARCH_PATH: &str = "/api/v1/search";
-/// Serves a Skill folder as a zip archive.
-const CLAWHUB_DOWNLOAD_PATH: &str = "/api/v1/download";
-/// Default page when a caller does not name one.
-const CLAWHUB_PAGE_SIZE: u32 = 30;
-/// Largest page the registry will serve in one answer.
-const CLAWHUB_MAX_PAGE_SIZE: u32 = 100;
-/// Shortest query the registry's search accepts. Anything shorter is a bad
-/// request, so a caller that has not asked for anything is browsing instead.
-const CLAWHUB_MIN_QUERY_CHARS: usize = 2;
-/// Longest query worth sending.
-const CLAWHUB_MAX_QUERY_CHARS: usize = 120;
+/// Its search endpoint is documented by the site itself; the ranked list is
+/// published only as the data its home page renders, which is why that one is
+/// read from the page rather than from an endpoint.
+const SKILLS_SH_BASE: &str = "https://www.skills.sh";
+/// Ranks the catalog against a query. `q` is required.
+const SKILLS_SH_SEARCH_PATH: &str = "/api/search";
+/// Where a repository serves one file at a revision.
+const RAW_GITHUB_BASE: &str = "https://raw.githubusercontent.com";
+/// Where a repository hands out its files as one archive.
+///
+/// It is what the repository's own "Download ZIP" uses and needs no API token,
+/// unlike the REST tarball endpoint, whose hourly budget a market would exhaust.
+const CODELOAD_BASE: &str = "https://codeload.github.com";
+/// The ranked list this build shipped with, so a fresh install shows a market
+/// before it has ever reached the catalog.
+///
+/// It is the array the catalog's own page renders, kept as JSON rather than as
+/// code so it stays data: nothing here decides what the market offers, only
+/// what it can show when nothing else answers.
+static SKILL_CATALOG_SNAPSHOT: &[u8] = include_bytes!("skill_catalog.json");
+
 /// Directory the manifest is looked up under inside a bundle. The Agent Skills
 /// convention is a capitalised `SKILL.md` at the folder root, but published
 /// bundles are not uniform, so the lowercase spelling is accepted too.
@@ -127,26 +132,24 @@ const SKILL_BUNDLE_MANIFEST_NAMES: [&str; 2] = ["SKILL.md", "skill.md"];
 
 /// One request may not take longer than this, including every redirect.
 ///
-/// The registry answers a search in about a second and a Skill bundle can take
-/// longer, so the ceiling sits above both while still failing an interactive
-/// read fast enough for the reader to retry it.
+/// The MCP registry answers a search in about a second and a Skill's repository
+/// archive can take longer, so the ceiling sits above both while still failing
+/// an interactive read fast enough for the reader to retry it.
 const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Redirect hops followed before the fetch is refused.
 const MAX_MARKET_REDIRECTS: usize = 5;
 /// How much of a refusal body is read.
 ///
-/// A refusal is a message, not a catalog: the Skill registry's ambiguous-slug
-/// answer names the candidate publishers, and that is the whole of what a
-/// caller can act on. Reading it under its own ceiling keeps a hostile upstream
-/// from answering a failed request with an unbounded body.
+/// A refusal is a message, not a catalog: what a caller can act on is the few
+/// words the upstream put beside the status. Reading it under its own ceiling
+/// keeps a hostile upstream from answering a failed request with an unbounded
+/// body.
 const MAX_MARKET_REFUSAL_BYTES: u64 = 16 * 1024;
 /// Entries a single response may contribute, so one huge catalog cannot flood
 /// the list.
 const MAX_ENTRIES_PER_SEARCH: usize = 500;
 /// Entries one market page holds when the caller does not name a size.
 const MARKET_PAGE_LIMIT: u32 = 20;
-/// A Skill document is markdown; anything past this is not one.
-const MAX_SKILL_DOCUMENT_FETCH_BYTES: u64 = MAX_SKILL_MARKET_DOCUMENT_BYTES + 1;
 
 // ---------------------------------------------------------------------------
 // Fetch policy
@@ -264,11 +267,10 @@ fn fetch_market_bytes(
 
 /// Fetch one market URL, letting the caller read a refusal.
 ///
-/// A refusal is not always just a status: the Skill registry answers an
-/// ambiguous slug with the candidate publishers in the body, and that body is
-/// the whole value of the response. Passing the refusal through a mapper keeps
-/// one fetch implementation — and so one redirect and size policy — while
-/// still letting an upstream with something to say be heard.
+/// A refusal is not always just a status: the body can name what was refused,
+/// and that is the whole value of the response. Passing the refusal through a
+/// mapper keeps one fetch implementation — and so one redirect and size policy
+/// — while still letting an upstream with something to say be heard.
 fn fetch_market_bytes_rejected_by(
     client: &reqwest::blocking::Client,
     raw_url: &str,
@@ -1329,371 +1331,403 @@ fn search_mcp_registry(request: &McpMarketSearchRequest) -> VibexResult<McpMarke
 }
 
 // ---------------------------------------------------------------------------
-// Skill registry adapter
+// Skill catalog adapter
 // ---------------------------------------------------------------------------
 
-/// What the registry publishes about one Skill.
+/// One Skill as the catalog's list and search endpoints publish it.
 ///
-/// Both catalog endpoints answer with the same record shape, so one decoder
-/// serves the ranked search and the browse list. Every counter is optional
-/// because a search result carries fewer fields than a list result; a missing
-/// counter is reported as zero rather than as a guess.
+/// Both endpoints answer the same record: a repository, the Skill's name inside
+/// it, and the install count used for ranking. Nothing about the Skill's
+/// contents travels here, which is why a search is one small request.
 #[derive(Debug, Deserialize)]
-struct ClawHubSkillRecord {
-    slug: String,
-    /// The handle is what disambiguates a slug several publishers own. The
-    /// registry nests it under `owner` on some responses.
-    #[serde(default, rename = "ownerHandle")]
-    owner_handle: Option<String>,
+struct SkillCatalogRecord {
+    /// `owner/repo`.
     #[serde(default)]
-    owner: Option<ClawHubOwner>,
-    #[serde(default, rename = "displayName")]
-    display_name: Option<String>,
+    source: Option<String>,
+    #[serde(default, rename = "skillId")]
+    skill_id: Option<String>,
     #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default, rename = "latestVersion")]
-    latest_version: Option<ClawHubLatestVersion>,
-    #[serde(default)]
-    tags: Option<std::collections::BTreeMap<String, String>>,
-    #[serde(default)]
-    stats: Option<ClawHubStats>,
-    #[serde(default)]
-    downloads: Option<u64>,
-    #[serde(default)]
-    stars: Option<u64>,
+    name: Option<String>,
     #[serde(default)]
     installs: Option<u64>,
-    #[serde(default, rename = "installsCurrent")]
-    installs_current: Option<u64>,
-    #[serde(default, rename = "updatedAt")]
-    updated_at: Option<i64>,
+    #[serde(default, rename = "isOfficial")]
+    is_official: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ClawHubOwner {
+struct SkillCatalogSearchResponse {
     #[serde(default)]
-    handle: Option<String>,
+    skills: Vec<SkillCatalogRecord>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ClawHubLatestVersion {
-    #[serde(default)]
-    version: Option<String>,
+/// What the catalog publishes about one repository owner, for the avatar a card
+/// shows in place of a logo no Skill has.
+fn skill_owner(source: &str) -> Option<&str> {
+    let owner = source.split('/').next()?.trim();
+    (!owner.is_empty()).then_some(owner)
 }
 
-/// The registry's counters. It documents this object as open, so each counter
-/// is read by name and anything else in it is ignored.
-#[derive(Debug, Deserialize)]
-struct ClawHubStats {
-    #[serde(default)]
-    downloads: Option<u64>,
-    #[serde(default)]
-    stars: Option<u64>,
-    #[serde(default)]
-    installs: Option<u64>,
-    #[serde(default, rename = "installsCurrent")]
-    installs_current: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClawHubListResponse {
-    #[serde(default)]
-    items: Vec<ClawHubSkillRecord>,
-    #[serde(default, rename = "nextCursor")]
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClawHubSearchResponse {
-    #[serde(default)]
-    results: Vec<ClawHubSkillRecord>,
-}
-
-/// A slug several publishers hold, which the registry refuses to resolve.
-///
-/// The refusal names the candidate handles, so it is also the one answer that
-/// makes a slug resolvable: the caller re-asks with a handle from this list
-/// instead of guessing one.
-#[derive(Debug, Deserialize)]
-struct ClawHubAmbiguousSlug {
-    #[serde(default)]
-    matches: Vec<ClawHubAmbiguousMatch>,
-}
-
-/// One candidate the refusal named.
-///
-/// These entries spell the handle the way the catalog does, not the way the
-/// nested `owner` object does, so they need their own decoder.
-#[derive(Debug, Deserialize)]
-struct ClawHubAmbiguousMatch {
-    #[serde(default, rename = "ownerHandle")]
-    owner_handle: Option<String>,
-    /// The spelling an older answer used for the same field.
-    #[serde(default)]
-    handle: Option<String>,
-}
-
-impl ClawHubAmbiguousMatch {
-    fn handle(&self) -> Option<String> {
-        trimmed(self.owner_handle.as_deref()).or_else(|| trimmed(self.handle.as_deref()))
-    }
-}
-
-fn trimmed(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-impl ClawHubSkillRecord {
-    fn owner_handle(&self) -> Option<String> {
-        trimmed(self.owner_handle.as_deref()).or_else(|| {
-            self.owner
-                .as_ref()
-                .and_then(|owner| trimmed(owner.handle.as_deref()))
+impl SkillCatalogRecord {
+    /// The entry this record describes, or `None` when it names no Skill.
+    ///
+    /// The id is the triple the catalog itself uses, so an installed Skill can
+    /// recognize the entry it came from without re-deriving the shape.
+    fn into_entry(self) -> Option<SkillMarketEntry> {
+        let source = self.source.as_deref().map(str::trim).unwrap_or_default();
+        let slug = self.skill_id.as_deref().map(str::trim).unwrap_or_default();
+        if source.is_empty() || slug.is_empty() || !source.contains('/') {
+            return None;
+        }
+        let name = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(slug)
+            .to_string();
+        Some(SkillMarketEntry {
+            id: format!("{source}/{slug}"),
+            source: source.to_string(),
+            slug: slug.to_string(),
+            name,
+            summary: None,
+            installs: self.installs.unwrap_or(0),
+            official: self.is_official.unwrap_or(false),
+            icon_url: skill_owner(source).map(skill_avatar_url),
         })
     }
+}
 
-    fn version(&self) -> Option<String> {
-        trimmed(self.version.as_deref())
-            .or_else(|| {
-                self.latest_version
-                    .as_ref()
-                    .and_then(|latest| trimmed(latest.version.as_deref()))
-            })
-            .or_else(|| {
-                self.tags
-                    .as_ref()
-                    .and_then(|tags| tags.get("latest"))
-                    .and_then(|value| trimmed(Some(value.as_str())))
-            })
+/// The avatar a repository owner publishes, at the size a card shows it.
+fn skill_avatar_url(owner: &str) -> String {
+    format!("https://github.com/{owner}.png?size=96")
+}
+
+/// The catalog's own list of the most installed Skills, read off its home page.
+///
+/// The page embeds the list it renders as escaped JSON inside a script payload,
+/// which is the only public surface that publishes the ranking: there is no
+/// list endpoint to ask. A page whose payload cannot be read is not a market
+/// outage — the search endpoint still answers — so this reports `None` and the
+/// caller falls back to what it shipped with.
+fn parse_skill_catalog_page(page: &str) -> Option<Vec<SkillMarketEntry>> {
+    const MARKER: &str = "initialSkills\\\":";
+    let start = page.find(MARKER)? + MARKER.len();
+    // The payload is JSON that was serialised into a string, so its quotes and
+    // escapes arrive doubled. Decoding it once yields the JSON the page held.
+    let decoded = page[start..].replace("\\\\", "\\").replace("\\\"", "\"");
+    let mut de = serde_json::Deserializer::from_str(&decoded);
+    let records = <Vec<SkillCatalogRecord> as serde::Deserialize>::deserialize(&mut de).ok()?;
+    let entries: Vec<SkillMarketEntry> = records
+        .into_iter()
+        .filter_map(SkillCatalogRecord::into_entry)
+        .collect();
+    (!entries.is_empty()).then_some(entries)
+}
+
+/// The catalog's ranked list, kept for a while and shared with every caller.
+///
+/// The ranking changes slowly and the page is nearly a megabyte, so one read
+/// serves every browse and every search that needs its top entries.
+/// When the list was read, and the list itself.
+type SkillCatalogCache = Option<(Instant, Vec<SkillMarketEntry>)>;
+
+static SKILL_CATALOG: LazyLock<Mutex<SkillCatalogCache>> = LazyLock::new(|| Mutex::new(None));
+
+/// How long the ranked list is trusted before the page is read again.
+const SKILL_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Entries the ranked list keeps. The page publishes more than a market shows,
+/// and the list is only ever a browse order plus a search's head start.
+const SKILL_CATALOG_LIMIT: usize = 200;
+
+/// Repositories with more entries than this are folded out of a browse page, so
+/// the first screen is not one publisher's.
+const SKILL_CATALOG_PER_REPO: usize = 4;
+
+/// How many entries one Skill page holds.
+const SKILL_MARKET_PAGE_SIZE: u32 = 30;
+
+/// Longest Skill query worth sending.
+const SKILL_MARKET_MAX_QUERY_CHARS: usize = 120;
+
+fn skill_catalog_cached() -> Option<Vec<SkillMarketEntry>> {
+    SKILL_CATALOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < SKILL_CATALOG_TTL)
+        .map(|(_, entries)| entries.clone())
+}
+
+fn skill_catalog_store(entries: &[SkillMarketEntry]) {
+    *SKILL_CATALOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Instant::now(), entries.to_vec()));
+}
+
+/// Read the ranked list, or the copy this build shipped with.
+///
+/// A page that cannot be reached or read costs the ranking, not the market: the
+/// embedded copy is what a fresh install shows on a plane, and a live page
+/// replaces it as soon as one arrives.
+fn skill_catalog(client: &reqwest::blocking::Client) -> Vec<SkillMarketEntry> {
+    if let Some(entries) = skill_catalog_cached() {
+        return entries;
     }
-
-    /// The install counter, from whichever spelling this response carries.
-    ///
-    /// The registry publishes both a lifetime `installs` and a current
-    /// `installsCurrent`; the current one is what a market should rank and
-    /// label by, because the lifetime one only ever grows.
-    fn installs(&self) -> u64 {
-        self.installs_current
-            .or_else(|| {
-                self.stats
-                    .as_ref()
-                    .and_then(|stats| stats.installs_current.or(stats.installs))
-            })
-            .or(self.installs)
-            .or_else(|| self.stats.as_ref().and_then(|stats| stats.installs))
-            .unwrap_or(0)
-    }
-
-    fn downloads(&self) -> u64 {
-        self.downloads
-            .or_else(|| self.stats.as_ref().and_then(|stats| stats.downloads))
-            .unwrap_or(0)
-    }
-
-    fn stars(&self) -> u64 {
-        self.stars
-            .or_else(|| self.stats.as_ref().and_then(|stats| stats.stars))
-            .unwrap_or(0)
-    }
-
-    fn into_entry(self) -> SkillMarketEntry {
-        let slug = self.slug.trim().to_string();
-        let owner_handle = self.owner_handle();
-        // The entry id is the registry's own identity for the Skill. Building
-        // it here rather than on the client is what lets an installed Skill
-        // recognize the entry it came from without re-deriving the shape.
-        let id = match owner_handle.as_deref() {
-            Some(owner) => format!("{owner}/{slug}"),
-            None => slug.clone(),
-        };
-        let downloads = self.downloads();
-        let stars = self.stars();
-        let installs = self.installs();
-        let name = trimmed(self.display_name.as_deref()).unwrap_or_else(|| slug.clone());
-        let summary =
-            trimmed(self.summary.as_deref()).or_else(|| trimmed(self.description.as_deref()));
-        let version = self.version();
-        SkillMarketEntry {
-            id,
-            slug,
-            owner_handle,
-            name,
-            summary,
-            version,
-            downloads,
-            installs,
-            stars,
-            updated_at: self.updated_at,
+    let fetched = fetch_market_bytes(client, SKILLS_SH_BASE, MAX_MARKET_RESPONSE_BYTES)
+        .ok()
+        .and_then(|(body, _)| String::from_utf8(body).ok())
+        .and_then(|page| parse_skill_catalog_page(&page));
+    match fetched {
+        Some(entries) => {
+            let entries = entries
+                .into_iter()
+                .take(SKILL_CATALOG_LIMIT)
+                .collect::<Vec<_>>();
+            skill_catalog_store(&entries);
+            entries
         }
+        None => skill_catalog_shipped(),
     }
 }
 
-/// What a caller's query means to the registry.
-struct ClawHubQuery {
-    /// The query actually sent upstream, absent when the caller is browsing.
-    text: Option<String>,
-}
-
-/// Resolve a caller's query into the request the registry can answer.
-///
-/// An empty or single-character query is not a failed search, it is the browse
-/// view: the caller has not asked for anything in particular yet. The search
-/// endpoint refuses those, so they become a ranked list instead. Anything the
-/// search would accept is passed through untouched.
-fn clawhub_query(query: Option<&str>) -> ClawHubQuery {
-    let query = query.map(str::trim).unwrap_or_default();
-    let query = query
-        .chars()
-        .take(CLAWHUB_MAX_QUERY_CHARS)
-        .collect::<String>();
-    if query.chars().count() < CLAWHUB_MIN_QUERY_CHARS {
-        return ClawHubQuery { text: None };
-    }
-    ClawHubQuery { text: Some(query) }
-}
-
-/// Build one registry URL under the fetch policy.
-///
-/// Every parameter is percent-encoded, including the cursor: the registry's
-/// cursor is an opaque blob, so it is data and never a path.
-fn clawhub_url(path: &str, params: &[(&str, String)]) -> String {
-    let mut url = format!("{CLAWHUB_API_BASE}{path}");
-    for (index, (key, value)) in params.iter().enumerate() {
-        url.push(if index == 0 { '?' } else { '&' });
-        url.push_str(key);
-        url.push('=');
-        url.push_str(&urlencode(value));
-    }
-    url
-}
-
-/// Whether the registry's answer was "this slug is ambiguous".
-///
-/// The registry reports it as a `409` whose body names the candidate handles,
-/// so the status alone is not enough to tell it apart from any other conflict;
-/// the body is what makes the failure actionable.
-fn clawhub_rejection(status: reqwest::StatusCode, body: &[u8]) -> VibexError {
-    if status == reqwest::StatusCode::CONFLICT
-        && let Ok(parsed) = serde_json::from_slice::<ClawHubAmbiguousSlug>(body)
-    {
-        let handles = parsed
-            .matches
+/// The copy this build shipped with, parsed once.
+fn skill_catalog_shipped() -> Vec<SkillMarketEntry> {
+    static SHIPPED: LazyLock<Vec<SkillMarketEntry>> = LazyLock::new(|| {
+        serde_json::from_slice::<Vec<SkillCatalogRecord>>(SKILL_CATALOG_SNAPSHOT)
+            .unwrap_or_default()
             .into_iter()
-            .filter_map(|candidate| candidate.handle())
-            .collect::<Vec<_>>();
-        if !handles.is_empty() {
-            // The message is the whole of what the desktop shows, so the
-            // candidates are named in it rather than only in the diagnostics:
-            // "choose one" is not actionable without saying which.
-            return VibexError::validation(
-                "market_skill_slug_ambiguous",
-                format!(
-                    "several publishers hold this Skill name; reinstall it from one publisher's entry ({})",
-                    handles.join(", ")
-                ),
-            )
-            .with_diagnostic("candidates", handles.join(","));
-        }
-    }
-    VibexError::provider(
-        "market_rejected",
-        format!("the registry responded with HTTP {}", status.as_u16()),
-    )
+            .filter_map(SkillCatalogRecord::into_entry)
+            .take(SKILL_CATALOG_LIMIT)
+            .collect()
+    });
+    SHIPPED.clone()
 }
 
-/// Fetch one page of the catalog, ranked by the caller's sort.
-fn clawhub_list_page(
-    client: &reqwest::blocking::Client,
-    sort: SkillMarketSort,
+/// Rank one browse page: most installed first, with no repository dominating it.
+fn skill_browse_page(
+    entries: &[SkillMarketEntry],
     cursor: Option<&str>,
     limit: u32,
-) -> VibexResult<(Vec<SkillMarketEntry>, Option<String>)> {
-    let mut params = vec![
-        ("limit", limit.to_string()),
-        ("sort", sort.as_registry_value().to_string()),
-        // A Skill the registry flagged is not something a market should offer:
-        // the flag is the registry's own malware signal.
-        ("nonSuspiciousOnly", "true".to_string()),
-    ];
-    if let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(("cursor", cursor.to_string()));
+) -> SkillMarketSearchResponse {
+    let limit = limit.clamp(1, MAX_ENTRIES_PER_SEARCH as u32) as usize;
+    let offset = cursor
+        .and_then(|cursor| cursor.strip_prefix("skill:"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    // The fold is the same on every page: a rule that only applied to the
+    // first would make the second page recompute a different list and repeat
+    // rows the reader has already scrolled past.
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let folded = entries
+        .iter()
+        .filter(|entry| {
+            let count = seen.entry(entry.source.clone()).or_default();
+            *count += 1;
+            *count <= SKILL_CATALOG_PER_REPO
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let page = folded
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next = offset + page.len();
+    let has_more = next < folded.len();
+    SkillMarketSearchResponse {
+        entries: page,
+        next_cursor: has_more.then(|| format!("skill:{next}")),
+        has_more,
+        description_missing: false,
     }
-    let response: ClawHubListResponse =
-        fetch_market_json(client, &clawhub_url(CLAWHUB_SKILLS_PATH, &params))?;
-    let next_cursor = trimmed(response.next_cursor.as_deref());
-    let entries = response
-        .items
-        .into_iter()
-        .filter(|record| !record.slug.trim().is_empty())
-        .map(ClawHubSkillRecord::into_entry)
-        .take(MAX_ENTRIES_PER_SEARCH)
-        .collect();
-    Ok((entries, next_cursor))
 }
 
 /// Rank the catalog against a query.
-fn clawhub_search_page(
+///
+/// The catalog's search is its own ranking and takes a required query, so it
+/// answers this directly; the local list is consulted first only to keep a
+/// search from dropping a Skill the reader just saw ranked.
+fn skill_search_page(
     client: &reqwest::blocking::Client,
     query: &str,
     limit: u32,
 ) -> VibexResult<Vec<SkillMarketEntry>> {
-    let params = vec![
-        ("q", query.to_string()),
-        ("limit", limit.to_string()),
-        ("nonSuspiciousOnly", "true".to_string()),
-    ];
-    let response: ClawHubSearchResponse =
-        fetch_market_json(client, &clawhub_url(CLAWHUB_SEARCH_PATH, &params))?;
+    let url = format!(
+        "{SKILLS_SH_BASE}{SKILLS_SH_SEARCH_PATH}?q={}&limit={}",
+        urlencode(query),
+        limit.clamp(1, MAX_ENTRIES_PER_SEARCH as u32)
+    );
+    let response: SkillCatalogSearchResponse = fetch_market_json(client, &url)?;
     Ok(response
-        .results
+        .skills
         .into_iter()
-        .filter(|record| !record.slug.trim().is_empty())
-        .map(ClawHubSkillRecord::into_entry)
+        .filter_map(SkillCatalogRecord::into_entry)
         .take(MAX_ENTRIES_PER_SEARCH)
         .collect())
 }
 
 // ---------------------------------------------------------------------------
-// Skill bundles
+// Skill documents
 // ---------------------------------------------------------------------------
 
-/// One file read out of a downloaded Skill archive.
+/// One file read out of a Skill folder.
 #[derive(Debug)]
-struct ClawHubBundleFile {
+struct SkillBundleFile {
     /// Relative path inside the Skill folder, `/`-separated.
     path: String,
     content: String,
     bytes: u64,
 }
 
-/// A downloaded Skill folder.
+/// A Skill folder as it will be written.
 #[derive(Default)]
-struct ClawHubBundle {
+struct SkillBundle {
     /// The manifest text, still carrying its frontmatter for the caller to
     /// split: the create path renders its own, so the publisher's is held
     /// apart rather than written through.
     manifest: Option<String>,
-    files: Vec<ClawHubBundleFile>,
-    /// Files the archive carried that will not be written, with the reason.
+    files: Vec<SkillBundleFile>,
+    /// Files the folder carried that will not be written, with the reason.
     skipped: Vec<String>,
+}
+
+/// The archive a repository hands out, which is the only place a Self-Published
+/// Skill's folder exists.
+///
+/// The catalog names the repository, not the folder: a Skill may sit at any
+/// depth in it (`pdf` lives under `skills/`, `find-skills` under `skills/`, a
+/// plugin's under its own plugin folder), so the folder is found by looking for
+/// the `SKILL.md` whose parent is named after the entry.
+fn skill_folder_from_archive(
+    archive: &[u8],
+    slug: &str,
+) -> VibexResult<(Option<String>, Vec<SkillBundleFile>, Vec<String>)> {
+    if !archive.starts_with(&[0x1f, 0x8b]) {
+        return Err(VibexError::provider(
+            "market_skill_bundle_invalid",
+            "the repository did not answer with an archive",
+        ));
+    }
+    let reader = std::io::Cursor::new(archive);
+    let decoder = flate2::read::GzDecoder::new(reader);
+    let mut tar = tar::Archive::new(decoder);
+    let wanted = slug.trim().trim_matches('/');
+
+    let mut skipped = Vec::new();
+    let mut manifest = None;
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut folder: Option<String> = None;
+
+    let entries = tar
+        .entries()
+        .map_err(|error| VibexError::provider("market_skill_bundle_invalid", error.to_string()))?;
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                skipped.push(format!("an entry could not be read: {error}"));
+                continue;
+            }
+        };
+        if !entry.header().entry_type().is_file() {
+            // Links and directories are not part of a Skill folder the way a
+            // published one is written: a link would point outside it.
+            continue;
+        }
+        let raw = match entry.path() {
+            Ok(path) => path.to_string_lossy().replace('\\', "/"),
+            Err(error) => {
+                skipped.push(format!("an entry has no usable name: {error}"));
+                continue;
+            }
+        };
+        // The archive wraps everything in one top folder named after the ref,
+        // which is not part of the folder the Skill will be written as.
+        let Some((_, rest)) = raw.split_once('/') else {
+            continue;
+        };
+        if !is_inside_skill(rest, wanted, &mut folder) {
+            continue;
+        }
+        let Some(path) = bundle_entry_path(rest) else {
+            skipped.push(format!(
+                "{rest}: the entry is not a file inside the Skill folder"
+            ));
+            continue;
+        };
+        let path = path
+            .strip_prefix(folder.as_deref().unwrap_or_default())
+            .map(|rest| rest.trim_start_matches('/'))
+            .unwrap_or(path.as_str())
+            .to_string();
+        if path.is_empty() {
+            continue;
+        }
+        if entry.size() > MAX_SKILL_MARKET_BUNDLE_FILE_BYTES {
+            skipped.push(format!(
+                "{path}: larger than the {MAX_SKILL_MARKET_BUNDLE_FILE_BYTES} byte file limit"
+            ));
+            continue;
+        }
+        if files.len() >= MAX_SKILL_MARKET_BUNDLE_FILES {
+            skipped.push(format!(
+                "{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_FILES} files"
+            ));
+            continue;
+        }
+        if total_bytes >= MAX_SKILL_MARKET_BUNDLE_BYTES {
+            skipped.push(format!(
+                "{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_BYTES} bytes"
+            ));
+            continue;
+        }
+        let limit =
+            MAX_SKILL_MARKET_BUNDLE_FILE_BYTES.min(MAX_SKILL_MARKET_BUNDLE_BYTES - total_bytes);
+        let mut body = Vec::new();
+        if std::io::Read::take(&mut entry, limit + 1)
+            .read_to_end(&mut body)
+            .is_err()
+        {
+            skipped.push(format!("{path}: the entry could not be decompressed"));
+            continue;
+        }
+        if body.len() as u64 > limit {
+            skipped.push(format!("{path}: larger than the size a Skill may carry"));
+            continue;
+        }
+        let Ok(content) = String::from_utf8(body) else {
+            skipped.push(format!("{path}: not UTF-8 text and was not installed"));
+            continue;
+        };
+        let bytes = content.len() as u64;
+        total_bytes += bytes;
+        if SKILL_BUNDLE_MANIFEST_NAMES.contains(&path.as_str()) {
+            manifest = Some(content);
+        } else {
+            files.push(SkillBundleFile {
+                path,
+                content,
+                bytes,
+            });
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((manifest, files, skipped))
 }
 
 /// Normalise an archive entry name into a relative path inside the Skill
 /// folder, or refuse it.
 ///
-/// The `zip` crate's own `enclosed_name` already refuses an entry that would
-/// escape the extraction root, which is the zip-slip case: `../`, an absolute
-/// path, or a Windows drive prefix. This goes one step further and treats the
-/// backslash as a separator too, because an entry named `..\..\x` is a
-/// traversal on the platform that reads it as one, and the check has to hold
-/// for the archive rather than only for the machine that opens it.
+/// `../`, an absolute path, and a Windows drive prefix are the traversal cases;
+/// the backslash is treated as a separator too, because an entry named
+/// `..\..\x` is a traversal on the platform that reads it as one, and the
+/// check has to hold for the archive rather than only for the machine that
+/// opens it.
 fn bundle_entry_path(raw: &str) -> Option<String> {
     let normalized = raw.replace('\\', "/");
     if normalized.ends_with('/') {
@@ -1713,216 +1747,52 @@ fn bundle_entry_path(raw: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Read a downloaded Skill archive into the files it publishes.
+/// Whether a repository path belongs to the Skill folder being extracted.
 ///
-/// The archive is untrusted input, so every ceiling is enforced while reading
-/// rather than after: a file is measured as it is decompressed, so a bomb is
-/// stopped at the limit instead of being materialised first. An entry that is
-/// refused is named in `skipped`, because the caller discloses it rather than
-/// shipping a Skill that quietly lost its scripts.
-fn read_skill_bundle(archive_bytes: &[u8]) -> VibexResult<ClawHubBundle> {
-    let reader = std::io::Cursor::new(archive_bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|error| VibexError::provider("market_skill_bundle_invalid", error.to_string()))?;
-
-    let mut bundle = ClawHubBundle::default();
-    let mut total_bytes = 0u64;
-    for index in 0..archive.len() {
-        let mut entry = match archive.by_index(index) {
-            Ok(entry) => entry,
-            Err(error) => {
-                bundle.skipped.push(format!("entry {index}: {error}"));
-                continue;
-            }
-        };
-        let raw_name = match entry.name() {
-            Ok(name) => name.to_string(),
-            Err(error) => {
-                bundle.skipped.push(format!("entry {index}: {error}"));
-                continue;
-            }
-        };
-        if entry.is_dir() {
-            continue;
-        }
-        // The crate's own confinement check is kept alongside the path policy
-        // so a change to either one still leaves the other standing.
-        if entry.enclosed_name().is_none() {
-            bundle.skipped.push(format!(
-                "{raw_name}: the entry would escape the Skill folder"
-            ));
-            continue;
-        }
-        let Some(path) = bundle_entry_path(&raw_name) else {
-            bundle.skipped.push(format!(
-                "{raw_name}: the entry is not a file inside the Skill folder"
-            ));
-            continue;
-        };
-        if entry.size() > MAX_SKILL_MARKET_BUNDLE_FILE_BYTES {
-            bundle.skipped.push(format!(
-                "{path}: larger than the {MAX_SKILL_MARKET_BUNDLE_FILE_BYTES} byte file limit"
-            ));
-            continue;
-        }
-        if bundle.files.len() >= MAX_SKILL_MARKET_BUNDLE_FILES {
-            bundle.skipped.push(format!(
-                "{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_FILES} files"
-            ));
-            continue;
-        }
-        if total_bytes >= MAX_SKILL_MARKET_BUNDLE_BYTES {
-            bundle.skipped.push(format!(
-                "{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_BYTES} bytes"
-            ));
-            continue;
-        }
-        // `take` bounds the read even when the entry lies about its size, so
-        // the ceiling holds against a decompression bomb rather than against
-        // the header the archive chose to publish.
-        let limit =
-            MAX_SKILL_MARKET_BUNDLE_FILE_BYTES.min(MAX_SKILL_MARKET_BUNDLE_BYTES - total_bytes);
-        let mut body = Vec::new();
-        if std::io::Read::take(&mut entry, limit + 1)
-            .read_to_end(&mut body)
-            .is_err()
-        {
-            bundle
-                .skipped
-                .push(format!("{path}: the entry could not be decompressed"));
-            continue;
-        }
-        if body.len() as u64 > limit {
-            // Which ceiling stopped it depends on which one the read was
-            // bounded by, and the report has to name the right one: a file cut
-            // short by the bundle's remaining budget is not an oversized file.
-            let reason = if limit < MAX_SKILL_MARKET_BUNDLE_FILE_BYTES {
-                format!("the bundle already carries {MAX_SKILL_MARKET_BUNDLE_BYTES} bytes")
+/// The first `SKILL.md` whose parent is named after the entry fixes the folder;
+/// everything under it afterwards is part of the Skill. A repository with no
+/// such folder yields nothing, which the caller reports as "not found" rather
+/// than installing a Skill the catalog named but the repository does not hold.
+fn is_inside_skill(path: &str, slug: &str, folder: &mut Option<String>) -> bool {
+    match folder.as_deref() {
+        Some(folder) => path == folder || path.starts_with(&format!("{folder}/")),
+        None => {
+            if path.rsplit_once('/').map(|(dir, _)| dir.rsplit('/').next()) == Some(Some(slug)) {
+                *folder = path.rsplit_once('/').map(|(dir, _)| dir.to_string());
+                true
             } else {
-                format!("larger than the {MAX_SKILL_MARKET_BUNDLE_FILE_BYTES} byte file limit")
-            };
-            bundle.skipped.push(format!("{path}: {reason}"));
-            continue;
-        }
-        let Ok(content) = String::from_utf8(body) else {
-            bundle
-                .skipped
-                .push(format!("{path}: not UTF-8 text and was not installed"));
-            continue;
-        };
-        let bytes = content.len() as u64;
-        total_bytes += bytes;
-        // The manifest is not a sibling: it is the document the install path
-        // renders, so the publisher's copy is kept apart from the assets.
-        if bundle.manifest.is_none() && SKILL_BUNDLE_MANIFEST_NAMES.contains(&path.as_str()) {
-            bundle.manifest = Some(content);
-        } else {
-            bundle.files.push(ClawHubBundleFile {
-                path,
-                content,
-                bytes,
-            });
+                false
+            }
         }
     }
-    bundle
-        .files
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(bundle)
 }
 
-/// Download one Skill folder.
-///
-/// The registry answers a bundle request two ways: with the zip archive, or —
-/// for a Skill it hosts from a public repository — with a JSON descriptor
-/// naming an archive elsewhere. Only the first is a Skill folder as published.
-/// The second falls through to the single-file endpoint, which still returns
-/// the manifest, so such a Skill installs as instructions without its assets
-/// and the caller is told which case it got.
+/// Fetch one Skill folder from the repository the catalog named.
 fn fetch_skill_bundle(
     client: &reqwest::blocking::Client,
+    source: &str,
     slug: &str,
-    owner_handle: Option<&str>,
-    version: Option<&str>,
-) -> VibexResult<ClawHubBundle> {
-    let params = clawhub_resolution_params("slug", slug, owner_handle, version);
-    let (body, _) = fetch_market_bytes_rejected_by(
-        client,
-        &clawhub_url(CLAWHUB_DOWNLOAD_PATH, &params),
-        MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES,
-        clawhub_rejection,
-    )?;
-    // The endpoint separates the two shapes by content type, but a zip always
-    // starts with its own local-file signature, so the bytes decide.
-    if body.starts_with(b"PK\x03\x04") {
-        return read_skill_bundle(&body);
-    }
-    Ok(ClawHubBundle {
-        manifest: Some(fetch_skill_manifest(client, slug, owner_handle, version)?),
-        skipped: vec![
-            "the registry serves this Skill as a single file; the assets it publishes alongside the manifest were not available as an archive"
-                .to_string(),
-        ],
-        ..ClawHubBundle::default()
-    })
-}
-
-/// Fetch just the manifest of a Skill.
-///
-/// Used when the registry has no archive to hand over. It is also the fallback
-/// that keeps such a Skill installable at all: the instructions are the part an
-/// Agent cannot work without.
-fn fetch_skill_manifest(
-    client: &reqwest::blocking::Client,
-    slug: &str,
-    owner_handle: Option<&str>,
-    version: Option<&str>,
-) -> VibexResult<String> {
-    let params = clawhub_resolution_params("path", "SKILL.md", owner_handle, version);
-    let url = clawhub_url(
-        &format!("{CLAWHUB_SKILLS_PATH}/{}/file", urlencode(slug)),
-        &params,
-    );
+) -> VibexResult<SkillBundle> {
+    let url = format!("{CODELOAD_BASE}/{source}/tar.gz/HEAD");
     let (body, _) = fetch_market_bytes_rejected_by(
         client,
         &url,
-        MAX_SKILL_DOCUMENT_FETCH_BYTES,
-        clawhub_rejection,
+        MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES,
+        |status, _| {
+            VibexError::provider(
+                "market_skill_repository_unreachable",
+                format!("the repository {source} answered HTTP {}", status.as_u16()),
+            )
+        },
     )?;
-    String::from_utf8(body).map_err(|_| {
-        VibexError::provider(
-            "market_skill_document_not_utf8",
-            "skill documents must be UTF-8 markdown",
-        )
+    let (manifest, files, skipped) = skill_folder_from_archive(&body, slug)?;
+    Ok(SkillBundle {
+        manifest,
+        files,
+        skipped,
     })
 }
 
-/// The parameters every endpoint that resolves one Skill version takes.
-///
-/// The first pair is the endpoint's own key — `slug` for the archive, `path`
-/// for the single-file reader — and the rest is the resolution the registry
-/// documents: a release to pin, and the handle that disambiguates the slug.
-fn clawhub_resolution_params(
-    key: &'static str,
-    value: &str,
-    owner_handle: Option<&str>,
-    version: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut params = vec![(key, value.to_string())];
-    match version.map(str::trim).filter(|value| !value.is_empty()) {
-        // A pinned release replaces the `latest` tag rather than joining it:
-        // the endpoint takes one or the other, and sending both would let the
-        // tag win and install a release the preview never showed.
-        Some(version) => params.push(("version", version.to_string())),
-        None => params.push(("tag", "latest".to_string())),
-    }
-    if let Some(owner) = owner_handle
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        params.push(("ownerHandle", owner.to_string()));
-    }
-    params
-}
 // ---------------------------------------------------------------------------
 // Frontmatter split
 // ---------------------------------------------------------------------------
@@ -1972,7 +1842,7 @@ fn split_skill_document(text: &str) -> (Option<String>, Option<String>, String) 
 fn skill_document_from_bundle(
     entry_id: &str,
     manifest: &str,
-    files: Vec<ClawHubBundleFile>,
+    files: Vec<SkillBundleFile>,
     skipped: Vec<String>,
 ) -> SkillMarketDocument {
     let (name, description, body) = split_skill_document(manifest);
@@ -2049,13 +1919,40 @@ impl ProviderConfigService {
         load_market_icon(entry_id)
     }
 
+    /// Load one market picture by its address.
+    ///
+    /// The address comes out of a catalog record the runtime itself received,
+    /// and the bytes come back through the same public-`https`, redirect and
+    /// size policy as every other market read, so a client never reaches a
+    /// publisher on its own.
+    pub fn market_asset(&self, icon_url: &str) -> VibexResult<MarketIcon> {
+        let url = market_url_policy(icon_url)?;
+        if let Some(icon) = market_icon_cache_get(url.as_str()) {
+            return Ok(icon);
+        }
+        let client = market_http_client()?;
+        let bytes = fetch_market_bytes(&client, url.as_str(), MAX_MARKET_ICON_BYTES)?.0;
+        let mime = sniff_image_mime(&bytes).ok_or_else(|| {
+            VibexError::provider(
+                "market_icon_not_image",
+                "the market named a picture that is not an image it can show",
+            )
+            .with_diagnostic("url", url.to_string())
+        })?;
+        let icon = MarketIcon {
+            mime: Some(mime.to_string()),
+            bytes,
+        };
+        market_icon_cache_put(url.as_str(), icon.clone());
+        Ok(icon)
+    }
+
     /// Answer one Skill market query.
     ///
-    /// A query the registry's search accepts is ranked by the registry. A
-    /// caller that has not asked for anything in particular is browsing, and
-    /// the catalog endpoint answers that directly — there is no query to
-    /// invent, and the caller's own ranking is passed through as the registry
-    /// documents it.
+    /// The catalog answers two questions differently. A browse is its ranked
+    /// list, which is one page read once and shared; a search is its own
+    /// endpoint, ranked by relevance. Neither publishes the Skill's text, so a
+    /// result is one small request however deep the page is.
     pub fn search_skill_market(
         &self,
         request: SkillMarketSearchRequest,
@@ -2063,30 +1960,38 @@ impl ProviderConfigService {
         let client = market_http_client()?;
         let limit = request
             .limit
-            .unwrap_or(CLAWHUB_PAGE_SIZE)
-            .clamp(1, CLAWHUB_MAX_PAGE_SIZE);
-        let query = clawhub_query(request.query.as_deref());
-        let sort = request.sort.unwrap_or(SkillMarketSort::Recommended);
-        match query.text {
-            Some(text) => {
-                let entries = clawhub_search_page(&client, &text, limit)?;
-                // The search endpoint ranks a whole catalog against a query and
-                // has no cursor of its own, so this answer is complete: there is
-                // no second page to walk and none is claimed.
+            .unwrap_or(SKILL_MARKET_PAGE_SIZE)
+            .clamp(1, MAX_ENTRIES_PER_SEARCH as u32);
+        let query = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .chars()
+                    .take(SKILL_MARKET_MAX_QUERY_CHARS)
+                    .collect::<String>()
+            });
+        match query {
+            Some(query) => {
+                let entries = skill_search_page(&client, &query, limit)?;
+                // The catalog's search ranks the whole catalog against the
+                // query and pages by nothing, so the answer is complete.
                 Ok(SkillMarketSearchResponse {
-                    has_more: false,
-                    next_cursor: None,
                     entries,
+                    next_cursor: None,
+                    has_more: false,
+                    description_missing: true,
                 })
             }
             None => {
-                let (entries, next_cursor) =
-                    clawhub_list_page(&client, sort, request.cursor.as_deref(), limit)?;
-                Ok(SkillMarketSearchResponse {
-                    has_more: next_cursor.is_some(),
-                    next_cursor,
-                    entries,
-                })
+                let entries = skill_catalog(&client);
+                Ok(skill_browse_page(
+                    &entries,
+                    request.cursor.as_deref(),
+                    limit,
+                ))
             }
         }
     }
@@ -2101,17 +2006,13 @@ impl ProviderConfigService {
         request: SkillMarketDocumentRequest,
     ) -> VibexResult<SkillMarketDocument> {
         let client = market_http_client()?;
-        let bundle = fetch_skill_bundle(
-            &client,
-            &request.slug,
-            request.owner_handle.as_deref(),
-            request.version.as_deref(),
-        )?;
+        let bundle = fetch_skill_bundle(&client, &request.source, &request.slug)?;
         let manifest = bundle.manifest.clone().ok_or_else(|| {
             VibexError::validation(
                 "market_skill_document_not_found",
-                "the Skill folder carries no SKILL.md",
+                "the repository carries no folder for this Skill",
             )
+            .with_diagnostic("source", request.source.clone())
             .with_diagnostic("slug", request.slug.clone())
         })?;
         Ok(skill_document_from_bundle(
@@ -2121,6 +2022,81 @@ impl ProviderConfigService {
             bundle.skipped,
         ))
     }
+
+    /// What one Skill says of itself, read from its manifest.
+    ///
+    /// A search result carries no description, and the card has room for one,
+    /// so this reads the folder's `SKILL.md` and answers its summary. It is
+    /// asked for the entries on screen rather than for every result, which is
+    /// what keeps a search to one request.
+    pub fn skill_market_summaries(
+        &self,
+        request: SkillMarketSummaryRequest,
+    ) -> VibexResult<SkillMarketSummaryResponse> {
+        let mut summaries = Vec::new();
+        for entry in request.entries.iter().take(MAX_ENTRIES_PER_SEARCH) {
+            if let Some(summary) = skill_summary(entry) {
+                summaries.push((entry.id.clone(), summary));
+            }
+        }
+        Ok(SkillMarketSummaryResponse { summaries })
+    }
+}
+
+/// Directories a published Skill folder sits under, in the order they are
+/// tried.
+///
+/// The catalog names the repository and the Skill's name, never the folder.
+/// Published repositories settle on a handful of layouts — a `skills/` folder,
+/// a plugin's own folder, a fragment at the root — so reading the manifest
+/// directly from one of them is a few small requests instead of a whole
+/// repository archive, which for a large repository would be tens of megabytes
+/// for one line of text.
+const SKILL_MANIFEST_PREFIXES: [&str; 4] = ["skills", "", "plugins", ".agents/skills"];
+
+/// The one-line description a Skill's manifest gives itself.
+///
+/// The manifest is the authority on what a Skill is, so this reads it rather
+/// than a page that renders it. A fetch that fails is simply no summary: a card
+/// without a description is better than a market that reports an outage for one.
+fn skill_summary(entry: &SkillMarketEntry) -> Option<String> {
+    let client = market_http_client().ok()?;
+    let manifest = fetch_skill_manifest(&client, &entry.source, &entry.slug)
+        .or_else(|| fetch_skill_bundle(&client, &entry.source, &entry.slug).ok()?.manifest)?;
+    let (_, description, _) = split_skill_document(&manifest);
+    description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read one Skill's manifest from the layouts a published repository uses.
+///
+/// Each attempt is one small request; the first that answers is the manifest.
+/// A repository that keeps its Skills somewhere else still installs, because
+/// the archive path finds the folder by its name — this is the cheap answer,
+/// not the only one.
+fn fetch_skill_manifest(
+    client: &reqwest::blocking::Client,
+    source: &str,
+    slug: &str,
+) -> Option<String> {
+    for prefix in SKILL_MANIFEST_PREFIXES {
+        let path = if prefix.is_empty() {
+            format!("{slug}/SKILL.md")
+        } else {
+            format!("{prefix}/{slug}/SKILL.md")
+        };
+        let url = format!("{RAW_GITHUB_BASE}/{source}/HEAD/{path}");
+        let Ok((body, _)) = fetch_market_bytes(client, &url, MAX_SKILL_MARKET_DOCUMENT_BYTES) else {
+            continue;
+        };
+        if let Ok(text) = String::from_utf8(body)
+            && !text.trim().is_empty()
+        {
+            return Some(text);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3095,88 +3071,137 @@ mod tests {
         );
     }
 
-    /// The live Skill registry, end to end.
+    /// What a card shows, from the live catalog: a name, a repository, a
+    /// count, an owner picture, and the description the Skill gives itself.
+    #[test]
+    #[ignore = "hits the live Skill catalog and GitHub"]
+    fn live_skill_card_has_every_element_a_card_shows() {
+        let service = ProviderConfigService::new(std::path::PathBuf::from(":memory:"));
+        let browse = service
+            .search_skill_market(SkillMarketSearchRequest {
+                query: None,
+                limit: Some(5),
+                cursor: None,
+                sort: None,
+            })
+            .expect("the live catalog answers a browse");
+        let entry = browse.entries.first().expect("a listed Skill").clone();
+        assert!(!entry.name.trim().is_empty(), "the card has no title");
+        assert!(entry.source.contains('/'), "the card has no repository");
+        assert!(!entry.slug.trim().is_empty(), "the card has no slug");
+        assert!(entry.installs > 0, "the browse is ranked by installs");
+
+        let icon_url = entry.icon_url.clone().expect("the card has no picture");
+        let icon = service.market_asset(&icon_url).expect("the picture loads");
+        assert!(!icon.is_empty(), "the picture came back empty");
+
+        let summaries = service
+            .skill_market_summaries(SkillMarketSummaryRequest {
+                entries: vec![entry.clone()],
+            })
+            .expect("the summaries answer");
+        let summary = summaries
+            .summaries
+            .iter()
+            .find(|(id, _)| id == &entry.id)
+            .map(|(_, summary)| summary.clone())
+            .expect("the card has no description");
+        assert!(!summary.trim().is_empty());
+        println!(
+            "{} | {} | {} | {} installs | {summary}",
+            entry.name, entry.source, entry.slug, entry.installs
+        );
+    }
+
+    /// The live Skill catalog, end to end.
     ///
-    /// Run it by hand when the registry's shape or reachability is in question:
-    /// `cargo test -p vibex-config-switch -- --ignored live_skill_registry`.
-    /// It is the check that the market answers at all, and that a bundle it
+    /// Run it by hand when the catalog's shape or reachability is in question:
+    /// `cargo test -p vibex-config-switch -- --ignored live_skill_catalog`.
+    /// It is the check that the market answers at all, and that a folder it
     /// hands over is one this product will install — the two halves of the
     /// feature that a fixture cannot prove.
     #[test]
-    #[ignore = "hits the live Skill registry"]
-    fn live_skill_registry_answers_and_serves_an_installable_bundle() {
-        let client = market_http_client().expect("the market client builds");
-
-        let (entries, next_cursor) =
-            clawhub_list_page(&client, SkillMarketSort::Recommended, None, 30)
-                .expect("the live registry answers a browse");
+    #[ignore = "hits the live Skill catalog and GitHub"]
+    fn live_skill_catalog_answers_and_serves_an_installable_bundle() {
+        let service = ProviderConfigService::new(std::path::PathBuf::from(":memory:"));
+        let browse = service
+            .search_skill_market(SkillMarketSearchRequest {
+                query: None,
+                limit: Some(30),
+                cursor: None,
+                sort: None,
+            })
+            .expect("the live catalog answers a browse");
         assert!(
-            entries.len() >= 20,
+            browse.entries.len() >= 20,
             "a browse page should hold most of what was asked for, got {}",
-            entries.len()
+            browse.entries.len()
         );
         assert!(
-            next_cursor.is_some(),
+            browse.next_cursor.is_some(),
             "a catalog this size should name a further page"
         );
-        let first = entries
+        let first = browse
+            .entries
             .iter()
-            .find(|entry| entry.owner_handle.is_some())
-            .expect("a listed Skill names its publisher");
+            .find(|entry| entry.source.contains('/'))
+            .expect("a listed Skill names its repository");
         assert!(!first.slug.trim().is_empty());
-        assert_eq!(
-            first.id,
-            format!("{}/{}", first.owner_handle.as_deref().unwrap(), first.slug)
+        assert_eq!(first.id, format!("{}/{}", first.source, first.slug));
+        assert!(
+            first.icon_url.is_some(),
+            "a card needs the owner's picture to lead with"
         );
 
         // A second page must be a different page, or the cursor is not being
         // honoured and the browse view would repeat itself forever.
-        let (next_entries, _) = clawhub_list_page(
-            &client,
-            SkillMarketSort::Recommended,
-            next_cursor.as_deref(),
-            30,
-        )
-        .expect("the live registry answers a second page");
+        let next = service
+            .search_skill_market(SkillMarketSearchRequest {
+                query: None,
+                limit: Some(30),
+                cursor: browse.next_cursor.clone(),
+                sort: None,
+            })
+            .expect("the live catalog answers a second page");
         assert!(
-            next_entries
+            next.entries
                 .iter()
-                .all(|entry| !entries.iter().any(|first| first.id == entry.id)),
+                .all(|entry| !browse.entries.iter().any(|first| first.id == entry.id)),
             "the second page repeated the first"
         );
 
-        let search = clawhub_search_page(&client, "pdf", 10).expect("the live registry searches");
+        let search = service
+            .search_skill_market(SkillMarketSearchRequest {
+                query: Some("pdf".to_string()),
+                limit: Some(10),
+                cursor: None,
+                sort: None,
+            })
+            .expect("the live catalog searches");
         assert!(
-            !search.is_empty(),
+            !search.entries.is_empty(),
             "searching for a common term found nothing"
         );
 
         // The document is the part the install writes, so it has to arrive as a
-        // folder with a manifest rather than as whatever the endpoint felt like
-        // sending.
-        let bundle = fetch_skill_bundle(
-            &client,
-            &first.slug,
-            first.owner_handle.as_deref(),
-            first.version.as_deref(),
-        )
-        .expect("the live registry serves a bundle");
-        let manifest = bundle
-            .manifest
-            .as_deref()
-            .expect("the bundle carries a SKILL.md");
+        // folder with a manifest rather than as whatever the repository held.
+        let document = service
+            .skill_market_document(SkillMarketDocumentRequest {
+                entry_id: first.id.clone(),
+                source: first.source.clone(),
+                slug: first.slug.clone(),
+            })
+            .expect("the live repository serves a folder");
         assert!(
-            !manifest.trim().is_empty(),
+            document.body.trim().len() > 20,
             "the manifest is the instructions an Agent follows"
         );
-        let document =
-            skill_document_from_bundle(&first.id, manifest, bundle.files, bundle.skipped);
         assert!(
             !document.too_large,
             "a published Skill should be installable"
         );
         validate_skill_bundle_document(&document)
-            .expect("what the registry served must pass the install's own check");
+            .expect("what the catalog served must pass the install's own check");
     }
 
     #[test]
@@ -3237,139 +3262,114 @@ mod tests {
     }
 
     #[test]
-    fn browse_view_sends_no_query_because_the_registry_rejects_a_short_one() {
-        // The registry's search refuses anything shorter than two characters,
-        // so a caller who has not asked for anything must not produce one: it
-        // becomes the catalog's own ranked list instead.
-        for short in [None, Some(""), Some("   "), Some("a")] {
-            assert!(
-                clawhub_query(short).text.is_none(),
-                "{short:?} must resolve to the browse view"
-            );
-        }
-        // Two characters is the first query the registry accepts, so it is
-        // passed through rather than replaced.
-        for search in ["ai", "kubernetes"] {
-            assert_eq!(clawhub_query(Some(search)).text.as_deref(), Some(search));
-        }
-        let padded = clawhub_query(Some("  ai  "));
-        assert_eq!(padded.text.as_deref(), Some("ai"));
-    }
-
-    #[test]
-    fn a_query_is_bounded_before_it_is_sent() {
-        let long = "x".repeat(CLAWHUB_MAX_QUERY_CHARS + 500);
-        let resolved = clawhub_query(Some(&long));
-        assert_eq!(
-            resolved.text.map(|text| text.chars().count()),
-            Some(CLAWHUB_MAX_QUERY_CHARS)
-        );
-    }
-
-    #[test]
-    fn registry_urls_encode_every_parameter() {
-        let url = clawhub_url(
-            CLAWHUB_SKILLS_PATH,
-            &[
-                ("limit", "30".to_string()),
-                ("cursor", "{\"v\":1,\"index\":\"by_downloads\"}".to_string()),
-            ],
-        );
-        assert!(url.starts_with("https://clawhub.ai/api/v1/skills?limit=30&cursor="));
-        // The cursor is an opaque blob, so it is data and never a path.
-        assert!(!url.contains('{'));
-        assert!(!url.contains('"'));
-        assert!(url.contains("%7B") && url.contains("%22"));
-    }
-
-    #[test]
-    fn a_registry_record_becomes_the_entry_the_market_shows() {
-        // The list form nests the counter block and names the version once.
-        let listed: ClawHubSkillRecord = serde_json::from_str(
+    fn a_catalog_record_becomes_the_entry_the_card_shows() {
+        let listed: SkillCatalogRecord = serde_json::from_str(
             r#"{
-                "slug": "pdf",
-                "ownerHandle": "awspace",
-                "displayName": "Pdf",
-                "summary": "Fill and read PDFs",
-                "topics": ["documents"],
-                "tags": {"latest": "1.4.0"},
-                "stats": {"downloads": 49697, "installs": 1479, "stars": 66},
-                "updatedAt": 1789594554485
+                "source": "anthropics/skills",
+                "skillId": "pdf",
+                "name": "pdf",
+                "installs": 220593,
+                "isOfficial": true,
+                "weeklyInstalls": [1, 2, 3]
             }"#,
         )
         .unwrap();
-        let entry = listed.into_entry();
-        assert_eq!(entry.id, "awspace/pdf");
+        let entry = listed.into_entry().expect("a record that names a Skill");
+        assert_eq!(entry.id, "anthropics/skills/pdf");
+        assert_eq!(entry.source, "anthropics/skills");
         assert_eq!(entry.slug, "pdf");
-        assert_eq!(entry.owner_handle.as_deref(), Some("awspace"));
-        assert_eq!(entry.name, "Pdf");
-        assert_eq!(entry.version.as_deref(), Some("1.4.0"));
-        assert_eq!(entry.downloads, 49697);
-        assert_eq!(entry.installs, 1479);
-        assert_eq!(entry.stars, 66);
-        assert_eq!(entry.updated_at, Some(1789594554485));
-    }
-
-    #[test]
-    fn a_search_record_carries_fewer_fields_than_a_listed_one() {
-        // The search form publishes no counter block and nests the publisher
-        // under `owner`; a missing counter is zero rather than a guess.
-        let searched: ClawHubSkillRecord = serde_json::from_str(
-            r#"{
-                "slug": "gitcrawl",
-                "displayName": "Gitcrawl",
-                "summary": "Crawl repositories",
-                "version": "0.3.1",
-                "owner": {"handle": "openclaw"},
-                "updatedAt": 1784845248916
-            }"#,
-        )
-        .unwrap();
-        let entry = searched.into_entry();
-        assert_eq!(entry.id, "openclaw/gitcrawl");
-        assert_eq!(entry.owner_handle.as_deref(), Some("openclaw"));
-        assert_eq!(entry.version.as_deref(), Some("0.3.1"));
-        assert_eq!(entry.installs, 0);
-        assert_eq!(entry.downloads, 0);
-        assert_eq!(entry.stars, 0);
-    }
-
-    #[test]
-    fn a_record_without_a_publisher_is_still_an_entry() {
-        // The handle is what disambiguates a slug, not what identifies it: a
-        // record that names none is listed under the slug alone rather than
-        // dropped, and the ambiguity surfaces when the slug is resolved.
-        let bare: ClawHubSkillRecord = serde_json::from_str(r#"{"slug": "orphan"}"#).unwrap();
-        let entry = bare.into_entry();
-        assert_eq!(entry.id, "orphan");
-        assert_eq!(entry.owner_handle, None);
-        assert_eq!(entry.name, "orphan");
-    }
-
-    #[test]
-    fn an_ambiguous_slug_reports_its_candidates() {
-        // The registry answers a slug several publishers hold with the handles
-        // themselves, which is the one refusal a caller can act on.
-        let body = br#"{
-            "code": "AMBIGUOUS_SKILL_SLUG",
-            "slug": "self-improving-agent",
-            "matches": [{"ownerHandle": "pskoett"}, {"ownerHandle": "nguyenmanhdung-app"}]
-        }"#;
-        let error = clawhub_rejection(reqwest::StatusCode::CONFLICT, body);
-        assert_eq!(error.code, "market_skill_slug_ambiguous");
-        assert!(
-            error
-                .diagnostics
-                .iter()
-                .any(|diagnostic| format!("{diagnostic:?}").contains("pskoett")),
-            "the candidate handles must survive into the error"
+        assert_eq!(entry.name, "pdf");
+        assert_eq!(entry.installs, 220593);
+        assert!(entry.official);
+        assert_eq!(
+            entry.icon_url.as_deref(),
+            Some("https://github.com/anthropics.png?size=96")
         );
     }
 
     #[test]
-    fn a_refusal_without_candidates_is_reported_as_a_status() {
-        let error = clawhub_rejection(reqwest::StatusCode::NOT_FOUND, b"not found");
-        assert_eq!(error.code, "market_rejected");
+    fn a_record_without_a_repository_is_not_an_entry() {
+        // A card with no repository cannot be installed from, so the record is
+        // dropped rather than listed as something the market cannot serve.
+        for body in [
+            r#"{"skillId": "pdf"}"#,
+            r#"{"source": "anthropics/skills"}"#,
+            r#"{"source": "no-slash", "skillId": "x"}"#,
+        ] {
+            let record: SkillCatalogRecord = serde_json::from_str(body).unwrap();
+            assert!(record.into_entry().is_none(), "{body} produced an entry");
+        }
+    }
+
+    #[test]
+    fn the_catalog_page_payload_is_read_despite_its_doubled_escapes() {
+        // The page embeds the list it renders as JSON inside a string, so the
+        // quotes arrive escaped and the array is not the whole document.
+        let page = r#"<html><script>self.__next_f.push([1,"{\"initialSkills\":[{\"source\":\"a/b\",\"skillId\":\"x\",\"name\":\"x\",\"installs\":7}],\"other\":1}"])</script></html>"#;
+        let entries = parse_skill_catalog_page(page).expect("the payload is readable");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "a/b/x");
+        assert_eq!(entries[0].installs, 7);
+        // A page that renders something else is not a market outage.
+        assert!(parse_skill_catalog_page("<html>nothing here</html>").is_none());
+    }
+
+    #[test]
+    fn a_browse_page_folds_one_repository_and_carries_a_cursor() {
+        let entries = (0..9)
+            .map(|index| SkillMarketEntry {
+                id: format!("acme/skills/s{index}"),
+                source: "acme/skills".to_string(),
+                slug: format!("s{index}"),
+                name: format!("s{index}"),
+                summary: None,
+                installs: 100 - index as u64,
+                official: false,
+                icon_url: None,
+            })
+            .collect::<Vec<_>>();
+        let first = skill_browse_page(&entries, None, 3);
+        // The first page is not one repository's, even though the list is.
+        assert_eq!(first.entries.len(), 3, "the fold still fills a page");
+        assert!(first.has_more);
+        let cursor = first.next_cursor.clone().expect("a further page");
+        let second = skill_browse_page(&entries, Some(&cursor), 3);
+        assert!(
+            second
+                .entries
+                .iter()
+                .all(|entry| !first.entries.iter().any(|first| first.id == entry.id)),
+            "the second page repeated the first"
+        );
+    }
+
+    #[test]
+    fn a_skill_folder_is_found_at_any_depth_in_its_repository() {
+        let archive = skill_archive(&[
+            ("repo-HEAD/README.md", "readme"),
+            ("repo-HEAD/skills/pdf/SKILL.md", "---\nname: pdf\n---\nBody"),
+            ("repo-HEAD/skills/pdf/scripts/run.py", "print(1)"),
+            (
+                "repo-HEAD/skills/other/SKILL.md",
+                "---\nname: other\n---\nOther",
+            ),
+        ]);
+        let (manifest, files, skipped) =
+            skill_folder_from_archive(&archive, "pdf").expect("the archive reads");
+        assert!(skipped.is_empty());
+        assert!(
+            manifest
+                .as_deref()
+                .unwrap_or_default()
+                .contains("name: pdf")
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "scripts/run.py");
+        // A repository that does not hold the Skill yields no manifest rather
+        // than another Skill's instructions.
+        let (missing, _, _) =
+            skill_folder_from_archive(&archive, "absent").expect("the archive still reads");
+        assert!(missing.is_none());
     }
 
     /// A stored entry is refused unless it stays inside the Skill folder.
@@ -3398,110 +3398,65 @@ mod tests {
     }
 
     /// Build a zip archive the way a publisher's bundle would arrive.
-    fn bundle_archive(entries: &[(&str, &str)]) -> Vec<u8> {
-        use std::io::Write as _;
+    /// A repository archive laid out the way the host produces one.
+    fn skill_archive(entries: &[(&str, &str)]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
         let mut bytes = Vec::new();
         {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
-            let options = zip::write::SimpleFileOptions::default();
+            let encoder = GzEncoder::new(&mut bytes, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
             for (path, content) in entries {
-                writer.start_file(*path, options).unwrap();
-                writer.write_all(content.as_bytes()).unwrap();
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, content.as_bytes())
+                    .unwrap();
             }
-            writer.finish().unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
         }
         bytes
     }
 
     #[test]
-    fn a_bundle_splits_its_manifest_from_its_assets() {
-        let archive = bundle_archive(&[
-            ("SKILL.md", "---\nname: demo\n---\n\nBody\n"),
-            ("references/api.md", "API notes"),
-            ("scripts/run.sh", "echo hi"),
-            ("assets/LEARNINGS.md", "notes"),
-        ]);
-        let bundle = read_skill_bundle(&archive).unwrap();
-        assert_eq!(
-            bundle.manifest.as_deref(),
-            Some("---\nname: demo\n---\n\nBody\n")
-        );
-        let paths = bundle
-            .files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
-        // Sorted, so an unchanged bundle produces a stable list and diff.
-        assert_eq!(
-            paths,
-            vec!["assets/LEARNINGS.md", "references/api.md", "scripts/run.sh"]
-        );
-        assert!(bundle.skipped.is_empty());
-    }
-
-    #[test]
-    fn a_bundle_refuses_entries_that_escape_it() {
-        // The archive is untrusted input: an entry that would write outside the
-        // Skill folder is reported and never extracted.
-        let archive = bundle_archive(&[
-            ("SKILL.md", "manifest"),
-            ("../escape.md", "escaped"),
-            ("references/../../escape-too.md", "escaped"),
-        ]);
-        let bundle = read_skill_bundle(&archive).unwrap();
-        assert_eq!(bundle.manifest.as_deref(), Some("manifest"));
-        assert!(bundle.files.is_empty(), "{:?}", bundle.files);
-        assert_eq!(bundle.skipped.len(), 2);
-    }
-
-    #[test]
-    fn a_bundle_refuses_a_file_past_the_per_file_limit() {
-        let oversized = "x".repeat(MAX_SKILL_MARKET_BUNDLE_FILE_BYTES as usize + 1);
-        let archive = bundle_archive(&[("SKILL.md", "manifest"), ("big.md", &oversized)]);
-        let bundle = read_skill_bundle(&archive).unwrap();
-        assert!(bundle.files.is_empty());
-        assert_eq!(bundle.skipped.len(), 1);
-        assert!(bundle.skipped[0].contains("big.md"));
-    }
-
-    #[test]
-    fn a_bundle_stops_at_the_file_count_limit() {
-        let owned = (0..MAX_SKILL_MARKET_BUNDLE_FILES + 3)
-            .map(|index| (format!("notes/{index}.md"), "note".to_string()))
-            .collect::<Vec<_>>();
-        let entries = owned
-            .iter()
-            .map(|(path, content)| (path.as_str(), content.as_str()))
-            .collect::<Vec<_>>();
-        let archive = bundle_archive(&entries);
-        let bundle = read_skill_bundle(&archive).unwrap();
-        assert_eq!(bundle.files.len(), MAX_SKILL_MARKET_BUNDLE_FILES);
-        assert_eq!(bundle.skipped.len(), 3);
-    }
-
-    #[test]
     fn a_bundle_refuses_a_file_that_is_not_utf8_text() {
-        use std::io::Write as _;
+        use flate2::write::GzEncoder;
         let mut bytes = Vec::new();
         {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
-            let options = zip::write::SimpleFileOptions::default();
-            writer.start_file("SKILL.md", options).unwrap();
-            writer.write_all(b"manifest").unwrap();
-            writer.start_file("logo.png", options).unwrap();
-            writer.write_all(&[0xff, 0xfe, 0x00, 0x01]).unwrap();
-            writer.finish().unwrap();
+            let encoder = GzEncoder::new(&mut bytes, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
+            for (path, content) in [
+                ("repo-HEAD/skills/demo/SKILL.md", b"manifest".to_vec()),
+                (
+                    "repo-HEAD/skills/demo/logo.png",
+                    vec![0xff, 0xfe, 0x00, 0x01],
+                ),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, content.as_slice())
+                    .unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
         }
-        let bundle = read_skill_bundle(&bytes).unwrap();
-        assert!(bundle.files.is_empty());
-        assert_eq!(bundle.skipped.len(), 1);
-        assert!(bundle.skipped[0].contains("logo.png"));
-        assert!(bundle.skipped[0].contains("UTF-8"));
+        let (manifest, files, skipped) = skill_folder_from_archive(&bytes, "demo").unwrap();
+        assert_eq!(manifest.as_deref(), Some("manifest"));
+        assert!(files.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].contains("logo.png"));
+        assert!(skipped[0].contains("UTF-8"));
     }
-
     #[test]
     fn a_download_that_is_not_an_archive_is_refused_rather_than_unpacked() {
-        assert!(read_skill_bundle(b"{\"sourceRef\":\"public-github\"}").is_err());
+        // The repository is asked for an archive; a body that is not gzip is
+        // refused before anything is unpacked.
+        let error =
+            skill_folder_from_archive(b"{\"sourceRef\":\"public-github\"}", "demo").unwrap_err();
+        assert!(error.code.starts_with("market_skill"));
     }
 
     /// A document as it would arrive back on an install request.

@@ -33,8 +33,8 @@ pub const MARKET_PAGE_SIZE: usize = 20;
 
 /// How many Skill entries one read fetches.
 ///
-/// The Skill index pages by an opaque cursor and reports no total, so the client
-/// takes one window and cuts its own pages out of it — three pages of
+/// The Skill market pages by an opaque cursor and reports no total, so the
+/// client takes one window and cuts its own pages out of it — three pages of
 /// [`MARKET_PAGE_SIZE`], which is enough to browse with and few enough that a
 /// reader who never turns a page pays for one read.
 pub const SKILL_MARKET_FETCH_LIMIT: usize = MARKET_PAGE_SIZE * 3;
@@ -635,34 +635,16 @@ impl McpServerTransportFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillMarketSortKind {
     Recommended = 0,
-    Downloads = 1,
-    Stars = 2,
-    Installs = 3,
-    Updated = 4,
-    Newest = 5,
-    Trending = 6,
+    Installs = 1,
 }
 
 impl SkillMarketSortKind {
-    pub const ALL: [Self; 7] = [
-        Self::Recommended,
-        Self::Downloads,
-        Self::Stars,
-        Self::Installs,
-        Self::Updated,
-        Self::Newest,
-        Self::Trending,
-    ];
+    pub const ALL: [Self; 2] = [Self::Recommended, Self::Installs];
 
     pub const fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Recommended => strings.config_registry_sort_recommended(),
-            Self::Downloads => strings.config_registry_sort_downloads(),
-            Self::Stars => strings.config_registry_sort_stars(),
             Self::Installs => strings.config_registry_sort_installs(),
-            Self::Updated => strings.config_registry_sort_updated(),
-            Self::Newest => strings.config_registry_sort_newest(),
-            Self::Trending => strings.config_registry_sort_trending(),
         }
     }
 
@@ -676,12 +658,7 @@ impl SkillMarketSortKind {
     pub const fn wire(self) -> vibex_core::SkillMarketSort {
         match self {
             Self::Recommended => vibex_core::SkillMarketSort::Recommended,
-            Self::Downloads => vibex_core::SkillMarketSort::Downloads,
-            Self::Stars => vibex_core::SkillMarketSort::Stars,
             Self::Installs => vibex_core::SkillMarketSort::Installs,
-            Self::Updated => vibex_core::SkillMarketSort::Updated,
-            Self::Newest => vibex_core::SkillMarketSort::Newest,
-            Self::Trending => vibex_core::SkillMarketSort::Trending,
         }
     }
 }
@@ -1097,10 +1074,10 @@ impl ConfigCenter {
 
     /// How many pages the registry on screen has, at least one.
     ///
-    /// The two registries answer differently and the count has to follow: MCP
-    /// is asked for one page at a time and reports what it matched, while the
-    /// Skill registry hands over one window and pages by cursor, so its pages
-    /// are cut here out of what was fetched.
+    /// The two markets answer differently and the count has to follow: MCP is
+    /// asked for one page at a time and reports what it matched, while the
+    /// Skill market hands over one window and pages by cursor, so its pages are
+    /// cut here out of what was fetched.
     pub fn registry_pages(&self, data: &ManagementData) -> usize {
         if self.section != ConfigSection::Catalog {
             return 1;
@@ -2290,8 +2267,8 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
     data.skill_market
         .iter()
         .map(|entry| {
-            // A Skill the reader already installed is one the registry entry
-            // points at: the stored record keeps the registry identity it came
+            // A Skill the reader already installed is one the market entry
+            // points at: the stored record keeps the market identity it came
             // from, so the card can say so rather than offering a first install
             // over an installed Skill.
             let uri = market_skill_uri(entry);
@@ -2301,12 +2278,14 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
                 .any(|skill| skill.source_uri.as_deref() == Some(uri.as_str()));
             ConfigRow::new(entry.id.clone(), entry.name.clone())
                 .cell(strings.config_kind_skill())
-                .cell(entry.version.clone().unwrap_or_default())
-                .cell(entry.owner_handle.clone().unwrap_or_default())
+                .cell(entry.source.clone())
+                .cell(entry.slug.clone())
                 .cell(skill_reach(entry))
                 .chip(
                     if installed {
                         strings.config_state_installed()
+                    } else if entry.official {
+                        strings.config_source_official()
                     } else {
                         strings.config_source_market()
                     },
@@ -2318,30 +2297,15 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
                 )
                 .summary(entry.summary.clone().unwrap_or_default())
                 // The id is what a stored Skill records as its origin, and the
-                // slug is what the registry routes by; a reader comparing the
-                // card with what they have needs both.
+                // repository is where its folder is read from; a reader
+                // comparing the card with what they have needs both.
                 .detail(strings.config_field_id(), entry.id.clone())
+                .detail(strings.config_field_repository(), entry.source.clone())
                 .detail(strings.config_field_slug(), entry.slug.clone())
-                .detail(
-                    strings.config_field_version(),
-                    entry.version.clone().unwrap_or_default(),
-                )
-                .detail(
-                    strings.config_field_publisher(),
-                    entry.owner_handle.clone().unwrap_or_default(),
-                )
-                .detail(strings.config_field_stars(), entry.stars.to_string())
-                .detail(
-                    strings.config_field_downloads(),
-                    entry.downloads.to_string(),
-                )
-                .detail(
-                    strings.config_field_updated(),
-                    entry.updated_at.map(stamp).unwrap_or_default(),
-                )
-                // The registry publishes whole Skills, so the card ends with
-                // the endpoint its document is read from: a reader who wants
-                // the source rather than the copy has somewhere to look.
+                .detail(strings.config_field_installs(), entry.installs.to_string())
+                // A published Skill is a folder in a repository, so the card
+                // ends with the page a reader can browse: the source rather
+                // than a copy of it.
                 .detail(strings.config_field_source(), market_skill_uri(entry))
                 .actions(&[if installed {
                     ConfigAction::Reinstall
@@ -2352,11 +2316,12 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
         .collect()
 }
 
-/// Which of the roster's three groups an Agent is in, as a sort key.
-///
-/// Enabled first, then added but switched off, then the ones the roster does
-/// not hold — the order the desktop shows them in, so the two clients list the
-/// same roster the same way.
+pub fn market_skill_uri(entry: &vibex_core::SkillMarketEntry) -> String {
+    format!("market:{}", entry.id)
+}
+
+/// Which band an Agent's row belongs to: present and on, present and off, or
+/// merely known to the catalogue.
 pub fn agent_group(agent: &vibex_core::AgentSnapshotEntry) -> u8 {
     match (agent.added, agent.enabled) {
         (true, true) => 0,
@@ -2365,29 +2330,12 @@ pub fn agent_group(agent: &vibex_core::AgentSnapshotEntry) -> u8 {
     }
 }
 
-/// The registry identity a stored Skill records when it is installed.
+/// How far a market Skill has reached.
 ///
-/// It is the same string the installed check compares against: one shape, so a
-/// card that says "installed" and a document that records its origin cannot
-/// disagree.
-pub fn market_skill_uri(entry: &vibex_core::SkillMarketEntry) -> String {
-    format!("market:{}", entry.id)
-}
-
-/// How far a registry Skill has reached, by the first count it publishes.
-///
-/// A registry fills in what it knows: a Skill that has been downloaded but
-/// never installed has installs of zero, and a row that says "0" over nine
-/// downloads reads as a Skill nobody wanted. The first count that is not zero
-/// is the one that says something.
+/// The catalog ranks by installs and publishes nothing else, so the count is
+/// the whole answer; a zero says what it says rather than being hidden.
 pub fn skill_reach(entry: &vibex_core::SkillMarketEntry) -> String {
-    if entry.installs > 0 {
-        entry.installs.to_string()
-    } else if entry.downloads > 0 {
-        entry.downloads.to_string()
-    } else {
-        entry.stars.to_string()
-    }
+    entry.installs.to_string()
 }
 
 fn mcp_source_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
@@ -2782,12 +2730,11 @@ pub enum FormPurpose {
     },
     /// A custom ACP Agent, from nothing.
     NewCustomAgent,
-    /// A Skill from the registry, and the Agents that should receive it.
+    /// A Skill from the market, and the Agents that should receive it.
     SkillMarketInstall {
         entry_id: String,
+        source: String,
         slug: String,
-        owner_handle: Option<String>,
-        version: Option<String>,
     },
     /// One Agent's sign-in method, and the variables it collects.
     AgentAuthMethod {
@@ -4353,9 +4300,8 @@ pub fn skill_market_install_form(
     ConfigForm::new(
         FormPurpose::SkillMarketInstall {
             entry_id: entry.id.clone(),
+            source: entry.source.clone(),
             slug: entry.slug.clone(),
-            owner_handle: entry.owner_handle.clone(),
-            version: entry.version.clone(),
         },
         format!("{} · {}", strings.config_action_install(), entry.name),
         fields,
@@ -5259,15 +5205,14 @@ mod tests {
     #[test]
     fn a_stored_skill_records_the_origin_the_card_looks_for() {
         let entry: vibex_core::SkillMarketEntry = serde_json::from_value(serde_json::json!({
-            "id": "awspace/pdf",
+            "id": "awspace/skills/pdf",
+            "source": "awspace/skills",
             "slug": "pdf",
             "name": "PDF",
-            "installs": 1,
-            "downloads": 0,
-            "stars": 0
+            "installs": 1
         }))
         .expect("entry");
-        assert_eq!(market_skill_uri(&entry), "market:awspace/pdf");
+        assert_eq!(market_skill_uri(&entry), "market:awspace/skills/pdf");
 
         let skill: vibex_core::Skill = serde_json::from_value(serde_json::json!({
             "id": "skill_pdf",
@@ -5294,24 +5239,20 @@ mod tests {
         assert_eq!(rows[0].chip, "Installed");
     }
 
-    /// A card's count is the first one the registry published rather than a
-    /// zero it filled in.
+    /// A card's count is the install count the catalog ranks by.
     #[test]
-    fn a_skill_card_counts_what_the_registry_published() {
+    fn a_skill_card_counts_what_the_catalog_published() {
         let mut entry: vibex_core::SkillMarketEntry = serde_json::from_value(serde_json::json!({
-            "id": "o/demo",
+            "id": "o/r/demo",
+            "source": "o/r",
             "slug": "demo",
             "name": "Demo",
-            "installs": 0,
-            "downloads": 0,
-            "stars": 0
+            "installs": 0
         }))
         .expect("entry");
         assert_eq!(skill_reach(&entry), "0");
-        entry.downloads = 9;
-        assert_eq!(skill_reach(&entry), "9", "downloads did not stand in");
         entry.installs = 3;
-        assert_eq!(skill_reach(&entry), "3", "installs did not win");
+        assert_eq!(skill_reach(&entry), "3");
     }
 
     /// The header options round-trip through the runtime's own JSON shape:

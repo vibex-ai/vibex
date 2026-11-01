@@ -1091,14 +1091,12 @@ fn market_entry(id: &str) -> vibex_core::McpMarketEntry {
 fn skill_market_entry(id: &str) -> vibex_core::SkillMarketEntry {
     serde_json::from_value(serde_json::json!({
         "id": id,
+        "source": "example/skills",
         "slug": id,
-        "ownerHandle": "example",
         "name": "Trace reader",
         "summary": "Read a trace",
-        "version": "1.0.0",
         "installs": 3,
-        "stars": 1,
-        "downloads": 9
+        "official": false
     }))
     .expect("skill market fixture")
 }
@@ -1340,7 +1338,7 @@ fn the_registry_narrowings_ask_the_registry_again() {
     match outcome.effects.as_slice() {
         [vibex_tui::app::Effect::SearchRegistry { registry, .. }] => assert_eq!(
             registry.sort.wire(),
-            vibex_core::SkillMarketSort::Downloads,
+            vibex_core::SkillMarketSort::Installs,
             "the ranking did not move"
         ),
         other => panic!("the ranking did not ask again: {other:?}"),
@@ -3277,17 +3275,9 @@ fn a_skill_is_previewed_before_it_is_installed() {
 
     let outcome = app.run_config_action_by_key("entry_reader", ConfigAction::Install);
     match outcome.effects.as_slice() {
-        [
-            vibex_tui::app::Effect::PreviewSkillMarket {
-                entry_id,
-                slug,
-                version,
-                ..
-            },
-        ] => {
+        [vibex_tui::app::Effect::PreviewSkillMarket { entry_id, slug, .. }] => {
             assert_eq!(entry_id, "entry_reader");
             assert_eq!(slug, "entry_reader");
-            assert_eq!(version.as_deref(), Some("1.0.0"));
         }
         other => panic!("the preview asked for nothing: {other:?}"),
     }
@@ -3373,18 +3363,16 @@ fn a_skill_too_large_to_install_is_refused_at_the_preview() {
 fn a_skill_the_reader_already_has_says_so() {
     let mut app = loaded(140, 40);
     let mut entry = skill_market_entry("entry_reader");
-    entry.installs = 0;
-    entry.downloads = 9;
-    entry.stars = 1;
+    entry.installs = 9;
     app.management_data.skill_market = vec![entry];
     app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
 
-    // Nothing stored: the card offers the install and counts the downloads it
-    // has, because a zero over nine downloads reads as a Skill nobody wanted.
+    // Nothing stored: the card offers the install and counts what the catalog
+    // says it has been installed.
     let rows = vibex_tui::config_center::skill_market_rows(&app.management_data, app.strings);
     assert!(rows[0].actions.contains(&ConfigAction::Install));
-    assert_eq!(rows[0].cells[3], "9", "the count did not fall back");
-    assert_eq!(rows[0].chip, "Registry");
+    assert_eq!(rows[0].cells[3], "9", "the count did not come through");
+    assert_eq!(rows[0].chip, "Market");
 
     // The same Skill, stored: the card offers it again by its other name.
     app.management_data.skills = vec![

@@ -827,6 +827,19 @@ impl ProviderManagementFacade {
         self.service.search_skill_market(request)
     }
 
+    /// Loads one market picture by the address a catalog published.
+    pub fn market_asset(&self, icon_url: &str) -> VibexResult<vibex_core::MarketIcon> {
+        self.service.market_asset(icon_url)
+    }
+
+    /// Reads what each of the named Skills says of itself.
+    pub fn skill_market_summaries(
+        &self,
+        request: vibex_core::SkillMarketSummaryRequest,
+    ) -> VibexResult<vibex_core::SkillMarketSummaryResponse> {
+        self.service.skill_market_summaries(request)
+    }
+
     pub fn skill_market_document(
         &self,
         request: vibex_core::SkillMarketDocumentRequest,

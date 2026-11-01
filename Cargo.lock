@@ -10010,6 +10010,7 @@ name = "vibex-config-switch"
 version = "0.1.0-rc.8"
 dependencies = [
  "dirs 6.0.0",
+ "flate2",
  "keyring",
  "reqwest",
  "rusqlite",
@@ -10018,6 +10019,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "toml 0.8.23",
  "vibex-core",

@@ -1705,6 +1705,12 @@ pub struct ManagementCenter {
     mcp_market_icons: BTreeMap<String, Arc<gpui::Image>>,
     /// Entries whose picture is being fetched, so one card asks once.
     mcp_market_icon_pending: BTreeSet<String>,
+    /// Skills whose owner avatar is being fetched, keyed by the picture URL.
+    ///
+    /// A Skill has no picture of its own — every Skill in one repository would
+    /// show the same one — so the owner is what a card leads with, and the same
+    /// owner is only fetched once.
+    skill_market_icon_pending: BTreeSet<String>,
     /// The MCP grid's scroll offset, so a page change can return to the top
     /// instead of dropping the reader into the middle of the new page.
     mcp_market_scroll: ScrollHandle,
@@ -1721,6 +1727,14 @@ pub struct ManagementCenter {
     skill_market_open: bool,
     skill_market_query: Entity<InputState>,
     skill_market_entries: Vec<vibex_core::SkillMarketEntry>,
+    /// What each listed Skill says of itself, by entry id.
+    ///
+    /// The catalog publishes no description with a result, so a card reads one
+    /// once and keeps it: the same Skill appears on every page of a browse and
+    /// on the search that follows it.
+    skill_market_summaries: BTreeMap<String, String>,
+    /// Entries whose summary is being read, so one card asks once.
+    skill_market_summary_pending: BTreeSet<String>,
     /// Which page of the fetched window the grid is showing.
     skill_market_page: usize,
     /// The Skill grid's scroll offset, so a page change can return to the top.
@@ -2893,6 +2907,7 @@ impl ManagementCenter {
             mcp_market_total: 0,
             mcp_market_icons: BTreeMap::new(),
             mcp_market_icon_pending: BTreeSet::new(),
+            skill_market_icon_pending: BTreeSet::new(),
             mcp_market_scroll: ScrollHandle::new(),
             mcp_market_loading: false,
             mcp_market_error: None,
@@ -2903,6 +2918,8 @@ impl ManagementCenter {
             skill_market_open: false,
             skill_market_query,
             skill_market_entries: Vec::new(),
+            skill_market_summaries: BTreeMap::new(),
+            skill_market_summary_pending: BTreeSet::new(),
             skill_market_page: 1,
             skill_market_scroll: ScrollHandle::new(),
             skill_market_loading: false,
@@ -11608,6 +11625,9 @@ impl ManagementCenter {
                     Ok(Ok(response)) => {
                         this.skill_market_entries = response.entries;
                         this.skill_market_next_cursor = response.next_cursor;
+                        this.load_skill_market_summaries(cx);
+                        this.load_skill_market_icons(cx);
+                        this.load_skill_market_icons(cx);
                     }
                     Ok(Err(error)) => {
                         this.skill_market_error =
@@ -11670,12 +11690,111 @@ impl ManagementCenter {
                             }
                         }
                         this.skill_market_next_cursor = response.next_cursor;
+                        this.load_skill_market_summaries(cx);
                     }
                     Ok(Err(error)) => {
                         this.skill_market_error =
                             Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => this.skill_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Load the owner picture each Skill card leads with.
+    ///
+    /// A Skill publishes no logo of its own, so the repository owner's avatar is
+    /// what the card shows; it is loaded through the runtime like every other
+    /// market picture, and keyed by its own URL so two Skills of one owner cost
+    /// one fetch.
+    fn load_skill_market_icons(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let wanted = self
+            .skill_market_entries
+            .iter()
+            .filter_map(|entry| entry.icon_url.clone())
+            .filter(|url| {
+                !self.mcp_market_icons.contains_key(url)
+                    && !self.skill_market_icon_pending.contains(url)
+            })
+            .collect::<BTreeSet<_>>();
+        for url in wanted {
+            self.skill_market_icon_pending.insert(url.clone());
+            let entity = cx.weak_entity();
+            let backend = backend.clone();
+            cx.spawn(async move |_, cx| {
+                let loaded = backend.management().market_asset(url.clone()).await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.skill_market_icon_pending.remove(&url);
+                    let Ok(asset) = loaded else {
+                        return;
+                    };
+                    let Some(format) = asset
+                        .mime
+                        .as_deref()
+                        .and_then(gpui::ImageFormat::from_mime_type)
+                    else {
+                        return;
+                    };
+                    if asset.bytes.is_empty() {
+                        return;
+                    }
+                    this.mcp_market_icons
+                        .insert(url, Arc::new(gpui::Image::from_bytes(format, asset.bytes)));
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Read what the Skills on screen say of themselves.
+    ///
+    /// The catalog's list is a name and a counter; the description is the one
+    /// part of a card that has to be read from the Skill itself. It is asked
+    /// for once per entry and kept, and a failure is simply no description: the
+    /// card is still a card without it.
+    fn load_skill_market_summaries(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let wanted = self
+            .skill_market_entries
+            .iter()
+            .filter(|entry| {
+                !self.skill_market_summaries.contains_key(&entry.id)
+                    && !self.skill_market_summary_pending.contains(&entry.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            return;
+        }
+        for entry in &wanted {
+            self.skill_market_summary_pending.insert(entry.id.clone());
+        }
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .skill_market_summaries(vibex_core::SkillMarketSummaryRequest { entries: wanted })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                for entry in this.skill_market_entries.clone() {
+                    this.skill_market_summary_pending.remove(&entry.id);
+                }
+                if let Ok(Ok(response)) = outcome {
+                    for (id, summary) in response.summaries {
+                        this.skill_market_summaries.entry(id).or_insert(summary);
+                    }
                 }
                 cx.notify();
             });
@@ -11704,9 +11823,8 @@ impl ManagementCenter {
                 .management()
                 .skill_market_document(vibex_core::SkillMarketDocumentRequest {
                     entry_id: entry.id.clone(),
+                    source: entry.source.clone(),
                     slug: entry.slug.clone(),
-                    owner_handle: entry.owner_handle.clone(),
-                    version: entry.version.clone(),
                 })
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -21338,36 +21456,54 @@ impl ManagementCenter {
             let entry_id = entry.id.clone();
             let install_entry = entry.clone();
             let install_id = entry.id.clone();
-            // The registry sorts a catalog item's counters by what the market
-            // ranks by; installs lead because that is the counter the browse
-            // chips name, and the rest are shown only when they are there.
-            let counter = (entry.installs > 0)
-                .then(|| market_installs_label(entry.installs))
-                .or_else(|| (entry.downloads > 0).then(|| format!("{} ↓", entry.downloads)))
-                .or_else(|| (entry.stars > 0).then(|| format!("{} ★", entry.stars)));
+            // The catalog ranks by installs and publishes nothing else, so the
+            // count is the whole of what the card can say about reach.
+            let counter = (entry.installs > 0).then(|| market_installs_label(entry.installs));
+            let repository = format!("https://github.com/{}", entry.source);
+            let link = Some((
+                repository.clone(),
+                Button::new(SharedString::from(format!(
+                    "management-skill-market-link-{install_id}"
+                )))
+                .xsmall()
+                .link()
+                .icon(IconName::ExternalLink)
+                .label(management_locale_text("Repository", "代码库", "程式庫"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_mcp_market_link(repository.clone(), cx)
+                }))
+                .into_any_element(),
+            ));
             grid = grid.child(management_market_card(
                 entry_id,
                 MarketCardMark {
                     glyph_path: "icons/vibex/book-open.svg",
-                    icon: None,
+                    icon: entry
+                        .icon_url
+                        .as_ref()
+                        .and_then(|url| self.mcp_market_icons.get(url).cloned()),
                 },
                 entry.name.clone(),
                 installed.then_some(MarketEntryState::Installed),
-                // The publisher is what tells two Skills of one slug apart,
-                // which is the same thing the registry needs to resolve one.
-                Some(match entry.owner_handle.as_deref() {
-                    Some(owner) => format!("@{owner}"),
-                    None => entry.slug.clone(),
-                }),
-                entry.summary.clone(),
-                entry.version.clone(),
+                // The repository is what tells two Skills of one name apart,
+                // and it is where the card's picture comes from.
+                Some(entry.source.clone()),
+                // A search result carries no description, so the card shows the
+                // one the Skill gives itself once it has been read.
+                self.skill_market_summaries
+                    .get(&entry.id)
+                    .cloned()
+                    .filter(|summary| !summary.trim().is_empty()),
+                entry
+                    .official
+                    .then(|| management_locale_text("Official", "官方", "官方").to_string()),
                 counter,
                 None,
                 Some(MarketCardEndpoint {
                     text: entry.slug.clone(),
                     icon_path: "icons/vibex/book-open.svg",
                 }),
-                None,
+                link,
                 Button::new(SharedString::from(format!(
                     "management-skill-market-install-{install_id}"
                 )))
@@ -21498,18 +21634,32 @@ impl ManagementCenter {
 
         let mut form = v_flex().w_full().min_h_0().gap_4().child(heading).child(
             management_market_detail_header(
-                management_market_glyph("icons/vibex/book-open.svg", cx),
+                // The form answers "which one am I installing" at a glance, so
+                // it keeps the picture the card led with.
+                match target
+                    .icon_url
+                    .as_ref()
+                    .and_then(|url| self.mcp_market_icons.get(url).cloned())
+                {
+                    Some(icon) => management_market_plate(
+                        gpui::img(icon)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .into_any_element(),
+                        cx,
+                    ),
+                    None => management_market_glyph("icons/vibex/book-open.svg", cx),
+                },
                 target.name.clone(),
                 installed.then_some(MarketEntryState::Installed),
-                Some(
-                    match (target.owner_handle.as_deref(), target.version.as_deref()) {
-                        (Some(owner), Some(version)) => format!("@{owner} · v{version}"),
-                        (Some(owner), None) => format!("@{owner}"),
-                        (None, Some(version)) => format!("{} · v{version}", target.slug),
-                        (None, None) => target.slug.clone(),
-                    },
-                ),
-                target.summary.clone(),
+                Some(match target.installs {
+                    0 => target.source.clone(),
+                    installs => format!("{} · {}", target.source, market_installs_label(installs)),
+                }),
+                self.skill_market_summaries
+                    .get(&target.id)
+                    .cloned()
+                    .or_else(|| target.summary.clone()),
                 None,
                 cx,
             ),
@@ -38215,8 +38365,8 @@ fn management_market_empty_row(
 ///
 /// The MCP market asks the runtime for exactly one page and the runtime asks
 /// the registry for it, so the page is addressed by offset rather than the
-/// whole catalog being shipped. The Skill registry ignores the offset, so that
-/// market fetches one window and pages it locally.
+/// whole catalog being shipped. The Skill market fetches one window and pages
+/// it locally, so this is the window's own page size.
 const MARKET_PAGE_SIZE: usize = 20;
 
 /// Entries the Skill market fetches in one go.
@@ -38809,13 +38959,13 @@ fn management_market_sort_filters(
 }
 
 /// The ways the Skill market lets a browse list be ordered.
-const MARKET_SKILL_SORTS: [vibex_core::SkillMarketSort; 6] = [
+///
+/// The catalog has one ranking of its own — most installed first — so there is
+/// one ordering to pick between rather than a vocabulary of counters it does
+/// not publish.
+const MARKET_SKILL_SORTS: [vibex_core::SkillMarketSort; 2] = [
     vibex_core::SkillMarketSort::Recommended,
     vibex_core::SkillMarketSort::Installs,
-    vibex_core::SkillMarketSort::Downloads,
-    vibex_core::SkillMarketSort::Stars,
-    vibex_core::SkillMarketSort::Trending,
-    vibex_core::SkillMarketSort::Newest,
 ];
 
 fn management_skill_sort_label(sort: vibex_core::SkillMarketSort) -> &'static str {
@@ -38823,14 +38973,6 @@ fn management_skill_sort_label(sort: vibex_core::SkillMarketSort) -> &'static st
     match sort {
         Sort::Recommended => management_locale_text("Recommended", "推荐", "推薦"),
         Sort::Installs => management_locale_text("Installs", "安装量", "安裝量"),
-        Sort::Downloads => management_locale_text("Downloads", "下载量", "下載量"),
-        Sort::Stars => management_locale_text("Stars", "收藏", "收藏"),
-        Sort::Trending => management_locale_text("Trending", "趋势", "趨勢"),
-        Sort::Newest => management_locale_text("Newest", "最新", "最新"),
-        // The registry also ranks by update time; the browse chips above cover
-        // the orderings a user picks between, so this one is reachable only by
-        // a caller that asks for it directly.
-        Sort::Updated => management_locale_text("Updated", "更新时间", "更新時間"),
     }
 }
 
@@ -42332,17 +42474,7 @@ mod tests {
     #[gpui::test]
     fn opencode_presets_start_with_the_session_header(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        cx.update(hint_layer::init);
-        // The editor queues notices on the hint layer its window's Root owns,
-        // so the test window carries one the way the real window does.
-        let mut built = None;
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let center = cx.new(|cx| ManagementCenter::new(window, cx));
-            let root = gpui_base::Root::new(center.clone(), window, cx);
-            built = Some(center);
-            root
-        });
-        let center = built.expect("the management window builds its center");
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
         let handle = cx.windows().pop().expect("test window");
 
         for preset_id in [
@@ -42700,6 +42832,36 @@ mod tests {
         );
     }
 
+    /// A Skill card carries what a reader picks it by: its name, the
+    /// repository it lives in, its install count, its publisher's mark, and
+    /// what it says it does.
+    #[test]
+    fn a_skill_card_carries_every_element_a_reader_picks_by() {
+        let source = include_str!("management.rs");
+        let market = source
+            .split_once("    fn render_skills_market(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The preview and confirmation panel for one Skill."))
+            .map(|(body, _)| body)
+            .expect("the Skill market should remain inspectable");
+        for element in [
+            "entry.name.clone()",
+            "entry.source.clone()",
+            "entry.slug.clone()",
+            "market_installs_label(entry.installs)",
+            // The picture and the official tick are read off the entry through
+            // a field access rustfmt may split across lines, so the assertion
+            // names the field rather than one spelling of the call.
+            ".icon_url",
+            "self.skill_market_summaries",
+            ".official",
+        ] {
+            assert!(
+                market.contains(element),
+                "the Skill card lost {element}"
+            );
+        }
+    }
+
     /// The registry publishes a full RFC3339 instant; a card only wants the day.
     #[test]
     fn market_timestamps_reduce_to_a_date() {
@@ -42893,8 +43055,7 @@ mod tests {
             "the transport filter belongs to the request, or paging under it would leave holes"
         );
 
-        // The Skill registry ignores the offset, so that market fetches one
-        // window and pages through it locally.
+        // The Skill market fetches one window and pages through it locally.
         assert!(
             skills.contains("market_page_slice("),
             "the Skill market should page the window it fetched"

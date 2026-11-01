@@ -3704,6 +3704,32 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderSkillMarketSearchResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::MarketAsset(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let icon_url = request.icon_url;
+            let result = run_market_blocking(move || service.market_asset(&icon_url))?;
+            serde_json::to_value(vibex_core::RemoteProviderMarketAssetResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillMarketSummary(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result =
+                run_market_blocking(move || service.skill_market_summaries(request.request))?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillMarketSummaryResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::SkillMarketDocument(request) => {
             authorize_provider_action(
                 runtime,

@@ -28,18 +28,18 @@ use vibex_core::{
     DiagnosticExportPayload, GatewayAgentUpdateRequest, GatewayCapabilitySuggestion,
     GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult,
-    McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
-    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, ModelCapabilitySuggestionRequest,
-    ModelProviderCredentialSecretRequest, ModelProviderCredentialSecretResponse,
-    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
-    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
-    PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
-    ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest, ProviderHealthSummary,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ManagementSnapshotPayload, MarketIcon, McpMarketIcon, McpMarketInstallRequest,
+    McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse, McpServer,
+    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    ModelCapabilitySuggestionRequest, ModelProviderCredentialSecretRequest,
+    ModelProviderCredentialSecretResponse, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    ModelProviderProfileUpdateRequest, Prompt, PromptCreateRequest, PromptDeleteRequest,
+    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -56,8 +56,8 @@ use vibex_core::{
     SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
     SkillImportRequest, SkillImportResult, SkillMarketDocument, SkillMarketDocumentRequest,
     SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse, SkillSetAgentMatrixRequest, SkillUpdateRequest,
-    SkillValidateRequest, SkillValidationResult,
+    SkillMarketSearchResponse, SkillMarketSummaryRequest, SkillMarketSummaryResponse,
+    SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
 };
 
 use crate::{BackendBound, BackendError, BackendFuture, MutationRequest};
@@ -773,6 +773,19 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: SkillMarketDocumentRequest,
     ) -> BackendFuture<'_, SkillMarketDocument>;
+
+    /// Loads one market picture by the address a catalog published.
+    fn market_asset(&self, icon_url: String) -> BackendFuture<'_, MarketIcon>;
+
+    /// Reads what each of the named Skills says of itself.
+    ///
+    /// The catalog's list and search publish no description, so a card asks for
+    /// the summarization of the page it is showing rather than the search
+    /// paying for text nobody may read.
+    fn skill_market_summaries(
+        &self,
+        request: SkillMarketSummaryRequest,
+    ) -> BackendFuture<'_, SkillMarketSummaryResponse>;
 
     fn install_skill_market_entry(
         &self,

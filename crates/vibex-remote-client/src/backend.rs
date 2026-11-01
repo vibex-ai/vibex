@@ -5831,6 +5831,52 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn market_asset(&self, icon_url: String) -> BackendFuture<'_, vibex_core::MarketIcon> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteProviderRequest::MarketAsset(vibex_core::RemoteProviderMarketAssetRequest {
+                    auth: this.auth(),
+                    icon_url,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMarketAssetResponse>(value)?.result)
+        })
+    }
+
+    fn skill_market_summaries(
+        &self,
+        request: vibex_core::SkillMarketSummaryRequest,
+    ) -> BackendFuture<'_, vibex_core::SkillMarketSummaryResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::SkillMarketSummary(
+                vibex_core::RemoteProviderSkillMarketSummaryRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillMarketSummaryResponse>(value)?.result)
+        })
+    }
+
     fn skill_market_document(
         &self,
         request: vibex_core::SkillMarketDocumentRequest,

@@ -15,6 +15,7 @@ os-keychain = ["dep:keyring"]
 [dependencies]
 dirs = "6"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"], optional = true }
+flate2 = "1"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver.workspace = true
@@ -22,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
 sha2.workspace = true
+tar = "0.4"
 toml = "0.8"
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }

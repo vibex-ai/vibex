@@ -47,17 +47,18 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult,
-    McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
-    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, MessageSubmissionState,
-    ModelCapabilitySuggestionRequest, OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest,
-    PromptDeleteRequest, PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest,
-    PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderConfiguredModel, ProviderHealthSummary, ProviderNativeExportApplyRequest,
-    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ManagementSnapshotPayload, MarketIcon, McpMarketIcon, McpMarketInstallRequest,
+    McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse, McpServer,
+    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    MessageSubmissionState, ModelCapabilitySuggestionRequest, OpenWorkspaceRequest, ProjectId,
+    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
+    PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
+    ProviderCapabilitySummary, ProviderConfiguredModel, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -78,10 +79,11 @@ use vibex_core::{
     SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
     SkillImportRequest, SkillImportResult, SkillMarketDocument, SkillMarketDocumentRequest,
     SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse, SkillSetAgentMatrixRequest, SkillUpdateRequest,
-    SkillValidateRequest, SkillValidationResult, SteerAgentMessageRequest, SteerAgentMessageResult,
-    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
-    TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    SkillMarketSearchResponse, SkillMarketSummaryRequest, SkillMarketSummaryResponse,
+    SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
+    SteerAgentMessageRequest, SteerAgentMessageResult, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus, TerminalWriteRequest,
+    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
@@ -4315,6 +4317,43 @@ impl ManagementBackend for NativeBackend {
                     BackendError::failed(
                         "market_search_task_failed",
                         "the market search task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn market_asset(&self, icon_url: String) -> BackendFuture<'_, MarketIcon> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || service.market_asset(&icon_url))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_asset_task_failed",
+                        "the market picture task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn skill_market_summaries(
+        &self,
+        request: SkillMarketSummaryRequest,
+    ) -> BackendFuture<'_, SkillMarketSummaryResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || service.skill_market_summaries(request))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_summary_task_failed",
+                        "the market summary task did not complete",
                     )
                 })?
                 .map_err(Into::into)

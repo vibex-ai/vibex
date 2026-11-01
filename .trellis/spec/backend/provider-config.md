@@ -1151,8 +1151,29 @@ ProviderConfigService::search_skill_market(SkillMarketSearchRequest)
   the address, and caches by entry id. A client renders the returned bytes; it
   never fetches a publisher URL itself, which is what makes the picture work on
   a paired device.
-- **The Skill market keeps ClawHub** (`https://clawhub.ai/api/v1/...`) with its
-  own rankings, cursors, and zip bundles; its searches are not the MCP path.
+- **The Skill market reads a public catalog, not a registry API.**
+  `GET https://www.skills.sh/api/search?q=&limit=` ranks the catalog against a
+  query; the browse list is the array the catalog's home page renders
+  (`initialSkills`), parsed out of the escaped JSON in its payload and kept for
+  six hours, with `src/skill_catalog.json` embedded as the copy a fresh install
+  shows before it has ever reached the site. A browse page folds one repository
+  to at most four entries and carries an opaque `skill:<offset>` cursor.
+- **A Skill is installed from the repository the catalog names.** The catalog
+  publishes `owner/repo` and the Skill's name inside it, never the folder, so
+  `skill_market_document` downloads `codeload.github.com/<repo>/tar.gz/HEAD`
+  once and lifts the folder whose `SKILL.md` parent is named after the entry.
+  `codeload` is used rather than the REST tarball endpoint because the market
+  must not spend the API's hourly budget. The archive is untrusted: only files
+  inside that folder, only UTF-8 text, symlinks and directories skipped, and the
+  same per-file/per-count/total ceilings as before.
+- **The card's elements come from three places.** Title, repository, slug and
+  install count are the catalog record; the picture is the repository owner's
+  avatar (`https://github.com/<owner>.png?size=96`), loaded through
+  `market_asset` by URL so two Skills of one owner cost one fetch; the
+  description is read from the Skill's own `SKILL.md` frontmatter by
+  `skill_market_summaries`, asked for the page on screen because a catalog
+  record carries no description. `official` is the catalog's own publisher
+  tick.
 
 ### 4. Failure handling
 

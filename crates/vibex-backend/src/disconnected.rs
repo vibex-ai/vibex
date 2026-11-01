@@ -36,8 +36,8 @@ use vibex_core::{
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
     GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpMarketIcon,
-    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, MarketIcon,
+    McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
@@ -67,10 +67,11 @@ use vibex_core::{
     SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
     SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillMarketDocument,
     SkillMarketDocumentRequest, SkillMarketInstallRequest, SkillMarketInstallResult,
-    SkillMarketSearchRequest, SkillMarketSearchResponse, SkillSetAgentMatrixRequest,
-    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
-    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    SkillMarketSearchRequest, SkillMarketSearchResponse, SkillMarketSummaryRequest,
+    SkillMarketSummaryResponse, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillValidateRequest, SkillValidationResult, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem,
+    TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::{
@@ -1150,6 +1151,17 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: SkillMarketSearchRequest,
     ) -> BackendFuture<'_, SkillMarketSearchResponse> {
+        disconnected_future!()
+    }
+
+    fn market_asset(&self, _icon_url: String) -> BackendFuture<'_, MarketIcon> {
+        disconnected_future!()
+    }
+
+    fn skill_market_summaries(
+        &self,
+        _request: SkillMarketSummaryRequest,
+    ) -> BackendFuture<'_, SkillMarketSummaryResponse> {
         disconnected_future!()
     }
 

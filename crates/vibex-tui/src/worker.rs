@@ -1123,9 +1123,8 @@ impl Dispatch {
             }
             M::InstallSkillMarketEntry {
                 entry_id,
+                source,
                 slug,
-                owner_handle,
-                version,
                 agent_ids,
                 document,
             } => {
@@ -1137,9 +1136,8 @@ impl Dispatch {
                     None => {
                         let document_request = vibex_core::SkillMarketDocumentRequest {
                             entry_id: entry_id.clone(),
+                            source,
                             slug,
-                            owner_handle,
-                            version,
                         };
                         self.facade
                             .management()
@@ -2167,15 +2165,13 @@ impl Dispatch {
             }
             Effect::PreviewSkillMarket {
                 entry_id,
+                source,
                 slug,
-                owner_handle,
-                version,
             } => {
                 let request = vibex_core::SkillMarketDocumentRequest {
                     entry_id,
+                    source,
                     slug,
-                    owner_handle,
-                    version,
                 };
                 let result = self
                     .facade

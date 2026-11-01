@@ -2169,6 +2169,17 @@ mod tests {
             error_future()
         }
 
+        fn market_asset(&self, _icon_url: String) -> BackendFuture<'_, vibex_core::MarketIcon> {
+            error_future()
+        }
+
+        fn skill_market_summaries(
+            &self,
+            _request: vibex_core::SkillMarketSummaryRequest,
+        ) -> BackendFuture<'_, vibex_core::SkillMarketSummaryResponse> {
+            error_future()
+        }
+
         fn skill_market_document(
             &self,
             _request: vibex_core::SkillMarketDocumentRequest,

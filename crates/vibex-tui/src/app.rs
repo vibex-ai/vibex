@@ -9168,9 +9168,8 @@ pub enum ConfigMutation {
     },
     InstallSkillMarketEntry {
         entry_id: String,
+        source: String,
         slug: String,
-        owner_handle: Option<String>,
-        version: Option<String>,
         agent_ids: Vec<vibex_core::AgentId>,
         /// The document the reader read. `None` only when this client could not
         /// read one, and the runtime is then asked for it as it was before.
@@ -9821,9 +9820,8 @@ pub enum Effect {
     /// Read one registry Skill in full, before it is installed.
     PreviewSkillMarket {
         entry_id: String,
+        source: String,
         slug: String,
-        owner_handle: Option<String>,
-        version: Option<String>,
     },
     /// Read what other CLI tools on this machine hold, ready to import.
     PreviewNativeImport {

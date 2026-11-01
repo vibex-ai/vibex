@@ -105,78 +105,54 @@ pub struct McpMarketEntry {
     pub icon_url: Option<String>,
 }
 
-/// One installable Skill as the registry lists it.
+/// One installable Skill as the market lists it.
 ///
-/// The registry publishes a name, a publisher, and the counters it ranks by; it
-/// does not publish the document. The document is resolved when the user asks
-/// to see one, so a search stays a single request.
+/// The catalog publishes a name, a repository, and the counters it ranks by; it
+/// does not publish the document. The document is resolved from the repository
+/// when the user asks to see one, so a search stays a single request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMarketEntry {
-    /// Registry identity, `ownerHandle/slug`, or the bare slug when the
-    /// registry did not name a publisher.
+    /// Market identity, `owner/repo/skill`.
     ///
     /// This is what a stored Skill records as its origin, so it has to be
     /// stable across a rename of the display name.
     pub id: String,
-    /// Routable slug. The registry keys a Skill by this, and it is what the
-    /// document and download endpoints take.
+    /// The repository the Skill lives in, as `owner/repo`.
+    pub source: String,
+    /// The Skill's own name inside that repository.
     pub slug: String,
-    /// Publisher handle.
-    ///
-    /// A slug is not unique across publishers: the registry answers with the
-    /// candidate handles rather than a document when several owners hold the
-    /// same one, so the handle travels with every request that resolves a slug.
-    #[serde(default)]
-    pub owner_handle: Option<String>,
     pub name: String,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub downloads: u64,
-    #[serde(default)]
     pub installs: u64,
+    /// Whether the repository that publishes it belongs to the vendor it
+    /// names, which is what the catalog's own tick means.
     #[serde(default)]
-    pub stars: u64,
-    /// Registry update time, epoch milliseconds.
+    pub official: bool,
+    /// The picture the card shows: the repository owner's avatar.
+    ///
+    /// A Skill has no logo of its own — the catalog publishes none, and every
+    /// Skill in one repository would carry the same one — so the owner is the
+    /// closest thing to a publisher mark. Loaded through the runtime, never
+    /// fetched by the client itself.
     #[serde(default)]
-    pub updated_at: Option<i64>,
+    pub icon_url: Option<String>,
 }
 
-/// Ranking a Skill search asks the registry for.
+/// How a Skill search is ranked.
 ///
-/// The registry ranks its own catalog, so an empty query returns its order
-/// rather than the caller's; asking for a ranking is therefore how a browse
-/// view states what it wants to see first.
+/// The catalog ranks its own browse list by installs, so this names the order a
+/// browse view asks for rather than a parameter a search takes. A search is
+/// ranked by the catalog's own relevance and ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillMarketSort {
-    /// The registry's own default ranking.
+    /// The catalog's own order: most installed first.
     Recommended,
-    Downloads,
-    Stars,
+    /// Most installed first, named for what the number counts.
     Installs,
-    Updated,
-    Newest,
-    Trending,
-}
-
-impl SkillMarketSort {
-    /// The registry's own name for this ranking. Sending anything else is a
-    /// bad request, so the vocabulary is closed here rather than at the call.
-    pub fn as_registry_value(self) -> &'static str {
-        match self {
-            Self::Recommended => "recommended",
-            Self::Downloads => "downloads",
-            Self::Stars => "stars",
-            Self::Installs => "installs",
-            Self::Updated => "updated",
-            Self::Newest => "newest",
-            Self::Trending => "trending",
-        }
-    }
 }
 
 /// One text file a Skill bundle carries beside its manifest.
@@ -331,25 +307,44 @@ pub struct SkillMarketSearchResponse {
     /// interprets it.
     #[serde(default)]
     pub next_cursor: Option<String>,
-    /// True when the registry reported another page beyond this one.
+    /// True when the catalog reported another page beyond this one.
     pub has_more: bool,
+    /// Whether the entries still need their summaries read.
+    ///
+    /// A ranked list publishes the install count it ranks by but not what the
+    /// Skill does, so a card asks for the summaries of the page it is showing
+    /// once rather than the search paying for text nobody may scroll to.
+    #[serde(default)]
+    pub description_missing: bool,
+}
+
+/// Ask for the one-line description of the Skills on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillMarketSummaryRequest {
+    pub entries: Vec<SkillMarketEntry>,
+}
+
+/// What each named Skill says of itself, by entry id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillMarketSummaryResponse {
+    pub summaries: Vec<(String, String)>,
 }
 
 /// Resolve one Skill document.
 ///
-/// The registry identity is carried explicitly rather than parsed back out of
-/// the entry id, because a slug may itself contain a slash and a publisher
-/// handle is what disambiguates a slug several owners hold.
+/// The repository and the Skill's name are carried explicitly rather than
+/// parsed back out of the entry id, because a Skill may sit at any depth in a
+/// repository and its folder name is not the identity the catalog publishes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMarketDocumentRequest {
     pub entry_id: String,
+    /// The repository the Skill lives in, as `owner/repo`.
+    pub source: String,
+    /// The Skill's own name inside that repository.
     pub slug: String,
-    #[serde(default)]
-    pub owner_handle: Option<String>,
-    /// Version to resolve. Absent means the registry's latest release.
-    #[serde(default)]
-    pub version: Option<String>,
 }
 
 /// Install one market entry as a real MCP server.
@@ -450,14 +445,17 @@ pub const MAX_MARKET_ICON_BYTES: u64 = 1024 * 1024;
 /// the card needs and a paired client needs no second request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct McpMarketIcon {
+pub struct MarketIcon {
     #[serde(default)]
     pub mime: Option<String>,
     #[serde(default)]
     pub bytes: Vec<u8>,
 }
 
-impl McpMarketIcon {
+/// A picture an MCP market entry published.
+pub type McpMarketIcon = MarketIcon;
+
+impl MarketIcon {
     /// Whether the runtime actually loaded a picture.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
