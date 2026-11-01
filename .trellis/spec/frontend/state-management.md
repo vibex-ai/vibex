@@ -318,6 +318,12 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
   window-control clusters, and the collapsed sidebar cluster all take
   `cx.theme().background`; the expanded sidebar cluster deliberately does not,
   because the rail's own tone runs up through the band behind it.
+- No column paints its page behind the floating chrome. A surface that reaches
+  the window's top edge stacks a second translucent layer under a title-bar
+  segment that already paints one, and two pages over one wallpaper read as a
+  pale block rather than as the same glass. The right-hand activity bar keeps
+  its full height as a frame but starts its own surface below
+  `TITLE_BAR_HEIGHT`, then pads its first row.
 - A missing home, a malformed stored name, or a missing stored file resolves to
   no image: the workbench paints the theme's page color again, and the
   appearance page shows the upload control without a thumbnail.

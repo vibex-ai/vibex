@@ -44109,24 +44109,36 @@ impl VibexWorkbench {
             );
         }
 
+        // The bar starts below the floating chrome rather than painting behind
+        // it. Its column reaches the window's top edge, and a surface there
+        // would be a second layer under the title bar's own right-hand cluster:
+        // two translucent pages over one wallpaper read as a pale block, and
+        // this is exactly the strip that showed it.
         v_flex()
-            .id("right-rail-activity-bar")
+            .id("right-rail-activity-bar-frame")
             .w(px(RIGHT_ACTIVITY_BAR_WIDTH))
             .h_full()
             .flex_none()
-            .items_center()
-            .gap(px(RIGHT_ACTIVITY_ITEM_GAP))
-            // The seam belongs to the open panel: with every rail surface
-            // collapsed the workbench edge stays unbroken.
-            .when(panel_open, |this| {
-                this.border_l_1().border_color(cx.theme().border)
-            })
-            .bg(cx.theme().background)
-            // Clear the floating chrome.
-            .pt(px(TITLE_BAR_HEIGHT + RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
-            .pb(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
-            .children(activities)
-            .child(div().flex_1())
+            .pt(px(TITLE_BAR_HEIGHT))
+            .child(
+                v_flex()
+                    .id("right-rail-activity-bar")
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .gap(px(RIGHT_ACTIVITY_ITEM_GAP))
+                    // The seam belongs to the open panel: with every rail surface
+                    // collapsed the workbench edge stays unbroken.
+                    .when(panel_open, |this| {
+                        this.border_l_1().border_color(cx.theme().border)
+                    })
+                    .bg(cx.theme().background)
+                    .pt(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
+                    .pb(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
+                    .children(activities)
+                    .child(div().flex_1()),
+            )
             .into_any_element()
     }
 
@@ -114063,10 +114075,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn open_management("))
             .map(|(body, _)| body)
             .expect("activity bar should remain inspectable");
-        assert!(
-            activity_bar
-                .contains(".pt(px(TITLE_BAR_HEIGHT + RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))")
-        );
+        // The bar clears the floating chrome: its frame starts below it and the
+        // strip pads its own first row.
+        assert!(activity_bar.contains(".id(\"right-rail-activity-bar-frame\")"));
+        assert!(activity_bar.contains(".pt(px(TITLE_BAR_HEIGHT))"));
+        assert!(activity_bar.contains(".pt(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))"));
         // The rail's seam belongs to an open panel: the strip itself draws no
         // divider, so a collapsed rail leaves the workbench edge unbroken.
         assert!(activity_bar.contains(".when(panel_open, |this| {"));
