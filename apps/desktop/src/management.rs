@@ -1778,6 +1778,8 @@ pub struct ManagementCenter {
     compact_sidebar_resize_drag: Option<ManagementSidebarResizeDragState>,
     profile_editor_open: bool,
     editing_profile_id: Option<String>,
+    /// The catalogue id a saved Provider remembers, held for this edit session.
+    profile_saved_catalog_id: Option<String>,
     /// Whether the stored Secret exists, shown as state.
     profile_secret_configured: bool,
     /// The stored Secret the editor read back, if the read succeeded.
@@ -3090,6 +3092,7 @@ impl ManagementCenter {
             selected_global_route_id: None,
             profile_editor_open: false,
             editing_profile_id: None,
+            profile_saved_catalog_id: None,
             profile_secret_configured: false,
             profile_secret_loaded: None,
             profile_secret_task: None,
@@ -6231,6 +6234,14 @@ impl ManagementCenter {
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
+        // The record's own catalogue id, remembered for this edit session: a
+        // Provider saved before the option was written keeps it here, and the
+        // capability lookup needs it to answer at all.
+        self.profile_saved_catalog_id = self
+            .providers
+            .iter()
+            .find(|candidate| candidate.id.as_str() == profile.id)
+            .and_then(|candidate| candidate.metadata.catalog_id.clone());
         self.editing_profile_id = Some(profile.id.clone());
         self.rebuild_profile_protocol_base_urls(window, cx);
         self.load_profile_headers(window, cx);
@@ -7199,9 +7210,20 @@ impl ManagementCenter {
             .iter()
             .find(|entry| entry.key == "catalogId")
             .map(|entry| entry.value.clone())
-            .unwrap_or_else(|| {
+            // A Provider saved before the option was written still remembers
+            // its catalogue id on the record itself.
+            .or_else(|| {
+                self.profile_saved_catalog_id
+                    .as_ref()
+                    .map(|catalog_id| catalog_id.to_string())
+            })
+            .or_else(|| {
+                // Last resort for a hand-made Provider: its name, slugged. A
+                // display name rarely matches a catalogue slug, so this mostly
+                // yields nothing rather than a wrong vendor.
                 let name = self.profile_name.read(cx).value().to_lowercase();
-                name.chars()
+                let slug = name
+                    .chars()
                     .map(|character| {
                         if character.is_ascii_alphanumeric() {
                             character
@@ -7211,11 +7233,13 @@ impl ManagementCenter {
                     })
                     .collect::<String>()
                     .trim_matches('-')
-                    .to_string()
+                    .to_string();
+                (!slug.is_empty()).then_some(slug)
             });
-        if provider_id.is_empty() {
+        let Some(provider_id) = provider_id.filter(|id| !id.is_empty()) else {
+            self.model_capability_suggestion = None;
             return;
-        }
+        };
         self.model_capability_suggestion = None;
         let entity = cx.weak_entity();
         self.profile_secret_task = Some(cx.spawn(async move |_, cx| {
@@ -24401,6 +24425,13 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         let mut options = self.profile_provider_options.clone();
+        // The catalogue id is what makes a capability suggestion possible: the
+        // lookup is keyed by the vendor slug, not by the display name. Writing
+        // it here is what a preset is for, and its absence was why a
+        // preset-created Provider got no suggestions at all.
+        if let Some(catalog_id) = preset.catalog_id.as_deref() {
+            options = with_provider_option(options, "catalogId", Some(catalog_id.to_string()));
+        }
         if let Some(wire_api) = preset.default_wire_api() {
             options = with_provider_option(
                 options,
@@ -36258,18 +36289,16 @@ fn management_provider_health_color(status: vibex_core::ProviderHealthStatus, cx
 }
 
 /// A Provider's mark: the vendor's logo when one is known, otherwise its
-/// initial on a quiet plate.
+/// initial. The mark is bare; the caller decides whether it sits on a plate.
 ///
-/// Every row reserves the same leading slot, so names line up whether or not
-/// a logo exists. The brand is looked up from what the record says about its
-/// vendor — the catalogue id, the bundled icon key, the vendor hint, then the
-/// name — and never from its models: a relay serving GPT is not OpenAI.
-fn provider_logo_tile(
+/// The brand is looked up from what the record says about its vendor — the
+/// catalogue id, the bundled icon key, the vendor hint, then the name — and
+/// never from its models: a relay serving GPT is not OpenAI.
+fn provider_logo_mark(
     profile: &vibex_core::ModelProviderProfile,
     size: Pixels,
     cx: &App,
 ) -> AnyElement {
-    let icon_size = size * 0.6;
     let logo = [
         profile.metadata.catalog_id.as_deref(),
         profile.metadata.icon.as_deref(),
@@ -36279,24 +36308,16 @@ fn provider_logo_tile(
     .into_iter()
     .flatten()
     .find_map(|candidate| {
-        model_brand_icon(
-            candidate,
-            icon_size,
-            Some(cx.theme().foreground.opacity(0.88)),
-        )
+        model_brand_icon(candidate, size, Some(cx.theme().foreground.opacity(0.88)))
     });
-    let plate = div()
+    let slot = div()
         .flex_none()
         .size(size)
         .flex()
         .items_center()
-        .justify_center()
-        .rounded(cx.theme().radius_lg)
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.7))
-        .bg(cx.theme().muted.opacity(0.5));
+        .justify_center();
     match logo {
-        Some(logo) => plate.child(logo).into_any_element(),
+        Some(logo) => slot.child(logo).into_any_element(),
         None => {
             let initial = profile
                 .display_name
@@ -36305,14 +36326,36 @@ fn provider_logo_tile(
                 .next()
                 .map(|character| character.to_uppercase().to_string())
                 .unwrap_or_else(|| "?".to_string());
-            plate
-                .text_size(size * 0.42)
+            slot.text_size(size * 0.7)
                 .font_semibold()
                 .text_color(cx.theme().muted_foreground)
                 .child(initial)
                 .into_any_element()
         }
     }
+}
+
+/// A Provider's mark on a quiet plate, for an identity header.
+///
+/// Every detail view reserves the same leading slot, so the headers of two
+/// records line up whether or not a logo exists.
+fn provider_logo_tile(
+    profile: &vibex_core::ModelProviderProfile,
+    size: Pixels,
+    cx: &App,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .size(size)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.7))
+        .bg(cx.theme().muted.opacity(0.5))
+        .child(provider_logo_mark(profile, size * 0.6, cx))
+        .into_any_element()
 }
 
 fn gateway_provider_status_badge(
@@ -47199,6 +47242,36 @@ mod gateway_surface_tests {
                 model_provider_profile_id: Some(ModelProviderProfileId::new()),
                 ..AgentModelProviderBinding::default()
             }]
+        ));
+    }
+
+    /// A preset writes the catalogue id it answers for.
+    ///
+    /// The capability lookup is keyed by that slug, not by the display name:
+    /// without it the lookup fell back to slugging "Anthropic" into
+    /// `anthropic` (which happens to work) or "Qwen (DashScope)" into
+    /// `qwen--dashscope-` (which does not), so most presets produced no
+    /// suggestion at all.
+    #[test]
+    fn a_preset_records_the_catalogue_id_its_capabilities_come_from() {
+        for (preset_id, catalog_id) in [
+            (vibex_core::PROVIDER_PRESET_ANTHROPIC, "anthropic"),
+            (vibex_core::PROVIDER_PRESET_DEEPSEEK, "deepseek"),
+            (vibex_core::PROVIDER_PRESET_MOONSHOT_KIMI, "moonshotai"),
+            (vibex_core::PROVIDER_PRESET_ZHIPU_GLM, "zhipuai"),
+            (vibex_core::PROVIDER_PRESET_ANTHROPIC, "anthropic"),
+        ] {
+            let preset = vibex_core::provider_preset(preset_id).expect("the preset ships");
+            assert_eq!(
+                preset.catalog_id.as_deref(),
+                Some(catalog_id),
+                "{preset_id} must name the catalogue entry its models come from"
+            );
+        }
+        // The writer must put it where the reader looks for it.
+        let picker = include_str!("management.rs");
+        assert!(picker.contains(
+            "with_provider_option(options, \"catalogId\", Some(catalog_id.to_string()))"
         ));
     }
 
