@@ -1174,6 +1174,13 @@ ProviderConfigService::search_skill_market(SkillMarketSearchRequest)
   `skill_market_summaries`, asked for the page on screen because a catalog
   record carries no description. `official` is the catalog's own publisher
   tick.
+- **A market read starts on the Tokio runtime, never the foreground
+  executor.** Every market read is blocking I/O handed to
+  `tokio::task::spawn_blocking` by `crates/vibex-backend`, so the desktop
+  dispatches it through `gpui_tokio::Tokio::spawn`. Polling one of those
+  backend futures straight from a `cx.spawn` foreground task panics with
+  `there is no reactor running, must be called from the context of a Tokio 1.x
+  runtime` on the first market picture a card loads.
 
 ### 4. Failure handling
 

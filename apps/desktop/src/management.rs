@@ -11386,11 +11386,17 @@ impl ManagementCenter {
             let entity = cx.weak_entity();
             let backend = backend.clone();
             let request_id = entry_id.clone();
+            // The runtime reads the picture on a blocking worker, and
+            // `spawn_blocking` needs a reactor. The read has to start on Tokio
+            // rather than on the foreground executor, where it would panic.
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                backend.management().mcp_market_icon(request_id).await
+            });
             cx.spawn(async move |_, cx| {
-                let loaded = backend.management().mcp_market_icon(request_id).await;
+                let loaded = runner.await.ok().and_then(Result::ok);
                 let _ = entity.update(cx, |this, cx| {
                     this.mcp_market_icon_pending.remove(&entry_id);
-                    let Ok(icon) = loaded else {
+                    let Some(icon) = loaded else {
                         return;
                     };
                     let Some(format) = icon
@@ -11627,7 +11633,6 @@ impl ManagementCenter {
                         this.skill_market_next_cursor = response.next_cursor;
                         this.load_skill_market_summaries(cx);
                         this.load_skill_market_icons(cx);
-                        this.load_skill_market_icons(cx);
                     }
                     Ok(Err(error)) => {
                         this.skill_market_error =
@@ -11726,11 +11731,19 @@ impl ManagementCenter {
             self.skill_market_icon_pending.insert(url.clone());
             let entity = cx.weak_entity();
             let backend = backend.clone();
+            let request_url = url.clone();
+            // The runtime reads the avatar on a blocking worker, so like every
+            // other market read it starts on Tokio; polling it from the
+            // foreground executor would leave `spawn_blocking` without a
+            // reactor and panic the app.
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                backend.management().market_asset(request_url).await
+            });
             cx.spawn(async move |_, cx| {
-                let loaded = backend.management().market_asset(url.clone()).await;
+                let loaded = runner.await.ok().and_then(Result::ok);
                 let _ = entity.update(cx, |this, cx| {
                     this.skill_market_icon_pending.remove(&url);
-                    let Ok(asset) = loaded else {
+                    let Some(asset) = loaded else {
                         return;
                     };
                     let Some(format) = asset
@@ -42830,6 +42843,25 @@ mod tests {
             market.contains("self.mcp_market_icons.get(&entry.id)"),
             "the grid should hand the card the picture it already loaded"
         );
+    }
+
+    /// Market pictures are read on a blocking worker inside the runtime, so the
+    /// request has to start on Tokio. Polling it from the foreground executor
+    /// leaves `spawn_blocking` without a reactor and panics the app.
+    #[test]
+    fn market_pictures_load_on_the_tokio_runtime() {
+        let source = include_str!("management.rs");
+        for loader in ["fn load_mcp_market_icons(", "fn load_skill_market_icons("] {
+            let body = source
+                .split_once(loader)
+                .and_then(|(_, tail)| tail.split_once("\n    ///"))
+                .map(|(body, _)| body)
+                .expect("the market picture loader should remain inspectable");
+            assert!(
+                body.contains("gpui_tokio::Tokio::spawn"),
+                "{loader} should start its read on the Tokio runtime"
+            );
+        }
     }
 
     /// A Skill card carries what a reader picks it by: its name, the
