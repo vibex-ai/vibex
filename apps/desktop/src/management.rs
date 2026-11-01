@@ -212,6 +212,12 @@ const MANAGEMENT_AGENT_TOOL_GLYPH_SIZE: f32 = 14.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a draft waits after the last keystroke before it fetches models.
+///
+/// A Key and an address are typed or pasted as two separate fields, so the
+/// fetch cannot hang off either one alone: it runs once both are present, and
+/// the pause is what keeps a paste from asking the endpoint per character.
+const PROVIDER_AUTO_FETCH_DEBOUNCE: Duration = Duration::from_millis(700);
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "sk-…";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
@@ -1373,6 +1379,10 @@ pub struct ManagementCenter {
     provider_create_base_url_error: Option<String>,
     provider_create_models_error: Option<String>,
     provider_create_endpoint_error: Option<String>,
+    /// The page draft's own debounce and generations, kept apart from the
+    /// dialog's so a create page and an edit dialog never cancel each other.
+    provider_create_auto_fetch_generation: u64,
+    provider_create_auto_fetch_task: Option<Task<()>>,
     /// The preset the editor's draft started from, until it is saved.
     ///
     /// It is kept beside the draft rather than inside it because a preset is a
@@ -1778,6 +1788,14 @@ pub struct ManagementCenter {
     profile_secret_loaded: Option<String>,
     /// The in-flight read that fills the API key field.
     profile_secret_task: Option<Task<()>>,
+    /// Counts every draft edit the auto-fetch watches, so a fetch scheduled by
+    /// an earlier keystroke can tell it was overtaken before it runs.
+    profile_auto_fetch_generation: u64,
+    /// The pending debounce between a typed address/Key and the fetch itself.
+    profile_auto_fetch_task: Option<Task<()>>,
+    /// The address and Key the last automatic fetch asked about, so an edit
+    /// that lands back on an already-asked pair does not ask again.
+    profile_auto_fetch_requested: Option<(String, String)>,
     /// The in-flight catalogue lookup behind the same-model template.
     model_canonical_task: Option<Task<()>>,
     /// Set only by the explicit Clear command, so an empty field on its own
@@ -2503,6 +2521,10 @@ impl ManagementCenter {
                     this.projection_editor.mark_draft_changed();
                     this.navigation.mark_dirty(ManagementSection::Agents, true);
                     this.sync_opencode_session_header(window, cx);
+                    // An address alone cannot answer a model fetch, but once a
+                    // Key is already in the field it completes the pair; the
+                    // debounce settles the two-field paste.
+                    this.schedule_profile_draft_auto_fetch(cx);
                     cx.notify();
                 },
             ),
@@ -2610,8 +2632,39 @@ impl ManagementCenter {
                 );
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
+                // A Key typed into a draft whose address is already set is the
+                // other half of what a model fetch waits for.
+                this.schedule_profile_draft_auto_fetch(cx);
                 cx.notify();
             }),
+            // The Providers page draft fetches its own model list, so it watches
+            // the two fields a fetch reads. The debounce lives on the schedule,
+            // so a paste that fills one field and then the other asks once.
+            cx.subscribe_in(
+                &provider_create_base_url,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.provider_create_base_url_error = None;
+                    this.navigation
+                        .mark_dirty(ManagementSection::Providers, false);
+                    this.schedule_provider_create_auto_fetch(window, cx);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(
+                &provider_create_api_key,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.schedule_provider_create_auto_fetch(window, cx);
+                    cx.notify();
+                },
+            ),
             cx.subscribe(&acp_command, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
@@ -2955,6 +3008,8 @@ impl ManagementCenter {
             provider_create_base_url_error: None,
             provider_create_models_error: None,
             provider_create_endpoint_error: None,
+            provider_create_auto_fetch_generation: 0,
+            provider_create_auto_fetch_task: None,
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
@@ -3038,6 +3093,9 @@ impl ManagementCenter {
             profile_secret_configured: false,
             profile_secret_loaded: None,
             profile_secret_task: None,
+            profile_auto_fetch_generation: 0,
+            profile_auto_fetch_task: None,
+            profile_auto_fetch_requested: None,
             model_canonical_task: None,
             profile_secret_clear: false,
             profile_name_error: None,
@@ -6028,6 +6086,7 @@ impl ManagementCenter {
         self.sync_projection_editor();
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
+        self.cancel_profile_auto_fetch();
         // Every new Provider starts by choosing; even "none of these" is a
         // choice the user makes rather than one the form makes for them.
         self.provider_preset_picker = true;
@@ -6103,6 +6162,9 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         self.select_provider_profile(profile.id.clone(), cx);
+        // A saved Provider fetches nothing on open: its stored catalogue is the
+        // answer, and only an explicit fetch asks the endpoint again.
+        self.cancel_profile_auto_fetch();
         let full_profile = self
             .provider_profiles
             .iter()
@@ -6286,6 +6348,7 @@ impl ManagementCenter {
     fn reset_profile_draft_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
+        self.cancel_profile_auto_fetch();
         self.profile_name
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_note
@@ -6316,6 +6379,7 @@ impl ManagementCenter {
         self.editing_profile_id = None;
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
+        self.cancel_profile_auto_fetch();
         self.provider_preset_picker = false;
         self.projection_editor.draft_revision = 0;
         self.profile_secret_configured = false;
@@ -8550,6 +8614,11 @@ impl ManagementCenter {
     /// silently configure anything. An authoritative catalogue replaces the
     /// previous one, because ids the Agent no longer advertises cannot be
     /// selected and keeping them would offer dead rows.
+    ///
+    /// `quiet` is the automatic fetch's lane: it runs on its own, before the
+    /// user has pressed anything, so a rejected half-typed Key must not raise a
+    /// failure banner the way the button's own fetch does. The catalogue it
+    /// filled still shows, which is the feedback that belongs to it.
     fn apply_fetched_models(
         &mut self,
         outcome: Result<
@@ -8558,6 +8627,7 @@ impl ManagementCenter {
         >,
         authoritative: bool,
         active_locale: ResolvedLocale,
+        quiet: bool,
         cx: &mut Context<Self>,
     ) {
         self.mutation = None;
@@ -8623,13 +8693,21 @@ impl ManagementCenter {
                 // A catalogue fetch answers the button the user just pressed,
                 // so its failure rides the dialog's failure lane — the light
                 // hint `present_feedback` puts above the dialog — rather than a
-                // band the dialog has to remember to clear.
-                self.error = Some(format!("{}: {}", error.code, error.message));
+                // band the dialog has to remember to clear. An automatic fetch
+                // has no press behind it and stays silent.
+                if !quiet {
+                    self.error = Some(format!("{}: {}", error.code, error.message));
+                }
             }
             Err(error) => {
-                let failed =
-                    management_error_text("Model detection failed", "模型探测失败", "模型探測失敗");
-                self.error = Some(format!("{}: {error}", failed));
+                if !quiet {
+                    let failed = management_error_text(
+                        "Model detection failed",
+                        "模型探测失败",
+                        "模型探測失敗",
+                    );
+                    self.error = Some(format!("{}: {error}", failed));
+                }
             }
         }
         cx.notify();
@@ -8695,7 +8773,7 @@ impl ManagementCenter {
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                this.apply_fetched_models(outcome, agent_owns_catalog, active_locale, cx);
+                this.apply_fetched_models(outcome, agent_owns_catalog, active_locale, false, cx);
             });
         }));
     }
@@ -8711,6 +8789,7 @@ impl ManagementCenter {
         agent_id: String,
         base_url: String,
         api_key: String,
+        quiet: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(agent_id) = AgentId::parse(agent_id).ok() else {
@@ -8768,7 +8847,93 @@ impl ManagementCenter {
             let _ = entity.update(cx, |this, cx| {
                 // The endpoint is the draft's only catalogue source, so its
                 // answer is authoritative for the rows it advertises.
-                this.apply_fetched_models(outcome, true, active_locale, cx);
+                this.apply_fetched_models(outcome, true, active_locale, quiet, cx);
+            });
+        }));
+    }
+
+    /// Whether the dialog draft holds what a model fetch needs.
+    ///
+    /// The same answers the picker's own fetch command reads: a draft (a saved
+    /// Provider already has a stored catalogue), an Agent whose projection takes
+    /// a caller-supplied endpoint and a Key, and both fields non-empty. Nothing
+    /// in flight counts, because a fetch already owns that lane.
+    fn profile_draft_auto_fetch_ready(&self, cx: &Context<Self>) -> bool {
+        if self.editing_profile_id.is_some() || self.mutation.is_some() {
+            return false;
+        }
+        let selected_agent_id = self.selected_agent_id.clone().unwrap_or_default();
+        if selected_agent_id.is_empty() {
+            return false;
+        }
+        let endpoint_editable = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::Endpoint)
+            && self.projection_editor.fixed_endpoint().is_none()
+            && self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
+        endpoint_editable
+            && !self.profile_base_url.read(cx).value().trim().is_empty()
+            && !self.profile_api_key.read(cx).value().trim().is_empty()
+    }
+
+    /// Drops a pending automatic fetch and forgets what it last asked for.
+    ///
+    /// Every path that abandons or replaces the draft calls this, so a timer
+    /// left over from the previous form cannot fetch against fields the next
+    /// form has already moved.
+    fn cancel_profile_auto_fetch(&mut self) {
+        self.profile_auto_fetch_generation = self.profile_auto_fetch_generation.wrapping_add(1);
+        self.profile_auto_fetch_task = None;
+        self.profile_auto_fetch_requested = None;
+    }
+
+    /// Fetches the catalogue once the draft's address and Key are both in.
+    ///
+    /// A Key and an address arrive one field after the other, so no single
+    /// change event is "finished typing"; the debounce is what waits for the
+    /// pair. The last pair asked for is remembered, which is what makes this
+    /// one automatic fetch rather than a request per keystroke: correcting the
+    /// same value again changes nothing, while a different address or Key is a
+    /// different question and is asked again.
+    fn schedule_profile_draft_auto_fetch(&mut self, cx: &mut Context<Self>) {
+        self.profile_auto_fetch_generation = self.profile_auto_fetch_generation.wrapping_add(1);
+        let generation = self.profile_auto_fetch_generation;
+        self.profile_auto_fetch_task = None;
+        if !self.profile_draft_auto_fetch_ready(cx) {
+            return;
+        }
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let base_url = self.profile_base_url.read(cx).value().trim().to_string();
+        let api_key = self.profile_api_key.read(cx).value().trim().to_string();
+        if self.profile_auto_fetch_requested.as_ref() == Some(&(base_url.clone(), api_key.clone()))
+        {
+            return;
+        }
+        let entity = cx.weak_entity();
+        self.profile_auto_fetch_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(PROVIDER_AUTO_FETCH_DEBOUNCE)
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                // A later keystroke has already scheduled its own answer.
+                if this.profile_auto_fetch_generation != generation {
+                    return;
+                }
+                this.profile_auto_fetch_task = None;
+                if !this.profile_draft_auto_fetch_ready(cx) {
+                    return;
+                }
+                let base_url = this.profile_base_url.read(cx).value().trim().to_string();
+                let api_key = this.profile_api_key.read(cx).value().trim().to_string();
+                if this.profile_auto_fetch_requested.as_ref()
+                    == Some(&(base_url.clone(), api_key.clone()))
+                {
+                    return;
+                }
+                this.profile_auto_fetch_requested = Some((base_url.clone(), api_key.clone()));
+                this.fetch_provider_draft_models(agent_id.clone(), base_url, api_key, true, cx);
             });
         }));
     }
@@ -13493,6 +13658,7 @@ impl ManagementCenter {
         self.provider_create_page_open = true;
         // A named preset skips the gallery; otherwise the page starts there.
         self.workspace_create_choosing = preset_id.is_none();
+        self.cancel_provider_create_auto_fetch();
         self.provider_create_error = None;
         self.provider_create_name_error = None;
         self.provider_create_base_url_error = None;
@@ -13533,6 +13699,7 @@ impl ManagementCenter {
 
     fn close_provider_create_page(&mut self, cx: &mut Context<Self>) {
         self.provider_create_page_open = false;
+        self.cancel_provider_create_auto_fetch();
         self.provider_create_error = None;
         self.provider_create_name_error = None;
         self.provider_create_base_url_error = None;
@@ -13580,6 +13747,11 @@ impl ManagementCenter {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
         self.apply_provider_create_preset_region(None, window, cx);
+        // The preset writes the address the fetch would ask; a timer left over
+        // from the previous draft must not answer for it. A Key already in the
+        // field makes the preset's address a question worth asking.
+        self.cancel_provider_create_auto_fetch();
+        self.schedule_provider_create_auto_fetch(window, cx);
         cx.notify();
     }
 
@@ -13592,6 +13764,7 @@ impl ManagementCenter {
         self.provider_create_preset = None;
         self.provider_create_preset_region = None;
         self.provider_create_category = None;
+        self.cancel_provider_create_auto_fetch();
         for input in [
             &self.provider_create_name,
             &self.provider_create_base_url,
@@ -13625,6 +13798,11 @@ impl ManagementCenter {
         self.provider_create_base_url
             .update(cx, |state, cx| state.set_value(base_url, window, cx));
         self.provider_create_preset_region = region_id;
+        // A region is a different address, so a timer about to ask the previous
+        // one is stale; a Key already in the field makes the new address worth
+        // asking.
+        self.cancel_provider_create_auto_fetch();
+        self.schedule_provider_create_auto_fetch(window, cx);
         cx.notify();
     }
 
@@ -13636,6 +13814,20 @@ impl ManagementCenter {
     /// written to that Agent. The answer only fills the model field, keeping
     /// any id already typed there.
     fn fetch_provider_create_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fetch_provider_create_models_for(false, window, cx)
+    }
+
+    /// The page fetch with a lane for the automatic one.
+    ///
+    /// `quiet` drops the failure message: an automatic fetch runs while the
+    /// user is still typing a Key, so a rejected intermediate value is not a
+    /// problem to report. The model field is the feedback either way.
+    fn fetch_provider_create_models_for(
+        &mut self,
+        quiet: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -13737,26 +13929,106 @@ impl ManagementCenter {
                         ));
                     }
                     Ok(Ok(_)) => {
-                        this.provider_create_models_error = Some(
-                            management_locale_text(
-                                "The endpoint returned no models",
-                                "接口没有返回模型",
-                                "介面沒有回傳模型",
-                            )
-                            .to_string(),
-                        );
+                        if !quiet {
+                            this.provider_create_models_error = Some(
+                                management_locale_text(
+                                    "The endpoint returned no models",
+                                    "接口没有返回模型",
+                                    "介面沒有回傳模型",
+                                )
+                                .to_string(),
+                            );
+                        }
                     }
                     Ok(Err(error)) => {
-                        this.provider_create_models_error =
-                            Some(format!("{}: {}", error.code, error.message));
+                        if !quiet {
+                            this.provider_create_models_error =
+                                Some(format!("{}: {}", error.code, error.message));
+                        }
                     }
                     Err(error) => {
-                        this.provider_create_models_error = Some(error.to_string());
+                        if !quiet {
+                            this.provider_create_models_error = Some(error.to_string());
+                        }
                     }
                 }
                 cx.notify();
             });
         }));
+    }
+
+    /// Drops the page draft's pending automatic fetch.
+    ///
+    /// The page is left for another record, saved, or reopened with a preset
+    /// applied; in every case a timer still holding the previous address and
+    /// Key would fetch against a draft that no longer exists.
+    fn cancel_provider_create_auto_fetch(&mut self) {
+        self.provider_create_auto_fetch_generation =
+            self.provider_create_auto_fetch_generation.wrapping_add(1);
+        self.provider_create_auto_fetch_task = None;
+    }
+
+    /// Fetches the page draft's model list once its address and Key are in.
+    ///
+    /// The page has no Agent of its own, so the fetch is the same one the
+    /// button runs: both need a configurable Agent before they can ask. A page
+    /// that cannot fetch yet simply waits, and the next edit schedules again;
+    /// once the pair is complete the debounce keeps the paste from asking the
+    /// endpoint per character.
+    fn schedule_provider_create_auto_fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.provider_create_auto_fetch_generation =
+            self.provider_create_auto_fetch_generation.wrapping_add(1);
+        let generation = self.provider_create_auto_fetch_generation;
+        self.provider_create_auto_fetch_task = None;
+        if !self.provider_create_auto_fetch_ready(cx) {
+            return;
+        }
+        let entity = cx.weak_entity();
+        self.provider_create_auto_fetch_task = Some(cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor()
+                .timer(PROVIDER_AUTO_FETCH_DEBOUNCE)
+                .await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.provider_create_auto_fetch_generation != generation {
+                    return;
+                }
+                this.provider_create_auto_fetch_task = None;
+                if !this.provider_create_auto_fetch_ready(cx) {
+                    return;
+                }
+                // The button's own guard would report a missing pair as an
+                // error; the automatic path has nothing to report there, it
+                // waits for the fields the user is still typing.
+                this.fetch_provider_create_models_for(true, window, cx);
+            });
+        }));
+    }
+
+    /// Whether the page draft holds what a model fetch needs.
+    fn provider_create_auto_fetch_ready(&self, cx: &Context<Self>) -> bool {
+        if !self.provider_create_page_open || self.mutation.is_some() {
+            return false;
+        }
+        if self
+            .workspace_configurable_agents()
+            .into_iter()
+            .find_map(|(agent_id, _)| AgentId::parse(agent_id).ok())
+            .is_none()
+        {
+            return false;
+        }
+        !self
+            .provider_create_base_url
+            .read(cx)
+            .value()
+            .trim()
+            .is_empty()
+            && !self
+                .provider_create_api_key
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
     }
 
     /// Creates the shared Provider the page draft describes.
@@ -21344,6 +21616,7 @@ impl ManagementCenter {
                                 agent_id.clone(),
                                 base_url.clone(),
                                 api_key.clone(),
+                                false,
                                 cx,
                             ),
                         })),
@@ -21450,9 +21723,9 @@ impl ManagementCenter {
                 )
             } else {
                 management_locale_text(
-                    "Enter an API key and request URL to fetch models, or add a model ID directly.",
-                    "填写 API Key 与请求地址后即可拉取模型，也可以直接添加模型 ID。",
-                    "填寫 API Key 與請求位址後即可擷取模型，也可以直接新增模型 ID。",
+                    "Enter an API key and request URL and the models load on their own; a model ID can also be added directly.",
+                    "填写 API Key 与请求地址后会自动拉取模型，也可以直接添加模型 ID。",
+                    "填寫 API Key 與請求位址後會自動擷取模型，也可以直接新增模型 ID。",
                 )
             };
             body = body.child(bare_empty_state(
@@ -24016,6 +24289,12 @@ impl ManagementCenter {
                 .to_string())
         ));
         self.navigation.mark_dirty(ManagementSection::Agents, true);
+        // The preset itself never fetches; the debounce only becomes relevant
+        // once a Key completes the pair. Dropping the pending timer keeps one
+        // scheduled against the previous preset's address from landing here,
+        // and scheduling again asks the new address when a Key is already in.
+        self.cancel_profile_auto_fetch();
+        self.schedule_profile_draft_auto_fetch(cx);
         cx.notify();
     }
 
@@ -24092,6 +24371,11 @@ impl ManagementCenter {
         };
         self.notice = Some(format!("{}: {label}", preset.display_name));
         self.navigation.mark_dirty(ManagementSection::Agents, true);
+        // A region is a different address, so a timer that was about to ask the
+        // previous one is stale; a Key already in the field makes the new
+        // address a question worth asking.
+        self.cancel_profile_auto_fetch();
+        self.schedule_profile_draft_auto_fetch(cx);
         cx.notify();
     }
 
@@ -42708,6 +42992,34 @@ mod tests {
         }
     }
 
+    /// One installed Agent as the snapshot lists it, enough for the page's
+    /// "which Agent answers this fetch" lookup.
+    fn test_agent_entry(id: &str) -> vibex_core::AgentSnapshotEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "label": id,
+            "runtimeKind": "acp",
+            "sourceKind": "builtin",
+            "added": true,
+            "enabled": true,
+            "orderIndex": 0,
+            "installed": true,
+            "configured": true,
+            "installStatus": "installed",
+            "managedInstall": {"managed": true, "status": "installed"},
+            "configStatus": "configured",
+            "runtimeStatus": "ready",
+            "models": [],
+            "modes": [],
+            "capabilityHints": [],
+            "env": {},
+            "params": {},
+            "diagnostics": [],
+            "nativeConfigPaths": []
+        }))
+        .expect("agent fixture")
+    }
+
     /// A projection that exposes the credential, endpoint, and Model controls,
     /// which is what makes the Provider editor render its whole form.
     fn projection_capability_with_models() -> vibex_core::AgentProviderProjectionCapability {
@@ -43050,6 +43362,148 @@ mod tests {
                 "a fetch must not configure Models the user has not chosen"
             );
         }
+    }
+
+    /// A draft fetches its own model list once the address and the Key are both
+    /// in, so the button is a refresh rather than the only way to load a
+    /// catalogue. The pair is what matters: neither field alone can ask.
+    #[gpui::test]
+    fn a_completed_key_and_address_fetch_models_without_a_click(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+        let type_into =
+            |field: &Entity<InputState>, value: &str, cx: &mut gpui::VisualTestContext| {
+                let field = field.clone();
+                let value = value.to_string();
+                cx.update_window(handle, |_, window, cx| {
+                    field.update(cx, |state, cx| state.set_value(value, window, cx));
+                })
+                .expect("the field belongs to the test window");
+                field.update(cx, |_, cx| cx.emit(InputEvent::Change));
+            };
+
+        // A draft on an Agent whose projection takes a caller-supplied endpoint
+        // and a Key.
+        center.update(cx, |center, _| {
+            center.selected_agent_id = Some("codex".to_string());
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_models());
+        });
+        let (base_url, api_key) = center.read_with(cx, |center, _| {
+            (
+                center.profile_base_url.clone(),
+                center.profile_api_key.clone(),
+            )
+        });
+
+        // An address alone is not a question: nothing is armed.
+        type_into(&base_url, "https://api.example.com/v1", cx);
+        cx.run_until_parked();
+        center.update(cx, |center, cx| {
+            assert!(center.profile_auto_fetch_task.is_none());
+            assert!(!center.profile_draft_auto_fetch_ready(cx));
+        });
+
+        // The Key completes the pair, and the debounce arms the fetch.
+        type_into(&api_key, "sk-test", cx);
+        cx.run_until_parked();
+        center.update(cx, |center, cx| {
+            assert!(center.profile_draft_auto_fetch_ready(cx));
+            assert!(
+                center.profile_auto_fetch_task.is_some(),
+                "the completed pair must schedule a fetch"
+            );
+        });
+
+        // Another keystroke in the same field re-arms rather than firing twice.
+        type_into(&api_key, "sk-test-2", cx);
+        cx.run_until_parked();
+        center.read_with(cx, |center, _| {
+            assert!(center.profile_auto_fetch_task.is_some());
+        });
+
+        // The page draft has its own timer, and its own readiness test. The page
+        // borrows a real Agent to answer the fetch, so the snapshot has one.
+        center.update(cx, |center, _| {
+            center.provider_create_page_open = true;
+            center.snapshot.agents = vec![test_agent_entry("codex")];
+        });
+        let (create_base_url, create_key) = center.read_with(cx, |center, _| {
+            (
+                center.provider_create_base_url.clone(),
+                center.provider_create_api_key.clone(),
+            )
+        });
+        type_into(&create_base_url, "https://relay.example.com/v1", cx);
+        type_into(&create_key, "sk-relay", cx);
+        cx.run_until_parked();
+        center.update(cx, |center, cx| {
+            assert!(center.provider_create_auto_fetch_ready(cx));
+            assert!(center.provider_create_auto_fetch_task.is_some());
+        });
+
+        // Closing the page drops the timer, so a late one cannot fetch against
+        // a draft that is gone.
+        center.update(cx, |center, cx| {
+            center.close_provider_create_page(cx);
+            assert!(center.provider_create_auto_fetch_task.is_none());
+            assert!(!center.provider_create_auto_fetch_ready(cx));
+        });
+
+        // A saved Provider is never auto-fetched: its stored catalogue answers.
+        center.update(cx, |center, cx| {
+            center.editing_profile_id = Some("saved".to_string());
+            center.schedule_profile_draft_auto_fetch(cx);
+            assert!(center.profile_auto_fetch_task.is_none());
+        });
+    }
+
+    /// The automatic fetch hangs off the same two fields the button reads, and
+    /// it is wired into both surfaces: forgetting one of these leaves a form
+    /// where the models never load on their own.
+    #[test]
+    fn the_auto_fetch_is_wired_to_both_draft_surfaces() {
+        let source = include_str!("management.rs");
+        let dialog = source
+            .split_once("    fn profile_draft_auto_fetch_ready(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The Provider options a draft fetch honors")
+            })
+            .map(|(body, _)| body)
+            .expect("the dialog's automatic fetch should remain inspectable");
+        assert!(dialog.contains("cx.background_executor()"));
+        assert!(dialog.contains("PROVIDER_AUTO_FETCH_DEBOUNCE"));
+        assert!(dialog.contains("this.fetch_provider_draft_models("));
+        // A saved Provider fetches nothing by itself: its stored catalogue
+        // answers until the reader asks again.
+        assert!(dialog.contains("self.editing_profile_id.is_some()"));
+
+        let page_ready = source
+            .split_once("    fn provider_create_auto_fetch_ready(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Creates the shared Provider"))
+            .map(|(body, _)| body)
+            .expect("the page's automatic fetch should remain inspectable");
+        assert!(page_ready.contains("workspace_configurable_agents()"));
+        assert!(page_ready.contains("provider_create_base_url"));
+        assert!(page_ready.contains("provider_create_api_key"));
+
+        // Both fields a fetch reads schedule it, in both surfaces.
+        for marker in [
+            "this.schedule_profile_draft_auto_fetch(cx);",
+            "this.schedule_provider_create_auto_fetch(window, cx);",
+        ] {
+            assert!(
+                source.matches(marker).count() >= 2,
+                "{marker} must be wired to more than one field"
+            );
+        }
+
+        // An automatic attempt stays silent on failure; the button's own fetch
+        // still reports through the dialog's failure lane.
+        assert!(source.contains("fn apply_fetched_models("));
+        assert!(source.contains("if !quiet {"));
     }
 
     #[test]
