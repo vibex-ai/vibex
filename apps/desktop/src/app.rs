@@ -89569,13 +89569,11 @@ impl FoundationSettings {
             option_env!("RUSTC_VERSION").unwrap_or("1.97.0")
         );
         let copy_summary = summary.clone();
-        settings_page(
-            locale::text("About", "关于", "關於"),
-            locale::text(
-                "Version, build and project information.",
-                "版本、构建和项目信息。",
-                "版本、建置與專案資訊。",
-            ),
+        // The brand lockup is this page's heading: the settings navigation
+        // already names the page, and a second "About" title under the wordmark
+        // would repeat the version line that follows it.
+        settings_page_with_heading(
+            about_brand_wordmark(cx),
             vec![
                 SettingsGroup::with_leading(
                     locale::text("Software update", "软件更新", "軟體更新"),
@@ -91787,9 +91785,74 @@ impl SettingsGroup {
     }
 }
 
+/// The About page's brand block: the Vibex lockup centered at the top of the
+/// page, with the installed version set underneath it.
+///
+/// The mark is the same one the new-session page leads with, drawn here as a
+/// picture rather than as the page's title so the settings navigation still
+/// names the page it opened. The version is the label the reader came for, so
+/// it sits directly under the lockup instead of only in the version chips
+/// further down.
+fn about_brand_wordmark(cx: &App) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+
+    v_flex()
+        .id("about-brand")
+        .w_full()
+        .min_w_0()
+        .items_center()
+        // The lockup is the one the new-session page leads with, so the two
+        // surfaces that introduce the product wear the same mark.
+        .child(startup_loading_wordmark(false, cx))
+        .child(
+            div()
+                .mt_2()
+                .text_sm()
+                .text_color(muted_foreground)
+                .child(format!(
+                    "{} {}",
+                    locale::text("Version", "版本", "版本"),
+                    env!("CARGO_PKG_VERSION")
+                )),
+        )
+        .into_any_element()
+}
+
 fn settings_page(
     title: &'static str,
     description: &'static str,
+    groups: Vec<SettingsGroup>,
+    cx: &App,
+) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let foreground = theme::semantic_color("foreground", is_dark);
+    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+
+    settings_page_with_heading(
+        v_flex()
+            .gap_1()
+            .text_color(foreground)
+            .child(div().text_lg().font_semibold().child(title))
+            .child(
+                div()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(muted_foreground)
+                    .child(description),
+            )
+            .into_any_element(),
+        groups,
+        cx,
+    )
+}
+
+/// A settings page whose leading block is supplied by the caller.
+///
+/// The About page replaces the usual title line with its brand lockup; every
+/// other page keeps the title and description [`settings_page`] builds.
+fn settings_page_with_heading(
+    heading: AnyElement,
     groups: Vec<SettingsGroup>,
     cx: &App,
 ) -> AnyElement {
@@ -91811,18 +91874,7 @@ fn settings_page(
         .text_color(foreground)
         .px(px(SETTINGS_PAGE_PADDING_X))
         .py_8()
-        .child(
-            v_flex()
-                .gap_1()
-                .child(div().text_lg().font_semibold().child(title))
-                .child(
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .text_color(muted_foreground)
-                        .child(description),
-                ),
-        )
+        .child(heading)
         .children(
             groups
                 .into_iter()
@@ -113138,6 +113190,27 @@ mod tests {
         // With nothing newer available the card falls back to the notes of the
         // installed version.
         assert!(about.contains("update_snapshot.current_notes.as_deref()"));
+        // The page leads with the product lockup and the installed version set
+        // under it, rather than with a second title line.
+        assert!(about.contains("about_brand_wordmark(cx)"));
+        assert!(about.contains("settings_page_with_heading("));
+
+        let brand = source
+            .split_once("fn about_brand_wordmark(")
+            .and_then(|(_, tail)| tail.split_once("\nfn settings_page("))
+            .map(|(body, _)| body)
+            .expect("the about brand block should remain inspectable");
+        assert!(brand.contains(".id(\"about-brand\")"));
+        assert!(brand.contains(".items_center()"));
+        assert!(
+            brand.contains("startup_loading_wordmark(false, cx)"),
+            "the About page wears the same lockup as the new-session page"
+        );
+        assert!(
+            brand.contains("env!(\"CARGO_PKG_VERSION\")"),
+            "the version under the lockup is the installed one"
+        );
+        assert!(brand.contains("locale::text(\"Version\", \"版本\", \"版本\")"));
 
         let card = source
             .split_once("    fn render_about_update_card(")
