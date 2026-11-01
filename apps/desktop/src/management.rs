@@ -594,9 +594,9 @@ impl ManagementNativeImportDialog {
 
 impl Render for ManagementNativeImportDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.center.read(cx).native_import_picker.is_none() {
-            return div().size_full().into_any_element();
-        }
+        // The body owns the loading gap, the empty state, and the list, so it
+        // renders on every frame: returning early while the preview is still
+        // being read would leave the dialog blank for the whole read.
         self.center
             .update(cx, |center, cx| center.render_native_import_picker_body(cx))
     }
