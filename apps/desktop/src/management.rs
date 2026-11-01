@@ -1511,6 +1511,12 @@ pub struct ManagementCenter {
     native_import_picker: Option<vibex_core::ProviderNativeImportPreview>,
     /// The import items checked in the picker, keyed by import item id.
     native_import_picked: BTreeSet<String>,
+    /// The import source whose tab the picker is showing.
+    ///
+    /// The picker reads one source at a time because the machine can expose
+    /// dozens of records from one tool and only a few from another; a single
+    /// flat list made the short source look like part of the long one.
+    native_import_active_source: vibex_core::ProviderNativeImportSource,
     /// Why the picker has no rows, when the read itself was fine.
     ///
     /// A scoped read can legitimately find nothing — the Agent has no CC Switch
@@ -2792,6 +2798,7 @@ impl ManagementCenter {
             native_import_report: None,
             native_import_picker: None,
             native_import_picked: BTreeSet::new(),
+            native_import_active_source: vibex_core::ProviderNativeImportSource::Codex,
             native_import_empty_note: None,
             native_import_generation: 0,
             native_import_target: None,
@@ -13015,7 +13022,21 @@ impl ManagementCenter {
                             // is a way to leave records out, not a quiz that
                             // makes the reader re-pick what the machine already
                             // said it could import.
+                            //
+                            // The dialog opens on the first source that has a
+                            // row, so it never starts on a tab that was only
+                            // worth showing in a previous read.
+                            let first_source = preview
+                                .items
+                                .iter()
+                                .find(|item| {
+                                    items.iter().any(|id| id == item.import_item_id.as_str())
+                                })
+                                .map(|item| item.source);
                             this.native_import_picked = items.into_iter().collect();
+                            if let Some(source) = first_source {
+                                this.native_import_active_source = source;
+                            }
                             this.native_import_picker = Some(preview);
                         }
                     }
@@ -13038,7 +13059,10 @@ impl ManagementCenter {
         let content = cx.new(|cx| ManagementNativeImportDialog::new(center, cx));
         let scoped = self.native_import_target.is_some();
         let muted = cx.theme().muted_foreground;
-        let width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 560.0);
+        // Wide enough for a Provider name, its address, and one status tag on
+        // one line: the picker is a scanning surface, and a narrow column turned
+        // every row into three stacked fragments.
+        let width = (f32::from(window.viewport_size().width) - 32.0).clamp(380.0, 640.0);
         window.open_dialog(cx, move |dialog, _, cx| {
             let confirm_center = confirm_center.clone();
             let close_center = close_center.clone();
@@ -13046,7 +13070,7 @@ impl ManagementCenter {
             // it shows is the count that will be written, and an empty
             // selection cannot be submitted by Enter or by the button.
             let picked = confirm_center.read(cx).native_import_picked.len();
-            dialog
+            let dialog = dialog
                 .title(if scoped {
                     management_locale_text(
                         "Import configuration for this Agent",
@@ -13061,7 +13085,51 @@ impl ManagementCenter {
                     )
                 })
                 .w(px(width))
-                .max_w(px(width))
+                .max_w(px(width));
+            let footer = gpui_component::dialog::DialogFooter::new()
+                // The running count sits on the leading edge, opposite the
+                // commit: it describes the whole dialog, not the tab on screen.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(match picked {
+                            0 => management_locale_text(
+                                "Nothing selected yet",
+                                "尚未选择任何配置",
+                                "尚未選擇任何設定",
+                            )
+                            .to_string(),
+                            count => format!(
+                                "{} {count}",
+                                management_locale_text("Selected", "已选", "已選")
+                            ),
+                        }),
+                )
+                .child(gpui_component::dialog::DialogClose::new().child(
+                    Button::new("management-native-import-cancel")
+                        .outline()
+                        .label(management_locale_text("Cancel", "取消", "取消")),
+                ))
+                .child(
+                    gpui_component::dialog::DialogAction::new().child(
+                        Button::new("management-native-import-confirm")
+                            .primary()
+                            .disabled(picked == 0)
+                            .when(picked > 0, |button| {
+                                button.label(format!(
+                                    "{} ({picked})",
+                                    management_locale_text("Import", "导入", "匯入")
+                                ))
+                            })
+                            .when(picked == 0, |button| {
+                                button.label(management_locale_text("Import", "导入", "匯入"))
+                            }),
+                    ),
+                );
+            dialog
                 .child(
                     v_flex()
                         .w_full()
@@ -13069,6 +13137,8 @@ impl ManagementCenter {
                         .gap_3()
                         .child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .text_xs()
                                 .text_color(muted)
                                 .child(management_locale_text(
@@ -13079,36 +13149,7 @@ impl ManagementCenter {
                         )
                         .child(content.clone()),
                 )
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(
-                            gpui_component::dialog::DialogClose::new().child(
-                                Button::new("management-native-import-cancel")
-                                    .outline()
-                                    .label(management_locale_text("Cancel", "取消", "取消")),
-                            ),
-                        )
-                        .child(
-                            gpui_component::dialog::DialogAction::new().child(
-                                Button::new("management-native-import-confirm")
-                                    .primary()
-                                    .disabled(picked == 0)
-                                    .when(picked > 0, |button| {
-                                        button.label(format!(
-                                            "{} ({picked})",
-                                            management_locale_text("Import", "导入", "匯入")
-                                        ))
-                                    })
-                                    .when(picked == 0, |button| {
-                                        button.label(management_locale_text(
-                                            "Import",
-                                            "导入",
-                                            "匯入",
-                                        ))
-                                    }),
-                            ),
-                        ),
-                )
+                .footer(footer)
                 .on_ok(move |_, _, cx| {
                     let mut opened = false;
                     confirm_center.update(cx, |this, cx| {
@@ -15027,13 +15068,14 @@ impl ManagementCenter {
         }
     }
 
-    /// The picker's body: one group per import source, one checkbox per item.
+    /// The picker's body: the sources as tabs, the active source's rows below.
     ///
-    /// The old Import wrote every candidate on a single click. Grouping by
-    /// source makes the choice legible — "three from Codex, one from CC Switch"
-    /// — and the per-source row plus the per-item checkbox are the two levels a
-    /// batch like this actually needs: everything from one tool, or this one
-    /// account.
+    /// A machine can expose dozens of records from one tool and one from
+    /// another, so the list is read one source at a time: the tab bar states
+    /// how much each source holds before it is opened, and the strip under it
+    /// carries the batch command for that source. The old body stacked every
+    /// source and every row in one scroll, which made the short sources look
+    /// like part of the long one and pushed the dialog's own actions away.
     pub(super) fn render_native_import_picker_body(
         &mut self,
         cx: &mut Context<Self>,
@@ -15053,163 +15095,326 @@ impl ManagementCenter {
                     .w_full()
                     .items_center()
                     .justify_center()
-                    .py_6()
+                    .gap_2()
+                    .py_10()
                     .child(Spinner::new().with_size(Size::Small))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Reading configurations on this machine…",
+                                "正在读取这台机器上的配置…",
+                                "正在讀取這台機器上的設定…",
+                            )),
+                    )
                     .into_any_element();
             }
-            return div()
-                .w_full()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(self.error.clone().unwrap_or_else(|| {
+            return native_import_empty_body(
+                self.error.clone().unwrap_or_else(|| {
                     management_locale_text(
                         "Everything already on this machine is imported.",
                         "这台机器上的配置都已导入。",
                         "這台機器上的設定都已匯入。",
                     )
                     .to_string()
-                }))
-                .into_any_element();
+                }),
+                cx,
+            );
         };
         let items = self.native_import_picker_items(&preview);
         if items.is_empty() {
-            return div()
-                .w_full()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text(
+            return native_import_empty_body(
+                management_locale_text(
                     "Everything already on this machine is imported.",
                     "这台机器上的配置都已导入。",
                     "這台機器上的設定都已匯入。",
-                ))
-                .into_any_element();
+                )
+                .to_string(),
+                cx,
+            );
         }
+
+        // Only sources that actually hold a row get a tab: an empty tab is a
+        // promise the dialog cannot keep, and the counts in the bar already
+        // tell the reader which tools were read.
+        let present_sources = native_import_sources()
+            .into_iter()
+            .filter(|source| items.iter().any(|item| item.source == *source))
+            .collect::<Vec<_>>();
+        let active = if present_sources.contains(&self.native_import_active_source) {
+            self.native_import_active_source
+        } else {
+            present_sources
+                .first()
+                .copied()
+                .unwrap_or(vibex_core::ProviderNativeImportSource::Codex)
+        };
+        self.native_import_active_source = active;
         let picked = self.native_import_picked.clone();
-        let mut groups = v_flex().w_full().min_w_0().gap_3();
-        for source in native_import_sources() {
-            let source_items = items
-                .iter()
-                .filter(|item| item.source == source)
-                .cloned()
-                .collect::<Vec<_>>();
-            if source_items.is_empty() {
-                continue;
+        let mut header = v_flex().w_full().min_w_0().gap_2();
+        header = header.child(self.render_native_import_source_tabs(&items, active, cx));
+
+        let mut source_items = items
+            .iter()
+            .filter(|item| item.source == active)
+            .cloned()
+            .collect::<Vec<_>>();
+        // Alphabetical so a source with dozens of records can be scanned by
+        // name; the preview's own order follows its files, which is not an
+        // order the reader can see.
+        source_items.sort_by_key(|item| item.display_name.to_lowercase());
+
+        let picked_count = source_items
+            .iter()
+            .filter(|item| picked.contains(item.import_item_id.as_str()))
+            .count();
+        let all_picked = picked_count == source_items.len();
+        let source_items_for_toggle = source_items.clone();
+        let mut rows = v_flex().w_full().min_w_0().gap_0p5().p_1();
+        for item in &source_items {
+            let id = item.import_item_id.as_str().to_string();
+            let toggled = id.clone();
+            let checked = picked.contains(id.as_str());
+            let status_note = native_import_item_status_note(item.status);
+            let mut meta = Vec::new();
+            if let Some(base_url) = item.base_url.as_deref() {
+                meta.push(compact_native_import_url(base_url));
             }
-            let picked_count = source_items
+            let model_count = item
+                .configured_models
                 .iter()
-                .filter(|item| picked.contains(item.import_item_id.as_str()))
+                .filter(|model| model.enabled)
                 .count();
-            let all_picked = picked_count == source_items.len();
-            let source_items_for_toggle = source_items.clone();
-            let mut rows = v_flex().w_full().min_w_0().gap_0p5();
-            for item in &source_items {
-                let id = item.import_item_id.as_str().to_string();
-                let toggled = id.clone();
-                let checked = picked.contains(id.as_str());
-                let status_note = native_import_item_status_note(item.status);
-                let subtitle = match (&item.base_url, status_note) {
-                    (Some(base_url), Some(note)) => format!("{base_url} · {note}"),
-                    (Some(base_url), None) => base_url.clone(),
-                    (None, Some(note)) => note.to_string(),
-                    (None, None) => item.provider_kind.to_string(),
-                };
-                rows = rows.child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded(px(6.0))
-                        .hover(|style| style.bg(cx.theme().primary.opacity(0.05)))
-                        .child(
-                            Checkbox::new(SharedString::from(format!(
-                                "management-native-import-item-{id}"
-                            )))
-                            .small()
-                            .checked(checked)
-                            .accessibility_label(SharedString::from(item.display_name.clone()))
-                            .on_click(cx.listener(
-                                move |this, checked, _, cx| {
-                                    this.toggle_native_import_picked(toggled.clone(), *checked, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(item.display_name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(subtitle),
-                                ),
-                        )
-                        .when_some(status_note, |row, note| {
-                            row.child(Tag::color(ColorName::Yellow).xsmall().child(note))
-                        }),
-                );
+            if model_count > 0 {
+                meta.push(management_model_count(model_count));
             }
-            groups =
-                groups.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Checkbox::new(SharedString::from(format!(
-                                        "management-native-import-source-{source:?}"
-                                    )))
+            if meta.is_empty() {
+                meta.push(item.provider_kind.to_string());
+            }
+            let subtitle = meta.join(" · ");
+            let row_id = SharedString::from(format!("management-native-import-row-{id}"));
+            let toggle_id = toggled.clone();
+            let checkbox_id = SharedString::from(format!("management-native-import-item-{id}"));
+            rows = rows.child(
+                h_flex()
+                    .id(row_id)
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(cx.theme().radius * 0.5)
+                    .hover(|style| {
+                        style.bg(management_surface_wash(cx, MANAGEMENT_PANEL_ROW_HOVER_WASH))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let next = !this.native_import_picked.contains(&toggle_id);
+                        this.toggle_native_import_picked(toggle_id.clone(), next, cx);
+                    }))
+                    .child(
+                        // The checkbox answers the same question the row does,
+                        // so the click that lands on it must not also reach the
+                        // row and toggle the item back.
+                        div()
+                            .id(SharedString::from(format!(
+                                "management-native-import-check-wrap-{id}"
+                            )))
+                            .flex_none()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                Checkbox::new(checkbox_id)
                                     .small()
-                                    .checked(all_picked)
-                                    .accessibility_label(native_import_source_label(source))
+                                    .checked(checked)
+                                    .accessibility_label(SharedString::from(
+                                        item.display_name.clone(),
+                                    ))
                                     .on_click(cx.listener(move |this, checked, _, cx| {
-                                        this.toggle_native_import_source(
-                                            &source_items_for_toggle,
-                                            source,
+                                        this.toggle_native_import_picked(
+                                            toggled.clone(),
                                             *checked,
                                             cx,
                                         )
                                     })),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(native_import_source_label(source)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                        .child(format!("{picked_count}/{}", source_items.len())),
-                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(native_import_item_glyph(
+                                item.provider_kind,
+                                &item.display_name,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_medium()
+                                    .text_color(if checked {
+                                        cx.theme().foreground
+                                    } else {
+                                        cx.theme().foreground.opacity(0.85)
+                                    })
+                                    .child(item.display_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(subtitle),
+                            ),
+                    )
+                    .when_some(status_note, |row, note| {
+                        row.child(
+                            div().flex_none().child(
+                                Tag::color(native_import_status_color(item.status))
+                                    .xsmall()
+                                    .child(note),
+                            ),
                         )
-                        .child(rows),
-                );
+                    }),
+            );
         }
-        groups.into_any_element()
+
+        // The pane is bounded here rather than left to the dialog: a source
+        // with dozens of records must scroll inside its own list so the tabs
+        // above and the actions below stay where the reader left them. It is
+        // not a flex child: the dialog sizes to its content, and a growing pane
+        // would stretch it to the whole window instead of listing the source.
+        let list = div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1p5()
+                    .bg(management_surface_wash(cx, MANAGEMENT_PANEL_STRIP_WASH))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Checkbox::new(SharedString::from(format!(
+                            "management-native-import-source-{active:?}"
+                        )))
+                        .small()
+                        .checked(all_picked)
+                        .accessibility_label(native_import_source_label(active))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text("Select all", "全选", "全選")),
+                        )
+                        .on_click(cx.listener(
+                            move |this, checked, _, cx| {
+                                this.toggle_native_import_source(
+                                    &source_items_for_toggle,
+                                    active,
+                                    *checked,
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.8))
+                            .child(format!("{picked_count}/{}", source_items.len())),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .max_h(rems(24.0))
+                    .overflow_y_scrollbar()
+                    .scroll_gutter()
+                    .child(rows),
+            );
+
+        header.child(list).into_any_element()
+    }
+
+    /// The picker's tabs: one per import source, each naming its own count.
+    ///
+    /// The count is the total the source holds, not the checked share: the
+    /// question the bar answers before a click is "where are my records", and
+    /// the checked share is answered by the strip inside the open tab.
+    fn render_native_import_source_tabs(
+        &mut self,
+        items: &[vibex_core::ProviderNativeImportItem],
+        active: vibex_core::ProviderNativeImportSource,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sources = native_import_sources()
+            .into_iter()
+            .filter(|source| items.iter().any(|item| item.source == *source))
+            .collect::<Vec<_>>();
+        let selected_index = sources
+            .iter()
+            .position(|source| *source == active)
+            .unwrap_or(0);
+        let tab_sources = sources.clone();
+        let muted = cx.theme().muted_foreground;
+        TabBar::new("management-native-import-sources")
+            .w_full()
+            .segmented()
+            .selected_index(selected_index)
+            .children(sources.into_iter().map(|source| {
+                let count = items.iter().filter(|item| item.source == source).count();
+                Tab::new()
+                    .flex_1()
+                    .aria_label(native_import_source_label(source))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .justify_center()
+                            .gap_1p5()
+                            .child(native_import_source_glyph(source, cx))
+                            .child(div().truncate().child(native_import_source_label(source)))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(count.to_string()),
+                            ),
+                    )
+            }))
+            .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                if let Some(source) = tab_sources.get(*index) {
+                    this.native_import_active_source = *source;
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
     }
 
     fn render_native_import_report(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -34954,6 +35159,121 @@ fn native_import_source_label(source: vibex_core::ProviderNativeImportSource) ->
     }
 }
 
+/// The mark a source wears in the picker's tab bar.
+///
+/// Codex and Claude have a brand mark; CC Switch has none, and it is a local
+/// database rather than an Agent, so it takes the database glyph the rest of
+/// the page already uses for the provider records it feeds.
+fn native_import_source_glyph(
+    source: vibex_core::ProviderNativeImportSource,
+    cx: &App,
+) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    match source {
+        vibex_core::ProviderNativeImportSource::Codex => {
+            agent_brand_icon("codex", px(14.0), Some(muted))
+        }
+        vibex_core::ProviderNativeImportSource::Claude => {
+            agent_brand_icon("claude", px(14.0), Some(muted))
+        }
+        vibex_core::ProviderNativeImportSource::CcSwitch => Icon::default()
+            .path("icons/vibex/database.svg")
+            .size(px(14.0))
+            .text_color(muted)
+            .into_any_element(),
+    }
+}
+
+/// The mark a row wears before its name.
+///
+/// The source a row came from is already answered by the open tab, so the row
+/// shows the Provider's own brand instead of repeating it: a Claude record read
+/// out of CC Switch still reads as Claude.
+fn native_import_item_glyph(kind: ProviderKind, label: &str, cx: &App) -> AnyElement {
+    let identity = format!("{kind} {label}");
+    agent_brand_icon(
+        &identity,
+        px(18.0),
+        Some(cx.theme().foreground.opacity(0.78)),
+    )
+}
+
+/// The Tag colour an import status takes.
+///
+/// Only the two states that need the reader's attention carry a colour; an
+/// importable row says nothing, because a tag on every row would make the
+/// exception invisible.
+fn native_import_status_color(status: vibex_core::ProviderNativeImportItemStatus) -> ColorName {
+    match status {
+        vibex_core::ProviderNativeImportItemStatus::Importable => ColorName::Gray,
+        vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => ColorName::Amber,
+        vibex_core::ProviderNativeImportItemStatus::Partial => ColorName::Blue,
+        vibex_core::ProviderNativeImportItemStatus::BlockedByParseError => ColorName::Red,
+    }
+}
+
+/// A configuration address as the narrow picker can show it.
+///
+/// The full URL stays in the row's accessible name through the record's own
+/// label; here the origin and path are enough to tell two relays apart, and a
+/// long query string would otherwise truncate the part that differs.
+fn compact_native_import_url(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let without_query = without_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    without_query.trim_end_matches('/').to_string()
+}
+
+/// The picker's body when it has no rows to show.
+///
+/// A preview that read fine but found nothing is a state, not a failure, so it
+/// gets the same framed surface as a list with a sentence inside it rather than
+/// a bare line of muted text floating in the dialog.
+fn native_import_empty_body(message: String, cx: &mut Context<ManagementCenter>) -> AnyElement {
+    EmptyState::new()
+        .w_full()
+        .flex_none()
+        .gap_1p5()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.70))
+        .p_4()
+        .header(
+            EmptyHeader::new()
+                .media(
+                    EmptyMedia::new()
+                        .with_variant(EmptyMediaVariant::Icon)
+                        .mb_0()
+                        .size(px(28.0))
+                        .rounded(px(7.0))
+                        .bg(cx.theme().muted.opacity(0.45))
+                        .child(
+                            Icon::new(IconName::Inbox)
+                                .size(px(15.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                )
+                .title(EmptyTitle::new().child(management_locale_text(
+                    "Nothing to import",
+                    "没有可导入的配置",
+                    "沒有可匯入的設定",
+                )))
+                .description(
+                    EmptyDescription::new()
+                        .max_w(px(360.0))
+                        .text_xs()
+                        .child(message),
+                ),
+        )
+        .into_any_element()
+}
+
 /// What an import item's status means for the reader, or `None` when it is
 /// simply importable.
 fn native_import_item_status_note(
@@ -46378,7 +46698,9 @@ mod gateway_surface_tests {
             "ManagementNativeImportDialog",
             "fn present_native_import_picker(",
             "fn render_native_import_picker_body(",
+            "fn render_native_import_source_tabs(",
             "fn confirm_native_import_picker(",
+            "management-native-import-sources",
             "management-native-import-item-",
             "management-native-import-source-",
             "management-native-import-confirm",
@@ -46387,18 +46709,66 @@ mod gateway_surface_tests {
             assert!(source.contains(marker), "import flow must keep {marker}");
         }
         // Grouping is by import source, so the picker names the sources the
-        // authority reads rather than inventing its own categories.
+        // authority reads rather than inventing its own categories. One source
+        // is open at a time, and the rows of that source are a bounded list, so
+        // a long source cannot push the tabs or the footer out of place.
         let body = source
             .split_once("fn render_native_import_picker_body(")
             .map(|(_, tail)| tail.split("\n    fn ").next().unwrap_or(tail))
             .expect("the picker body should remain inspectable");
-        assert!(body.contains("for source in native_import_sources()"));
+        assert!(body.contains("self.render_native_import_source_tabs("));
+        assert!(body.contains("item.source == active"));
         assert!(body.contains("toggle_native_import_source("));
         assert!(body.contains("toggle_native_import_picked("));
+        assert!(body.contains("overflow_y_scrollbar()"));
         // The old command wrote every candidate it could find; that path is
         // gone, so nothing can import without the reader seeing the list.
         // Concatenated so this assertion does not match its own source text.
         assert!(!source.contains(&["fn preview_native_", "import("].concat()));
+    }
+
+    /// The picker states the batch before the click.
+    ///
+    /// A source tab carries the size of its own list, and the footer carries
+    /// what is currently checked across every source — the number the commit
+    /// button writes. Both are derived from check state, never from the tab on
+    /// screen alone.
+    #[test]
+    fn native_import_shows_counts_on_its_tabs_and_its_footer() {
+        let source = include_str!("management.rs");
+        let tabs = source
+            .split_once("    fn render_native_import_source_tabs(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the source tabs should remain inspectable");
+        assert!(tabs.contains("TabBar::new(\"management-native-import-sources\")"));
+        assert!(tabs.contains(".segmented()"));
+        assert!(tabs.contains("native_import_source_label(source)"));
+        assert!(tabs.contains("native_import_source_glyph(source, cx)"));
+        assert!(tabs.contains("item.source == source"));
+
+        let dialog = source
+            .split_once("    fn present_native_import_picker(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Writes the configurations checked"))
+            .map(|(body, _)| body)
+            .expect("the import dialog should remain inspectable");
+        assert!(dialog.contains("Nothing selected yet"));
+        assert!(dialog.contains("Selected"));
+        // The count is read from the same check state the rows toggle.
+        assert!(dialog.contains("confirm_center.read(cx).native_import_picked.len()"));
+    }
+
+    /// A source the machine has records for is the one the dialog opens on.
+    #[test]
+    fn native_import_opens_on_a_source_that_has_records() {
+        let source = include_str!("management.rs");
+        assert!(source.contains("native_import_active_source"));
+        let scan = source
+            .split_once("        let runner = {\n            let backend = backend.clone();")
+            .and_then(|(_, tail)| tail.split_once("    /// Presents the picker over the page."))
+            .map(|(body, _)| body)
+            .expect("the preview read should remain inspectable");
+        assert!(scan.contains("this.native_import_active_source = source"));
     }
 
     #[test]
