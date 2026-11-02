@@ -15,10 +15,11 @@ use std::time::Duration;
 use crate::typography::{code_font_weight, ui_rems};
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
-    Entity, EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollHandle, SharedString,
-    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, Toggled, WeakEntity,
-    Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
+    Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight, Hsla, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, Orientation, PathBuilder, Pixels, Rems, Render, Role,
+    ScrollAnchor, ScrollHandle, SharedString, Size as GpuiSize, StatefulInteractiveElement as _,
+    Subscription, Task, Toggled, WeakEntity, Window, canvas, div, point, prelude::*, px, rems,
+    size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
@@ -37,7 +38,10 @@ use gpui_component::{
     },
     form::{Field, Form},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{
+        Editor, EditorState, Enter as InputEnter, Input, InputEvent, InputState,
+        MoveLeft as InputMoveLeft, MoveRight as InputMoveRight, Textarea, TextareaState,
+    },
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::NotificationType,
     pagination::Pagination,
@@ -1419,6 +1423,20 @@ pub struct ManagementCenter {
     /// two tabs keeps each list's own actions beside it instead of stacking one
     /// under the other.
     provider_picker_tab: ProviderPickerTab,
+    /// The row the keyboard is on in the picker.
+    ///
+    /// The chooser is a list of unlike records, so the roving selection is a
+    /// value rather than an index: re-filtering, switching tabs, or a refresh
+    /// can move every row, and an index would then point at a different source.
+    provider_picker_choice: Option<ProviderPickerChoice>,
+    /// The focus the picker falls back to when the Providers tab's search field
+    /// goes away. The group half has no filter, but the arrow keys must keep
+    /// working after the tab switches.
+    provider_picker_focus: FocusHandle,
+    /// The picker list's scroll position and the anchor the selected row uses
+    /// to bring itself into view.
+    provider_picker_scroll: ScrollHandle,
+    provider_picker_scroll_anchor: ScrollAnchor,
     /// Where the picker was reached from, so a form opened from it can return.
     provider_picker_origin: ProviderPickerOrigin,
     /// Whether the open Provider form came from the picker rather than from an
@@ -2616,9 +2634,16 @@ impl ManagementCenter {
                 }
                 cx.notify();
             }),
-            cx.subscribe(&provider_preset_query, |_, _, event: &InputEvent, cx| {
+            cx.subscribe(&provider_preset_query, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
+                }
+                // The filter changes which rows exist, so the row the keyboard
+                // was on may have moved out of the list. Rendering re-seats the
+                // selection on the first match instead of keeping a source the
+                // term hides.
+                if this.provider_preset_picker {
+                    this.provider_picker_choice = None;
                 }
                 cx.notify();
             }),
@@ -2839,6 +2864,10 @@ impl ManagementCenter {
                 cx.notify();
             }),
         ];
+        let provider_picker_focus = cx.focus_handle();
+        let provider_picker_scroll = ScrollHandle::new();
+        let provider_picker_scroll_anchor =
+            ScrollAnchor::for_handle(provider_picker_scroll.clone());
         Self {
             runtime: None,
             backend: None,
@@ -3083,6 +3112,10 @@ impl ManagementCenter {
             provider_preset_region: None,
             provider_preset_picker: false,
             provider_picker_tab: ProviderPickerTab::default(),
+            provider_picker_choice: None,
+            provider_picker_focus,
+            provider_picker_scroll,
+            provider_picker_scroll_anchor,
             provider_picker_origin: ProviderPickerOrigin::default(),
             provider_form_from_picker: false,
             route_group_form_from_picker: false,
@@ -6171,6 +6204,9 @@ impl ManagementCenter {
         // Every new Provider starts by choosing; even "none of these" is a
         // choice the user makes rather than one the form makes for them.
         self.provider_preset_picker = true;
+        self.provider_picker_choice = None;
+        self.provider_picker_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         self.provider_preset_query
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.sync_projection_editor();
@@ -6233,6 +6269,7 @@ impl ManagementCenter {
         self.error = None;
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         self.present_profile_editor_dialog(window, cx);
+        self.focus_provider_picker_search(window, cx);
         cx.notify();
     }
 
@@ -6423,8 +6460,12 @@ impl ManagementCenter {
         self.editing_profile_id = None;
         self.provider_form_from_picker = false;
         self.provider_preset_picker = true;
+        self.provider_picker_choice = None;
+        self.provider_picker_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         self.provider_preset_query
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.focus_provider_picker_search(window, cx);
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         cx.notify();
     }
@@ -7084,11 +7125,13 @@ impl ManagementCenter {
                 .entrance(DialogEntrance::None)
                 .child(dialog_content.clone())
                 // The Dialog answers Enter with its own confirm action, whose
-                // default is "close this overlay". Enter in a form means the
-                // form's commit, so it saves here, and the dialog is closed by
-                // the save path only after the backend accepted it.
-                .on_ok(move |_, _, cx| {
-                    confirm_center.update(cx, |center, cx| center.save_profile(cx));
+                // default is "close this overlay". The step decides what Enter
+                // means: on the picker it runs the highlighted source, and in
+                // the form it commits. The dialog is closed by the save path
+                // only after the backend accepted it.
+                .on_ok(move |_, window, cx| {
+                    confirm_center
+                        .update(cx, |center, cx| center.confirm_profile_dialog(window, cx));
                     false
                 })
                 .on_close(move |_, window, cx| {
@@ -17046,6 +17089,38 @@ impl ManagementCenter {
         }
     }
 
+    /// Whether the inline editor already holds the catalogue's value.
+    ///
+    /// The limits live in text fields rather than the option slots, so the
+    /// comparison reads the boxes the user is looking at. A blank box is not
+    /// an adopted value, even when the suggestion itself is empty.
+    fn provider_model_capability_is_adopted(&self, field: &str, suggested: &str, cx: &App) -> bool {
+        let current = match field {
+            "contextTokens" => self
+                .provider_model_edit_context
+                .as_ref()
+                .map(|input| input.read(cx).value().trim().to_string()),
+            "outputTokens" => self
+                .provider_model_edit_output
+                .as_ref()
+                .map(|input| input.read(cx).value().trim().to_string()),
+            "imageInput" => self
+                .provider_model_edit_image_input
+                .map(|value| value.to_string()),
+            "pdfInput" => self
+                .provider_model_edit_pdf_input
+                .map(|value| value.to_string()),
+            "temperature" => self
+                .provider_model_edit_temperature
+                .map(|value| value.to_string()),
+            "reasoning" => self
+                .provider_model_edit_reasoning
+                .map(|value| value.to_string()),
+            _ => return false,
+        };
+        current.as_deref() == Some(suggested)
+    }
+
     /// Writes one suggested field into the inline editor's own copy.
     fn adopt_provider_model_capability_field(
         &mut self,
@@ -17404,12 +17479,12 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    /// The catalogue's values for the open model, each with its own adopt
-    /// control.
+    /// The catalogue's values the open model does not hold yet, each with its
+    /// own adopt control.
     ///
-    /// The list stays visible after the automatic fill, because it is also the
-    /// way back: an edited field can be returned to the catalogue's value, and
-    /// "adopt all" restores every one of them.
+    /// A value the automatic fill wrote is left out; when the user edits it
+    /// away, its row comes back as the way to restore it, and "adopt all"
+    /// restores every differing field at once.
     fn render_provider_model_capability_suggestions(
         &mut self,
         model: &vibex_core::ModelProviderCatalogEntry,
@@ -17418,7 +17493,19 @@ impl ManagementCenter {
         let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
             return div().into_any_element();
         };
-        if suggestion.fields.is_empty() {
+        // A value already in the form is not a suggestion any more: the list
+        // is only the way back to a catalogue value the user has changed, and
+        // repeating the values the automatic fill just wrote made the editor
+        // look like it was still asking for them.
+        let pending = suggestion
+            .fields
+            .iter()
+            .filter(|field| {
+                !self.provider_model_capability_is_adopted(&field.field, &field.value, cx)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
             return div().into_any_element();
         }
         let approximate = suggestion.approximate;
@@ -17479,7 +17566,7 @@ impl ManagementCenter {
                     .text_color(cx.theme().muted_foreground)
                     .child(note),
             );
-        for field in suggestion.fields {
+        for field in pending {
             let label = match field.field.as_str() {
                 "contextTokens" => {
                     management_locale_text("Context window", "上下文窗口", "上下文視窗")
@@ -23823,13 +23910,13 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    /// The catalogue's suggestions, one row per field with its own adopt
-    /// control.
+    /// The catalogue's suggestions that the Model does not hold yet.
     ///
     /// A field with no declaration is filled as soon as the answer arrives, so
-    /// the editor opens useful instead of blank; the rows stay listed because
-    /// the catalogue's value is what an edited field can be returned to, and
-    /// adopting one is still an explicit click.
+    /// the editor opens useful instead of blank. A suggestion the form already
+    /// shows is therefore left out rather than listed with an "Apply" that
+    /// would write the value it is already displaying; only a field the user
+    /// changed still offers the way back to the catalogue's value.
     fn render_capability_suggestions(
         &mut self,
         index: usize,
@@ -23838,31 +23925,46 @@ impl ManagementCenter {
         let Some(suggestion) = self.model_capability_suggestion.clone() else {
             return Vec::new();
         };
+        let capabilities = self
+            .profile_configured_models
+            .get(index)
+            .map(|model| &model.capabilities);
+        let pending = suggestion
+            .fields
+            .iter()
+            .filter(|field| {
+                capabilities.is_none_or(|capabilities| {
+                    !model_capability_matches_suggestion(capabilities, &field.field, &field.value)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Vec::new();
+        }
         let approximate = suggestion.approximate;
         let mut rows = Vec::new();
-        if !suggestion.fields.is_empty() {
-            rows.push(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_end()
-                    .child(
-                        Button::new("provider-model-adopt-all")
-                            .xsmall()
-                            .outline()
-                            .label(management_locale_text(
-                                "Apply all suggestions",
-                                "采用全部建议",
-                                "採用全部建議",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.adopt_all_capability_fields(window, cx)
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        for field in suggestion.fields {
+        rows.push(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_end()
+                .child(
+                    Button::new("provider-model-adopt-all")
+                        .xsmall()
+                        .outline()
+                        .label(management_locale_text(
+                            "Apply all suggestions",
+                            "采用全部建议",
+                            "採用全部建議",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.adopt_all_capability_fields(window, cx)
+                        })),
+                )
+                .into_any_element(),
+        );
+        for field in pending {
             let label = match field.field.as_str() {
                 "contextTokens" => {
                     management_locale_text("Context window", "上下文窗口", "上下文視窗")
@@ -23984,9 +24086,9 @@ impl ManagementCenter {
             return;
         };
         // An explicit adoption is the user's decision on a field, so it may
-        // replace a previously adopted value; it never silently replaces a
-        // value the user typed, because the control is only offered while the
-        // field is empty.
+        // replace a value the user typed; the control is only shown while the
+        // field differs from the catalogue, so the click states what it will
+        // do instead of writing silently.
         // The declaration owns the mapping from a suggested field to itself, so
         // the editor does not grow a second copy of it.
         let mut capabilities = model.capabilities.clone();
@@ -24722,30 +24824,12 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    /// Identity: name, note, and website. Name gets the primary emphasis.
-    /// The first step of adding a Provider to an Agent.
-    ///
-    /// Two things belong on this step and neither can be inferred from the
-    /// other. A Provider the user already configured globally is the common
-    /// case — they want this Agent to use it, not a second copy of it — so the
-    /// list of existing records comes first and is searchable. Creating one is
-    /// the fallback, and it keeps the preset library behind it.
-    fn render_provider_picker_step(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let query = self.provider_preset_query.read(cx).value().to_string();
+    /// The saved Providers the picker lists, in the order it draws them.
+    fn provider_picker_existing_profiles(
+        &self,
+        query: &str,
+    ) -> Vec<vibex_core::ModelProviderProfile> {
         let normalized = query.trim().to_lowercase();
-        // A shared Provider appears once here however many Agents bind it. A
-        // record this Agent already launches through stays listed but is not
-        // selectable, because choosing it again would be a no-op dressed up as
-        // an action.
-        let selected_agent = self
-            .selected_agent_id
-            .as_deref()
-            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok());
         let mut existing = self
             .providers
             .iter()
@@ -24772,6 +24856,302 @@ impl ManagementCenter {
                 .to_lowercase()
                 .cmp(&right.display_name.to_lowercase())
         });
+        existing
+    }
+
+    /// The route groups this Agent can reference, in the order the picker
+    /// draws them.
+    fn provider_picker_route_groups(&self, query: &str) -> Vec<SharedRouteGroupRow> {
+        let normalized = query.trim().to_lowercase();
+        let mut available =
+            shared_route_group_rows(&self.model_routes, &self.agent_model_route_bindings)
+                .into_iter()
+                .filter(|row| row.route.status == vibex_core::RouteStatus::Enabled)
+                .filter(|row| {
+                    normalized.is_empty()
+                        || row.route.display_name.to_lowercase().contains(&normalized)
+                        || row
+                            .route
+                            .agent_model()
+                            .is_some_and(|model| model.to_lowercase().contains(&normalized))
+                        || row
+                            .route
+                            .enabled_members()
+                            .filter_map(|member| {
+                                self.providers
+                                    .iter()
+                                    .find(|profile| profile.id == member.model_provider_profile_id)
+                                    .map(|profile| profile.display_name.to_lowercase())
+                            })
+                            .any(|name| name.contains(&normalized))
+                })
+                .collect::<Vec<_>>();
+        available.sort_by(|left, right| {
+            left.route
+                .display_name
+                .to_lowercase()
+                .cmp(&right.route.display_name.to_lowercase())
+        });
+        available
+    }
+
+    /// The preset library under its kind headings, in the order it draws them.
+    fn provider_picker_preset_sections(
+        &self,
+        query: &str,
+    ) -> Vec<(ProviderPresetCategory, Vec<vibex_core::ProviderPreset>)> {
+        let matching = provider_preset_tiles(vibex_core::provider_presets(), query);
+        ProviderPresetCategory::ALL
+            .into_iter()
+            .filter_map(|category| {
+                let listed = matching
+                    .iter()
+                    .filter(|preset| provider_preset_category(preset) == category)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!listed.is_empty()).then_some((category, listed))
+            })
+            .collect()
+    }
+
+    fn provider_picker_agent(&self) -> Option<vibex_core::AgentId> {
+        self.selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok())
+    }
+
+    fn provider_picker_provider_in_use(&self, profile: &vibex_core::ModelProviderProfile) -> bool {
+        self.provider_picker_agent().is_some_and(|agent_id| {
+            agent_uses_shared_provider(&agent_id, profile, &self.provider_bindings)
+        })
+    }
+
+    fn provider_picker_referenced_route_ids(&self) -> BTreeSet<vibex_core::ModelRouteId> {
+        self.agent_model_route_bindings
+            .iter()
+            .filter(|binding| binding.deleted_at_ms.is_none())
+            .filter(|binding| Some(binding.agent_id.as_str()) == self.selected_agent_id.as_deref())
+            .map(|binding| binding.model_route_id.clone())
+            .collect()
+    }
+
+    /// Every row the keyboard can land on, in visual order.
+    ///
+    /// A row that already answers the question — a Provider this Agent uses, a
+    /// group it references — is drawn but has no action, so it is not a stop
+    /// for the roving selection either.
+    fn provider_picker_choices(&self, query: &str) -> Vec<ProviderPickerChoice> {
+        match self.provider_picker_tab {
+            ProviderPickerTab::Providers => {
+                let mut choices = self
+                    .provider_picker_existing_profiles(query)
+                    .into_iter()
+                    .filter(|profile| !self.provider_picker_provider_in_use(profile))
+                    .map(|profile| ProviderPickerChoice::ExistingProvider(profile.id))
+                    .collect::<Vec<_>>();
+                for (_, presets) in self.provider_picker_preset_sections(query) {
+                    choices.extend(
+                        presets
+                            .into_iter()
+                            .map(|preset| ProviderPickerChoice::Preset(preset.id)),
+                    );
+                }
+                choices.push(ProviderPickerChoice::Custom);
+                choices
+            }
+            ProviderPickerTab::RouteGroups => {
+                let referenced = self.provider_picker_referenced_route_ids();
+                let mut choices = self
+                    .provider_picker_route_groups(query)
+                    .into_iter()
+                    .filter(|row| !referenced.contains(&row.route.id))
+                    .map(|row| ProviderPickerChoice::RouteGroup(row.route.id))
+                    .collect::<Vec<_>>();
+                choices.push(ProviderPickerChoice::Custom);
+                choices
+            }
+        }
+    }
+
+    /// Keeps the roving selection on a row that is still visible.
+    fn sync_provider_picker_choice(&mut self, query: &str) {
+        let choices = self.provider_picker_choices(query);
+        let Some(first) = choices.first().cloned() else {
+            self.provider_picker_choice = None;
+            return;
+        };
+        if !self
+            .provider_picker_choice
+            .as_ref()
+            .is_some_and(|choice| choices.contains(choice))
+        {
+            self.provider_picker_choice = Some(first);
+        }
+    }
+
+    fn move_provider_picker_choice(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let query = self.provider_preset_query.read(cx).value().to_string();
+        let choices = self.provider_picker_choices(&query);
+        if choices.is_empty() {
+            return;
+        }
+        let current = self
+            .provider_picker_choice
+            .as_ref()
+            .and_then(|choice| choices.iter().position(|candidate| candidate == choice))
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, choices.len() as isize - 1) as usize;
+        if self.provider_picker_choice.as_ref() == Some(&choices[next]) {
+            return;
+        }
+        self.provider_picker_choice = Some(choices[next].clone());
+        // The selection may sit below the fold, and a highlight the reader
+        // cannot see is not a selection. The row itself is anchored, so nested
+        // section headings do not have to become scroll items.
+        self.provider_picker_scroll_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
+    fn switch_provider_picker_tab(
+        &mut self,
+        tab: ProviderPickerTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.provider_picker_tab == tab {
+            return;
+        }
+        self.provider_picker_tab = tab;
+        self.provider_picker_choice = None;
+        // The two halves have different lengths, so an offset from the list
+        // that was on screen could land past the end of the other one.
+        self.provider_picker_scroll
+            .set_offset(point(px(0.0), px(0.0)));
+        // The provider half owns a search field and the group half does not,
+        // so the tab switch has to leave the keyboard somewhere that still
+        // exists on the other side.
+        self.provider_picker_focus.focus(window, cx);
+        self.provider_preset_query
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        if tab == ProviderPickerTab::Providers {
+            self.focus_provider_picker_search(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn move_provider_picker_tab(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = ProviderPickerTab::ALL
+            .iter()
+            .position(|tab| *tab == self.provider_picker_tab)
+        else {
+            return;
+        };
+        let next = index as isize + delta;
+        if next < 0 || next >= ProviderPickerTab::ALL.len() as isize {
+            return;
+        }
+        self.switch_provider_picker_tab(ProviderPickerTab::ALL[next as usize], window, cx);
+    }
+
+    /// Runs the action the keyboard is on.
+    ///
+    /// The selected row is the same row a click would hit: a preset opens the
+    /// form, a saved Provider binds this Agent, and the custom row starts an
+    /// empty one. Enter is routed here by the search field's capture action
+    /// and by the dialog's confirm action, so it works whichever of them owns
+    /// the focus.
+    fn activate_provider_picker_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let query = self.provider_preset_query.read(cx).value().to_string();
+        let choice = self
+            .provider_picker_choice
+            .clone()
+            .or_else(|| self.provider_picker_choices(&query).first().cloned());
+        let Some(choice) = choice else {
+            return;
+        };
+        match choice {
+            ProviderPickerChoice::ExistingProvider(id) => {
+                self.use_existing_provider(id, cx);
+            }
+            ProviderPickerChoice::RouteGroup(id) => {
+                self.use_existing_route_group(id, cx);
+            }
+            ProviderPickerChoice::Preset(id) => {
+                self.choose_provider_preset(&id, window, cx);
+            }
+            ProviderPickerChoice::Custom => {
+                if self.provider_picker_tab == ProviderPickerTab::Providers {
+                    self.choose_custom_provider(window, cx);
+                } else {
+                    self.create_route_group_from_picker(window, cx);
+                }
+            }
+        }
+    }
+
+    /// Puts the keyboard in the picker's filter without taking the list away.
+    ///
+    /// The filter is the picker's focus surface: typing narrows the list, and
+    /// the arrow keys still move the roving selection through it.
+    fn focus_provider_picker_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.provider_preset_query.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            query.read(cx).focus_handle(cx).focus(window, cx);
+        });
+    }
+
+    /// What Enter means in this dialog: a choice on the picker step, a save on
+    /// the Provider form.
+    fn confirm_profile_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.provider_preset_picker {
+            self.activate_provider_picker_choice(window, cx);
+        } else {
+            self.save_profile(cx);
+        }
+    }
+
+    /// Identity: name, note, and website. Name gets the primary emphasis.
+    /// The first step of adding a Provider to an Agent.
+    ///
+    /// Two things belong on this step and neither can be inferred from the
+    /// other. A Provider the user already configured globally is the common
+    /// case — they want this Agent to use it, not a second copy of it — so the
+    /// list of existing records comes first and is searchable. Creating one is
+    /// the fallback, and it keeps the preset library behind it.
+    fn render_provider_picker_step(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let query = self.provider_preset_query.read(cx).value().to_string();
+        let normalized = query.trim().to_lowercase();
+        // The keyboard selection is kept on a row that still exists. Rendering
+        // is the point where the visible list is known, so this is also where a
+        // filter, a tab switch, or a refresh re-seats it on the first match.
+        self.sync_provider_picker_choice(&query);
+        let selected_choice = self.provider_picker_choice.clone();
+        // A shared Provider appears once here however many Agents bind it. A
+        // record this Agent already launches through stays listed but is not
+        // selectable, because choosing it again would be a no-op dressed up as
+        // an action.
+        let existing = self.provider_picker_existing_profiles(&query);
 
         // A saved record and a route group are the same kind of choice, so the
         // list is a grid of equal cards: two columns when the dialog is wide
@@ -24788,9 +25168,10 @@ impl ManagementCenter {
             // and no action: hiding it made a used record indistinguishable
             // from one that was never there, and binding it again was a no-op
             // dressed up as an action.
-            let in_use = selected_agent.as_ref().is_some_and(|agent_id| {
-                agent_uses_shared_provider(agent_id, profile, &self.provider_bindings)
-            });
+            let in_use = self.provider_picker_provider_in_use(profile);
+            let selected = selected_choice.as_ref()
+                == Some(&ProviderPickerChoice::ExistingProvider(profile.id.clone()));
+            let scroll_anchor = selected.then(|| self.provider_picker_scroll_anchor.clone());
             let model_count = profile
                 .configured_models
                 .iter()
@@ -24824,6 +25205,8 @@ impl ManagementCenter {
                     .px_2()
                     .py_2()
                     .rounded(cx.theme().radius)
+                    .when(selected, |this| this.bg(cx.theme().primary.opacity(0.10)))
+                    .anchor_scroll(scroll_anchor)
                     .when(!pending && !in_use, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
@@ -24917,46 +25300,8 @@ impl ManagementCenter {
         // use", so they belong on the same chooser as Providers rather than
         // behind a separate button: a reference to a global group and a new one
         // are both answers to the same question.
-        let already_referenced = self
-            .agent_model_route_bindings
-            .iter()
-            .filter(|binding| {
-                binding.deleted_at_ms.is_none()
-                    && Some(binding.agent_id.as_str()) == self.selected_agent_id.as_deref()
-            })
-            .map(|binding| binding.model_route_id.clone())
-            .collect::<Vec<_>>();
-        let mut available_groups =
-            shared_route_group_rows(&self.model_routes, &self.agent_model_route_bindings)
-                .into_iter()
-                // A referenced group stays listed; the row says so with a check
-                // instead of removing itself from the chooser.
-                .filter(|row| row.route.status == vibex_core::RouteStatus::Enabled)
-                .filter(|row| {
-                    normalized.is_empty()
-                        || row.route.display_name.to_lowercase().contains(&normalized)
-                        || row
-                            .route
-                            .agent_model()
-                            .is_some_and(|model| model.to_lowercase().contains(&normalized))
-                        || row
-                            .route
-                            .enabled_members()
-                            .filter_map(|member| {
-                                self.providers
-                                    .iter()
-                                    .find(|profile| profile.id == member.model_provider_profile_id)
-                                    .map(|profile| profile.display_name.to_lowercase())
-                            })
-                            .any(|name| name.contains(&normalized))
-                })
-                .collect::<Vec<_>>();
-        available_groups.sort_by(|left, right| {
-            left.route
-                .display_name
-                .to_lowercase()
-                .cmp(&right.route.display_name.to_lowercase())
-        });
+        let already_referenced = self.provider_picker_referenced_route_ids();
+        let available_groups = self.provider_picker_route_groups(&query);
         // Groups this Agent already references stay on the list, marked as
         // taken: a name that disappears once chosen reads as if it were gone,
         // and the reader cannot tell it apart from a group that never existed.
@@ -24985,6 +25330,9 @@ impl ManagementCenter {
                 let use_id = route_id.clone();
                 let summary = management_route_group_member_summary(&row.route, &self.providers);
                 let already = already_referenced.contains(&route_id);
+                let selected = selected_choice.as_ref()
+                    == Some(&ProviderPickerChoice::RouteGroup(route_id.clone()));
+                let scroll_anchor = selected.then(|| self.provider_picker_scroll_anchor.clone());
                 line = line.child(
                     h_flex()
                         .id(SharedString::from(format!(
@@ -24998,6 +25346,8 @@ impl ManagementCenter {
                         .px_2()
                         .py_2()
                         .rounded(cx.theme().radius)
+                        .when(selected, |this| this.bg(cx.theme().primary.opacity(0.10)))
+                        .anchor_scroll(scroll_anchor)
                         .when(!pending && !already, |this| {
                             this.cursor_pointer()
                                 .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
@@ -25075,7 +25425,11 @@ impl ManagementCenter {
         // content height of zero and the chooser looks empty.
         let mut body = v_flex().w_full().min_w_0().min_h_0().flex_1().gap_2();
         if providers_tab {
-            let matching = provider_preset_tiles(vibex_core::provider_presets(), &query);
+            let preset_sections = self.provider_picker_preset_sections(&query);
+            let selected_preset = match &selected_choice {
+                Some(ProviderPickerChoice::Preset(id)) => Some(id.as_str()),
+                _ => None,
+            };
             // The library is read in kinds, not as one flat grid: a vendor's own
             // API, a relay, and a server on this machine are different answers to
             // the same question, and a name alone does not say which is which.
@@ -25090,11 +25444,7 @@ impl ManagementCenter {
             let added_presets = self
                 .providers
                 .iter()
-                .filter(|profile| {
-                    selected_agent.as_ref().is_some_and(|agent_id| {
-                        agent_uses_shared_provider(agent_id, profile, &self.provider_bindings)
-                    })
-                })
+                .filter(|profile| self.provider_picker_provider_in_use(profile))
                 .filter_map(|profile| {
                     profile
                         .metadata
@@ -25122,15 +25472,7 @@ impl ManagementCenter {
             // server on this machine are different answers to the same question,
             // and a name alone does not say which is which. A kind the search
             // emptied is left out entirely.
-            for category in ProviderPresetCategory::ALL {
-                let listed = matching
-                    .iter()
-                    .filter(|preset| provider_preset_category(preset) == category)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if listed.is_empty() {
-                    continue;
-                }
+            for (category, listed) in &preset_sections {
                 sections = sections.child(provider_source_section(
                     SharedString::from(format!(
                         "management-provider-sources-{}",
@@ -25138,11 +25480,20 @@ impl ManagementCenter {
                     )),
                     category.icon(),
                     category.label(),
-                    provider_source_rows(&listed, pending, &added_presets, cx),
+                    provider_source_rows(
+                        listed,
+                        pending,
+                        &added_presets,
+                        selected_preset,
+                        selected_preset
+                            .is_some()
+                            .then(|| self.provider_picker_scroll_anchor.clone()),
+                        cx,
+                    ),
                     cx,
                 ));
             }
-            if matching.is_empty() {
+            if preset_sections.is_empty() {
                 sections = sections.child(compact_empty_state(
                     management_locale_text(
                         "No matching sources",
@@ -25164,6 +25515,7 @@ impl ManagementCenter {
                     .w_full()
                     .min_h_0()
                     .flex_1()
+                    .track_scroll(&self.provider_picker_scroll)
                     .overflow_y_scrollbar()
                     .scroll_gutter()
                     .pb_1()
@@ -25180,6 +25532,7 @@ impl ManagementCenter {
                     .w_full()
                     .min_h_0()
                     .flex_1()
+                    .track_scroll(&self.provider_picker_scroll)
                     .overflow_y_scrollbar()
                     .scroll_gutter()
                     .pb_1()
@@ -25187,11 +25540,79 @@ impl ManagementCenter {
             );
         }
 
+        let custom_selected = selected_choice.as_ref() == Some(&ProviderPickerChoice::Custom);
         v_flex()
             .w_full()
             .min_h_0()
             .flex_1()
             .gap_2()
+            .track_focus(&self.provider_picker_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !this.provider_preset_picker || event.keystroke.modifiers.modified() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "up" => this.move_provider_picker_choice(-1, window, cx),
+                    "down" => this.move_provider_picker_choice(1, window, cx),
+                    "left" | "right" => {
+                        // A non-empty search field still owns the horizontal
+                        // arrows: they move its caret, not the tab selection.
+                        let search_focused = this
+                            .provider_preset_query
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window);
+                        let query_empty = this
+                            .provider_preset_query
+                            .read(cx)
+                            .value()
+                            .trim()
+                            .is_empty();
+                        if search_focused && !query_empty {
+                            return;
+                        }
+                        let delta = if event.keystroke.key == "left" { -1 } else { 1 };
+                        this.move_provider_picker_tab(delta, window, cx);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &InputMoveLeft, window, cx| {
+                if this
+                    .provider_preset_query
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .is_empty()
+                {
+                    this.move_provider_picker_tab(-1, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &InputMoveRight, window, cx| {
+                if this
+                    .provider_preset_query
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .is_empty()
+                {
+                    this.move_provider_picker_tab(1, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            // Input's Enter action is bound in the field's own key context, so
+            // it never reaches the dialog's confirm binding while the filter
+            // owns the focus. Claim it here; Enter on any other focus still
+            // arrives through the dialog and lands in the same method.
+            .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
+                if action.shift || action.secondary {
+                    return;
+                }
+                this.activate_provider_picker_choice(window, cx);
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .w_full()
@@ -25224,6 +25645,9 @@ impl ManagementCenter {
                     .px_2()
                     .py_2()
                     .rounded(cx.theme().radius)
+                    .when(custom_selected, |this| {
+                        this.bg(cx.theme().primary.opacity(0.10))
+                    })
                     .when(!pending, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
@@ -25345,10 +25769,17 @@ impl ManagementCenter {
             .on_click(cx.listener(|this, index: &usize, window, cx| {
                 if let Some(tab) = ProviderPickerTab::ALL.get(*index) {
                     this.provider_picker_tab = *tab;
+                    this.provider_picker_choice = None;
+                    this.provider_picker_scroll
+                        .set_offset(point(px(0.0), px(0.0)));
                     // The term was typed against the list that was on screen,
                     // so it does not carry into the other one.
                     this.provider_preset_query
                         .update(cx, |state, cx| state.set_value("", window, cx));
+                    this.provider_picker_focus.focus(window, cx);
+                    if *tab == ProviderPickerTab::Providers {
+                        this.focus_provider_picker_search(window, cx);
+                    }
                     cx.notify();
                 }
             }))
@@ -25469,8 +25900,13 @@ impl ManagementCenter {
         self.provider_preset_picker = true;
         self.provider_form_from_picker = false;
         self.provider_picker_tab = ProviderPickerTab::RouteGroups;
+        self.provider_picker_choice = None;
+        self.provider_picker_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         self.profile_editor_open = true;
         self.present_profile_editor_dialog(window, cx);
+        let focus = self.provider_picker_focus.clone();
+        cx.defer_in(window, move |_, window, cx| focus.focus(window, cx));
         cx.notify();
     }
 
@@ -25755,8 +26191,9 @@ impl ManagementCenter {
                             "更換預設",
                         ))
                         .disabled(pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.provider_preset_picker = true;
+                            this.focus_provider_picker_search(window, cx);
                             cx.notify();
                         })),
                 )
@@ -37131,6 +37568,19 @@ enum ProviderPickerTab {
     RouteGroups,
 }
 
+/// One actionable row of the picker, in the order the chooser draws them.
+///
+/// The picker mixes three record kinds and one command, so a plain index is not
+/// stable enough to be the keyboard cursor: the same slot means a different
+/// source after a filter or a tab switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderPickerChoice {
+    ExistingProvider(vibex_core::ModelProviderProfileId),
+    RouteGroup(vibex_core::ModelRouteId),
+    Preset(String),
+    Custom,
+}
+
 impl ProviderPickerTab {
     const ALL: [Self; 2] = [Self::Providers, Self::RouteGroups];
 
@@ -40470,16 +40920,21 @@ fn provider_source_rows(
     presets: &[vibex_core::ProviderPreset],
     pending: bool,
     added: &BTreeSet<String>,
+    selected_preset: Option<&str>,
+    scroll_anchor: Option<ScrollAnchor>,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let mut rows = v_flex().w_full().min_w_0().gap_0p5();
     for line in presets.chunks(PROVIDER_SOURCE_COLUMNS) {
         let mut row = h_flex().w_full().min_w_0().gap_1();
         for preset in line {
+            let selected = selected_preset == Some(preset.id.as_str());
             row = row.child(provider_source_tile(
                 preset,
                 pending,
                 added.contains(&preset.id),
+                selected,
+                selected.then(|| scroll_anchor.clone()).flatten(),
                 cx,
             ));
         }
@@ -40502,6 +40957,8 @@ fn provider_source_tile(
     preset: &vibex_core::ProviderPreset,
     pending: bool,
     added: bool,
+    selected: bool,
+    scroll_anchor: Option<ScrollAnchor>,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let preset_id = preset.id.clone();
@@ -40521,6 +40978,8 @@ fn provider_source_tile(
         .px_1()
         .py_1()
         .rounded(cx.theme().radius)
+        .when(selected, |this| this.bg(cx.theme().primary.opacity(0.10)))
+        .anchor_scroll(scroll_anchor)
         .when(!pending, |this| {
             this.cursor_pointer()
                 .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
@@ -42621,6 +43080,28 @@ fn empty_state(
     .into_any_element()
 }
 
+/// Whether a Model already carries the value the catalogue suggests.
+///
+/// The suggestion is a string because that is how the catalogue spells the
+/// field, so the declaration is compared in the same spelling rather than
+/// re-parsing it. A missing declaration never matches.
+fn model_capability_matches_suggestion(
+    capabilities: &vibex_core::ProviderModelCapabilities,
+    field: &str,
+    suggested: &str,
+) -> bool {
+    let current = match field {
+        "contextTokens" => capabilities.context_tokens.map(|value| value.to_string()),
+        "outputTokens" => capabilities.output_tokens.map(|value| value.to_string()),
+        "reasoning" => capabilities.reasoning.map(|value| value.to_string()),
+        "imageInput" => capabilities.image_input.map(|value| value.to_string()),
+        "pdfInput" => capabilities.pdf_input.map(|value| value.to_string()),
+        "temperature" => capabilities.temperature.map(|value| value.to_string()),
+        _ => return false,
+    };
+    current.as_deref() == Some(suggested)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43068,10 +43549,11 @@ mod tests {
             .expect("Model-id field subscription should remain inspectable");
 
         // The Dialog's own Enter binding confirms by closing the overlay, so
-        // the editor must claim the key: Save on Enter, and the Model-id field
-        // adding its row instead of saving the whole dialog.
-        assert!(dialog.contains(".on_ok(move |_, _, cx| {"));
-        assert!(dialog.contains("center.save_profile(cx)"));
+        // the editor must claim the key: the picker runs its highlighted row,
+        // the form saves, and the Model-id field adds its row instead of saving
+        // the whole dialog.
+        assert!(dialog.contains(".on_ok(move |_, window, cx| {"));
+        assert!(dialog.contains("center.confirm_profile_dialog(window, cx)"));
         assert!(dialog.contains("false"));
         assert!(model_draft.contains("InputEvent::PressEnter"));
         assert!(model_draft.contains("cx.stop_propagation();"));
@@ -49688,12 +50170,18 @@ mod gateway_surface_tests {
         assert!(picker.contains("management-provider-existing-"));
         assert!(picker.contains("use_existing_provider(profile_id.clone(), cx)"));
         assert!(picker.contains("Already configured"));
-        assert!(picker.contains("provider_preset_tiles"));
+        assert!(picker.contains("provider_picker_preset_sections("));
         // Each source is one row in a kind's block, so the row's own mark and
         // the block's heading live in the helpers the step calls, not inline.
         assert!(picker.contains("provider_source_rows("));
         assert!(picker.contains("provider_source_section("));
-        assert!(picker.contains("ProviderPresetCategory::ALL"));
+        let preset_sections = source
+            .split_once("    fn provider_picker_preset_sections(")
+            .and_then(|(_, tail)| tail.split_once("    fn provider_picker_agent("))
+            .map(|(body, _)| body)
+            .expect("the preset sections should remain inspectable");
+        assert!(preset_sections.contains("ProviderPresetCategory::ALL"));
+        assert!(preset_sections.contains("provider_preset_tiles"));
         // The chooser no longer offers a "recently used" strip: the library is
         // read by kind, so a second ordering of the same presets competed with
         // the blocks and pushed them down.
@@ -49735,7 +50223,8 @@ mod gateway_surface_tests {
         );
         // A saved Provider this Agent already uses is drawn with a check and no
         // click, rather than being filtered out of the list and offered again.
-        assert!(picker.contains("agent_uses_shared_provider("));
+        assert!(picker.contains("provider_picker_provider_in_use("));
+        assert!(source.contains("agent_uses_shared_provider("));
         assert!(
             !picker.contains(".legacy_provider_profile_id\n                    .as_ref()\n                    .is_none_or"),
             "a used Provider must stay listed, marked as taken"
@@ -49780,7 +50269,7 @@ mod gateway_surface_tests {
 
         assert!(picker.contains("management-provider-preset-custom"));
         assert!(picker.contains("management_search_input"));
-        assert!(picker.contains("provider_preset_tiles"));
+        assert!(picker.contains("provider_picker_preset_sections("));
     }
 
     #[test]
@@ -50255,6 +50744,74 @@ mod gateway_surface_tests {
             !saving.contains("route_group_members.is_empty()"),
             "the provider-only draft no longer exists"
         );
+    }
+
+    /// A catalogue answer stops being a suggestion once the form holds it.
+    ///
+    /// This is what keeps the editor from listing the values the automatic
+    /// fill has just written under an "Apply" button that writes them again.
+    #[test]
+    fn a_catalogue_value_is_not_suggested_once_the_model_has_it() {
+        let mut capabilities = vibex_core::ProviderModelCapabilities::default();
+        assert!(!model_capability_matches_suggestion(
+            &capabilities,
+            "contextTokens",
+            "1000000"
+        ));
+        capabilities.context_tokens = Some(1_000_000);
+        capabilities.image_input = Some(true);
+        assert!(model_capability_matches_suggestion(
+            &capabilities,
+            "contextTokens",
+            "1000000"
+        ));
+        assert!(model_capability_matches_suggestion(
+            &capabilities,
+            "imageInput",
+            "true"
+        ));
+        assert!(!model_capability_matches_suggestion(
+            &capabilities,
+            "imageInput",
+            "false"
+        ));
+    }
+
+    /// The picker's roving selection follows the direction keys, and the
+    /// horizontal pair moves the tab when the search field is empty.
+    #[gpui::test]
+    fn the_source_chooser_moves_its_keyboard_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_preset_picker = true;
+                center.provider_preset_query.update(cx, |state, cx| {
+                    state.set_value("", window, cx);
+                });
+                center.provider_picker_choice = None;
+                center.sync_provider_picker_choice("");
+                let first = center
+                    .provider_picker_choice
+                    .clone()
+                    .expect("the library offers a first row");
+                center.move_provider_picker_choice(1, window, cx);
+                assert_ne!(
+                    center.provider_picker_choice.as_ref(),
+                    Some(&first),
+                    "down moves to the next source"
+                );
+
+                center.move_provider_picker_tab(1, window, cx);
+                assert_eq!(center.provider_picker_tab, ProviderPickerTab::RouteGroups);
+                center.sync_provider_picker_choice("");
+                assert_eq!(
+                    center.provider_picker_choice,
+                    Some(ProviderPickerChoice::Custom),
+                    "an empty group list still offers the new-group command"
+                );
+            });
+        });
     }
 }
 

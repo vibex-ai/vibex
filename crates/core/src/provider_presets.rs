@@ -1320,8 +1320,9 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_ANYROUTER,
                 "AnyRouter",
                 &[
-                    (chat, "https://anyrouter.top/v1"),
-                    (messages, "https://anyrouter.top/v1"),
+                    (chat, "http://anyrouter.top/v1"),
+                    (responses, "http://anyrouter.top/v1"),
+                    (messages, "http://anyrouter.top"),
                 ],
                 &[],
             )
@@ -1863,6 +1864,22 @@ mod tests {
         assert_ne!(
             go.endpoint_for(ProviderModelWireApi::AnthropicMessages),
             go.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions)
+        );
+    }
+
+    /// AnyRouter answers the Anthropic and OpenAI families at different root
+    /// paths, so a preset that shares one address between them sends one
+    /// protocol to the other's endpoint.
+    #[test]
+    fn anyrouter_keeps_the_anthropic_and_openai_roots_apart() {
+        let anyrouter = provider_preset(PROVIDER_PRESET_ANYROUTER).unwrap();
+        assert_eq!(
+            anyrouter.endpoint_for(ProviderModelWireApi::AnthropicMessages),
+            Some("http://anyrouter.top")
+        );
+        assert_eq!(
+            anyrouter.endpoint_for(ProviderModelWireApi::OpenaiResponses),
+            Some("http://anyrouter.top/v1")
         );
     }
 }
