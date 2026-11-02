@@ -51,6 +51,7 @@ use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
     Theme, ThemeStyled as _, TitleBar, VirtualListScrollHandle, WindowExt as _,
+    accordion::Accordion,
     animation::EffectTransition as Transition,
     avatar::Avatar,
     bubble::{Bubble, BubbleContent, BubbleReactions},
@@ -177,8 +178,9 @@ use vibex_desktop_model::{
     WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
     WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
     complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
-    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
-    move_strings_relative, ordered_agent_ids, parse_unified_diff,
+    custom_worktree_path_is_absolute, has_managed_child_agent_delegations,
+    is_runtime_model_favorite, move_string_relative, move_strings_relative, ordered_agent_ids,
+    parse_unified_diff, runtime_auth_source_use_count, runtime_selection_use_count,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
     sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
     sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
@@ -10061,6 +10063,10 @@ pub struct VibexWorkbench {
     /// The provider/model layer is scoped to starred models across every
     /// Agent rather than to the selected Agent's providers.
     runtime_provider_favorites_view: bool,
+    /// Provider and route groups the reader folded away, keyed by
+    /// `agent_id:source_id`. Missing means open, so a new group arrives
+    /// expanded and a search can reveal every match without touching this set.
+    runtime_provider_collapsed_groups: BTreeSet<String>,
     /// When the current popover's exit animation began. `Some` keeps the
     /// popover mounted (and inert) until the timeline elapses.
     runtime_menu_closing_since: Option<Instant>,
@@ -11663,6 +11669,7 @@ impl VibexWorkbench {
             runtime_provider_keyboard_selection: None,
             runtime_provider_search_focus_pending: false,
             runtime_provider_favorites_view: false,
+            runtime_provider_collapsed_groups: BTreeSet::new(),
             runtime_menu_closing_since: None,
             runtime_menu_trigger_press_was_open: false,
             runtime_authentication_menu: None,
@@ -38079,6 +38086,7 @@ impl VibexWorkbench {
         self.new_session_runtime_menu_auth_source = None;
         self.begin_runtime_menu_close(window, cx);
         self.set_new_session_runtime_selection(Some(selection.clone()));
+        self.record_runtime_selection_use(&selection);
         self.remember_runtime_selection(&selection);
         self.new_session_error = None;
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
@@ -39043,25 +39051,32 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Star/unstar one model and re-home the keyboard cursor.
+    /// Star/unstar one Agent + source + model triple and re-home the keyboard
+    /// cursor.
     ///
-    /// Starring reorders the list — stars float to the top of their group and
-    /// leave the favorites view — so the cursor is re-anchored onto the
-    /// selected row. Following the starred row instead would park its wash
-    /// beside the selected row's ring, reading as two highlighted rows.
+    /// The star belongs to the exact source that serves the model, so two
+    /// Providers advertising the same model id keep independent stars.
     fn toggle_runtime_model_favorite(
         &mut self,
         agent_id: &AgentId,
+        auth_source: &RuntimeAuthSource,
         model_key: &str,
         cx: &mut Context<Self>,
     ) {
         self.ui_state
             .composer
-            .toggle_runtime_model_favorite(agent_id, model_key);
+            .toggle_runtime_model_favorite(agent_id, auth_source, model_key);
         self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_scroll_to_selection = true;
         self.queue_ui_state();
         cx.notify();
+    }
+
+    /// Record one chosen triple for the picker's frequency ordering.
+    fn record_runtime_selection_use(&mut self, selection: &SessionRuntimeSelection) {
+        self.ui_state
+            .composer
+            .record_runtime_selection_use(selection);
     }
 
     /// Hand focus back to the composer once the picker leaves.
@@ -39149,6 +39164,7 @@ impl VibexWorkbench {
         self.composer_runtime_menu_agent_id = None;
         self.composer_runtime_menu_auth_source = None;
         self.begin_runtime_menu_close(window, cx);
+        self.record_runtime_selection_use(&selection);
         if self.selected_session_runtime_uninitialized() {
             self.initialize_uninitialized_session_runtime(selection, cx);
             return;
@@ -54844,16 +54860,24 @@ impl VibexWorkbench {
         } else {
             vec![agent_id.clone()]
         };
+        let query = normalized_session_search_query(search.read(cx).value().as_ref());
         let groups = runtime_provider_groups_for_query(
             catalog,
             &agent_ids,
-            search.read(cx).value().as_ref(),
+            &query,
             favorites_view,
             &favorites,
             preferred.as_ref(),
             &self.ui_state.composer.runtime_selections_by_model,
+            &self.ui_state.composer.runtime_selection_usage,
             &self.ui_state.composer.route_group_order,
         );
+        let searching = !query.trim().is_empty();
+        let collapsed = &self.runtime_provider_collapsed_groups;
+        let groups = groups
+            .into_iter()
+            .filter(|group| searching || !collapsed.contains(&runtime_provider_group_key(group)))
+            .collect::<Vec<_>>();
         let choices = runtime_provider_group_choices(&groups);
         if choices.is_empty() {
             return;
@@ -55187,6 +55211,7 @@ impl VibexWorkbench {
             &favorites,
             preferred,
             &self.ui_state.composer.runtime_selections_by_model,
+            &self.ui_state.composer.runtime_selection_usage,
             &self.ui_state.composer.route_group_order,
         );
         let provider_scroll = self.runtime_provider_scroll.clone();
@@ -55202,71 +55227,45 @@ impl VibexWorkbench {
         let selected_background = runtime_menu_selected_background(cx);
         let selected_shadows = runtime_menu_selected_shadows(cx);
         let hairline = runtime_menu_hairline(cx);
-        let mut visible_groups = Vec::new();
-
-        // A long list of route groups pushes the rest of the menu off screen, so
-        // only the first few are drawn. A search is never folded: the reader
-        // typed something specific, and hiding the match they wanted is the one
-        // failure a fold cannot justify.
         let searching = !query.trim().is_empty();
-        let route_groups = groups
-            .iter()
-            .filter(|group| group.source.kind == RuntimeAuthSourceKind::ModelRoute)
-            .count();
-        let folded_routes = !searching && route_groups > RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD;
-        let mut drawn_routes = 0usize;
-        let mut folded_away = 0usize;
+        let collapsed = self.runtime_provider_collapsed_groups.clone();
+        let profiles = self.runtime_provider_profiles.clone();
+        let mut group_keys = Vec::new();
+        let mut accordion = Accordion::new(format!("{menu_prefix}-runtime-provider-accordion"))
+            .multiple(true)
+            .bordered(false)
+            .w_full()
+            .h_auto()
+            .flex_none();
 
         for group in &groups {
-            if group.source.kind == RuntimeAuthSourceKind::ModelRoute {
-                if folded_routes && drawn_routes >= RUNTIME_ROUTE_GROUP_FOLD {
-                    folded_away += 1;
-                    continue;
-                }
-                drawn_routes += 1;
-            }
             let heading_key = format!(
                 "{menu_prefix}-runtime-provider-heading:{}:{}",
                 group.agent_id.as_str(),
                 group.source.source.id()
             );
+            let group_key = runtime_provider_group_key(group);
+            group_keys.push(group_key.clone());
+            let open = searching || !collapsed.contains(&group_key);
             let auth_agent_id = group.agent_id.clone();
             let auth_source = group.source.source.clone();
-            let mut heading = div()
-                .id(SharedString::from(heading_key.clone()))
+            let heading_label = if favorites_view {
+                format!(
+                    "{} · {}",
+                    runtime_agent_label(&self.agent_snapshots, &group.agent_id),
+                    group.source_label
+                )
+            } else {
+                group.source_label.clone()
+            };
+            let heading = div()
                 .w_full()
                 .h(px(COMPOSER_RUNTIME_GROUP_HEADING_HEIGHT))
                 .flex_none()
-                .px_2()
                 .flex()
                 .items_center()
                 .gap_2()
-                .rounded(px(6.0))
-                .bg(if group.can_authenticate {
-                    hover_blend(&heading_key, rest_background, highlight_background)
-                } else {
-                    rest_background
-                })
-                .when(group.can_authenticate, |this| {
-                    this.cursor_pointer()
-                        .on_hover(hover_listener(cx.entity_id(), heading_key.clone()))
-                })
-                .child(match group.source.kind {
-                    // A route is a saved composition rather than one upstream,
-                    // so it takes the branch icon instead of the database.
-                    RuntimeAuthSourceKind::ProviderProfile => new_session_selector_icon(
-                        "icons/vibex/database.svg",
-                        theme::semantic_color("chart-2", cx.theme().is_dark()),
-                    ),
-                    RuntimeAuthSourceKind::ModelRoute => new_session_selector_icon(
-                        "icons/vibex/git-branch.svg",
-                        theme::semantic_color("chart-1", cx.theme().is_dark()),
-                    ),
-                    RuntimeAuthSourceKind::AgentAccount => Icon::new(IconName::User)
-                        .size(px(16.0))
-                        .text_color(theme::semantic_color("chart-3", cx.theme().is_dark()))
-                        .into_any_element(),
-                })
+                .child(runtime_provider_group_icon(group, &profiles, cx))
                 .child(
                     div()
                         .min_w_0()
@@ -55275,7 +55274,7 @@ impl VibexWorkbench {
                         .text_size(type_scale::menu_heading())
                         .font_semibold()
                         .text_color(cx.theme().foreground.opacity(0.84))
-                        .child(group.source_label.clone()),
+                        .child(heading_label),
                 )
                 .child(
                     div()
@@ -55284,188 +55283,218 @@ impl VibexWorkbench {
                         .text_color(cx.theme().muted_foreground)
                         .child(group.status.clone()),
                 );
-            if group.can_authenticate {
-                heading = heading.on_click(cx.listener(move |this, _, _, cx| {
-                    if new_session {
-                        this.navigate_new_session_runtime_menu(
-                            ComposerRuntimeMenuView::Authentication,
-                            Some(auth_source.clone()),
-                            cx,
-                        );
-                    } else {
-                        this.navigate_composer_runtime_menu(
-                            ComposerRuntimeMenuView::Authentication,
-                            Some(auth_agent_id.clone()),
-                            Some(auth_source.clone()),
-                            cx,
-                        );
-                    }
-                    this.load_runtime_authentication_menu(
-                        auth_agent_id.clone(),
-                        auth_source.clone(),
-                        cx,
-                    );
-                }));
-            }
-
-            let rows = group.choices.iter().cloned().map(|choice| {
-                let is_selected = selected.is_some_and(|selected| {
-                    choice.selection.agent_id == selected.agent_id
-                        && choice.selection.auth_source == selected.auth_source
-                        && choice.selection.model == selected.model
-                });
-                let keyboard_selected = keyboard_selection.as_ref().is_some_and(|selection| {
-                    runtime_selection_identity_matches(&choice.selection, selection)
-                });
-                let highlighted =
-                    keyboard_selected || (is_selected && keyboard_selection.is_none());
-                // Only the highlighted row may consume the reveal requests;
-                // otherwise the first painted row would steal them.
-                let should_reveal_row = highlighted;
-                let reveal_workbench = workbench.clone();
-                let reveal_selection = choice.selection.clone();
-                let reveal_scroll = provider_scroll.clone();
-                let model_key = runtime_model_selection_key(&choice.selection.model);
-                let row_id = format!(
-                    "{menu_prefix}-runtime-grouped-model:{}:{}",
-                    choice.selection.auth_source.id(),
-                    model_key
-                );
-                let selection = choice.selection;
-                let click_selection = selection.clone();
-                let favorite_agent_id = selection.agent_id.clone();
-                let favorite_model_key = model_key.clone();
-                let is_favorite = favorites.iter().any(|favorite| {
-                    favorite.agent_id == favorite_agent_id
-                        && favorite.model_key == favorite_model_key
-                });
-                let icon = selection
-                    .model_id()
-                    .and_then(|model_id| {
-                        model_brand_icon(
-                            model_id,
-                            px(16.0),
-                            Some(cx.theme().foreground.opacity(0.88)),
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        new_session_selector_icon(
-                            "icons/vibex/sparkles.svg",
-                            theme::semantic_color("chart-2", cx.theme().is_dark()),
-                        )
+            let mut rows = group
+                .choices
+                .iter()
+                .cloned()
+                .map(|choice| {
+                    let is_selected = selected.is_some_and(|selected| {
+                        choice.selection.agent_id == selected.agent_id
+                            && choice.selection.auth_source == selected.auth_source
+                            && choice.selection.model == selected.model
                     });
-                let background = if is_selected {
-                    selected_background
-                } else if highlighted {
-                    highlight_background
-                } else {
-                    hover_blend(&row_id, rest_background, highlight_background)
-                };
-                let mut row = div()
-                    .id(SharedString::from(row_id.clone()))
-                    .w_full()
-                    .h(px(COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT))
-                    .flex_none()
-                    .pl(px(28.0))
-                    .pr_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .bg(background)
-                    .when(is_selected, |this| this.shadow(selected_shadows.clone()))
-                    .cursor_pointer()
-                    .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if new_session {
-                            this.choose_new_session_runtime(click_selection.clone(), window, cx);
-                        } else {
-                            this.choose_runtime_selection(click_selection.clone(), window, cx);
-                        }
-                    }))
-                    .child(icon)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(type_scale::menu_row())
-                            .font_medium()
-                            .text_color(cx.theme().foreground)
-                            .child(choice.label.clone()),
-                    )
-                    .when(is_selected, |this| {
-                        this.child(Icon::new(IconName::Check).size(px(14.0)))
-                    })
-                    .child(runtime_menu_star_toggle(
-                        row_id.clone(),
-                        is_favorite,
-                        cx.listener(move |this, _, _, cx| {
-                            this.toggle_runtime_model_favorite(
-                                &favorite_agent_id,
-                                &favorite_model_key,
-                                cx,
+                    let keyboard_selected = keyboard_selection.as_ref().is_some_and(|selection| {
+                        runtime_selection_identity_matches(&choice.selection, selection)
+                    });
+                    let highlighted =
+                        keyboard_selected || (is_selected && keyboard_selection.is_none());
+                    // Only the highlighted row may consume the reveal requests;
+                    // otherwise the first painted row would steal them.
+                    let should_reveal_row = highlighted;
+                    let reveal_workbench = workbench.clone();
+                    let reveal_selection = choice.selection.clone();
+                    let reveal_scroll = provider_scroll.clone();
+                    let model_key = runtime_model_selection_key(&choice.selection.model);
+                    let row_id = format!(
+                        "{menu_prefix}-runtime-grouped-model:{}:{}",
+                        choice.selection.auth_source.id(),
+                        model_key
+                    );
+                    let selection = choice.selection;
+                    let click_selection = selection.clone();
+                    let favorite_agent_id = selection.agent_id.clone();
+                    let favorite_auth_source = selection.auth_source.clone();
+                    let favorite_model_key = model_key.clone();
+                    let is_favorite = is_runtime_model_favorite(
+                        &favorites,
+                        &favorite_agent_id,
+                        &favorite_auth_source,
+                        &favorite_model_key,
+                    );
+                    let icon = selection
+                        .model_id()
+                        .and_then(|model_id| {
+                            model_brand_icon(
+                                model_id,
+                                px(16.0),
+                                Some(cx.theme().foreground.opacity(0.88)),
                             )
-                        }),
-                        cx.entity_id(),
-                        cx,
-                    ));
-                row = row.on_prepaint(move |bounds, window, cx| {
-                    if !should_reveal_row {
-                        return;
-                    }
-                    let should_reveal = reveal_workbench
-                        .update(cx, |this, _| {
-                            this.runtime_provider_reveal_selection
-                                .take_if(|selection| {
-                                    runtime_selection_identity_matches(selection, &reveal_selection)
-                                })
-                                .is_some()
-                                || std::mem::take(&mut this.runtime_provider_scroll_to_selection)
                         })
-                        .unwrap_or(false);
-                    if should_reveal {
-                        scroll_row_into_view(&reveal_scroll, bounds, window);
-                    }
-                });
-                row.into_any_element()
+                        .unwrap_or_else(|| {
+                            new_session_selector_icon(
+                                "icons/vibex/sparkles.svg",
+                                theme::semantic_color("chart-2", cx.theme().is_dark()),
+                            )
+                        });
+                    let background = if is_selected {
+                        selected_background
+                    } else if highlighted {
+                        highlight_background
+                    } else {
+                        hover_blend(&row_id, rest_background, highlight_background)
+                    };
+                    let mut row = div()
+                        .id(SharedString::from(row_id.clone()))
+                        .w_full()
+                        .h(px(COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT))
+                        .flex_none()
+                        .pl(px(28.0))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .bg(background)
+                        .when(is_selected, |this| this.shadow(selected_shadows.clone()))
+                        .cursor_pointer()
+                        .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if new_session {
+                                this.choose_new_session_runtime(
+                                    click_selection.clone(),
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.choose_runtime_selection(click_selection.clone(), window, cx);
+                            }
+                        }))
+                        .child(icon)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(type_scale::menu_row())
+                                .font_medium()
+                                .text_color(cx.theme().foreground)
+                                .child(choice.label.clone()),
+                        )
+                        .when(is_selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        })
+                        .child(runtime_menu_star_toggle(
+                            row_id.clone(),
+                            is_favorite,
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_runtime_model_favorite(
+                                    &favorite_agent_id,
+                                    &favorite_auth_source,
+                                    &favorite_model_key,
+                                    cx,
+                                )
+                            }),
+                            cx.entity_id(),
+                            cx,
+                        ));
+                    row = row.on_prepaint(move |bounds, window, cx| {
+                        if !should_reveal_row {
+                            return;
+                        }
+                        let should_reveal = reveal_workbench
+                            .update(cx, |this, _| {
+                                this.runtime_provider_reveal_selection
+                                    .take_if(|selection| {
+                                        runtime_selection_identity_matches(
+                                            selection,
+                                            &reveal_selection,
+                                        )
+                                    })
+                                    .is_some()
+                                    || std::mem::take(
+                                        &mut this.runtime_provider_scroll_to_selection,
+                                    )
+                            })
+                            .unwrap_or(false);
+                        if should_reveal {
+                            scroll_row_into_view(&reveal_scroll, bounds, window);
+                        }
+                    });
+                    row.into_any_element()
+                })
+                .collect::<Vec<_>>();
+            // An account that cannot authenticate has nothing to list, so its
+            // sign-in action is the group's only row. Keeping it in the body
+            // instead of the accordion header avoids a focusable button nested
+            // inside the header's own trigger.
+            if group.can_authenticate {
+                rows.insert(
+                    0,
+                    Button::new(format!("{heading_key}:sign-in"))
+                        .small()
+                        .ghost()
+                        .w_full()
+                        .h(px(COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT))
+                        .px_2()
+                        .justify_start()
+                        .rounded(px(6.0))
+                        .icon(Icon::new(IconName::User).size(px(14.0)))
+                        .label(locale::text("Sign in", "登录", "登入"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if new_session {
+                                this.navigate_new_session_runtime_menu(
+                                    ComposerRuntimeMenuView::Authentication,
+                                    Some(auth_source.clone()),
+                                    cx,
+                                );
+                            } else {
+                                this.navigate_composer_runtime_menu(
+                                    ComposerRuntimeMenuView::Authentication,
+                                    Some(auth_agent_id.clone()),
+                                    Some(auth_source.clone()),
+                                    cx,
+                                );
+                            }
+                            this.load_runtime_authentication_menu(
+                                auth_agent_id.clone(),
+                                auth_source.clone(),
+                                cx,
+                            );
+                        }))
+                        .into_any_element(),
+                );
+            }
+            let body = v_flex().w_full().children(rows);
+            let rest = rest_background;
+            accordion = accordion.item(move |item| {
+                item.open(open)
+                    .with_size(gpui_component::Size::XSmall)
+                    .bg(rest)
+                    .border_b_0()
+                    .rounded(px(6.0))
+                    .hover(move |style| style.bg(highlight_background))
+                    .title(heading)
+                    .child(body)
             });
-
-            visible_groups.push(
-                v_flex()
-                    .w_full()
-                    .child(heading)
-                    .children(rows)
-                    .into_any_element(),
-            );
         }
 
-        // A hidden group must not look like a route that does not exist: the
-        // count says how many were folded, and the hint says how to see them.
-        if folded_away > 0 {
-            visible_groups.push(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(theme::semantic_color(
-                        "muted-foreground",
-                        cx.theme().is_dark(),
-                    ))
-                    .child(match locale::current_locale() {
-                        locale::ResolvedLocale::En => {
-                            format!("{folded_away} more routes — type to search")
-                        }
-                        locale::ResolvedLocale::ZhCn => {
-                            format!("另有 {folded_away} 条路由 —— 输入以搜索")
-                        }
-                        locale::ResolvedLocale::ZhTw => {
-                            format!("另有 {folded_away} 條路由 —— 輸入以搜尋")
-                        }
-                    })
-                    .into_any_element(),
-            );
+        if !group_keys.is_empty() && !searching {
+            let collapsed_workbench = workbench.clone();
+            let all_keys = group_keys.clone();
+            accordion = accordion.on_toggle_click(move |open_indices, _, cx| {
+                let next = all_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !open_indices.contains(index))
+                    .map(|(_, key)| key.clone())
+                    .collect::<BTreeSet<_>>();
+                let _ = collapsed_workbench.update(cx, |this, cx| {
+                    if this.runtime_provider_collapsed_groups != next {
+                        this.runtime_provider_collapsed_groups = next;
+                        cx.notify();
+                    }
+                });
+            });
         }
 
         let agent_row = self.render_runtime_agent_row(catalog, agent_id, new_session, cx);
@@ -55602,14 +55631,14 @@ impl VibexWorkbench {
                     // as the real scroll driver for keyboard reveal.
                     .overflow_y_scroll()
                     .vertical_scrollbar(&provider_scroll)
-                    .when(visible_groups.is_empty(), |this| {
+                    .when(groups.is_empty(), |this| {
                         this.child(if query.is_empty() {
                             runtime_menu_empty_state(favorites_view, cx)
                         } else {
                             runtime_menu_search_empty_state(&query, cx)
                         })
                     })
-                    .children(visible_groups),
+                    .child(accordion),
             )
             .child(
                 v_flex()
@@ -78020,9 +78049,11 @@ struct RuntimeProviderGroup {
 /// Build the visible provider groups for one query.
 ///
 /// `agent_ids` is the Agent filter — one id normally, every enabled Agent in
-/// the favorites view. `favorites_only` keeps just the starred models. Route
-/// group headings follow `route_group_order`, the order the Agent page's cards
-/// were dragged into; the other source kinds keep their existing order.
+/// the favorites view. `favorites_only` keeps just the starred Agent + source +
+/// model triples. Providers, route groups, and their models are ordered by the
+/// usage counts in `usage`, highest first; `route_group_order` breaks ties
+/// between route groups so the Agent page's drag order still applies when two
+/// routes have been used equally often.
 #[allow(clippy::too_many_arguments)]
 fn runtime_provider_groups_for_query(
     catalog: &SessionRuntimeOptionCatalog,
@@ -78032,29 +78063,32 @@ fn runtime_provider_groups_for_query(
     favorites: &[RuntimeModelFavorite],
     preferred: Option<&SessionRuntimeSelection>,
     remembered: &[SessionRuntimeSelection],
+    usage: &BTreeMap<String, u64>,
     route_group_order: &BTreeMap<String, i64>,
 ) -> Vec<RuntimeProviderGroup> {
     let query = normalized_session_search_query(query);
-    let is_favorite = |agent_id: &AgentId, model_key: &str| {
-        favorites
-            .iter()
-            .any(|favorite| &favorite.agent_id == agent_id && favorite.model_key == model_key)
-    };
-    // The remembered list is most-recent-last and already capped, so it is the
-    // recency list. A model the user chose before is what they are most likely
-    // to choose again, and it belongs above the rest of its group rather than
-    // wherever the Provider happened to list it.
-    let is_recent = |selection: &SessionRuntimeSelection| {
-        remembered
-            .iter()
-            .rev()
-            .any(|recent| runtime_selection_identity_matches(recent, selection))
+    let is_favorite = |agent_id: &AgentId, source: &RuntimeAuthSource, model_key: &str| {
+        is_runtime_model_favorite(favorites, agent_id, source, model_key)
     };
     let mut groups = Vec::new();
     for agent_id in agent_ids {
         let mut sources = runtime_auth_sources_for_agent(catalog, agent_id);
-        // Agent accounts first, then provider profiles alphabetically.
-        sources.sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
+        // Usage frequency leads; Agent accounts then provider profiles by name
+        // break ties so an unused list still reads the same every time.
+        sources.sort_by(|left, right| {
+            runtime_auth_source_use_count(usage, agent_id, &right.source)
+                .cmp(&runtime_auth_source_use_count(
+                    usage,
+                    agent_id,
+                    &left.source,
+                ))
+                .then_with(|| {
+                    (!matches!(left.kind, RuntimeAuthSourceKind::AgentAccount))
+                        .cmp(&!matches!(right.kind, RuntimeAuthSourceKind::AgentAccount))
+                })
+                .then_with(|| left.label.cmp(&right.label))
+                .then_with(|| left.source.cmp(&right.source))
+        });
         for source in sources {
             let model_count = runtime_auth_source_model_count(catalog, agent_id, &source.source);
             if source.kind == RuntimeAuthSourceKind::ProviderProfile && model_count == 0 {
@@ -78069,7 +78103,7 @@ fn runtime_provider_groups_for_query(
                 runtime_model_choices(catalog, agent_id, &source.source, preferred, remembered)
             {
                 let model_key = runtime_model_selection_key(&choice.selection.model);
-                let favorite = is_favorite(agent_id, &model_key);
+                let favorite = is_favorite(agent_id, &source.source, &model_key);
                 if favorites_only && !favorite {
                     continue;
                 }
@@ -78083,21 +78117,21 @@ fn runtime_provider_groups_for_query(
                     )
                 };
                 if let Some(rank) = rank {
-                    // Stars float to the top of their group, then recently used
-                    // models; input order breaks the remaining ties. A search
-                    // term outranks all three, so recency never displaces a
-                    // better match.
-                    let recent = is_recent(&choice.selection);
-                    ranked.push((rank, !favorite, !recent, input_index, choice));
+                    // A search term outranks frequency, then the most-used
+                    // triple leads, and catalogue order breaks the tie.
+                    ranked.push((
+                        rank,
+                        std::cmp::Reverse(runtime_selection_use_count(usage, &choice.selection)),
+                        input_index,
+                        choice,
+                    ));
                 }
                 input_index += 1;
             }
-            ranked.sort_by_key(|(rank, unstarred, unrecent, index, _)| {
-                (*rank, *unstarred, *unrecent, *index)
-            });
+            ranked.sort_by_key(|(rank, usage, index, _)| (*rank, *usage, *index));
             let choices = ranked
                 .into_iter()
-                .map(|(_, _, _, _, choice)| choice)
+                .map(|(_, _, _, choice)| choice)
                 .collect::<Vec<_>>();
             // An Agent account group stays visible with no models so its
             // sign-in affordance remains reachable; provider profiles and the
@@ -78131,12 +78165,87 @@ fn runtime_provider_groups_for_query(
             });
         }
     }
-    // The source list already puts Agent accounts and Provider profiles before
-    // route groups, and each kind in name order. Only the route-group band is
-    // reordered, so dragging on the Agent page cannot shuffle a Provider
-    // heading. `sort_by_key` is stable, which leaves every other band intact.
-    groups.sort_by_key(|group| runtime_provider_group_sort_key(group, route_group_order));
+    // Frequency leads across every source kind. A tie falls back to the
+    // established banding: Agent accounts and Providers before route groups,
+    // with route groups following their saved drag order.
+    groups.sort_by(|left, right| {
+        runtime_auth_source_use_count(usage, &right.agent_id, &right.source.source)
+            .cmp(&runtime_auth_source_use_count(
+                usage,
+                &left.agent_id,
+                &left.source.source,
+            ))
+            .then_with(|| {
+                runtime_provider_group_sort_key(left, route_group_order)
+                    .cmp(&runtime_provider_group_sort_key(right, route_group_order))
+            })
+            .then_with(|| left.source_label.cmp(&right.source_label))
+            .then_with(|| left.source.source.cmp(&right.source.source))
+    });
     groups
+}
+
+/// Stable identity of one provider/route group inside the picker.
+///
+/// One Agent may expose an account, Providers, and routes at once, so the
+/// source id alone is not unique across a favorites view that spans Agents.
+fn runtime_provider_group_key(group: &RuntimeProviderGroup) -> String {
+    format!("{}:{}", group.agent_id.as_str(), group.source.source.id())
+}
+
+/// The brand mark of one provider or route heading.
+///
+/// A Provider's own metadata is not on the runtime summary, so the mark is
+/// resolved from what the catalogue and the loaded Provider list do carry: the
+/// vendor name, the default model, then the configured models. An Agent account
+/// uses the Agent's mark, and a route keeps the branch glyph because it is a
+/// composition rather than a vendor.
+fn runtime_provider_group_icon(
+    group: &RuntimeProviderGroup,
+    profiles: &[ProviderProfileSummary],
+    cx: &App,
+) -> AnyElement {
+    let size = px(16.0);
+    match group.source.kind {
+        RuntimeAuthSourceKind::AgentAccount => {
+            agent_brand_icon(group.agent_id.as_str(), size, None)
+        }
+        RuntimeAuthSourceKind::ModelRoute => new_session_selector_icon(
+            "icons/vibex/git-branch.svg",
+            theme::semantic_color("chart-1", cx.theme().is_dark()),
+        ),
+        RuntimeAuthSourceKind::ProviderProfile => {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id.as_str() == group.source.source.id());
+            let default_model = profile.and_then(|profile| {
+                profile.default_model.as_deref().or_else(|| {
+                    profile
+                        .configured_models
+                        .first()
+                        .map(|model| model.id.as_str())
+                })
+            });
+            let candidates = [
+                Some(group.source_label.as_str()),
+                Some(group.source.label.as_str()),
+                profile.map(|profile| profile.display_name.as_str()),
+                default_model,
+            ];
+            candidates
+                .into_iter()
+                .flatten()
+                .find_map(|candidate| {
+                    model_brand_icon(candidate, size, Some(cx.theme().foreground.opacity(0.88)))
+                })
+                .unwrap_or_else(|| {
+                    new_session_selector_icon(
+                        "icons/vibex/database.svg",
+                        theme::semantic_color("chart-2", cx.theme().is_dark()),
+                    )
+                })
+        }
+    }
 }
 
 /// The sort rank of one provider group.
@@ -78304,6 +78413,11 @@ fn runtime_menu_star_toggle(
             runtime_menu_highlight_background(cx),
         ))
         .on_hover(hover_listener(owner, hover_key.clone()))
+        .aria_label(if starred {
+            locale::text("Unstar model", "取消收藏模型", "取消收藏模型")
+        } else {
+            locale::text("Star model", "收藏模型", "收藏模型")
+        })
         // The row itself is clickable; starring must not also pick the model.
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
@@ -78366,15 +78480,6 @@ fn choice_option_member_count(
         .map(|option| option.member_count.max(1))
         .unwrap_or(1)
 }
-
-/// How many route groups the picker draws before folding the rest away.
-///
-/// The design's threshold is "more than five", with the first four staying — the
-/// fifth row is the one that says how many were folded, so it is not a route.
-/// A search ignores the fold.
-const RUNTIME_ROUTE_GROUP_FOLD: usize = 4;
-/// The count above which the fold engages.
-const RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD: usize = 5;
 
 /// The one line a route's group heading shows.
 ///
@@ -101692,14 +101797,13 @@ mod tests {
         ));
     }
 
-    /// A model the user already chose sits at the top of its group until a
-    /// search term says otherwise.
+    /// The most-used model leads its group until a search term says otherwise.
     ///
-    /// The remembered list is the only recency signal this surface has, and a
-    /// list that re-sorted itself out from under the user on every reopen is
-    /// exactly what it exists to prevent.
+    /// Frequency is the only ordering signal this surface has now that stars
+    /// are scoped to a source: a list that re-sorted itself by recency on every
+    /// reopen is exactly what the counts exist to prevent.
     #[test]
-    fn a_remembered_model_floats_to_the_top_of_its_group() {
+    fn a_frequently_used_model_leads_its_group() {
         let first = new_session_runtime_option("codex", "Codex");
         let mut second = first.clone();
         second.selection.model = RuntimeModelSelection::explicit("codex_model_mini");
@@ -101723,7 +101827,7 @@ mod tests {
             options: vec![first.clone(), second.clone()],
         };
 
-        let models = |remembered: &[SessionRuntimeSelection]| {
+        let models = |usage: &BTreeMap<String, u64>| {
             runtime_provider_groups_for_query(
                 &catalog,
                 std::slice::from_ref(&agent_id),
@@ -101731,7 +101835,8 @@ mod tests {
                 false,
                 &[],
                 None,
-                remembered,
+                &[],
+                usage,
                 &BTreeMap::new(),
             )
             .into_iter()
@@ -101746,19 +101851,29 @@ mod tests {
         };
 
         assert_eq!(
-            models(&[]),
+            models(&BTreeMap::new()),
             vec![
                 "model:codex_model".to_string(),
                 "model:codex_model_mini".to_string()
             ]
         );
+        let usage = BTreeMap::from([
+            (
+                vibex_desktop_model::runtime_selection_usage_key(&second.selection),
+                3,
+            ),
+            (
+                vibex_desktop_model::runtime_selection_usage_key(&first.selection),
+                1,
+            ),
+        ]);
         assert_eq!(
-            models(std::slice::from_ref(&second.selection)),
+            models(&usage),
             vec![
                 "model:codex_model_mini".to_string(),
                 "model:codex_model".to_string()
             ],
-            "the remembered model must lead its group"
+            "the frequently used model must lead its group"
         );
     }
 
@@ -109643,6 +109758,7 @@ mod tests {
             None,
             &[],
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         assert!(
             groups.is_empty(),
@@ -109844,13 +109960,16 @@ mod tests {
         assert!(provider_groups.contains("RuntimeAuthSourceKind::AgentAccount"));
         assert!(provider_groups.contains("sort_by_key"));
         assert!(
-            provider_groups.contains("!matches!(source.kind, RuntimeAuthSourceKind::AgentAccount)")
+            provider_groups.contains("matches!(left.kind, RuntimeAuthSourceKind::AgentAccount)"),
+            "an unused source list still puts Agent accounts before Providers"
         );
+        assert!(provider_groups.contains("runtime_auth_source_use_count"));
+        assert!(provider_groups.contains("runtime_selection_use_count"));
         assert!(provider_groups.contains("RuntimeAuthSourceAvailability::Verifying"));
         assert!(provider_groups.contains("RuntimeAuthSourceAvailability::DiscoveringModels"));
         assert!(
             provider_groups.contains("ranked.sort_by_key"),
-            "search must rank matches and float starred models to the top of their group"
+            "search must rank matches before the frequency ordering"
         );
         assert!(grouped_models.contains("ComposerRuntimeMenuView::Authentication"));
         assert!(grouped_models.contains("load_runtime_authentication_menu("));
@@ -119771,11 +119890,146 @@ mod route_picker_tests {
         assert_eq!(runtime_auth_source_status_label(&source, 4, 1), "4 models");
     }
 
-    /// The fold keeps the picker's height bounded.
+    /// Provider and route groups are accordion items whose open state the
+    /// workbench owns, so a fold survives a re-render and a search can force
+    /// every matching group open.
     #[test]
-    fn the_route_fold_is_five_groups() {
-        assert_eq!(RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD, 5);
-        assert_eq!(RUNTIME_ROUTE_GROUP_FOLD, 4);
+    fn provider_groups_are_controlled_accordion_items() {
+        let source = include_str!("app.rs");
+        let grouped = source
+            .split_once("    fn render_provider_model_groups(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("grouped provider/model renderer should remain inspectable");
+        assert!(
+            grouped
+                .contains("Accordion::new(format!(\"{menu_prefix}-runtime-provider-accordion\"))")
+        );
+        assert!(grouped.contains(".multiple(true)"));
+        assert!(grouped.contains(".bordered(false)"));
+        assert!(grouped.contains(".on_toggle_click(move |open_indices"));
+        assert!(grouped.contains("runtime_provider_collapsed_groups"));
+        assert!(grouped.contains("let open = searching || !collapsed.contains(&group_key);"));
+        assert!(grouped.contains("runtime_provider_group_key(group)"));
+    }
+
+    /// A star belongs to one Agent + source + model triple, and Provider
+    /// headings follow the same frequency counts as their models.
+    #[test]
+    fn favorites_and_frequency_are_scoped_to_one_source() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let profile_a = vibex_core::ProviderProfileId::new();
+        let profile_b = vibex_core::ProviderProfileId::new();
+        let source_a = RuntimeAuthSource::provider_profile(profile_a.clone());
+        let source_b = RuntimeAuthSource::provider_profile(profile_b.clone());
+        let summary = |source: RuntimeAuthSource, label: &str| RuntimeAuthSourceSummary {
+            source,
+            auth_source_revision: 1,
+            agent_id: agent_id.clone(),
+            label: label.to_string(),
+            kind: RuntimeAuthSourceKind::ProviderProfile,
+            availability: RuntimeAuthSourceAvailability::Available,
+            account_hint: None,
+            model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Available,
+            supported_actions: Vec::new(),
+        };
+        let option =
+            |profile_id: vibex_core::ProviderProfileId, label: &str| SessionRuntimeOption {
+                selection: SessionRuntimeSelection::provider(
+                    agent_id.clone(),
+                    profile_id,
+                    "shared-model",
+                ),
+                agent_label: "Codex".to_string(),
+                auth_source_label: label.to_string(),
+                model_label: "Shared".to_string(),
+                reasoning_efforts: Vec::new(),
+                modes: Vec::new(),
+                features: Vec::new(),
+                availability: vibex_core::RuntimeOptionAvailability::Available,
+                member_count: 1,
+                auto_routes: false,
+            };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: vec![
+                summary(source_a.clone(), "Alpha"),
+                summary(source_b.clone(), "Beta"),
+            ],
+            options: vec![
+                option(profile_a.clone(), "Alpha"),
+                option(profile_b.clone(), "Beta"),
+            ],
+        };
+        let favorites = vec![RuntimeModelFavorite::new(
+            agent_id.clone(),
+            source_a.clone(),
+            "model:shared-model",
+        )];
+        let usage = BTreeMap::from([
+            (
+                vibex_desktop_model::runtime_selection_usage_key(&catalog.options[0].selection),
+                1,
+            ),
+            (
+                vibex_desktop_model::runtime_selection_usage_key(&catalog.options[1].selection),
+                5,
+            ),
+        ]);
+        let groups = runtime_provider_groups_for_query(
+            &catalog,
+            std::slice::from_ref(&agent_id),
+            "",
+            false,
+            &favorites,
+            None,
+            &[],
+            &usage,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.source.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Beta", "Alpha"],
+            "the more frequently used Provider leads"
+        );
+
+        let starred = runtime_provider_groups_for_query(
+            &catalog,
+            std::slice::from_ref(&agent_id),
+            "",
+            true,
+            &favorites,
+            None,
+            &[],
+            &usage,
+            &BTreeMap::new(),
+        );
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].source.label, "Alpha");
+        assert_eq!(starred[0].choices.len(), 1);
+
+        let other_favorite = vec![RuntimeModelFavorite::new(
+            agent_id.clone(),
+            source_b,
+            "model:shared-model",
+        )];
+        let starred = runtime_provider_groups_for_query(
+            &catalog,
+            &[agent_id],
+            "",
+            true,
+            &other_favorite,
+            None,
+            &[],
+            &usage,
+            &BTreeMap::new(),
+        );
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].source.label, "Beta");
     }
 
     /// A group's models are filed under the group, not under the gateway.
@@ -119850,6 +120104,7 @@ mod route_picker_tests {
             &[],
             None,
             &[],
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         assert_eq!(

@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vibex_core::{
     AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentToolPreferences, MessageAttachment,
-    PromptId, SessionRuntimeSelection,
+    PromptId, RuntimeAuthSource, RuntimeModelSelection, SessionRuntimeSelection,
 };
 
 use crate::{
@@ -24,6 +24,10 @@ pub const MAX_UI_STATE_WRITE_DELAY_MS: u64 = 300;
 pub const DEFAULT_CORRUPT_BACKUP_LIMIT: usize = 3;
 pub const RUNTIME_SELECTION_PREFERENCE_LIMIT: usize = 256;
 pub const RUNTIME_MODEL_FAVORITE_LIMIT: usize = 256;
+/// Agent + auth source + model triples whose use count is remembered. The
+/// picker's ordering reads these counts; a bounded history keeps the UI-state
+/// file from growing without limit.
+pub const RUNTIME_SELECTION_USAGE_LIMIT: usize = 512;
 pub const KEYBOARD_SHORTCUT_OVERRIDE_LIMIT: usize = 64;
 /// Messages the persisted pre-send queue may hold. The queue is a handful of
 /// messages the reader lined up, not a second message history.
@@ -1209,25 +1213,176 @@ pub enum SessionContentWidthMode {
     Full,
 }
 
-/// One starred model in the provider/model picker.
+/// One starred Agent + auth source + model triple in the provider/model
+/// picker.
 ///
-/// Keyed by Agent plus the picker's own model key rather than by an auth
-/// source: a star follows the model across the account and provider-profile
-/// entries that may advertise it.
+/// A star belongs to the exact source that serves the model: the same model
+/// under another Provider, account, or route is a different choice, because
+/// those choices can differ in Key, price, and failover. `auth_source` is
+/// optional only so a state file written before the star was scoped still
+/// deserializes; those legacy entries never match a row and are dropped by
+/// [`DesktopUiStateV1::normalize`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeModelFavorite {
     pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<RuntimeAuthSource>,
     pub model_key: String,
 }
 
 impl RuntimeModelFavorite {
-    pub fn new(agent_id: impl Into<AgentId>, model_key: impl Into<String>) -> Self {
+    pub fn new(
+        agent_id: impl Into<AgentId>,
+        auth_source: RuntimeAuthSource,
+        model_key: impl Into<String>,
+    ) -> Self {
         Self {
             agent_id: agent_id.into(),
+            auth_source: Some(auth_source),
             model_key: model_key.into(),
         }
     }
+
+    pub fn matches(
+        &self,
+        agent_id: &AgentId,
+        auth_source: &RuntimeAuthSource,
+        model_key: &str,
+    ) -> bool {
+        &self.agent_id == agent_id
+            && self.auth_source.as_ref() == Some(auth_source)
+            && self.model_key == model_key
+    }
+}
+
+/// Whether `selection`'s Agent + source + model triple is starred.
+pub fn is_runtime_model_favorite(
+    favorites: &[RuntimeModelFavorite],
+    agent_id: &AgentId,
+    auth_source: &RuntimeAuthSource,
+    model_key: &str,
+) -> bool {
+    favorites
+        .iter()
+        .any(|favorite| favorite.matches(agent_id, auth_source, model_key))
+}
+
+/// Star/unstar one Agent + source + model triple. Returns `true` when the
+/// triple is starred afterwards. A new star past
+/// [`RUNTIME_MODEL_FAVORITE_LIMIT`] evicts the oldest entry so the persisted
+/// list stays bounded.
+pub fn toggle_runtime_model_favorite(
+    favorites: &mut Vec<RuntimeModelFavorite>,
+    agent_id: &AgentId,
+    auth_source: &RuntimeAuthSource,
+    model_key: &str,
+) -> bool {
+    if let Some(index) = favorites
+        .iter()
+        .position(|favorite| favorite.matches(agent_id, auth_source, model_key))
+    {
+        favorites.remove(index);
+        return false;
+    }
+    while favorites.len() >= RUNTIME_MODEL_FAVORITE_LIMIT {
+        favorites.remove(0);
+    }
+    favorites.push(RuntimeModelFavorite::new(
+        agent_id.clone(),
+        auth_source.clone(),
+        model_key,
+    ));
+    true
+}
+
+/// Stable key of one Agent + auth source + model triple.
+///
+/// The unit separator cannot appear in an Agent, source, or model id, so the
+/// key round-trips without the ambiguity a colon join has when a model id
+/// already contains one.
+pub fn runtime_selection_usage_key(selection: &SessionRuntimeSelection) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        selection.agent_id.as_str(),
+        runtime_auth_source_usage_key(&selection.auth_source),
+        runtime_model_usage_key(&selection.model)
+    )
+}
+
+fn runtime_auth_source_usage_key(source: &RuntimeAuthSource) -> String {
+    match source {
+        RuntimeAuthSource::ProviderProfile {
+            provider_profile_id,
+        } => format!("provider:{}", provider_profile_id.as_str()),
+        RuntimeAuthSource::AgentAccount { auth_context_id } => {
+            format!("account:{}", auth_context_id.as_str())
+        }
+        RuntimeAuthSource::ModelRoute { model_route_id } => {
+            format!("route:{}", model_route_id.as_str())
+        }
+    }
+}
+
+fn runtime_model_usage_key(model: &RuntimeModelSelection) -> String {
+    match model {
+        RuntimeModelSelection::Explicit { model_id } => format!("model:{model_id}"),
+        RuntimeModelSelection::AgentDefault => "agent-default".to_string(),
+    }
+}
+
+/// Record one user choice of a triple.
+pub fn record_runtime_selection_use(
+    usage: &mut BTreeMap<String, u64>,
+    selection: &SessionRuntimeSelection,
+) {
+    let key = runtime_selection_usage_key(selection);
+    let count = usage.entry(key).or_insert(0);
+    *count = count.saturating_add(1);
+    if usage.len() > RUNTIME_SELECTION_USAGE_LIMIT {
+        // Evict the least-used entries rather than the oldest: the map has no
+        // insertion order, and a rarely used model is the one worth forgetting.
+        let mut counts = usage
+            .iter()
+            .map(|(key, count)| (key.clone(), *count))
+            .collect::<Vec<_>>();
+        counts.sort_by_key(|(_, count)| *count);
+        for (key, _) in counts
+            .into_iter()
+            .take(usage.len().saturating_sub(RUNTIME_SELECTION_USAGE_LIMIT))
+        {
+            usage.remove(&key);
+        }
+    }
+}
+
+/// How often one Agent + source + model triple was chosen.
+pub fn runtime_selection_use_count(
+    usage: &BTreeMap<String, u64>,
+    selection: &SessionRuntimeSelection,
+) -> u64 {
+    usage
+        .get(&runtime_selection_usage_key(selection))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// How often any model of one Agent + auth source was chosen.
+pub fn runtime_auth_source_use_count(
+    usage: &BTreeMap<String, u64>,
+    agent_id: &AgentId,
+    auth_source: &RuntimeAuthSource,
+) -> u64 {
+    let prefix = format!(
+        "{}\u{1f}{}\u{1f}",
+        agent_id.as_str(),
+        runtime_auth_source_usage_key(auth_source)
+    );
+    usage
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, count)| *count)
+        .sum()
 }
 
 /// One message the Composer has queued but not sent yet.
@@ -1296,10 +1451,16 @@ pub struct ComposerUiState {
     pub runtime_selections_by_model: Vec<SessionRuntimeSelection>,
     #[serde(default)]
     pub default_runtime_selection: Option<SessionRuntimeSelection>,
-    /// Starred models, oldest first. Order is the tie-break inside the
-    /// favorites view, so it is preserved rather than sorted.
+    /// Starred Agent + auth source + model triples, oldest first. Order is the
+    /// tie-break inside the favorites view, so it is preserved rather than
+    /// sorted.
     #[serde(default)]
     pub favorite_runtime_models: Vec<RuntimeModelFavorite>,
+    /// How many times each Agent + auth source + model triple has been chosen.
+    /// The picker orders Providers, routes, and models by these counts, highest
+    /// first.
+    #[serde(default)]
+    pub runtime_selection_usage: BTreeMap<String, u64>,
     #[serde(default)]
     pub queue_send_mode: ComposerQueueSendMode,
     #[serde(default)]
@@ -1318,30 +1479,52 @@ pub struct ComposerUiState {
 }
 
 impl ComposerUiState {
-    pub fn is_runtime_model_favorite(&self, agent_id: &AgentId, model_key: &str) -> bool {
-        self.favorite_runtime_models
-            .iter()
-            .any(|favorite| &favorite.agent_id == agent_id && favorite.model_key == model_key)
+    pub fn is_runtime_model_favorite(
+        &self,
+        agent_id: &AgentId,
+        auth_source: &RuntimeAuthSource,
+        model_key: &str,
+    ) -> bool {
+        is_runtime_model_favorite(
+            &self.favorite_runtime_models,
+            agent_id,
+            auth_source,
+            model_key,
+        )
     }
 
-    /// Star/unstar one model. Returns `true` when the model is starred
-    /// afterwards. A new star past [`RUNTIME_MODEL_FAVORITE_LIMIT`] evicts the
-    /// oldest entry so the persisted list stays bounded.
-    pub fn toggle_runtime_model_favorite(&mut self, agent_id: &AgentId, model_key: &str) -> bool {
-        let existing = self
-            .favorite_runtime_models
-            .iter()
-            .position(|favorite| &favorite.agent_id == agent_id && favorite.model_key == model_key);
-        if let Some(index) = existing {
-            self.favorite_runtime_models.remove(index);
-            return false;
-        }
-        while self.favorite_runtime_models.len() >= RUNTIME_MODEL_FAVORITE_LIMIT {
-            self.favorite_runtime_models.remove(0);
-        }
-        self.favorite_runtime_models
-            .push(RuntimeModelFavorite::new(agent_id.clone(), model_key));
-        true
+    /// Star/unstar one Agent + auth source + model triple. Returns `true` when
+    /// the triple is starred afterwards.
+    pub fn toggle_runtime_model_favorite(
+        &mut self,
+        agent_id: &AgentId,
+        auth_source: &RuntimeAuthSource,
+        model_key: &str,
+    ) -> bool {
+        toggle_runtime_model_favorite(
+            &mut self.favorite_runtime_models,
+            agent_id,
+            auth_source,
+            model_key,
+        )
+    }
+
+    /// Record one user choice of a triple, feeding the picker's frequency
+    /// ordering.
+    pub fn record_runtime_selection_use(&mut self, selection: &SessionRuntimeSelection) {
+        record_runtime_selection_use(&mut self.runtime_selection_usage, selection);
+    }
+
+    pub fn runtime_selection_use_count(&self, selection: &SessionRuntimeSelection) -> u64 {
+        runtime_selection_use_count(&self.runtime_selection_usage, selection)
+    }
+
+    pub fn runtime_auth_source_use_count(
+        &self,
+        agent_id: &AgentId,
+        auth_source: &RuntimeAuthSource,
+    ) -> u64 {
+        runtime_auth_source_use_count(&self.runtime_selection_usage, agent_id, auth_source)
     }
 }
 
@@ -1750,6 +1933,33 @@ impl DesktopUiStateV1 {
             runtime_selections_by_model.push(selection);
         }
         self.composer.runtime_selections_by_model = runtime_selections_by_model;
+        // A star is an Agent + source + model triple now. A legacy entry has no
+        // source and can never match a row, so it is discarded instead of
+        // silently starring the same model under every Provider.
+        let mut seen_favorites = BTreeSet::new();
+        self.composer.favorite_runtime_models =
+            std::mem::take(&mut self.composer.favorite_runtime_models)
+                .into_iter()
+                .filter(|favorite| {
+                    favorite.auth_source.is_some()
+                        && !favorite.model_key.is_empty()
+                        && favorite.model_key.len() <= 256
+                })
+                .filter(|favorite| {
+                    seen_favorites.insert((
+                        favorite.agent_id.clone(),
+                        favorite.auth_source.clone(),
+                        favorite.model_key.clone(),
+                    ))
+                })
+                .take(RUNTIME_MODEL_FAVORITE_LIMIT)
+                .collect();
+        self.composer.runtime_selection_usage =
+            std::mem::take(&mut self.composer.runtime_selection_usage)
+                .into_iter()
+                .filter(|(key, count)| !key.is_empty() && key.len() <= 512 && *count > 0)
+                .take(RUNTIME_SELECTION_USAGE_LIMIT)
+                .collect();
         self.composer.default_runtime_selection = self
             .composer
             .default_runtime_selection
@@ -2573,40 +2783,72 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn runtime_model_favorites_toggle_per_agent_and_model() {
+    fn runtime_model_favorites_are_scoped_to_the_agent_source_and_model() {
         let mut composer = ComposerUiState::default();
         let claude = AgentId::parse("claude").expect("agent id");
         let codex = AgentId::parse("codex").expect("agent id");
+        let account = RuntimeAuthSource::agent_account(vibex_core::AgentAuthContextId::new());
+        let provider = RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new());
 
-        assert!(!composer.is_runtime_model_favorite(&claude, "model:opus"));
-        assert!(composer.toggle_runtime_model_favorite(&claude, "model:opus"));
-        assert!(composer.is_runtime_model_favorite(&claude, "model:opus"));
-        // The same model id under another Agent is a different star.
-        assert!(!composer.is_runtime_model_favorite(&codex, "model:opus"));
-        assert!(composer.toggle_runtime_model_favorite(&codex, "model:opus"));
+        assert!(!composer.is_runtime_model_favorite(&claude, &account, "model:opus"));
+        assert!(composer.toggle_runtime_model_favorite(&claude, &account, "model:opus"));
+        assert!(composer.is_runtime_model_favorite(&claude, &account, "model:opus"));
+        // The same model id under another source is a different star.
+        assert!(!composer.is_runtime_model_favorite(&claude, &provider, "model:opus"));
+        assert!(composer.toggle_runtime_model_favorite(&claude, &provider, "model:opus"));
+        // The same source and model under another Agent is a different star.
+        assert!(!composer.is_runtime_model_favorite(&codex, &account, "model:opus"));
+        assert!(composer.toggle_runtime_model_favorite(&codex, &account, "model:opus"));
+        assert_eq!(composer.favorite_runtime_models.len(), 3);
+        assert!(!composer.toggle_runtime_model_favorite(&claude, &account, "model:opus"));
         assert_eq!(composer.favorite_runtime_models.len(), 2);
-        assert!(!composer.toggle_runtime_model_favorite(&claude, "model:opus"));
-        assert_eq!(composer.favorite_runtime_models.len(), 1);
-        assert!(composer.is_runtime_model_favorite(&codex, "model:opus"));
+        assert!(composer.is_runtime_model_favorite(&codex, &account, "model:opus"));
     }
 
     #[test]
     fn runtime_model_favorites_stay_bounded_and_keep_insertion_order() {
         let mut composer = ComposerUiState::default();
         let agent = AgentId::parse("claude").expect("agent id");
+        let source = RuntimeAuthSource::agent_account(vibex_core::AgentAuthContextId::new());
         for index in 0..RUNTIME_MODEL_FAVORITE_LIMIT + 3 {
-            composer.toggle_runtime_model_favorite(&agent, &format!("model:{index}"));
+            composer.toggle_runtime_model_favorite(&agent, &source, &format!("model:{index}"));
         }
         assert_eq!(
             composer.favorite_runtime_models.len(),
             RUNTIME_MODEL_FAVORITE_LIMIT
         );
         // The oldest stars are evicted first, so the newest one survives.
-        assert!(!composer.is_runtime_model_favorite(&agent, "model:0"));
+        assert!(!composer.is_runtime_model_favorite(&agent, &source, "model:0"));
         assert!(composer.is_runtime_model_favorite(
             &agent,
+            &source,
             &format!("model:{}", RUNTIME_MODEL_FAVORITE_LIMIT + 2)
         ));
+    }
+
+    #[test]
+    fn runtime_selection_usage_counts_sources_and_models() {
+        let mut composer = ComposerUiState::default();
+        let agent = AgentId::parse("claude").expect("agent id");
+        let provider = RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new());
+        let other = RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new());
+        let selection = |model: &str| SessionRuntimeSelection {
+            auth_source: provider.clone(),
+            ..SessionRuntimeSelection::provider(
+                agent.clone(),
+                vibex_core::ProviderProfileId::parse("provider_unused").unwrap(),
+                model,
+            )
+        };
+        composer.record_runtime_selection_use(&selection("model:opus"));
+        composer.record_runtime_selection_use(&selection("model:opus"));
+        composer.record_runtime_selection_use(&selection("model:sonnet"));
+        assert_eq!(
+            composer.runtime_selection_use_count(&selection("model:opus")),
+            2
+        );
+        assert_eq!(composer.runtime_auth_source_use_count(&agent, &provider), 3);
+        assert_eq!(composer.runtime_auth_source_use_count(&agent, &other), 0);
     }
 
     /// The pre-send queue is shell state like any other: it has to survive a

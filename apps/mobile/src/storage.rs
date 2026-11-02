@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,10 @@ use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
     AgentTimelineReasoningDisplayMode, RemoteServerKind, TimelineItem, VibexSessionId,
 };
-use vibex_desktop_model::ThemeSelection;
+use vibex_desktop_model::{
+    RUNTIME_MODEL_FAVORITE_LIMIT, RUNTIME_SELECTION_USAGE_LIMIT, RuntimeModelFavorite,
+    ThemeSelection,
+};
 use vibex_remote_client::ClientDeviceIdentity;
 
 use crate::pairing::MobileCredentialBundle;
@@ -30,13 +33,18 @@ const MAX_TIMELINE_DISPLAY_SETTINGS_BYTES: u64 = 128 * 1024;
 const MAX_TIMELINE_DISPLAY_SETTINGS_OVERRIDES: usize = 32;
 const MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES: usize = 256;
 const APP_SETTINGS_FILE: &str = "app-settings.json";
-const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v2";
+const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v3";
 /// The v1 settings file carries the notification switches that the build which
 /// wrote it derived from `Default`, which was `false` for all four. It is still
 /// read, so a phone that upgraded keeps its appearance and language, but the
 /// switches are not carried over — see [`CredentialStorage::load_app_settings`].
 const APP_SETTINGS_SCHEMA_VERSION_V1: &str = "vibex-native-mobile-app-settings.v1";
-const MAX_APP_SETTINGS_BYTES: u64 = 4 * 1024;
+/// The v2 file is the same record without the picker's stars and usage counts.
+const APP_SETTINGS_SCHEMA_VERSION_V2: &str = "vibex-native-mobile-app-settings.v2";
+/// Stars and frequency counts live beside the settings, so the bound has to
+/// cover a full favourites list and a bounded usage table rather than only the
+/// handful of switches it held before.
+const MAX_APP_SETTINGS_BYTES: u64 = 256 * 1024;
 /// The summary window of the sessions this phone opened last, kept so a cold
 /// start paints the conversation before the network answers. One file rather
 /// than one per session: the set is small and bounded, and eviction has to see
@@ -184,6 +192,13 @@ pub struct AppSettings {
     pub notify_completed: bool,
     pub notify_needs_input: bool,
     pub notify_failed: bool,
+    /// Starred Agent + auth source + model triples, oldest first. The picker
+    /// keeps them on the phone because the desktop's own stars travel through
+    /// the UI-state projection, which a remote client cannot write.
+    pub favorite_runtime_models: Vec<RuntimeModelFavorite>,
+    /// How often each Agent + auth source + model triple has been chosen. The
+    /// picker orders Providers, routes, and models by these counts.
+    pub runtime_selection_usage: BTreeMap<String, u64>,
 }
 
 /// What a phone with no stored settings file starts on.
@@ -207,6 +222,8 @@ impl Default for AppSettings {
             notify_completed: true,
             notify_needs_input: true,
             notify_failed: true,
+            favorite_runtime_models: Vec::new(),
+            runtime_selection_usage: BTreeMap::new(),
         }
     }
 }
@@ -237,6 +254,10 @@ struct StoredAppSettings {
     notify_needs_input: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notify_failed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    favorite_runtime_models: Vec<RuntimeModelFavorite>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    runtime_selection_usage: BTreeMap<String, u64>,
 }
 
 /// One paired runtime: the credential plus the mobile-owned metadata the
@@ -768,6 +789,7 @@ impl CredentialStorage {
             Err(_) => return self.reject_invalid_app_settings(&path),
         };
         if stored.schema_version != APP_SETTINGS_SCHEMA_VERSION
+            && stored.schema_version != APP_SETTINGS_SCHEMA_VERSION_V2
             && stored.schema_version != APP_SETTINGS_SCHEMA_VERSION_V1
         {
             return self.reject_invalid_app_settings(&path);
@@ -779,7 +801,7 @@ impl CredentialStorage {
         // every switch that reads as a choice — a file with the master on, or
         // with only some categories off, is left exactly as stored — and
         // repairs only the all-off shape the bug produced. Once anything is
-        // saved the file is v2 and this never runs again.
+        // saved the file is v3 and this never runs again.
         let carries_derived_notification_defaults = stored.schema_version
             == APP_SETTINGS_SCHEMA_VERSION_V1
             && stored.notifications == Some(false)
@@ -807,6 +829,30 @@ impl CredentialStorage {
                 _ => return self.reject_invalid_app_settings(&path),
             },
         };
+        let mut seen_favorites = BTreeSet::new();
+        let favorite_runtime_models = stored
+            .favorite_runtime_models
+            .into_iter()
+            .filter(|favorite| {
+                favorite.auth_source.is_some()
+                    && !favorite.model_key.is_empty()
+                    && favorite.model_key.len() <= 256
+            })
+            .filter(|favorite| {
+                seen_favorites.insert((
+                    favorite.agent_id.clone(),
+                    favorite.auth_source.clone(),
+                    favorite.model_key.clone(),
+                ))
+            })
+            .take(RUNTIME_MODEL_FAVORITE_LIMIT)
+            .collect::<Vec<_>>();
+        let runtime_selection_usage = stored
+            .runtime_selection_usage
+            .into_iter()
+            .filter(|(key, count)| !key.is_empty() && key.len() <= 512 && *count > 0)
+            .take(RUNTIME_SELECTION_USAGE_LIMIT)
+            .collect::<BTreeMap<_, _>>();
         Ok(AppSettings {
             theme,
             language,
@@ -825,6 +871,8 @@ impl CredentialStorage {
             notify_completed: notification_switch(stored.notify_completed),
             notify_needs_input: notification_switch(stored.notify_needs_input),
             notify_failed: notification_switch(stored.notify_failed),
+            favorite_runtime_models,
+            runtime_selection_usage,
         })
     }
 
@@ -847,6 +895,8 @@ impl CredentialStorage {
             notify_completed: Some(settings.notify_completed),
             notify_needs_input: Some(settings.notify_needs_input),
             notify_failed: Some(settings.notify_failed),
+            favorite_runtime_models: settings.favorite_runtime_models.clone(),
+            runtime_selection_usage: settings.runtime_selection_usage.clone(),
         };
         let encoded = serde_json::to_vec(&stored)
             .map_err(|_| storage_error("mobile_app_settings_encode_failed"))?;
@@ -1607,9 +1657,23 @@ mod tests {
         let storage = CredentialStorage::new(temp.path().to_path_buf());
         assert_eq!(storage.load_app_settings().unwrap(), AppSettings::default());
 
+        let selection = vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
         let settings = AppSettings {
             theme: Some(crate::theme::AppearanceMode::Light),
             language: Some(crate::locale::LanguagePreference::ZhCn),
+            favorite_runtime_models: vec![RuntimeModelFavorite::new(
+                selection.agent_id.clone(),
+                selection.auth_source.clone(),
+                "model:gpt-5",
+            )],
+            runtime_selection_usage: BTreeMap::from([(
+                vibex_desktop_model::runtime_selection_usage_key(&selection),
+                3,
+            )]),
             ..AppSettings::default()
         };
         storage.save_app_settings(&settings).unwrap();

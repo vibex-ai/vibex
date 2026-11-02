@@ -58,6 +58,8 @@ use vibex_desktop_model::{
     SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor, SidebarState,
     ThemeSelection, TimelineAnchorSpan, TimelineConversationTurn, TimelineModel,
     TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, WorktreeLifecycleDisplayState,
+    is_runtime_model_favorite, record_runtime_selection_use, runtime_auth_source_use_count,
+    runtime_selection_use_count, toggle_runtime_model_favorite,
 };
 use vibex_remote_client::{
     ClientDeviceIdentity, RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend,
@@ -93,6 +95,7 @@ use crate::toast::{Hint, Tone};
 use crate::touch_selection::TouchToolbar;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme, toast, update};
+use gpui_component::accordion::Accordion;
 use gpui_component::avatar::Avatar;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
@@ -101,7 +104,7 @@ use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
 use gpui_component::progress::ProgressCircle;
 use gpui_component::shimmer::ShimmerText;
-use gpui_component::{Disableable as _, Icon, Sizable as _, StyledExt as _};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, StyledExt as _};
 
 /// How long a released press still counts as the hold that just fired.
 ///
@@ -2063,6 +2066,12 @@ pub struct MobileApp {
     /// Re-renders the sheet while the model search changes, so the list below
     /// filters as the user types.
     runtime_sheet_search_subscription: Option<gpui::Subscription>,
+    /// Whether the picker is scoped to starred Agent + source + model triples
+    /// across every Agent instead of the current Agent's providers.
+    runtime_favorites_only: bool,
+    /// Provider and route groups the reader folded away, keyed by
+    /// `agent_id:source_id`. Missing means open.
+    runtime_collapsed_groups: BTreeSet<String>,
     /// Desktop agent snapshots keyed by id, providing the labels the desktop
     /// uses for brand lookup.
     runtime_agent_labels: BTreeMap<AgentId, String>,
@@ -4159,6 +4168,8 @@ impl MobileApp {
             runtime_draft: None,
             runtime_sheet_search: None,
             runtime_sheet_search_subscription: None,
+            runtime_favorites_only: false,
+            runtime_collapsed_groups: BTreeSet::new(),
             runtime_agent_labels: BTreeMap::new(),
             runtime_agent_order: Vec::new(),
             runtime_agent_strip_scroll: ScrollHandle::new(),
@@ -6780,10 +6791,33 @@ impl MobileApp {
         if self.runtime_switch_busy_generation.is_some() {
             return;
         }
-        self.runtime_draft = Some(selection);
+        self.runtime_draft = Some(selection.clone());
         self.runtime_switch_error = None;
+        record_runtime_selection_use(&mut self.app_settings.runtime_selection_usage, &selection);
+        self.persist_app_settings(cx);
         self.sync_runtime_feature_inputs();
         self.commit_runtime_draft(cx);
+        cx.notify();
+    }
+
+    /// Star/unstar one Agent + source + model triple.
+    ///
+    /// The star belongs to the exact source that serves the model, so two
+    /// Providers advertising the same model id keep independent stars.
+    fn toggle_runtime_model_favorite(
+        &mut self,
+        agent_id: &AgentId,
+        auth_source: &vibex_core::RuntimeAuthSource,
+        model_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        toggle_runtime_model_favorite(
+            &mut self.app_settings.favorite_runtime_models,
+            agent_id,
+            auth_source,
+            model_key,
+        );
+        self.persist_app_settings(cx);
         cx.notify();
     }
 
@@ -19459,6 +19493,7 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let agents = self.runtime_agent_strip_agents(catalog);
         let draft_agent = draft.map(|draft| draft.agent_id.clone());
+        let favorites_only = self.runtime_favorites_only;
         let frame = self.runtime_agent_strip_frame.clone();
         div()
             .on_children_prepainted(move |bounds, _, _| {
@@ -19484,8 +19519,52 @@ impl MobileApp {
                     .items_center()
                     .gap_1()
                     .px_2()
+                    .child(
+                        div()
+                            .id("runtime-agent-starred")
+                            .relative()
+                            .flex_shrink_0()
+                            .w(px(40.0))
+                            .h(px(40.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(favorites_only, |tab| tab.bg(theme::bg_card_dim()))
+                            .when(!busy, |tab| {
+                                tab.cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.runtime_favorites_only =
+                                                !this.runtime_favorites_only;
+                                            cx.notify();
+                                        }),
+                                    )
+                            })
+                            .aria_label(locale::text(
+                                "Starred models",
+                                "已收藏的模型",
+                                "已收藏的模型",
+                            ))
+                            .child(
+                                Icon::new(if favorites_only {
+                                    IconName::StarFill
+                                } else {
+                                    IconName::Star
+                                })
+                                .size(px(18.0))
+                                .text_color(if favorites_only {
+                                    theme::text_primary()
+                                } else {
+                                    theme::text_secondary()
+                                }),
+                            )
+                            .when(favorites_only, |tab| tab.child(runtime_tab_indicator())),
+                    )
                     .children(agents.into_iter().map(|(agent_id, label)| {
-                        let selected = draft_agent.as_ref() == Some(&agent_id);
+                        let selected = !favorites_only && draft_agent.as_ref() == Some(&agent_id);
                         let tab_agent_id = agent_id.clone();
                         div()
                             .id(format!("runtime-agent-tab:{}", agent_id.as_str()))
@@ -19504,6 +19583,7 @@ impl MobileApp {
                                     .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
+                                            this.runtime_favorites_only = false;
                                             this.choose_runtime_agent(tab_agent_id.clone(), cx)
                                         }),
                                     )
@@ -19665,147 +19745,282 @@ impl MobileApp {
                 ))
                 .into_any_element();
         };
-        let agent_id = draft.agent_id.clone();
-
-        let mut sources = catalog
-            .auth_sources
+        let favorites_view = self.runtime_favorites_only;
+        let favorites = self.app_settings.favorite_runtime_models.clone();
+        let usage = self.app_settings.runtime_selection_usage.clone();
+        let agent_entries = self.runtime_agent_strip_agents(Some(catalog));
+        let agent_labels = agent_entries
             .iter()
-            .filter(|source| source.agent_id == agent_id)
             .cloned()
-            .collect::<Vec<_>>();
-        sources.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.label.cmp(&right.label))
-                .then_with(|| left.source.cmp(&right.source))
-        });
-
-        let mut groups = Vec::new();
-        for source in sources {
-            let options = catalog
-                .options
+            .collect::<BTreeMap<AgentId, String>>();
+        let agent_ids = if favorites_view {
+            agent_entries
                 .iter()
-                .filter(|option| {
-                    option.availability == RuntimeOptionAvailability::Available
-                        && option.selection.agent_id == agent_id
-                        && option.selection.auth_source == source.source
-                })
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![draft.agent_id.clone()]
+        };
+        let searching = !query.is_empty();
+        let collapsed = self.runtime_collapsed_groups.clone();
+        let workbench = cx.weak_entity();
+        let mut group_keys = Vec::new();
+        let mut accordion = Accordion::new("mobile-runtime-provider-accordion")
+            .multiple(true)
+            .bordered(false)
+            .w_full()
+            .h_auto()
+            .flex_shrink_0();
+
+        for agent_id in &agent_ids {
+            let mut sources = catalog
+                .auth_sources
+                .iter()
+                .filter(|source| &source.agent_id == agent_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            let source_matches = query.is_empty()
-                || source.label.to_lowercase().contains(&query)
-                || runtime_auth_source_display_label(&source)
-                    .to_lowercase()
-                    .contains(&query);
-            let models = options
-                .iter()
-                .filter(|option| {
-                    source_matches || option.model_label.to_lowercase().contains(&query)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if !source_matches && models.is_empty() {
-                continue;
-            }
+            sources.sort_by(|left, right| {
+                runtime_auth_source_use_count(&usage, agent_id, &right.source)
+                    .cmp(&runtime_auth_source_use_count(
+                        &usage,
+                        agent_id,
+                        &left.source,
+                    ))
+                    .then_with(|| left.kind.cmp(&right.kind))
+                    .then_with(|| left.label.cmp(&right.label))
+                    .then_with(|| left.source.cmp(&right.source))
+            });
 
-            let status = runtime_auth_source_status_label(
-                source.availability,
-                models.len().max(options.len()),
-            );
-            let source_id = source.source.id().to_string();
-            let (heading_icon, heading_color) = match source.kind {
-                RuntimeAuthSourceKind::ProviderProfile => {
-                    ("icons/database.svg", theme::accent_green())
+            for source in sources {
+                let options = catalog
+                    .options
+                    .iter()
+                    .filter(|option| {
+                        option.availability == RuntimeOptionAvailability::Available
+                            && option.selection.agent_id == *agent_id
+                            && option.selection.auth_source == source.source
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let source_matches = query.is_empty()
+                    || source.label.to_lowercase().contains(&query)
+                    || runtime_auth_source_display_label(&source)
+                        .to_lowercase()
+                        .contains(&query);
+                let mut models = options
+                    .iter()
+                    .filter(|option| {
+                        let model_key = runtime_model_selection_key(&option.selection.model);
+                        let favorite = is_runtime_model_favorite(
+                            &favorites,
+                            agent_id,
+                            &source.source,
+                            &model_key,
+                        );
+                        (!favorites_view || favorite)
+                            && (source_matches
+                                || option.model_label.to_lowercase().contains(&query))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                models.sort_by_key(|option| {
+                    std::cmp::Reverse(runtime_selection_use_count(&usage, &option.selection))
+                });
+                if models.is_empty() && (favorites_view || !source_matches) {
+                    continue;
                 }
-                RuntimeAuthSourceKind::AgentAccount => ("icons/user.svg", theme::accent_chart3()),
-                // A route is a saved composition, so it reads like a Provider
-                // group rather than an account.
-                RuntimeAuthSourceKind::ModelRoute => ("icons/database.svg", theme::accent_green()),
-            };
-            let group = div()
-                .child(
-                    div()
-                        .h(px(34.0))
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            svg()
-                                .path(heading_icon)
-                                .size(px(15.0))
-                                .text_color(heading_color),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(theme::font_caption())
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::sidebar_foreground(0.84))
-                                .child(runtime_auth_source_display_label(&source)),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_muted())
-                                .child(status),
-                        ),
-                )
-                .children(models.into_iter().map(|option| {
-                    let selection = option.selection.clone();
-                    let is_selected = runtime_option_matches(&option, draft);
-                    let model_id = selection.model_id().map(str::to_string);
-                    let row_id = format!(
-                        "runtime-model:{}:{}",
-                        source_id,
-                        runtime_model_selection_key(&selection.model)
-                    );
-                    runtime_sheet_row(
-                        row_id,
-                        runtime_model_icon(
-                            model_id.as_deref(),
-                            px(theme::ICON_SM + 2.0),
-                            theme::text_primary(),
-                        ),
-                        option.model_label.clone(),
-                        is_selected,
-                        false,
+
+                let status = runtime_auth_source_status_label(
+                    source.availability,
+                    if favorites_view {
+                        models.len()
+                    } else {
+                        options.len().max(models.len())
+                    },
+                );
+                let source_id = source.source.id().to_string();
+                let source_label = runtime_auth_source_display_label(&source);
+                let heading_label = if favorites_view {
+                    let agent_label = agent_labels
+                        .get(agent_id)
+                        .cloned()
+                        .unwrap_or_else(|| agent_id.as_str().to_string());
+                    format!("{agent_label} · {source_label}")
+                } else {
+                    source_label
+                };
+                let group_key = format!("{}:{source_id}", agent_id.as_str());
+                group_keys.push(group_key.clone());
+                let open = searching || !collapsed.contains(&group_key);
+                let model_ids = options
+                    .iter()
+                    .filter_map(|option| option.selection.model_id())
+                    .collect::<Vec<_>>();
+                let heading = div()
+                    .h(px(40.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(runtime_provider_icon(
+                        &source,
+                        model_ids.first().copied(),
+                        px(16.0),
+                        theme::text_primary(),
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_caption())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::sidebar_foreground(0.84))
+                            .child(heading_label),
                     )
-                    .pl(px(28.0))
-                    .pr_3()
-                    .when(!busy, |row| {
-                        row.cursor_pointer()
-                            .active(|style| style.bg(theme::row_active_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let selection = selection.clone();
-                                    move |this, _, _, cx| {
-                                        this.choose_runtime_selection(selection.clone(), cx);
-                                        // A chosen model is the end of this
-                                        // drawer's visit: the chip under it
-                                        // names the answer, and the list would
-                                        // only cover the page that shows it.
-                                        this.close_sheet(SheetKey::RuntimeOptions, cx);
-                                    }
-                                }),
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(status),
+                    );
+
+                let rows = models
+                    .into_iter()
+                    .map(|option| {
+                        let selection = option.selection.clone();
+                        let is_selected = runtime_option_matches(&option, draft);
+                        let model_id = selection.model_id().map(str::to_string);
+                        let model_key = runtime_model_selection_key(&selection.model);
+                        let row_id = format!(
+                            "runtime-model:{}:{}:{}",
+                            agent_id.as_str(),
+                            source_id,
+                            model_key
+                        );
+                        let favorite_agent_id = agent_id.clone();
+                        let favorite_source = selection.auth_source.clone();
+                        let favorite_model_key = model_key.clone();
+                        let favorite = is_runtime_model_favorite(
+                            &favorites,
+                            &favorite_agent_id,
+                            &favorite_source,
+                            &favorite_model_key,
+                        );
+                        runtime_sheet_row(
+                            row_id,
+                            runtime_model_icon(
+                                model_id.as_deref(),
+                                px(theme::ICON_SM + 2.0),
+                                theme::text_primary(),
+                            ),
+                            option.model_label.clone(),
+                            is_selected,
+                            false,
+                        )
+                        .pl(px(28.0))
+                        .pr_1p5()
+                        .when(!busy, |row| {
+                            row.cursor_pointer()
+                                .active(|style| style.bg(theme::row_active_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let selection = selection.clone();
+                                        move |this, _, _, cx| {
+                                            this.choose_runtime_selection(selection.clone(), cx);
+                                            // A chosen model is the end of this
+                                            // drawer's visit: the chip under it
+                                            // names the answer, and the list would
+                                            // only cover the page that shows it.
+                                            this.close_sheet(SheetKey::RuntimeOptions, cx);
+                                        }
+                                    }),
+                                )
+                        })
+                        .when(is_selected, |row| {
+                            row.child(
+                                svg()
+                                    .path("icons/check.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_primary()),
                             )
-                    })
-                    .when(is_selected, |row| {
-                        row.child(
-                            svg()
-                                .path("icons/check.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_primary()),
+                        })
+                        .child(
+                            div()
+                                .id(format!("runtime-model-star:{model_key}"))
+                                .flex_shrink_0()
+                                .size(px(34.0))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .aria_label(if favorite {
+                                    locale::text("Unstar model", "取消收藏模型", "取消收藏模型")
+                                } else {
+                                    locale::text("Star model", "收藏模型", "收藏模型")
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_runtime_model_favorite(
+                                            &favorite_agent_id,
+                                            &favorite_source,
+                                            &favorite_model_key,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(
+                                    Icon::new(if favorite {
+                                        IconName::StarFill
+                                    } else {
+                                        IconName::Star
+                                    })
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(if favorite {
+                                        theme::accent_yellow()
+                                    } else {
+                                        theme::text_muted()
+                                    }),
+                                ),
                         )
                     })
-                }));
-            groups.push(group);
+                    .collect::<Vec<_>>();
+                let body = div().flex().flex_col().children(rows);
+                accordion = accordion.item(move |item| {
+                    item.open(open)
+                        .with_size(gpui_component::Size::XSmall)
+                        .bg(theme::bg_card())
+                        .border_b_0()
+                        .title(heading)
+                        .child(body)
+                });
+            }
+        }
+
+        if !group_keys.is_empty() && !searching {
+            let collapsed_workbench = workbench;
+            let all_keys = group_keys.clone();
+            accordion = accordion.on_toggle_click(move |open_indices, _, cx| {
+                let next = all_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !open_indices.contains(index))
+                    .map(|(_, key)| key.clone())
+                    .collect::<BTreeSet<_>>();
+                let _ = collapsed_workbench.update(cx, |this, cx| {
+                    if this.runtime_collapsed_groups != next {
+                        this.runtime_collapsed_groups = next;
+                        cx.notify();
+                    }
+                });
+            });
         }
 
         div()
@@ -19816,21 +20031,23 @@ impl MobileApp {
             .overflow_y_scroll()
             .restrict_scroll_to_axis()
             .pb_1()
-            .when(groups.is_empty(), |list| {
+            .when(group_keys.is_empty(), |list| {
                 list.child(
                     div()
                         .px_4()
                         .py(px(28.0))
                         .text_size(theme::font_caption())
                         .text_color(theme::text_muted())
-                        .child(if query.is_empty() {
+                        .child(if favorites_view {
+                            locale::text("No starred models", "暂无收藏的模型", "暫無收藏的模型")
+                        } else if query.is_empty() {
                             locale::text("No configuration", "暂无配置", "暫無配置")
                         } else {
                             locale::text("No models found", "未找到模型", "找不到模型")
                         }),
                 )
             })
-            .children(groups)
+            .child(accordion)
             .into_any_element()
     }
 
@@ -33336,6 +33553,58 @@ fn runtime_model_icon(model_id: Option<&str>, size: gpui::Pixels, tint: Hsla) ->
             .flex_shrink_0()
             .text_color(theme::accent_green())
             .into_any_element(),
+    }
+}
+
+/// The brand mark of one provider or route heading.
+///
+/// A Provider's own icon metadata is not on the runtime summary, so the mark is
+/// resolved from the vendor name and then the first model it serves. An Agent
+/// account uses the Agent's mark, and a route keeps the branch glyph because it
+/// is a composition rather than a vendor.
+fn runtime_provider_icon(
+    source: &RuntimeAuthSourceSummary,
+    model_id: Option<&str>,
+    size: gpui::Pixels,
+    tint: Hsla,
+) -> gpui::AnyElement {
+    match source.kind {
+        RuntimeAuthSourceKind::AgentAccount => {
+            runtime_agent_icon(&source.agent_id, &source.label, size, tint)
+        }
+        RuntimeAuthSourceKind::ModelRoute => svg()
+            .path("icons/git-branch.svg")
+            .size(size)
+            .flex_shrink_0()
+            .text_color(theme::accent_green())
+            .into_any_element(),
+        RuntimeAuthSourceKind::ProviderProfile => {
+            let label = runtime_auth_source_display_label(source);
+            [Some(label.as_str()), model_id, Some(source.label.as_str())]
+                .into_iter()
+                .flatten()
+                .find_map(model_brand_asset)
+                .map(|(path, themed)| {
+                    if themed {
+                        svg()
+                            .path(path)
+                            .size(size)
+                            .flex_shrink_0()
+                            .text_color(tint)
+                            .into_any_element()
+                    } else {
+                        img(path).size(size).flex_shrink_0().into_any_element()
+                    }
+                })
+                .unwrap_or_else(|| {
+                    svg()
+                        .path("icons/database.svg")
+                        .size(size)
+                        .flex_shrink_0()
+                        .text_color(theme::accent_green())
+                        .into_any_element()
+                })
+        }
     }
 }
 
