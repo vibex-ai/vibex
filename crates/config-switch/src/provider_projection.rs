@@ -10728,6 +10728,201 @@ mod provider_delete_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Deleting a shared Provider also retires every Agent launch row that reached
+    /// it through a binding.
+    ///
+    /// A shared Provider has no legacy id of its own, so deleting only through the
+    /// Provider's legacy identity leaves those launch rows live. The next backfill
+    /// then tries to insert a replacement binding whose legacy unique key is still
+    /// held by the deleted binding, which fails the whole database open.
+    #[test]
+    fn deleting_a_shared_provider_retires_each_agents_launch_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-provider-delete-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database_path = dir.join("state.db");
+        let service = ProviderConfigService::new(&database_path);
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Shared".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "shared-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("shared-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        for agent in ["opencode", "pi"] {
+            service
+                .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                    provider_profile_id: vibex_core::ProviderProfileId::new(),
+                    model_provider_profile_id: Some(shared.id.clone()),
+                    agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                    make_default: false,
+                })
+                .unwrap();
+        }
+
+        let conn = service.open_connection().unwrap();
+        let bindings =
+            AgentModelProviderBindingRepository::list_for_model_provider(&conn, &shared.id)
+                .unwrap();
+        let legacy_ids = bindings
+            .iter()
+            .filter_map(|binding| binding.legacy_provider_profile_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(legacy_ids.len(), 2, "both Agents must have a launch row");
+        drop(conn);
+
+        service.delete_model_provider_profile(&shared.id).unwrap();
+
+        let mut conn = vibex_db::open_database(&database_path).unwrap();
+        vibex_db::apply_migrations(&mut conn).unwrap();
+        for legacy_id in &legacy_ids {
+            let deleted_at_ms: Option<i64> = conn
+                .query_row(
+                    "SELECT deleted_at_ms FROM provider_profiles
+                     WHERE provider_profile_id = ?1",
+                    rusqlite::params![legacy_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                deleted_at_ms.is_some(),
+                "the launch row {legacy_id} must be retired with the shared Provider"
+            );
+        }
+        assert!(
+            AgentModelProviderBindingRepository::list_for_model_provider(&conn, &shared.id)
+                .unwrap()
+                .is_empty(),
+            "no active binding may survive the delete"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A database already damaged by the old shared-Provider delete self-heals on
+    /// open instead of failing every read with the binding unique constraint.
+    #[test]
+    fn backfill_retires_a_live_launch_row_whose_binding_is_a_tombstone() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-provider-delete-repair-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database_path = dir.join("state.db");
+        let service = ProviderConfigService::new(&database_path);
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Legacy damage".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "shared-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("shared-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let binding =
+            AgentModelProviderBindingRepository::list_for_model_provider(&conn, &shared.id)
+                .unwrap()
+                .pop()
+                .expect("the bound Agent must have a binding");
+        let legacy_id = binding
+            .legacy_provider_profile_id
+            .clone()
+            .expect("the binding must name its launch row");
+
+        // Reproduce the old delete: both v2 records become tombstones, while the
+        // launch row remains active and therefore enters the next backfill.
+        let deleted_at_ms = vibex_core::unix_timestamp_ms().max(1);
+        conn.execute(
+            "UPDATE agent_model_provider_bindings_v2
+             SET deleted_at_ms = ?2
+             WHERE agent_model_provider_binding_id = ?1",
+            rusqlite::params![binding.id.as_str(), deleted_at_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE model_provider_profiles
+             SET deleted_at_ms = ?2
+             WHERE model_provider_profile_id = ?1",
+            rusqlite::params![shared.id.as_str(), deleted_at_ms],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = vibex_db::open_database(&database_path).unwrap();
+        vibex_db::apply_migrations(&mut conn).unwrap();
+        let launch_deleted_at_ms: Option<i64> = conn
+            .query_row(
+                "SELECT deleted_at_ms FROM provider_profiles
+                 WHERE provider_profile_id = ?1",
+                rusqlite::params![legacy_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            launch_deleted_at_ms.is_some(),
+            "backfill must retire the launch row instead of colliding with its tombstone"
+        );
+        assert!(
+            vibex_db::apply_migrations(&mut conn).unwrap().is_empty(),
+            "the repair must be idempotent"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A Provider created on the global page has no legacy row to delete through.
     ///
     /// This is why the global page needed its own delete path: the only delete

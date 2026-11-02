@@ -113,11 +113,39 @@ impl ModelProviderProfileRepository {
                 "model_provider_profile_delete_transaction_failed",
                 "failed to start the Provider delete transaction",
             ))?;
-        // Only the bindings carry a link to this Provider. Their configured models
-        // hang off the binding with `ON DELETE CASCADE`, so marking the binding is
-        // enough; and the runtime profiles are per Agent, not per Provider, so
-        // deleting one from here would take away a launch contract the Agent still
-        // needs.
+        // Retire every launch row reached by this Provider before the bindings
+        // become tombstones. A shared Provider has no legacy id of its own, so its
+        // bindings are the only records that name each Agent's launch row. Leaving
+        // those rows live makes the compatibility backfill try to recreate a
+        // binding whose legacy unique key is still held by the tombstone.
+        transaction
+            .execute(
+                "UPDATE provider_profiles SET deleted_at_ms = ?2
+                 WHERE deleted_at_ms IS NULL
+                   AND (
+                       provider_profile_id IN (
+                           SELECT legacy_provider_profile_id
+                           FROM agent_model_provider_bindings_v2
+                           WHERE model_provider_profile_id = ?1
+                               AND legacy_provider_profile_id IS NOT NULL
+                       )
+                       OR provider_profile_id IN (
+                           SELECT legacy_provider_profile_id
+                           FROM model_provider_profiles
+                           WHERE model_provider_profile_id = ?1
+                               AND legacy_provider_profile_id IS NOT NULL
+                       )
+                   )",
+                params![provider_id.as_str(), deleted_at_ms],
+            )
+            .map_err(storage_err(
+                "model_provider_profile_delete_legacy_failed",
+                "failed to delete the launch rows behind this Provider",
+            ))?;
+        // Their configured models hang off the binding with `ON DELETE CASCADE`, so
+        // marking the binding is enough. Runtime profiles are per Agent, not per
+        // Provider, so deleting one here would take away a launch contract the
+        // Agent still needs.
         transaction
             .execute(
                 "UPDATE agent_model_provider_bindings_v2 SET deleted_at_ms = ?2
@@ -127,23 +155,6 @@ impl ModelProviderProfileRepository {
             .map_err(storage_err(
                 "model_provider_profile_delete_cascade_failed",
                 "failed to delete the bindings that point at this Provider",
-            ))?;
-        // The legacy row goes too, and for a reason that is easy to miss: the
-        // compatibility backfill re-projects every *live* legacy Profile, so a
-        // deleted shared record whose legacy row survived would be rebuilt on the
-        // next open and the delete would look like it never happened.
-        transaction
-            .execute(
-                "UPDATE provider_profiles SET deleted_at_ms = ?2
-                 WHERE provider_profile_id IN (
-                     SELECT legacy_provider_profile_id FROM model_provider_profiles
-                     WHERE model_provider_profile_id = ?1
-                 ) AND deleted_at_ms IS NULL",
-                params![provider_id.as_str(), deleted_at_ms],
-            )
-            .map_err(storage_err(
-                "model_provider_profile_delete_legacy_failed",
-                "failed to delete the launch row behind this Provider",
             ))?;
         transaction
             .execute(
@@ -492,6 +503,31 @@ impl AgentModelProviderBindingRepository {
             .map(Option::flatten)
     }
 
+    /// When a legacy identity is held by a deleted binding.
+    ///
+    /// The unique legacy id deliberately survives a soft delete so historical
+    /// sessions keep their ledger. Backfill must distinguish that tombstone from a
+    /// missing binding; treating it as missing attempts a duplicate INSERT.
+    pub fn tombstone_timestamp(
+        conn: &Connection,
+        legacy_id: &ProviderProfileId,
+    ) -> VibexResult<Option<i64>> {
+        conn.query_row(
+            "
+            SELECT MAX(deleted_at_ms)
+            FROM agent_model_provider_bindings_v2
+            WHERE legacy_provider_profile_id = ?1
+                AND deleted_at_ms IS NOT NULL
+            ",
+            params![legacy_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(storage_err(
+            "agent_model_provider_binding_tombstone_lookup_failed",
+            "failed to inspect an Agent provider binding tombstone",
+        ))
+    }
+
     pub fn list_for_model_provider(
         conn: &Connection,
         id: &ModelProviderProfileId,
@@ -686,6 +722,26 @@ impl ProviderProjectionCompatibilityRepository {
         for profile in profiles {
             let before =
                 AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &profile.id)?;
+            // A deleted binding leaves its unique legacy identity behind. If its
+            // launch row is still live, projection would collide with that
+            // tombstone. Retire the stale launch row instead of recreating a
+            // Provider the user already deleted.
+            if before.is_none()
+                && let Some(deleted_at_ms) =
+                    AgentModelProviderBindingRepository::tombstone_timestamp(conn, &profile.id)?
+            {
+                conn.execute(
+                    "UPDATE provider_profiles
+                     SET deleted_at_ms = ?2
+                     WHERE provider_profile_id = ?1 AND deleted_at_ms IS NULL",
+                    params![profile.id.as_str(), deleted_at_ms],
+                )
+                .map_err(storage_err(
+                    "provider_projection_legacy_tombstone_repair_failed",
+                    "failed to retire a launch row whose Agent provider binding was deleted",
+                ))?;
+                continue;
+            }
             // A launch row an Agent materialised from a shared Provider already
             // points at that Provider, and the v2 id derived from this row is not
             // the record it belongs to. Projecting it would create a second

@@ -5447,6 +5447,14 @@ ProviderConfigService::{
   Key is added, replaced, or removed through the v2 credential endpoints. The
   Agent-scoped list stays during the compatibility window; it is what the
   Agent-scoped editor and its drag ordering still read.
+- **Deleting a shared Provider retires every launch row reached through its
+  bindings.** A shared Provider may have no legacy id of its own, so each
+  binding's `legacy_provider_profile_id` is the durable link to the Agent launch
+  row that must be soft-deleted in the same transaction. Compatibility backfill
+  treats a deleted binding's legacy id as a tombstone: if the launch row is still
+  live, backfill retires it instead of inserting a replacement binding and
+  colliding with the unique legacy identity. This keeps old databases recoverable
+  and prevents a deleted Provider from being recreated on the next open.
 - **Neither list is derived from the other.** The gateway's upstream picker uses
   the v2 identity the settings store, and a client never computes one id from
   the other; the authority resolves the pair once and publishes candidates.
