@@ -1651,6 +1651,9 @@ pub struct ManagementCenter {
     /// Scroll state for the Providers workspace, used by the gallery's category
     /// buttons to reveal a section without filtering the library.
     workspace_create_scroll: ScrollHandle,
+    /// Scroll state for the record detail pages, whose identity header and tabs
+    /// stay fixed while only the body moves.
+    workspace_detail_scroll: ScrollHandle,
     /// The revision the Provider settings form was loaded from.
     workspace_edit_revision: Option<i64>,
     /// The revision of the route group the detail page's draft was loaded
@@ -2946,6 +2949,7 @@ impl ManagementCenter {
         let provider_picker_scroll_anchor =
             ScrollAnchor::for_handle(provider_picker_scroll.clone());
         let workspace_create_scroll = ScrollHandle::new();
+        let workspace_detail_scroll = ScrollHandle::new();
         Self {
             runtime: None,
             backend: None,
@@ -3253,6 +3257,7 @@ impl ManagementCenter {
             workspace_create_choosing: true,
             workspace_create_search,
             workspace_create_scroll,
+            workspace_detail_scroll,
             workspace_edit_revision: None,
             workspace_route_edit_revision: None,
             route_group_recommendations_height: MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT,
@@ -36479,13 +36484,16 @@ impl Render for ManagementCenter {
         // the view grows past the window and takes its own footer — the market
         // pager, the import view's Detect command — off the bottom with it.
         // Left unscrolled, the pane's height is definite and the inner list is
-        // the only thing that moves.
+        // the only thing that moves. The Provider record pages use the same
+        // branch: they pin their header and tabs and scroll only their body.
         //
         // The padding is spelled out in both branches rather than applied
         // before them: the pane's own inset is what keeps the overlay scrollbar
         // off its content, so it has to sit on the same builder chain as the
         // scroll wrapper — which is the chain a source check reads.
-        let main = if self.section_body_owns_its_scroll() {
+        let main = if self.section_body_owns_its_scroll()
+            || self.provider_workspace_detail_owns_scroll()
+        {
             pane.id("management-provider-workspace-scroll")
                 .when(viewport_width < 640.0, |main| main.p_3())
                 .when(viewport_width >= 640.0, |main| main.p_4())

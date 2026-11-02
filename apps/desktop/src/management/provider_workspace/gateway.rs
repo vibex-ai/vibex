@@ -41,13 +41,10 @@ impl ManagementCenter {
             GatewayDetailTab::Advanced => self.render_workspace_gateway_settings(window, cx),
             GatewayDetailTab::Overview => self.render_workspace_gateway_overview(cx),
         };
-        v_flex()
-            .id("management-gateway")
-            .w_full()
-            .min_w_0()
-            .gap_4()
-            .child(self.render_workspace_gateway_header(window, cx))
-            .child(ws_tabs(
+        ws_detail_page(
+            "management-gateway",
+            self.render_workspace_gateway_header(window, cx),
+            ws_tabs(
                 "management-gateway-detail-tabs",
                 GATEWAY_TABS
                     .iter()
@@ -57,13 +54,16 @@ impl ManagementCenter {
                 |this, index, _, cx| {
                     if let Some(tab) = GATEWAY_TABS.get(index) {
                         this.gateway_detail_tab = *tab;
+                        this.workspace_detail_scroll
+                            .set_offset(point(px(0.0), px(0.0)));
                         cx.notify();
                     }
                 },
                 cx,
-            ))
-            .child(body)
-            .into_any_element()
+            ),
+            body,
+            &self.workspace_detail_scroll,
+        )
     }
 
     fn render_workspace_gateway_header(

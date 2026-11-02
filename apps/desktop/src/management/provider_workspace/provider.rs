@@ -51,13 +51,10 @@ impl ManagementCenter {
             }
             _ => self.render_workspace_provider_overview(&row, cx),
         };
-        v_flex()
-            .id("management-provider-page")
-            .w_full()
-            .min_w_0()
-            .gap_4()
-            .child(self.render_workspace_provider_header(&row, cx))
-            .child(ws_tabs(
+        ws_detail_page(
+            "management-provider-page",
+            self.render_workspace_provider_header(&row, cx),
+            ws_tabs(
                 "management-provider-detail-tabs",
                 PROVIDER_TABS
                     .iter()
@@ -67,13 +64,16 @@ impl ManagementCenter {
                 |this, index, _, cx| {
                     if let Some(tab) = PROVIDER_TABS.get(index) {
                         this.provider_detail_tab = *tab;
+                        this.workspace_detail_scroll
+                            .set_offset(point(px(0.0), px(0.0)));
                         cx.notify();
                     }
                 },
                 cx,
-            ))
-            .child(body)
-            .into_any_element()
+            ),
+            body,
+            &self.workspace_detail_scroll,
+        )
     }
 
     fn render_workspace_provider_header(

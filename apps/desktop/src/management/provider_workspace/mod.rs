@@ -32,6 +32,7 @@ impl ManagementCenter {
     ) -> AnyElement {
         // Authoring replaces the detail pane so the list the new record lands
         // in stays visible beside it.
+        let owns_scroll = self.provider_workspace_detail_owns_scroll();
         let page = if self.provider_create_page_open {
             self.render_workspace_provider_create(window, cx)
         } else if self.route_group_page_open {
@@ -57,8 +58,20 @@ impl ManagementCenter {
             .id("management-provider-workspace")
             .w_full()
             .min_w_0()
+            .when(owns_scroll, |workspace| workspace.h_full().min_h_0())
             .child(page)
             .into_any_element()
+    }
+
+    /// Whether the record page on screen owns the right pane's scroll.
+    ///
+    /// The three detail pages pin their header and tabs and scroll only their
+    /// body. The authoring pages are long forms, so they keep the pane's own
+    /// scroll instead.
+    pub(super) fn provider_workspace_detail_owns_scroll(&self) -> bool {
+        management_primary_section(self.navigation.active) == ManagementSection::Providers
+            && !self.provider_create_page_open
+            && !self.route_group_page_open
     }
 
     /// Selects one Provider in the left column.
@@ -69,6 +82,8 @@ impl ManagementCenter {
         self.providers_sidebar_tab = ProviderSidebarTab::Providers;
         self.provider_create_page_open = false;
         self.route_group_page_open = false;
+        self.workspace_detail_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -80,6 +95,8 @@ impl ManagementCenter {
         self.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
         self.provider_create_page_open = false;
         self.route_group_page_open = false;
+        self.workspace_detail_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -91,6 +108,8 @@ impl ManagementCenter {
         self.providers_sidebar_tab = ProviderSidebarTab::Providers;
         self.provider_create_page_open = false;
         self.route_group_page_open = false;
+        self.workspace_detail_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -516,6 +535,41 @@ fn ws_tabs(
         }))
         .on_click(
             cx.listener(move |this, index: &usize, window, cx| on_click(this, *index, window, cx)),
+        )
+        .into_any_element()
+}
+
+/// A detail page whose identity header and tabs stay put while the body moves.
+///
+/// The header and tab bar are `flex_none`, so they keep their height; the body
+/// takes the rest and owns the scroll. A reader can therefore reach any section
+/// of a long page without losing the record's name or the way to another tab.
+fn ws_detail_page(
+    id: &'static str,
+    header: AnyElement,
+    tabs: AnyElement,
+    body: AnyElement,
+    scroll: &ScrollHandle,
+) -> AnyElement {
+    v_flex()
+        .id(id)
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .gap_4()
+        .child(div().w_full().min_w_0().flex_none().child(header))
+        .child(div().w_full().min_w_0().flex_none().child(tabs))
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}-body")))
+                .relative()
+                .w_full()
+                .min_h_0()
+                .flex_1()
+                .track_scroll(scroll)
+                .overflow_y_scroll()
+                .vertical_scrollbar(scroll)
+                .child(body),
         )
         .into_any_element()
 }
@@ -1172,11 +1226,52 @@ mod tests {
                 "the {name} page has underline tabs"
             );
             assert!(
+                source.contains("ws_detail_page("),
+                "the {name} page pins its header and tabs"
+            );
+            assert!(
                 !source.contains(".segmented()"),
                 "the {name} page has no segmented tabs"
             );
         }
         assert!(super::ws_tabs_are_underlined());
+    }
+
+    /// The record pages keep their identity header and tabs in place while the
+    /// body scrolls, and the pane hands the scroll to them instead of wrapping
+    /// the whole page in a second one.
+    #[test]
+    fn detail_headers_and_tabs_stay_fixed_above_the_scrolling_body() {
+        let kit = include_str!("mod.rs");
+        let page = kit
+            .split_once("fn ws_detail_page(")
+            .and_then(|(_, tail)| tail.split_once("\n/// A section card"))
+            .map(|(body, _)| body)
+            .expect("the shared detail page should remain inspectable");
+        let header = page
+            .find("flex_none().child(header)")
+            .expect("the header must not shrink or scroll");
+        let tabs = page
+            .find("flex_none().child(tabs)")
+            .expect("the tab bar must not shrink or scroll");
+        let body = page
+            .find(".flex_1()")
+            .expect("the body takes the remaining height");
+        assert!(header < tabs && tabs < body);
+        assert!(page.contains(".track_scroll("));
+        assert!(page.contains(".overflow_y_scroll()"));
+        assert!(page.contains(".vertical_scrollbar("));
+
+        let management = include_str!("../../management.rs");
+        let main = management
+            .split_once("let main = if self.section_body_owns_its_scroll()")
+            .and_then(|(_, tail)| tail.split_once("let layout = if wide {"))
+            .map(|(body, _)| body)
+            .expect("the management pane should remain inspectable");
+        assert!(
+            main.contains("|| self.provider_workspace_detail_owns_scroll()"),
+            "the detail page owns the scroll, not the pane around it"
+        );
     }
 
     /// Agents bind and unbind by clicking their own capsule; nothing on the
