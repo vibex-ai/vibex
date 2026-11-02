@@ -482,8 +482,6 @@ const SIDEBAR_PANEL_VIEWPORT_RATIO: f32 = 0.45;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 12.0;
 const SIDEBAR_RESIZE_KEYBOARD_STEP: f32 = 16.0;
 const PREVIEW_PANEL_MIN_WIDTH: f32 = 360.0;
-const PREVIEW_PANEL_MAX_WIDTH: f32 = 900.0;
-const PREVIEW_PANEL_VIEWPORT_RATIO: f32 = 0.62;
 /// The detached preview window opens wide enough for the tab strip and the
 /// side-by-side split the panel already supports.
 const PREVIEW_WINDOW_WIDTH: f32 = 1080.0;
@@ -3962,10 +3960,12 @@ fn preview_panel_min_width(preview_min_width: f32) -> f32 {
 
 /// The width range the preview panel's left seam may drag within.
 ///
-/// The panel's ceiling is what the session page leaves it, not a share of the
-/// viewport: every drag keeps the conversation at least
-/// `WORKBENCH_PREVIEW_MIN_CENTER_WIDTH` wide, so pulling the seam across the
-/// window can never starve the timeline the panel sits next to.
+/// The panel's ceiling is what the session page leaves it: every drag keeps the
+/// conversation at least `WORKBENCH_PREVIEW_MIN_CENTER_WIDTH` wide, so pulling
+/// the seam across the window can never starve the timeline the panel sits
+/// next to. There is no second ceiling — a fixed cap or a share of the
+/// viewport would stop the editor short of the width the window can actually
+/// give it.
 fn preview_panel_width_limits(
     viewport_width: f32,
     preview_min_width: f32,
@@ -3973,18 +3973,11 @@ fn preview_panel_width_limits(
     right_edge_width: f32,
 ) -> (f32, f32) {
     let minimum = preview_panel_min_width(preview_min_width);
-    let available_width =
+    let maximum =
         (viewport_width - sidebar_width - right_edge_width - WORKBENCH_PREVIEW_MIN_CENTER_WIDTH)
             .floor()
             .max(minimum);
-    let viewport_max =
-        (viewport_width * PREVIEW_PANEL_VIEWPORT_RATIO).clamp(minimum, PREVIEW_PANEL_MAX_WIDTH);
-    (
-        minimum,
-        PREVIEW_PANEL_MAX_WIDTH
-            .min(available_width)
-            .min(viewport_max),
-    )
+    (minimum, maximum)
 }
 
 /// The width a docked preview panel renders at for a stored preference.
@@ -101564,7 +101557,8 @@ mod tests {
         // The seam's floor is the width the panel is actually drawn at, so the
         // handle cannot advertise a bound the shell then ignores.
         assert_eq!(minimum, medium.preview_min_width);
-        assert!(maximum > minimum);
+        // 954 - right activity bar (40) - session page minimum (240).
+        assert_eq!(maximum, 674.0);
         assert_eq!(
             resolved_preview_panel_width(
                 520.0,
@@ -101579,7 +101573,7 @@ mod tests {
         // instead of on the pinned minimum the Medium shell used to impose.
         assert_eq!(
             resolved_preview_panel_width(
-                PREVIEW_PANEL_MAX_WIDTH,
+                2_000.0,
                 954.0,
                 medium.preview_min_width,
                 0.0,
@@ -101596,13 +101590,21 @@ mod tests {
         let (_, maximum) =
             preview_panel_width_limits(1_440.0, wide.preview_min_width, 260.0, 320.0);
         // Sidebar (260) + session page (240) + right rail (320) leave the panel
-        // its ceiling; the 62% viewport share and the panel's own maximum are
-        // both wider than that here.
+        // its ceiling.
         assert_eq!(maximum, 620.0);
         assert_eq!(
             1_440.0 - 260.0 - 320.0 - maximum,
             WORKBENCH_PREVIEW_MIN_CENTER_WIDTH
         );
+    }
+
+    #[test]
+    fn a_wide_preview_panel_keeps_the_width_the_old_ceiling_refused() {
+        let (_, maximum) = preview_panel_width_limits(2_554.0, 360.0, 320.0, 336.0);
+        // The only bound is the session page's minimum: a fixed panel cap or a
+        // viewport share would stop the editor well short of this width.
+        assert_eq!(maximum, 1_658.0);
+        assert!(maximum > 900.0);
     }
 
     #[test]
