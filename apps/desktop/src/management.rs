@@ -8085,7 +8085,7 @@ impl ManagementCenter {
     /// record can serve an Agent that speaks Messages and another that speaks
     /// Chat. The protocol is therefore not a property of the Provider at all —
     /// it is chosen when an Agent binds it.
-    fn save_shared_provider(&mut self, cx: &mut Context<Self>) {
+    fn save_shared_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             self.error = Some(
                 management_error_text(
@@ -8211,7 +8211,7 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ProfileCreate);
         self.error = None;
         let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        self.mutation_task = Some(cx.spawn_in(window, async move |_, cx| {
             let outcome = async {
                 let mut profile = backend
                     .management()
@@ -8277,7 +8277,7 @@ impl ManagementCenter {
                 Ok::<_, VibexError>((profile, verification))
             }
             .await;
-            this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.mutation = None;
                 match outcome {
                     Ok((profile, verification)) => {
@@ -8321,6 +8321,13 @@ impl ManagementCenter {
                         this.projection_editor.set_secret_intent(false, false);
                         this.navigation
                             .mark_dirty(ManagementSection::Providers, false);
+                        // Close the overlay with the state that retires it, not
+                        // in a later frame: the host renders an empty body once
+                        // this flag is false, and an empty modal left up while
+                        // the backend refresh starts reads as a stalled close.
+                        if window.has_active_dialog(cx) {
+                            window.close_dialog(cx);
+                        }
                         cx.notify();
                         this.refresh(cx);
                         if let Some((bound_profile_id, agent_id)) = verification {
@@ -8341,12 +8348,12 @@ impl ManagementCenter {
         }));
     }
 
-    fn save_profile(&mut self, cx: &mut Context<Self>) {
+    fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A new Provider is always a shared v2 record. When the dialog came
         // from an Agent card, the create path enables it for that Agent; the
         // record itself stays available for other Agents to bind.
         if self.editing_profile_id.is_none() {
-            self.save_shared_provider(cx);
+            self.save_shared_provider(window, cx);
             return;
         }
         let Some(agent) = self.snapshot.agents.iter().find(|agent| {
@@ -8576,9 +8583,9 @@ impl ManagementCenter {
                 agent_id_for_verification,
             ))
         });
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        self.mutation_task = Some(cx.spawn_in(window, async move |_, cx| {
             let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
+            let _ = entity.update_in(cx, |this, window, cx| {
                 this.mutation = None;
                 match outcome {
                     Ok(Ok((message, saved_profile_id, updating, agent_id))) => {
@@ -8593,6 +8600,10 @@ impl ManagementCenter {
                         this.profile_secret_clear = false;
                         this.projection_editor.set_secret_intent(false, false);
                         this.notice = Some(message);
+                        if window.has_active_dialog(cx) {
+                            window.close_dialog(cx);
+                        }
+                        cx.notify();
                         this.refresh(cx);
                         // A new Provider's Key is checked the moment it is
                         // saved: "it was written" and "it works" are different
@@ -24818,7 +24829,9 @@ impl ManagementCenter {
                             })
                             .loading(saving)
                             .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_profile(window, cx)),
+                            ),
                     ),
             )
             .into_any_element()
@@ -25087,10 +25100,10 @@ impl ManagementCenter {
         };
         match choice {
             ProviderPickerChoice::ExistingProvider(id) => {
-                self.use_existing_provider(id, cx);
+                self.use_existing_provider(id, window, cx);
             }
             ProviderPickerChoice::RouteGroup(id) => {
-                self.use_existing_route_group(id, cx);
+                self.use_existing_route_group(id, window, cx);
             }
             ProviderPickerChoice::Preset(id) => {
                 self.choose_provider_preset(&id, window, cx);
@@ -25122,7 +25135,7 @@ impl ManagementCenter {
         if self.provider_preset_picker {
             self.activate_provider_picker_choice(window, cx);
         } else {
-            self.save_profile(cx);
+            self.save_profile(window, cx);
         }
     }
 
@@ -25210,8 +25223,8 @@ impl ManagementCenter {
                     .when(!pending && !in_use, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.use_existing_provider(profile_id.clone(), cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.use_existing_provider(profile_id.clone(), window, cx)
                             }))
                     })
                     .child(management_profile_glyph(
@@ -25351,8 +25364,8 @@ impl ManagementCenter {
                         .when(!pending && !already, |this| {
                             this.cursor_pointer()
                                 .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.use_existing_route_group(use_id.clone(), cx)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.use_existing_route_group(use_id.clone(), window, cx)
                                 }))
                         })
                         .child(
@@ -25742,29 +25755,30 @@ impl ManagementCenter {
             .iter()
             .position(|tab| *tab == active)
             .unwrap_or(0);
+        // The component's "Filling Space" recipe: segmented tabs, each one
+        // taking an equal share of the bar. The chooser is the first step of
+        // the flow, so the switch should read as one control rather than two
+        // pills floating in a track.
         TabBar::new("management-provider-picker-tabs")
             .w_full()
-            .pill()
+            .segmented()
             .selected_index(selected_index)
             .children(ProviderPickerTab::ALL.into_iter().map(|tab| {
                 let count = match tab {
                     ProviderPickerTab::Providers => providers,
                     ProviderPickerTab::RouteGroups => groups,
                 };
-                Tab::new().flex_1().aria_label(tab.label()).child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .justify_center()
-                        .child(Icon::default().path(tab.icon()).size(px(13.0)))
-                        .child(tab.label())
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(count.to_string()),
-                        ),
-                )
+                Tab::new()
+                    .flex_1()
+                    .aria_label(tab.label())
+                    .prefix(Icon::default().path(tab.icon()))
+                    .label(tab.label())
+                    .suffix(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(count.to_string()),
+                    )
             }))
             .on_click(cx.listener(|this, index: &usize, window, cx| {
                 if let Some(tab) = ProviderPickerTab::ALL.get(*index) {
@@ -25794,6 +25808,7 @@ impl ManagementCenter {
     fn use_existing_provider(
         &mut self,
         provider_id: vibex_core::ModelProviderProfileId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(agent_id) = self.selected_agent_id.clone() else {
@@ -25823,6 +25838,9 @@ impl ManagementCenter {
             .unwrap_or_else(vibex_core::ProviderProfileId::new);
         self.provider_preset_picker = false;
         self.profile_editor_open = false;
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
         self.bind_provider_to_agent(agent_id, profile_id, Some(provider_id), cx);
     }
 
@@ -25834,6 +25852,7 @@ impl ManagementCenter {
     fn use_existing_route_group(
         &mut self,
         route_id: vibex_core::ModelRouteId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(agent_id) = self
@@ -25845,6 +25864,9 @@ impl ManagementCenter {
         };
         self.provider_preset_picker = false;
         self.profile_editor_open = false;
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
         self.bind_route_group(agent_id, route_id, cx);
     }
 
@@ -25870,6 +25892,12 @@ impl ManagementCenter {
         // the chooser again.
         self.provider_preset_picker = true;
         self.profile_editor_open = false;
+        // Retire the chooser explicitly. The host would otherwise render its
+        // empty closed body for a frame and schedule a close of its own, which
+        // can land on the group dialog this method opens next.
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
         cx.defer_in(window, move |center, window, cx| {
             center.open_route_group_editor(true, window, cx);
         });
@@ -28503,7 +28531,7 @@ impl ManagementCenter {
     /// Agent, when the dialog was opened from one, only gains a reference: the
     /// same write that stores the group binds it, and a later unbind removes
     /// the reference without touching the record.
-    fn save_route_group(&mut self, cx: &mut Context<Self>) {
+    fn save_route_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -28733,7 +28761,7 @@ impl ManagementCenter {
         self.error = None;
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        self.mutation_task = Some(cx.spawn_in(window, async move |_, cx| {
             let saved = match editing {
                 Some(_) => {
                     backend
@@ -28768,7 +28796,7 @@ impl ManagementCenter {
                 (Ok(_), None) => Ok(()),
                 (Err(error), _) => Err(error.clone()),
             };
-            this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.mutation = None;
                 match outcome {
                     Ok(()) => {
@@ -28783,6 +28811,10 @@ impl ManagementCenter {
                         if let Ok(saved) = &saved {
                             this.selected_global_route_id = Some(saved.id.to_string());
                         }
+                        if window.has_active_dialog(cx) {
+                            window.close_dialog(cx);
+                        }
+                        cx.notify();
                         this.refresh(cx);
                     }
                     Err(error) => {
@@ -30975,8 +31007,8 @@ impl ManagementCenter {
                 // the reader steps between them.
                 .entrance(DialogEntrance::None)
                 .child(dialog_content.clone())
-                .on_ok(move |_, _, cx| {
-                    confirm_center.update(cx, |center, cx| center.save_route_group(cx));
+                .on_ok(move |_, window, cx| {
+                    confirm_center.update(cx, |center, cx| center.save_route_group(window, cx));
                     false
                 })
                 .on_close(move |_, _, cx| {
@@ -46846,7 +46878,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the new-Provider route should remain inspectable");
         assert!(save.contains("if self.editing_profile_id.is_none()"));
-        assert!(save.contains("self.save_shared_provider(cx)"));
+        assert!(save.contains("self.save_shared_provider(window, cx)"));
         let shared = source
             .split_once("    fn save_shared_provider(")
             .and_then(|(_, tail)| tail.split_once("\n    fn save_profile("))
@@ -49971,6 +50003,13 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the tab bar should remain inspectable");
         assert!(tabs.contains("TabBar::new(\"management-provider-picker-tabs\")"));
+        // The component's Filling Space recipe is a segmented bar whose tabs
+        // each take an equal share of the width.
+        assert!(tabs.contains(".segmented()"));
+        assert!(tabs.contains(".flex_1()"));
+        assert!(tabs.contains(".prefix("));
+        assert!(tabs.contains(".label(tab.label())"));
+        assert!(tabs.contains(".suffix("));
         // A saved selection, not a hover: the tab bar owns the active state.
         assert!(tabs.contains(".selected_index(selected_index)"));
         assert!(tabs.contains("this.provider_picker_tab = *tab;"));
@@ -50156,7 +50195,7 @@ mod gateway_surface_tests {
             .split_once("let saving")
             .expect("the form follows the picker")
             .0;
-        assert!(!picker_step.contains("save_profile(cx)"));
+        assert!(!picker_step.contains("save_profile(window, cx)"));
 
         // Existing Providers are the first list on the step, and choosing one
         // is a bind rather than a second copy.
@@ -50168,7 +50207,7 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the picker step should remain inspectable");
         assert!(picker.contains("management-provider-existing-"));
-        assert!(picker.contains("use_existing_provider(profile_id.clone(), cx)"));
+        assert!(picker.contains("use_existing_provider(profile_id.clone(), window, cx)"));
         assert!(picker.contains("Already configured"));
         assert!(picker.contains("provider_picker_preset_sections("));
         // Each source is one row in a kind's block, so the row's own mark and
@@ -50210,7 +50249,7 @@ mod gateway_surface_tests {
         assert!(picker.contains("ProviderPickerTab::Providers"));
         assert!(picker.contains("ProviderPickerTab::RouteGroups"));
         assert!(picker.contains("management-provider-existing-group-"));
-        assert!(picker.contains("use_existing_route_group(use_id.clone(), cx)"));
+        assert!(picker.contains("use_existing_route_group(use_id.clone(), window, cx)"));
         // A group this Agent already references stays on the list with a check
         // rather than disappearing, so the two states are distinguishable.
         assert!(picker.contains("already_referenced.contains(&route_id)"));

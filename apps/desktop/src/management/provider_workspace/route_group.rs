@@ -1089,7 +1089,7 @@ impl ManagementCenter {
                     })
                     .loading(pending)
                     .disabled(pending || enabled == 0)
-                    .on_click(cx.listener(|this, _, _, cx| this.save_route_group(cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.save_route_group(window, cx)))
                     .into_any_element(),
             ],
             cx,
