@@ -123,7 +123,7 @@ impl ManagementCenter {
                 };
                 grid = grid.child(create_tile(
                     SharedString::from(format!("management-provider-create-preset-{}", preset.id)),
-                    provider_source_logo(preset, px(42.0), cx),
+                    provider_source_logo(preset, px(38.0), cx),
                     preset.display_name.clone(),
                     host,
                     note,
@@ -611,6 +611,7 @@ impl ManagementCenter {
 
         let all_presets = Button::new("management-provider-create-all-presets")
             .ghost()
+            .icon(IconName::ArrowLeft)
             .label(management_locale_text(
                 "All presets",
                 "全部预设",

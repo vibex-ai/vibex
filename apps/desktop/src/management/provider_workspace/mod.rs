@@ -1282,10 +1282,11 @@ mod tests {
         assert!(!gallery.contains("workspace_create_category"));
         assert!(!gallery.contains(".selected(category == active)"));
 
-        // Presets use the bare brand mark at the larger gallery size; only
+        // Presets use the bare brand mark at a slightly larger gallery size; only
         // Custom keeps the rounded icon plate.
-        assert!(gallery.contains("provider_source_logo(preset, px(42.0), cx)"));
+        assert!(gallery.contains("provider_source_logo(preset, px(38.0), cx)"));
         assert!(gallery.contains("ws_icon_tile(\"icons/vibex/wrench.svg\", px(42.0), None, cx)"));
+        assert!(CREATE.contains(".icon(IconName::ArrowLeft)"));
 
         // Custom is its own row before the categorized catalog.
         let custom = gallery.find("let custom =").unwrap();
