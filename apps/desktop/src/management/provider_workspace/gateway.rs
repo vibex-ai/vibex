@@ -311,17 +311,11 @@ impl ManagementCenter {
         // What it serves: the model names an Agent can ask for, by group.
         let mut served = BTreeMap::<String, Vec<String>>::new();
         for model in &snapshot.models {
-            let group = model
-                .route_id
-                .as_deref()
-                .and_then(|route_id| {
-                    self.model_routes
-                        .iter()
-                        .find(|route| route.id.as_str() == route_id)
-                        .map(|route| route.display_name.clone())
-                })
-                .unwrap_or_else(|| model.provider_name.clone());
-            let label = self.workspace_requested_model_label(&model.model_id);
+            let group = self.workspace_route_group_label(
+                model.route_id.as_deref(),
+                Some(model.provider_name.as_str()),
+            );
+            let label = self.workspace_served_model_label(&model.model_id);
             let models = served.entry(group).or_default();
             if !models.contains(&label) {
                 models.push(label);

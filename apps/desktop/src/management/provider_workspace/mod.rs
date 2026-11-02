@@ -158,12 +158,26 @@ impl ManagementCenter {
             .iter()
             .find(|route| route.id.as_str() == parsed.group_id)
             .map(|route| route.display_name.trim())
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.is_empty() && *name != parsed.group_id);
         match group {
             Some(group) if group != model => format!("{model} · {group}"),
             Some(group) => group.to_string(),
             None => model.to_string(),
         }
+    }
+
+    /// A model a group serves, as a reader knows it.
+    fn workspace_served_model_label(&self, requested: &str) -> String {
+        served_model_label(requested)
+    }
+
+    /// A route group by the name a reader knows.
+    fn workspace_route_group_label(
+        &self,
+        route_id: Option<&str>,
+        recorded: Option<&str>,
+    ) -> String {
+        route_group_label(&self.model_routes, route_id, recorded)
     }
 
     /// The traffic range as a menu button, shared by every traffic view so a
@@ -197,6 +211,46 @@ impl ManagementCenter {
             })
             .into_any_element()
     }
+}
+
+/// A model a group serves, as a reader knows it.
+///
+/// A group model is addressed as `group/<route id>/<model>`, and the id in the
+/// middle is routing rather than a name. The row that lists a group's models
+/// already names the group, so only the model part belongs in the label.
+fn served_model_label(requested: &str) -> String {
+    match vibex_core::route_group_model_ref(requested) {
+        Some(parsed) => parsed.model_id.trim().to_string(),
+        None => requested.to_string(),
+    }
+}
+
+/// A route group by the name a reader knows.
+///
+/// `recorded` is the name the gateway catalogue wrote down. An empty name, or
+/// the group id repeated as a name, is a record failing to resolve rather than
+/// a label, so it is never shown.
+fn route_group_label(
+    routes: &[vibex_core::ModelRoute],
+    route_id: Option<&str>,
+    recorded: Option<&str>,
+) -> String {
+    if let Some(route_id) = route_id
+        && let Some(route) = routes.iter().find(|route| route.id.as_str() == route_id)
+    {
+        let name = route.display_name.trim();
+        if !name.is_empty() && name != route_id {
+            return name.to_string();
+        }
+    }
+    recorded
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && Some(*name) != route_id)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            management_locale_text("Unnamed route group", "未命名路由组", "未命名路由組")
+                .to_string()
+        })
 }
 
 /// The figures every traffic view reports, computed once per view.
@@ -901,6 +955,8 @@ impl ManagementCenter {
 
 #[cfg(test)]
 mod tests {
+    use super::{route_group_label, served_model_label};
+
     const SIDEBAR: &str = include_str!("sidebar.rs");
     const PROVIDER: &str = include_str!("provider.rs");
     const ROUTE_GROUP: &str = include_str!("route_group.rs");
@@ -1236,6 +1292,65 @@ mod tests {
         let catalog = gallery.find("let mut catalog =").unwrap();
         assert!(custom < catalog);
         assert!(gallery.contains(".child(custom)\n                .child(catalog)"));
+    }
+
+    /// The gateway's "Models served" list names the model, never the routing
+    /// address. `group/<route id>/<model>` is how a request is addressed; the
+    /// route id in the middle is not a label a reader can use.
+    #[test]
+    fn served_models_drop_the_route_group_id_from_their_label() {
+        let route_id = "model_route_3bd5441d5e57472eb221a813c2c1c285";
+        assert_eq!(
+            served_model_label(&format!("group/{route_id}/claude-sonnet-4")),
+            "claude-sonnet-4"
+        );
+        assert_eq!(served_model_label("gpt-5"), "gpt-5");
+
+        // The overview must render that label, not the raw model id it parses.
+        assert!(GATEWAY.contains("self.workspace_served_model_label(&model.model_id)"));
+        assert!(!GATEWAY.contains("push(model.model_id.clone())"));
+    }
+
+    /// A group's heading is its display name. A record whose name is missing,
+    /// or is just its id, falls back to the name the catalogue recorded and
+    /// finally to a readable placeholder — never to the id.
+    #[test]
+    fn route_group_headings_never_fall_back_to_the_id() {
+        let route = vibex_core::ModelRoute {
+            display_name: "Claude Sonnet".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("claude-sonnet-4".to_string()),
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        let route_id = route.id.as_str().to_string();
+        assert_eq!(
+            route_group_label(
+                std::slice::from_ref(&route),
+                Some(route_id.as_str()),
+                Some("Claude Sonnet"),
+            ),
+            "Claude Sonnet"
+        );
+
+        let unnamed = vibex_core::ModelRoute {
+            display_name: route_id.clone(),
+            ..route.clone()
+        };
+        let recorded = "Claude Sonnet";
+        assert_eq!(
+            route_group_label(
+                std::slice::from_ref(&unnamed),
+                Some(route_id.as_str()),
+                Some(recorded),
+            ),
+            recorded,
+            "an id repeated as a name is not a label"
+        );
+
+        let placeholder = route_group_label(&[], Some(route_id.as_str()), Some(route_id.as_str()));
+        assert!(!placeholder.is_empty());
+        assert_ne!(placeholder, route_id);
     }
 }
 
