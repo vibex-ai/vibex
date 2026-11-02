@@ -56,17 +56,24 @@ impl ManagementCenter {
         );
         for category in ProviderPresetCategory::ALL {
             let anchor = anchor_for(category).expect("every category owns a scroll anchor");
+            let debug_selector = match category {
+                ProviderPresetCategory::Vendor => "management-provider-create-kind-vendor",
+                ProviderPresetCategory::Relay => "management-provider-create-kind-relay",
+                ProviderPresetCategory::Local => "management-provider-create-kind-local",
+            };
             chips = chips.child(
                 Button::new(SharedString::from(format!(
                     "management-provider-create-kind-{}",
                     category.metadata_value()
                 )))
+                .debug_selector(move || debug_selector.to_string())
                 .small()
                 .ghost()
                 .label(category.label())
                 .disabled(!available.contains(&category))
                 .on_click(cx.listener(move |_, _, window, cx| {
                     anchor.scroll_to(window, cx);
+                    cx.notify();
                 })),
             );
         }
@@ -695,11 +702,14 @@ fn create_tile(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    let debug_id = id.to_string();
     h_flex()
         .id(id)
-        .flex_1()
-        .min_w(rems(13.0))
-        .max_w(rems(19.0))
+        .debug_selector(move || debug_id.clone())
+        // A wrapping row must not stretch the tiles in a short final row.
+        .flex_none()
+        .w(rems(14.0))
+        .max_w_full()
         .items_center()
         .gap_3()
         .p_3()
@@ -747,4 +757,105 @@ fn create_tile(
         )
         .on_click(on_click)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn gallery_category_buttons_scroll_to_their_sections(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1200.0), px(600.0)));
+
+        center.update(cx, |center, _| {
+            center.navigation.active = ManagementSection::Providers;
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+
+        let local = cx
+            .debug_bounds("management-provider-create-kind-local")
+            .expect("the Local category button should be laid out");
+        assert!(
+            local.size.width > px(0.0) && local.size.height > px(0.0),
+            "the Local category button needs a real hit target"
+        );
+        let max_offset = center.read_with(cx, |center, _| {
+            center.workspace_create_scroll.max_offset().y
+        });
+        assert!(
+            max_offset > px(0.0),
+            "the preset gallery should be taller than its viewport"
+        );
+        let before = center.read_with(cx, |center, _| center.workspace_create_scroll.offset().y);
+        cx.simulate_click(local.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+
+        let after = center.read_with(cx, |center, _| center.workspace_create_scroll.offset().y);
+        assert!(
+            after < before,
+            "clicking Local should scroll the gallery down: before={before:?}, after={after:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn gallery_tiles_keep_one_width_across_short_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1200.0), px(600.0)));
+        center.update(cx, |center, _| {
+            center.navigation.active = ManagementSection::Providers;
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let custom = cx
+            .debug_bounds("management-provider-create-custom")
+            .expect("the custom tile should be laid out");
+        let openai = cx
+            .debug_bounds("management-provider-create-preset-openai")
+            .expect("a first-row preset tile should be laid out");
+        let ollama = cx
+            .debug_bounds("management-provider-create-preset-ollama")
+            .expect("a short-row preset tile should be laid out");
+
+        assert_eq!(custom.size.width, openai.size.width);
+        assert_eq!(ollama.size.width, openai.size.width);
+    }
 }

@@ -35807,13 +35807,18 @@ impl Render for ManagementCenter {
                 .when(viewport_width < 640.0, |main| main.p_3())
                 .when(viewport_width >= 640.0, |main| main.p_4())
                 .into_any_element()
+        } else if provider_sidebar {
+            pane.id("management-provider-workspace-scroll")
+                .when(viewport_width < 640.0, |main| main.p_3())
+                .when(viewport_width >= 640.0, |main| main.p_4())
+                .track_scroll(&self.workspace_create_scroll)
+                .overflow_y_scroll()
+                .vertical_scrollbar(&self.workspace_create_scroll)
+                .into_any_element()
         } else {
             pane.id("management-provider-workspace-scroll")
                 .when(viewport_width < 640.0, |main| main.p_3())
                 .when(viewport_width >= 640.0, |main| main.p_4())
-                .when(provider_sidebar, |main| {
-                    main.track_scroll(&self.workspace_create_scroll)
-                })
                 .overflow_y_scrollbar()
                 .into_any_element()
         };
