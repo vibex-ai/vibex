@@ -2115,6 +2115,42 @@ fn agent_can_host_transport(agent_id: &AgentId, transport: McpServerTransportKin
     !matches!(agent_id.as_str(), "codex" | "deepseek-harness")
 }
 
+/// Keep the source identity and picture of a market install in the saved server.
+///
+/// The registry entry id identifies the source, and its picture URL lets a
+/// desktop recover the publisher's mark after a restart. Existing non-market
+/// tags survive a reinstall; old market tags are replaced so the record cannot
+/// claim two source entries or keep a stale picture.
+fn merge_market_install_tags(
+    existing: &[String],
+    candidate: &[String],
+    entry_id: &str,
+) -> Vec<String> {
+    let market_icon_url = candidate
+        .iter()
+        .find_map(|tag| tag.strip_prefix("market-icon:"))
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string);
+    let mut tags = Vec::new();
+    for tag in existing.iter().chain(candidate) {
+        if tag == "market"
+            || tag.starts_with("market:")
+            || tag.starts_with("market-icon:")
+            || tags.contains(tag)
+        {
+            continue;
+        }
+        tags.push(tag.clone());
+    }
+    tags.push("market".to_string());
+    tags.push(format!("market:{entry_id}"));
+    if let Some(icon_url) = market_icon_url {
+        tags.push(format!("market-icon:{icon_url}"));
+    }
+    tags
+}
+
 impl ProviderConfigService {
     pub fn install_mcp_market_entry(
         &self,
@@ -2204,12 +2240,16 @@ impl ProviderConfigService {
                 updated.url = candidate.url.clone();
                 updated.headers = candidate.headers.clone();
                 updated.description = candidate.description.clone();
+                updated.tags =
+                    merge_market_install_tags(&updated.tags, &candidate.tags, &request.entry_id);
                 updated.updated_at_ms = now;
                 updated
             }
-            None => McpServerRepository::from_create_request(normalize_mcp_create_request(
-                candidate.clone(),
-            )),
+            None => {
+                let mut create = candidate.clone();
+                create.tags = merge_market_install_tags(&[], &candidate.tags, &request.entry_id);
+                McpServerRepository::from_create_request(normalize_mcp_create_request(create))
+            }
         };
         let mut matrix = server.agent_matrix.clone();
         for agent_id in &hostable {

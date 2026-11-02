@@ -219,6 +219,17 @@ const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_AGENT_TOOL_ICON_SIZE: f32 = 22.0;
 /// The glyph drawn inside that square.
 const MANAGEMENT_AGENT_TOOL_GLYPH_SIZE: f32 = 14.0;
+/// The fixed leading slot every management sidebar card reserves for its mark.
+///
+/// Keeping the slot identical across Agents, Providers, MCP servers, Skills,
+/// and Prompts makes their text columns share one spine even when the mark
+/// itself is a brand image, a market icon, or a bundled glyph.
+const MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE: f32 = 36.0;
+/// The picture size inside that slot. It leaves the card's vertical padding
+/// untouched while matching the Agent logo scale.
+const MANAGEMENT_SIDEBAR_IMAGE_SIZE: f32 = 28.0;
+/// Bundled resource glyphs sit optically smaller than filled brand images.
+const MANAGEMENT_RESOURCE_GLYPH_SIZE: f32 = 20.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -5855,6 +5866,8 @@ impl ManagementCenter {
     fn apply_snapshot(&mut self, snapshot: ManagementSnapshot, cx: &mut Context<Self>) {
         self.details_ready = true;
         self.snapshot = snapshot.center;
+        self.load_mcp_market_icons(cx);
+        self.load_skill_market_icons(cx);
         self.gateway = snapshot.gateway;
         self.providers = snapshot.providers;
         // A reveal belongs to the exact Secret that was read. A fresh snapshot
@@ -11691,7 +11704,7 @@ impl ManagementCenter {
         }));
     }
 
-    /// Load the picture of every entry on screen that has one.
+    /// Load the picture of every market entry or installed MCP server on screen.
     ///
     /// The bytes come from the runtime, so this is one request per card rather
     /// than one per frame, and a picture already in hand is not asked for
@@ -11701,17 +11714,19 @@ impl ManagementCenter {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let wanted = self
+        let wanted_entry_ids = self
             .mcp_market_entries
             .iter()
             .filter(|entry| entry.icon_url.is_some())
             .map(|entry| entry.id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .filter(|id| {
                 !self.mcp_market_icons.contains_key(id)
                     && !self.mcp_market_icon_pending.contains(id)
             })
             .collect::<Vec<_>>();
-        for entry_id in wanted {
+        for entry_id in wanted_entry_ids {
             self.mcp_market_icon_pending.insert(entry_id.clone());
             let entity = cx.weak_entity();
             let backend = backend.clone();
@@ -11743,6 +11758,52 @@ impl ManagementCenter {
                         entry_id,
                         Arc::new(gpui::Image::from_bytes(format, icon.bytes)),
                     );
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        let wanted_urls = self
+            .snapshot
+            .mcp_servers
+            .iter()
+            .filter_map(|server| mcp_market_icon_url(&server.tags))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|url| {
+                !self.mcp_market_icons.contains_key(url)
+                    && !self.skill_market_icon_pending.contains(url)
+            })
+            .collect::<Vec<_>>();
+        for url in wanted_urls {
+            self.skill_market_icon_pending.insert(url.clone());
+            let entity = cx.weak_entity();
+            let backend = backend.clone();
+            let request_url = url.clone();
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                backend.management().market_asset(request_url).await
+            });
+            cx.spawn(async move |_, cx| {
+                let loaded = runner.await.ok().and_then(Result::ok);
+                let _ = entity.update(cx, |this, cx| {
+                    this.skill_market_icon_pending.remove(&url);
+                    let Some(asset) = loaded else {
+                        return;
+                    };
+                    let Some(format) = asset
+                        .mime
+                        .as_deref()
+                        .and_then(gpui::ImageFormat::from_mime_type)
+                    else {
+                        return;
+                    };
+                    if asset.bytes.is_empty() {
+                        return;
+                    }
+                    this.mcp_market_icons
+                        .insert(url, Arc::new(gpui::Image::from_bytes(format, asset.bytes)));
                     cx.notify();
                 });
             })
@@ -12048,10 +12109,20 @@ impl ManagementCenter {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let wanted = self
+        let mut wanted = self
             .skill_market_entries
             .iter()
             .filter_map(|entry| entry.icon_url.clone())
+            .collect::<BTreeSet<_>>();
+        wanted.extend(
+            self.snapshot
+                .skills
+                .iter()
+                .filter_map(|skill| skill.source_uri.as_deref())
+                .filter_map(skill_market_icon_url_for_source_uri),
+        );
+        let wanted = wanted
+            .into_iter()
             .filter(|url| {
                 !self.mcp_market_icons.contains_key(url)
                     && !self.skill_market_icon_pending.contains(url)
@@ -20895,6 +20966,7 @@ impl ManagementCenter {
                 .count();
             let model_provider_configuration_supported =
                 self.model_provider_agent_ids.contains(&id);
+            let card_style = management_sidebar_card_style(selected, cx);
             let row = h_flex()
                 .id(SharedString::from(format!("management-agent-row-{id}")))
                 .aria_label(agent.label.clone())
@@ -20905,21 +20977,11 @@ impl ManagementCenter {
                 .overflow_hidden()
                 .rounded(px(8.0))
                 .border_1()
-                .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
-                .bg(if selected {
-                    cx.theme().accent
-                } else {
-                    cx.theme().background.opacity(0.70)
-                })
+                .border_color(card_style.border)
+                .bg(card_style.background)
                 .px_2()
                 .py_2()
-                .hover(|style| {
-                    style.bg(if selected {
-                        cx.theme().accent
-                    } else {
-                        cx.theme().primary.opacity(0.08)
-                    })
-                })
+                .hover(move |style| style.bg(card_style.hover_background))
                 .when(added, |row| {
                     row.role(Role::Button)
                         .focusable()
@@ -21452,9 +21514,16 @@ impl ManagementCenter {
                 .filter(|entry| entry.enabled)
                 .count();
             let enabled = server.status == vibex_core::McpServerStatus::Enabled;
+            let market_icon = mcp_market_icon_url(&server.tags)
+                .and_then(|url| self.mcp_market_icons.get(url).cloned())
+                .or_else(|| {
+                    mcp_market_entry_id(&server.tags)
+                        .and_then(|entry_id| self.mcp_market_icons.get(entry_id).cloned())
+                });
             rows = rows.child(management_resource_row(
                 SharedString::from(format!("management-mcp-select-{select_id}")),
                 "icons/vibex/boxes.svg",
+                market_icon,
                 ManagementResourceRowText {
                     title: server.display_name.clone(),
                     // The same word the market card uses for the same fact. The
@@ -22890,9 +22959,15 @@ impl ManagementCenter {
                 .filter(|entry| entry.enabled)
                 .count();
             let enabled = skill.status == vibex_core::SkillStatus::Enabled;
+            let market_icon = skill
+                .source_uri
+                .as_deref()
+                .and_then(skill_market_icon_url_for_source_uri)
+                .and_then(|url| self.mcp_market_icons.get(&url).cloned());
             rows = rows.child(management_resource_row(
                 SharedString::from(format!("management-skill-select-{select_id}")),
                 "icons/vibex/library.svg",
+                market_icon,
                 ManagementResourceRowText {
                     title: skill.display_name.clone(),
                     subtitle: format!(
@@ -32831,6 +32906,7 @@ impl ManagementCenter {
             rows = rows.child(management_resource_row(
                 SharedString::from(format!("management-prompt-select-{select_id}")),
                 "icons/vibex/file-text.svg",
+                None,
                 ManagementResourceRowText {
                     title: prompt.display_name.clone(),
                     // A Prompt is its body, so the row previews the text the
@@ -37330,7 +37406,7 @@ fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) ->
     let identity = format!("{identity} {label}").to_ascii_lowercase();
     agent_brand_icon(
         &identity,
-        px(28.0),
+        px(MANAGEMENT_SIDEBAR_IMAGE_SIZE),
         Some(
             cx.theme()
                 .foreground
@@ -37341,7 +37417,7 @@ fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) ->
 
 fn management_agent_glyph(identity: &str, label: &str, active: bool, cx: &App) -> AnyElement {
     div()
-        .size(px(36.0))
+        .size(px(MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE))
         .flex_none()
         .flex()
         .items_center()
@@ -39355,6 +39431,41 @@ fn market_entry_meta_line(entry: &vibex_core::McpMarketEntry) -> Option<String> 
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// The registry entry an installed MCP server came from.
+///
+/// The tag is written by the install service so it survives restarts and does
+/// not depend on the market page still being loaded when the sidebar renders.
+fn mcp_market_entry_id(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix("market:"))
+        .map(str::trim)
+        .filter(|entry_id| !entry_id.is_empty())
+}
+
+/// The publisher picture saved with a market-installed MCP server.
+///
+/// The address is part of the install provenance rather than a local asset, so
+/// the same public-image policy applies after a restart as when the market card
+/// first showed it.
+fn mcp_market_icon_url(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix("market-icon:"))
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+}
+
+/// The publisher picture used by a Skill installed from the market.
+///
+/// A market Skill's `source_uri` is `market:<owner>/<repo>/<skill>`. The
+/// catalog derives its card image from the repository owner, so an installed
+/// Skill can recover the same image without retaining the transient market
+/// entry.
+fn skill_market_icon_url_for_source_uri(source_uri: &str) -> Option<String> {
+    let entry_id = source_uri.strip_prefix("market:")?;
+    let owner = entry_id.split('/').next()?.trim();
+    (!owner.is_empty()).then(|| format!("https://github.com/{owner}.png?size=96"))
+}
+
 /// Turn the entry the user was shown plus the form's answers into a create
 /// request. Values the form supplied win over the catalog's defaults, because
 /// the form is where a credential the catalog could not know about is entered.
@@ -39400,6 +39511,15 @@ fn market_entry_to_candidate(
             env.push(value.clone());
         }
     }
+    let mut tags = vec!["market".to_string()];
+    if let Some(icon_url) = entry
+        .icon_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        tags.push(format!("market-icon:{icon_url}"));
+    }
     vibex_core::McpServerCreateRequest {
         display_name: entry.name.clone(),
         transport_kind: entry.transport,
@@ -39413,7 +39533,7 @@ fn market_entry_to_candidate(
         url: entry.url.clone(),
         headers,
         description: entry.description.clone(),
-        tags: vec!["market".to_string()],
+        tags,
         secret_references: Vec::new(),
         provider_matrix: Vec::new(),
     }
@@ -40842,6 +40962,33 @@ fn provider_protocol_url_override_label(wire_api: vibex_core::ProviderModelWireA
     }
 }
 
+/// The three surfaces every management sidebar card uses for its state.
+///
+/// Agent, Provider, MCP, Skill, and Prompt rows share this policy so hover and
+/// selection cannot drift apart between sections.
+#[derive(Clone, Copy)]
+struct ManagementSidebarCardStyle {
+    border: Hsla,
+    background: Hsla,
+    hover_background: Hsla,
+}
+
+fn management_sidebar_card_style(selected: bool, cx: &App) -> ManagementSidebarCardStyle {
+    ManagementSidebarCardStyle {
+        border: cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }),
+        background: if selected {
+            cx.theme().accent
+        } else {
+            cx.theme().background.opacity(0.70)
+        },
+        hover_background: if selected {
+            cx.theme().accent
+        } else {
+            cx.theme().primary.opacity(0.08)
+        },
+    }
+}
+
 /// The lines a management sidebar row says about its resource.
 struct ManagementResourceRowText {
     /// The resource's own name.
@@ -40863,6 +41010,7 @@ struct ManagementResourceRowText {
 fn management_resource_row(
     id: SharedString,
     glyph_path: &'static str,
+    icon: Option<Arc<gpui::Image>>,
     text: ManagementResourceRowText,
     enabled: bool,
     selected: bool,
@@ -40893,10 +41041,11 @@ fn management_resource_row(
         Some(meta) => format!("{title}, {status_label}, {subtitle}, {meta}"),
         None => format!("{title}, {status_label}, {subtitle}"),
     };
+    let card_style = management_sidebar_card_style(selected, cx);
 
     let click = on_activate.clone();
     let keyboard = on_activate;
-    v_flex()
+    h_flex()
         .id(id)
         .role(Role::Button)
         .aria_label(accessible_label)
@@ -40906,36 +41055,16 @@ fn management_resource_row(
         .relative()
         .w_full()
         .min_w_0()
+        .items_center()
         .gap_1()
         .overflow_hidden()
         .rounded(px(8.0))
         .border_1()
-        // One selected treatment for the whole sidebar: the market entry button
-        // and a chosen resource row both answer "which view is the body on", so
-        // they take the same primary boundary and wash. The row used to drop its
-        // border when chosen, which made the current row look less defined than
-        // the ones around it.
-        .border_color(if selected {
-            cx.theme().primary.opacity(0.45)
-        } else {
-            cx.theme().border.opacity(0.65)
-        })
-        // Selection takes the solid accent plate and hover the light primary
-        // wash, the same pairing every list in this column uses.
-        .bg(if selected {
-            cx.theme().accent
-        } else {
-            cx.theme().background.opacity(0.70)
-        })
+        .border_color(card_style.border)
+        .bg(card_style.background)
         .px_2()
         .py_2()
-        .hover(|style| {
-            style.bg(if selected {
-                cx.theme().accent
-            } else {
-                cx.theme().primary.opacity(0.08)
-            })
-        })
+        .hover(move |style| style.bg(card_style.hover_background))
         .on_click(cx.listener(move |this, _, window, cx| click(this, window, cx)))
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             if event.keystroke.key == "enter" || event.keystroke.key == "space" {
@@ -40943,19 +41072,25 @@ fn management_resource_row(
                 cx.stop_propagation();
             }
         }))
+        // The mark owns a leading column so the two text lines form one block
+        // centred against the full card height.
+        .child(management_resource_sidebar_glyph(
+            glyph_path,
+            icon.as_ref(),
+            selected,
+            cx,
+        ))
         .child(
-            h_flex()
-                .w_full()
+            v_flex()
+                .flex_1()
                 .min_w_0()
-                .items_center()
-                .gap_1()
-                .child(management_resource_sidebar_glyph(glyph_path, selected, cx))
+                .gap_0p5()
                 .child(
                     h_flex()
-                        .flex_1()
+                        .w_full()
                         .min_w_0()
-                        .h(px(28.0))
-                        .px_1()
+                        .items_center()
+                        .gap_1()
                         .child(
                             div()
                                 .min_w_0()
@@ -40966,18 +41101,19 @@ fn management_resource_row(
                         )
                         .children(status_tag)
                         .child(div().flex_1()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(match meta {
+                            Some(meta) => format!("{subtitle} · {meta}"),
+                            None => subtitle,
+                        }),
                 ),
-        )
-        .child(
-            div()
-                .pl(px(40.0))
-                .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(match meta {
-                    Some(meta) => format!("{subtitle} · {meta}"),
-                    None => subtitle,
-                }),
         )
         .into_any_element()
 }
@@ -41112,31 +41248,34 @@ fn management_market_entry_button(
         .into_any_element()
 }
 
-fn management_resource_sidebar_glyph(path: &'static str, selected: bool, cx: &App) -> AnyElement {
-    let (surface, foreground) = if selected {
-        (
-            cx.theme().primary.opacity(0.16),
-            cx.theme().foreground.opacity(0.92),
-        )
+fn management_resource_sidebar_glyph(
+    path: &'static str,
+    icon: Option<&Arc<gpui::Image>>,
+    selected: bool,
+    cx: &App,
+) -> AnyElement {
+    let foreground = if selected {
+        cx.theme().foreground.opacity(0.92)
     } else {
-        (cx.theme().muted.opacity(0.30), cx.theme().muted_foreground)
+        cx.theme().muted_foreground
     };
     div()
-        // The same 36px plate the Agent cards lead with, so the glyphs of all
-        // three sidebars land on one vertical line.
-        .size(px(36.0))
+        .size(px(MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(cx.theme().radius)
-        .bg(surface)
-        .child(
-            Icon::default()
+        .child(match icon {
+            Some(icon) => gpui::img(icon.clone())
+                .size(px(MANAGEMENT_SIDEBAR_IMAGE_SIZE))
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            None => Icon::default()
                 .path(path)
-                .size(px(16.0))
-                .text_color(foreground),
-        )
+                .size(px(MANAGEMENT_RESOURCE_GLYPH_SIZE))
+                .text_color(foreground)
+                .into_any_element(),
+        })
         .into_any_element()
 }
 
@@ -44513,8 +44652,12 @@ mod tests {
     #[test]
     fn market_pictures_load_on_the_tokio_runtime() {
         let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("management tests should remain inspectable");
         for loader in ["fn load_mcp_market_icons(", "fn load_skill_market_icons("] {
-            let body = source
+            let body = production
                 .split_once(loader)
                 .and_then(|(_, tail)| tail.split_once("\n    ///"))
                 .map(|(body, _)| body)
@@ -48458,6 +48601,113 @@ mod tests {
     }
 
     #[test]
+    fn management_sidebar_cards_share_the_agent_row_geometry_and_states() {
+        let source = include_str!("management.rs");
+        let style = source
+            .split_once("fn management_sidebar_card_style(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The lines a management sidebar row"))
+            .map(|(body, _)| body)
+            .expect("the shared card style should remain inspectable");
+        assert!(style.contains(".opacity(if selected { 0.0 } else { 0.65 })"));
+        assert!(style.contains("cx.theme().accent"));
+        assert!(style.contains("cx.theme().background.opacity(0.70)"));
+        assert!(style.contains("cx.theme().primary.opacity(0.08)"));
+
+        let agent = source
+            .split_once("    fn render_agents(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_sidebar("))
+            .map(|(body, _)| body)
+            .expect("the Agent sidebar should remain inspectable");
+        assert!(agent.contains("management_sidebar_card_style(selected, cx)"));
+
+        let resource = source
+            .split_once("fn management_resource_row(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The header of a management sidebar"))
+            .map(|(body, _)| body)
+            .expect("the resource card should remain inspectable");
+        assert!(resource.contains("h_flex()"));
+        assert!(resource.contains(".items_center()"));
+        assert!(resource.contains("management_sidebar_card_style(selected, cx)"));
+        assert!(resource.contains("management_resource_sidebar_glyph("));
+        assert!(!resource.contains("cx.theme().primary.opacity(0.45)"));
+
+        let mark = source
+            .split_once("fn management_resource_sidebar_glyph(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\nfn management_resource_discovery_status_label(")
+            })
+            .map(|(body, _)| body)
+            .expect("the resource mark should remain inspectable");
+        assert!(mark.contains("MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE"));
+        assert!(mark.contains("MANAGEMENT_SIDEBAR_IMAGE_SIZE"));
+        assert!(mark.contains("gpui::ObjectFit::Contain"));
+        assert!(!mark.contains(".bg("));
+        assert!(!mark.contains(".rounded("));
+
+        let provider = include_str!("management/provider_workspace/sidebar.rs");
+        assert!(provider.contains("management_sidebar_card_style(selected, cx)"));
+        assert!(provider.contains(".size(px(MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE))"));
+        assert!(!provider.contains("cx.theme().primary.opacity(0.45)"));
+    }
+
+    #[test]
+    fn installed_market_resources_recover_their_market_icons() {
+        let tags = vec![
+            "market".to_string(),
+            "market:io.example/server".to_string(),
+            "market-icon:https://cdn.example/icon.png".to_string(),
+        ];
+        assert_eq!(mcp_market_entry_id(&tags), Some("io.example/server"));
+        assert_eq!(
+            mcp_market_icon_url(&tags),
+            Some("https://cdn.example/icon.png")
+        );
+        assert_eq!(
+            skill_market_icon_url_for_source_uri("market:owner/repo/skill").as_deref(),
+            Some("https://github.com/owner.png?size=96")
+        );
+        assert!(skill_market_icon_url_for_source_uri("file:///tmp/skill").is_none());
+        assert_eq!(
+            market_entry_to_candidate(&market_entry_for_display(), &[]).tags,
+            vec![
+                "market".to_string(),
+                "market-icon:https://cdn.example/icon.png".to_string(),
+            ]
+        );
+
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("management tests should remain inspectable");
+        for loader in ["fn load_mcp_market_icons(", "fn load_skill_market_icons("] {
+            assert!(production.contains(loader));
+        }
+        assert!(production.contains(".filter_map(|server| mcp_market_icon_url(&server.tags))"));
+        assert!(production.contains(".filter_map(|skill| skill.source_uri.as_deref())"));
+        let mcp_sidebar = source
+            .split_once("    fn render_mcp_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The MCP market"))
+            .map(|(body, _)| body)
+            .expect("the MCP sidebar should remain inspectable");
+        assert!(mcp_sidebar.contains("mcp_market_entry_id(&server.tags)"));
+        assert!(mcp_sidebar.contains("mcp_market_icon_url(&server.tags)"));
+        let skill_sidebar = source
+            .split_once("    fn render_skills_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_advanced_sidebar("))
+            .map(|(body, _)| body)
+            .expect("the Skill sidebar should remain inspectable");
+        assert!(skill_sidebar.contains("skill_market_icon_url_for_source_uri"));
+        let apply_snapshot = source
+            .split_once("    fn apply_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Puts one Prompt"))
+            .map(|(body, _)| body)
+            .expect("the snapshot application should remain inspectable");
+        assert!(apply_snapshot.contains("self.load_mcp_market_icons(cx)"));
+        assert!(apply_snapshot.contains("self.load_skill_market_icons(cx)"));
+    }
+
+    #[test]
     fn agent_sidebar_keeps_hidden_scrollbars_and_full_row_selection() {
         let source = include_str!("management.rs");
         let render_agents = source
@@ -48481,8 +48731,10 @@ mod tests {
         assert!(render_agents.contains("this.custom_agent_editor_open = true;"));
         assert!(!render_agents.contains("management-agent-remove-"));
         assert!(!render_agents.contains("management-agent-catalog-"));
-        assert!(render_agents.contains("cx.theme().primary.opacity(0.08)"));
-        assert!(render_agents.contains("cx.theme().accent"));
+        assert!(render_agents.contains("management_sidebar_card_style(selected, cx)"));
+        assert!(render_agents.contains("card_style.border"));
+        assert!(render_agents.contains("card_style.background"));
+        assert!(render_agents.contains("card_style.hover_background"));
         assert!(render_agents.contains("cx.theme().foreground.opacity(0.72)"));
         assert!(!render_agents.contains("cx.theme().primary.opacity(0.11)"));
         assert!(!render_agents.contains(".shadow_sm()"));

@@ -12933,6 +12933,89 @@ args = ["--root", "/tmp/workspace"]
     }
 
     #[test]
+    fn market_install_persists_and_refreshes_its_source_entry() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let claude = AgentId::parse("claude").unwrap();
+        let request = |entry_id: &str, icon_url: Option<&str>| {
+            let mut tags = vec!["market".to_string(), "team-tools".to_string()];
+            if let Some(icon_url) = icon_url {
+                tags.push(format!("market-icon:{icon_url}"));
+            }
+            vibex_core::McpMarketInstallRequest {
+                entry_id: entry_id.to_string(),
+                agent_ids: vec![claude.clone()],
+                env_values: Vec::new(),
+                candidate: McpServerCreateRequest {
+                    display_name: "Market Files".to_string(),
+                    transport_kind: McpServerTransportKind::Stdio,
+                    status: McpServerStatus::Enabled,
+                    scope_kind: McpServerScopeKind::User,
+                    project_id: None,
+                    workspace_id: None,
+                    command: Some("mcp-files".to_string()),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    url: None,
+                    headers: Vec::new(),
+                    description: Some("From the market".to_string()),
+                    tags,
+                    secret_references: Vec::new(),
+                    provider_matrix: Vec::new(),
+                },
+            }
+        };
+
+        let first = service
+            .install_mcp_market_entry(request(
+                "io.example/files-v1",
+                Some("https://cdn.example/files-v1.png"),
+            ))
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(
+            first.server.tags,
+            vec![
+                "team-tools".to_string(),
+                "market".to_string(),
+                "market:io.example/files-v1".to_string(),
+                "market-icon:https://cdn.example/files-v1.png".to_string(),
+            ]
+        );
+
+        let second = service
+            .install_mcp_market_entry(request(
+                "io.example/files-v2",
+                Some("https://cdn.example/files-v2.png"),
+            ))
+            .unwrap();
+        assert!(!second.created);
+        assert_eq!(second.server.id, first.server.id);
+        assert_eq!(
+            second.server.tags,
+            vec![
+                "team-tools".to_string(),
+                "market".to_string(),
+                "market:io.example/files-v2".to_string(),
+                "market-icon:https://cdn.example/files-v2.png".to_string(),
+            ]
+        );
+
+        let third = service
+            .install_mcp_market_entry(request("io.example/files-v3", None))
+            .unwrap();
+        assert!(!third.created);
+        assert_eq!(
+            third.server.tags,
+            vec![
+                "team-tools".to_string(),
+                "market".to_string(),
+                "market:io.example/files-v3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn mcp_discovery_scans_added_agents_and_skips_removed_agents() {
         let dir = tempdir().unwrap();
         let codex_home = dir.path().join("codex-disabled-home");

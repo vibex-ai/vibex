@@ -791,7 +791,7 @@ pub(super) fn workspace_gateway_state(
 fn workspace_card_mark(mark: AnyElement) -> AnyElement {
     div()
         .flex_none()
-        .size(px(30.0))
+        .size(px(MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE))
         .flex()
         .items_center()
         .justify_center()
@@ -819,33 +819,20 @@ fn workspace_nav_row(
     cx: &App,
 ) -> AnyElement {
     let check_id = id.clone();
+    let card_style = management_sidebar_card_style(selected, cx);
     h_flex()
         .id(id)
         .w_full()
         .min_w_0()
         .items_center()
-        .gap_2p5()
+        .gap_1()
         .p_2()
         .rounded(px(8.0))
         .border_1()
-        .border_color(if selected {
-            cx.theme().primary.opacity(0.0)
-        } else {
-            cx.theme().border.opacity(0.65)
-        })
-        .bg(if selected {
-            cx.theme().accent
-        } else {
-            cx.theme().background.opacity(0.70)
-        })
+        .border_color(card_style.border)
+        .bg(card_style.background)
         .cursor_pointer()
-        .hover(|style| {
-            style.bg(if selected {
-                cx.theme().accent
-            } else {
-                cx.theme().primary.opacity(0.08)
-            })
-        })
+        .hover(move |style| style.bg(card_style.hover_background))
         // While selecting, a checkbox leads the card: the click names a set in
         // this mode, so which records are in it has to be the leading fact.
         // The box stops the click from reaching the row, because the row's
